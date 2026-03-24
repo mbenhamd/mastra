@@ -1,5 +1,12 @@
 # @mastra/core
 
+## 1.16.0-alpha.3
+
+### Patch Changes
+
+- Updated dependencies [[`47358d9`](https://github.com/mastra-ai/mastra/commit/47358d960bb2b931321de7e798f341ab0df81f44)]:
+  - @mastra/schema-compat@1.2.7-alpha.1
+
 ## 1.16.0-alpha.2
 
 ### Minor Changes

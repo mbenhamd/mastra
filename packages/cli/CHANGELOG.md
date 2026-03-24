@@ -1,5 +1,15 @@
 # mastra
 
+## 1.3.15-alpha.3
+
+### Patch Changes
+
+- Added metrics dashboard with KPI cards, trace volume, latency, model usage, and scores visualizations. Includes filtering by date range, agents, models, and providers. Added HorizontalBars, MetricsCard, MetricsKpiCard, MetricsLineChart, MetricsFlexGrid, and MetricsDataTable design system components. ([#14491](https://github.com/mastra-ai/mastra/pull/14491))
+
+- Updated dependencies:
+  - @mastra/core@1.16.0-alpha.3
+  - @mastra/deployer@1.16.0-alpha.3
+
 ## 1.3.15-alpha.2
 
 ### Patch Changes

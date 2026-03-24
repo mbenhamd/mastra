@@ -1,5 +1,20 @@
 # @mastra/playground-ui
 
+## 19.0.0-alpha.3
+
+### Patch Changes
+
+- Added EntityList.NoMatch component that displays a message when search filtering returns no results. Applied to all entity list pages: Agents, Workflows, Tools, Scorers, Processors, Prompts, Datasets, and MCP Servers. ([#14621](https://github.com/mastra-ai/mastra/pull/14621))
+
+- Added metrics dashboard with KPI cards, trace volume, latency, model usage, and scores visualizations. Includes filtering by date range, agents, models, and providers. Added HorizontalBars, MetricsCard, MetricsKpiCard, MetricsLineChart, MetricsFlexGrid, and MetricsDataTable design system components. ([#14491](https://github.com/mastra-ai/mastra/pull/14491))
+
+- Updated dependencies [[`47358d9`](https://github.com/mastra-ai/mastra/commit/47358d960bb2b931321de7e798f341ab0df81f44)]:
+  - @mastra/schema-compat@1.2.7-alpha.1
+  - @mastra/client-js@1.10.0-alpha.3
+  - @mastra/core@1.16.0-alpha.3
+  - @mastra/react@0.2.17-alpha.3
+  - @mastra/ai-sdk@1.2.1-alpha.0
+
 ## 19.0.0-alpha.2
 
 ### Patch Changes

@@ -1,5 +1,13 @@
 # @mastra/hono
 
+## 1.3.0-alpha.3
+
+### Patch Changes
+
+- Updated dependencies:
+  - @mastra/core@1.16.0-alpha.3
+  - @mastra/server@1.16.0-alpha.3
+
 ## 1.3.0-alpha.2
 
 ### Patch Changes
