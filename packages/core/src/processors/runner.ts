@@ -1102,15 +1102,31 @@ export class ProcessorRunner {
           );
           const mutations = messageList.stopRecording();
           recordingStopped = true;
-          validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
+          const rawResult = result as RunProcessInputStepResult & { phase?: string };
+          const workflowProcessInputStepResult: ProcessInputStepResult = {
+            ...rawResult,
+            messageList: undefined,
+            messages:
+              rawResult.messages &&
+              (rawResult.modelContextMessages === undefined ||
+                !areProcessorMessageArraysEqual(rawResult.messages, rawResult.modelContextMessages)) &&
+              !areProcessorMessageArraysEqual(processableMessages, rawResult.messages)
+                ? rawResult.messages
+                : undefined,
+            modelContextMessages: rawResult.modelContextMessages,
+          };
+          delete (workflowProcessInputStepResult as { phase?: string }).phase;
           const {
             messages,
             systemMessages,
             modelContextMessages,
             messageList: _messageList,
-            phase: _phase,
             ...rest
-          } = result as RunProcessInputStepResult & { phase?: string };
+          } = await ProcessorRunner.validateAndFormatProcessInputStepResult(workflowProcessInputStepResult, {
+            messageList,
+            processor: { id: processorOrWorkflow.id },
+            stepNumber,
+          });
 
           if (hadModelContextMessages && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
             throw new MastraError({
@@ -1131,7 +1147,7 @@ export class ProcessorRunner {
           if (systemMessages) {
             messageList.replaceAllSystemMessages(systemMessages as CoreMessageV4[]);
           }
-          if ('modelContextMessages' in result) {
+          if ('modelContextMessages' in workflowProcessInputStepResult) {
             stepInput.modelContextMessages = normalizePromptOnlyMessages(
               (modelContextMessages ?? []) as MastraDBMessage[],
             );
