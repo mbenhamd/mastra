@@ -256,6 +256,10 @@ function buildProcessInputStepSpanOutput(args: {
   return output;
 }
 
+function hasRegularMessageListMutations(mutations: ReturnType<MessageList['stopRecording']>): boolean {
+  return mutations.some(mutation => mutation.type !== 'addSystem');
+}
+
 export class ProcessorRunner {
   public readonly inputProcessors: ProcessorOrWorkflow[];
   public readonly outputProcessors: ProcessorOrWorkflow[];
@@ -1237,6 +1241,7 @@ export class ProcessorRunner {
           abortSignal: args.abortSignal,
         };
 
+        const hadModelContextMessages = stepInput.modelContextMessages !== undefined;
         const result = await ProcessorRunner.validateAndFormatProcessInputStepResult(
           await processMethod(processMethodArgs),
           {
@@ -1250,6 +1255,21 @@ export class ProcessorRunner {
 
         // Stop recording and get mutations for this processor
         const mutations = messageList.stopRecording();
+
+        if (
+          hadModelContextMessages &&
+          mutations.length > 0 &&
+          hasRegularMessageListMutations(mutations) &&
+          !messages &&
+          !modelContextMessages
+        ) {
+          throw new MastraError({
+            category: 'USER',
+            domain: 'AGENT',
+            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT_MESSAGES',
+            text: `Processor ${processor.id} mutated messageList after a previous processor returned modelContextMessages. Return messages or modelContextMessages from this processor so the next model prompt stays in sync with the mutation.`,
+          });
+        }
 
         if (stepInput.modelContextMessages !== undefined && mutations.length > 0) {
           throw new MastraError({
