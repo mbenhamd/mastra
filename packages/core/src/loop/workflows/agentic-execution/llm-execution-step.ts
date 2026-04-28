@@ -455,6 +455,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             providerOptions?: SharedProviderOptions | undefined;
             modelSettings?: Omit<CallSettings, 'abortSignal'> | undefined;
             structuredOutput?: StructuredOutputOptions<OUTPUT>;
+            modelContextMessages?: MastraDBMessage[];
             workspace?: Workspace;
             modelContextMessages?: MastraDBMessage[];
           } = {

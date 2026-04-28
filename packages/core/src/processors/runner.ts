@@ -1063,7 +1063,7 @@ export class ProcessorRunner {
     // Run through all input processors that have processInputStep
     for (const [index, processorOrWorkflow] of processors.entries()) {
       const processableMessages: MastraDBMessage[] = stepInput.modelContextMessages ?? messageList.get.all.db();
-      const idsBeforeProcessing = messageList.get.all.db().map((m: MastraDBMessage) => m.id);
+      const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with inputStep phase
