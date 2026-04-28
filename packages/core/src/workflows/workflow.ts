@@ -723,6 +723,7 @@ function createStepFromProcessor<TProcessorId extends string>(
       const {
         phase,
         messages,
+        modelContextMessages,
         messageList,
         stepNumber,
         systemMessages,
@@ -744,7 +745,6 @@ function createStepFromProcessor<TProcessorId extends string>(
         structuredOutput,
         steps,
         usage,
-        modelContextMessages,
         messageId,
         rotateResponseMessageId,
         // Shared processor states map for accessing persisted state
@@ -789,6 +789,7 @@ function createStepFromProcessor<TProcessorId extends string>(
 
             return {
               messages: processableMessages,
+              ...(modelContextMessages ? { modelContextMessages } : {}),
               ...(systemMessages ? { systemMessages } : {}),
               ...(stepNumber !== undefined ? { stepNumber } : {}),
               ...(currentMessageId ? { messageId: currentMessageId } : {}),
@@ -849,6 +850,16 @@ function createStepFromProcessor<TProcessorId extends string>(
               !areProcessorMessageArraysEqual(messages as unknown[] | undefined, payload.messages)
             ) {
               output.messages = payload.messages;
+            }
+
+            if (
+              Array.isArray(payload.modelContextMessages) &&
+              !areProcessorMessageArraysEqual(
+                modelContextMessages as unknown[] | undefined,
+                payload.modelContextMessages,
+              )
+            ) {
+              output.modelContextMessages = payload.modelContextMessages;
             }
 
             if (
@@ -1009,6 +1020,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 .add(messages as MastraDBMessage[], 'input')
                 .addSystem((systemMessages ?? []) as CoreMessage[])
             : undefined),
+        modelContextMessages,
         stepNumber,
         systemMessages,
         streamParts,
@@ -1029,7 +1041,6 @@ function createStepFromProcessor<TProcessorId extends string>(
         structuredOutput,
         steps,
         usage,
-        modelContextMessages,
         messageId: currentMessageId,
         rotateResponseMessageId: rotateCurrentResponseMessageId,
       };
@@ -1299,7 +1310,11 @@ function createStepFromProcessor<TProcessorId extends string>(
                 });
               }
 
-              if (validatedResult.messages && passThrough.modelContextMessages === undefined) {
+              if (
+                validatedResult.messages &&
+                passThrough.modelContextMessages === undefined &&
+                validatedResult.modelContextMessages === undefined
+              ) {
                 ProcessorRunner.applyMessagesToMessageList(
                   validatedResult.messages,
                   checkedMessageList,
@@ -1345,24 +1360,17 @@ function createStepFromProcessor<TProcessorId extends string>(
 
               // Preserve messages in return - passThrough doesn't include messages,
               // so we must explicitly include it to avoid losing it for subsequent steps.
-              if (validatedResult.modelContextMessages) {
-                return {
-                  ...returnPassThrough,
-                  ...validatedResult,
-                  ...(currentMessageId ? { messageId: validatedResult.messageId ?? currentMessageId } : {}),
-                };
-              }
-              if (returnPassThrough.modelContextMessages) {
-                return {
-                  ...returnPassThrough,
-                  ...validatedResult,
-                  ...(currentMessageId ? { messageId: validatedResult.messageId ?? currentMessageId } : {}),
-                };
-              }
+              const nextModelContextMessages =
+                validatedResult.modelContextMessages ??
+                (returnPassThrough.modelContextMessages !== undefined && validatedResult.messages
+                  ? stripPromptOnlySystemMessages(validatedResult.messages)
+                  : undefined);
+              const nextMessages = nextModelContextMessages ?? validatedResult.messages ?? returnMessages;
               return {
                 ...returnPassThrough,
-                messages: returnMessages,
+                messages: nextMessages,
                 ...validatedResult,
+                ...(nextModelContextMessages !== undefined ? { modelContextMessages: nextModelContextMessages } : {}),
                 ...(currentMessageId ? { messageId: validatedResult.messageId ?? currentMessageId } : {}),
               };
             }

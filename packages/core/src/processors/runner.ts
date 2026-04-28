@@ -1073,69 +1073,87 @@ export class ProcessorRunner {
       // Handle workflow as processor with inputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
         const currentSystemMessages = messageList.getAllSystemMessages();
-        const messageListBeforeWorkflow = snapshotMessageList(messageList);
-        const result = await this.executeWorkflowAsProcessor(
-          processorOrWorkflow,
-          {
-            phase: 'inputStep',
-            messages: processableMessages,
-            messageList,
-            stepNumber,
-            steps,
-            systemMessages: currentSystemMessages,
-            rotateResponseMessageId: args.rotateResponseMessageId
-              ? () => {
-                  const nextMessageId = args.rotateResponseMessageId!();
-                  stepInput.messageId = nextMessageId;
-                  return nextMessageId;
-                }
-              : undefined,
-            ...stepInput,
-          },
-          observabilityContext,
-          requestContext,
-          writer,
-          args.abortSignal,
-        );
-        const workflowMutatedMessageList = didMessageListChange(messageList, messageListBeforeWorkflow);
-        validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
-        if (stepInput.modelContextMessages !== undefined && workflowMutatedMessageList) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-            text: `Processor workflow ${processorOrWorkflow.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
-          });
-        }
-        if (result.modelContextMessages !== undefined && workflowMutatedMessageList) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
-            text: `Processor workflow ${processorOrWorkflow.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
-          });
-        }
-        const { messages, systemMessages, modelContextMessages, ...rest } = result;
-        if (systemMessages) {
-          messageList.replaceAllSystemMessages(systemMessages as CoreMessageV4[]);
-        }
-        if ('modelContextMessages' in result) {
-          stepInput.modelContextMessages = normalizePromptOnlyMessages(
-            (modelContextMessages ?? []) as MastraDBMessage[],
-          );
-        } else if (messages) {
-          if (stepInput.modelContextMessages !== undefined) {
-            stepInput.modelContextMessages = normalizePromptOnlyMessages(messages as MastraDBMessage[]);
-          } else {
-            ProcessorRunner.applyMessagesToMessageList(
-              messages as MastraDBMessage[],
+        const hadModelContextMessages = stepInput.modelContextMessages !== undefined;
+        messageList.startRecording();
+        let recordingStopped = false;
+        try {
+          const result = await this.executeWorkflowAsProcessor(
+            processorOrWorkflow,
+            {
+              phase: 'inputStep',
+              messages: processableMessages,
               messageList,
-              idsBeforeProcessing,
-              check,
-            );
+              stepNumber,
+              steps,
+              systemMessages: currentSystemMessages,
+              rotateResponseMessageId: args.rotateResponseMessageId
+                ? () => {
+                    const nextMessageId = args.rotateResponseMessageId!();
+                    stepInput.messageId = nextMessageId;
+                    return nextMessageId;
+                  }
+                : undefined,
+              ...stepInput,
+            },
+            observabilityContext,
+            requestContext,
+            writer,
+            args.abortSignal,
+          );
+          const mutations = messageList.stopRecording();
+          recordingStopped = true;
+          validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
+          const {
+            messages,
+            systemMessages,
+            modelContextMessages,
+            messageList: _messageList,
+            phase: _phase,
+            ...rest
+          } = result as RunProcessInputStepResult & { phase?: string };
+
+          if (hadModelContextMessages && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
+            throw new MastraError({
+              category: 'USER',
+              domain: 'AGENT',
+              id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
+              text: `Processor workflow ${processorOrWorkflow.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
+            });
           }
+          if (modelContextMessages !== undefined && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
+            throw new MastraError({
+              category: 'USER',
+              domain: 'AGENT',
+              id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
+              text: `Processor workflow ${processorOrWorkflow.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
+            });
+          }
+          if (systemMessages) {
+            messageList.replaceAllSystemMessages(systemMessages as CoreMessageV4[]);
+          }
+          if ('modelContextMessages' in result) {
+            stepInput.modelContextMessages = normalizePromptOnlyMessages(
+              (modelContextMessages ?? []) as MastraDBMessage[],
+            );
+          } else if (messages) {
+            if (stepInput.modelContextMessages !== undefined) {
+              stepInput.modelContextMessages = normalizePromptOnlyMessages(messages as MastraDBMessage[]);
+            } else {
+              ProcessorRunner.applyMessagesToMessageList(
+                messages as MastraDBMessage[],
+                messageList,
+                idsBeforeProcessing,
+                check,
+              );
+            }
+          }
+          Object.assign(stepInput, rest);
+        } catch (error) {
+          if (!recordingStopped) {
+            messageList.stopRecording();
+          }
+          throw error;
         }
-        Object.assign(stepInput, rest);
         continue;
       }
 
