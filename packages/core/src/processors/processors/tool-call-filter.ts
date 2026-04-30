@@ -3,18 +3,12 @@ import type { RequestContext } from '../../request-context';
 
 import type { Processor } from '../index';
 
-/**
- * Type definition for tool invocation parts in MastraDBMessage format 2
- */
-type V2ToolInvocationPart = {
-  type: 'tool-invocation';
-  toolInvocation: {
-    toolName: string;
-    toolCallId: string;
-    args: unknown;
-    result?: unknown;
-    state: 'call' | 'result';
-  };
+type MastraMessagePart = NonNullable<Extract<MastraDBMessage['content'], { parts?: unknown }>['parts']>[number];
+type V2ToolInvocationPart = Extract<MastraMessagePart, { type: 'tool-invocation' }>;
+
+type ToolCallFilterOptions = {
+  exclude?: string[];
+  preserveModelOutput?: boolean;
 };
 
 /**
@@ -26,13 +20,18 @@ export class ToolCallFilter implements Processor {
   readonly id = 'tool-call-filter';
   name = 'ToolCallFilter';
   private exclude: string[] | 'all';
+  private preserveModelOutput: boolean;
 
   /**
    * Create a filter for tool calls and results.
    * @param options Configuration options
    * @param options.exclude List of specific tool names to exclude. If not provided, all tool calls are excluded.
+   * @param options.preserveModelOutput Keep completed tool results that have providerMetadata.mastra.modelOutput,
+   * replacing the raw result with that compact model-facing projection.
    */
-  constructor(options: { exclude?: string[] } = {}) {
+  constructor(options: ToolCallFilterOptions = {}) {
+    this.preserveModelOutput = options.preserveModelOutput ?? false;
+
     // If no options or exclude is provided, exclude all tools
     if (!options || !options.exclude) {
       this.exclude = 'all'; // Exclude all tools
@@ -40,6 +39,40 @@ export class ToolCallFilter implements Processor {
       // Exclude specific tools
       this.exclude = Array.isArray(options.exclude) ? options.exclude : [];
     }
+  }
+
+  private getModelOutput(part: V2ToolInvocationPart): unknown {
+    const mastraMetadata = part.providerMetadata?.mastra;
+    if (!mastraMetadata || typeof mastraMetadata !== 'object') {
+      return undefined;
+    }
+
+    return (mastraMetadata as Record<string, unknown>).modelOutput;
+  }
+
+  private compactToolResultPart(part: V2ToolInvocationPart): V2ToolInvocationPart | null {
+    if (!this.preserveModelOutput || part.toolInvocation.state !== 'result') {
+      return null;
+    }
+
+    const modelOutput = this.getModelOutput(part);
+    if (modelOutput == null) {
+      return null;
+    }
+
+    return {
+      ...part,
+      toolInvocation: {
+        ...part.toolInvocation,
+        result: modelOutput,
+      },
+    };
+  }
+
+  private getToolInvocationsFromParts(parts: MastraDBMessage['content']['parts']) {
+    return parts
+      .filter((part): part is V2ToolInvocationPart => part.type === 'tool-invocation')
+      .map(part => part.toolInvocation);
   }
 
   async processInput(args: {
@@ -85,11 +118,17 @@ export class ToolCallFilter implements Processor {
             return message;
           }
 
-          // Filter out tool invocation parts
-          const nonToolParts = message.content.parts.filter((part: any) => part.type !== 'tool-invocation');
+          const filteredParts = message.content.parts.flatMap((part: any) => {
+            if (part.type !== 'tool-invocation') {
+              return [part];
+            }
+
+            const compactPart = this.compactToolResultPart(part as V2ToolInvocationPart);
+            return compactPart ? [compactPart] : [];
+          });
 
           // If no parts remain after filtering, remove the message
-          if (nonToolParts.length === 0) {
+          if (filteredParts.length === 0) {
             return null;
           }
 
@@ -98,11 +137,13 @@ export class ToolCallFilter implements Processor {
           const { toolInvocations: originalToolInvocations, ...contentWithoutToolInvocations } = message.content as any;
           const updatedContent: any = {
             ...contentWithoutToolInvocations,
-            parts: nonToolParts,
+            parts: filteredParts,
           };
 
-          // Don't include toolInvocations since we're excluding all tools
-          // (already excluded by destructuring above)
+          const compactToolInvocations = this.getToolInvocationsFromParts(filteredParts);
+          if (compactToolInvocations.length > 0) {
+            updatedContent.toolInvocations = compactToolInvocations;
+          }
 
           return {
             ...message,
@@ -149,31 +190,28 @@ export class ToolCallFilter implements Processor {
           }
 
           // Filter out excluded tool invocation parts
-          const filteredParts = message.content.parts.filter((part: any) => {
+          const filteredParts = message.content.parts.flatMap((part: any) => {
             if (part.type !== 'tool-invocation') {
-              return true; // Keep non-tool parts
+              return [part]; // Keep non-tool parts
             }
 
             const invocationPart = part as unknown as V2ToolInvocationPart;
             const invocation = invocationPart.toolInvocation;
+            const shouldExclude =
+              (invocation.state === 'call' && this.exclude.includes(invocation.toolName)) ||
+              (invocation.state === 'result' && excludedToolCallIds.has(invocation.toolCallId)) ||
+              (invocation.state === 'result' && this.exclude.includes(invocation.toolName));
 
-            // Exclude if it's a call for an excluded tool
-            if (invocation.state === 'call' && this.exclude.includes(invocation.toolName)) {
-              return false;
+            if (!shouldExclude) {
+              return [part];
             }
 
-            // Exclude if it's a result for an excluded tool call
-            // This handles both cases: when there's a matching call, and when only results exist
-            if (invocation.state === 'result' && excludedToolCallIds.has(invocation.toolCallId)) {
-              return false;
+            const compactPart = this.compactToolResultPart(invocationPart);
+            if (compactPart) {
+              return [compactPart];
             }
 
-            // Also exclude results by tool name if no corresponding call exists (edge case in test data)
-            if (invocation.state === 'result' && this.exclude.includes(invocation.toolName)) {
-              return false;
-            }
-
-            return true; // Keep other tool invocations
+            return [];
           });
 
           // If no parts remain, remove the message entirely
@@ -189,15 +227,9 @@ export class ToolCallFilter implements Processor {
             parts: filteredParts,
           };
 
-          // Filter toolInvocations array if it exists
-          if ('toolInvocations' in message.content && Array.isArray((message.content as any).toolInvocations)) {
-            const filteredToolInvocations = (message.content as any).toolInvocations.filter(
-              (inv: any) => !this.exclude.includes(inv.toolName),
-            );
-            if (filteredToolInvocations.length > 0) {
-              updatedContent.toolInvocations = filteredToolInvocations;
-            }
-            // If no tool invocations remain, don't include the field (already excluded by destructuring)
+          const filteredToolInvocations = this.getToolInvocationsFromParts(filteredParts);
+          if (filteredToolInvocations.length > 0) {
+            updatedContent.toolInvocations = filteredToolInvocations;
           }
 
           // Check if message has no parts and no text content

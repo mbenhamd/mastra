@@ -74,10 +74,11 @@ export const toolCallFilterProvider: ProcessorProvider = {
   },
   configSchema: z.object({
     exclude: z.array(z.string()).optional(),
+    preserveModelOutput: z.boolean().optional(),
   }),
   availablePhases: ['processInput'] as ProcessorPhase[],
   createProcessor(config) {
-    return new ToolCallFilter(config as { exclude?: string[] });
+    return new ToolCallFilter(config as { exclude?: string[]; preserveModelOutput?: boolean });
   },
 };
 
