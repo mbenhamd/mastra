@@ -2055,6 +2055,7 @@ export interface ExecuteProcessorResponse {
   success: boolean;
   phase: string;
   messages?: MastraDBMessage[];
+  modelContextMessages?: MastraDBMessage[];
   messageList?: {
     messages: MastraDBMessage[];
   };
