@@ -362,7 +362,14 @@ export function createMapResultsStep<OUTPUT = undefined>({
             })();
           } else {
             agentSpan?.end();
-            await runOnFinishCallback();
+            try {
+              await runOnFinishCallback();
+            } catch (onFinishError) {
+              capabilities.logger.error('Error in onFinish callback', {
+                error: onFinishError,
+                runId,
+              });
+            }
           }
         },
         onStepFinish: result.onStepFinish,
