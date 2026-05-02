@@ -590,7 +590,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             structuredOutput?: StructuredOutputOptions<OUTPUT>;
             modelContextMessages?: MastraDBMessage[];
             workspace?: Workspace;
-            modelContextMessages?: MastraDBMessage[];
           } = {
             messageId: currentMessageId,
             model,
