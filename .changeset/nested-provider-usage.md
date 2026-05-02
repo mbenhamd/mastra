@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Normalize nested and provider-native token usage shapes into canonical `LanguageModelUsage` before Harness token accounting.
+`@mastra/core` now reports consistent Harness prompt, completion, reasoning, and cache token counts across providers.

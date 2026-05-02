@@ -168,4 +168,16 @@ describe('normalizeLanguageModelUsage', () => {
       raw: undefined,
     });
   });
+
+  it('does not coerce unknown object usage totals to zero', () => {
+    expect(normalizeLanguageModelUsage({})).toEqual({
+      inputTokens: undefined,
+      outputTokens: undefined,
+      totalTokens: undefined,
+      reasoningTokens: undefined,
+      cachedInputTokens: undefined,
+      cacheCreationInputTokens: undefined,
+      raw: undefined,
+    });
+  });
 });

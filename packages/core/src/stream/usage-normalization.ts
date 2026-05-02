@@ -107,13 +107,15 @@ export function normalizeLanguageModelUsage(usage: unknown): LanguageModelUsage 
     ['outputTokens', 'total'],
     ['usageMetadata', 'candidatesTokenCount'],
   ]);
+  const explicitTotalTokens = getFirstUsageNumber(usage, [
+    ['totalTokens'],
+    ['total_tokens'],
+    ['totalTokenCount'],
+    ['usageMetadata', 'totalTokenCount'],
+  ]);
   const totalTokens =
-    getFirstUsageNumber(usage, [
-      ['totalTokens'],
-      ['total_tokens'],
-      ['totalTokenCount'],
-      ['usageMetadata', 'totalTokenCount'],
-    ]) ?? (inputTokens ?? 0) + (outputTokens ?? 0);
+    explicitTotalTokens ??
+    (inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined);
 
   const normalized: LanguageModelUsage = {
     inputTokens,
