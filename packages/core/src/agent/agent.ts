@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { TextPart, UIMessage } from '@internal/ai-sdk-v4';
 import type { ModelMessage } from '@internal/ai-sdk-v5';
+import { TTLCache } from '@isaacs/ttlcache';
 import { wrapSchemaWithNullTransform } from '@mastra/schema-compat';
 import type { StandardSchemaWithJSON } from '@mastra/schema-compat/schema';
 import type { JSONSchema7 } from 'json-schema';
@@ -5311,10 +5312,85 @@ export class Agent<
   }
 
   /**
+   * Tracks in-progress runIds for single-flight: concurrent calls for the same runId
+   * await the same Promise instead of duplicating finish side effects.
+   * @internal
+   */
+  #inProgressRunIds = new Map<string, Promise<void>>();
+
+  /**
+   * Bounded cache for completed runIds. Entries expire after 5 minutes to avoid
+   * unbounded memory growth while still suppressing duplicate finish calls.
+   * @internal
+   */
+  #completedRunIds = new TTLCache<string, boolean>({
+    max: 1000,
+    ttl: 5 * 60 * 1000,
+    updateAgeOnGet: true,
+  });
+
+  async #executeOnFinish({
+    result,
+    readOnlyMemory,
+    thread: threadAfter,
+    threadId,
+    resourceId,
+    memoryConfig,
+    outputText,
+    requestContext,
+    agentSpan,
+    runId,
+    messageList,
+    threadExists,
+    structuredOutput = false,
+    overrideScorers,
+  }: AgentExecuteOnFinishOptions) {
+    if (this.#completedRunIds.has(runId)) {
+      this.logger.debug('Skipping executeOnFinish - already completed for runId', { runId, threadId });
+      return;
+    }
+
+    const existingInProgress = this.#inProgressRunIds.get(runId);
+    if (existingInProgress) {
+      this.logger.debug('Waiting for in-progress executeOnFinish for runId', { runId, threadId });
+      await existingInProgress;
+      return;
+    }
+
+    const executionPromise = this.#executeOnFinishCore({
+      result,
+      readOnlyMemory,
+      thread: threadAfter,
+      threadId,
+      resourceId,
+      memoryConfig,
+      outputText,
+      requestContext,
+      agentSpan,
+      runId,
+      messageList,
+      threadExists,
+      structuredOutput,
+      overrideScorers,
+    })
+      .then(() => {
+        this.#completedRunIds.set(runId, true);
+        this.#inProgressRunIds.delete(runId);
+      })
+      .catch(error => {
+        this.#inProgressRunIds.delete(runId);
+        throw error;
+      });
+
+    this.#inProgressRunIds.set(runId, executionPromise);
+    await executionPromise;
+  }
+
+  /**
    * Handles post-execution tasks including memory persistence and title generation.
    * @internal
    */
-  async #executeOnFinish({
+  async #executeOnFinishCore({
     result,
     readOnlyMemory,
     thread: threadAfter,
@@ -5503,6 +5579,21 @@ export class Agent<
           }
         : {}),
     });
+  }
+
+  /**
+   * @internal Test hook for focused single-flight coverage.
+   */
+  __testHandles(): {
+    executeOnFinish: (options: AgentExecuteOnFinishOptions) => Promise<void>;
+    inProgressRunIds: Map<string, Promise<void>>;
+    completedRunIds: TTLCache<string, boolean>;
+  } {
+    return {
+      executeOnFinish: this.#executeOnFinish.bind(this),
+      inProgressRunIds: this.#inProgressRunIds,
+      completedRunIds: this.#completedRunIds,
+    };
   }
 
   /**
