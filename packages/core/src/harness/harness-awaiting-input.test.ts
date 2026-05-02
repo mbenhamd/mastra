@@ -40,6 +40,72 @@ function createToolCallStream() {
   });
 }
 
+function createAskUserToolCallStream({
+  question = 'Continue?',
+  options,
+  selectionMode,
+}: {
+  question?: string;
+  options?: Array<{ label: string; description?: string }>;
+  selectionMode?: 'single_select' | 'multi_select';
+} = {}) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue({ type: 'stream-start', warnings: [] });
+      controller.enqueue({
+        type: 'response-metadata',
+        id: 'id-ask',
+        modelId: 'mock',
+        timestamp: new Date(0),
+      });
+      controller.enqueue({
+        type: 'tool-call',
+        toolCallId: 'ask-call',
+        toolName: 'ask_user',
+        input: JSON.stringify({
+          question,
+          ...(options ? { options } : {}),
+          ...(selectionMode ? { selectionMode } : {}),
+        }),
+        providerExecuted: false,
+      });
+      controller.enqueue({
+        type: 'finish',
+        finishReason: 'tool-calls',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      });
+      controller.close();
+    },
+  });
+}
+
+function createSubmitPlanToolCallStream({ title = 'Implementation Plan', plan = '# Plan' } = {}) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue({ type: 'stream-start', warnings: [] });
+      controller.enqueue({
+        type: 'response-metadata',
+        id: 'id-plan',
+        modelId: 'mock',
+        timestamp: new Date(0),
+      });
+      controller.enqueue({
+        type: 'tool-call',
+        toolCallId: 'plan-call',
+        toolName: 'submit_plan',
+        input: JSON.stringify({ title, plan }),
+        providerExecuted: false,
+      });
+      controller.enqueue({
+        type: 'finish',
+        finishReason: 'tool-calls',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      });
+      controller.close();
+    },
+  });
+}
+
 function createTextStream() {
   return new ReadableStream({
     start(controller) {
@@ -220,6 +286,146 @@ describe('Harness awaiting input durability', () => {
       resumeData: { confirmed: true },
     });
     expect(repeated.status).toBe('already_resolved');
+  });
+
+  it('discovers a durable ask_user question and resumes it from a fresh harness', async () => {
+    const agent = new Agent({
+      id: 'durable-question-agent',
+      name: 'Durable Question Agent',
+      instructions: 'You ask questions.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: (() => {
+          let callCount = 0;
+          return async () => {
+            callCount++;
+            return { stream: callCount === 1 ? createAskUserToolCallStream() : createTextStream() };
+          };
+        })(),
+      }),
+    });
+
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({
+      agents: { 'durable-question-agent': agent },
+      logger: false,
+      storage,
+    });
+    const registeredAgent = mastra.getAgent('durable-question-agent');
+
+    const firstHarness = new Harness({
+      id: 'durable-question-harness',
+      resourceId: 'question-resource',
+      storage,
+      modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
+      initialState: { yolo: true } as any,
+    });
+    await firstHarness.init();
+    await firstHarness.createThread();
+    await firstHarness.sendMessage({ content: 'Ask before continuing' });
+
+    const [question] = await firstHarness.listAwaitingInputs();
+    expect(question).toMatchObject({
+      kind: 'question',
+      durable: true,
+      runId: expect.any(String),
+      resourceId: 'question-resource',
+      questionId: expect.any(String),
+      question: 'Continue?',
+    });
+
+    const freshHarness = new Harness({
+      id: 'durable-question-harness',
+      resourceId: 'question-resource',
+      storage,
+      modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
+      initialState: { yolo: true } as any,
+    });
+    await freshHarness.init();
+
+    const result = await freshHarness.resumeAwaitingInput({
+      id: question!.id,
+      resumeData: 'Yes, continue',
+    });
+
+    expect(result.status).toBe('resumed');
+
+    const repeated = await freshHarness.resumeAwaitingInput({
+      id: question!.id,
+      resumeData: 'Yes, continue',
+    });
+    expect(repeated.status).toBe('already_resolved');
+  });
+
+  it('discovers a durable submit_plan approval and resumes approved from a fresh harness', async () => {
+    const agent = new Agent({
+      id: 'durable-plan-agent',
+      name: 'Durable Plan Agent',
+      instructions: 'You submit plans.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: (() => {
+          let callCount = 0;
+          return async () => {
+            callCount++;
+            return { stream: callCount === 1 ? createSubmitPlanToolCallStream() : createTextStream() };
+          };
+        })(),
+      }),
+    });
+
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({
+      agents: { 'durable-plan-agent': agent },
+      logger: false,
+      storage,
+    });
+    const registeredAgent = mastra.getAgent('durable-plan-agent');
+
+    const firstHarness = new Harness({
+      id: 'durable-plan-harness',
+      resourceId: 'plan-resource',
+      storage,
+      modes: [
+        { id: 'build', name: 'Build', default: true, agent: registeredAgent },
+        { id: 'plan', name: 'Plan', agent: registeredAgent },
+      ],
+      initialState: { yolo: true } as any,
+    });
+    await firstHarness.init();
+    await firstHarness.switchMode({ modeId: 'plan' });
+    await firstHarness.createThread();
+    await firstHarness.sendMessage({ content: 'Submit the plan' });
+
+    const [plan] = await firstHarness.listAwaitingInputs();
+    expect(plan).toMatchObject({
+      kind: 'plan_approval',
+      durable: true,
+      runId: expect.any(String),
+      modeId: 'plan',
+      resourceId: 'plan-resource',
+      planId: expect.any(String),
+      title: 'Implementation Plan',
+      plan: '# Plan',
+    });
+
+    const freshHarness = new Harness({
+      id: 'durable-plan-harness',
+      resourceId: 'plan-resource',
+      storage,
+      modes: [
+        { id: 'build', name: 'Build', default: true, agent: registeredAgent },
+        { id: 'plan', name: 'Plan', agent: registeredAgent },
+      ],
+      initialState: { yolo: true } as any,
+    });
+    await freshHarness.init();
+
+    const result = await freshHarness.resumeAwaitingInput({
+      id: plan!.id,
+      resumeData: { action: 'approved' },
+    });
+
+    expect(result.status).toBe('resumed');
+    expect(freshHarness.getCurrentModeId()).toBe('build');
   });
 
   it('resumes a durable tool approval by id from storage', async () => {
