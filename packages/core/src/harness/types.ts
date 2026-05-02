@@ -685,6 +685,9 @@ export interface HarnessDisplayState {
     toolCallId: string;
     toolName: string;
     args: unknown;
+    modeId?: string;
+    threadId?: string;
+    resourceId?: string;
   } | null;
 
   // ── Tool suspension ─────────────────────────────────────────────────
@@ -695,6 +698,9 @@ export interface HarnessDisplayState {
     args: unknown;
     suspendPayload: unknown;
     resumeSchema?: string;
+    modeId?: string;
+    threadId?: string;
+    resourceId?: string;
   } | null;
 
   // ── Interactive prompts ──────────────────────────────────────────────
@@ -704,6 +710,9 @@ export interface HarnessDisplayState {
     question: string;
     options?: HarnessQuestionOption[];
     selectionMode?: HarnessQuestionSelectionMode;
+    modeId?: string;
+    threadId?: string;
+    resourceId?: string;
   } | null;
 
   /** A plan awaiting user approval (null when none) */
@@ -711,6 +720,9 @@ export interface HarnessDisplayState {
     planId: string;
     title?: string;
     plan: string;
+    modeId?: string;
+    threadId?: string;
+    resourceId?: string;
   } | null;
 
   // ── Subagent tracking ────────────────────────────────────────────────

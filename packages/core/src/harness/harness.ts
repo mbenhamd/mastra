@@ -2801,20 +2801,23 @@ export class Harness<TState = {}> {
     resourceId = this.resourceId,
     threadId,
   }: HarnessListAwaitingInputsOptions): HarnessAwaitingInput[] {
-    if (resourceId !== this.resourceId) return [];
-    if (threadId && threadId !== this.currentThreadId) return [];
-
     const inputs: HarnessAwaitingInput[] = [];
     const pendingApproval = this.displayState.pendingApproval;
-    if (pendingApproval) {
+    const pendingApprovalResourceId = pendingApproval?.resourceId ?? this.resourceId;
+    const pendingApprovalThreadId = pendingApproval?.threadId ?? this.currentThreadId ?? undefined;
+    if (
+      pendingApproval &&
+      pendingApprovalResourceId === resourceId &&
+      (!threadId || pendingApprovalThreadId === threadId)
+    ) {
       inputs.push({
         id: pendingApproval.toolCallId,
         kind: 'tool_approval',
         durable: false,
         runId: this.currentRunId ?? undefined,
-        modeId: this.currentModeId,
-        threadId: this.currentThreadId ?? undefined,
-        resourceId: this.resourceId,
+        modeId: pendingApproval.modeId ?? this.currentModeId,
+        threadId: pendingApprovalThreadId,
+        resourceId: pendingApprovalResourceId,
         toolCallId: pendingApproval.toolCallId,
         toolName: pendingApproval.toolName,
         args: pendingApproval.args,
@@ -2823,15 +2826,21 @@ export class Harness<TState = {}> {
     }
 
     const pendingSuspension = this.displayState.pendingSuspension;
-    if (pendingSuspension) {
+    const pendingSuspensionResourceId = pendingSuspension?.resourceId ?? this.resourceId;
+    const pendingSuspensionThreadId = pendingSuspension?.threadId ?? this.currentThreadId ?? undefined;
+    if (
+      pendingSuspension &&
+      pendingSuspensionResourceId === resourceId &&
+      (!threadId || pendingSuspensionThreadId === threadId)
+    ) {
       inputs.push({
         id: pendingSuspension.toolCallId,
         kind: 'tool_suspension',
         durable: false,
         runId: this.pendingSuspensionRunId ?? this.currentRunId ?? undefined,
-        modeId: this.currentModeId,
-        threadId: this.currentThreadId ?? undefined,
-        resourceId: this.resourceId,
+        modeId: pendingSuspension.modeId ?? this.currentModeId,
+        threadId: pendingSuspensionThreadId,
+        resourceId: pendingSuspensionResourceId,
         toolCallId: pendingSuspension.toolCallId,
         toolName: pendingSuspension.toolName,
         args: pendingSuspension.args,
@@ -2842,14 +2851,20 @@ export class Harness<TState = {}> {
     }
 
     const pendingQuestion = this.displayState.pendingQuestion;
-    if (pendingQuestion) {
+    const pendingQuestionResourceId = pendingQuestion?.resourceId ?? this.resourceId;
+    const pendingQuestionThreadId = pendingQuestion?.threadId ?? this.currentThreadId ?? undefined;
+    if (
+      pendingQuestion &&
+      pendingQuestionResourceId === resourceId &&
+      (!threadId || pendingQuestionThreadId === threadId)
+    ) {
       inputs.push({
         id: pendingQuestion.questionId,
         kind: 'question',
         durable: false,
-        modeId: this.currentModeId,
-        threadId: this.currentThreadId ?? undefined,
-        resourceId: this.resourceId,
+        modeId: pendingQuestion.modeId ?? this.currentModeId,
+        threadId: pendingQuestionThreadId,
+        resourceId: pendingQuestionResourceId,
         questionId: pendingQuestion.questionId,
         question: pendingQuestion.question,
         options: pendingQuestion.options,
@@ -2858,14 +2873,20 @@ export class Harness<TState = {}> {
     }
 
     const pendingPlanApproval = this.displayState.pendingPlanApproval;
-    if (pendingPlanApproval) {
+    const pendingPlanApprovalResourceId = pendingPlanApproval?.resourceId ?? this.resourceId;
+    const pendingPlanApprovalThreadId = pendingPlanApproval?.threadId ?? this.currentThreadId ?? undefined;
+    if (
+      pendingPlanApproval &&
+      pendingPlanApprovalResourceId === resourceId &&
+      (!threadId || pendingPlanApprovalThreadId === threadId)
+    ) {
       inputs.push({
         id: pendingPlanApproval.planId,
         kind: 'plan_approval',
         durable: false,
-        modeId: this.currentModeId,
-        threadId: this.currentThreadId ?? undefined,
-        resourceId: this.resourceId,
+        modeId: pendingPlanApproval.modeId ?? this.currentModeId,
+        threadId: pendingPlanApprovalThreadId,
+        resourceId: pendingPlanApprovalResourceId,
         planId: pendingPlanApproval.planId,
         title: pendingPlanApproval.title,
         plan: pendingPlanApproval.plan,
@@ -3481,6 +3502,9 @@ export class Harness<TState = {}> {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           args: event.args,
+          modeId: this.currentModeId,
+          threadId: this.currentThreadId ?? undefined,
+          resourceId: this.resourceId,
         };
         break;
 
@@ -3491,6 +3515,9 @@ export class Harness<TState = {}> {
           args: event.args,
           suspendPayload: event.suspendPayload,
           resumeSchema: event.resumeSchema,
+          modeId: this.currentModeId,
+          threadId: this.currentThreadId ?? undefined,
+          resourceId: this.resourceId,
         };
         break;
 
@@ -3501,6 +3528,9 @@ export class Harness<TState = {}> {
           question: event.question,
           options: event.options,
           selectionMode: event.selectionMode,
+          modeId: this.currentModeId,
+          threadId: this.currentThreadId ?? undefined,
+          resourceId: this.resourceId,
         };
         break;
 
@@ -3509,6 +3539,9 @@ export class Harness<TState = {}> {
           planId: event.planId,
           title: event.title,
           plan: event.plan,
+          modeId: this.currentModeId,
+          threadId: this.currentThreadId ?? undefined,
+          resourceId: this.resourceId,
         };
         break;
 

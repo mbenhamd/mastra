@@ -491,4 +491,31 @@ describe('Harness awaiting input durability', () => {
     const result = await harness.resumeAwaitingInput({ id: 'q-1', resumeData: 'Yes' });
     expect(result.status).toBe('live_session_only');
   });
+
+  it('keeps live awaiting inputs scoped to the resource where they were created', async () => {
+    const agent = new Agent({
+      id: 'live-scope-agent',
+      name: 'Live Scope Agent',
+      instructions: 'You ask questions.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: async () => ({ stream: createTextStream() }),
+      }),
+    });
+
+    const harness = new Harness({
+      id: 'live-scope-harness',
+      resourceId: 'resource-1',
+      modes: [{ id: 'default', name: 'Default', default: true, agent }],
+    });
+
+    (harness as any).emit({
+      type: 'ask_question',
+      questionId: 'q-1',
+      question: 'Continue?',
+    });
+    harness.setResourceId({ resourceId: 'resource-2' });
+
+    await expect(harness.listAwaitingInputs()).resolves.toEqual([]);
+    await expect(harness.getAwaitingInput({ id: 'q-1' })).resolves.toBeNull();
+  });
 });
