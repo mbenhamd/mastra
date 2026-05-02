@@ -5329,6 +5329,30 @@ export class Agent<
     updateAgeOnGet: true,
   });
 
+  /**
+   * Tracks response messages already appended during finish processing. This
+   * prevents a retry after a partial finish failure from mutating the shared
+   * MessageList twice.
+   * @internal
+   */
+  #finishResponseAddedRunIds = new TTLCache<string, boolean>({
+    max: 1000,
+    ttl: 5 * 60 * 1000,
+    updateAgeOnGet: true,
+  });
+
+  /**
+   * Tracks title generation already scheduled during finish processing. Title
+   * generation is intentionally fire-and-forget, so retries must not schedule it
+   * again for the same run.
+   * @internal
+   */
+  #titleGenerationScheduledRunIds = new TTLCache<string, boolean>({
+    max: 1000,
+    ttl: 5 * 60 * 1000,
+    updateAgeOnGet: true,
+  });
+
   async #executeOnFinish({
     result,
     readOnlyMemory,
@@ -5462,8 +5486,22 @@ export class Agent<
       ];
     }
 
-    if (responseMessages?.length) {
-      messageList.add(responseMessages, 'response');
+    if (responseMessages?.length && !this.#finishResponseAddedRunIds.has(runId)) {
+      const existingMessageIds = new Set(
+        messageList.get.all
+          .db()
+          .map(message => message.id)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0),
+      );
+      const newResponseMessages = responseMessages.filter(message => {
+        const id = (message as { id?: unknown }).id;
+        return !(typeof id === 'string' && existingMessageIds.has(id));
+      });
+
+      if (newResponseMessages.length > 0) {
+        messageList.add(newResponseMessages, 'response');
+      }
+      this.#finishResponseAddedRunIds.set(runId, true);
     }
 
     if (memory && resourceId && thread && !readOnlyMemory) {
@@ -5503,10 +5541,16 @@ export class Agent<
         const messages = messageList.get.all.core();
         const requiredMessages = minMessages ?? 1;
 
-        if (shouldGenerate && !thread.title && messages.length >= requiredMessages) {
+        if (
+          shouldGenerate &&
+          !thread.title &&
+          messages.length >= requiredMessages &&
+          !this.#titleGenerationScheduledRunIds.has(runId)
+        ) {
           const userMessage = this.getMostRecentUserMessage(uiMessages);
 
           if (userMessage) {
+            this.#titleGenerationScheduledRunIds.set(runId, true);
             void this.genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions).then(
               async title => {
                 if (title) {

@@ -289,10 +289,15 @@ export function createMapResultsStep<OUTPUT = undefined>({
             });
 
           if (!aborted) {
-            const outputText = messageList.get.all
-              .core()
-              .map(m => m.content)
-              .join('\n');
+            const outputText =
+              typeof payload.text === 'string' && payload.text.length > 0
+                ? payload.text
+                : payload.object !== undefined
+                  ? (JSON.stringify(payload.object) ?? String(payload.object))
+                  : messageList.get.all
+                      .core()
+                      .map(m => m.content)
+                      .join('\n');
 
             const executeFinish = () =>
               capabilities.executeOnFinish({
@@ -343,17 +348,16 @@ export function createMapResultsStep<OUTPUT = undefined>({
                         );
 
                   agentSpan?.error({ error: spanError, endSpan: true });
-                  return;
                 }
-              }
-
-              try {
-                await runOnFinishCallback();
-              } catch (onFinishError) {
-                capabilities.logger.error('Error in onFinish callback', {
-                  error: onFinishError,
-                  runId,
-                });
+              } finally {
+                try {
+                  await runOnFinishCallback();
+                } catch (onFinishError) {
+                  capabilities.logger.error('Error in onFinish callback', {
+                    error: onFinishError,
+                    runId,
+                  });
+                }
               }
             })();
           } else {

@@ -153,6 +153,32 @@ describe('Agent#executeOnFinish single-flight', () => {
     expect(handles.completedRunIds.has(runId)).toBe(true);
   });
 
+  it('does not append duplicate response messages when retrying after a partial finish failure', async () => {
+    const runId = 'run-4b-retry-after-partial-failure';
+    const agentSpan = createAgentSpan();
+    const options = createMinimalOptions(runId, agentSpan);
+    options.result.response.dbMessages = [
+      {
+        id: 'assistant-response-1',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+    ] as any;
+    agentSpan.end.mockImplementationOnce(() => {
+      throw new Error('span export failed after message append');
+    });
+
+    await expect(handles.executeOnFinish(options)).rejects.toThrow('span export failed after message append');
+    expect(handles.completedRunIds.has(runId)).toBe(false);
+    expect(options.messageList.get.all.db().filter(message => message.id === 'assistant-response-1')).toHaveLength(1);
+
+    await expect(handles.executeOnFinish(options)).resolves.toBeUndefined();
+
+    expect(options.messageList.get.all.db().filter(message => message.id === 'assistant-response-1')).toHaveLength(1);
+    expect(agentSpan.end).toHaveBeenCalledTimes(2);
+    expect(handles.completedRunIds.has(runId)).toBe(true);
+  });
+
   it('tracks different runIds independently', async () => {
     const runIdA = 'run-5a-independent';
     const runIdB = 'run-5b-independent';
