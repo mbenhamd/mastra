@@ -35,6 +35,16 @@
         "default": "./dist/harness.cjs"
       }
     },
+    "./transport": {
+      "import": {
+        "types": "./dist/transport.d.ts",
+        "default": "./dist/transport.js"
+      },
+      "require": {
+        "types": "./dist/transport.d.ts",
+        "default": "./dist/transport.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "files": [

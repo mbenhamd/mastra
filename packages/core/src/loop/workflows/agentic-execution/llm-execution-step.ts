@@ -908,6 +908,29 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               tools: currentStep.tools,
             });
             for (const msg of builtMessages) {
+              if (options?.abortSignal?.aborted && msg.content && typeof msg.content === 'object') {
+                const existingMastraMetadata =
+                  typeof msg.content.metadata?.mastra === 'object' && msg.content.metadata.mastra !== null
+                    ? msg.content.metadata.mastra
+                    : {};
+                const existingStatus = (existingMastraMetadata as { responseStatus?: unknown }).responseStatus;
+                if (existingStatus === 'finished' || existingStatus === 'completed') {
+                  messageList.add(msg, 'response');
+                  continue;
+                }
+
+                msg.content = {
+                  ...msg.content,
+                  metadata: {
+                    ...msg.content.metadata,
+                    mastra: {
+                      ...existingMastraMetadata,
+                      responseStatus: 'aborted',
+                      runId,
+                    },
+                  },
+                };
+              }
               messageList.add(msg, 'response');
             }
 
