@@ -690,4 +690,48 @@ describe('Harness awaiting input durability', () => {
     expect(approve1!).toBeLessThan(wait2!);
     expect(wait2!).toBeLessThan(approve2!);
   });
+
+  it('replays all deferred auto-approved tool approvals sequentially', async () => {
+    const agent = new Agent({
+      id: 'deferred-auto-approval-queue-agent',
+      name: 'Deferred Auto Approval Queue Agent',
+      instructions: 'You write files.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: async () => ({ stream: createTextStream() }),
+      }),
+    });
+    const harness = new Harness({
+      id: 'deferred-auto-approval-queue-harness',
+      initialState: { yolo: true } as any,
+      deferredAutoApproval: true,
+      modes: [{ id: 'default', name: 'Default', default: true, agent }],
+    });
+    const approvedMessage = {
+      id: 'deferred-approved-message',
+      role: 'assistant' as const,
+      content: [{ type: 'text' as const, text: 'Approved after drain.' }],
+      createdAt: new Date(),
+    };
+    const handleToolApprove = vi.fn(async () => ({ message: approvedMessage }));
+    const waitForAwaitingInputReady = vi.spyOn(harness, 'waitForAwaitingInputReady').mockResolvedValue(null);
+    (harness as any).handleToolApprove = handleToolApprove;
+
+    await expect(
+      (harness as any).processStream(
+        { fullStream: createApprovalFullStream({ toolCallIds: ['approval-call-1', 'approval-call-2'] }) },
+        new RequestContext(),
+      ),
+    ).resolves.toMatchObject({ message: approvedMessage });
+
+    expect(waitForAwaitingInputReady).toHaveBeenNthCalledWith(1, { id: 'approval-call-1' });
+    expect(waitForAwaitingInputReady).toHaveBeenNthCalledWith(2, { id: 'approval-call-2' });
+    expect(handleToolApprove).toHaveBeenNthCalledWith(1, {
+      toolCallId: 'approval-call-1',
+      requestContext: expect.any(RequestContext),
+    });
+    expect(handleToolApprove).toHaveBeenNthCalledWith(2, {
+      toolCallId: 'approval-call-2',
+      requestContext: expect.any(RequestContext),
+    });
+  });
 });

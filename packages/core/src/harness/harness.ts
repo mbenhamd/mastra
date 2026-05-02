@@ -2411,22 +2411,25 @@ export class Harness<TState = {}> {
 
     this.emit({ type: 'message_end', message: currentMessage });
 
-    const deferredAutoApproval = deferredAutoApprovals[0];
-    if (deferredAutoApproval) {
+    let deferredResult: { message: HarnessMessage; suspended?: boolean } | undefined;
+    for (const deferredAutoApproval of deferredAutoApprovals) {
       await this.waitForAwaitingInputReady({ id: deferredAutoApproval.toolCallId });
 
       if (deferredAutoApproval.decision === 'approve') {
-        return await this.handleToolApprove({
+        deferredResult = await this.handleToolApprove({
           toolCallId: deferredAutoApproval.toolCallId,
           requestContext: deferredAutoApproval.requestContext,
         });
+        continue;
       }
 
-      return await this.handleToolDecline({
+      deferredResult = await this.handleToolDecline({
         toolCallId: deferredAutoApproval.toolCallId,
         requestContext: deferredAutoApproval.requestContext,
       });
     }
+
+    if (deferredResult) return deferredResult;
 
     return { message: currentMessage, suspended: isSuspended || undefined };
   }
