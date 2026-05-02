@@ -127,7 +127,10 @@ export const askUserTool = createTool({
         };
       }
 
-      if (!harnessCtx?.emitEvent || !harnessCtx?.registerQuestion) {
+      const suspend = readToolSuspend(toolContext);
+      const canSuspendDurably = Boolean(harnessCtx?.durableAwaitingInputs && harnessCtx?.emitEvent && suspend);
+
+      if (!harnessCtx?.emitEvent || (!harnessCtx?.registerQuestion && !canSuspendDurably)) {
         return {
           content: `[Question for user]: ${question}${
             options?.length ? '\nOptions: ' + options.map(o => o.label).join(', ') : ''
@@ -138,7 +141,6 @@ export const askUserTool = createTool({
 
       const questionId = `q_${++questionCounter}_${Date.now()}`;
 
-      const suspend = readToolSuspend(toolContext);
       if (harnessCtx.durableAwaitingInputs && suspend) {
         harnessCtx.emitEvent!({
           type: 'ask_question',
@@ -238,7 +240,10 @@ export const submitPlanTool = createTool({
         };
       }
 
-      if (!harnessCtx?.emitEvent || !harnessCtx?.registerPlanApproval) {
+      const suspend = readToolSuspend(toolContext);
+      const canSuspendDurably = Boolean(harnessCtx?.durableAwaitingInputs && harnessCtx?.emitEvent && suspend);
+
+      if (!harnessCtx?.emitEvent || (!harnessCtx?.registerPlanApproval && !canSuspendDurably)) {
         return {
           content: `[Plan submitted for review]\n\nTitle: ${title || 'Implementation Plan'}\n\n${plan}`,
           isError: false,
@@ -247,7 +252,6 @@ export const submitPlanTool = createTool({
 
       const planId = `plan_${++planCounter}_${Date.now()}`;
 
-      const suspend = readToolSuspend(toolContext);
       if (harnessCtx.durableAwaitingInputs && suspend) {
         harnessCtx.emitEvent!({
           type: 'plan_approval_required',

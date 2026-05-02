@@ -2,4 +2,9 @@
 '@mastra/core': patch
 ---
 
-Allow Harness `ask_user` questions and `submit_plan` approvals to be discovered and resumed through durable awaiting-input APIs.
+Harness now lets developers discover and resume durable `ask_user` questions and `submit_plan` approvals with `listAwaitingInputs()` and `resumeAwaitingInput()`.
+
+```ts
+const [input] = await harness.listAwaitingInputs();
+await harness.resumeAwaitingInput({ id: input.id, resumeData: 'Yes, continue' });
+```
