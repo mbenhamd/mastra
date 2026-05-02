@@ -1874,6 +1874,11 @@ export class Harness<TState = {}> {
     if (response.traceId) {
       this.currentTraceId = response.traceId;
     }
+    const deferredAutoApprovals: Array<{
+      decision: 'approve' | 'decline';
+      toolCallId: string;
+      requestContext: RequestContext;
+    }> = [];
     let currentMessage: HarnessMessage = {
       id: this.generateId(),
       role: 'assistant',
@@ -2033,12 +2038,24 @@ export class Harness<TState = {}> {
           const policy = this.resolveToolApproval(toolName);
 
           if (policy === 'allow') {
+            if (this.config.deferredAutoApproval) {
+              deferredAutoApprovals.push({ decision: 'approve', toolCallId, requestContext });
+              isSuspended = true;
+              break;
+            }
+
             const result = await this.handleToolApprove({ toolCallId, requestContext });
             currentMessage = result.message;
             return result;
           }
 
           if (policy === 'deny') {
+            if (this.config.deferredAutoApproval) {
+              deferredAutoApprovals.push({ decision: 'decline', toolCallId, requestContext });
+              isSuspended = true;
+              break;
+            }
+
             const result = await this.handleToolDecline({ toolCallId, requestContext });
             currentMessage = result.message;
             return result;
@@ -2393,6 +2410,24 @@ export class Harness<TState = {}> {
     }
 
     this.emit({ type: 'message_end', message: currentMessage });
+
+    const deferredAutoApproval = deferredAutoApprovals[0];
+    if (deferredAutoApproval) {
+      await this.waitForAwaitingInputReady({ id: deferredAutoApproval.toolCallId });
+
+      if (deferredAutoApproval.decision === 'approve') {
+        return await this.handleToolApprove({
+          toolCallId: deferredAutoApproval.toolCallId,
+          requestContext: deferredAutoApproval.requestContext,
+        });
+      }
+
+      return await this.handleToolDecline({
+        toolCallId: deferredAutoApproval.toolCallId,
+        requestContext: deferredAutoApproval.requestContext,
+      });
+    }
+
     return { message: currentMessage, suspended: isSuspended || undefined };
   }
 
