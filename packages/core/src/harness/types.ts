@@ -589,6 +589,9 @@ export type HarnessAwaitingInput =
       id: string;
       kind: 'question';
       durable: false;
+      modeId?: string;
+      threadId?: string;
+      resourceId?: string;
       questionId: string;
       question: string;
       options?: HarnessQuestionOption[];
@@ -598,6 +601,9 @@ export type HarnessAwaitingInput =
       id: string;
       kind: 'plan_approval';
       durable: false;
+      modeId?: string;
+      threadId?: string;
+      resourceId?: string;
       planId: string;
       title?: string;
       plan: string;
@@ -611,6 +617,11 @@ export interface HarnessWaitForAwaitingInputReadyOptions {
 
 export interface HarnessGetAwaitingInputOptions {
   id: string;
+}
+
+export interface HarnessListAwaitingInputsOptions {
+  resourceId?: string;
+  threadId?: string;
 }
 
 export interface HarnessResumeAwaitingInputOptions {

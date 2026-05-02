@@ -8,13 +8,12 @@ import type { TracingContext, TracingOptions } from '../observability';
 import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { StandardSchemaWithJSON } from '../schema';
-import type { WorkflowRun } from '../storage/types';
-import type { WorkflowRunState } from '../workflows';
 import type { MemoryStorage } from '../storage/domains/memory/base';
-import type { ObservationalMemoryRecord } from '../storage/types';
+import type { ObservationalMemoryRecord, WorkflowRun } from '../storage/types';
 import { getProjectedToolPayload, hasProjectedToolPayload } from '../tools/payload-projection';
 import type { ToolPayloadProjectionPhase } from '../tools/types';
 import { safeStringify } from '../utils';
+import type { WorkflowRunState } from '../workflows';
 import { Workspace } from '../workspace/workspace';
 import type { WorkspaceConfig } from '../workspace/workspace';
 
@@ -37,6 +36,7 @@ import type {
   HarnessEvent,
   HarnessEventListener,
   HarnessGetAwaitingInputOptions,
+  HarnessListAwaitingInputsOptions,
   HarnessMessage,
   HarnessMessageContent,
   HarnessMode,
@@ -2509,6 +2509,30 @@ export class Harness<TState = {}> {
   }
 
   /**
+   * Return pending awaiting inputs visible to this Harness resource.
+   * Durable tool approvals and suspensions are read from workflow storage when available.
+   */
+  async listAwaitingInputs({ resourceId = this.resourceId, threadId }: HarnessListAwaitingInputsOptions = {}): Promise<
+    HarnessAwaitingInput[]
+  > {
+    if (resourceId !== this.resourceId) return [];
+
+    const inputs = new Map<string, HarnessAwaitingInput>();
+    const durableInputs = await this.listDurableAwaitingInputs({ resourceId, threadId });
+    for (const input of durableInputs) {
+      inputs.set(input.id, input);
+    }
+
+    for (const input of this.listLiveAwaitingInputs({ resourceId, threadId })) {
+      if (!inputs.has(input.id)) {
+        inputs.set(input.id, input);
+      }
+    }
+
+    return Array.from(inputs.values());
+  }
+
+  /**
    * Resume a pending awaiting-input id.
    * Durable tool approval and suspension states can be resumed from a fresh Harness instance.
    */
@@ -2770,10 +2794,21 @@ export class Harness<TState = {}> {
   }
 
   private getLiveAwaitingInput(id: string): HarnessAwaitingInput | null {
+    return this.listLiveAwaitingInputs({}).find(input => input.id === id) ?? null;
+  }
+
+  private listLiveAwaitingInputs({
+    resourceId = this.resourceId,
+    threadId,
+  }: HarnessListAwaitingInputsOptions): HarnessAwaitingInput[] {
+    if (resourceId !== this.resourceId) return [];
+    if (threadId && threadId !== this.currentThreadId) return [];
+
+    const inputs: HarnessAwaitingInput[] = [];
     const pendingApproval = this.displayState.pendingApproval;
-    if (pendingApproval?.toolCallId === id) {
-      return {
-        id,
+    if (pendingApproval) {
+      inputs.push({
+        id: pendingApproval.toolCallId,
         kind: 'tool_approval',
         durable: false,
         runId: this.currentRunId ?? undefined,
@@ -2784,13 +2819,13 @@ export class Harness<TState = {}> {
         toolName: pendingApproval.toolName,
         args: pendingApproval.args,
         requireToolApproval: (this.state as Record<string, unknown>).yolo !== true,
-      };
+      });
     }
 
     const pendingSuspension = this.displayState.pendingSuspension;
-    if (pendingSuspension?.toolCallId === id) {
-      return {
-        id,
+    if (pendingSuspension) {
+      inputs.push({
+        id: pendingSuspension.toolCallId,
         kind: 'tool_suspension',
         durable: false,
         runId: this.pendingSuspensionRunId ?? this.currentRunId ?? undefined,
@@ -2803,35 +2838,41 @@ export class Harness<TState = {}> {
         suspendPayload: pendingSuspension.suspendPayload,
         resumeSchema: pendingSuspension.resumeSchema,
         requireToolApproval: (this.state as Record<string, unknown>).yolo !== true,
-      };
+      });
     }
 
     const pendingQuestion = this.displayState.pendingQuestion;
-    if (pendingQuestion?.questionId === id) {
-      return {
-        id,
+    if (pendingQuestion) {
+      inputs.push({
+        id: pendingQuestion.questionId,
         kind: 'question',
         durable: false,
+        modeId: this.currentModeId,
+        threadId: this.currentThreadId ?? undefined,
+        resourceId: this.resourceId,
         questionId: pendingQuestion.questionId,
         question: pendingQuestion.question,
         options: pendingQuestion.options,
         selectionMode: pendingQuestion.selectionMode,
-      };
+      });
     }
 
     const pendingPlanApproval = this.displayState.pendingPlanApproval;
-    if (pendingPlanApproval?.planId === id) {
-      return {
-        id,
+    if (pendingPlanApproval) {
+      inputs.push({
+        id: pendingPlanApproval.planId,
         kind: 'plan_approval',
         durable: false,
+        modeId: this.currentModeId,
+        threadId: this.currentThreadId ?? undefined,
+        resourceId: this.resourceId,
         planId: pendingPlanApproval.planId,
         title: pendingPlanApproval.title,
         plan: pendingPlanApproval.plan,
-      };
+      });
     }
 
-    return null;
+    return inputs;
   }
 
   private async getDurableAwaitingInput(id: string): Promise<HarnessAwaitingInput | null> {
@@ -2845,6 +2886,51 @@ export class Harness<TState = {}> {
     });
 
     return run ? this.getAwaitingInputFromWorkflowRun({ id, run }) : null;
+  }
+
+  private async listDurableAwaitingInputs({
+    resourceId = this.resourceId,
+    threadId,
+  }: HarnessListAwaitingInputsOptions): Promise<HarnessAwaitingInput[]> {
+    if (resourceId !== this.resourceId) return [];
+
+    const workflowsStore = await this.config.storage?.getStore('workflows');
+    if (!workflowsStore) return [];
+
+    const listRuns = async (status: 'suspended' | 'waiting') =>
+      await workflowsStore.listWorkflowRuns({
+        workflowName: HARNESS_AGENTIC_LOOP_WORKFLOW_NAME,
+        resourceId,
+        status,
+        perPage: false,
+      });
+
+    const [suspended, waiting] = await Promise.all([listRuns('suspended'), listRuns('waiting')]);
+    const runs = [...suspended.runs, ...waiting.runs].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+    const inputs = new Map<string, HarnessAwaitingInput>();
+
+    for (const run of runs) {
+      const resumeLabels = this.getResumeLabelsFromWorkflowRun(run);
+      for (const id of Object.keys(resumeLabels)) {
+        if (inputs.has(id)) continue;
+
+        const input = this.getAwaitingInputFromWorkflowRun({ id, run });
+        if (input && (!threadId || input.threadId === threadId)) {
+          inputs.set(input.id, input);
+        }
+      }
+    }
+
+    return Array.from(inputs.values());
+  }
+
+  private getResumeLabelsFromWorkflowRun(run: WorkflowRun): WorkflowRunState['resumeLabels'] {
+    try {
+      const snapshot = typeof run.snapshot === 'string' ? (JSON.parse(run.snapshot) as WorkflowRunState) : run.snapshot;
+      return snapshot.resumeLabels ?? {};
+    } catch {
+      return {};
+    }
   }
 
   private async activateResumeThread(threadId: string): Promise<void> {
