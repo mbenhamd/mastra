@@ -35,6 +35,7 @@ import type {
   ProcessInputStepResult,
   Processor,
   ProcessorMessageResult,
+  ProcessorResultCallback,
   ProcessorStreamWriter,
   ProcessorWorkflow,
   RunProcessInputStepArgs,
@@ -145,6 +146,18 @@ export class ProcessorState<OUTPUT = undefined> {
  * Union type for processor or workflow that can be used as a processor
  */
 type ProcessorOrWorkflow = Processor | ProcessorWorkflow;
+
+type ProcessorWorkflowStepSnapshot = {
+  processorId: string;
+  processorName?: string;
+  processorIndex: number;
+  processorExecutor: 'workflow';
+  processorWorkflowId: string;
+  processorStepId: string;
+  processorStepIndex: number;
+  processorStepStatus: string;
+  output: ProcessorStepOutput;
+};
 
 function areProcessorMessageArraysEqual(before: unknown[] | undefined, after: unknown[] | undefined): boolean {
   if (before === after) {
@@ -260,6 +273,99 @@ function hasRegularMessageListMutations(mutations: ReturnType<MessageList['stopR
   return mutations.some(mutation => mutation.type !== 'addSystem');
 }
 
+function isProcessorStepOutput(output: unknown): output is ProcessorStepOutput {
+  return (
+    output !== null &&
+    typeof output === 'object' &&
+    'phase' in output &&
+    ('messageList' in output ||
+      'messages' in output ||
+      'part' in output ||
+      'modelContextMessages' in output ||
+      'tools' in output ||
+      'toolChoice' in output ||
+      'activeTools' in output ||
+      'structuredOutput' in output)
+  );
+}
+
+function processorIdFromWorkflowStepId(stepId: string, workflowId: string): string {
+  const processorSegment = stepId
+    .split('.')
+    .reverse()
+    .find(segment => segment.startsWith('processor:'));
+
+  return processorSegment?.slice('processor:'.length) || stepId || workflowId;
+}
+
+function stringArraysEqual(before: unknown, after: unknown): boolean {
+  if (before === after) {
+    return true;
+  }
+
+  if (!Array.isArray(before) || !Array.isArray(after)) {
+    return before === after;
+  }
+
+  return before.length === after.length && before.every((value, index) => value === after[index]);
+}
+
+function stableStringify(value: unknown, seen = new WeakSet<object>()): string {
+  if (!value || typeof value !== 'object') {
+    return JSON.stringify(value) ?? String(value);
+  }
+
+  if (seen.has(value)) {
+    return '"[Circular]"';
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify(item, seen)).join(',')}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${stableStringify(record[key], seen)}`)
+    .join(',')}}`;
+}
+
+function valuesEqual(before: unknown, after: unknown): boolean {
+  return before === after || stableStringify(before) === stableStringify(after);
+}
+
+function processorStepOutputChanged(before: ProcessorStepOutput, after: ProcessorStepOutput): boolean {
+  const beforeRecord = before as Record<string, unknown>;
+  const afterRecord = after as Record<string, unknown>;
+
+  return (
+    !areProcessorMessageArraysEqual(
+      Array.isArray(beforeRecord.messageList) ? beforeRecord.messageList : undefined,
+      Array.isArray(afterRecord.messageList) ? afterRecord.messageList : undefined,
+    ) ||
+    (!Array.isArray(beforeRecord.messageList) &&
+      !Array.isArray(afterRecord.messageList) &&
+      beforeRecord.messageList !== afterRecord.messageList) ||
+    !areProcessorMessageArraysEqual(
+      beforeRecord.messages as unknown[] | undefined,
+      afterRecord.messages as unknown[] | undefined,
+    ) ||
+    !areProcessorMessageArraysEqual(
+      beforeRecord.systemMessages as unknown[] | undefined,
+      afterRecord.systemMessages as unknown[] | undefined,
+    ) ||
+    !valuesEqual(beforeRecord.tools, afterRecord.tools) ||
+    !valuesEqual(beforeRecord.toolChoice, afterRecord.toolChoice) ||
+    !stringArraysEqual(beforeRecord.activeTools, afterRecord.activeTools) ||
+    !valuesEqual(beforeRecord.structuredOutput, afterRecord.structuredOutput) ||
+    !areProcessorMessageArraysEqual(
+      beforeRecord.modelContextMessages as unknown[] | undefined,
+      afterRecord.modelContextMessages as unknown[] | undefined,
+    )
+  );
+}
+
 export class ProcessorRunner {
   public readonly inputProcessors: ProcessorOrWorkflow[];
   public readonly outputProcessors: ProcessorOrWorkflow[];
@@ -321,29 +427,97 @@ export class ProcessorRunner {
     requestContext?: RequestContext,
     writer?: ProcessorStreamWriter,
     abortSignal?: AbortSignal,
+    onWorkflowProcessorResult?: (snapshot: ProcessorWorkflowStepSnapshot) => void,
+    workflowProcessorIndex: number = 0,
   ): Promise<ProcessorStepOutput> {
     // Create a run and start the workflow
     const run = await workflow.createRun();
-    const result = await run.start({
-      // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
-      // but not part of the official ProcessorStepOutput schema
-      inputData: {
-        ...input,
-        // Pass the processorStates map so workflow processor steps can access their state
-        processorStates: this.processorStates,
-        // Pass abortSignal so processors can cancel in-flight work
-        abortSignal,
-      } as ProcessorStepOutput,
-      ...observabilityContext,
-      requestContext,
-      outputWriter: writer ? chunk => writer.custom(chunk) : undefined,
-    });
+    const workflowStepSnapshots: ProcessorWorkflowStepSnapshot[] = [];
+    let lastWorkflowStepOutput = input;
+    const unwatch =
+      typeof run.watch === 'function'
+        ? run.watch(event => {
+            if (event.type !== 'workflow-step-result') {
+              return;
+            }
+
+            const payload = event.payload as
+              | { id?: unknown; status?: unknown; output?: unknown; metadata?: { processorIndex?: unknown } }
+              | undefined;
+            const stepId = typeof payload?.id === 'string' ? payload.id : undefined;
+            if (!stepId || !isProcessorStepOutput(payload?.output)) {
+              return;
+            }
+
+            if (!processorStepOutputChanged(lastWorkflowStepOutput, payload.output)) {
+              lastWorkflowStepOutput = payload.output;
+              return;
+            }
+
+            const processorId = processorIdFromWorkflowStepId(stepId, workflow.id);
+            workflowStepSnapshots.push({
+              processorId,
+              processorName: processorId,
+              processorIndex:
+                typeof payload?.metadata?.processorIndex === 'number'
+                  ? payload.metadata.processorIndex
+                  : workflowProcessorIndex,
+              processorExecutor: 'workflow',
+              processorWorkflowId: workflow.id,
+              processorStepId: stepId,
+              processorStepIndex: workflowStepSnapshots.length,
+              processorStepStatus: typeof payload.status === 'string' ? payload.status : 'unknown',
+              output: payload.output,
+            });
+            lastWorkflowStepOutput = payload.output;
+          })
+        : () => {};
+
+    let result;
+    try {
+      result = await run.start({
+        // Cast to allow processorStates/abortSignal - passed through to workflow processor steps
+        // but not part of the official ProcessorStepOutput schema
+        inputData: {
+          ...input,
+          // Pass the processorStates map so workflow processor steps can access their state
+          processorStates: this.processorStates,
+          // Pass abortSignal so processors can cancel in-flight work
+          abortSignal,
+        } as ProcessorStepOutput,
+        ...observabilityContext,
+        requestContext,
+        outputWriter: writer ? chunk => writer.custom(chunk) : undefined,
+      });
+    } finally {
+      unwatch();
+    }
+
+    for (const snapshot of workflowStepSnapshots) {
+      onWorkflowProcessorResult?.(snapshot);
+    }
 
     // Check for tripwire status - this means a processor in the workflow called abort()
     if (result.status === 'tripwire') {
       const tripwireData = (
         result as { tripwire?: { reason?: string; retry?: boolean; metadata?: unknown; processorId?: string } }
       ).tripwire;
+      if (
+        tripwireData?.processorId &&
+        !workflowStepSnapshots.some(snapshot => snapshot.processorId === tripwireData.processorId)
+      ) {
+        onWorkflowProcessorResult?.({
+          processorId: tripwireData.processorId,
+          processorName: tripwireData.processorId,
+          processorIndex: workflowProcessorIndex,
+          processorExecutor: 'workflow',
+          processorWorkflowId: workflow.id,
+          processorStepId: `processor:${tripwireData.processorId}`,
+          processorStepIndex: workflowStepSnapshots.length,
+          processorStepStatus: 'tripwire',
+          output: input,
+        });
+      }
       // Re-throw as TripWire so the agent handles it properly
       throw new TripWire(
         tripwireData?.reason || `Tripwire triggered in workflow ${workflow.id}`,
@@ -811,6 +985,7 @@ export class ProcessorRunner {
     observabilityContext?: ObservabilityContext,
     requestContext?: RequestContext,
     retryCount: number = 0,
+    onProcessorResult?: ProcessorResultCallback,
   ): Promise<RunInputProcessorsResult> {
     let modelContextMessages: MastraDBMessage[] | undefined;
 
@@ -835,6 +1010,10 @@ export class ProcessorRunner {
           },
           observabilityContext,
           requestContext,
+          undefined,
+          undefined,
+          snapshot => onProcessorResult?.(snapshot),
+          index,
         );
         const workflowMutatedMessageList = didMessageListChange(messageList, messageListBeforeWorkflow);
         validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
@@ -996,6 +1175,18 @@ export class ProcessorRunner {
           },
           attributes: mutations.length > 0 ? { messageListMutations: mutations } : undefined,
         });
+        onProcessorResult?.({
+          processorId: processor.id,
+          processorName: processor.name,
+          processorIndex: index,
+          output: {
+            ...result,
+            phase: 'input',
+            messages: processableMessages,
+            systemMessages: messageList.getAllSystemMessages(),
+            ...(modelContextMessages !== undefined ? { modelContextMessages } : {}),
+          },
+        });
       } catch (error) {
         // Stop recording on error
         messageList.stopRecording();
@@ -1099,6 +1290,12 @@ export class ProcessorRunner {
             requestContext,
             writer,
             args.abortSignal,
+            snapshot =>
+              args.onProcessorResult?.({
+                ...snapshot,
+                result: snapshot.output as RunProcessInputStepResult,
+              }),
+            index,
           );
           const mutations = messageList.stopRecording();
           recordingStopped = true;
@@ -1318,7 +1515,7 @@ export class ProcessorRunner {
             category: 'USER',
             domain: 'AGENT',
             id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT_MESSAGES',
-            text: `Processor ${processor.id} mutated messageList after a previous processor returned modelContextMessages. Return messages or modelContextMessages from this processor so the next model prompt stays in sync with the mutation.`,
+            text: `Processor ${processor.id} mutated messageList after prompt-only model context was set by a previous processor. Return messages or modelContextMessages from this processor so the next model prompt stays in sync with the mutation.`,
           });
         }
 
@@ -1354,6 +1551,12 @@ export class ProcessorRunner {
           messageList.replaceAllSystemMessages(systemMessages);
         }
         Object.assign(stepInput, rest);
+        args.onProcessorResult?.({
+          processorId: processor.id,
+          processorName: processor.name,
+          processorIndex: index,
+          result: stepInput,
+        });
 
         processorSpan?.end({
           output: buildProcessInputStepSpanOutput({

@@ -6,6 +6,7 @@ import type { MastraMemory } from '../../../memory/memory';
 import type { MemoryConfigInternal } from '../../../memory/types';
 import { createObservabilityContext } from '../../../observability';
 import type { Span, SpanType } from '../../../observability';
+import type { PromptToolWaterfallRecorder } from '../../../observability/prompt-tool-waterfall';
 import { StructuredOutputProcessor } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
 import type { Step } from '../../../workflows';
@@ -29,6 +30,7 @@ interface MapResultsStepOptions<OUTPUT = undefined> {
   agentId: string;
   methodType: AgentMethodType;
   saveQueueManager?: SaveQueueManager;
+  promptToolWaterfallRecorder?: PromptToolWaterfallRecorder;
   /**
    * Shared processor state map that persists across agent turns.
    */
@@ -48,6 +50,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
   agentId,
   methodType,
   saveQueueManager,
+  promptToolWaterfallRecorder,
 }: MapResultsStepOptions<OUTPUT>): Step<
   string,
   unknown,
@@ -124,6 +127,16 @@ export function createMapResultsStep<OUTPUT = undefined>({
           options: options,
           model: agentModel,
           messageList: memoryData.messageList,
+          promptToolWaterfallRecorder,
+        });
+
+        promptToolWaterfallRecorder?.finalizeSpan({
+          agentSpan,
+          status: 'tripwire',
+          tripwire: {
+            reason: memoryData.tripwire?.reason,
+            processorId: memoryData.tripwire?.processorId,
+          },
         });
 
         // End agent span with tripwire information after fallback completes
@@ -141,6 +154,12 @@ export function createMapResultsStep<OUTPUT = undefined>({
 
         return bail(modelOutput);
       } catch (error) {
+        promptToolWaterfallRecorder?.finalizeSpan({
+          agentSpan,
+          status: 'error',
+          error,
+        });
+
         // End agent span with error and tripwire context so failures aren't masked
         agentSpan?.error({
           error: error as Error,
@@ -271,6 +290,11 @@ export function createMapResultsStep<OUTPUT = undefined>({
             // End the AGENT_RUN span so the trace is exported.
             // Without this, the span is orphaned and exporters that wait
             // for the root span to end (e.g. Datadog) never emit the trace.
+            promptToolWaterfallRecorder?.finalizeSpan({
+              agentSpan,
+              status: 'error',
+              error,
+            });
             agentSpan?.error({ error, endSpan: true });
             return;
           }
@@ -289,6 +313,21 @@ export function createMapResultsStep<OUTPUT = undefined>({
             });
 
           if (!aborted) {
+            // Finalize the model-facing waterfall before non-blocking finish side effects
+            // so public stream results can expose the completed prompt/tool snapshot.
+            promptToolWaterfallRecorder?.finalizeSpan({
+              agentSpan,
+              status: payload.tripwire || payload.finishReason === 'tripwire' ? 'tripwire' : 'finished',
+              ...(payload.tripwire
+                ? {
+                    tripwire: {
+                      reason: payload.tripwire.reason,
+                      processorId: payload.tripwire.processorId,
+                    },
+                  }
+                : {}),
+            });
+
             const outputText =
               typeof payload.text === 'string' && payload.text.length > 0
                 ? payload.text
@@ -315,6 +354,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
                 threadExists: memoryData.threadExists,
                 structuredOutput: !!options.structuredOutput?.schema,
                 overrideScorers: options.scorers,
+                promptToolWaterfallRecorder,
               });
 
             void (async () => {
@@ -347,6 +387,11 @@ export function createMapResultsStep<OUTPUT = undefined>({
                           retryError,
                         );
 
+                  promptToolWaterfallRecorder?.finalizeSpan({
+                    agentSpan,
+                    status: 'error',
+                    error: spanError,
+                  });
                   agentSpan?.error({ error: spanError, endSpan: true });
                 }
               } finally {
@@ -361,6 +406,10 @@ export function createMapResultsStep<OUTPUT = undefined>({
               }
             })();
           } else {
+            promptToolWaterfallRecorder?.finalizeSpan({
+              agentSpan,
+              status: 'finished',
+            });
             agentSpan?.end();
             try {
               await runOnFinishCallback();
@@ -389,6 +438,8 @@ export function createMapResultsStep<OUTPUT = undefined>({
       messageList: memoryData.messageList!,
       modelContextMessages: memoryData.modelContextMessages,
       maxProcessorRetries: options.maxProcessorRetries,
+      promptToolWaterfallRecorder,
+      promptToolWaterfallAgentSpan: agentSpan,
       // IsTaskComplete scoring for supervisor patterns
       isTaskComplete: options.isTaskComplete,
       // Iteration hook for supervisor patterns
