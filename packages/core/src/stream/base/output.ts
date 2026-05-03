@@ -902,6 +902,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     metadata: error.options?.metadata,
                     processorId: error.processorId,
                   };
+                  self.#finalizePromptWaterfallTripwire(self.#tripwire);
                   self.resolvePromises({
                     finishReason: 'other',
                     text: '',
@@ -910,10 +911,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   self.#error = getErrorFromUnknown(error, {
                     fallbackMessage: 'Unknown error in stream',
                   });
-                  self.resolvePromises({
-                    finishReason: 'error',
-                    text: '',
+                  self.#finalizePromptWaterfallError(self.#error);
+                  self.#status = 'failed';
+                  Object.values(self.#delayedPromises).forEach(promise => {
+                    if (promise.status.type === 'pending') {
+                      promise.reject(self.#error);
+                    }
                   });
+                  throw self.#error;
                 }
                 if (self.#delayedPromises.object.status.type !== 'resolved') {
                   self.#delayedPromises.object.resolve(undefined as OUTPUT);
