@@ -5322,7 +5322,9 @@ export class Agent<
         error,
       });
       const normalizedError = error instanceof Error ? error : new Error(String(error));
-      agentSpan?.error({ error: normalizedError, endSpan: true });
+      if (!agentSpan?.endTime) {
+        agentSpan?.error({ error: normalizedError, endSpan: true });
+      }
       throw error;
     }
 
