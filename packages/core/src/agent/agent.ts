@@ -5321,9 +5321,8 @@ export class Agent<
         status: 'error',
         error,
       });
-      if (error instanceof Error) {
-        agentSpan?.error({ error, endSpan: true });
-      }
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      agentSpan?.error({ error: normalizedError, endSpan: true });
       throw error;
     }
 
@@ -5428,6 +5427,8 @@ export class Agent<
           status: 'error',
           error,
         });
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        agentSpan?.error({ error: normalizedError, endSpan: true });
         this.#inProgressRunIds.delete(runId);
         throw error;
       });

@@ -300,6 +300,10 @@ function stringArraysEqual(before: unknown, after: unknown): boolean {
 
 function stableStringify(value: unknown, seen = new WeakSet<object>()): string {
   if (!value || typeof value !== 'object') {
+    if (typeof value === 'bigint') {
+      return `${value.toString()}n`;
+    }
+
     return JSON.stringify(value) ?? String(value);
   }
 
