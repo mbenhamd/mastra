@@ -838,6 +838,41 @@ describe('ProcessorRunner', () => {
       expect(messageList.get.all.db()).toContainEqual(mutationMessage);
     });
 
+    it('should allow processInputStep processors to add system messages after prompt-only mode starts', async () => {
+      const canonicalMessage = createMessage('canonical input', 'user');
+      const promptOnlyMessage = createMessage('prompt-only input', 'user');
+
+      messageList.add([canonicalMessage], 'user');
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'context-step',
+            processInputStep: async () => ({ modelContextMessages: [promptOnlyMessage] }),
+          },
+          {
+            id: 'system-step',
+            processInputStep: async ({ messageList }) => {
+              messageList.addSystem('extra system guidance');
+              return {};
+            },
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const result = await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        steps: [],
+        model: createMockModel(),
+      });
+
+      expect(result.modelContextMessages).toEqual([promptOnlyMessage]);
+      expect(messageList.getAllSystemMessages()).toHaveLength(1);
+    });
+
     it('should snapshot workflow step outputs before later in-place mutations', async () => {
       const firstMessage = createMessage('first workflow prompt', 'user');
       const secondMessage = createMessage('second workflow prompt', 'user');

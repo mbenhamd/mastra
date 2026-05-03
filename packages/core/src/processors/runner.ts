@@ -492,10 +492,11 @@ export class ProcessorRunner {
   ): Promise<ProcessorStepOutput> {
     // Create a run and start the workflow
     const run = await workflow.createRun();
+    const shouldCaptureSnapshots = !!onWorkflowProcessorResult;
     const workflowStepSnapshots: ProcessorWorkflowStepSnapshot[] = [];
-    let lastWorkflowStepOutput = cloneProcessorStepOutput(input);
+    let lastWorkflowStepOutput = shouldCaptureSnapshots ? cloneProcessorStepOutput(input) : undefined;
     const unwatch =
-      typeof run.watch === 'function'
+      shouldCaptureSnapshots && typeof run.watch === 'function'
         ? run.watch(event => {
             if (event.type !== 'workflow-step-result') {
               return;
@@ -510,7 +511,7 @@ export class ProcessorRunner {
             }
 
             const workflowStepOutput = cloneProcessorStepOutput(payload.output);
-            if (!processorStepOutputChanged(lastWorkflowStepOutput, workflowStepOutput)) {
+            if (lastWorkflowStepOutput && !processorStepOutputChanged(lastWorkflowStepOutput, workflowStepOutput)) {
               lastWorkflowStepOutput = workflowStepOutput;
               return;
             }
@@ -554,8 +555,10 @@ export class ProcessorRunner {
       unwatch();
     }
 
-    for (const snapshot of workflowStepSnapshots) {
-      onWorkflowProcessorResult?.(snapshot);
+    if (shouldCaptureSnapshots) {
+      for (const snapshot of workflowStepSnapshots) {
+        onWorkflowProcessorResult?.(snapshot);
+      }
     }
 
     // Check for tripwire status - this means a processor in the workflow called abort()
@@ -1594,6 +1597,7 @@ export class ProcessorRunner {
         if (
           stepInput.modelContextMessages !== undefined &&
           mutations.length > 0 &&
+          hasRegularMessageListMutations(mutations) &&
           messages === undefined &&
           modelContextMessages === undefined
         ) {
