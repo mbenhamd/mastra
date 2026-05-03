@@ -192,7 +192,6 @@ export class PromptToolWaterfallRecorder {
     const waterfall = this.finalize({ status, tripwire, error });
 
     if (agentSpan?.isValid && !this.#spanFinalized) {
-      this.#spanFinalized = true;
       const span = agentSpan.createChildSpan({
         type: SpanType.PROMPT_TOOL_WATERFALL,
         name: 'prompt tool waterfall',
@@ -206,6 +205,7 @@ export class PromptToolWaterfallRecorder {
       span.end({
         output: waterfall,
       });
+      this.#spanFinalized = true;
     }
 
     return waterfall;
