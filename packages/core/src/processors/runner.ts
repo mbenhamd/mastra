@@ -1077,7 +1077,7 @@ export class ProcessorRunner {
           requestContext,
           undefined,
           undefined,
-          snapshot => onProcessorResult?.(snapshot),
+          onProcessorResult ? snapshot => onProcessorResult(snapshot) : undefined,
           index,
         );
         const workflowMutatedMessageList = didMessageListChange(messageList, messageListBeforeWorkflow);
@@ -1333,6 +1333,7 @@ export class ProcessorRunner {
         messageList.startRecording();
         let recordingStopped = false;
         try {
+          let workflowSnapshotResult = cloneRunProcessInputStepResult(stepInput);
           const result = await this.executeWorkflowAsProcessor(
             processorOrWorkflow,
             {
@@ -1355,17 +1356,19 @@ export class ProcessorRunner {
             requestContext,
             writer,
             args.abortSignal,
-            snapshot => {
-              const snapshotResult = {
-                ...stepInput,
-                ...(snapshot.output as Partial<RunProcessInputStepResult>),
-              };
-              args.onProcessorResult?.({
-                ...snapshot,
-                output: { ...snapshot.output },
-                result: cloneRunProcessInputStepResult(snapshotResult),
-              });
-            },
+            args.onProcessorResult
+              ? snapshot => {
+                  workflowSnapshotResult = cloneRunProcessInputStepResult({
+                    ...workflowSnapshotResult,
+                    ...(snapshot.output as Partial<RunProcessInputStepResult>),
+                  });
+                  args.onProcessorResult?.({
+                    ...snapshot,
+                    output: { ...snapshot.output },
+                    result: cloneRunProcessInputStepResult(workflowSnapshotResult),
+                  });
+                }
+              : undefined,
             index,
           );
           const mutations = messageList.stopRecording();
