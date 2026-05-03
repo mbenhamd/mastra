@@ -16,7 +16,7 @@ const phases = result.promptWaterfall?.phases.map(phase => ({
 }));
 ```
 
-The waterfall lets you inspect ordered phase summaries, prompt character sizes, schema character sizes, tool identifiers, processor identifiers, and terminal error or tripwire metadata lengths. It does not store raw prompt text, tool descriptions, raw tool schemas, tool inputs, tool outputs, error messages, or tripwire reasons.
+The waterfall lets you inspect ordered phase summaries and key metadata about prompts, schemas, tools, and processors. It keeps the summary compact and does not store raw prompt text, tool descriptions, raw tool schemas, tool inputs, tool outputs, error messages, or tripwire reasons.
 
 Legacy `generateLegacy()` and `streamLegacy()` results do not include `promptWaterfall`.
 

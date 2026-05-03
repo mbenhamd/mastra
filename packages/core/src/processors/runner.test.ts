@@ -801,6 +801,161 @@ describe('ProcessorRunner', () => {
       ).rejects.toThrow('mutated messageList after prompt-only model context was set');
     });
 
+    it('should allow processInputStep processors to repair prompt-only context with returned messages', async () => {
+      const canonicalMessage = createMessage('canonical input', 'user');
+      const promptOnlyMessage = createMessage('prompt-only input', 'user');
+      const mutationMessage = createMessage('canonical mutation', 'assistant');
+      const repairedPromptMessage = createMessage('repaired prompt-only input', 'user');
+
+      messageList.add([canonicalMessage], 'user');
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'context-step',
+            processInputStep: async () => ({ modelContextMessages: [promptOnlyMessage] }),
+          },
+          {
+            id: 'repair-step',
+            processInputStep: async ({ messageList }) => {
+              messageList.add([mutationMessage], 'response');
+              return { messages: [repairedPromptMessage] };
+            },
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const result = await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        steps: [],
+        model: createMockModel(),
+      });
+
+      expect(result.modelContextMessages).toEqual([repairedPromptMessage]);
+      expect(messageList.get.all.db()).toContainEqual(mutationMessage);
+    });
+
+    it('should snapshot workflow step outputs before later in-place mutations', async () => {
+      const firstMessage = createMessage('first workflow prompt', 'user');
+      const secondMessage = createMessage('second workflow prompt', 'user');
+      const workflowOutput = {
+        phase: 'inputStep',
+        messages: [firstMessage],
+        providerOptions: { test: { mode: 'first' } },
+      } satisfies ProcessorStepOutput;
+      const processorResults: Array<{ processorId: string; result?: { messages?: MastraDBMessage[] } }> = [];
+      let watcher: ((event: unknown) => void) | undefined;
+
+      messageList.add([createMessage('canonical input', 'user')], 'user');
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'mutating-workflow',
+            inputSchema: {},
+            outputSchema: {},
+            execute: async () => undefined,
+            createRun: async () => ({
+              watch: (callback: (event: unknown) => void) => {
+                watcher = callback;
+                return () => {};
+              },
+              start: async () => {
+                watcher?.({
+                  type: 'workflow-step-result',
+                  payload: { id: 'processor:first-workflow-step', status: 'success', output: workflowOutput },
+                });
+                workflowOutput.messages = [secondMessage];
+                workflowOutput.providerOptions.test.mode = 'second';
+                watcher?.({
+                  type: 'workflow-step-result',
+                  payload: { id: 'processor:second-workflow-step', status: 'success', output: workflowOutput },
+                });
+                return { status: 'success' as const, result: workflowOutput, steps: {} };
+              },
+            }),
+          } as unknown as ProcessorWorkflow,
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        steps: [],
+        model: createMockModel(),
+        onProcessorResult: result => processorResults.push(result),
+      });
+
+      expect(processorResults.map(result => result.processorId)).toEqual([
+        'first-workflow-step',
+        'second-workflow-step',
+      ]);
+      expect(processorResults.map(result => result.result?.messages?.[0]?.id)).toEqual([
+        firstMessage.id,
+        secondMessage.id,
+      ]);
+    });
+
+    it('should report latest workflow snapshot output for tripwire fallback phases', async () => {
+      const latestMessage = createMessage('latest workflow prompt before tripwire', 'user');
+      const workflowOutput = {
+        phase: 'inputStep',
+        messages: [latestMessage],
+      } satisfies ProcessorStepOutput;
+      const processorResults: Array<{ processorId: string; result?: { messages?: MastraDBMessage[] } }> = [];
+      let watcher: ((event: unknown) => void) | undefined;
+
+      messageList.add([createMessage('canonical input', 'user')], 'user');
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'tripwire-workflow',
+            inputSchema: {},
+            outputSchema: {},
+            execute: async () => undefined,
+            createRun: async () => ({
+              watch: (callback: (event: unknown) => void) => {
+                watcher = callback;
+                return () => {};
+              },
+              start: async () => {
+                watcher?.({
+                  type: 'workflow-step-result',
+                  payload: { id: 'processor:last-successful-step', status: 'success', output: workflowOutput },
+                });
+                return {
+                  status: 'tripwire' as const,
+                  tripwire: { reason: 'blocked', processorId: 'tripwire-step' },
+                  steps: {},
+                };
+              },
+            }),
+          } as unknown as ProcessorWorkflow,
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await expect(
+        runner.runProcessInputStep({
+          messageList,
+          stepNumber: 0,
+          steps: [],
+          model: createMockModel(),
+          onProcessorResult: result => processorResults.push(result),
+        }),
+      ).rejects.toBeInstanceOf(TripWire);
+
+      expect(processorResults.map(result => result.processorId)).toEqual(['last-successful-step', 'tripwire-step']);
+      expect(processorResults.at(-1)?.result?.messages?.[0]?.id).toBe(latestMessage.id);
+    });
+
     it('should reject mutating messageList while returning prompt-only model context from processInputStep', async () => {
       const promptOnlyMessage = createMessage('prompt-only input', 'user');
       messageList.add([createMessage('canonical input', 'user')], 'user');

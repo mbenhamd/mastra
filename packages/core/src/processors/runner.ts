@@ -327,18 +327,53 @@ function valuesEqual(before: unknown, after: unknown): boolean {
   return before === after || stableStringify(before) === stableStringify(after);
 }
 
+function clonePlainValue<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  if (value instanceof MessageList) {
+    return cloneMessageArray(value.get.all.db()) as T;
+  }
+
+  if (seen.has(value)) {
+    return seen.get(value) as T;
+  }
+
+  if (Array.isArray(value)) {
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    clone.push(...value.map(item => clonePlainValue(item, seen)));
+    return clone as T;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return value;
+  }
+
+  const clone: Record<string, unknown> = {};
+  seen.set(value, clone);
+  for (const [key, entryValue] of Object.entries(value)) {
+    clone[key] = clonePlainValue(entryValue, seen);
+  }
+  return clone as T;
+}
+
 function cloneMessageArray<T extends unknown[] | undefined>(messages: T): T {
   if (!Array.isArray(messages)) {
     return messages;
   }
 
-  return messages.map(message =>
-    message && typeof message === 'object' && !Array.isArray(message) ? { ...message } : message,
-  ) as T;
+  return clonePlainValue(messages);
 }
 
 function cloneRecord<T extends Record<string, unknown> | undefined>(record: T): T {
-  return record && typeof record === 'object' && !Array.isArray(record) ? ({ ...record } as T) : record;
+  return clonePlainValue(record);
+}
+
+function cloneProcessorStepOutput(output: ProcessorStepOutput): ProcessorStepOutput {
+  return clonePlainValue(output);
 }
 
 function cloneRunProcessInputStepResult(result: RunProcessInputStepResult): RunProcessInputStepResult {
@@ -458,7 +493,7 @@ export class ProcessorRunner {
     // Create a run and start the workflow
     const run = await workflow.createRun();
     const workflowStepSnapshots: ProcessorWorkflowStepSnapshot[] = [];
-    let lastWorkflowStepOutput = input;
+    let lastWorkflowStepOutput = cloneProcessorStepOutput(input);
     const unwatch =
       typeof run.watch === 'function'
         ? run.watch(event => {
@@ -474,8 +509,9 @@ export class ProcessorRunner {
               return;
             }
 
-            if (!processorStepOutputChanged(lastWorkflowStepOutput, payload.output)) {
-              lastWorkflowStepOutput = payload.output;
+            const workflowStepOutput = cloneProcessorStepOutput(payload.output);
+            if (!processorStepOutputChanged(lastWorkflowStepOutput, workflowStepOutput)) {
+              lastWorkflowStepOutput = workflowStepOutput;
               return;
             }
 
@@ -492,9 +528,9 @@ export class ProcessorRunner {
               processorStepId: stepId,
               processorStepIndex: workflowStepSnapshots.length,
               processorStepStatus: typeof payload.status === 'string' ? payload.status : 'unknown',
-              output: payload.output,
+              output: workflowStepOutput,
             });
-            lastWorkflowStepOutput = payload.output;
+            lastWorkflowStepOutput = workflowStepOutput;
           })
         : () => {};
 
@@ -531,6 +567,7 @@ export class ProcessorRunner {
         tripwireData?.processorId &&
         !workflowStepSnapshots.some(snapshot => snapshot.processorId === tripwireData.processorId)
       ) {
+        const lastWorkflowStepSnapshot = workflowStepSnapshots[workflowStepSnapshots.length - 1];
         onWorkflowProcessorResult?.({
           processorId: tripwireData.processorId,
           processorName: tripwireData.processorId,
@@ -540,7 +577,7 @@ export class ProcessorRunner {
           processorStepId: `processor:${tripwireData.processorId}`,
           processorStepIndex: workflowStepSnapshots.length,
           processorStepStatus: 'tripwire',
-          output: input,
+          output: lastWorkflowStepSnapshot?.output ?? cloneProcessorStepOutput(input),
         });
       }
       // Re-throw as TripWire so the agent handles it properly
@@ -1042,7 +1079,7 @@ export class ProcessorRunner {
         );
         const workflowMutatedMessageList = didMessageListChange(messageList, messageListBeforeWorkflow);
         validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
-        if (modelContextMessages !== undefined && workflowMutatedMessageList) {
+        if (modelContextMessages !== undefined && workflowMutatedMessageList && !result.messages) {
           throw new MastraError({
             category: 'USER',
             domain: 'AGENT',
@@ -1141,7 +1178,7 @@ export class ProcessorRunner {
         // Stop recording and capture mutations before applying internal plumbing changes.
         const mutations = messageList.stopRecording();
 
-        if (modelContextMessages !== undefined && mutations.length > 0) {
+        if (modelContextMessages !== undefined && mutations.length > 0 && !result.messages) {
           throw new MastraError({
             category: 'USER',
             domain: 'AGENT',
@@ -1335,6 +1372,7 @@ export class ProcessorRunner {
             phase: _phase,
             messages: rawMessages,
             modelContextMessages: rawModelContextMessages,
+            messageList: _rawMessageList,
             ...rawRest
           } = rawResult;
           const normalizedMessages =
@@ -1348,18 +1386,15 @@ export class ProcessorRunner {
             'modelContextMessages' in rawResult
               ? {
                   ...rawRest,
-                  messageList: undefined,
                   modelContextMessages: rawModelContextMessages,
                 }
               : normalizedMessages
                 ? {
                     ...rawRest,
-                    messageList: undefined,
                     messages: normalizedMessages,
                   }
                 : {
                     ...rawRest,
-                    messageList: undefined,
                   };
           const {
             messages,
@@ -1373,7 +1408,13 @@ export class ProcessorRunner {
             stepNumber,
           });
 
-          if (hadModelContextMessages && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
+          if (
+            hadModelContextMessages &&
+            mutations.length > 0 &&
+            hasRegularMessageListMutations(mutations) &&
+            messages === undefined &&
+            modelContextMessages === undefined
+          ) {
             throw new MastraError({
               category: 'USER',
               domain: 'AGENT',
@@ -1550,7 +1591,12 @@ export class ProcessorRunner {
           });
         }
 
-        if (stepInput.modelContextMessages !== undefined && mutations.length > 0) {
+        if (
+          stepInput.modelContextMessages !== undefined &&
+          mutations.length > 0 &&
+          messages === undefined &&
+          modelContextMessages === undefined
+        ) {
           throw new MastraError({
             category: 'USER',
             domain: 'AGENT',

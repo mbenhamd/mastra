@@ -401,15 +401,20 @@ describe('PromptToolWaterfall agent integration', () => {
           expect.objectContaining({ processorId: 'tool-narrowing-processor' }),
         ]),
       );
-      const processorPhase = inputProcessorPhases.find(phase => phase.meta?.processorId === 'waterfall-processor');
+      const processorToolPhase = inputProcessorPhases.find(
+        phase => phase.meta?.processorId === 'waterfall-processor' && phase.stepIndex === 0,
+      );
+      const processorPromptPhase = inputProcessorPhases.find(
+        phase => phase.meta?.processorId === 'waterfall-processor' && phase.delta.promptCharsDelta > 0,
+      );
       const toolNarrowingPhase = inputProcessorPhases.find(
         phase => phase.meta?.processorId === 'tool-narrowing-processor',
       );
       const prepareStepPhase = waterfall.phases.find(
         phase => phase.kind === 'prepare_step' && phase.stepIndex === 1 && phase.meta?.processorId === 'prepare-step',
       );
-      expect(processorPhase?.delta.promptCharsDelta).toBeGreaterThan(0);
-      expect(processorPhase?.delta.activeToolsAdded).toEqual(['privateLookup', 'privateArchive']);
+      expect(processorPromptPhase?.delta.promptCharsDelta).toBeGreaterThan(0);
+      expect(processorToolPhase?.delta.activeToolsAdded).toEqual(['privateLookup', 'privateArchive']);
       expect(toolNarrowingPhase?.delta.activeToolsRemoved).toEqual(['privateArchive']);
       expect(toolNarrowingPhase?.toolSurface.activeTools).toEqual(['privateLookup']);
       expect(prepareStepPhase?.delta.toolChoiceChanged).toBe(true);
