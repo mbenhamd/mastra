@@ -695,6 +695,14 @@ function formatObserverAttachmentPlaceholder(part: ObserverAttachmentPart, count
   return label ? `[${attachmentType} #${attachmentId}: ${label}]` : `[${attachmentType} #${attachmentId}]`;
 }
 
+function ensureDataUri(data: string, mediaType?: string): string {
+  if (!mediaType || data.startsWith('data:')) {
+    return data;
+  }
+
+  return `data:${mediaType};base64,${data}`;
+}
+
 function mapToolResultBlockToAttachment(block: unknown): ObserverAttachmentPart | undefined {
   if (!block || typeof block !== 'object') {
     return undefined;
@@ -718,15 +726,13 @@ function mapToolResultBlockToAttachment(block: unknown): ObserverAttachmentPart 
 
     const data = record.data;
     if (typeof data !== 'string') return undefined;
-    const imageData = mediaType ? `data:${mediaType};base64,${data}` : data;
-    return { type: 'image', image: imageData, mimeType: mediaType };
+    return { type: 'image', image: ensureDataUri(data, mediaType), mimeType: mediaType };
   }
 
   if (type === 'image-data') {
     const data = record.data;
     if (typeof data !== 'string') return undefined;
-    const image = mediaType ? `data:${mediaType};base64,${data}` : data;
-    return { type: 'image', image, mimeType: mediaType };
+    return { type: 'image', image: ensureDataUri(data, mediaType), mimeType: mediaType };
   }
 
   if (type === 'image-url') {
@@ -738,7 +744,7 @@ function mapToolResultBlockToAttachment(block: unknown): ObserverAttachmentPart 
   if (type === 'media') {
     const data = record.data;
     if (typeof data !== 'string' || !mediaType) return undefined;
-    const dataUri = `data:${mediaType};base64,${data}`;
+    const dataUri = ensureDataUri(data, mediaType);
     if (mediaType.toLowerCase().startsWith('image/')) {
       return { type: 'image', image: dataUri, mimeType: mediaType };
     }
@@ -748,15 +754,13 @@ function mapToolResultBlockToAttachment(block: unknown): ObserverAttachmentPart 
   if (type === 'file-data') {
     const data = record.data;
     if (typeof data !== 'string') return undefined;
-    const dataUri = mediaType ? `data:${mediaType};base64,${data}` : data;
-    return { type: 'file', data: dataUri, mimeType: mediaType, filename };
+    return { type: 'file', data: ensureDataUri(data, mediaType), mimeType: mediaType, filename };
   }
 
   if (type === 'file') {
     const data = record.data;
     if (typeof data !== 'string') return undefined;
-    const fileData = mediaType && !data.startsWith('data:') ? `data:${mediaType};base64,${data}` : data;
-    return { type: 'file', data: fileData, mimeType: mediaType, filename };
+    return { type: 'file', data: ensureDataUri(data, mediaType), mimeType: mediaType, filename };
   }
 
   if (type === 'file-url') {
@@ -790,7 +794,7 @@ function extractToolResultAttachments(
 
     attachments.push(toObserverInputAttachmentPart(attachment));
     const placeholder = formatObserverAttachmentPlaceholder(attachment, counter);
-    return { type: (block as { type?: unknown }).type, placeholder };
+    return { type: 'text', text: placeholder };
   });
 
   if (attachments.length === 0) {

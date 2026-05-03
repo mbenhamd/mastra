@@ -1582,6 +1582,79 @@ describe('Observer Agent Helpers', () => {
       expect(formatted).not.toContain(base64);
     });
 
+    it('should replace URL, file, and generic media tool-result blocks with attachment placeholders', () => {
+      const pdfBase64 = 'P'.repeat(2000);
+      const imageBase64 = 'I'.repeat(2000);
+      const imageUrl = 'https://example.com/screenshots/page.png';
+      const fileUrl = 'https://example.com/files/report.csv';
+      const msg = createTestMessage('ignored', 'assistant');
+      msg.content = {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'tool-media',
+              toolName: 'read_assets',
+              args: {},
+              result: {},
+            },
+            providerMetadata: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [
+                    { type: 'text', text: 'Collected assets.' },
+                    { type: 'image-url', url: imageUrl, mediaType: 'image/png' },
+                    { type: 'file-data', data: pdfBase64, mediaType: 'application/pdf', filename: 'paper.pdf' },
+                    { type: 'file-url', url: fileUrl, mediaType: 'text/csv', filename: 'report.csv' },
+                    { type: 'media', data: imageBase64, mediaType: 'image/jpeg' },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      } as any;
+
+      const formatted = formatMessagesForObserver([msg]);
+      expect(formatted).toContain('Tool Result read_assets');
+      expect(formatted).toContain('Collected assets.');
+      expect(formatted).toContain('[Image #1: page.png]');
+      expect(formatted).toContain('[File #1: paper.pdf]');
+      expect(formatted).toContain('[File #2: report.csv]');
+      expect(formatted).toContain('[Image #2: image/jpeg]');
+      expect(formatted).not.toContain(pdfBase64);
+      expect(formatted).not.toContain(imageBase64);
+      expect(formatted).not.toContain(imageUrl);
+      expect(formatted).not.toContain(fileUrl);
+    });
+
+    it('should redact media blocks when formatting tool results for token counting', () => {
+      const imageBase64 = 'G'.repeat(2000);
+      const pdfBase64 = 'H'.repeat(2000);
+      const formatted = formatToolResultForObserver({
+        type: 'content',
+        value: [
+          { type: 'text', text: 'Collected assets.' },
+          { type: 'image-data', data: `data:image/png;base64,${imageBase64}`, mediaType: 'image/png' },
+          { type: 'file-data', data: pdfBase64, mediaType: 'application/pdf', filename: 'paper.pdf' },
+          { type: 'image-file-id', id: 'img_123' },
+          { type: 'file-id', id: 'file_456' },
+        ],
+      });
+
+      expect(formatted).toContain('Collected assets.');
+      expect(formatted).toContain('[Image: image/png]');
+      expect(formatted).toContain('[File: paper.pdf]');
+      expect(formatted).toContain('[Image: img_123]');
+      expect(formatted).toContain('[File: file_456]');
+      expect(formatted).not.toContain(imageBase64);
+      expect(formatted).not.toContain(pdfBase64);
+      expect(formatted).not.toContain('data:image/png;base64');
+    });
+
     it('should leave non-content tool-result outputs unchanged', () => {
       const msg = createTestMessage('ignored', 'assistant');
       msg.content = {
@@ -1796,6 +1869,87 @@ describe('Observer Agent Helpers', () => {
       expect(joinedText).toContain('Tool Result read_file');
       expect(joinedText).toContain('[Image #1: image/png]');
       expect(joinedText).not.toContain(base64);
+    });
+
+    it('should hoist URL, file, and generic media tool-result blocks into observer input attachments', () => {
+      const pdfBase64 = 'E'.repeat(1500);
+      const dataUriImage = `data:image/jpeg;base64,${'F'.repeat(1500)}`;
+      const imageUrl = 'https://example.com/screenshots/page.png';
+      const fileUrl = 'https://example.com/files/report.csv';
+      const msg = createTestMessage('ignored', 'assistant');
+      msg.content = {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'tool-media',
+              toolName: 'read_assets',
+              args: {},
+              result: {},
+            },
+            providerMetadata: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [
+                    { type: 'text', text: 'Collected assets.' },
+                    { type: 'image-url', url: imageUrl, mediaType: 'image/png' },
+                    { type: 'file-data', data: pdfBase64, mediaType: 'application/pdf', filename: 'paper.pdf' },
+                    { type: 'file-url', url: fileUrl, mediaType: 'text/csv', filename: 'report.csv' },
+                    { type: 'media', data: dataUriImage, mediaType: 'image/jpeg' },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      } as any;
+
+      const historyMessage = buildObserverHistoryMessage([msg]);
+      const content = historyMessage.content as any[];
+
+      const textParts = content.filter(part => part.type === 'text');
+      const imageParts = content.filter(part => part.type === 'image');
+      const fileParts = content.filter(part => part.type === 'file');
+
+      expect(imageParts).toHaveLength(2);
+      expect(imageParts[0]).toMatchObject({
+        type: 'image',
+        image: imageUrl,
+        mimeType: 'image/png',
+      });
+      expect(imageParts[1]).toMatchObject({
+        type: 'image',
+        image: dataUriImage,
+        mimeType: 'image/jpeg',
+      });
+
+      expect(fileParts).toHaveLength(2);
+      expect(fileParts[0]).toMatchObject({
+        type: 'file',
+        data: `data:application/pdf;base64,${pdfBase64}`,
+        mimeType: 'application/pdf',
+        filename: 'paper.pdf',
+      });
+      expect(fileParts[1]).toMatchObject({
+        type: 'file',
+        data: fileUrl,
+        mimeType: 'text/csv',
+        filename: 'report.csv',
+      });
+
+      const joinedText = textParts.map(part => part.text).join('\n');
+      expect(joinedText).toContain('Tool Result read_assets');
+      expect(joinedText).toContain('[Image #1: page.png]');
+      expect(joinedText).toContain('[File #1: paper.pdf]');
+      expect(joinedText).toContain('[File #2: report.csv]');
+      expect(joinedText).toContain('[Image #2: image/jpeg]');
+      expect(joinedText).not.toContain(pdfBase64);
+      expect(joinedText).not.toContain(dataUriImage);
+      expect(joinedText).not.toContain(imageUrl);
+      expect(joinedText).not.toContain(fileUrl);
     });
 
     it('should reuse part-level date grouping without message separators', () => {
