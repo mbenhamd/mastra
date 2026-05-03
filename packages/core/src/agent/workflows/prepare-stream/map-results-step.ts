@@ -313,19 +313,21 @@ export function createMapResultsStep<OUTPUT = undefined>({
             });
 
           if (!aborted) {
-            // Finalize the model-facing waterfall before non-blocking finish side effects
-            // so public stream results can expose the completed prompt/tool snapshot.
-            promptToolWaterfallRecorder?.finalizeSpan({
-              agentSpan,
-              status: payload.tripwire || payload.finishReason === 'tripwire' ? 'tripwire' : 'finished',
-              ...(payload.tripwire
-                ? {
-                    tripwire: {
-                      reason: payload.tripwire.reason,
-                      processorId: payload.tripwire.processorId,
-                    },
-                  }
-                : {}),
+            const waterfallSuccessStatus =
+              payload.tripwire || payload.finishReason === 'tripwire' ? 'tripwire' : 'finished';
+            const waterfallTripwire = payload.tripwire
+              ? {
+                  tripwire: {
+                    reason: payload.tripwire.reason,
+                    processorId: payload.tripwire.processorId,
+                  },
+                }
+              : {};
+            // Finalize the payload now so public stream results expose the completed
+            // prompt/tool snapshot; the trace span is emitted after finish side effects.
+            promptToolWaterfallRecorder?.finalize({
+              status: waterfallSuccessStatus,
+              ...waterfallTripwire,
             });
 
             const outputText =
@@ -360,6 +362,11 @@ export function createMapResultsStep<OUTPUT = undefined>({
             void (async () => {
               try {
                 await executeFinish();
+                promptToolWaterfallRecorder?.finalizeSpan({
+                  agentSpan,
+                  status: waterfallSuccessStatus,
+                  ...waterfallTripwire,
+                });
               } catch (e) {
                 capabilities.logger.error('Error saving memory on finish (first attempt)', {
                   error: e,
@@ -368,6 +375,11 @@ export function createMapResultsStep<OUTPUT = undefined>({
 
                 try {
                   await executeFinish();
+                  promptToolWaterfallRecorder?.finalizeSpan({
+                    agentSpan,
+                    status: waterfallSuccessStatus,
+                    ...waterfallTripwire,
+                  });
                 } catch (retryError) {
                   capabilities.logger.error('Error saving memory on finish (retry failed)', {
                     error: retryError,

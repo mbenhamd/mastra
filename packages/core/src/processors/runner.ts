@@ -274,19 +274,7 @@ function hasRegularMessageListMutations(mutations: ReturnType<MessageList['stopR
 }
 
 function isProcessorStepOutput(output: unknown): output is ProcessorStepOutput {
-  return (
-    output !== null &&
-    typeof output === 'object' &&
-    'phase' in output &&
-    ('messageList' in output ||
-      'messages' in output ||
-      'part' in output ||
-      'modelContextMessages' in output ||
-      'tools' in output ||
-      'toolChoice' in output ||
-      'activeTools' in output ||
-      'structuredOutput' in output)
-  );
+  return output !== null && typeof output === 'object' && 'phase' in output;
 }
 
 function processorIdFromWorkflowStepId(stepId: string, workflowId: string): string {
@@ -335,6 +323,34 @@ function valuesEqual(before: unknown, after: unknown): boolean {
   return before === after || stableStringify(before) === stableStringify(after);
 }
 
+function cloneMessageArray<T extends unknown[] | undefined>(messages: T): T {
+  if (!Array.isArray(messages)) {
+    return messages;
+  }
+
+  return messages.map(message =>
+    message && typeof message === 'object' && !Array.isArray(message) ? { ...message } : message,
+  ) as T;
+}
+
+function cloneRecord<T extends Record<string, unknown> | undefined>(record: T): T {
+  return record && typeof record === 'object' && !Array.isArray(record) ? ({ ...record } as T) : record;
+}
+
+function cloneRunProcessInputStepResult(result: RunProcessInputStepResult): RunProcessInputStepResult {
+  return {
+    ...result,
+    ...(result.messages ? { messages: cloneMessageArray(result.messages) } : {}),
+    ...(result.modelContextMessages ? { modelContextMessages: cloneMessageArray(result.modelContextMessages) } : {}),
+    ...(result.systemMessages ? { systemMessages: cloneMessageArray(result.systemMessages) } : {}),
+    ...(result.activeTools ? { activeTools: [...result.activeTools] } : {}),
+    ...(result.tools ? { tools: cloneRecord(result.tools) } : {}),
+    ...(result.providerOptions ? { providerOptions: cloneRecord(result.providerOptions) } : {}),
+    ...(result.modelSettings ? { modelSettings: cloneRecord(result.modelSettings) } : {}),
+    ...(result.structuredOutput ? { structuredOutput: cloneRecord(result.structuredOutput) } : {}),
+  };
+}
+
 function processorStepOutputChanged(before: ProcessorStepOutput, after: ProcessorStepOutput): boolean {
   const beforeRecord = before as Record<string, unknown>;
   const afterRecord = after as Record<string, unknown>;
@@ -358,6 +374,11 @@ function processorStepOutputChanged(before: ProcessorStepOutput, after: Processo
     !valuesEqual(beforeRecord.tools, afterRecord.tools) ||
     !valuesEqual(beforeRecord.toolChoice, afterRecord.toolChoice) ||
     !stringArraysEqual(beforeRecord.activeTools, afterRecord.activeTools) ||
+    !valuesEqual(beforeRecord.model, afterRecord.model) ||
+    beforeRecord.messageId !== afterRecord.messageId ||
+    !valuesEqual(beforeRecord.providerOptions, afterRecord.providerOptions) ||
+    !valuesEqual(beforeRecord.modelSettings, afterRecord.modelSettings) ||
+    beforeRecord.retryCount !== afterRecord.retryCount ||
     !valuesEqual(beforeRecord.structuredOutput, afterRecord.structuredOutput) ||
     !areProcessorMessageArraysEqual(
       beforeRecord.modelContextMessages as unknown[] | undefined,
@@ -1290,11 +1311,17 @@ export class ProcessorRunner {
             requestContext,
             writer,
             args.abortSignal,
-            snapshot =>
+            snapshot => {
+              const snapshotResult = {
+                ...stepInput,
+                ...(snapshot.output as Partial<RunProcessInputStepResult>),
+              };
               args.onProcessorResult?.({
                 ...snapshot,
-                result: snapshot.output as RunProcessInputStepResult,
-              }),
+                output: { ...snapshot.output },
+                result: cloneRunProcessInputStepResult(snapshotResult),
+              });
+            },
             index,
           );
           const mutations = messageList.stopRecording();
@@ -1555,7 +1582,7 @@ export class ProcessorRunner {
           processorId: processor.id,
           processorName: processor.name,
           processorIndex: index,
-          result: stepInput,
+          result: cloneRunProcessInputStepResult(stepInput),
         });
 
         processorSpan?.end({

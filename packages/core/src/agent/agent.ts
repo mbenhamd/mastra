@@ -5423,6 +5423,11 @@ export class Agent<
         this.#inProgressRunIds.delete(runId);
       })
       .catch(error => {
+        promptToolWaterfallRecorder?.finalizeSpan({
+          agentSpan,
+          status: 'error',
+          error,
+        });
         this.#inProgressRunIds.delete(runId);
         throw error;
       });

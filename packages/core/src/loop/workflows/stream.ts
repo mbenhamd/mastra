@@ -272,15 +272,17 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
             payload: { error },
           });
 
-          if (rest.options?.onError) {
-            await rest.options?.onError?.({ error });
+          try {
+            if (rest.options?.onError) {
+              await rest.options?.onError?.({ error });
+            }
+          } finally {
+            rest.promptToolWaterfallRecorder?.finalizeSpan({
+              agentSpan,
+              status: 'error',
+              error,
+            });
           }
-
-          rest.promptToolWaterfallRecorder?.finalizeSpan({
-            agentSpan,
-            status: 'error',
-            error,
-          });
         } else if (executionResult.status === 'suspended') {
           rest.promptToolWaterfallRecorder?.finalizeSpan({
             agentSpan,

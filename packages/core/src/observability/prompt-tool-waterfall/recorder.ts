@@ -38,6 +38,10 @@ function textLength(value: unknown): number {
   return typeof value === 'string' ? value.length : String(value ?? '').length;
 }
 
+function statusPriority(status: PromptToolWaterfallStatus): number {
+  return status === 'error' ? 2 : status === 'tripwire' ? 1 : 0;
+}
+
 function createDelta(
   previous: Pick<PromptToolWaterfallPhase, 'prompt' | 'toolSurface'> | undefined,
   next: Pick<PromptToolWaterfallPhase, 'prompt' | 'toolSurface'>,
@@ -134,17 +138,32 @@ export class PromptToolWaterfallRecorder {
     tripwire?: { reason?: string; processorId?: string };
     error?: unknown;
   }): PromptToolWaterfall {
-    if (this.#finalized) {
-      return this.#finalized;
-    }
-
-    const finalPhase = this.#phases.at(-1);
     const normalizedError =
       error instanceof Error
         ? { name: error.name, messageChars: error.message.length }
         : error
           ? { messageChars: textLength(error) }
           : undefined;
+    const normalizedTripwire = tripwire?.reason
+      ? {
+          reasonChars: tripwire.reason.length,
+          ...(tripwire.processorId ? { processorId: tripwire.processorId } : {}),
+        }
+      : undefined;
+
+    if (this.#finalized) {
+      if (statusPriority(status) > statusPriority(this.#finalized.status)) {
+        this.#finalized = {
+          ...this.#finalized,
+          status,
+          ...(normalizedTripwire ? { tripwire: normalizedTripwire } : {}),
+          ...(normalizedError ? { error: normalizedError } : {}),
+        };
+      }
+      return this.#finalized;
+    }
+
+    const finalPhase = this.#phases.at(-1);
 
     this.#finalized = {
       runId: this.runId,
@@ -152,14 +171,7 @@ export class PromptToolWaterfallRecorder {
       stepCount: new Set(this.#phases.map(phase => phase.stepIndex)).size,
       phases: this.#phases,
       ...(finalPhase ? { finalPrompt: finalPhase.prompt, finalToolSurface: finalPhase.toolSurface } : {}),
-      ...(tripwire?.reason
-        ? {
-            tripwire: {
-              reasonChars: tripwire.reason.length,
-              ...(tripwire.processorId ? { processorId: tripwire.processorId } : {}),
-            },
-          }
-        : {}),
+      ...(normalizedTripwire ? { tripwire: normalizedTripwire } : {}),
       ...(normalizedError ? { error: normalizedError } : {}),
     };
 

@@ -2,7 +2,9 @@
 '@mastra/core': minor
 ---
 
-Added agent prompt/tool waterfall summaries that show how prompts and tool surfaces change during a vNext run. The same typed, summary-only payload is available on `agent.generate()` results, `stream.getFullOutput()` results, finalized stream outputs, and, when tracing has a valid agent span, the `prompt_tool_waterfall` trace span.
+Added typed, summary-only `promptWaterfall` observability for agent runs.
+
+`promptWaterfall` is now available on `agent.generate()` results, finalized stream output, and `stream.getFullOutput()`. When tracing has a valid agent span, Mastra also emits the same summary on a `prompt_tool_waterfall` child span.
 
 ```ts
 const result = await agent.generate('Summarize the thread');
@@ -14,6 +16,8 @@ const phases = result.promptWaterfall?.phases.map(phase => ({
 }));
 ```
 
-The waterfall records ordered checkpoints for the initial prompt, the memory-enabled preparation branch, configured input processors, input processor phases for nested processor workflows, `prepareStep`, pre-model execution, and structured output handling. It helps developers debug what the model saw before each model call without storing raw prompt text, tool descriptions, raw tool schema definitions, tool inputs, tool outputs, error messages, or tripwire reasons. It stores configured identifiers such as tool names, active tool names, tool choice names, processor ids, processor-workflow step ids, and error class names. Legacy `generateLegacy()` and `streamLegacy()` results do not include `promptWaterfall`.
+The waterfall lets you inspect ordered phase summaries, prompt character sizes, schema character sizes, tool identifiers, processor identifiers, and terminal error or tripwire metadata lengths. It does not store raw prompt text, tool descriptions, raw tool schemas, tool inputs, tool outputs, error messages, or tripwire reasons.
+
+Legacy `generateLegacy()` and `streamLegacy()` results do not include `promptWaterfall`.
 
 Refs mastra-ai/mastra#16038.
