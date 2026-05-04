@@ -142,6 +142,7 @@ export const FlowPolicySchema = z
 export const FlowDecisionActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('continue') }).strict(),
   z.object({ type: z.literal('ask_clarification'), question: z.string().min(1).optional() }).strict(),
+  z.object({ type: z.literal('require_capability'), capabilities: z.array(z.string().min(1)) }).strict(),
   z
     .object({
       type: z.literal('apply_tool_policy'),
@@ -185,6 +186,7 @@ export const FlowStateSchema = z
     runId: z.string().min(1).optional(),
     revision: z.number().int().nonnegative().default(0),
     retryCount: z.number().int().nonnegative().default(0),
+    capabilities: z.array(z.string().min(1)).default([]),
     activeDecisionId: z.string().min(1).optional(),
     decisions: z.array(FlowDecisionSummarySchema).default([]),
     evidence: EvidenceLedgerSchema.default({ version: FLOW_SIGNALS_VERSION, entries: [] }),

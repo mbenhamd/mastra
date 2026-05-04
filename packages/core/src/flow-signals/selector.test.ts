@@ -80,6 +80,23 @@ describe('selectFlowDecision', () => {
     });
   });
 
+  it('blocks when policy required capabilities are not resolved in state', () => {
+    const baseFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const frame = {
+      ...baseFrame,
+      state: {
+        ...baseFrame.state,
+        capabilities: [],
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions).toContainEqual({ type: 'require_capability', capabilities: ['retrieval'] });
+    expect(decision.actions.some(action => action.type === 'finalize')).toBe(false);
+  });
+
   it('blocks for clarification when ambiguity is blocking', () => {
     const decision = selectFlowDecision(ambiguousDecisionFrame, baseFlowPolicy);
 

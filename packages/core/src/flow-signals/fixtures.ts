@@ -50,6 +50,7 @@ export const canonicalDecisionFrames: DecisionFrame[] = decisionPoints.map((deci
     runId: 'run.fixture',
     revision: index,
     retryCount: decisionPoint === 'tool_failure' ? 1 : 0,
+    capabilities: ['retrieval'],
     decisions: [],
     evidence: {
       version: 1,

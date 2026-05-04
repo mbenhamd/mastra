@@ -16,12 +16,21 @@ export function selectFlowDecision(
   const actions: FlowDecisionAction[] = [];
   const reasons: string[] = [];
 
+  const missingCapabilities = policy.requiredCapabilities.filter(
+    capability => !frame.state.capabilities.includes(capability),
+  );
+
   if (policy.clarificationRequired || frame.signals.ambiguity.blocking) {
     actions.push({
       type: 'ask_clarification',
       question: frame.signals.ambiguity.clarificationQuestion,
     });
     reasons.push('clarification_required');
+  }
+
+  if (missingCapabilities.length > 0) {
+    actions.push({ type: 'require_capability', capabilities: missingCapabilities });
+    reasons.push('required_capabilities_missing');
   }
 
   if (policy.allowedTools.length > 0 || policy.deniedTools.length > 0) {
@@ -60,6 +69,7 @@ export function selectFlowDecision(
   const hasBlockingOrTerminalAction = actions.some(
     action =>
       action.type === 'ask_clarification' ||
+      action.type === 'require_capability' ||
       action.type === 'require_evidence' ||
       action.type === 'retry' ||
       action.type === 'fail',
@@ -106,7 +116,14 @@ function getDecisionStatus(actions: FlowDecisionAction[]): FlowDecision['status'
     return 'failed';
   }
 
-  if (actions.some(action => action.type === 'ask_clarification' || action.type === 'require_evidence')) {
+  if (
+    actions.some(
+      action =>
+        action.type === 'ask_clarification' ||
+        action.type === 'require_capability' ||
+        action.type === 'require_evidence',
+    )
+  ) {
     return 'blocked';
   }
 
