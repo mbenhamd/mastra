@@ -57,7 +57,15 @@ export function selectFlowDecision(
     }
   }
 
-  if (frame.decisionPoint === 'pre_final' && missingEvidence.length === 0) {
+  const hasBlockingOrTerminalAction = actions.some(
+    action =>
+      action.type === 'ask_clarification' ||
+      action.type === 'require_evidence' ||
+      action.type === 'retry' ||
+      action.type === 'fail',
+  );
+
+  if (frame.decisionPoint === 'pre_final' && missingEvidence.length === 0 && !hasBlockingOrTerminalAction) {
     actions.push({ type: 'finalize', contractId: policy.outputContractId });
     reasons.push('pre_final_ready');
   }

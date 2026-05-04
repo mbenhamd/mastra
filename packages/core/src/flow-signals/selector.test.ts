@@ -102,6 +102,30 @@ describe('selectFlowDecision', () => {
     });
   });
 
+  it('does not finalize when pre_final is blocked by clarification', () => {
+    const baseFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const frame = {
+      ...baseFrame,
+      signals: {
+        ...baseFrame.signals,
+        ambiguity: {
+          status: 'ambiguous' as const,
+          blocking: true,
+          clarificationQuestion: 'Which final format should be used?',
+        },
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions).toContainEqual({
+      type: 'ask_clarification',
+      question: 'Which final format should be used?',
+    });
+    expect(decision.actions.some(action => action.type === 'finalize')).toBe(false);
+  });
+
   it('fails retry decision points when max retries are exceeded', () => {
     const frame = canonicalDecisionFrames.find(item => item.decisionPoint === 'tool_failure')!;
     const decision = selectFlowDecision(frame, baseFlowPolicy);
