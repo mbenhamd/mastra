@@ -9,7 +9,7 @@ import { z } from 'zod/v4';
 
 import type { InMemoryTaskStore } from '../a2a/store';
 import { coreAuthMiddleware } from '../auth/helpers';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '../constants';
+import { MASTRA_FLOW_CONTEXT_KEY_PREFIX, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '../constants';
 import { formatZodError } from '../handlers/error';
 import { normalizeRoutePath } from '../utils';
 import { generateOpenAPIDocument, convertCustomRoutesToOpenAPIPaths } from './openapi-utils';
@@ -327,12 +327,12 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   }
 
   private static readonly RESERVED_CONTEXT_KEYS = new Set([MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY]);
-  private static readonly RESERVED_CONTEXT_KEY_PREFIXES = ['mastra.flow'];
+  private static readonly RESERVED_CONTEXT_KEY_PREFIXES = [MASTRA_FLOW_CONTEXT_KEY_PREFIX];
 
   private static isReservedContextKey(key: string): boolean {
     return (
       MastraServer.RESERVED_CONTEXT_KEYS.has(key) ||
-      MastraServer.RESERVED_CONTEXT_KEY_PREFIXES.some(prefix => key === prefix || key.startsWith(`${prefix}.`))
+      MastraServer.RESERVED_CONTEXT_KEY_PREFIXES.some(prefix => key === prefix || key.startsWith(prefix))
     );
   }
 

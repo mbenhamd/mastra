@@ -12,6 +12,8 @@ export const MASTRA_THREAD_ID_KEY = 'mastra__threadId';
 
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
+export const MASTRA_FLOW_CONTEXT_KEY_PREFIX = 'mastra__flow';
+
 export const WORKSPACE_TOOLS_PREFIX = 'mastra_workspace' as const;
 
 export const WORKSPACE_TOOLS = {
