@@ -122,6 +122,18 @@ describe('selectFlowDecision', () => {
     expect(decision.actions.some(action => action.type === 'finalize')).toBe(false);
   });
 
+  it('omits the clarification question property when no question is available', () => {
+    const decision = selectFlowDecision(canonicalDecisionFrames[0], {
+      ...baseFlowPolicy,
+      id: 'policy.clarification',
+      clarificationRequired: true,
+      requiredEvidence: [],
+    });
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions).toContainEqual({ type: 'ask_clarification' });
+  });
+
   it('blocks for clarification when ambiguity is blocking', () => {
     const decision = selectFlowDecision(ambiguousDecisionFrame, baseFlowPolicy);
 
@@ -176,7 +188,7 @@ describe('selectFlowDecision', () => {
     expect(decision.actions).toContainEqual({ type: 'fail', reason: 'max_retries_exceeded' });
   });
 
-  it('prioritizes blocked status over retry when retry point requirements are missing', () => {
+  it('does not emit retry when retry point requirements are blocked', () => {
     const frame = {
       ...canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!,
       state: {
@@ -192,7 +204,7 @@ describe('selectFlowDecision', () => {
       type: 'require_evidence',
       requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
     });
-    expect(decision.actions).toContainEqual({ type: 'retry', reason: 'retry_after_tripwire' });
+    expect(decision.actions.some(action => action.type === 'retry')).toBe(false);
   });
 
   it('does not satisfy evidence requirements with observed evidence', () => {

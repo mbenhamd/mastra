@@ -21,10 +21,8 @@ export function selectFlowDecision(
   );
 
   if (policy.clarificationRequired || frame.signals.ambiguity.blocking) {
-    actions.push({
-      type: 'ask_clarification',
-      question: frame.signals.ambiguity.clarificationQuestion,
-    });
+    const question = frame.signals.ambiguity.clarificationQuestion;
+    actions.push(question ? { type: 'ask_clarification', question } : { type: 'ask_clarification' });
     reasons.push('clarification_required');
   }
 
@@ -56,10 +54,14 @@ export function selectFlowDecision(
     reasons.push('output_contract_from_policy');
   }
 
+  const hasBlockingAction = actions.some(isBlockingAction);
+
   if (shouldRetry(frame.decisionPoint)) {
     if (policy.maxRetries === undefined || frame.state.retryCount < policy.maxRetries) {
-      actions.push({ type: 'retry', reason: frame.decisionPoint });
-      reasons.push('retry_allowed');
+      if (!hasBlockingAction) {
+        actions.push({ type: 'retry', reason: frame.decisionPoint });
+        reasons.push('retry_allowed');
+      }
     } else {
       actions.push({ type: 'fail', reason: 'max_retries_exceeded' });
       reasons.push('retry_denied');
@@ -67,12 +69,7 @@ export function selectFlowDecision(
   }
 
   const hasBlockingOrTerminalAction = actions.some(
-    action =>
-      action.type === 'ask_clarification' ||
-      action.type === 'require_capability' ||
-      action.type === 'require_evidence' ||
-      action.type === 'retry' ||
-      action.type === 'fail',
+    action => isBlockingAction(action) || action.type === 'retry' || action.type === 'fail',
   );
 
   if (frame.decisionPoint === 'pre_final' && missingEvidence.length === 0 && !hasBlockingOrTerminalAction) {
@@ -111,19 +108,18 @@ function shouldRetry(decisionPoint: string): boolean {
   );
 }
 
+function isBlockingAction(action: FlowDecisionAction): boolean {
+  return (
+    action.type === 'ask_clarification' || action.type === 'require_capability' || action.type === 'require_evidence'
+  );
+}
+
 function getDecisionStatus(actions: FlowDecisionAction[]): FlowDecision['status'] {
   if (actions.some(action => action.type === 'fail')) {
     return 'failed';
   }
 
-  if (
-    actions.some(
-      action =>
-        action.type === 'ask_clarification' ||
-        action.type === 'require_capability' ||
-        action.type === 'require_evidence',
-    )
-  ) {
+  if (actions.some(isBlockingAction)) {
     return 'blocked';
   }
 
