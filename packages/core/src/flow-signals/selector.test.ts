@@ -69,6 +69,31 @@ describe('flow signals schemas', () => {
       }),
     ).toThrow();
   });
+
+  it('rejects invalid public decision envelopes', () => {
+    const baseDecision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        actions: [],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        reasons: [],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        status: 'continue',
+      }),
+    ).toThrow();
+  });
 });
 
 describe('selectFlowDecision', () => {

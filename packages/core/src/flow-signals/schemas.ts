@@ -26,14 +26,12 @@ export const FlowSignalSourceSchema = z.enum([
 
 export const FlowOutputFormatSchema = z.enum(['plain', 'markdown', 'table', 'json', 'artifact']);
 
-export const FlowRefSchema = z
-  .object({
-    id: z.string().min(1),
-    kind: z.enum(['message', 'tool_call', 'tool_result', 'source', 'file', 'artifact', 'approval', 'state']),
-    hash: z.string().min(1).optional(),
-    uri: z.string().min(1).optional(),
-  })
-  .strict();
+export const FlowRefSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(['message', 'tool_call', 'tool_result', 'source', 'file', 'artifact', 'approval', 'state']),
+  hash: z.string().min(1).optional(),
+  uri: z.string().min(1).optional(),
+});
 
 export const FlowRequestedOutputSchema = z
   .object({
@@ -175,10 +173,49 @@ export const FlowDecisionSchema = z
     policyId: z.string().min(1),
     decisionPoint: FlowDecisionPointSchema,
     status: z.enum(['continue', 'blocked', 'retry', 'failed', 'finalize']),
-    actions: z.array(FlowDecisionActionSchema),
-    reasons: z.array(z.string().min(1)),
+    actions: z.array(FlowDecisionActionSchema).min(1),
+    reasons: z.array(z.string().min(1)).min(1),
   })
-  .strict();
+  .strict()
+  .superRefine((decision, ctx) => {
+    const expectedStatus = getFlowDecisionStatus(decision.actions);
+    if (decision.status !== expectedStatus) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `Flow decision status must be ${expectedStatus} for its actions`,
+        path: ['status'],
+      });
+    }
+  });
+
+type FlowDecisionStatus = 'continue' | 'blocked' | 'retry' | 'failed' | 'finalize';
+
+function getFlowDecisionStatus(actions: FlowDecisionAction[]): FlowDecisionStatus {
+  if (actions.some(action => action.type === 'fail')) {
+    return 'failed';
+  }
+
+  if (
+    actions.some(
+      action =>
+        action.type === 'ask_clarification' ||
+        action.type === 'require_capability' ||
+        action.type === 'require_evidence',
+    )
+  ) {
+    return 'blocked';
+  }
+
+  if (actions.some(action => action.type === 'retry')) {
+    return 'retry';
+  }
+
+  if (actions.some(action => action.type === 'finalize')) {
+    return 'finalize';
+  }
+
+  return 'continue';
+}
 
 export const FlowDecisionSummarySchema = z
   .object({

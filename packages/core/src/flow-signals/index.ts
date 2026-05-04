@@ -9,6 +9,10 @@
  * experimental surface yet; add them with concrete integrations once the runtime
  * mapping is proven.
  *
+ * `FLOW_SIGNALS_VERSION` is a lockstep envelope version for the v1 schemas in
+ * this entrypoint. Split schema-specific versions only when a persisted runtime
+ * consumer needs independent migration.
+ *
  * Intended adapter direction:
  * processor or harness runtime state -> DecisionFrame -> selectFlowDecision -> processor or harness action.
  */
