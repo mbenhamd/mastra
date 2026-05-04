@@ -1,3 +1,4 @@
+import { acquireStreamSlot, buildContinuationOpts, releaseStreamSlot, resolveStreamUntilIdleScope, TERMINAL_BG_CHUNKS } from "../shared/stream-until-idle";
 /**
  * Implementation of `DurableAgent.streamUntilIdle`. Mirrors the regular
  * agent's `stream-until-idle.ts` but adapted for durable execution:
@@ -17,7 +18,6 @@
  * 5. `maxIdleMs` fires only between turns when nothing is happening.
  */
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { deepMerge } from '../../utils';
 import type { MessageListInput } from '../message-list';
 
@@ -26,81 +26,6 @@ import type { DurableAgent, DurableAgentStreamOptions, DurableAgentStreamResult 
 export interface DurableStreamUntilIdleDeps {
   activeStreams: Map<string, () => void>;
   bgManager: BackgroundTaskManager | undefined;
-}
-
-const TERMINAL_BG_CHUNKS = new Set([
-  'background-task-completed',
-  'background-task-failed',
-  'background-task-cancelled',
-]);
-
-async function resolveScope(
-  agent: DurableAgent<any, any, any>,
-  mergedOptions: Record<string, any>,
-): Promise<{ threadId: string | undefined; resourceId: string | undefined; scopeKey: string | null } | null> {
-  const requestContext = (mergedOptions?.requestContext as RequestContext | undefined) ?? new RequestContext();
-  const memory = await agent.getMemory();
-  if (!memory) return null;
-
-  const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
-  const resourceIdFromContext = requestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
-  const threadIdFromArgs =
-    typeof mergedOptions?.memory?.thread === 'string'
-      ? mergedOptions.memory.thread
-      : (mergedOptions?.memory?.thread as { id?: string } | undefined)?.id;
-
-  const threadId = threadIdFromContext ?? threadIdFromArgs;
-  const resourceId = resourceIdFromContext ?? (mergedOptions?.memory?.resource as string | undefined);
-  const scopeKey = threadId || resourceId ? `${threadId ?? ''}|${resourceId ?? ''}` : null;
-  return { threadId, resourceId, scopeKey };
-}
-
-function buildContinuationDirective(batch: Array<Record<string, unknown>>): string {
-  const entries = batch
-    .map(chunk => {
-      const payload = (chunk as { payload?: Record<string, unknown> }).payload ?? {};
-      return {
-        toolCallId: payload.toolCallId as string | undefined,
-        toolName: payload.toolName as string | undefined,
-      };
-    })
-    .filter(e => !!e.toolCallId);
-
-  const idList = entries.map(e => (e.toolName ? `${e.toolCallId} (${e.toolName})` : e.toolCallId)).join(', ');
-
-  return (
-    `Background task(s) you previously dispatched have completed. ` +
-    `Process ONLY these tool-call IDs (their results are now in the conversation): ${idList}. ` +
-    `IMPORTANT: Do NOT process any tool-call IDs that were not in the list, ` +
-    `and do NOT call the same tool again — the result is already available. ` +
-    `Use these result(s) to answer the user's original question.`
-  );
-}
-
-function buildContinuationOpts(
-  baseContinuationOpts: Record<string, any>,
-  callerContext: any[] | undefined,
-  batch: Array<Record<string, unknown>>,
-): Record<string, any> {
-  const directive = buildContinuationDirective(batch);
-  return {
-    ...baseContinuationOpts,
-    context: [...(callerContext ?? []), { role: 'user' as const, content: directive }],
-  };
-}
-
-function acquireStreamSlot(activeStreams: Map<string, () => void>, scopeKey: string | null, closer: () => void): void {
-  if (!scopeKey) return;
-  const priorClose = activeStreams.get(scopeKey);
-  priorClose?.();
-  activeStreams.set(scopeKey, closer);
-}
-
-function releaseStreamSlot(activeStreams: Map<string, () => void>, scopeKey: string | null, closer: () => void): void {
-  if (!scopeKey) return;
-  if (activeStreams.get(scopeKey) === closer) {
-    activeStreams.delete(scopeKey);
-  }
 }
 
 export async function runDurableStreamUntilIdle<OUTPUT = undefined>(
@@ -119,7 +44,7 @@ export async function runDurableStreamUntilIdle<OUTPUT = undefined>(
     (restStreamOptions ?? {}) as Record<string, unknown>,
   ) as Record<string, any>;
 
-  const scope = await resolveScope(agent, mergedOptions);
+  const scope = await resolveStreamUntilIdleScope(agent, mergedOptions);
 
   if (!deps.bgManager || !scope) {
     return (agent as any).stream(messages, restStreamOptions as any) as Promise<DurableAgentStreamResult<OUTPUT>>;

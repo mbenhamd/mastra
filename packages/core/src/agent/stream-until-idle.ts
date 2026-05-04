@@ -1,3 +1,4 @@
+import { acquireStreamSlot, buildContinuationOpts, releaseStreamSlot, resolveStreamUntilIdleScope, TERMINAL_BG_CHUNKS } from "./shared/stream-until-idle";
 /**
  * Implementation of `Agent.streamUntilIdle`. Extracted from `agent.ts` to
  * keep that file focused on the public Agent surface. `Agent.streamUntilIdle`
@@ -19,7 +20,6 @@
  *    active inner stream) so slow first-tokens don't close the stream.
  */
 import type { BackgroundTaskManager } from '../background-tasks/manager';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../request-context';
 import type { MastraModelOutput } from '../stream/base/output';
 import { deepMerge } from '../utils';
 import type { Agent } from './agent';
@@ -44,130 +44,6 @@ export interface StreamUntilIdleDeps {
   bgManager: BackgroundTaskManager | undefined;
 }
 
-interface ResolvedScope {
-  threadId: string | undefined;
-  resourceId: string | undefined;
-  scopeKey: string | null;
-}
-
-const TERMINAL_BG_CHUNKS = new Set([
-  'background-task-completed',
-  'background-task-failed',
-  'background-task-cancelled',
-]);
-
-/**
- * Resolve memory / thread / resource for this call, matching `#execute`
- * semantics (RequestContext-scoped keys override caller-supplied memory
- * args). Returns `null` when no memory backend is configured — caller
- * falls through to a plain stream in that case.
- */
-async function resolveStreamUntilIdleScope(
-  agent: Agent<any, any, any, any>,
-  mergedOptions: Record<string, any>,
-): Promise<ResolvedScope | null> {
-  const requestContext = (mergedOptions?.requestContext as RequestContext | undefined) ?? new RequestContext();
-  const memory = await agent.getMemory({ requestContext });
-  if (!memory) return null;
-
-  const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
-  const resourceIdFromContext = requestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
-  const threadIdFromArgs =
-    typeof mergedOptions?.memory?.thread === 'string'
-      ? mergedOptions.memory.thread
-      : (mergedOptions?.memory?.thread as { id?: string } | undefined)?.id;
-
-  const threadId = threadIdFromContext ?? threadIdFromArgs;
-  const resourceId = resourceIdFromContext ?? (mergedOptions?.memory?.resource as string | undefined);
-
-  // Scope key = `threadId|resourceId`. Calls without either get null (no
-  // active-stream coordination — no way to meaningfully identify "the same
-  // conversation").
-  const scopeKey = threadId || resourceId ? `${threadId ?? ''}|${resourceId ?? ''}` : null;
-
-  return { threadId, resourceId, scopeKey };
-}
-
-/**
- * Build the ephemeral user-prompt text that tells the LLM which tool-call
- * IDs just completed. The directive stops the LLM from (a) re-processing
- * results already handled on a prior continuation and (b) mimicking the
- * prior assistant ack text ("I'm running it in the background") and
- * re-dispatching the same tool.
- */
-function buildContinuationDirective(batch: Array<Record<string, unknown>>): string {
-  const entries = batch
-    .map(chunk => {
-      const payload = (chunk as { payload?: Record<string, unknown> }).payload ?? {};
-      return {
-        toolCallId: payload.toolCallId as string | undefined,
-        toolName: payload.toolName as string | undefined,
-      };
-    })
-    .filter(e => !!e.toolCallId);
-
-  const idList = entries.map(e => (e.toolName ? `${e.toolCallId} (${e.toolName})` : e.toolCallId)).join(', ');
-
-  return (
-    `Background task(s) you previously dispatched have completed. ` +
-    `Process ONLY these tool-call IDs (their results are now in the conversation): ${idList}. ` +
-    `IMPORTANT: Do NOT process any tool-call IDs that were not in the list, ` +
-    `and do NOT call the same tool again — the result is already available. ` +
-    `Use these result(s) to answer the user's original question.`
-  );
-}
-
-/**
- * Wrap the continuation directive into a stream-options object suitable for
- * a recursive `agent.stream([], ...)` call. `context` messages are visible
- * to the LLM but NOT persisted to memory, so the directive doesn't pollute
- * future turns.
- */
-function buildContinuationOpts(
-  baseContinuationOpts: Record<string, any>,
-  callerContext: any[] | undefined,
-  batch: Array<Record<string, unknown>>,
-): Record<string, any> {
-  const directive = buildContinuationDirective(batch);
-  return {
-    ...baseContinuationOpts,
-    context: [...(callerContext ?? []), { role: 'user' as const, content: directive }],
-  };
-}
-
-/**
- * Register `closer` as the active wrapper for `scopeKey`, aborting any
- * prior registered closer first. No-op for null scopes.
- */
-function acquireStreamSlot(activeStreams: Map<string, () => void>, scopeKey: string | null, closer: () => void): void {
-  if (!scopeKey) return;
-  const priorClose = activeStreams.get(scopeKey);
-  priorClose?.();
-  activeStreams.set(scopeKey, closer);
-}
-
-/**
- * Remove `closer` from the active streams map iff it's still the entry for
- * `scopeKey`. A later call that took over (and replaced the entry) will not
- * get its own entry deleted by a predecessor's delayed close.
- */
-function releaseStreamSlot(activeStreams: Map<string, () => void>, scopeKey: string | null, closer: () => void): void {
-  if (!scopeKey) return;
-  if (activeStreams.get(scopeKey) === closer) {
-    activeStreams.delete(scopeKey);
-  }
-}
-
-/**
- * Run `agent.streamUntilIdle`. See the module doc above for the high-level
- * flow. Returns a `MastraModelOutput` whose `fullStream` spans the initial
- * turn PLUS any continuations triggered by background task completions.
- *
- * Aggregate properties (`text`, `toolCalls`, `toolResults`, `finishReason`,
- * `messageList`, `getFullOutput()`) still resolve against the first turn's
- * internal buffer. Consumers who need an aggregated view should read
- * `fullStream` and accumulate, or follow up with `agent.generate(...)`.
- */
 export async function runStreamUntilIdle<OUTPUT>(
   agent: Agent<any, any, any, any>,
   messages: MessageListInput,
