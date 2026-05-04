@@ -327,6 +327,14 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   }
 
   private static readonly RESERVED_CONTEXT_KEYS = new Set([MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY]);
+  private static readonly RESERVED_CONTEXT_KEY_PREFIXES = ['mastra.flow'];
+
+  private static isReservedContextKey(key: string): boolean {
+    return (
+      MastraServer.RESERVED_CONTEXT_KEYS.has(key) ||
+      MastraServer.RESERVED_CONTEXT_KEY_PREFIXES.some(prefix => key === prefix || key.startsWith(`${prefix}.`))
+    );
+  }
 
   protected mergeRequestContext({
     paramsRequestContext,
@@ -338,13 +346,13 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     const requestContext = new RequestContext();
     if (bodyRequestContext) {
       for (const [key, value] of Object.entries(bodyRequestContext)) {
-        if (MastraServer.RESERVED_CONTEXT_KEYS.has(key)) continue;
+        if (MastraServer.isReservedContextKey(key)) continue;
         requestContext.set(key, value);
       }
     }
     if (paramsRequestContext) {
       for (const [key, value] of Object.entries(paramsRequestContext)) {
-        if (MastraServer.RESERVED_CONTEXT_KEYS.has(key)) continue;
+        if (MastraServer.isReservedContextKey(key)) continue;
         requestContext.set(key, value);
       }
     }
