@@ -1225,6 +1225,20 @@ export class MemoryStorageClickhouse extends MemoryStorage {
       });
 
       // Verify updates were applied and retry if needed
+      const verifyResult = await this.client.query({
+        query: `SELECT id, content, role, type, "createdAt", thread_id AS "threadId", "resourceId" FROM ${TABLE_MESSAGES} WHERE id IN ({messageIds:Array(String)})`,
+        query_params: { messageIds: parsedExistingMessages.map(m => m.id) },
+        clickhouse_settings: {
+          date_time_input_format: 'best_effort',
+          date_time_output_format: 'iso',
+          use_client_time_zone: 1,
+          output_format_json_quote_64bit_integers: 0,
+        },
+      });
+
+      const verifyRows = await verifyResult.json();
+      const verifiedMessages = transformRows<MastraDBMessage>(verifyRows.data);
+
       for (const existingMessage of parsedExistingMessages) {
         const updatePayload = messages.find(m => m.id === existingMessage.id);
         if (!updatePayload) continue;
@@ -1232,23 +1246,9 @@ export class MemoryStorageClickhouse extends MemoryStorage {
         const { id, ...fieldsToUpdate } = updatePayload;
         if (Object.keys(fieldsToUpdate).length === 0) continue;
 
-        // Check if the update was actually applied
-        const verifyResult = await this.client.query({
-          query: `SELECT id, content, role, type, "createdAt", thread_id AS "threadId", "resourceId" FROM ${TABLE_MESSAGES} WHERE id = {messageId:String}`,
-          query_params: { messageId: id },
-          clickhouse_settings: {
-            date_time_input_format: 'best_effort',
-            date_time_output_format: 'iso',
-            use_client_time_zone: 1,
-            output_format_json_quote_64bit_integers: 0,
-          },
-        });
+        const updatedMessage = verifiedMessages.find(m => m.id === id);
 
-        const verifyRows = await verifyResult.json();
-        if (verifyRows.data.length > 0) {
-          const updatedMessage = transformRows<MastraDBMessage>(verifyRows.data)[0];
-
-          if (updatedMessage) {
+        if (updatedMessage) {
             // Check if the update was applied correctly
             let needsRetry = false;
             for (const [key, value] of Object.entries(fieldsToUpdate)) {
@@ -1339,71 +1339,21 @@ export class MemoryStorageClickhouse extends MemoryStorage {
         await new Promise(resolve => setTimeout(resolve, 10));
 
         const now = new Date().toISOString().replace('Z', '');
+        const threadIds = Array.from(threadIdsToUpdate);
 
-        // Get existing threads to preserve their data
-        const threadUpdatePromises = Array.from(threadIdsToUpdate).map(async threadId => {
-          // Get existing thread data - get newest version by updatedAt
-          const threadResult = await this.client.query({
-            query: `SELECT id, resourceId, title, metadata, createdAt FROM ${TABLE_THREADS} WHERE id = {threadId:String} ORDER BY updatedAt DESC LIMIT 1`,
-            query_params: { threadId },
-            clickhouse_settings: {
-              date_time_input_format: 'best_effort',
-              date_time_output_format: 'iso',
-              use_client_time_zone: 1,
-              output_format_json_quote_64bit_integers: 0,
-            },
-          });
-
-          const threadRows = await threadResult.json();
-          if (threadRows.data.length > 0) {
-            const existingThread = threadRows.data[0] as any;
-
-            // Delete existing thread
-            await this.client.command({
-              query: `DELETE FROM ${TABLE_THREADS} WHERE id = {threadId:String}`,
-              query_params: { threadId },
-              clickhouse_settings: {
-                date_time_input_format: 'best_effort',
-                use_client_time_zone: 1,
-                output_format_json_quote_64bit_integers: 0,
-              },
-            });
-
-            // Insert updated thread with new timestamp
-            await this.client.insert({
-              table: TABLE_THREADS,
-              format: 'JSONEachRow',
-              values: [
-                {
-                  id: existingThread.id,
-                  resourceId: existingThread.resourceId,
-                  title: existingThread.title,
-                  metadata:
-                    typeof existingThread.metadata === 'string'
-                      ? existingThread.metadata
-                      : serializeMetadata(existingThread.metadata as Record<string, unknown>),
-                  createdAt: existingThread.createdAt,
-                  updatedAt: now,
-                },
-              ],
-              clickhouse_settings: {
-                date_time_input_format: 'best_effort',
-                use_client_time_zone: 1,
-                output_format_json_quote_64bit_integers: 0,
-              },
-            });
-          }
-        });
-
-        await Promise.all(threadUpdatePromises);
-      }
-
-      // Re-fetch to return the fully updated messages
-      const updatedMessages: MastraDBMessage[] = [];
-      for (const messageId of messageIds) {
-        const updatedResult = await this.client.query({
-          query: `SELECT id, content, role, type, "createdAt", thread_id AS "threadId", "resourceId" FROM ${TABLE_MESSAGES} WHERE id = {messageId:String}`,
-          query_params: { messageId },
+        // Get existing threads to preserve their data - get newest version by updatedAt
+        const threadResult = await this.client.query({
+          query: `
+            SELECT id, resourceId, title, metadata, createdAt
+            FROM (
+              SELECT id, resourceId, title, metadata, createdAt,
+                     ROW_NUMBER() OVER (PARTITION BY id ORDER BY updatedAt DESC) as row_num
+              FROM ${TABLE_THREADS}
+              WHERE id IN ({threadIds:Array(String)})
+            )
+            WHERE row_num = 1
+          `,
+          query_params: { threadIds },
           clickhouse_settings: {
             date_time_input_format: 'best_effort',
             date_time_output_format: 'iso',
@@ -1411,14 +1361,61 @@ export class MemoryStorageClickhouse extends MemoryStorage {
             output_format_json_quote_64bit_integers: 0,
           },
         });
-        const updatedRows = await updatedResult.json();
-        if (updatedRows.data.length > 0) {
-          const message = transformRows<MastraDBMessage>(updatedRows.data)[0];
-          if (message) {
-            updatedMessages.push(message);
-          }
+
+        const threadRows = await threadResult.json();
+        const existingThreads = threadRows.data as any[];
+
+        if (existingThreads.length > 0) {
+          const existingThreadIds = existingThreads.map(t => t.id);
+
+          // Delete existing threads
+          await this.client.command({
+            query: `DELETE FROM ${TABLE_THREADS} WHERE id IN ({threadIds:Array(String)})`,
+            query_params: { threadIds: existingThreadIds },
+            clickhouse_settings: {
+              date_time_input_format: 'best_effort',
+              use_client_time_zone: 1,
+              output_format_json_quote_64bit_integers: 0,
+            },
+          });
+
+          // Insert updated threads with new timestamp
+          await this.client.insert({
+            table: TABLE_THREADS,
+            format: 'JSONEachRow',
+            values: existingThreads.map(existingThread => ({
+              id: existingThread.id,
+              resourceId: existingThread.resourceId,
+              title: existingThread.title,
+              metadata:
+                typeof existingThread.metadata === 'string'
+                  ? existingThread.metadata
+                  : serializeMetadata(existingThread.metadata as Record<string, unknown>),
+              createdAt: existingThread.createdAt,
+              updatedAt: now,
+            })),
+            clickhouse_settings: {
+              date_time_input_format: 'best_effort',
+              use_client_time_zone: 1,
+              output_format_json_quote_64bit_integers: 0,
+            },
+          });
         }
       }
+
+      // Re-fetch to return the fully updated messages
+      const updatedResult = await this.client.query({
+        query: `SELECT id, content, role, type, "createdAt", thread_id AS "threadId", "resourceId" FROM ${TABLE_MESSAGES} WHERE id IN ({messageIds:Array(String)})`,
+        query_params: { messageIds },
+        clickhouse_settings: {
+          date_time_input_format: 'best_effort',
+          date_time_output_format: 'iso',
+          use_client_time_zone: 1,
+          output_format_json_quote_64bit_integers: 0,
+        },
+      });
+      const updatedRows = await updatedResult.json();
+      const updatedMessages = transformRows<MastraDBMessage>(updatedRows.data);
 
       // Parse content back to objects
       return updatedMessages.map(message => {
