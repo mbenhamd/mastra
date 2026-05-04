@@ -1,0 +1,122 @@
+import { describe, expect, it } from 'vitest';
+import { ambiguousDecisionFrame, baseFlowPolicy, canonicalDecisionFrames } from './fixtures';
+import {
+  DecisionFrameSchema,
+  EvidenceLedgerSchema,
+  FLOW_STATE_SNAPSHOT_KEY,
+  FlowDecisionSchema,
+  FlowPolicySchema,
+  FlowStateSchema,
+} from './schemas';
+import { selectFlowDecision } from './selector';
+
+describe('flow signals schemas', () => {
+  it('accepts canonical fixtures for every v1 decision point', () => {
+    const points = canonicalDecisionFrames.map(frame => DecisionFrameSchema.parse(frame).decisionPoint);
+
+    expect(points).toEqual([
+      'turn_start',
+      'post_tool_batch',
+      'hitl_suspend',
+      'hitl_resume',
+      'delegation_entry',
+      'delegation_return',
+      'retry_after_tripwire',
+      'tool_failure',
+      'structured_output_failure',
+      'pre_final',
+    ]);
+  });
+
+  it('round-trips state, policy, evidence, and decisions through JSON serialization', () => {
+    const frame = DecisionFrameSchema.parse(canonicalDecisionFrames[1]);
+    const policy = FlowPolicySchema.parse(baseFlowPolicy);
+    const decision = selectFlowDecision(frame, policy);
+
+    const restoredState = FlowStateSchema.parse(JSON.parse(JSON.stringify(frame.state)));
+    const restoredPolicy = FlowPolicySchema.parse(JSON.parse(JSON.stringify(policy)));
+    const restoredDecision = FlowDecisionSchema.parse(JSON.parse(JSON.stringify(decision)));
+    const restoredEvidence = EvidenceLedgerSchema.parse(JSON.parse(JSON.stringify(frame.state.evidence)));
+
+    expect(FLOW_STATE_SNAPSHOT_KEY).toBe('mastra.flow.state');
+    expect(restoredState.version).toBe(1);
+    expect(restoredPolicy.id).toBe(policy.id);
+    expect(restoredDecision.id).toBe(decision.id);
+    expect(restoredEvidence.entries[0]?.ref?.hash).toBe('sha256:post_tool_batch');
+  });
+});
+
+describe('selectFlowDecision', () => {
+  it('is deterministic for the same frame and policy', () => {
+    const first = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+    const second = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+
+    expect(second).toEqual(first);
+  });
+
+  it('does not let requested signals weaken app policy', () => {
+    const frame = {
+      ...canonicalDecisionFrames[0]!,
+      signals: {
+        ...canonicalDecisionFrames[0]!.signals,
+        requestedCapabilities: [],
+        entities: {
+          ...canonicalDecisionFrames[0]!.signals.entities,
+          toolRefs: ['network.write'],
+        },
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.actions).toContainEqual({
+      type: 'apply_tool_policy',
+      allowedTools: ['knowledge.search'],
+      deniedTools: ['network.write'],
+    });
+    expect(decision.actions).toContainEqual({
+      type: 'require_evidence',
+      requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+    });
+  });
+
+  it('blocks for clarification when ambiguity is blocking', () => {
+    const decision = selectFlowDecision(ambiguousDecisionFrame, baseFlowPolicy);
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions[0]).toEqual({
+      type: 'ask_clarification',
+      question: 'Which output should be produced?',
+    });
+  });
+
+  it('finalizes at pre_final when required evidence is present', () => {
+    const frame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('finalize');
+    expect(decision.actions).toContainEqual({ type: 'finalize', contractId: 'contract.summary.v1' });
+    expect(decision.actions).not.toContainEqual({
+      type: 'require_evidence',
+      requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+    });
+  });
+
+  it('fails retry decision points when max retries are exceeded', () => {
+    const frame = canonicalDecisionFrames.find(item => item.decisionPoint === 'tool_failure')!;
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('failed');
+    expect(decision.actions).toContainEqual({ type: 'fail', reason: 'max_retries_exceeded' });
+  });
+
+  it('expresses evidence requirements as typed requirements, not prose checks', () => {
+    const decision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+    const evidenceAction = decision.actions.find(action => action.type === 'require_evidence');
+
+    expect(evidenceAction).toEqual({
+      type: 'require_evidence',
+      requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+    });
+  });
+});
