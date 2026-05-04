@@ -44,6 +44,31 @@ describe('flow signals schemas', () => {
     expect(restoredDecision.id).toBe(decision.id);
     expect(restoredEvidence.entries[0]?.ref?.hash).toBe('sha256:post_tool_batch');
   });
+
+  it('rejects no-op actionable decision payloads', () => {
+    const baseDecision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        actions: [{ type: 'require_capability', capabilities: [] }],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        actions: [{ type: 'require_evidence', requirements: [] }],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        actions: [{ type: 'apply_tool_policy', allowedTools: [], deniedTools: [] }],
+      }),
+    ).toThrow();
+  });
 });
 
 describe('selectFlowDecision', () => {

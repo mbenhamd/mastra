@@ -139,23 +139,33 @@ export const FlowPolicySchema = z
   })
   .strict();
 
-export const FlowDecisionActionSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('continue') }).strict(),
-  z.object({ type: z.literal('ask_clarification'), question: z.string().min(1).optional() }).strict(),
-  z.object({ type: z.literal('require_capability'), capabilities: z.array(z.string().min(1)) }).strict(),
-  z
-    .object({
-      type: z.literal('apply_tool_policy'),
-      allowedTools: z.array(z.string()),
-      deniedTools: z.array(z.string()),
-    })
-    .strict(),
-  z.object({ type: z.literal('require_evidence'), requirements: z.array(EvidenceRequirementSchema) }).strict(),
-  z.object({ type: z.literal('apply_output_contract'), contractId: z.string().min(1) }).strict(),
-  z.object({ type: z.literal('retry'), reason: z.string().min(1) }).strict(),
-  z.object({ type: z.literal('fail'), reason: z.string().min(1) }).strict(),
-  z.object({ type: z.literal('finalize'), contractId: z.string().min(1).optional() }).strict(),
-]);
+export const FlowDecisionActionSchema = z
+  .discriminatedUnion('type', [
+    z.object({ type: z.literal('continue') }).strict(),
+    z.object({ type: z.literal('ask_clarification'), question: z.string().min(1).optional() }).strict(),
+    z.object({ type: z.literal('require_capability'), capabilities: z.array(z.string().min(1)).min(1) }).strict(),
+    z
+      .object({
+        type: z.literal('apply_tool_policy'),
+        allowedTools: z.array(z.string().min(1)),
+        deniedTools: z.array(z.string().min(1)),
+      })
+      .strict(),
+    z.object({ type: z.literal('require_evidence'), requirements: z.array(EvidenceRequirementSchema).min(1) }).strict(),
+    z.object({ type: z.literal('apply_output_contract'), contractId: z.string().min(1) }).strict(),
+    z.object({ type: z.literal('retry'), reason: z.string().min(1) }).strict(),
+    z.object({ type: z.literal('fail'), reason: z.string().min(1) }).strict(),
+    z.object({ type: z.literal('finalize'), contractId: z.string().min(1).optional() }).strict(),
+  ])
+  .superRefine((action, ctx) => {
+    if (action.type === 'apply_tool_policy' && action.allowedTools.length === 0 && action.deniedTools.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'apply_tool_policy requires at least one allowed or denied tool',
+        path: ['allowedTools'],
+      });
+    }
+  });
 
 export const FlowDecisionSchema = z
   .object({

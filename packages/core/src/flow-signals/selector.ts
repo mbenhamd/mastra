@@ -1,4 +1,4 @@
-import { DecisionFrameSchema, FlowPolicySchema, FlowDecisionSchema } from './schemas';
+import { DecisionFrameSchema, FLOW_SIGNALS_VERSION, FlowPolicySchema, FlowDecisionSchema } from './schemas';
 import type { EvidenceEntry, EvidenceRequirement, FlowDecision, FlowDecisionAction } from './schemas';
 
 export type SelectFlowDecisionOptions = {
@@ -86,7 +86,7 @@ export function selectFlowDecision(
   }
 
   const decision: FlowDecision = {
-    version: 1,
+    version: FLOW_SIGNALS_VERSION,
     id: options.decisionId ?? createDecisionId(frame.id, policy.id, frame.state.revision),
     frameId: frame.id,
     policyId: policy.id,
