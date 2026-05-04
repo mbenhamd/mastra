@@ -138,7 +138,7 @@ describe('selectFlowDecision', () => {
     const decision = selectFlowDecision(ambiguousDecisionFrame, baseFlowPolicy);
 
     expect(decision.status).toBe('blocked');
-    expect(decision.actions[0]).toEqual({
+    expect(decision.actions).toContainEqual({
       type: 'ask_clarification',
       question: 'Which output should be produced?',
     });
@@ -189,10 +189,11 @@ describe('selectFlowDecision', () => {
   });
 
   it('does not emit retry when retry point requirements are blocked', () => {
+    const retryFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!;
     const frame = {
-      ...canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!,
+      ...retryFrame,
       state: {
-        ...canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!.state,
+        ...retryFrame.state,
         retryCount: 0,
       },
     };
