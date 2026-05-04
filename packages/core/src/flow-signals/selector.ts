@@ -106,12 +106,12 @@ function getDecisionStatus(actions: FlowDecisionAction[]): FlowDecision['status'
     return 'failed';
   }
 
-  if (actions.some(action => action.type === 'retry')) {
-    return 'retry';
-  }
-
   if (actions.some(action => action.type === 'ask_clarification' || action.type === 'require_evidence')) {
     return 'blocked';
+  }
+
+  if (actions.some(action => action.type === 'retry')) {
+    return 'retry';
   }
 
   if (actions.some(action => action.type === 'finalize')) {
@@ -123,7 +123,7 @@ function getDecisionStatus(actions: FlowDecisionAction[]): FlowDecision['status'
 
 function satisfiesEvidenceRequirement(entries: EvidenceEntry[], requirement: EvidenceRequirement): boolean {
   const count = entries.reduce((total, entry) => {
-    if (entry.status === 'rejected') {
+    if (entry.status !== 'accepted') {
       return total;
     }
 

@@ -134,6 +134,48 @@ describe('selectFlowDecision', () => {
     expect(decision.actions).toContainEqual({ type: 'fail', reason: 'max_retries_exceeded' });
   });
 
+  it('prioritizes blocked status over retry when retry point requirements are missing', () => {
+    const frame = {
+      ...canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!,
+      state: {
+        ...canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!.state,
+        retryCount: 0,
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions).toContainEqual({
+      type: 'require_evidence',
+      requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+    });
+    expect(decision.actions).toContainEqual({ type: 'retry', reason: 'retry_after_tripwire' });
+  });
+
+  it('does not satisfy evidence requirements with observed evidence', () => {
+    const baseFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const frame = {
+      ...baseFrame,
+      state: {
+        ...baseFrame.state,
+        evidence: {
+          version: 1 as const,
+          entries: baseFrame.state.evidence.entries.map(entry => ({ ...entry, status: 'observed' as const })),
+        },
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('blocked');
+    expect(decision.actions).toContainEqual({
+      type: 'require_evidence',
+      requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+    });
+    expect(decision.actions.some(action => action.type === 'finalize')).toBe(false);
+  });
+
   it('expresses evidence requirements as typed requirements, not prose checks', () => {
     const decision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
     const evidenceAction = decision.actions.find(action => action.type === 'require_evidence');
