@@ -38,7 +38,7 @@ describe('flow signals schemas', () => {
     const restoredDecision = FlowDecisionSchema.parse(JSON.parse(JSON.stringify(decision)));
     const restoredEvidence = EvidenceLedgerSchema.parse(JSON.parse(JSON.stringify(frame.state.evidence)));
 
-    expect(FLOW_STATE_SNAPSHOT_KEY).toBe('mastra.flow.state');
+    expect(FLOW_STATE_SNAPSHOT_KEY).toBe('mastra__flowState');
     expect(restoredState.version).toBe(1);
     expect(restoredPolicy.id).toBe(policy.id);
     expect(restoredDecision.id).toBe(decision.id);

@@ -1,7 +1,7 @@
 import { z } from 'zod/v4';
 
 export const FLOW_SIGNALS_VERSION = 1 as const;
-export const FLOW_STATE_SNAPSHOT_KEY = 'mastra.flow.state' as const;
+export const FLOW_STATE_SNAPSHOT_KEY = 'mastra__flowState' as const;
 
 export const FlowDecisionPointSchema = z.enum([
   'turn_start',
