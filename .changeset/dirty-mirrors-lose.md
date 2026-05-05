@@ -2,13 +2,5 @@
 '@mastra/core': minor
 ---
 
-Added lifecycle timestamps to Harness display state so UIs can show when visible tool and subagent entries start and complete. Restarted tool entries now also clear stale terminal output before the next run begins, suspended runs preserve in-flight display state for later resume, and force-ended subagents receive terminal error timestamps.
-
-```ts
-harness.subscribeDisplayState(state => {
-  const toolCallId = "tool-call-id";
-  const tool = state.activeTools.get(toolCallId);
-
-  console.log(tool?.startedAt, tool?.completedAt);
-});
-```
+Added `startedAt` and `completedAt` timestamps to Harness display state for active tools and subagents.
+This lets UIs show when tool calls and subagents start and finish.
