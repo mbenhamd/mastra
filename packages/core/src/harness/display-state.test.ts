@@ -205,6 +205,17 @@ describe('agent lifecycle', () => {
     emit(harness, { type: 'agent_end', reason: 'complete' });
     expect(harness.getDisplayState().activeSubagents.size).toBe(0);
   });
+
+  it('preserves activeSubagents on agent_end with reason suspended', () => {
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 'find', modelId: 'gpt-4o' });
+    expect(harness.getDisplayState().activeSubagents.size).toBe(1);
+
+    emit(harness, { type: 'agent_end', reason: 'suspended' });
+
+    const subagent = harness.getDisplayState().activeSubagents.get('s1');
+    expect(subagent?.status).toBe('running');
+    expect(subagent?.completedAt).toBeUndefined();
+  });
 });
 
 // ===========================================================================
@@ -417,6 +428,17 @@ describe('tool lifecycle', () => {
 
       vi.useRealTimers();
     });
+
+    it('does not clear resolved args when tool input starts for a running entry', () => {
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'old.ts' } });
+
+      emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'execute_command' });
+
+      const tool = harness.getDisplayState().activeTools.get('t1')!;
+      expect(tool.name).toBe('read_file');
+      expect(tool.args).toEqual({ path: 'old.ts' });
+      expect(tool.status).toBe('streaming_input');
+    });
   });
 
   describe('tool_update', () => {
@@ -562,6 +584,24 @@ describe('tool lifecycle', () => {
 
       const tool = harness.getDisplayState().activeTools.get('t1');
       expect(tool?.status).toBe('running');
+      expect(tool?.completedAt).toBeUndefined();
+    });
+
+    it('does not mark streaming_input tools as error on agent_end with reason suspended', () => {
+      emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'confirmAction' });
+      emit(harness, {
+        type: 'tool_suspended',
+        toolCallId: 't1',
+        toolName: 'confirmAction',
+        args: { action: 'deploy' },
+        suspendPayload: {},
+        resumeSchema: undefined,
+      });
+
+      emit(harness, { type: 'agent_end', reason: 'suspended' });
+
+      const tool = harness.getDisplayState().activeTools.get('t1');
+      expect(tool?.status).toBe('streaming_input');
       expect(tool?.completedAt).toBeUndefined();
     });
 
