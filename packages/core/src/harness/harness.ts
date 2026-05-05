@@ -32,6 +32,7 @@ import type { TaskItemSnapshot } from './tools';
 import { defaultDisplayState, defaultOMProgressState } from './types';
 import type {
   AvailableModel,
+  ActiveSubagentState,
   HeartbeatHandler,
   HarnessConfig,
   HarnessDisplayState,
@@ -2746,23 +2747,28 @@ export class Harness<TState = {}> {
       case 'agent_end': {
         ds.isRunning = false;
         ds.pendingApproval = null;
-        if (event.reason !== 'suspended') {
-          ds.pendingSuspension = null;
-        }
         ds.pendingQuestion = null;
         ds.pendingPlanApproval = null;
         if (event.reason !== 'suspended') {
+          ds.pendingSuspension = null;
+          const completedAt = new Date();
           // Mark any still-running tools as errored (handles abort mid-run)
           for (const [toolCallId, tool] of ds.activeTools) {
             if (tool.status === 'running' || tool.status === 'streaming_input') {
               tool.status = 'error';
-              tool.completedAt = new Date();
+              tool.completedAt = completedAt;
               ds.toolInputBuffers.delete(toolCallId);
             }
           }
-        }
-        if (event.reason !== 'suspended') {
-          ds.activeSubagents = new Map();
+          const forcedSubagents = new Map<string, ActiveSubagentState>();
+          for (const [toolCallId, subagent] of ds.activeSubagents) {
+            if (subagent.status === 'running') {
+              subagent.status = 'error';
+              subagent.completedAt = completedAt;
+              forcedSubagents.set(toolCallId, subagent);
+            }
+          }
+          ds.activeSubagents = forcedSubagents;
         }
         break;
       }

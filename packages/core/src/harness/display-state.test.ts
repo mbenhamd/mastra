@@ -199,8 +199,30 @@ describe('agent lifecycle', () => {
     expect(harness.getDisplayState().activeTools.get('t1')?.status).toBe('completed');
   });
 
-  it('clears activeSubagents on agent_end', () => {
+  it('marks running subagents as error on agent_end with non-suspended reason', () => {
+    vi.useFakeTimers();
+    const completedAt = new Date('2026-01-01T00:02:00.000Z');
     emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 'find', modelId: 'gpt-4o' });
+    expect(harness.getDisplayState().activeSubagents.size).toBe(1);
+
+    vi.setSystemTime(completedAt);
+    emit(harness, { type: 'agent_end', reason: 'complete' });
+
+    const subagent = harness.getDisplayState().activeSubagents.get('s1');
+    expect(subagent?.status).toBe('error');
+    expect(subagent?.completedAt).toEqual(completedAt);
+  });
+
+  it('clears completed subagents on agent_end', () => {
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 'find', modelId: 'gpt-4o' });
+    emit(harness, {
+      type: 'subagent_end',
+      toolCallId: 's1',
+      agentType: 'explore',
+      result: 'done',
+      isError: false,
+      durationMs: 1,
+    });
     expect(harness.getDisplayState().activeSubagents.size).toBe(1);
 
     emit(harness, { type: 'agent_end', reason: 'complete' });
