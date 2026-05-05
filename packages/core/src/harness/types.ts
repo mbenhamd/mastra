@@ -523,12 +523,13 @@ export interface OMProgressState {
 export interface ActiveToolState {
   name: string;
   args: unknown;
-  status: 'streaming_input' | 'running' | 'completed' | 'error';
+  status: 'streaming_input' | 'running' | 'completed' | 'error' | 'denied';
   startedAt?: Date;
   completedAt?: Date;
   partialResult?: string;
   result?: unknown;
   isError?: boolean;
+  deniedReason?: string;
   shellOutput?: string;
 }
 
@@ -757,7 +758,7 @@ export type HarnessEvent =
       resumeSchema?: string;
     }
   | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
-  | { type: 'tool_end'; toolCallId: string; result: unknown; isError: boolean }
+  | { type: 'tool_end'; toolCallId: string; result: unknown; isError: boolean; denied?: boolean; deniedReason?: string }
   | { type: 'tool_input_start'; toolCallId: string; toolName: string }
   | { type: 'tool_input_delta'; toolCallId: string; argsTextDelta: string; toolName?: string }
   | { type: 'tool_input_end'; toolCallId: string }
@@ -954,7 +955,15 @@ export type HarnessMessageContent =
   | { type: 'text'; text: string }
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
-  | { type: 'tool_result'; id: string; name: string; result: unknown; isError: boolean }
+  | {
+      type: 'tool_result';
+      id: string;
+      name: string;
+      result: unknown;
+      isError: boolean;
+      denied?: boolean;
+      deniedReason?: string;
+    }
   | {
       type: 'system_reminder';
       message: string;

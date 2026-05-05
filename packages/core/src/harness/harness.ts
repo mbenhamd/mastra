@@ -1618,6 +1618,8 @@ export class Harness<TState = {}> {
           args?: unknown;
           result?: unknown;
           isError?: boolean;
+          denied?: boolean;
+          deniedReason?: string;
         };
         [key: string]: unknown;
       }>;
@@ -1683,6 +1685,7 @@ export class Harness<TState = {}> {
                 name: inv.toolName,
                 result: inv.result,
                 isError: inv.isError ?? false,
+                ...(inv.denied === true ? { denied: true, deniedReason: inv.deniedReason } : {}),
               });
             }
           } else if (part.toolCallId && part.toolName) {
@@ -1702,6 +1705,12 @@ export class Harness<TState = {}> {
               name: part.toolName,
               result: part.result,
               isError: part.isError ?? false,
+              ...(part.denied === true
+                ? {
+                    denied: true,
+                    deniedReason: typeof part.deniedReason === 'string' ? part.deniedReason : undefined,
+                  }
+                : {}),
             });
           }
           break;
@@ -1932,12 +1941,15 @@ export class Harness<TState = {}> {
             name: toolResult.toolName,
             result: toolResult.result,
             isError: toolResult.isError ?? false,
+            ...(toolResult.denied === true ? { denied: true, deniedReason: toolResult.deniedReason } : {}),
           });
           this.emit({
             type: 'tool_end',
             toolCallId: toolResult.toolCallId,
             result: toolResult.result,
             isError: toolResult.isError ?? false,
+            denied: toolResult.denied,
+            deniedReason: toolResult.deniedReason,
           });
           this.emit({ type: 'message_update', message: { ...currentMessage } });
           break;
@@ -2874,13 +2886,16 @@ export class Harness<TState = {}> {
       case 'tool_end': {
         const endedTool = ds.activeTools.get(event.toolCallId);
         if (endedTool) {
-          endedTool.status = event.isError ? 'error' : 'completed';
+          endedTool.status = event.denied ? 'denied' : event.isError ? 'error' : 'completed';
           endedTool.result = event.result;
           endedTool.isError = event.isError;
           endedTool.completedAt = new Date();
+          if (event.denied) {
+            endedTool.deniedReason = event.deniedReason;
+          }
         }
         // Track file modifications
-        if (!event.isError) {
+        if (!event.isError && !event.denied) {
           const FILE_TOOLS = ['string_replace_lsp', 'write_file', 'ast_smart_edit'];
           const toolState = ds.activeTools.get(event.toolCallId);
           if (toolState && FILE_TOOLS.includes(toolState.name)) {
