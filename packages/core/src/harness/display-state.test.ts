@@ -98,6 +98,10 @@ describe('agent lifecycle', () => {
     harness = createHarness();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('sets isRunning to true on agent_start', () => {
     emit(harness, { type: 'agent_start' });
     expect(harness.getDisplayState().isRunning).toBe(true);
@@ -159,12 +163,30 @@ describe('agent lifecycle', () => {
     expect(harness.getDisplayState().activeTools.get('t1')?.status).toBe('error');
   });
 
+  it('sets completedAt when agent_end marks running tools as error', () => {
+    vi.useFakeTimers();
+    const completedAt = new Date('2026-01-01T00:02:00.000Z');
+    emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'test.ts' } });
+
+    vi.setSystemTime(completedAt);
+    emit(harness, { type: 'agent_end', reason: 'aborted' });
+
+    expect(harness.getDisplayState().activeTools.get('t1')?.completedAt).toEqual(completedAt);
+
+    vi.useRealTimers();
+  });
+
   it('marks streaming_input tools as error on agent_end', () => {
+    vi.useFakeTimers();
+    const completedAt = new Date('2026-01-01T00:02:00.000Z');
     emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'write_file' });
     expect(harness.getDisplayState().activeTools.get('t1')?.status).toBe('streaming_input');
 
+    vi.setSystemTime(completedAt);
     emit(harness, { type: 'agent_end', reason: 'aborted' });
-    expect(harness.getDisplayState().activeTools.get('t1')?.status).toBe('error');
+    const tool = harness.getDisplayState().activeTools.get('t1');
+    expect(tool?.status).toBe('error');
+    expect(tool?.completedAt).toEqual(completedAt);
   });
 
   it('does not change completed tools on agent_end', () => {
@@ -237,6 +259,10 @@ describe('tool lifecycle', () => {
     harness = createHarness();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   describe('tool_start / tool_end', () => {
     it('creates tool entry on tool_start', () => {
       emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'foo.ts' } });
@@ -245,6 +271,20 @@ describe('tool lifecycle', () => {
       expect(tool!.name).toBe('read_file');
       expect(tool!.args).toEqual({ path: 'foo.ts' });
       expect(tool!.status).toBe('running');
+    });
+
+    it('sets startedAt on tool_start', () => {
+      vi.useFakeTimers();
+      const startedAt = new Date('2026-01-01T00:00:00.000Z');
+      vi.setSystemTime(startedAt);
+
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'foo.ts' } });
+
+      const tool = harness.getDisplayState().activeTools.get('t1');
+      expect(tool!.startedAt).toEqual(startedAt);
+      expect(tool!.completedAt).toBeUndefined();
+
+      vi.useRealTimers();
     });
 
     it('updates existing tool entry on tool_start (after tool_input_start)', () => {
@@ -260,6 +300,26 @@ describe('tool lifecycle', () => {
       expect(tool!.args).toEqual({ path: 'x', content: 'y' });
     });
 
+    it('preserves startedAt when tool_start follows tool_input_start', () => {
+      vi.useFakeTimers();
+      const startedAt = new Date('2026-01-01T00:00:00.000Z');
+      const runningAt = new Date('2026-01-01T00:00:05.000Z');
+      vi.setSystemTime(startedAt);
+
+      emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'write_file' });
+      const streamingTool = harness.getDisplayState().activeTools.get('t1');
+      expect(streamingTool!.startedAt).toEqual(startedAt);
+
+      vi.setSystemTime(runningAt);
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'write_file', args: { path: 'x' } });
+
+      const runningTool = harness.getDisplayState().activeTools.get('t1');
+      expect(runningTool!.startedAt).toEqual(startedAt);
+      expect(runningTool!.completedAt).toBeUndefined();
+
+      vi.useRealTimers();
+    });
+
     it('marks tool as completed on successful tool_end', () => {
       emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: {} });
       emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'file contents', isError: false });
@@ -269,12 +329,91 @@ describe('tool lifecycle', () => {
       expect(tool!.isError).toBe(false);
     });
 
+    it('sets completedAt on successful tool_end', () => {
+      vi.useFakeTimers();
+      const completedAt = new Date('2026-01-01T00:01:00.000Z');
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: {} });
+
+      vi.setSystemTime(completedAt);
+      emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'file contents', isError: false });
+
+      const tool = harness.getDisplayState().activeTools.get('t1');
+      expect(tool!.completedAt).toEqual(completedAt);
+
+      vi.useRealTimers();
+    });
+
     it('marks tool as error on failed tool_end', () => {
       emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: {} });
       emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'not found', isError: true });
       const tool = harness.getDisplayState().activeTools.get('t1');
       expect(tool!.status).toBe('error');
       expect(tool!.isError).toBe(true);
+    });
+
+    it('sets completedAt on failed tool_end', () => {
+      vi.useFakeTimers();
+      const completedAt = new Date('2026-01-01T00:01:00.000Z');
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: {} });
+
+      vi.setSystemTime(completedAt);
+      emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'not found', isError: true });
+
+      expect(harness.getDisplayState().activeTools.get('t1')!.completedAt).toEqual(completedAt);
+
+      vi.useRealTimers();
+    });
+
+    it('refreshes startedAt and clears completedAt when a completed tool restarts', () => {
+      vi.useFakeTimers();
+      const firstStartedAt = new Date('2026-01-01T00:00:00.000Z');
+      const firstCompletedAt = new Date('2026-01-01T00:01:00.000Z');
+      const secondStartedAt = new Date('2026-01-01T00:02:00.000Z');
+
+      vi.setSystemTime(firstStartedAt);
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: {} });
+      vi.setSystemTime(firstCompletedAt);
+      emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'ok', isError: false });
+
+      vi.setSystemTime(secondStartedAt);
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'again.ts' } });
+
+      const tool = harness.getDisplayState().activeTools.get('t1')!;
+      expect(tool.status).toBe('running');
+      expect(tool.startedAt).toEqual(secondStartedAt);
+      expect(tool.completedAt).toBeUndefined();
+      expect(tool.result).toBeUndefined();
+      expect(tool.isError).toBeUndefined();
+
+      vi.useRealTimers();
+    });
+
+    it('refreshes startedAt and clears terminal fields when tool input restarts after completion', () => {
+      vi.useFakeTimers();
+      const firstStartedAt = new Date('2026-01-01T00:00:00.000Z');
+      const firstCompletedAt = new Date('2026-01-01T00:01:00.000Z');
+      const secondStartedAt = new Date('2026-01-01T00:02:00.000Z');
+
+      vi.setSystemTime(firstStartedAt);
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'execute_command', args: {} });
+      emit(harness, { type: 'tool_update', toolCallId: 't1', partialResult: 'partial output' });
+      emit(harness, { type: 'shell_output', toolCallId: 't1', output: 'line\n', stream: 'stdout' });
+      vi.setSystemTime(firstCompletedAt);
+      emit(harness, { type: 'tool_end', toolCallId: 't1', result: 'failed', isError: true });
+
+      vi.setSystemTime(secondStartedAt);
+      emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'execute_command' });
+
+      const tool = harness.getDisplayState().activeTools.get('t1')!;
+      expect(tool.status).toBe('streaming_input');
+      expect(tool.startedAt).toEqual(secondStartedAt);
+      expect(tool.completedAt).toBeUndefined();
+      expect(tool.partialResult).toBeUndefined();
+      expect(tool.result).toBeUndefined();
+      expect(tool.isError).toBeUndefined();
+      expect(tool.shellOutput).toBeUndefined();
+
+      vi.useRealTimers();
     });
   });
 
@@ -559,6 +698,10 @@ describe('subagent lifecycle', () => {
     harness = createHarness();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('creates subagent entry on subagent_start', () => {
     emit(harness, {
       type: 'subagent_start',
@@ -575,6 +718,18 @@ describe('subagent lifecycle', () => {
     expect(sub!.forked).toBe(true);
     expect(sub!.status).toBe('running');
     expect(sub!.toolCalls).toEqual([]);
+  });
+
+  it('sets startedAt on subagent_start', () => {
+    vi.useFakeTimers();
+    const startedAt = new Date('2026-01-01T00:00:00.000Z');
+    vi.setSystemTime(startedAt);
+
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 't', modelId: 'm' });
+
+    const sub = harness.getDisplayState().activeSubagents.get('s1');
+    expect(sub!.startedAt).toEqual(startedAt);
+    expect(sub!.completedAt).toBeUndefined();
   });
 
   it('appends text on subagent_text_delta', () => {
@@ -635,6 +790,24 @@ describe('subagent lifecycle', () => {
     expect(sub.result).toBe('done');
   });
 
+  it('sets completedAt on successful subagent_end', () => {
+    vi.useFakeTimers();
+    const completedAt = new Date('2026-01-01T00:01:00.000Z');
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
+
+    vi.setSystemTime(completedAt);
+    emit(harness, {
+      type: 'subagent_end',
+      toolCallId: 's1',
+      agentType: 'execute',
+      result: 'done',
+      isError: false,
+      durationMs: 1234,
+    });
+
+    expect(harness.getDisplayState().activeSubagents.get('s1')!.completedAt).toEqual(completedAt);
+  });
+
   it('marks subagent as error on failed subagent_end', () => {
     emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
     emit(harness, {
@@ -646,6 +819,24 @@ describe('subagent lifecycle', () => {
       durationMs: 500,
     });
     expect(harness.getDisplayState().activeSubagents.get('s1')!.status).toBe('error');
+  });
+
+  it('sets completedAt on failed subagent_end', () => {
+    vi.useFakeTimers();
+    const completedAt = new Date('2026-01-01T00:01:00.000Z');
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
+
+    vi.setSystemTime(completedAt);
+    emit(harness, {
+      type: 'subagent_end',
+      toolCallId: 's1',
+      agentType: 'execute',
+      result: 'failed',
+      isError: true,
+      durationMs: 500,
+    });
+
+    expect(harness.getDisplayState().activeSubagents.get('s1')!.completedAt).toEqual(completedAt);
   });
 });
 
@@ -1439,17 +1630,36 @@ describe('Harness.subscribeDisplayState()', () => {
 
     emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'write_file', args });
     emit(harness, { type: 'tool_end', toolCallId: 't1', result: { ok: true }, isError: false });
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 't', modelId: 'm' });
+    emit(harness, {
+      type: 'subagent_end',
+      toolCallId: 's1',
+      agentType: 'explore',
+      result: 'done',
+      isError: false,
+      durationMs: 1,
+    });
 
     const snapshot = listener.mock.calls.at(-1)?.[0];
     expect(snapshot).toBeDefined();
 
     (snapshot!.activeTools.get('t1')!.args as typeof args).nested.marker = 'mutated';
+    snapshot!.activeTools.get('t1')!.startedAt!.setUTCFullYear(2030);
+    snapshot!.activeTools.get('t1')!.completedAt!.setUTCFullYear(2031);
+    snapshot!.activeSubagents.get('s1')!.startedAt!.setUTCFullYear(2032);
+    snapshot!.activeSubagents.get('s1')!.completedAt!.setUTCFullYear(2033);
     snapshot!.modifiedFiles.get('original.ts')!.firstModified.setUTCFullYear(2030);
     snapshot!.modifiedFiles.get('original.ts')!.operations.push('extra');
 
     const liveToolArgs = harness.getDisplayState().activeTools.get('t1')!.args as typeof args;
+    const liveTool = harness.getDisplayState().activeTools.get('t1')!;
+    const liveSubagent = harness.getDisplayState().activeSubagents.get('s1')!;
     const liveModifiedFile = harness.getDisplayState().modifiedFiles.get('original.ts')!;
     expect(liveToolArgs.nested.marker).toBe('original');
+    expect(liveTool.startedAt).toEqual(firstModified);
+    expect(liveTool.completedAt).toEqual(firstModified);
+    expect(liveSubagent.startedAt).toEqual(firstModified);
+    expect(liveSubagent.completedAt).toEqual(firstModified);
     expect(liveModifiedFile.firstModified).toEqual(firstModified);
     expect(liveModifiedFile.operations).toEqual(['write_file']);
   });
