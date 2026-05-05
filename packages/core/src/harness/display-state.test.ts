@@ -395,7 +395,7 @@ describe('tool lifecycle', () => {
       const secondStartedAt = new Date('2026-01-01T00:02:00.000Z');
 
       vi.setSystemTime(firstStartedAt);
-      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'execute_command', args: {} });
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'read_file', args: { path: 'old.ts' } });
       emit(harness, { type: 'tool_update', toolCallId: 't1', partialResult: 'partial output' });
       emit(harness, { type: 'shell_output', toolCallId: 't1', output: 'line\n', stream: 'stdout' });
       vi.setSystemTime(firstCompletedAt);
@@ -405,6 +405,8 @@ describe('tool lifecycle', () => {
       emit(harness, { type: 'tool_input_start', toolCallId: 't1', toolName: 'execute_command' });
 
       const tool = harness.getDisplayState().activeTools.get('t1')!;
+      expect(tool.name).toBe('execute_command');
+      expect(tool.args).toEqual({});
       expect(tool.status).toBe('streaming_input');
       expect(tool.startedAt).toEqual(secondStartedAt);
       expect(tool.completedAt).toBeUndefined();
@@ -543,6 +545,24 @@ describe('tool lifecycle', () => {
 
       emit(harness, { type: 'agent_end', reason: 'suspended' });
       expect(harness.getDisplayState().pendingSuspension).not.toBeNull();
+    });
+
+    it('does not mark running tools as error on agent_end with reason suspended', () => {
+      emit(harness, { type: 'tool_start', toolCallId: 't1', toolName: 'confirmAction', args: { action: 'deploy' } });
+      emit(harness, {
+        type: 'tool_suspended',
+        toolCallId: 't1',
+        toolName: 'confirmAction',
+        args: { action: 'deploy' },
+        suspendPayload: {},
+        resumeSchema: undefined,
+      });
+
+      emit(harness, { type: 'agent_end', reason: 'suspended' });
+
+      const tool = harness.getDisplayState().activeTools.get('t1');
+      expect(tool?.status).toBe('running');
+      expect(tool?.completedAt).toBeUndefined();
     });
 
     it('clears pendingSuspension on agent_end with non-suspended reason', () => {

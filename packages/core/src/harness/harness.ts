@@ -2751,11 +2751,13 @@ export class Harness<TState = {}> {
         }
         ds.pendingQuestion = null;
         ds.pendingPlanApproval = null;
-        // Mark any still-running tools as errored (handles abort mid-run)
-        for (const [, tool] of ds.activeTools) {
-          if (tool.status === 'running' || tool.status === 'streaming_input') {
-            tool.status = 'error';
-            tool.completedAt = new Date();
+        if (event.reason !== 'suspended') {
+          // Mark any still-running tools as errored (handles abort mid-run)
+          for (const [, tool] of ds.activeTools) {
+            if (tool.status === 'running' || tool.status === 'streaming_input') {
+              tool.status = 'error';
+              tool.completedAt = new Date();
+            }
           }
         }
         ds.activeSubagents = new Map();
@@ -2780,6 +2782,8 @@ export class Harness<TState = {}> {
         ds.toolInputBuffers.set(event.toolCallId, { text: '', toolName: event.toolName });
         const existing = ds.activeTools.get(event.toolCallId);
         if (existing) {
+          existing.name = event.toolName;
+          existing.args = {};
           if (existing.status === 'completed' || existing.status === 'error') {
             existing.startedAt = new Date();
           } else {
