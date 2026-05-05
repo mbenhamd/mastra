@@ -2,10 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Agent } from '../agent';
 import { InMemoryStore } from '../storage/mock';
 import { Harness } from './harness';
-import type { HarnessEvent } from './types';
+import type { HarnessEvent, HarnessSubagent, HarnessSubagentHistoryEntry } from './types';
 import { defaultDisplayState } from './types';
 
-function createHarness(storage?: InMemoryStore) {
+function createHarness(storage?: InMemoryStore, opts?: { subagents?: HarnessSubagent[] }) {
   const agent = new Agent({
     name: 'test-agent',
     instructions: 'You are a test agent.',
@@ -16,6 +16,7 @@ function createHarness(storage?: InMemoryStore) {
     id: 'test-harness',
     storage: storage ?? new InMemoryStore(),
     modes: [{ id: 'default', name: 'Default', default: true, agent }],
+    subagents: opts?.subagents,
   });
 }
 
@@ -815,6 +816,44 @@ describe('subagent lifecycle', () => {
     expect(sub!.completedAt).toBeUndefined();
   });
 
+  it('includes displayName from configured subagent name on subagent_start', () => {
+    harness = createHarness(undefined, {
+      subagents: [
+        {
+          id: 'explore',
+          name: 'Explore',
+          description: 'Find relevant context',
+          instructions: 'Find relevant context.',
+        },
+      ],
+    });
+
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 't', modelId: 'm' });
+
+    const sub = harness.getDisplayState().activeSubagents.get('s1');
+    expect(sub!.agentType).toBe('explore');
+    expect(sub!.displayName).toBe('Explore');
+  });
+
+  it('leaves displayName unset when agentType has no configured subagent match', () => {
+    harness = createHarness(undefined, {
+      subagents: [
+        {
+          id: 'explore',
+          name: 'Explore',
+          description: 'Find relevant context',
+          instructions: 'Find relevant context.',
+        },
+      ],
+    });
+
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
+
+    const sub = harness.getDisplayState().activeSubagents.get('s1');
+    expect(sub!.agentType).toBe('execute');
+    expect(sub!.displayName).toBeUndefined();
+  });
+
   it('appends text on subagent_text_delta', () => {
     emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 't', modelId: 'm' });
     emit(harness, { type: 'subagent_text_delta', toolCallId: 's1', agentType: 'explore', textDelta: 'hello ' });
@@ -879,6 +918,7 @@ describe('subagent lifecycle', () => {
     emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
 
     vi.setSystemTime(completedAt);
+
     emit(harness, {
       type: 'subagent_end',
       toolCallId: 's1',
@@ -889,6 +929,37 @@ describe('subagent lifecycle', () => {
     });
 
     expect(harness.getDisplayState().activeSubagents.get('s1')!.completedAt).toEqual(completedAt);
+  });
+
+  it('preserves displayName on terminal subagent history entries', () => {
+    harness = createHarness(undefined, {
+      subagents: [
+        {
+          id: 'execute',
+          name: 'Execute',
+          description: 'Perform the delegated task',
+          instructions: 'Perform the delegated task.',
+        },
+      ],
+    });
+
+    emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'execute', task: 't', modelId: 'm' });
+    emit(harness, {
+      type: 'subagent_end',
+      toolCallId: 's1',
+      agentType: 'execute',
+      result: 'done',
+      isError: false,
+      durationMs: 1234,
+    });
+
+    const terminalSubagent = harness.getDisplayState().activeSubagents.get('s1')!;
+    const historyEntry: HarnessSubagentHistoryEntry = terminalSubagent;
+
+    expect(terminalSubagent.status).toBe('completed');
+    expect(historyEntry.agentType).toBe('execute');
+    expect(historyEntry.displayName).toBe('Execute');
+    expect(historyEntry.result).toBe('done');
   });
 
   it('marks subagent as error on failed subagent_end', () => {
