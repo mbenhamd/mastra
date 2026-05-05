@@ -2753,10 +2753,11 @@ export class Harness<TState = {}> {
         ds.pendingPlanApproval = null;
         if (event.reason !== 'suspended') {
           // Mark any still-running tools as errored (handles abort mid-run)
-          for (const [, tool] of ds.activeTools) {
+          for (const [toolCallId, tool] of ds.activeTools) {
             if (tool.status === 'running' || tool.status === 'streaming_input') {
               tool.status = 'error';
               tool.completedAt = new Date();
+              ds.toolInputBuffers.delete(toolCallId);
             }
           }
         }

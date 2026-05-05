@@ -187,6 +187,7 @@ describe('agent lifecycle', () => {
     const tool = harness.getDisplayState().activeTools.get('t1');
     expect(tool?.status).toBe('error');
     expect(tool?.completedAt).toEqual(completedAt);
+    expect(harness.getDisplayState().toolInputBuffers.has('t1')).toBe(false);
   });
 
   it('does not change completed tools on agent_end', () => {
