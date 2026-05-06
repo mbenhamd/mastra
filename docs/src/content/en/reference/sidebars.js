@@ -49,7 +49,6 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'ai-sdk/chat-route', label: 'chatRoute()' },
-        { type: 'doc', id: 'ai-sdk/harness-to-ui-message-stream', label: 'harnessToUIMessageStream()' },
         { type: 'doc', id: 'ai-sdk/handle-chat-stream', label: 'handleChatStream()' },
         { type: 'doc', id: 'ai-sdk/handle-network-stream', label: 'handleNetworkStream()' },
         { type: 'doc', id: 'ai-sdk/handle-workflow-stream', label: 'handleWorkflowStream()' },
@@ -376,6 +375,7 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'processors/batch-parts-processor', label: 'BatchPartsProcessor' },
+        { type: 'doc', id: 'processors/cost-guard-processor', label: 'CostGuardProcessor' },
         { type: 'doc', id: 'processors/language-detector', label: 'LanguageDetector' },
         { type: 'doc', id: 'processors/message-history-processor', label: 'MessageHistory' },
         { type: 'doc', id: 'processors/moderation-processor', label: 'ModerationProcessor' },
@@ -387,6 +387,7 @@ const sidebars = {
           id: 'processors/prompt-injection-detector',
           label: 'PromptInjectionDetector',
         },
+        { type: 'doc', id: 'processors/regex-filter-processor', label: 'RegexFilterProcessor' },
         { type: 'doc', id: 'processors/semantic-recall-processor', label: 'SemanticRecall' },
         { type: 'doc', id: 'processors/skill-search-processor', label: 'SkillSearchProcessor' },
         { type: 'doc', id: 'processors/stream-error-retry-processor', label: 'StreamErrorRetryProcessor' },
@@ -576,7 +577,6 @@ const sidebars = {
         { type: 'doc', id: 'workflows/run', label: 'Run Class' },
         { type: 'doc', id: 'workflows/step', label: 'Step Class' },
         { type: 'doc', id: 'workflows/workflow', label: 'Workflow Class' },
-        { type: 'doc', id: 'workflows/workflow-state-reader', label: 'Workflow State Reader' },
         {
           type: 'category',
           label: 'Methods',

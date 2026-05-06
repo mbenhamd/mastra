@@ -4,7 +4,7 @@ import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
 import type { CallSettings, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
-import type { MastraDBMessage, MessageList } from '../../../agent/message-list';
+import type { MessageList } from '../../../agent/message-list';
 import { TripWire } from '../../../agent/trip-wire';
 import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '../../../agent/utils';
 import { generateBackgroundTaskSystemPrompt } from '../../../background-tasks';
@@ -17,7 +17,6 @@ import { ConsoleLogger } from '../../../logger';
 import { createObservabilityContext, SpanType } from '../../../observability';
 import { executeWithContextSync } from '../../../observability/utils';
 import type { ProcessorStreamWriter } from '../../../processors/index';
-import { createPromptOnlyMessageList } from '../../../processors/index';
 import { PrepareStepProcessor } from '../../../processors/processors/prepare-step';
 import { ProcessorRunner } from '../../../processors/runner';
 import { RequestContext } from '../../../request-context';
@@ -32,13 +31,13 @@ import type {
   StreamTransport,
   StreamTransportRef,
 } from '../../../stream/types';
-import { ChunkFrom } from '../../../stream/types';
-import {
-  projectToolPayloadForTargets,
-  withToolPayloadProjectionMetadata,
-  withToolPayloadProjectionProviderMetadata,
-} from '../../../tools/payload-projection';
+import { ChunkFrom, readModelStreamTransport } from '../../../stream/types';
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
+import {
+  createToolGateSubjectForTool,
+  evaluateToolGateForRequest,
+  getToolGateRuntimeState,
+} from '../../../tools/tool-gate';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
 import { isMastraTool } from '../../../tools/toolchecks';
 import { makeCoreTool } from '../../../utils';
@@ -69,124 +68,8 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   logger?: IMastraLogger;
   transportRef?: StreamTransportRef;
   transportResolver?: () => StreamTransport | undefined;
-  toolPayloadProjection?: NonNullable<OuterLLMRun['_internal']>['toolPayloadProjection'];
+  toolGatePolicyActive?: boolean;
 };
-
-async function addToolPayloadProjectionToChunk<OUTPUT>(
-  chunk: ChunkType<OUTPUT>,
-  {
-    tools,
-    policy,
-    logger,
-  }: {
-    tools?: ToolSet;
-    policy?: NonNullable<OuterLLMRun['_internal']>['toolPayloadProjection'];
-    logger?: IMastraLogger;
-  },
-): Promise<ChunkType<OUTPUT>> {
-  const payload = 'payload' in chunk ? chunk.payload : undefined;
-  if (!payload || typeof payload !== 'object') {
-    return chunk;
-  }
-
-  const toolName = (payload as { toolName?: unknown }).toolName;
-  const toolCallId = (payload as { toolCallId?: unknown }).toolCallId;
-  if (typeof toolName !== 'string' || typeof toolCallId !== 'string') {
-    return chunk;
-  }
-
-  const tool =
-    tools?.[toolName] ||
-    findProviderToolByName(tools, toolName) ||
-    Object.values(tools || {}).find((candidate: any) => `id` in candidate && candidate.id === toolName);
-  const source = {
-    policy,
-    toolProjection: (tool as { payloadProjection?: unknown } | undefined)?.payloadProjection as any,
-  };
-  let projection;
-
-  if (chunk.type === 'tool-call') {
-    projection = await projectToolPayloadForTargets(
-      {
-        phase: 'input-available',
-        toolName,
-        toolCallId,
-        input: (payload as { args?: unknown }).args,
-        providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-      },
-      source,
-      logger,
-    );
-  } else if (chunk.type === 'tool-call-delta') {
-    projection = await projectToolPayloadForTargets(
-      {
-        phase: 'input-delta',
-        toolName,
-        toolCallId,
-        inputTextDelta: (payload as { argsTextDelta?: string }).argsTextDelta,
-        providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-      },
-      source,
-      logger,
-    );
-  } else if (chunk.type === 'tool-result') {
-    chunk = withToolPayloadProjectionMetadata(
-      chunk,
-      await projectToolPayloadForTargets(
-        {
-          phase: 'input-available',
-          toolName,
-          toolCallId,
-          input: (payload as { args?: unknown }).args,
-          providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-        },
-        source,
-        logger,
-      ),
-    );
-    projection = await projectToolPayloadForTargets(
-      {
-        phase: 'output-available',
-        toolName,
-        toolCallId,
-        input: (payload as { args?: unknown }).args,
-        output: (payload as { result?: unknown }).result,
-        providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-      },
-      source,
-      logger,
-    );
-  } else if (chunk.type === 'tool-error') {
-    chunk = withToolPayloadProjectionMetadata(
-      chunk,
-      await projectToolPayloadForTargets(
-        {
-          phase: 'input-available',
-          toolName,
-          toolCallId,
-          input: (payload as { args?: unknown }).args,
-          providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-        },
-        source,
-        logger,
-      ),
-    );
-    projection = await projectToolPayloadForTargets(
-      {
-        phase: 'error',
-        toolName,
-        toolCallId,
-        input: (payload as { args?: unknown }).args,
-        error: (payload as { error?: unknown }).error,
-        providerMetadata: (payload as { providerMetadata?: Record<string, unknown> }).providerMetadata,
-      },
-      source,
-      logger,
-    );
-  }
-
-  return withToolPayloadProjectionMetadata(chunk, projection);
-}
 
 function buildResponseModelMetadata(
   runState: AgenticRunState,
@@ -206,6 +89,74 @@ function buildResponseModelMetadata(
   return Object.keys(metadata).length > 0 ? { metadata } : undefined;
 }
 
+function getSpecificToolChoiceName(toolChoice: ToolChoice<any> | undefined): string | undefined {
+  return typeof toolChoice === 'object' && toolChoice !== null && 'toolName' in toolChoice
+    ? String(toolChoice.toolName)
+    : undefined;
+}
+
+async function applyToolGateToModelInput<TOOLS extends ToolSet>({
+  currentStep,
+  requestContext,
+  runId,
+  threadId,
+  resourceId,
+}: {
+  currentStep: {
+    tools?: TOOLS | undefined;
+    toolChoice?: ToolChoice<TOOLS> | undefined;
+    activeTools?: (keyof TOOLS)[] | undefined;
+  };
+  requestContext: RequestContext;
+  runId: string;
+  threadId?: string;
+  resourceId?: string;
+}): Promise<void> {
+  if (!getToolGateRuntimeState(requestContext, { runId })?.policy) return;
+  if (!currentStep.tools) return;
+
+  const toolEntries = Object.entries(currentStep.tools);
+  if (toolEntries.length === 0) return;
+
+  const activeToolNames = currentStep.activeTools?.map(String);
+  const deniedToolNames = new Set<string>();
+
+  for (const [toolName, tool] of toolEntries) {
+    if (activeToolNames && !activeToolNames.includes(toolName)) continue;
+
+    const decision = await evaluateToolGateForRequest({
+      requestContext,
+      subject: createToolGateSubjectForTool({
+        boundary: 'model-input',
+        toolName,
+        tool,
+      }),
+      runId,
+      threadId,
+      resourceId,
+    });
+
+    if (decision?.effect === 'deny') {
+      deniedToolNames.add(toolName);
+    }
+  }
+
+  if (deniedToolNames.size === 0) return;
+
+  currentStep.tools = Object.fromEntries(toolEntries.filter(([toolName]) => !deniedToolNames.has(toolName))) as TOOLS;
+
+  if (currentStep.activeTools) {
+    currentStep.activeTools = currentStep.activeTools.filter(
+      toolName => !deniedToolNames.has(String(toolName)),
+    ) as (keyof TOOLS)[];
+  }
+
+  const chosenToolName = getSpecificToolChoiceName(currentStep.toolChoice);
+  if (chosenToolName && deniedToolNames.has(chosenToolName)) {
+    currentStep.toolChoice = Object.keys(currentStep.tools).length > 0 ? ('auto' as ToolChoice<TOOLS>) : undefined;
+  }
+}
+
 async function processOutputStream<OUTPUT = undefined>({
   tools,
   messageId,
@@ -219,12 +170,12 @@ async function processOutputStream<OUTPUT = undefined>({
   logger,
   transportRef,
   transportResolver,
-  toolPayloadProjection,
+  toolGatePolicyActive,
 }: ProcessOutputStreamOptions<OUTPUT>): Promise<CollectedChunk[]> {
   let transportSet = false;
   const collectedChunks: CollectedChunk[] = [];
 
-  for await (let chunk of outputStream._getBaseStream()) {
+  for await (const chunk of outputStream._getBaseStream()) {
     // Stop processing chunks if the abort signal has fired.
     // Some LLM providers continue streaming data after abort (e.g. due to buffering),
     // so we must check the signal on each iteration to avoid accumulating the full
@@ -250,18 +201,8 @@ async function processOutputStream<OUTPUT = undefined>({
       continue;
     }
 
-    chunk = await addToolPayloadProjectionToChunk(chunk, {
-      tools,
-      policy: toolPayloadProjection,
-      logger,
-    });
-
     // Collect every chunk for post-stream message building
-    collectedChunks.push({
-      type: chunk.type,
-      payload: 'payload' in chunk ? chunk.payload : undefined,
-      metadata: chunk.metadata,
-    });
+    collectedChunks.push({ type: chunk.type, payload: chunk.payload });
 
     switch (chunk.type) {
       case 'response-metadata':
@@ -280,7 +221,7 @@ async function processOutputStream<OUTPUT = undefined>({
           tools?.[chunk.payload.toolName] ||
           Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
 
-        if (tool && 'onInputStart' in tool) {
+        if (!toolGatePolicyActive && tool && 'onInputStart' in tool) {
           try {
             await tool?.onInputStart?.({
               toolCallId: chunk.payload.toolCallId,
@@ -301,7 +242,7 @@ async function processOutputStream<OUTPUT = undefined>({
           tools?.[chunk.payload.toolName || ''] ||
           Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
 
-        if (tool && 'onInputDelta' in tool) {
+        if (!toolGatePolicyActive && tool && 'onInputDelta' in tool) {
           try {
             await tool?.onInputDelta?.({
               inputTextDelta: chunk.payload.argsTextDelta,
@@ -379,7 +320,7 @@ async function processOutputStream<OUTPUT = undefined>({
               args: chunk.payload.args,
               result: chunk.payload.result,
             },
-            providerMetadata: withToolPayloadProjectionProviderMetadata(chunk.payload.providerMetadata, chunk.metadata),
+            providerMetadata: chunk.payload.providerMetadata,
             providerExecuted: inferProviderExecuted(chunk.payload.providerExecuted, resultToolDef),
           });
         }
@@ -496,7 +437,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   autoResumeSuspendedTools,
   maxProcessorRetries,
   workspace,
-  modelContextMessages,
   outputWriter,
 }: OuterLLMRun<TOOLS, OUTPUT> & { toolCallForeachOptions?: ToolCallForeachOptions }) {
   const initialSystemMessages = messageList.getAllSystemMessages();
@@ -525,13 +465,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // Start the MODEL_STEP span at the beginning of LLM execution
       modelSpanTracker?.startStep();
 
-      let modelResult;
+      let modelResult: ReturnType<typeof execute> | undefined;
       let warnings: any;
       let request: any;
       let rawResponse: any;
       let activeFallbackModelIndex = inputData.fallbackModelIndex || 0;
       let executedStepModel: string | undefined;
-      let executedModelContextMessages: MastraDBMessage[] | undefined;
       const maxErrorProcessorRetries = maxProcessorRetries ?? (errorProcessors?.length ? 10 : undefined);
       const { outputStream, callBail, runState, stepTools, stepWorkspace, processAPIErrorRetry } =
         await executeStreamWithFallbackModels<{
@@ -573,12 +512,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             messageList.addSystem(inputData.processorRetryFeedback, 'processor-retry-feedback');
           }
 
-          const hasExplicitModelContextMessages = Object.prototype.hasOwnProperty.call(
-            inputData,
-            'modelContextMessages',
-          );
-          const shouldSeedModelContextMessages =
-            (inputData.output?.steps?.length || 0) === 0 && !hasExplicitModelContextMessages;
           const currentStep: {
             messageId: string;
             model: MastraLanguageModel;
@@ -588,7 +521,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             providerOptions?: SharedProviderOptions | undefined;
             modelSettings?: Omit<CallSettings, 'abortSignal'> | undefined;
             structuredOutput?: StructuredOutputOptions<OUTPUT>;
-            modelContextMessages?: MastraDBMessage[];
             workspace?: Workspace;
           } = {
             messageId: currentMessageId,
@@ -600,9 +532,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             modelSettings,
             structuredOutput,
             workspace,
-            modelContextMessages: shouldSeedModelContextMessages
-              ? modelContextMessages
-              : inputData.modelContextMessages,
           };
 
           const inputStepProcessors = [
@@ -638,6 +567,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 stepNumber: inputData.output?.steps?.length || 0,
                 ...createObservabilityContext(stepTracingContext),
                 requestContext,
+                runId,
+                resourceId: _internal?.resourceId,
                 model,
                 steps: inputData.output?.steps || [],
                 messageId: currentStep.messageId,
@@ -652,7 +583,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 providerOptions,
                 modelSettings,
                 structuredOutput,
-                modelContextMessages: currentStep.modelContextMessages,
                 retryCount: inputData.processorRetryCount || 0,
                 writer: inputStepWriter,
                 abortSignal: options?.abortSignal,
@@ -788,6 +718,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             }
           }
 
+          if (requestContext && getToolGateRuntimeState(requestContext, { runId })?.policy) {
+            await applyToolGateToModelInput({
+              currentStep,
+              requestContext,
+              runId,
+              threadId: _internal?.threadId,
+              resourceId: _internal?.resourceId,
+            });
+          }
+
           // Store activeTools on _internal so toolCallStep can enforce them
           if (_internal) {
             _internal.stepActiveTools = currentStep.activeTools as string[] | undefined;
@@ -825,14 +765,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             downloadConcurrency,
             supportedUrls: resolvedSupportedUrls,
           };
-          const promptMessageList = currentStep.modelContextMessages
-            ? createPromptOnlyMessageList({
-                canonicalMessageList: messageList,
-                modelContextMessages: currentStep.modelContextMessages,
-              })
-            : messageList;
-          executedModelContextMessages = currentStep.modelContextMessages;
-          let inputMessages = await promptMessageList.get.all.aiV5.llmPrompt(messageListPromptArgs);
+          let inputMessages = await messageList.get.all.aiV5.llmPrompt(messageListPromptArgs);
 
           if (autoResumeSuspendedTools) {
             const messages = messageList.get.all.db();
@@ -1007,7 +940,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           let transportResolver: (() => StreamTransport | undefined) | undefined;
           if (currentStep.model instanceof ModelRouterLanguageModel) {
             const routerModel = currentStep.model;
-            transportResolver = () => routerModel._getStreamTransport();
+            transportResolver = () => readModelStreamTransport(modelResult) ?? routerModel._getStreamTransport();
           }
 
           try {
@@ -1028,7 +961,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               logger,
               transportRef: _internal?.transportRef,
               transportResolver,
-              toolPayloadProjection: _internal?.toolPayloadProjection,
+              toolGatePolicyActive: requestContext ? !!getToolGateRuntimeState(requestContext, { runId })?.policy : false,
             });
 
             // Build messages from the full chunk sequence and add to messageList.
@@ -1041,29 +974,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               tools: currentStep.tools,
             });
             for (const msg of builtMessages) {
-              if (options?.abortSignal?.aborted && msg.content && typeof msg.content === 'object') {
-                const existingMastraMetadata =
-                  typeof msg.content.metadata?.mastra === 'object' && msg.content.metadata.mastra !== null
-                    ? msg.content.metadata.mastra
-                    : {};
-                const existingStatus = (existingMastraMetadata as { responseStatus?: unknown }).responseStatus;
-                if (existingStatus === 'finished' || existingStatus === 'completed') {
-                  messageList.add(msg, 'response');
-                  continue;
-                }
-
-                msg.content = {
-                  ...msg.content,
-                  metadata: {
-                    ...msg.content.metadata,
-                    mastra: {
-                      ...existingMastraMetadata,
-                      responseStatus: 'aborted',
-                      runId,
-                    },
-                  },
-                };
-              }
               messageList.add(msg, 'response');
             }
 
@@ -1163,10 +1073,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
               const errorResult = await processorRunner.runProcessAPIError({
                 error,
-                messages: executedModelContextMessages ?? messageList.get.all.db(),
-                ...(executedModelContextMessages !== undefined
-                  ? { modelContextMessages: executedModelContextMessages }
-                  : {}),
+                messages: messageList.get.all.db(),
                 messageList,
                 stepNumber: inputData.output?.steps?.length || 0,
                 steps: inputData.output?.steps || [],
@@ -1186,7 +1093,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               });
 
               if (errorResult.retry && canRetryError) {
-                executedModelContextMessages = errorResult.modelContextMessages ?? executedModelContextMessages;
                 // Signal retry - store on runState so it's handled after the callback returns
                 runState.setState({
                   hasErrored: false,
@@ -1304,8 +1210,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
         const errorResult = await processorRunner.runProcessAPIError({
           error: runState.state.apiError,
-          messages: executedModelContextMessages ?? messageList.get.all.db(),
-          ...(executedModelContextMessages !== undefined ? { modelContextMessages: executedModelContextMessages } : {}),
+          messages: messageList.get.all.db(),
           messageList,
           stepNumber: inputData.output?.steps?.length || 0,
           steps: inputData.output?.steps || [],
@@ -1324,7 +1229,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         });
 
         if (errorResult.retry && canRetryError) {
-          executedModelContextMessages = errorResult.modelContextMessages ?? executedModelContextMessages;
           apiErrorRetryResult = errorResult;
           // Clear error state for retry
           runState.setState({
@@ -1372,9 +1276,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           },
           messages,
           processorRetryCount: nextProcessorRetryCount,
-          // API-error retries re-run the same model attempt, so preserve the exact
-          // prompt-only context that was executed instead of reseeding from canonical messages.
-          ...(executedModelContextMessages !== undefined ? { modelContextMessages: executedModelContextMessages } : {}),
           ...(activeFallbackModelIndex > 0 ? { fallbackModelIndex: activeFallbackModelIndex } : {}),
         };
       }
@@ -1627,9 +1528,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // Track processor retry count for next iteration
         processorRetryCount: nextProcessorRetryCount,
         processorRetryFeedback: retryFeedbackText,
-        ...(shouldRetry && executedModelContextMessages !== undefined
-          ? { modelContextMessages: executedModelContextMessages }
-          : {}),
         ...(nextFallbackModelIndex > 0 ? { fallbackModelIndex: nextFallbackModelIndex } : {}),
       };
     },

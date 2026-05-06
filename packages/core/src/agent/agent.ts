@@ -6,6 +6,7 @@ import type { StandardSchemaWithJSON } from '@mastra/schema-compat/schema';
 import type { JSONSchema7 } from 'json-schema';
 import { z } from 'zod/v4';
 import type { MastraPrimitives, MastraUnion } from '../action';
+import { MastraFGAPermissions } from '../auth/ee';
 import type { AgentBackgroundConfig, ToolBackgroundConfig } from '../background-tasks';
 import { MastraBase } from '../base';
 import type { MastraBrowser } from '../browser/browser';
@@ -69,9 +70,10 @@ import { ChunkFrom } from '../stream';
 import type { MastraAgentNetworkStream } from '../stream';
 import type { FullOutput, MastraModelOutput } from '../stream/base/output';
 import { createTool } from '../tools';
+import { setToolGateRuntimeStateForRun } from '../tools/tool-gate';
 import type { ToolToConvert } from '../tools/tool-builder/builder';
 import { isMastraTool, isProviderTool } from '../tools/toolchecks';
-import type { CoreTool, ToolPayloadProjectionPolicy } from '../tools/types';
+import type { CoreTool } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import { makeCoreTool, createMastraProxy, ensureToolProperties, deepMerge } from '../utils';
 import type { ToolOptions } from '../utils';
@@ -260,7 +262,6 @@ export class Agent<
   #hasExplicitBrowser = false;
   #requestContextSchema?: StandardSchemaWithJSON<TRequestContext>;
   #backgroundTasks?: AgentBackgroundConfig;
-  #toolPayloadProjection?: ToolPayloadProjectionPolicy;
   /**
    * Tracks the active `streamUntilIdle` wrapper per `(threadId|resourceId)`
    * scope on this Agent instance. A new call for the same scope aborts the
@@ -356,7 +357,6 @@ export class Agent<
     this.#defaultStreamOptionsLegacy = config.defaultStreamOptionsLegacy || {};
     this.#defaultOptions = config.defaultOptions || ({} as AgentExecutionOptions<TOutput>);
     this.#defaultNetworkOptions = config.defaultNetworkOptions || {};
-    this.#toolPayloadProjection = config.toolPayloadProjection;
 
     this.#tools = config.tools || ({} as TTools);
 
@@ -2821,7 +2821,6 @@ export class Agent<
     processorStates?: Map<string, ProcessorState>;
   } & ObservabilityContext): Promise<{
     messageList: MessageList;
-    modelContextMessages?: MastraDBMessage[];
     tripwire?: {
       reason: string;
       retry?: boolean;
@@ -2830,7 +2829,6 @@ export class Agent<
     };
   }> {
     let tripwire: { reason: string; retry?: boolean; metadata?: unknown; processorId?: string } | undefined;
-    let modelContextMessages: MastraDBMessage[] | undefined;
 
     if (
       inputProcessorOverrides?.length ||
@@ -2847,12 +2845,7 @@ export class Agent<
         processorStates,
       });
       try {
-        ({ messageList, modelContextMessages } = await runner.runInputProcessors(
-          messageList,
-          observabilityContext,
-          requestContext,
-          0,
-        ));
+        messageList = await runner.runInputProcessors(messageList, observabilityContext, requestContext, 0);
       } catch (error) {
         if (error instanceof TripWire) {
           tripwire = {
@@ -2883,7 +2876,6 @@ export class Agent<
 
     return {
       messageList,
-      modelContextMessages,
       tripwire,
     };
   }
@@ -2900,7 +2892,6 @@ export class Agent<
       messageList: MessageList;
       stepNumber?: number;
       inputProcessorOverrides?: InputProcessorOrWorkflow[];
-      modelContextMessages?: MastraDBMessage[];
       processorStates?: Map<string, ProcessorState>;
       tools?: Record<string, CoreTool>;
       runId?: string;
@@ -2913,7 +2904,6 @@ export class Agent<
   ): Promise<{
     messageList: MessageList;
     tools?: Record<string, CoreTool>;
-    modelContextMessages?: MastraDBMessage[];
     tripwire?: {
       reason: string;
       retry?: boolean;
@@ -2934,14 +2924,12 @@ export class Agent<
       outputWriter,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
-      modelContextMessages,
       ...rest
     } = args;
     const observabilityContext = resolveObservabilityContext(rest);
 
     let tripwire: { reason: string; retry?: boolean; metadata?: unknown; processorId?: string } | undefined;
     let nextTools = tools;
-    let nextModelContextMessages = modelContextMessages;
 
     if (inputProcessorOverrides?.length || this.#inputProcessors || this.#memory) {
       const runner = await this.getProcessorRunner({
@@ -2962,10 +2950,10 @@ export class Agent<
           // OM's processInputStep doesn't use the model parameter, so this is safe.
           model: model as MastraLanguageModel,
           tools,
-          modelContextMessages: nextModelContextMessages,
+          runId,
+          resourceId,
           retryCount: 0,
         });
-        nextModelContextMessages = result.modelContextMessages;
         if (result.tools) {
           const workspace = await this.getWorkspace({ requestContext });
           const memory = await this.getMemory({ requestContext });
@@ -3039,7 +3027,6 @@ export class Agent<
     return {
       messageList,
       tools: nextTools,
-      modelContextMessages: nextModelContextMessages,
       tripwire,
     };
   }
@@ -4265,14 +4252,8 @@ export class Agent<
           backgroundConfig: subAgentBackgroundConfig,
         };
 
-        // Mark the wrapper tool so tool-call-step picks up the background config
-        if (subAgentBackgroundConfig) {
-          (toolObj as any).backgroundConfig = subAgentBackgroundConfig;
-        }
-
-        // TODO; fix recursion type
         convertedAgentTools[`agent-${agentName}`] = makeCoreTool(
-          toolObj as any,
+          toolObj,
           options,
           undefined,
           autoResumeSuspendedTools,
@@ -4386,7 +4367,7 @@ export class Agent<
                 resourceId,
               });
 
-              const run = await workflow.createRun({ runId: runIdToUse });
+              const run = await workflow.createRun({ runId: runIdToUse, resourceId });
               const { resumeData, suspend } = context?.agent ?? {};
 
               let result: WorkflowResult<any, any, any, any> | undefined = undefined;
@@ -5178,6 +5159,11 @@ export class Agent<
         resourceId,
       }) ||
       randomUUID();
+    if (options.toolGatePolicy) {
+      setToolGateRuntimeStateForRun(requestContext, runId, {
+        policy: options.toolGatePolicy,
+      });
+    }
     const instructions = options.instructions || (await this.getInstructions({ requestContext }));
 
     // Set Tracing context
@@ -5292,8 +5278,6 @@ export class Agent<
       agentName: this.name,
       toolCallId: options.toolCallId,
       workspace,
-      toolPayloadProjection:
-        options.toolPayloadProjection ?? this.#toolPayloadProjection ?? this.#mastra?.getToolPayloadProjection(),
       ...(options.disableBackgroundTasks
         ? {}
         : {
@@ -5732,6 +5716,21 @@ export class Agent<
     // Validate request context if schema is provided
     await this.#validateRequestContext(options?.requestContext);
 
+    // FGA authorization check
+    const fgaProvider = this.#mastra?.getServer()?.fga;
+    if (fgaProvider) {
+      const user = options?.requestContext?.get('user');
+      if (user) {
+        const { checkFGA } = await import(/* @vite-ignore */ '../auth/ee/fga-check');
+        await checkFGA({
+          fgaProvider,
+          user,
+          resource: { type: 'agent', id: this.id },
+          permission: MastraFGAPermissions.AGENTS_EXECUTE,
+        });
+      }
+    }
+
     const defaultOptions = await this.getDefaultOptions({
       requestContext: options?.requestContext,
     });
@@ -5848,6 +5847,21 @@ export class Agent<
   ): Promise<MastraModelOutput<OUTPUT>> {
     // Validate request context if schema is provided
     await this.#validateRequestContext(streamOptions?.requestContext);
+
+    // FGA authorization check
+    const streamFgaProvider = this.#mastra?.getServer()?.fga;
+    if (streamFgaProvider) {
+      const user = streamOptions?.requestContext?.get('user');
+      if (user) {
+        const { checkFGA } = await import('../auth/ee/fga-check');
+        await checkFGA({
+          fgaProvider: streamFgaProvider,
+          user,
+          resource: { type: 'agent', id: this.id },
+          permission: MastraFGAPermissions.AGENTS_EXECUTE,
+        });
+      }
+    }
 
     const defaultOptions = await this.getDefaultOptions({
       requestContext: streamOptions?.requestContext,

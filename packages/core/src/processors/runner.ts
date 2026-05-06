@@ -1,10 +1,11 @@
-import type { CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
 import type { StepResult } from '@internal/ai-sdk-v5';
 import type { MastraDBMessage, MessageInput } from '../agent/message-list';
 import { MessageList, messagesAreEqual } from '../agent/message-list';
 import { TripWire } from '../agent/trip-wire';
 import type { TripWireOptions } from '../agent/trip-wire';
+import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '../agent/utils';
 import { MastraError } from '../error';
+import { resolveModelConfig } from '../llm';
 import type { IMastraLogger } from '../logger';
 import { EntityType, SpanType, createObservabilityContext, resolveObservabilityContext } from '../observability';
 import type { ObservabilityContext, Span } from '../observability';
@@ -12,7 +13,6 @@ import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
 import type { LanguageModelUsage } from '../stream/types';
-import { normalizePromptOnlyMessages, snapshotMessageList } from './prompt-view';
 import {
   summarizeActiveToolsForSpan,
   summarizeProcessorModelForSpan,
@@ -22,43 +22,37 @@ import {
 } from './span-payload';
 import type { ProcessorStepOutput } from './step-schema';
 import { isMaybeClaude46, TrailingAssistantGuard } from './trailing-assistant-guard';
-import {
-  validateAndFormatProcessInputResult,
-  validateAndFormatProcessInputStepResult,
-  validateProcessorResultExclusivity,
-} from './validate-result';
 import { isProcessorWorkflow } from './index';
 import type {
   ErrorProcessorOrWorkflow,
   OutputResult,
-  ProcessInputResult,
   ProcessInputStepResult,
   Processor,
   ProcessorMessageResult,
   ProcessorStreamWriter,
+  ProcessorViolation,
   ProcessorWorkflow,
   RunProcessInputStepArgs,
   RunProcessInputStepResult,
   ToolCallInfo,
 } from './index';
 
-export type RunInputProcessorsResult = {
-  messageList: MessageList;
-  modelContextMessages?: MastraDBMessage[];
-};
-
-function didMessageListChange(messageList: MessageList, snapshotBefore: string): boolean {
-  return snapshotMessageList(messageList) !== snapshotBefore;
-}
-
-function stripUndefinedMessageContextFields<T extends Record<string, unknown>>(result: T): T {
-  if ('messages' in result && result.messages === undefined) {
-    delete result.messages;
+/**
+ * Safely invoke a processor's onViolation callback when a TripWire is caught.
+ * Errors from the callback are silently caught.
+ */
+async function invokeOnViolation(processor: Processor, error: TripWire): Promise<void> {
+  if (!processor.onViolation) return;
+  try {
+    const violation: ProcessorViolation = {
+      processorId: error.processorId ?? processor.id,
+      message: error.message,
+      detail: error.options?.metadata,
+    };
+    await processor.onViolation(violation);
+  } catch {
+    // onViolation errors are silently caught
   }
-  if ('modelContextMessages' in result && result.modelContextMessages === undefined) {
-    delete result.modelContextMessages;
-  }
-  return result;
 }
 
 /**
@@ -256,10 +250,6 @@ function buildProcessInputStepSpanOutput(args: {
   return output;
 }
 
-function hasRegularMessageListMutations(mutations: ReturnType<MessageList['stopRecording']>): boolean {
-  return mutations.some(mutation => mutation.type !== 'addSystem');
-}
-
 export class ProcessorRunner {
   public readonly inputProcessors: ProcessorOrWorkflow[];
   public readonly outputProcessors: ProcessorOrWorkflow[];
@@ -379,17 +369,15 @@ export class ProcessorRunner {
     }
 
     // Extract and validate the output from the workflow result
-    const output =
-      result.result && typeof result.result === 'object'
-        ? stripUndefinedMessageContextFields(result.result as ProcessorStepOutput)
-        : result.result;
+    const output = result.result;
 
     if (!output || typeof output !== 'object') {
       // No output means no changes - return input unchanged
       return input;
     }
 
-    if (!('phase' in output)) {
+    // Validate it has the expected ProcessorStepOutput shape
+    if (!('phase' in output) || !('messages' in output || 'part' in output || 'messageList' in output)) {
       throw new MastraError({
         category: 'USER',
         domain: 'AGENT',
@@ -397,8 +385,6 @@ export class ProcessorRunner {
         text: `Processor workflow ${workflow.id} returned invalid output format. Expected ProcessorStepOutput.`,
       });
     }
-
-    validateProcessorResultExclusivity({ result: output, processorId: workflow.id });
 
     return output as ProcessorStepOutput;
   }
@@ -555,6 +541,7 @@ export class ProcessorRunner {
               },
             },
           });
+          await invokeOnViolation(processor, error);
           throw error;
         }
         processorSpan?.error({ error: error as Error, endSpan: true });
@@ -695,6 +682,7 @@ export class ProcessorRunner {
                 },
               },
             });
+            await invokeOnViolation(processor, error);
             return {
               part: null,
               blocked: true,
@@ -811,67 +799,27 @@ export class ProcessorRunner {
     observabilityContext?: ObservabilityContext,
     requestContext?: RequestContext,
     retryCount: number = 0,
-  ): Promise<RunInputProcessorsResult> {
-    let modelContextMessages: MastraDBMessage[] | undefined;
-
+  ): Promise<MessageList> {
     for (const [index, processorOrWorkflow] of this.inputProcessors.entries()) {
-      let processableMessages: MastraDBMessage[] = modelContextMessages ?? messageList.get.input.db();
-      const inputIds = messageList.get.input.db().map((m: MastraDBMessage) => m.id);
+      let processableMessages: MastraDBMessage[] = messageList.get.input.db();
+      const inputIds = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor
       if (isProcessorWorkflow(processorOrWorkflow)) {
         const currentSystemMessages = messageList.getAllSystemMessages();
-        const messageListBeforeWorkflow = snapshotMessageList(messageList);
-        const result = await this.executeWorkflowAsProcessor(
+        await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'input',
             messages: processableMessages,
             messageList,
-            modelContextMessages,
             systemMessages: currentSystemMessages,
             retryCount,
           },
           observabilityContext,
           requestContext,
         );
-        const workflowMutatedMessageList = didMessageListChange(messageList, messageListBeforeWorkflow);
-        validateProcessorResultExclusivity({ result, processorId: processorOrWorkflow.id });
-        if (modelContextMessages !== undefined && workflowMutatedMessageList) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-            text: `Processor workflow ${processorOrWorkflow.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
-          });
-        }
-        if (result.modelContextMessages !== undefined && workflowMutatedMessageList) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
-            text: `Processor workflow ${processorOrWorkflow.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
-          });
-        }
-        if (result.systemMessages) {
-          messageList.replaceAllSystemMessages(result.systemMessages as CoreMessageV4[]);
-        }
-        if ('modelContextMessages' in result) {
-          modelContextMessages = normalizePromptOnlyMessages((result.modelContextMessages ?? []) as MastraDBMessage[]);
-        } else if (result.messages) {
-          if (modelContextMessages !== undefined) {
-            modelContextMessages = normalizePromptOnlyMessages(result.messages as MastraDBMessage[]);
-          } else {
-            ProcessorRunner.applyMessagesToMessageList(
-              result.messages as MastraDBMessage[],
-              messageList,
-              inputIds,
-              check,
-            );
-            processableMessages = messageList.get.input.db();
-          }
-        }
         continue;
       }
 
@@ -917,69 +865,115 @@ export class ProcessorRunner {
         // Get per-processor state that persists across all method calls within this request
         const processorState = this.getProcessorState(processor.id);
 
-        const result = await ProcessorRunner.validateAndFormatProcessInputResult(
-          await processMethod({
-            messages: processableMessages,
-            systemMessages: currentSystemMessages,
-            state: processorState.customState,
-            abort,
-            ...createObservabilityContext({ currentSpan: processorSpan }),
-            messageList,
-            requestContext,
-            retryCount,
-          }),
-          {
-            messageList,
-            processor,
-          },
-        );
+        const result = await processMethod({
+          messages: processableMessages,
+          systemMessages: currentSystemMessages,
+          state: processorState.customState,
+          abort,
+          ...createObservabilityContext({ currentSpan: processorSpan }),
+          messageList,
+          requestContext,
+          retryCount,
+        });
 
-        // Stop recording and capture mutations before applying internal plumbing changes.
-        const mutations = messageList.stopRecording();
+        // Handle MessageList, MastraDBMessage[], or { messages, systemMessages } return types
+        let mutations: Array<{
+          type: 'add' | 'addSystem' | 'removeByIds' | 'clear';
+          source?: string;
+          count?: number;
+          ids?: string[];
+          text?: string;
+          tag?: string;
+          message?: any;
+        }>;
 
-        if (modelContextMessages !== undefined && mutations.length > 0) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-            text: `Processor ${processor.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
-          });
-        }
-
-        if ('modelContextMessages' in result && mutations.length > 0) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
-            text: `Processor ${processor.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
-          });
-        }
-
-        if (result.systemMessages) {
-          messageList.replaceAllSystemMessages(result.systemMessages);
-        }
-
-        if ('modelContextMessages' in result) {
-          modelContextMessages = normalizePromptOnlyMessages(result.modelContextMessages ?? []);
-          processableMessages = modelContextMessages;
-        } else if (result.messages) {
-          if (modelContextMessages !== undefined) {
-            modelContextMessages = normalizePromptOnlyMessages(result.messages);
-            processableMessages = modelContextMessages;
-          } else {
-            ProcessorRunner.applyMessagesToMessageList(result.messages, messageList, inputIds, check);
-            processableMessages = messageList.get.input.db();
-          }
-        } else if (result.messageList) {
-          if (modelContextMessages !== undefined) {
+        if (result instanceof MessageList) {
+          if (result !== messageList) {
             throw new MastraError({
               category: 'USER',
               domain: 'AGENT',
-              id: 'PROCESSOR_RETURNED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-              text: `Processor ${processor.id} returned messageList after prompt-only model context was set. Return messages to update the prompt-only context instead.`,
+              id: 'PROCESSOR_RETURNED_EXTERNAL_MESSAGE_LIST',
+              text: `Processor ${processor.id} returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
             });
           }
+          // Stop recording and capture mutations
+          mutations = messageList.stopRecording();
           if (mutations.length > 0) {
+            // Processor returned a MessageList - it has been modified in place
+            // Update processableMessages to reflect ALL current messages for next processor
+            processableMessages = messageList.get.input.db();
+          }
+        } else if (this.isProcessInputResultWithSystemMessages(result)) {
+          // Processor returned { messages, systemMessages } - handle both
+          mutations = messageList.stopRecording();
+
+          // Replace system messages with the modified ones
+          messageList.replaceAllSystemMessages(result.systemMessages);
+
+          // Handle regular messages
+          const regularMessages = result.messages;
+          if (regularMessages) {
+            const deletedIds = inputIds.filter(i => !regularMessages.some(m => m.id === i));
+            if (deletedIds.length) {
+              messageList.removeByIds(deletedIds);
+            }
+
+            // Separate any new system messages from other messages (backward compat)
+            const newSystemMessages = regularMessages.filter(m => m.role === 'system');
+            const nonSystemMessages = regularMessages.filter(m => m.role !== 'system');
+
+            // Add any new system messages from the messages array
+            for (const sysMsg of newSystemMessages) {
+              const systemText =
+                (sysMsg.content.content as string | undefined) ??
+                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
+                '';
+              messageList.addSystem(systemText);
+            }
+
+            // Add non-system messages normally
+            if (nonSystemMessages.length > 0) {
+              for (const message of nonSystemMessages) {
+                messageList.removeByIds([message.id]);
+                messageList.add(message, check.getSource(message) || 'input');
+              }
+            }
+          }
+
+          processableMessages = messageList.get.input.db();
+        } else {
+          // Processor returned an array - stop recording before clear/add (that's just internal plumbing)
+          mutations = messageList.stopRecording();
+
+          if (result) {
+            // Clear and re-add since processor worked with array. clear all messages, the new result array is all messages in the list (new input but also any messages added by other processors, memory for ex)
+            const deletedIds = inputIds.filter(i => !result.some(m => m.id === i));
+            if (deletedIds.length) {
+              messageList.removeByIds(deletedIds);
+            }
+
+            // Separate system messages from other messages since they need different handling
+            const systemMessages = result.filter(m => m.role === 'system');
+            const nonSystemMessages = result.filter(m => m.role !== 'system');
+
+            // Add system messages using addSystem
+            for (const sysMsg of systemMessages) {
+              const systemText =
+                (sysMsg.content.content as string | undefined) ??
+                sysMsg.content.parts?.map(p => (p.type === 'text' ? p.text : '')).join('\n') ??
+                '';
+              messageList.addSystem(systemText);
+            }
+
+            // Add non-system messages normally
+            if (nonSystemMessages.length > 0) {
+              for (const message of nonSystemMessages) {
+                messageList.removeByIds([message.id]);
+                messageList.add(message, check.getSource(message) || 'input');
+              }
+            }
+
+            // Use messageList.get.input.db() for consistency with MessageList return type
             processableMessages = messageList.get.input.db();
           }
         }
@@ -989,7 +983,6 @@ export class ProcessorRunner {
             ...(!areProcessorMessageArraysEqual(inputMessagesBefore, processableMessages)
               ? { messages: processableMessages }
               : {}),
-            ...(modelContextMessages !== undefined ? { modelContextMessages } : {}),
             ...(!areProcessorMessageArraysEqual(inputSystemMessagesBefore, messageList.getAllSystemMessages())
               ? { systemMessages: messageList.getAllSystemMessages() }
               : {}),
@@ -1012,6 +1005,7 @@ export class ProcessorRunner {
               },
             },
           });
+          await invokeOnViolation(processor, error);
           throw error;
         }
         processorSpan?.error({ error: error as Error, endSpan: true });
@@ -1019,7 +1013,7 @@ export class ProcessorRunner {
       }
     }
 
-    return { messageList, modelContextMessages };
+    return messageList;
   }
 
   /**
@@ -1054,7 +1048,6 @@ export class ProcessorRunner {
       providerOptions: args.providerOptions,
       modelSettings: args.modelSettings,
       structuredOutput: args.structuredOutput,
-      modelContextMessages: args.modelContextMessages,
       retryCount: args.retryCount ?? 0,
     };
 
@@ -1066,127 +1059,39 @@ export class ProcessorRunner {
 
     // Run through all input processors that have processInputStep
     for (const [index, processorOrWorkflow] of processors.entries()) {
-      const processableMessages: MastraDBMessage[] = stepInput.modelContextMessages ?? messageList.get.all.db();
+      const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const idsBeforeProcessing = processableMessages.map((m: MastraDBMessage) => m.id);
       const check = messageList.makeMessageSourceChecker();
 
       // Handle workflow as processor with inputStep phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
         const currentSystemMessages = messageList.getAllSystemMessages();
-        const hadModelContextMessages = stepInput.modelContextMessages !== undefined;
-        messageList.startRecording();
-        let recordingStopped = false;
-        try {
-          const result = await this.executeWorkflowAsProcessor(
-            processorOrWorkflow,
-            {
-              phase: 'inputStep',
-              messages: processableMessages,
-              messageList,
-              stepNumber,
-              steps,
-              systemMessages: currentSystemMessages,
-              rotateResponseMessageId: args.rotateResponseMessageId
-                ? () => {
-                    const nextMessageId = args.rotateResponseMessageId!();
-                    stepInput.messageId = nextMessageId;
-                    return nextMessageId;
-                  }
-                : undefined,
-              ...stepInput,
-            },
-            observabilityContext,
-            requestContext,
-            writer,
-            args.abortSignal,
-          );
-          const mutations = messageList.stopRecording();
-          recordingStopped = true;
-          const rawResult = result as RunProcessInputStepResult & { phase?: string };
-          const {
-            phase: _phase,
-            messages: rawMessages,
-            modelContextMessages: rawModelContextMessages,
-            ...rawRest
-          } = rawResult;
-          const normalizedMessages =
-            rawMessages &&
-            (rawModelContextMessages === undefined ||
-              !areProcessorMessageArraysEqual(rawMessages, rawModelContextMessages)) &&
-            !areProcessorMessageArraysEqual(processableMessages, rawMessages)
-              ? rawMessages
-              : undefined;
-          const workflowProcessInputStepResult: ProcessInputStepResult =
-            'modelContextMessages' in rawResult
-              ? {
-                  ...rawRest,
-                  messageList: undefined,
-                  modelContextMessages: rawModelContextMessages,
-                }
-              : normalizedMessages
-                ? {
-                    ...rawRest,
-                    messageList: undefined,
-                    messages: normalizedMessages,
-                  }
-                : {
-                    ...rawRest,
-                    messageList: undefined,
-                  };
-          const {
-            messages,
-            systemMessages,
-            modelContextMessages,
-            messageList: _messageList,
-            ...rest
-          } = await ProcessorRunner.validateAndFormatProcessInputStepResult(workflowProcessInputStepResult, {
+        const result = await this.executeWorkflowAsProcessor(
+          processorOrWorkflow,
+          {
+            phase: 'inputStep',
+            messages: processableMessages,
             messageList,
-            processor: { id: processorOrWorkflow.id },
             stepNumber,
-          });
-
-          if (hadModelContextMessages && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
-            throw new MastraError({
-              category: 'USER',
-              domain: 'AGENT',
-              id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-              text: `Processor workflow ${processorOrWorkflow.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
-            });
-          }
-          if (modelContextMessages !== undefined && mutations.length > 0 && hasRegularMessageListMutations(mutations)) {
-            throw new MastraError({
-              category: 'USER',
-              domain: 'AGENT',
-              id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
-              text: `Processor workflow ${processorOrWorkflow.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
-            });
-          }
-          if (systemMessages) {
-            messageList.replaceAllSystemMessages(systemMessages as CoreMessageV4[]);
-          }
-          if ('modelContextMessages' in workflowProcessInputStepResult) {
-            stepInput.modelContextMessages = normalizePromptOnlyMessages(
-              (modelContextMessages ?? []) as MastraDBMessage[],
-            );
-          } else if (messages) {
-            if (stepInput.modelContextMessages !== undefined) {
-              stepInput.modelContextMessages = normalizePromptOnlyMessages(messages as MastraDBMessage[]);
-            } else {
-              ProcessorRunner.applyMessagesToMessageList(
-                messages as MastraDBMessage[],
-                messageList,
-                idsBeforeProcessing,
-                check,
-              );
-            }
-          }
-          Object.assign(stepInput, rest);
-        } catch (error) {
-          if (!recordingStopped) {
-            messageList.stopRecording();
-          }
-          throw error;
-        }
+            steps,
+            systemMessages: currentSystemMessages,
+            runId: args.runId,
+            resourceId: args.resourceId,
+            rotateResponseMessageId: args.rotateResponseMessageId
+              ? () => {
+                  const nextMessageId = args.rotateResponseMessageId!();
+                  stepInput.messageId = nextMessageId;
+                  return nextMessageId;
+                }
+              : undefined,
+            ...stepInput,
+          },
+          observabilityContext,
+          requestContext,
+          writer,
+          args.abortSignal,
+        );
+        Object.assign(stepInput, result);
         continue;
       }
 
@@ -1219,6 +1124,8 @@ export class ProcessorRunner {
         modelSettings: stepInput.modelSettings,
         structuredOutput: stepInput.structuredOutput,
         requestContext,
+        runId: args.runId,
+        resourceId: args.resourceId,
       };
 
       // Use the current span (the step span) as the parent for processor spans
@@ -1261,20 +1168,8 @@ export class ProcessorRunner {
         };
 
         const processMethodArgs = {
-          messages: processableMessages,
           messageList,
-          stepNumber,
-          steps,
-          messageId: stepInput.messageId,
-          systemMessages: currentSystemMessages,
-          tools: stepInput.tools,
-          toolChoice: stepInput.toolChoice,
-          model: stepInput.model!,
-          activeTools: stepInput.activeTools,
-          providerOptions: stepInput.providerOptions,
-          modelSettings: stepInput.modelSettings,
-          structuredOutput: stepInput.structuredOutput,
-          requestContext,
+          ...inputData,
           state: processorState.customState,
           abort,
           ...(args.rotateResponseMessageId
@@ -1292,7 +1187,6 @@ export class ProcessorRunner {
           abortSignal: args.abortSignal,
         };
 
-        const hadModelContextMessages = stepInput.modelContextMessages !== undefined;
         const result = await ProcessorRunner.validateAndFormatProcessInputStepResult(
           await processMethod(processMethodArgs),
           {
@@ -1301,59 +1195,17 @@ export class ProcessorRunner {
             stepNumber,
           },
         );
-        const returnedModelContextMessages = 'modelContextMessages' in result;
-        const { messages, systemMessages, modelContextMessages, ...rest } = result;
-
-        // Stop recording and get mutations for this processor
-        const mutations = messageList.stopRecording();
-
-        if (
-          hadModelContextMessages &&
-          mutations.length > 0 &&
-          hasRegularMessageListMutations(mutations) &&
-          !messages &&
-          !modelContextMessages
-        ) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT_MESSAGES',
-            text: `Processor ${processor.id} mutated messageList after a previous processor returned modelContextMessages. Return messages or modelContextMessages from this processor so the next model prompt stays in sync with the mutation.`,
-          });
-        }
-
-        if (stepInput.modelContextMessages !== undefined && mutations.length > 0) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_AFTER_MODEL_CONTEXT',
-            text: `Processor ${processor.id} mutated messageList after prompt-only model context was set. Mutate canonical messages before returning modelContextMessages, or return messages to update the prompt-only context.`,
-          });
-        }
-
-        if (returnedModelContextMessages && mutations.length > 0) {
-          throw new MastraError({
-            category: 'USER',
-            domain: 'AGENT',
-            id: 'PROCESSOR_MUTATED_MESSAGE_LIST_WITH_MODEL_CONTEXT_MESSAGES',
-            text: `Processor ${processor.id} mutated messageList and returned modelContextMessages. Prompt-only model context cannot be combined with canonical messageList mutations.`,
-          });
-        }
-
+        const { messages, systemMessages, ...rest } = result;
         if (messages) {
-          if (stepInput.modelContextMessages !== undefined) {
-            stepInput.modelContextMessages = normalizePromptOnlyMessages(messages);
-          } else {
-            ProcessorRunner.applyMessagesToMessageList(messages, messageList, idsBeforeProcessing, check);
-          }
-        }
-        if (returnedModelContextMessages) {
-          stepInput.modelContextMessages = normalizePromptOnlyMessages(modelContextMessages ?? []);
+          ProcessorRunner.applyMessagesToMessageList(messages, messageList, idsBeforeProcessing, check);
         }
         if (systemMessages) {
           messageList.replaceAllSystemMessages(systemMessages);
         }
         Object.assign(stepInput, rest);
+
+        // Stop recording and get mutations for this processor
+        const mutations = messageList.stopRecording();
 
         processorSpan?.end({
           output: buildProcessInputStepSpanOutput({
@@ -1362,7 +1214,7 @@ export class ProcessorRunner {
             afterStepInput: stepInput,
             beforeMessages: inputData.messages,
             beforeSystemMessages: inputData.systemMessages,
-            messages: stepInput.modelContextMessages ?? messageList.get.all.db(),
+            messages: messageList.get.all.db(),
             systemMessages: messageList.getAllSystemMessages(),
           }),
           attributes: mutations.length > 0 ? { messageListMutations: mutations } : undefined,
@@ -1383,6 +1235,7 @@ export class ProcessorRunner {
               },
             },
           });
+          await invokeOnViolation(processor, error);
           throw error;
         }
         processorSpan?.error({ error: error as Error, endSpan: true });
@@ -1391,6 +1244,22 @@ export class ProcessorRunner {
     }
 
     return stepInput;
+  }
+
+  /**
+   * Type guard to check if result is { messages, systemMessages }
+   */
+  private isProcessInputResultWithSystemMessages(
+    result: unknown,
+  ): result is { messages: MastraDBMessage[]; systemMessages: unknown[] } {
+    return (
+      result !== null &&
+      typeof result === 'object' &&
+      'messages' in result &&
+      'systemMessages' in result &&
+      Array.isArray((result as any).messages) &&
+      Array.isArray((result as any).systemMessages)
+    );
   }
 
   /**
@@ -1603,6 +1472,7 @@ export class ProcessorRunner {
               },
             },
           });
+          await invokeOnViolation(processor, error);
           throw error;
         }
         processorSpan?.error({ error: error as Error, endSpan: true });
@@ -1624,7 +1494,6 @@ export class ProcessorRunner {
     args: {
       error: unknown;
       messages: MastraDBMessage[];
-      modelContextMessages?: MastraDBMessage[];
       messageList: MessageList;
       stepNumber: number;
       steps: Array<StepResult<any>>;
@@ -1635,7 +1504,7 @@ export class ProcessorRunner {
       abortSignal?: AbortSignal;
       rotateResponseMessageId?: () => string;
     } & Partial<ObservabilityContext>,
-  ): Promise<{ retry: boolean; modelContextMessages?: MastraDBMessage[] }> {
+  ): Promise<{ retry: boolean }> {
     const { error, messageList, stepNumber, steps, requestContext, retryCount = 0, writer, abortSignal } = args;
     const observabilityContext = resolveObservabilityContext(args);
 
@@ -1662,7 +1531,7 @@ export class ProcessorRunner {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
       };
 
-      const processableMessages: MastraDBMessage[] = args.modelContextMessages ?? messageList.get.all.db();
+      const processableMessages: MastraDBMessage[] = messageList.get.all.db();
       const systemMessagesBefore = messageList.getAllSystemMessages();
       const messageIdBefore = args.messageId;
       let messageIdAfter = args.messageId;
@@ -1696,7 +1565,6 @@ export class ProcessorRunner {
       try {
         const result = await processMethod({
           messages: processableMessages,
-          ...(args.modelContextMessages !== undefined ? { modelContextMessages: processableMessages } : {}),
           messageList,
           stepNumber,
           steps,
@@ -1746,14 +1614,7 @@ export class ProcessorRunner {
         });
 
         if (result?.retry) {
-          return {
-            retry: true,
-            ...(result.modelContextMessages !== undefined
-              ? { modelContextMessages: normalizePromptOnlyMessages(result.modelContextMessages) }
-              : args.modelContextMessages !== undefined
-                ? { modelContextMessages: args.modelContextMessages }
-                : {}),
-          };
+          return { retry: true };
         }
       } catch (processorError) {
         // Stop recording on error
@@ -1771,6 +1632,7 @@ export class ProcessorRunner {
               },
             },
           });
+          await invokeOnViolation(processor, processorError);
           throw processorError;
         }
 
@@ -1813,24 +1675,6 @@ export class ProcessorRunner {
     }
   }
 
-  static validateAndFormatProcessInputResult(
-    result: ProcessInputResult | undefined | void,
-    {
-      messageList,
-      processor,
-    }: {
-      messageList: MessageList;
-      processor: Processor;
-    },
-  ): {
-    messages?: MastraDBMessage[];
-    messageList?: MessageList;
-    modelContextMessages?: MastraDBMessage[];
-    systemMessages?: CoreMessageV4[];
-  } {
-    return validateAndFormatProcessInputResult(result, { messageList, processor });
-  }
-
   static async validateAndFormatProcessInputStepResult(
     result: ProcessInputStepResult | Awaited<ProcessorMessageResult> | undefined | void,
     {
@@ -1843,6 +1687,61 @@ export class ProcessorRunner {
       stepNumber: number;
     },
   ): Promise<RunProcessInputStepResult> {
-    return validateAndFormatProcessInputStepResult(result, { messageList, processor, stepNumber });
+    if (result instanceof MessageList) {
+      if (result !== messageList) {
+        throw new MastraError({
+          category: 'USER',
+          domain: 'AGENT',
+          id: 'PROCESSOR_RETURNED_EXTERNAL_MESSAGE_LIST',
+          text: `Processor ${processor.id} returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
+        });
+      }
+      return {
+        messageList: result,
+      };
+    } else if (Array.isArray(result)) {
+      return {
+        messages: result,
+      };
+    } else if (result) {
+      if (result.messageList && result.messageList !== messageList) {
+        throw new MastraError({
+          category: 'USER',
+          domain: 'AGENT',
+          id: 'PROCESSOR_RETURNED_EXTERNAL_MESSAGE_LIST',
+          text: `Processor ${processor.id} returned a MessageList instance other than the one that was passed in as an argument. New external message list instances are not supported. Use the messageList argument instead.`,
+        });
+      }
+      if (result.messages && result.messageList) {
+        throw new MastraError({
+          category: 'USER',
+          domain: 'AGENT',
+          id: 'PROCESSOR_RETURNED_MESSAGES_AND_MESSAGE_LIST',
+          text: `Processor ${processor.id} returned both messages and messageList. Only one of these is allowed.`,
+        });
+      }
+      const { model: _model, ...rest } = result;
+      if (result.model) {
+        const resolvedModel = await resolveModelConfig(result.model);
+        const isSupported = isSupportedLanguageModel(resolvedModel);
+        if (!isSupported) {
+          throw new MastraError({
+            category: 'USER',
+            domain: 'AGENT',
+            id: 'PROCESSOR_RETURNED_UNSUPPORTED_MODEL',
+            text: `Processor ${processor.id} returned an unsupported model version ${resolvedModel.specificationVersion} in step ${stepNumber}. Only ${supportedLanguageModelSpecifications.join(', ')} models are supported in processInputStep.`,
+          });
+        }
+
+        return {
+          model: resolvedModel,
+          ...rest,
+        };
+      }
+
+      return rest;
+    }
+
+    return {};
   }
 }

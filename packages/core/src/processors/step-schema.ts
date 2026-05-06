@@ -105,7 +105,6 @@ export type ProcessorStepToolsConfig = ToolSet | Record<string, unknown>;
 export type ProcessorInputPhaseType = {
   phase: 'input';
   messages: ProcessorMessageType[];
-  modelContextMessages?: ProcessorMessageType[];
   messageList: MessageList;
   systemMessages?: CoreMessageType[];
   retryCount?: number;
@@ -114,11 +113,12 @@ export type ProcessorInputPhaseType = {
 export type ProcessorInputStepPhaseType = {
   phase: 'inputStep';
   messages: ProcessorMessageType[];
-  modelContextMessages?: ProcessorMessageType[];
   messageList: MessageList;
   stepNumber: number;
   systemMessages?: CoreMessageType[];
   retryCount?: number;
+  runId?: string;
+  resourceId?: string;
   model?: ProcessorStepModelConfig;
   tools?: ProcessorStepToolsConfig;
   toolChoice?: ToolChoice<ToolSet>;
@@ -183,7 +183,6 @@ export type ProcessorStepInputType =
 export type ProcessorStepOutputType = {
   phase: 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep';
   messages?: ProcessorMessageType[];
-  modelContextMessages?: ProcessorMessageType[];
   messageList?: MessageList;
   systemMessages?: CoreMessageType[];
   stepNumber?: number;
@@ -196,6 +195,8 @@ export type ProcessorStepOutputType = {
   text?: string;
   usage?: Record<string, unknown>;
   retryCount?: number;
+  runId?: string;
+  resourceId?: string;
   model?: MastraLanguageModel;
   tools?: ProcessorStepToolsConfig;
   toolChoice?: ToolChoice<ToolSet>;
@@ -515,7 +516,6 @@ const retryCountSchema = z.number().optional();
 export const ProcessorInputPhaseSchema = z.object({
   phase: z.literal('input'),
   messages: messagesSchema,
-  modelContextMessages: messagesSchema.optional(),
   messageList: messageListSchema,
   systemMessages: systemMessagesSchema.optional(),
   retryCount: retryCountSchema,
@@ -529,11 +529,12 @@ export const ProcessorInputPhaseSchema = z.object({
 export const ProcessorInputStepPhaseSchema = z.object({
   phase: z.literal('inputStep'),
   messages: messagesSchema,
-  modelContextMessages: messagesSchema.optional(),
   messageList: messageListSchema,
   stepNumber: z.number().describe('The current step number (0-indexed)'),
   systemMessages: systemMessagesSchema.optional(),
   retryCount: retryCountSchema,
+  runId: z.string().optional().describe('Current agent run ID when available'),
+  resourceId: z.string().optional().describe('Current resource ID when available'),
   messageId: z.string().optional().describe('The active assistant response message ID for this step'),
   rotateResponseMessageId: z
     .custom<() => string>()
@@ -644,7 +645,6 @@ export const ProcessorStepOutputSchema: z.ZodType<ProcessorStepOutputType> = z.o
 
   // Message-based fields (used by most phases)
   messages: messagesSchema.optional(),
-  modelContextMessages: messagesSchema.optional(),
   messageList: messageListSchema.optional(),
   systemMessages: systemMessagesSchema.optional(),
 
@@ -667,6 +667,8 @@ export const ProcessorStepOutputSchema: z.ZodType<ProcessorStepOutputType> = z.o
 
   // Retry count
   retryCount: z.number().optional(),
+  runId: z.string().optional(),
+  resourceId: z.string().optional(),
 
   // Model and tools configuration (for inputStep phase)
   model: z.custom<MastraLanguageModel>().optional(),

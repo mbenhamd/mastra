@@ -9,7 +9,7 @@ import type { VersionOverrides } from '../mastra/types';
 import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
-import type { ToolPayloadProjectionPolicy } from '../tools';
+import type { ToolGatePolicy } from '../tools/tool-gate';
 import type { OutputWriter } from '../workflows/types';
 import type { MessageListInput } from './message-list';
 import type {
@@ -466,6 +466,9 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
   /** Request Context containing dynamic configuration and state */
   requestContext?: RequestContext<any>; // @TODO: Figure out how to type this without breaking all the inner types
 
+  /** Experimental runtime policy for model-visible tools and server-side tool calls. */
+  toolGatePolicy?: ToolGatePolicy;
+
   /**
    * Per-invocation version overrides for sub-agents (and future primitives).
    * Merged on top of Mastra instance-level versions and propagated via requestContext.
@@ -572,9 +575,6 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
 
   /** Whether to include raw chunks in the stream output (not available on all model providers) */
   includeRawChunks?: boolean;
-
-  /** Per-invocation tool payload projection policy for display and transcript serializers. */
-  toolPayloadProjection?: ToolPayloadProjectionPolicy;
 
   /**
    * Callback fired after each iteration (LLM call) completes.

@@ -8,6 +8,7 @@ import { ChunkFrom } from '../../../stream/types';
 import { createTool } from '../../../tools';
 import { ToolStream } from '../../../tools/stream';
 import { CoreToolBuilder } from '../../../tools/tool-builder/builder';
+import { getToolGateRuntimeState, setToolGateRuntimeState } from '../../../tools/tool-gate';
 import type { MastraToolInvocationOptions } from '../../../tools/types';
 import type { OuterLLMRun } from '../../types';
 import { createToolCallStep } from './tool-call-step';
@@ -40,101 +41,6 @@ const makeBaseExecuteParams = (suspend: Mock, overrides: any = {}) => ({
   abortSignal: new AbortController().signal,
   validateSchemas: false,
   ...overrides,
-});
-
-describe('createToolCallStep background task stream replay', () => {
-  afterEach(() => {
-    vi.clearAllMocks();
-    vi.restoreAllMocks();
-  });
-
-  it('should replay a synthetic tool-call only once per resumed background task stream', async () => {
-    const controller = { enqueue: vi.fn() };
-    const streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
-    const messageList = createMessageList();
-    const backgroundTaskManager = {
-      enqueue: vi.fn(async (_payload: any, context: any) => {
-        context.onChunk?.({
-          type: 'background-task-completed',
-          payload: {
-            taskId: 'task-1',
-            toolCallId: 'call-1',
-            toolName: 'background-tool',
-            agentId: 'agent-1',
-            runId: 'resumed-run',
-            result: { first: true },
-            completedAt: new Date(),
-          },
-        });
-        context.onChunk?.({
-          type: 'background-task-completed',
-          payload: {
-            taskId: 'task-1',
-            toolCallId: 'call-1',
-            toolName: 'background-tool',
-            agentId: 'agent-1',
-            runId: 'resumed-run',
-            result: { second: true },
-            completedAt: new Date(),
-          },
-        });
-
-        return {
-          task: { id: 'task-1' },
-          fallbackToSync: false,
-        };
-      }),
-      cancel: vi.fn(),
-      waitForNextTask: vi.fn(),
-    };
-    const tools = {
-      'background-tool': {
-        backgroundConfig: { enabled: true },
-        execute: vi.fn(),
-      },
-    } as any;
-
-    const toolCallStep = createToolCallStep({
-      tools,
-      messageList,
-      controller,
-      runId: 'current-run',
-      streamState,
-      _internal: {
-        backgroundTaskManager,
-        backgroundTaskManagerConfig: { enabled: true },
-        agentBackgroundConfig: { tools: 'all' },
-      },
-    } as any);
-
-    await toolCallStep.execute(
-      makeBaseExecuteParams(vi.fn(), {
-        inputData: {
-          toolCallId: 'call-1',
-          toolName: 'background-tool',
-          args: { query: 'customers' },
-        },
-      }),
-    );
-    let replayedToolCalls: any[] = [];
-    await vi.waitFor(() => {
-      replayedToolCalls = controller.enqueue.mock.calls
-        .map(([chunk]) => chunk)
-        .filter(chunk => chunk.type === 'tool-call');
-      expect(replayedToolCalls).toHaveLength(1);
-    });
-
-    expect(replayedToolCalls).toHaveLength(1);
-    expect(replayedToolCalls[0]).toMatchObject({
-      type: 'tool-call',
-      runId: 'resumed-run',
-      payload: {
-        toolCallId: 'call-1',
-        toolName: 'background-tool',
-        args: { query: 'customers' },
-      },
-    });
-  });
 });
 
 describe('createToolCallStep tool execution error handling', () => {
@@ -308,7 +214,6 @@ describe('createToolCallStep tool approval workflow', () => {
     const inputData = makeInputData();
 
     const executePromise = toolCallStep.execute(makeExecuteParams({ inputData }));
-    await new Promise(resolve => setImmediate(resolve));
 
     expect(controller.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -322,6 +227,8 @@ describe('createToolCallStep tool approval workflow', () => {
         }),
       }),
     );
+
+    await new Promise(resolve => setImmediate(resolve));
 
     expect(suspend).toHaveBeenCalledWith(
       {
@@ -350,6 +257,8 @@ describe('createToolCallStep tool approval workflow', () => {
 
     expect(result).toEqual({
       result: 'Tool call was not approved by the user',
+      denied: true,
+      deniedReason: 'Tool call was not approved by the user',
       ...inputData,
     });
     expectNoToolExecution();
@@ -490,6 +399,159 @@ describe('createToolCallStep needsApprovalFn enriched context', () => {
       result: toolResult,
       ...makeInputData(),
     });
+  });
+});
+
+describe('createToolCallStep tool gate enforcement', () => {
+  let controller: { enqueue: Mock };
+  let suspend: Mock;
+  let streamState: { serialize: Mock };
+  let messageList: MessageList;
+
+  const makeInputData = (args: Record<string, unknown> = { action: 'send' }) => ({
+    toolCallId: 'gate-call-id',
+    toolName: 'gate-tool',
+    args,
+  });
+
+  const makeExecuteParams = (requestContext: RequestContext, overrides: any = {}) => ({
+    ...makeBaseExecuteParams(suspend, { requestContext }),
+    writer: new ToolStream({
+      prefix: 'tool',
+      callId: 'gate-call-id',
+      name: 'gate-tool',
+      runId: 'gate-run-id',
+    }),
+    inputData: makeInputData(),
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    controller = { enqueue: vi.fn() };
+    suspend = vi.fn().mockReturnValue(new Promise(() => {}));
+    streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
+    messageList = createMessageList();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it('rejects denied tool calls before execution', async () => {
+    const execute = vi.fn().mockResolvedValue({ ok: true });
+    const onInputAvailable = vi.fn();
+    const requestContext = new RequestContext();
+    setToolGateRuntimeState(requestContext, {
+      policy: {
+        id: 'deny-policy',
+        evaluate: ({ subject, args }) => {
+          expect(subject.boundary).toBe('tool-call');
+          expect(args).toEqual({ action: 'delete' });
+          return { effect: 'deny', reason: 'delete is disabled' };
+        },
+      },
+    });
+
+    const toolCallStep = createToolCallStep({
+      tools: {
+        'gate-tool': { execute, onInputAvailable },
+      },
+      messageList,
+      controller,
+      runId: 'gate-run-id',
+      streamState,
+    } as any);
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams(requestContext, {
+        inputData: makeInputData({ action: 'delete' }),
+      }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(onInputAvailable).not.toHaveBeenCalled();
+    expect(result.error?.name).toBe('ToolNotFoundError');
+    expect(String(result.error?.message)).toContain('delete is disabled');
+    expect(getToolGateRuntimeState(requestContext)?.decisions?.[0]).toMatchObject({
+      effect: 'deny',
+      toolCallId: 'gate-call-id',
+    });
+  });
+
+  it('does not let needsApprovalFn downgrade tool gate approval', async () => {
+    const execute = vi.fn();
+    const requestContext = new RequestContext();
+    setToolGateRuntimeState(requestContext, {
+      policy: {
+        id: 'approval-policy',
+        evaluate: () => ({ effect: 'requireApproval', reason: 'external write' }),
+      },
+    });
+
+    const toolCallStep = createToolCallStep({
+      tools: {
+        'gate-tool': {
+          execute,
+          needsApprovalFn: vi.fn().mockReturnValue(false),
+        },
+      },
+      messageList,
+      controller,
+      runId: 'gate-run-id',
+      streamState,
+    } as any);
+
+    const executePromise = toolCallStep.execute(makeExecuteParams(requestContext));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(suspend).toHaveBeenCalled();
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-call-approval',
+      }),
+    );
+
+    await expect(Promise.race([executePromise, Promise.resolve('completed')])).resolves.toBe('completed');
+  });
+
+  it('does not accept model-provided resumeData for tool gate approval', async () => {
+    const execute = vi.fn();
+    const requestContext = new RequestContext();
+    setToolGateRuntimeState(requestContext, {
+      policy: {
+        id: 'approval-policy',
+        evaluate: () => ({ effect: 'requireApproval', reason: 'external write' }),
+      },
+    });
+
+    const toolCallStep = createToolCallStep({
+      tools: {
+        'gate-tool': { execute },
+      },
+      messageList,
+      controller,
+      runId: 'gate-run-id',
+      streamState,
+    } as any);
+
+    const executePromise = toolCallStep.execute(
+      makeExecuteParams(requestContext, {
+        inputData: makeInputData({ action: 'send', resumeData: { approved: true } }),
+      }),
+    );
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(suspend).toHaveBeenCalled();
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-call-approval',
+      }),
+    );
+
+    await expect(Promise.race([executePromise, Promise.resolve('completed')])).resolves.toBe('completed');
   });
 });
 
