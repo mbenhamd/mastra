@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Added an internal Flow Signals processor-step mapping prototype for tool policy decisions.
+Improved Flow Signals tool policy handling in `@mastra/core` by applying allow and deny decisions during processor steps.
