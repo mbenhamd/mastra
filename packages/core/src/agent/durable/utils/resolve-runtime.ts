@@ -253,12 +253,13 @@ export async function toolRequiresApproval(
   tool: CoreTool,
   globalRequireApproval?: boolean,
   args?: Record<string, unknown>,
+  context?: { requestContext?: Record<string, unknown>; workspace?: Workspace },
 ): Promise<boolean> {
   let requires = !!(globalRequireApproval || (tool as any).requireApproval);
 
   if ((tool as any).needsApprovalFn) {
     try {
-      requires = Boolean(await (tool as any).needsApprovalFn(args ?? {})) || requires;
+      requires = Boolean(await (tool as any).needsApprovalFn(args ?? {}, context ?? {})) || requires;
     } catch {
       // On error, default to requiring approval (safe default)
       requires = true;

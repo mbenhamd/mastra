@@ -264,9 +264,7 @@ describe('createToolCallStep tool approval workflow', () => {
     expectNoToolExecution();
   });
 
-  it('should return inputData as-is for provider-executed tools (no client execution)', async () => {
-    // Provider-executed tools are handled by the stream path (tool-call + tool-result chunks
-    // in llm-execution-step), so tool-call-step just passes through inputData unchanged.
+  it('should reject provider-executed tool calls when the tool is not active', async () => {
     const inputData = {
       ...makeInputData(),
       toolName: 'web_search_20250305',
@@ -275,8 +273,7 @@ describe('createToolCallStep tool approval workflow', () => {
 
     const result = await toolCallStep.execute(makeExecuteParams({ inputData }));
 
-    expect(result).toEqual(inputData);
-    expect(result.result).toBeUndefined();
+    expect(result.error?.name).toBe('ToolNotFoundError');
     expectNoToolExecution();
   });
 

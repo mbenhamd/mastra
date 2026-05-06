@@ -230,11 +230,6 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
       };
 
-      const toolGatePolicyActive = !!getToolGateRuntimeState(requestContext, { runId })?.policy;
-      if (inputData.providerExecuted && !toolGatePolicyActive) {
-        return inputData;
-      }
-
       // Resolve the tool key for activeTools enforcement (may differ from toolName when matched by id)
       const toolKey = stepTools?.[inputData.toolName]
         ? inputData.toolName
@@ -266,6 +261,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           resumeDataFromArgs = resumeDataFromInput;
         }
 
+        const toolGatePolicyActive = !!getToolGateRuntimeState(requestContext, { runId })?.policy;
         const toolGateDecision = toolGatePolicyActive
           ? await evaluateToolGateForRequest({
               requestContext,

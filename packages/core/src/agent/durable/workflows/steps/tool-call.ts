@@ -328,7 +328,10 @@ export function createDurableToolCallStep() {
 
       // 2. Check if tool requires approval
       const requiresApproval =
-        (await toolRequiresApproval(tool, agentOptions.requireToolApproval, args)) ||
+        (await toolRequiresApproval(tool, agentOptions.requireToolApproval, args, {
+          requestContext: requestContextForRun ? Object.fromEntries(requestContextForRun.entries()) : {},
+          workspace,
+        })) ||
         toolGateDecision?.effect === 'requireApproval';
       const hadApprovalBeforeResume = durableToolCallWasApproved(requestContextForRun, runId, toolCallId);
 

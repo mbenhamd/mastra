@@ -8,7 +8,20 @@ describe('durable tool approval resolution', () => {
     } as any;
 
     await expect(toolRequiresApproval(tool, true, { action: 'send' })).resolves.toBe(true);
-    expect(tool.needsApprovalFn).toHaveBeenCalledWith({ action: 'send' });
+    expect(tool.needsApprovalFn).toHaveBeenCalledWith({ action: 'send' }, {});
+  });
+
+  it('passes request context and workspace to needsApprovalFn', async () => {
+    const tool = {
+      needsApprovalFn: vi.fn().mockReturnValue(false),
+    } as any;
+    const context = {
+      requestContext: { userId: 'user-123' },
+      workspace: { id: 'workspace-123' },
+    } as any;
+
+    await expect(toolRequiresApproval(tool, false, { action: 'send' }, context)).resolves.toBe(false);
+    expect(tool.needsApprovalFn).toHaveBeenCalledWith({ action: 'send' }, context);
   });
 
   it('does not let needsApprovalFn downgrade tool-owned approval', async () => {
