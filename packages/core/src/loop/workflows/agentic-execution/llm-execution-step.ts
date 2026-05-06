@@ -33,11 +33,6 @@ import type {
 } from '../../../stream/types';
 import { ChunkFrom, readModelStreamTransport } from '../../../stream/types';
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
-import {
-  createToolGateSubjectForTool,
-  evaluateToolGateForRequest,
-  getToolGateRuntimeState,
-} from '../../../tools/tool-gate';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
 import { isMastraTool } from '../../../tools/toolchecks';
 import { makeCoreTool } from '../../../utils';
@@ -68,7 +63,6 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   logger?: IMastraLogger;
   transportRef?: StreamTransportRef;
   transportResolver?: () => StreamTransport | undefined;
-  toolGatePolicyActive?: boolean;
 };
 
 function buildResponseModelMetadata(
@@ -89,74 +83,6 @@ function buildResponseModelMetadata(
   return Object.keys(metadata).length > 0 ? { metadata } : undefined;
 }
 
-function getSpecificToolChoiceName(toolChoice: ToolChoice<any> | undefined): string | undefined {
-  return typeof toolChoice === 'object' && toolChoice !== null && 'toolName' in toolChoice
-    ? String(toolChoice.toolName)
-    : undefined;
-}
-
-async function applyToolGateToModelInput<TOOLS extends ToolSet>({
-  currentStep,
-  requestContext,
-  runId,
-  threadId,
-  resourceId,
-}: {
-  currentStep: {
-    tools?: TOOLS | undefined;
-    toolChoice?: ToolChoice<TOOLS> | undefined;
-    activeTools?: (keyof TOOLS)[] | undefined;
-  };
-  requestContext: RequestContext;
-  runId: string;
-  threadId?: string;
-  resourceId?: string;
-}): Promise<void> {
-  if (!getToolGateRuntimeState(requestContext, { runId })?.policy) return;
-  if (!currentStep.tools) return;
-
-  const toolEntries = Object.entries(currentStep.tools);
-  if (toolEntries.length === 0) return;
-
-  const activeToolNames = currentStep.activeTools?.map(String);
-  const deniedToolNames = new Set<string>();
-
-  for (const [toolName, tool] of toolEntries) {
-    if (activeToolNames && !activeToolNames.includes(toolName)) continue;
-
-    const decision = await evaluateToolGateForRequest({
-      requestContext,
-      subject: createToolGateSubjectForTool({
-        boundary: 'model-input',
-        toolName,
-        tool,
-      }),
-      runId,
-      threadId,
-      resourceId,
-    });
-
-    if (decision?.effect === 'deny') {
-      deniedToolNames.add(toolName);
-    }
-  }
-
-  if (deniedToolNames.size === 0) return;
-
-  currentStep.tools = Object.fromEntries(toolEntries.filter(([toolName]) => !deniedToolNames.has(toolName))) as TOOLS;
-
-  if (currentStep.activeTools) {
-    currentStep.activeTools = currentStep.activeTools.filter(
-      toolName => !deniedToolNames.has(String(toolName)),
-    ) as (keyof TOOLS)[];
-  }
-
-  const chosenToolName = getSpecificToolChoiceName(currentStep.toolChoice);
-  if (chosenToolName && deniedToolNames.has(chosenToolName)) {
-    currentStep.toolChoice = Object.keys(currentStep.tools).length > 0 ? ('auto' as ToolChoice<TOOLS>) : undefined;
-  }
-}
-
 async function processOutputStream<OUTPUT = undefined>({
   tools,
   messageId,
@@ -170,7 +96,6 @@ async function processOutputStream<OUTPUT = undefined>({
   logger,
   transportRef,
   transportResolver,
-  toolGatePolicyActive,
 }: ProcessOutputStreamOptions<OUTPUT>): Promise<CollectedChunk[]> {
   let transportSet = false;
   const collectedChunks: CollectedChunk[] = [];
@@ -221,7 +146,7 @@ async function processOutputStream<OUTPUT = undefined>({
           tools?.[chunk.payload.toolName] ||
           Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
 
-        if (!toolGatePolicyActive && tool && 'onInputStart' in tool) {
+        if (tool && 'onInputStart' in tool) {
           try {
             await tool?.onInputStart?.({
               toolCallId: chunk.payload.toolCallId,
@@ -242,7 +167,7 @@ async function processOutputStream<OUTPUT = undefined>({
           tools?.[chunk.payload.toolName || ''] ||
           Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
 
-        if (!toolGatePolicyActive && tool && 'onInputDelta' in tool) {
+        if (tool && 'onInputDelta' in tool) {
           try {
             await tool?.onInputDelta?.({
               inputTextDelta: chunk.payload.argsTextDelta,
@@ -567,8 +492,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 stepNumber: inputData.output?.steps?.length || 0,
                 ...createObservabilityContext(stepTracingContext),
                 requestContext,
-                runId,
-                resourceId: _internal?.resourceId,
                 model,
                 steps: inputData.output?.steps || [],
                 messageId: currentStep.messageId,
@@ -716,16 +639,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               logger?.error('Error in processInputStep processors:', error);
               throw error;
             }
-          }
-
-          if (requestContext && getToolGateRuntimeState(requestContext, { runId })?.policy) {
-            await applyToolGateToModelInput({
-              currentStep,
-              requestContext,
-              runId,
-              threadId: _internal?.threadId,
-              resourceId: _internal?.resourceId,
-            });
           }
 
           // Store activeTools on _internal so toolCallStep can enforce them
@@ -961,7 +874,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               logger,
               transportRef: _internal?.transportRef,
               transportResolver,
-              toolGatePolicyActive: requestContext ? !!getToolGateRuntimeState(requestContext, { runId })?.policy : false,
             });
 
             // Build messages from the full chunk sequence and add to messageList.

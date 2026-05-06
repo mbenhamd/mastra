@@ -9,7 +9,6 @@ import type { VersionOverrides } from '../mastra/types';
 import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
-import type { ToolGatePolicy } from '../tools/tool-gate';
 import type { OutputWriter } from '../workflows/types';
 import type { MessageListInput } from './message-list';
 import type {
@@ -465,9 +464,6 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
 
   /** Request Context containing dynamic configuration and state */
   requestContext?: RequestContext<any>; // @TODO: Figure out how to type this without breaking all the inner types
-
-  /** Experimental runtime policy for model-visible tools and server-side tool calls. */
-  toolGatePolicy?: ToolGatePolicy;
 
   /**
    * Per-invocation version overrides for sub-agents (and future primitives).
