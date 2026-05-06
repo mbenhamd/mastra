@@ -485,14 +485,7 @@ export function getToolGateRuntimeState(
 
 export function clearToolGateRuntimeState(requestContext: RequestContext, options?: { runId?: string }): void {
   if (!options?.runId) {
-    const store = toolGateRuntimeState.get(requestContext);
-    if (!store?.runStates?.size) {
-      toolGateRuntimeState.delete(requestContext);
-      return;
-    }
-    toolGateRuntimeState.set(requestContext, {
-      runStates: store.runStates,
-    });
+    toolGateRuntimeState.delete(requestContext);
     return;
   }
 
