@@ -135,7 +135,32 @@ export const FlowPolicySchema = z
     maxRetries: z.number().int().nonnegative().optional(),
     clarificationRequired: z.boolean().default(false),
   })
-  .strict();
+  .strict()
+  .superRefine((policy, ctx) => {
+    const allowedTools = new Set(policy.allowedTools);
+
+    for (const deniedTool of policy.deniedTools) {
+      if (allowedTools.has(deniedTool)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `Tool "${deniedTool}" cannot be both allowed and denied`,
+          path: ['deniedTools'],
+        });
+      }
+    }
+  });
+
+export const FlowDecisionActionTypeSchema = z.enum([
+  'continue',
+  'ask_clarification',
+  'require_capability',
+  'apply_tool_policy',
+  'require_evidence',
+  'apply_output_contract',
+  'retry',
+  'fail',
+  'finalize',
+]);
 
 export const FlowDecisionActionSchema = z
   .discriminatedUnion('type', [
@@ -156,12 +181,28 @@ export const FlowDecisionActionSchema = z
     z.object({ type: z.literal('finalize'), contractId: z.string().min(1).optional() }).strict(),
   ])
   .superRefine((action, ctx) => {
-    if (action.type === 'apply_tool_policy' && action.allowedTools.length === 0 && action.deniedTools.length === 0) {
+    if (action.type !== 'apply_tool_policy') {
+      return;
+    }
+
+    if (action.allowedTools.length === 0 && action.deniedTools.length === 0) {
       ctx.addIssue({
         code: 'custom',
         message: 'apply_tool_policy requires at least one allowed or denied tool',
         path: ['allowedTools'],
       });
+    }
+
+    const allowedTools = new Set(action.allowedTools);
+
+    for (const deniedTool of action.deniedTools) {
+      if (allowedTools.has(deniedTool)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `Tool "${deniedTool}" cannot be both allowed and denied`,
+          path: ['deniedTools'],
+        });
+      }
     }
   });
 
@@ -184,6 +225,45 @@ export const FlowDecisionSchema = z
         code: 'custom',
         message: `Flow decision status must be ${expectedStatus} for its actions`,
         path: ['status'],
+      });
+    }
+
+    const hasContinue = decision.actions.some(action => action.type === 'continue');
+    if (hasContinue && decision.actions.length > 1) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Flow decision continue action cannot be combined with other actions',
+        path: ['actions'],
+      });
+    }
+
+    const terminalActionTypes = new Set(
+      decision.actions
+        .filter(action => action.type === 'fail' || action.type === 'retry' || action.type === 'finalize')
+        .map(action => action.type),
+    );
+
+    if (terminalActionTypes.size > 1) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Flow decision cannot contain multiple terminal action types',
+        path: ['actions'],
+      });
+    }
+
+    const hasFinalize = decision.actions.some(action => action.type === 'finalize');
+    const hasBlockingAction = decision.actions.some(
+      action =>
+        action.type === 'ask_clarification' ||
+        action.type === 'require_capability' ||
+        action.type === 'require_evidence',
+    );
+
+    if (hasFinalize && hasBlockingAction) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Flow decision finalize action cannot be combined with blocking actions',
+        path: ['actions'],
       });
     }
   });
@@ -223,7 +303,7 @@ export const FlowDecisionSummarySchema = z
     policyId: z.string().min(1),
     decisionPoint: FlowDecisionPointSchema,
     status: z.enum(['continue', 'blocked', 'retry', 'failed', 'finalize']),
-    actionTypes: z.array(z.string().min(1)).default([]),
+    actionTypes: z.array(FlowDecisionActionTypeSchema).default([]),
   })
   .strict();
 
@@ -275,6 +355,7 @@ export type EvidenceRequirement = z.infer<typeof EvidenceRequirementSchema>;
 export type EvidenceEntry = z.infer<typeof EvidenceEntrySchema>;
 export type EvidenceLedger = z.infer<typeof EvidenceLedgerSchema>;
 export type FlowPolicy = z.infer<typeof FlowPolicySchema>;
+export type FlowDecisionActionType = z.infer<typeof FlowDecisionActionTypeSchema>;
 export type FlowDecisionAction = z.infer<typeof FlowDecisionActionSchema>;
 export type FlowDecision = z.infer<typeof FlowDecisionSchema>;
 export type FlowDecisionSummary = z.infer<typeof FlowDecisionSummarySchema>;

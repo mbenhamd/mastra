@@ -70,6 +70,28 @@ describe('flow signals schemas', () => {
     ).toThrow();
   });
 
+  it('rejects contradictory tool policy payloads', () => {
+    expect(() =>
+      FlowPolicySchema.parse({
+        ...baseFlowPolicy,
+        allowedTools: ['knowledge.search'],
+        deniedTools: ['knowledge.search'],
+      }),
+    ).toThrow();
+
+    const baseDecision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        status: 'continue',
+        actions: [
+          { type: 'apply_tool_policy', allowedTools: ['knowledge.search'], deniedTools: ['knowledge.search'] },
+        ],
+      }),
+    ).toThrow();
+  });
+
   it('rejects invalid public decision envelopes', () => {
     const baseDecision = selectFlowDecision(canonicalDecisionFrames[0], baseFlowPolicy);
 
@@ -91,6 +113,56 @@ describe('flow signals schemas', () => {
       FlowDecisionSchema.parse({
         ...baseDecision,
         status: 'continue',
+        actions: [{ type: 'continue' }, { type: 'apply_output_contract', contractId: 'contract.summary.v1' }],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        status: 'retry',
+        actions: [
+          { type: 'retry', reason: 'retry_after_tripwire' },
+          { type: 'finalize', contractId: 'contract.summary.v1' },
+        ],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        status: 'blocked',
+        actions: [
+          {
+            type: 'require_evidence',
+            requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
+          },
+          { type: 'finalize', contractId: 'contract.summary.v1' },
+        ],
+      }),
+    ).toThrow();
+
+    expect(() =>
+      FlowDecisionSchema.parse({
+        ...baseDecision,
+        status: 'continue',
+      }),
+    ).toThrow();
+  });
+
+  it('rejects unknown action types in persisted decision summaries', () => {
+    expect(() =>
+      FlowStateSchema.parse({
+        version: 1,
+        decisions: [
+          {
+            id: 'decision.unknown-action',
+            policyId: 'policy.default',
+            decisionPoint: 'turn_start',
+            status: 'continue',
+            actionTypes: ['unknown_action'],
+          },
+        ],
       }),
     ).toThrow();
   });
@@ -174,11 +246,23 @@ describe('selectFlowDecision', () => {
     const decision = selectFlowDecision(frame, baseFlowPolicy);
 
     expect(decision.status).toBe('finalize');
+    expect(decision.actions).toContainEqual({ type: 'apply_output_contract', contractId: 'contract.summary.v1' });
     expect(decision.actions).toContainEqual({ type: 'finalize', contractId: 'contract.summary.v1' });
     expect(decision.actions).not.toContainEqual({
       type: 'require_evidence',
       requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
     });
+  });
+
+  it('omits finalize contractId when no output contract is configured', () => {
+    const frame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const decision = selectFlowDecision(frame, {
+      ...baseFlowPolicy,
+      outputContractId: undefined,
+    });
+
+    expect(decision.status).toBe('finalize');
+    expect(decision.actions).toContainEqual({ type: 'finalize' });
   });
 
   it('does not finalize when pre_final is blocked by clarification', () => {
@@ -231,6 +315,24 @@ describe('selectFlowDecision', () => {
       requirements: [{ id: 'evidence.retrieval', kind: 'retrieval', requiredCount: 1, match: {} }],
     });
     expect(decision.actions.some(action => action.type === 'retry')).toBe(false);
+  });
+
+  it('emits retry when retry point requirements are satisfied and budget remains', () => {
+    const retryFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'retry_after_tripwire')!;
+    const evidenceFrame = canonicalDecisionFrames.find(item => item.decisionPoint === 'pre_final')!;
+    const frame = {
+      ...retryFrame,
+      state: {
+        ...retryFrame.state,
+        retryCount: 0,
+        evidence: evidenceFrame.state.evidence,
+      },
+    };
+
+    const decision = selectFlowDecision(frame, baseFlowPolicy);
+
+    expect(decision.status).toBe('retry');
+    expect(decision.actions).toContainEqual({ type: 'retry', reason: 'retry_after_tripwire' });
   });
 
   it('does not satisfy evidence requirements with observed evidence', () => {

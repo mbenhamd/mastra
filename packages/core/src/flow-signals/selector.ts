@@ -73,7 +73,11 @@ export function selectFlowDecision(
   );
 
   if (frame.decisionPoint === 'pre_final' && missingEvidence.length === 0 && !hasBlockingOrTerminalAction) {
-    actions.push({ type: 'finalize', contractId: policy.outputContractId });
+    actions.push(
+      policy.outputContractId
+        ? { type: 'finalize', contractId: policy.outputContractId }
+        : { type: 'finalize' },
+    );
     reasons.push('pre_final_ready');
   }
 
