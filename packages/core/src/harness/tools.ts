@@ -199,7 +199,13 @@ export const submitPlanTool = createTool({
 // Task Tools
 // =============================================================================
 
-const taskItemSchema = z.object({
+const taskIdSchema = z
+  .string()
+  .min(1)
+  .describe("Stable task identifier (for example, 'investigate-tests'). Keep this unchanged across updates.");
+
+const taskItemInputSchema = z.object({
+  id: taskIdSchema.optional(),
   content: z.string().min(1).describe("Task description in imperative form (e.g., 'Fix authentication bug')"),
   status: z.enum(['pending', 'in_progress', 'completed']).describe('Current task status'),
   activeForm: z
@@ -208,19 +214,135 @@ const taskItemSchema = z.object({
     .describe("Present continuous form shown during execution (e.g., 'Fixing authentication bug')"),
 });
 
+const taskItemSchema = taskItemInputSchema.extend({
+  id: taskIdSchema,
+});
+
+export type TaskItemInput = z.infer<typeof taskItemInputSchema>;
 export type TaskItem = z.infer<typeof taskItemSchema>;
+
+function createDeterministicTaskId(task: TaskItemInput, occurrence: number): string {
+  const slug = task.content
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+  const suffix = occurrence > 1 ? `_${occurrence}` : '';
+  return `task_${slug || 'item'}${suffix}`;
+}
+
+function makeUniqueTaskId(id: string, usedIds: Set<string>): string {
+  if (!usedIds.has(id)) return id;
+
+  let suffix = 2;
+  let nextId = `${id}_${suffix}`;
+  while (usedIds.has(nextId)) {
+    suffix += 1;
+    nextId = `${id}_${suffix}`;
+  }
+  return nextId;
+}
+
+export function assignTaskIds(tasks: TaskItemInput[], previousTasks: TaskItem[] = []): TaskItem[] {
+  const usedIds = new Set<string>();
+  const contentOccurrences = new Map<string, number>();
+
+  return tasks.map(task => {
+    const previousMatch = previousTasks.find(
+      previous => previous.content === task.content && !usedIds.has(previous.id),
+    );
+    // Compatibility fallback for older task_write calls that omitted IDs:
+    // prefer exact content matches, otherwise mint a deterministic ID.
+    const contentOccurrence = (contentOccurrences.get(task.content) ?? 0) + 1;
+    contentOccurrences.set(task.content, contentOccurrence);
+
+    const fallbackId = createDeterministicTaskId(task, contentOccurrence);
+    // If the model repeats an explicit ID in the same write, keep the first one
+    // and mint/reuse a stable fallback for the duplicate instead of failing the whole list.
+    const id = makeUniqueTaskId(
+      task.id && !usedIds.has(task.id) ? task.id : (previousMatch?.id ?? fallbackId),
+      usedIds,
+    );
+    usedIds.add(id);
+
+    return {
+      id,
+      content: task.content,
+      status: task.status,
+      activeForm: task.activeForm,
+    };
+  });
+}
+
+function getCurrentTasks(harnessCtx: HarnessRequestContext | undefined): TaskItem[] {
+  const state = harnessCtx?.getState ? harnessCtx.getState() : harnessCtx?.state;
+  const typedState = state as {
+    tasks?: TaskItemInput[];
+  };
+
+  return assignTaskIds(typedState?.tasks || []);
+}
+
+function formatTaskListResult(tasks: TaskItem[]): string {
+  const completed = tasks.filter(t => t.status === 'completed').length;
+  const inProgress = tasks.find(t => t.status === 'in_progress');
+  const total = tasks.length;
+
+  let summary = `Tasks updated: [${completed}/${total} completed]`;
+  if (inProgress) {
+    summary += `\nCurrently: ${inProgress.activeForm} (${inProgress.id})`;
+  }
+  if (tasks.length > 0) {
+    summary += `\nTask IDs:\n${tasks.map(t => `- ${t.id}: ${t.content} (${t.status})`).join('\n')}`;
+  }
+
+  return summary;
+}
+
+function hasMultipleInProgress(tasks: TaskItem[]): boolean {
+  return tasks.filter(task => task.status === 'in_progress').length > 1;
+}
+
+function multipleInProgressError(tasks: TaskItem[]) {
+  return {
+    content: 'Only one task can be in_progress at a time.',
+    tasks,
+    isError: true,
+  };
+}
+
+async function writeTasks(harnessCtx: HarnessRequestContext | undefined, tasks: TaskItem[]): Promise<void> {
+  if (!harnessCtx) return;
+
+  await harnessCtx.setState({ tasks });
+
+  harnessCtx.emitEvent?.({
+    type: 'task_updated',
+    tasks,
+  });
+}
+
+function formatAvailableTaskIds(tasks: TaskItem[]): string {
+  if (tasks.length === 0) return 'No tasks are currently tracked.';
+  return `Available task IDs:\n${tasks.map(t => `- ${t.id}: ${t.content} (${t.status})`).join('\n')}`;
+}
 
 /**
  * Built-in harness tool: manage a structured task list for the coding session.
  * Full-replacement semantics: each call replaces the entire task list.
+ * Prefer task_update or task_complete for changing existing tasks by ID.
  */
 export const taskWriteTool = createTool({
   id: 'task_write',
   description: `Create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
 
 Usage:
-- Pass the FULL task list each time (replaces previous list)
-- Each task has: content (imperative), status (pending|in_progress|completed), activeForm (present continuous)
+- Use this to create the initial task list or replace the whole list after replanning
+- Pass the FULL task list each time this tool is called (replaces the previous list)
+- Each task has: id (stable identifier), content (imperative), status (pending, in_progress, or completed), activeForm (present continuous)
+- Keep task IDs stable across updates. If omitted, IDs are generated and returned in the tool result
+- When an ID is omitted while rewriting an existing list, matching content may reuse an existing ID
+- Prefer single-task update tools when they are available
 - Mark tasks in_progress BEFORE starting work (only ONE at a time)
 - Mark tasks completed IMMEDIATELY after finishing
 - Use this for multi-step tasks requiring 3+ distinct actions
@@ -230,42 +352,163 @@ States:
 - in_progress: Currently working on (limit to ONE)
 - completed: Finished successfully`,
   inputSchema: z.object({
-    tasks: z.array(taskItemSchema).describe('The complete updated task list'),
+    tasks: z.array(taskItemInputSchema).describe('The complete updated task list'),
   }),
   execute: async ({ tasks }, context) => {
     try {
       const harnessCtx = context?.requestContext?.get('harness') as HarnessRequestContext | undefined;
-
-      if (harnessCtx) {
-        // Always update state
-        await harnessCtx.setState({ tasks });
-
-        // Always emit event immediately for real-time updates
-        // The UI will handle deduplication if needed
-        harnessCtx.emitEvent?.({
-          type: 'task_updated',
-          tasks,
-        });
+      const currentTasks = getCurrentTasks(harnessCtx);
+      const normalizedTasks = assignTaskIds(tasks, currentTasks);
+      if (hasMultipleInProgress(normalizedTasks)) {
+        return multipleInProgressError(currentTasks);
       }
 
-      // Build summary for the model's context
-      const completed = tasks.filter(t => t.status === 'completed').length;
-      const inProgress = tasks.find(t => t.status === 'in_progress');
-      const total = tasks.length;
-
-      let summary = `Tasks updated: [${completed}/${total} completed]`;
-      if (inProgress) {
-        summary += `\nCurrently: ${inProgress.activeForm}`;
-      }
+      // Always update state and emit immediately for real-time updates.
+      // The UI will handle deduplication if needed.
+      await writeTasks(harnessCtx, normalizedTasks);
 
       return {
-        content: summary,
+        content: formatTaskListResult(normalizedTasks),
+        tasks: normalizedTasks,
         isError: false,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       return {
         content: `Failed to update tasks: ${msg}`,
+        tasks: [],
+        isError: true,
+      };
+    }
+  },
+});
+
+/**
+ * Built-in harness tool: update one tracked task by stable ID.
+ */
+export const taskUpdateTool = createTool({
+  id: 'task_update',
+  description: `Update one task in the current task list by stable ID. Use this for targeted changes to one existing task.
+
+Usage:
+- Provide the task ID returned by the task-list tools
+- Include only the fields that changed
+- Use status to move a task between pending, in_progress, and completed
+- Use task_complete when only marking a task completed`,
+  inputSchema: z
+    .object({
+      id: taskIdSchema,
+      content: z.string().min(1).optional().describe('New task description in imperative form'),
+      status: z.enum(['pending', 'in_progress', 'completed']).optional().describe('New task status'),
+      activeForm: z.string().min(1).optional().describe('New present continuous form shown during execution'),
+    })
+    .refine(input => input.content !== undefined || input.status !== undefined || input.activeForm !== undefined, {
+      message: 'Provide at least one field to update.',
+    }),
+  execute: async ({ id, content, status, activeForm }, context) => {
+    try {
+      const harnessCtx = context?.requestContext?.get('harness') as HarnessRequestContext | undefined;
+      if (!harnessCtx) {
+        return {
+          content: 'Unable to update task list (no harness context)',
+          tasks: [],
+          isError: true,
+        };
+      }
+
+      const tasks = getCurrentTasks(harnessCtx);
+      const taskIndex = tasks.findIndex(task => task.id === id);
+      if (taskIndex === -1) {
+        return {
+          content: `Task not found: ${id}\n\n${formatAvailableTaskIds(tasks)}`,
+          tasks,
+          isError: true,
+        };
+      }
+
+      const updatedTasks = tasks.map((task, index) =>
+        index === taskIndex
+          ? {
+              ...task,
+              ...(content !== undefined ? { content } : {}),
+              ...(status !== undefined ? { status } : {}),
+              ...(activeForm !== undefined ? { activeForm } : {}),
+            }
+          : task,
+      );
+      if (hasMultipleInProgress(updatedTasks)) {
+        return multipleInProgressError(tasks);
+      }
+
+      await writeTasks(harnessCtx, updatedTasks);
+
+      return {
+        content: formatTaskListResult(updatedTasks),
+        tasks: updatedTasks,
+        isError: false,
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: `Failed to update task: ${msg}`,
+        tasks: [],
+        isError: true,
+      };
+    }
+  },
+});
+
+/**
+ * Built-in harness tool: mark one tracked task completed by stable ID.
+ */
+export const taskCompleteTool = createTool({
+  id: 'task_complete',
+  description: `Mark one task completed by stable ID. Use this when one tracked task is finished.`,
+  inputSchema: z.object({
+    id: taskIdSchema,
+  }),
+  execute: async ({ id }, context) => {
+    try {
+      const harnessCtx = context?.requestContext?.get('harness') as HarnessRequestContext | undefined;
+      if (!harnessCtx) {
+        return {
+          content: 'Unable to update task list (no harness context)',
+          tasks: [],
+          isError: true,
+        };
+      }
+
+      const tasks = getCurrentTasks(harnessCtx);
+      const taskIndex = tasks.findIndex(task => task.id === id);
+      if (taskIndex === -1) {
+        return {
+          content: `Task not found: ${id}\n\n${formatAvailableTaskIds(tasks)}`,
+          tasks,
+          isError: true,
+        };
+      }
+
+      const updatedTasks = tasks.map((task, index) =>
+        index === taskIndex
+          ? {
+              ...task,
+              status: 'completed' as const,
+            }
+          : task,
+      );
+
+      await writeTasks(harnessCtx, updatedTasks);
+
+      return {
+        content: formatTaskListResult(updatedTasks),
+        tasks: updatedTasks,
+        isError: false,
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: `Failed to complete task: ${msg}`,
+        tasks: [],
         isError: true,
       };
     }
@@ -278,13 +521,14 @@ States:
  */
 export const taskCheckTool = createTool({
   id: 'task_check',
-  description: `Check the completion status of your current task list. Use this before deciding to end work on a task to ensure all tasks are completed.
+  description: `Check the completion status of your current task list. Use this before finishing tracked work to ensure all tasks are completed.
 
 Returns:
 - Total number of tasks
 - Number of completed, in progress, and pending tasks
 - List of incomplete tasks (if any)
-- Boolean indicating if all tasks are done`,
+- Boolean indicating if all tasks are done
+- Structured task list snapshot with stable IDs`,
   inputSchema: z.object({}), // No input needed
   execute: async ({}, context) => {
     try {
@@ -293,26 +537,18 @@ Returns:
       if (!harnessCtx) {
         return {
           content: 'Unable to access task list (no harness context)',
+          tasks: [],
           isError: true,
         };
       }
 
-      // Get current state which includes tasks
-      // Use getState() for live state instead of the snapshot
-      const state = harnessCtx.getState ? harnessCtx.getState() : harnessCtx.state;
-      const typedState = state as {
-        tasks?: Array<{
-          content: string;
-          status: 'pending' | 'in_progress' | 'completed';
-          activeForm: string;
-        }>;
-      };
-
-      const tasks = typedState.tasks || [];
+      // Prefer live harness state when available; fall back to the request snapshot for older contexts.
+      const tasks = getCurrentTasks(harnessCtx);
 
       if (tasks.length === 0) {
         return {
           content: 'No tasks found. Consider using task_write to create a task list for complex work.',
+          tasks,
           isError: false,
         };
       }
@@ -336,13 +572,13 @@ Returns:
         if (inProgress.length > 0) {
           response += '\n\nIn Progress:';
           inProgress.forEach(t => {
-            response += `\n- ${t.content}`;
+            response += `\n- ${t.id}: ${t.content}`;
           });
         }
         if (pending.length > 0) {
           response += '\n\nPending:';
           pending.forEach(t => {
-            response += `\n- ${t.content}`;
+            response += `\n- ${t.id}: ${t.content}`;
           });
         }
         response += '\n\nContinue working on these tasks before ending.';
@@ -350,12 +586,14 @@ Returns:
 
       return {
         content: response,
+        tasks,
         isError: false,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       return {
         content: `Failed to check tasks: ${msg}`,
+        tasks: [],
         isError: true,
       };
     }

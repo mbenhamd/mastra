@@ -509,7 +509,12 @@ describe('createSubagentTool allowedWorkspaceTools filtering', () => {
         name: 'Execute',
         description: 'Executor.',
         instructions: 'Execute stuff.',
-        tools: { task_write: { id: 'task_write' } as any, task_check: { id: 'task_check' } as any },
+        tools: {
+          task_write: { id: 'task_write' } as any,
+          task_update: { id: 'task_update' } as any,
+          task_complete: { id: 'task_complete' } as any,
+          task_check: { id: 'task_check' } as any,
+        },
         allowedWorkspaceTools: ['view', 'write_file', 'execute_command'],
       },
     ];
@@ -533,15 +538,25 @@ describe('createSubagentTool allowedWorkspaceTools filtering', () => {
       write_file: {},
       execute_command: {},
       task_write: {},
+      task_update: {},
+      task_complete: {},
       task_check: {},
     };
     const result = streamOpts.prepareStep({ tools: allTools });
 
     // All tools should be visible
     expect(result.activeTools).toEqual(
-      expect.arrayContaining(['view', 'write_file', 'execute_command', 'task_write', 'task_check']),
+      expect.arrayContaining([
+        'view',
+        'write_file',
+        'execute_command',
+        'task_write',
+        'task_update',
+        'task_complete',
+        'task_check',
+      ]),
     );
-    expect(result.activeTools).toHaveLength(5);
+    expect(result.activeTools).toHaveLength(7);
   });
 });
 

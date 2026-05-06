@@ -10,6 +10,7 @@ import type { PublicSchema } from '../schema';
 import type { MastraCompositeStore } from '../storage/base';
 import type { DynamicArgument } from '../types';
 import type { Workspace, WorkspaceConfig, WorkspaceStatus } from '../workspace';
+import type { TaskItem } from './tools';
 
 // =============================================================================
 // Heartbeat Handlers
@@ -169,7 +170,14 @@ export type HarnessStateSchema<T> = T;
 /**
  * Identifiers for the built-in harness tools that can be selectively disabled.
  */
-export type BuiltinToolId = 'ask_user' | 'submit_plan' | 'task_write' | 'task_check' | 'subagent';
+export type BuiltinToolId =
+  | 'ask_user'
+  | 'submit_plan'
+  | 'task_write'
+  | 'task_update'
+  | 'task_complete'
+  | 'task_check'
+  | 'subagent';
 
 export interface HarnessConfig<TState = {}> {
   /** Unique identifier for this harness instance */
@@ -278,7 +286,8 @@ export interface HarnessConfig<TState = {}> {
   /**
    * Built-in tool IDs to disable.
    * Any tool listed here will be excluded from the `harnessBuiltIn` toolset.
-   * Valid values: 'ask_user', 'submit_plan', 'task_write', 'task_check', 'subagent'.
+   * Valid values: 'ask_user', 'submit_plan', 'task_write', 'task_update',
+   * 'task_complete', 'task_check', 'subagent'.
    */
   disableBuiltinTools?: BuiltinToolId[];
 
@@ -648,19 +657,11 @@ export interface HarnessDisplayState {
   modifiedFiles: Map<string, { operations: string[]; firstModified: Date }>;
 
   // ── Tasks ────────────────────────────────────────────────────────────
-  /** Current task list (from task_write tool) */
-  tasks: Array<{
-    content: string;
-    status: 'pending' | 'in_progress' | 'completed';
-    activeForm: string;
-  }>;
+  /** Current task list (from task tools) */
+  tasks: TaskItem[];
 
   /** Previous task list snapshot (for diff detection) */
-  previousTasks: Array<{
-    content: string;
-    status: 'pending' | 'in_progress' | 'completed';
-    activeForm: string;
-  }>;
+  previousTasks: TaskItem[];
 }
 
 /**
@@ -895,11 +896,7 @@ export type HarnessEvent =
   | { type: 'subagent_model_changed'; modelId: string; scope: 'global' | 'thread'; agentType?: string }
   | {
       type: 'task_updated';
-      tasks: Array<{
-        content: string;
-        status: 'pending' | 'in_progress' | 'completed';
-        activeForm: string;
-      }>;
+      tasks: TaskItem[];
     }
   | { type: 'display_state_changed'; displayState: HarnessDisplayState };
 

@@ -258,7 +258,7 @@ function summarizeArgs(args: unknown): string {
   const obj = args as Record<string, unknown>;
   const parts: string[] = [];
 
-  // Special handling for task_write tool
+  // Special handling for task list snapshots.
   if (obj.tasks && Array.isArray(obj.tasks)) {
     const tasks = obj.tasks as Array<{
       content?: string;

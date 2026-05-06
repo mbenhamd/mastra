@@ -732,24 +732,35 @@ describe('task_updated', () => {
 
   it('updates tasks from event payload', () => {
     const tasks = [
-      { content: 'Fix bug', status: 'in_progress' as const, activeForm: 'Fixing bug' },
-      { content: 'Write tests', status: 'pending' as const, activeForm: 'Writing tests' },
+      { id: 'fix-bug', content: 'Fix bug', status: 'in_progress' as const, activeForm: 'Fixing bug' },
+      { id: 'write-tests', content: 'Write tests', status: 'pending' as const, activeForm: 'Writing tests' },
     ];
     emit(harness, { type: 'task_updated', tasks });
     expect(harness.getDisplayState().tasks).toBe(tasks);
   });
 
   it('snapshots current tasks to previousTasks before update', () => {
-    const tasks1 = [{ content: 'Task 1', status: 'pending' as const, activeForm: 'T1' }];
+    const tasks1 = [{ id: 'task-1', content: 'Task 1', status: 'pending' as const, activeForm: 'T1' }];
     const tasks2 = [
-      { content: 'Task 1', status: 'completed' as const, activeForm: 'T1' },
-      { content: 'Task 2', status: 'in_progress' as const, activeForm: 'T2' },
+      { id: 'task-1', content: 'Task 1', status: 'completed' as const, activeForm: 'T1' },
+      { id: 'task-2', content: 'Task 2', status: 'in_progress' as const, activeForm: 'T2' },
     ];
 
     emit(harness, { type: 'task_updated', tasks: tasks1 });
     expect(harness.getDisplayState().previousTasks).toEqual([]);
 
     emit(harness, { type: 'task_updated', tasks: tasks2 });
+    expect(harness.getDisplayState().previousTasks).toEqual(tasks1);
+    expect(harness.getDisplayState().tasks).toBe(tasks2);
+  });
+
+  it('preserves task ids in current and previous task snapshots', () => {
+    const tasks1 = [{ id: 'task-1', content: 'Task 1', status: 'in_progress' as const, activeForm: 'T1' }];
+    const tasks2 = [{ id: 'task-1', content: 'Task 1', status: 'completed' as const, activeForm: 'T1' }];
+
+    emit(harness, { type: 'task_updated', tasks: tasks1 });
+    emit(harness, { type: 'task_updated', tasks: tasks2 });
+
     expect(harness.getDisplayState().previousTasks).toEqual(tasks1);
     expect(harness.getDisplayState().tasks).toBe(tasks2);
   });
@@ -1108,7 +1119,10 @@ describe('resetThreadDisplayState', () => {
     emit(harness, { type: 'ask_question', questionId: 'q1', question: 'Q?', options: [] });
     emit(harness, { type: 'plan_approval_required', planId: 'p1', title: 'P', plan: '#' });
     emit(harness, { type: 'subagent_start', toolCallId: 's1', agentType: 'explore', task: 't', modelId: 'm' });
-    emit(harness, { type: 'task_updated', tasks: [{ content: 'T', status: 'pending', activeForm: 'T' }] });
+    emit(harness, {
+      type: 'task_updated',
+      tasks: [{ id: 'task-t', content: 'T', status: 'pending', activeForm: 'T' }],
+    });
     emit(harness, { type: 'om_observation_start', cycleId: 'c1', operationType: 'observation', tokensToObserve: 5000 });
     emit(harness, { type: 'om_buffering_start', cycleId: 'c2', operationType: 'observation', tokensToBuffer: 1000 });
 
@@ -1553,7 +1567,7 @@ describe('full lifecycle integration', () => {
     // Task update
     emit(harness, {
       type: 'task_updated',
-      tasks: [{ content: 'Edit foo', status: 'completed', activeForm: 'Editing' }],
+      tasks: [{ id: 'edit-foo', content: 'Edit foo', status: 'completed', activeForm: 'Editing' }],
     });
     expect(ds.tasks).toHaveLength(1);
 

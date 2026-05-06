@@ -99,6 +99,8 @@ export interface TUIState {
   streamingComponent?: AssistantMessageComponent;
   streamingMessage?: HarnessMessage;
   pendingTools: Map<string, IToolExecutionComponent>;
+  /** Task tools are hidden on success but promoted to normal tool boxes on errors */
+  pendingTaskToolIds: Set<string>;
   /** Position hint for task_write inline rendering when streaming */
   taskWriteInsertIndex: number;
   /** Track all tool IDs seen during current stream (prevents duplicates) */
@@ -233,6 +235,7 @@ export function createTUIState(options: MastraTUIOptions): TUIState {
     // Agent / streaming
     isInitialized: false,
     pendingTools: new Map(),
+    pendingTaskToolIds: new Set(),
     taskWriteInsertIndex: -1,
     seenToolCallIds: new Set(),
     subagentToolCallIds: new Set(),

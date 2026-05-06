@@ -19,7 +19,15 @@ import {
   DEFAULT_DISPLAY_STATE_SUBSCRIPTION_OPTIONS,
   DisplayStateScheduler,
 } from './display-state-scheduler';
-import { askUserTool, createSubagentTool, submitPlanTool, taskCheckTool, taskWriteTool } from './tools';
+import {
+  askUserTool,
+  createSubagentTool,
+  submitPlanTool,
+  taskCheckTool,
+  taskCompleteTool,
+  taskUpdateTool,
+  taskWriteTool,
+} from './tools';
 import { defaultDisplayState, defaultOMProgressState } from './types';
 import type {
   AvailableModel,
@@ -3076,6 +3084,8 @@ export class Harness<TState = {}> {
       ask_user: askUserTool,
       submit_plan: submitPlanTool,
       task_write: taskWriteTool,
+      task_update: taskUpdateTool,
+      task_complete: taskCompleteTool,
       task_check: taskCheckTool,
     };
 

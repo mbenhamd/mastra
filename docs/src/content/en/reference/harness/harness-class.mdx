@@ -252,7 +252,7 @@ await harness.sendMessage({ content: 'Hello!' })
     name: 'disableBuiltinTools',
     type: 'BuiltinToolId[]',
     description:
-      'Built-in harness tool IDs to remove from the `harnessBuiltIn` toolset. Valid values are `ask_user`, `submit_plan`, `task_write`, `task_check`, and `subagent`.',
+      'Built-in harness tool IDs to remove from the `harnessBuiltIn` toolset. Valid values are `ask_user`, `submit_plan`, `task_write`, `task_update`, `task_complete`, `task_check`, and `subagent`.',
     isOptional: true,
   },
   {
@@ -1030,8 +1030,10 @@ The harness provides built-in tools to agents in every mode:
 | - | - |
 | `ask_user` | Ask the user a question and wait for their response. Supports free text, single-select choices, and multi-select choices. |
 | `submit_plan` | Submit a plan for user review and approval. |
-| `task_write` | Create or update a structured task list for tracking progress. |
-| `task_check` | Check the completion status of the current task list. |
+| `task_write` | Create or replace a structured task list for tracking progress. Assigns task IDs when omitted. |
+| `task_update` | Update one tracked task by ID. |
+| `task_complete` | Mark one tracked task completed by ID. |
+| `task_check` | Check the completion status of the current task list and return the structured task list snapshot. |
 | `subagent` | Spawn a focused subagent with constrained tools (only available when `subagents` is configured). Pass `forked: true` to inherit the parent conversation — see [Forked subagents](#forked-subagents). |
 
 ### `ask_user` selections

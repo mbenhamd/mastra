@@ -128,22 +128,51 @@ ${webTools.join(' / ')} — Search the web / extract page content
   // --- Task management tools (all modes) ---
 
   const taskTools: string[] = [];
+  const canUpdateTask = !denied.has('task_update');
+  const canCompleteTask = !denied.has('task_complete');
+  const canCheckTasks = !denied.has('task_check');
+  const canWriteTasks = !denied.has('task_write');
+  const patchToolGuidance =
+    canUpdateTask && canCompleteTask
+      ? '- Prefer task_update or task_complete when changing one existing task.'
+      : canUpdateTask
+        ? '- Prefer task_update when changing one existing task.'
+        : canCompleteTask
+          ? '- Prefer task_complete when marking one existing task completed.'
+          : '- Use task_write with the full task list when changing existing tasks.';
 
-  if (!denied.has('task_write')) {
+  if (canWriteTasks) {
     taskTools.push(`
 **task_write** — Track tasks for complex multi-step work
 - Use when a task requires 3 or more distinct steps or actions.
-- Pass the FULL task list each time (replaces previous list).
+- Use task_write to create the initial task list or replace the whole list after replanning.
+- Each task has: id (stable identifier), content (imperative form), status (pending, in_progress, or completed), activeForm (present continuous form shown during execution).
+- Keep task IDs stable across updates. If you omit IDs, the tool result returns generated IDs.
+${patchToolGuidance}
 - Mark tasks \`in_progress\` BEFORE starting work. Only ONE task should be \`in_progress\` at a time.
-- Mark tasks \`completed\` IMMEDIATELY after finishing each task. Do not batch completions.
-- Each task has: content (imperative form), status (pending|in_progress|completed), activeForm (present continuous form shown during execution).`);
+- Mark tasks \`completed\` IMMEDIATELY after finishing each task. Do not batch completions.`);
   }
 
-  if (!denied.has('task_check')) {
+  if (canUpdateTask) {
+    taskTools.push(`
+**task_update** — Patch one tracked task by ID
+- Use this for targeted changes to one existing task.
+- Provide the task ID and only the fields that changed: content, status, or activeForm.`);
+  }
+
+  if (canCompleteTask) {
+    taskTools.push(`
+**task_complete** — Mark one tracked task completed by ID
+- Use this immediately after finishing a tracked task.
+- Provide the task ID returned by available task-list tools${canCheckTasks ? ', including task_check' : ''}.`);
+  }
+
+  if (canCheckTasks) {
     taskTools.push(`
 **task_check** — Check completion status of tasks
-- Use this BEFORE deciding you're done with a task to verify all tasks are completed.
+- Use this BEFORE finishing tracked work to verify all tasks are completed.
 - Returns the number of completed, in progress, and pending tasks.
+- Returns a structured task list snapshot with stable IDs.
 - If any tasks remain incomplete, continue working on them.
 - IMPORTANT: Always check task completion before ending work on a complex task.`);
   }

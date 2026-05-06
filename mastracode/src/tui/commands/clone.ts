@@ -88,6 +88,7 @@ export async function resetUIAfterClone(ctx: CloneResetContext, clonedTitle: str
   const { state } = ctx;
   state.chatContainer.clear();
   state.pendingTools.clear();
+  state.pendingTaskToolIds?.clear();
   state.allToolComponents = [];
   state.allSystemReminderComponents = [];
   state.messageComponentsById.clear();

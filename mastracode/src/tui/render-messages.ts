@@ -5,8 +5,8 @@
  */
 import { Container, Spacer, Text } from '@mariozechner/pi-tui';
 import type { Component } from '@mariozechner/pi-tui';
-import type { HarnessMessage, HarnessMessageContent, TaskItem } from '@mastra/core/harness';
-import { parseSubagentMeta } from '@mastra/core/harness';
+import type { HarnessMessage, HarnessMessageContent, TaskItem, TaskItemInput } from '@mastra/core/harness';
+import { assignTaskIds, parseSubagentMeta } from '@mastra/core/harness';
 import chalk from 'chalk';
 import { AskQuestionInlineComponent } from './components/ask-question-inline.js';
 import { AssistantMessageComponent } from './components/assistant-message.js';
@@ -234,6 +234,87 @@ export function addUserMessage(state: TUIState, message: HarnessMessage): void {
   }
 }
 
+function getTaskResultTasks(result: unknown): TaskItemInput[] | undefined {
+  if (typeof result !== 'object' || result === null || !('tasks' in result)) return undefined;
+  const tasks = (result as { tasks?: unknown }).tasks;
+  return Array.isArray(tasks) ? (tasks as TaskItemInput[]) : undefined;
+}
+
+function areTasksEqual(left: readonly TaskItem[] | undefined, right: readonly TaskItem[]): boolean {
+  if (!left || left.length !== right.length) return false;
+  return left.every((task, index) => {
+    const other = right[index];
+    return (
+      other !== undefined &&
+      task.id === other.id &&
+      task.content === other.content &&
+      task.status === other.status &&
+      task.activeForm === other.activeForm
+    );
+  });
+}
+
+function applyTaskPatch(tasks: TaskItem[], args: unknown, status?: TaskItem['status']): TaskItem[] {
+  if (
+    typeof args !== 'object' ||
+    args === null ||
+    !('id' in args) ||
+    typeof (args as { id?: unknown }).id !== 'string'
+  ) {
+    return tasks;
+  }
+
+  const patch = args as { id: string; content?: string; status?: TaskItem['status']; activeForm?: string };
+  return tasks.map(task => (task.id === patch.id ? { ...task, ...patch, ...(status ? { status } : {}) } : task));
+}
+
+function applyTaskToolResult(
+  tasks: TaskItem[],
+  toolName: string,
+  args: unknown,
+  result: unknown,
+  isError: boolean,
+): TaskItem[] {
+  if (isError) return tasks;
+
+  if (toolName === 'task_write') {
+    const resultTasks = getTaskResultTasks(result);
+    const inputTasks = (args as { tasks?: TaskItemInput[] } | undefined)?.tasks;
+    const rawTasks = resultTasks ?? inputTasks;
+    const nextTasks = rawTasks ? assignTaskIds(rawTasks, tasks) : undefined;
+    return nextTasks ? [...nextTasks] : [];
+  }
+
+  if (toolName === 'task_update' || toolName === 'task_complete') {
+    const resultTasks = getTaskResultTasks(result);
+    return resultTasks
+      ? assignTaskIds(resultTasks, tasks)
+      : applyTaskPatch(tasks, args, toolName === 'task_complete' ? 'completed' : undefined);
+  }
+
+  return tasks;
+}
+
+function replayTaskState(messages: HarnessMessage[]): TaskItem[] {
+  let tasks: TaskItem[] = [];
+
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue;
+
+    for (const content of message.content) {
+      if (content.type !== 'tool_call') continue;
+      if (content.name !== 'task_write' && content.name !== 'task_update' && content.name !== 'task_complete') continue;
+
+      const toolResult = message.content.find(c => c.type === 'tool_result' && c.id === content.id);
+      if (toolResult?.type !== 'tool_result') continue;
+
+      tasks = applyTaskToolResult(tasks, content.name, content.args, toolResult.result, toolResult.isError);
+    }
+  }
+
+  return tasks;
+}
+
 // =============================================================================
 // renderExistingMessages
 // =============================================================================
@@ -243,18 +324,23 @@ export function addUserMessage(state: TUIState, message: HarnessMessage): void {
  * Called on thread switch and initial load.
  */
 export async function renderExistingMessages(state: TUIState): Promise<void> {
-  const messages = await state.harness.listMessages({ limit: 40 });
+  const allMessages = await state.harness.listMessages();
+  const messages = allMessages.slice(-40);
+  const messagesBeforeVisibleWindow = allMessages.slice(0, Math.max(0, allMessages.length - messages.length));
 
   state.chatContainer.clear();
   state.pendingTools.clear();
+  state.pendingTaskToolIds?.clear();
   state.allToolComponents = [];
   state.allSlashCommandComponents = [];
   state.allSystemReminderComponents = [];
   state.messageComponentsById.clear();
   state.allShellComponents = [];
 
-  // Local accumulator for detecting task clears during history reconstruction
-  let previousTasksAcc: TaskItem[] = [];
+  // Local accumulator for detecting task clears during visible history reconstruction.
+  // Seed it from the full prior history so long threads keep task state even when
+  // the original task_write is outside the rendered message window.
+  let previousTasksAcc = replayTaskState(messagesBeforeVisibleWindow);
 
   for (const message of messages) {
     if (message.role === 'user') {
@@ -379,22 +465,54 @@ export async function renderExistingMessages(state: TUIState): Promise<void> {
           // If this was task_write with all completed or cleared, show inline instead of tool component
           let replacedWithInline = false;
           if (content.name === 'task_write' && toolResult?.type === 'tool_result' && !toolResult.isError) {
-            const args = content.args as { tasks?: TaskItem[] } | undefined;
-            const tasks = args?.tasks;
-            if (tasks && tasks.length > 0 && tasks.every(t => t.status === 'completed')) {
-              renderCompletedTasksInline(state, tasks);
+            const wasAllCompleted =
+              previousTasksAcc.length > 0 && previousTasksAcc.every(t => t.status === 'completed');
+            const nextTasks = applyTaskToolResult(
+              previousTasksAcc,
+              content.name,
+              content.args,
+              toolResult.result,
+              toolResult.isError,
+            );
+            if (nextTasks.length > 0 && nextTasks.every(t => t.status === 'completed')) {
+              previousTasksAcc = nextTasks;
+              if (!wasAllCompleted) {
+                renderCompletedTasksInline(state, nextTasks);
+              }
               replacedWithInline = true;
-            } else if (!tasks || tasks.length === 0) {
+            } else if (nextTasks.length === 0) {
               // Tasks were cleared - show with previous tasks if we have them
               if (previousTasksAcc.length > 0) {
                 renderClearedTasksInline(state, previousTasksAcc);
-                previousTasksAcc = [];
                 replacedWithInline = true;
               }
+              previousTasksAcc = [];
             } else {
               // Track for detecting clears
-              previousTasksAcc = [...tasks];
+              previousTasksAcc = nextTasks;
+              replacedWithInline = true;
             }
+          }
+
+          if (
+            (content.name === 'task_update' || content.name === 'task_complete') &&
+            toolResult?.type === 'tool_result' &&
+            !toolResult.isError
+          ) {
+            const wasAllCompleted =
+              previousTasksAcc.length > 0 && previousTasksAcc.every(t => t.status === 'completed');
+            previousTasksAcc = applyTaskToolResult(
+              previousTasksAcc,
+              content.name,
+              content.args,
+              toolResult.result,
+              toolResult.isError,
+            );
+            const isAllCompleted = previousTasksAcc.length > 0 && previousTasksAcc.every(t => t.status === 'completed');
+            if (!wasAllCompleted && isAllCompleted) {
+              renderCompletedTasksInline(state, previousTasksAcc);
+            }
+            replacedWithInline = true;
           }
 
           // If this was submit_plan, show the plan with approval status
@@ -502,10 +620,20 @@ export async function renderExistingMessages(state: TUIState): Promise<void> {
     }
   }
 
-  // Restore pinned task list from the last active task_write in history
-  if (previousTasksAcc.length > 0 && state.taskProgress) {
+  // Restore or clear the pinned task list from history replay.
+  if (state.taskProgress) {
     state.taskProgress.updateTasks(previousTasksAcc);
   }
+  const currentTasks =
+    typeof state.harness.getState === 'function'
+      ? (state.harness.getState() as { tasks?: TaskItem[] }).tasks
+      : undefined;
+  if (!areTasksEqual(currentTasks, previousTasksAcc)) {
+    await state.harness.setState({ tasks: previousTasksAcc });
+  }
+  const displayState = state.harness.getDisplayState() as { tasks?: TaskItem[]; previousTasks?: TaskItem[] };
+  displayState.previousTasks = displayState.tasks ? [...displayState.tasks] : [];
+  displayState.tasks = [...previousTasksAcc];
 
   state.ui.requestRender();
 }

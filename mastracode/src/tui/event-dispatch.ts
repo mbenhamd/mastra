@@ -293,7 +293,8 @@ export async function dispatchEvent(event: HarnessEvent, ectx: EventHandlerConte
       if (state.taskProgress) {
         state.taskProgress.updateTasks(tasks ?? []);
 
-        // Find the most recent task_write tool component and get its position
+        // Defensive cleanup for older or non-streaming task_write components.
+        // Current task tools update the pinned component directly through task_updated.
         let insertIndex = -1;
         for (let i = state.allToolComponents.length - 1; i >= 0; i--) {
           const comp = state.allToolComponents[i];
@@ -312,12 +313,14 @@ export async function dispatchEvent(event: HarnessEvent, ectx: EventHandlerConte
 
         // Check if all tasks are completed
         const allCompleted = tasks && tasks.length > 0 && tasks.every(t => t.status === 'completed');
-        if (allCompleted) {
+        const previousTasks = state.harness.getDisplayState().previousTasks;
+        const wasAllCompleted = previousTasks.length > 0 && previousTasks.every(t => t.status === 'completed');
+        if (allCompleted && !wasAllCompleted) {
           // Show collapsed completed list (pinned/live)
           ectx.renderCompletedTasksInline(tasks, insertIndex, true);
-        } else if (state.harness.getDisplayState().previousTasks.length > 0 && (!tasks || tasks.length === 0)) {
+        } else if (previousTasks.length > 0 && (!tasks || tasks.length === 0)) {
           // Tasks were cleared
-          ectx.renderClearedTasksInline(state.harness.getDisplayState().previousTasks, insertIndex);
+          ectx.renderClearedTasksInline(previousTasks, insertIndex);
         }
 
         state.ui.requestRender();

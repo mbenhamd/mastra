@@ -1,12 +1,19 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import z from 'zod';
 
-import { getToolCategory } from '../../permissions.js';
-import { MC_TOOLS } from '../../tool-names.js';
-import { buildToolGuidance } from '../prompts/tool-guidance.js';
-import { createDynamicTools } from '../tools.js';
+vi.mock('../tools/index.js', () => ({
+  createWebSearchTool: () => ({ description: 'web search' }),
+  createWebExtractTool: () => ({ description: 'web extract' }),
+  hasTavilyKey: () => false,
+  requestSandboxAccessTool: { description: 'request sandbox access' },
+}));
+
+import { getToolCategory } from '../permissions.js';
+import { MC_TOOLS } from '../tool-names.js';
+import { buildToolGuidance } from './prompts/tool-guidance.js';
+import { createDynamicTools } from './tools.js';
 
 // Minimal mock of HarnessRequestContext shape that createDynamicTools reads
 function makeRequestContext(
@@ -153,6 +160,8 @@ describe('getToolCategory – extra tools', () => {
   it('should return null for always-allowed tools', () => {
     expect(getToolCategory('ask_user')).toBeNull();
     expect(getToolCategory('task_write')).toBeNull();
+    expect(getToolCategory('task_update')).toBeNull();
+    expect(getToolCategory('task_complete')).toBeNull();
     expect(getToolCategory('task_check')).toBeNull();
   });
 });

@@ -6,6 +6,7 @@ export async function handleNewCommand(ctx: SlashCommandContext): Promise<void> 
   state.pendingNewThread = true;
   state.chatContainer.clear();
   state.pendingTools.clear();
+  state.pendingTaskToolIds?.clear();
   state.allToolComponents = [];
   state.allSlashCommandComponents = [];
   state.allSystemReminderComponents = [];

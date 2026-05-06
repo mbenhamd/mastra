@@ -35,6 +35,8 @@ function createMockTUIState(harness: ReturnType<typeof createMockHarness>): TUIS
       updateTasks: vi.fn(),
       getTasks: () => [],
     },
+    allToolComponents: [],
+    chatContainer: { children: [] },
     taskWriteInsertIndex: 5,
     ui: { requestRender: vi.fn() },
     projectInfo: { rootPath: '/tmp/test', gitBranch: 'main' },
@@ -140,6 +142,30 @@ describe('thread lifecycle clears per-thread harness state', () => {
     );
 
     expect((state.taskProgress as any).updateTasks).toHaveBeenCalledWith([]);
+  });
+
+  it('uses recorded task insertion index when rendering completed tasks', async () => {
+    const tasks = [{ id: 'task-1', content: 'Task 1', status: 'completed' as const, activeForm: 'Completing task 1' }];
+
+    await dispatchEvent({ type: 'task_updated', tasks }, ectx, state);
+
+    expect(ectx.renderCompletedTasksInline).toHaveBeenCalledWith(tasks, 5, true);
+    expect(state.taskWriteInsertIndex).toBe(-1);
+  });
+
+  it('does not render a duplicate completed task list for repeated all-completed updates', async () => {
+    const tasks = [{ id: 'task-1', content: 'Task 1', status: 'completed' as const, activeForm: 'Completing task 1' }];
+    (state.harness as any).getDisplayState = () => ({
+      isRunning: false,
+      tasks,
+      previousTasks: tasks,
+      omProgress: { status: 'idle', pendingTokens: 0 },
+      modifiedFiles: new Map(),
+    });
+
+    await dispatchEvent({ type: 'task_updated', tasks }, ectx, state);
+
+    expect(ectx.renderCompletedTasksInline).not.toHaveBeenCalled();
   });
 
   it('does not clear non-ephemeral state like currentModelId', async () => {
