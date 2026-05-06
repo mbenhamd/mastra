@@ -610,6 +610,8 @@ Use this tool when:
           model,
           tools: mergedTools,
           workspace,
+          ...(definition.inputProcessors ? { inputProcessors: definition.inputProcessors } : {}),
+          ...(definition.outputProcessors ? { outputProcessors: definition.outputProcessors } : {}),
         });
 
         // Only resolve workspace tool names when an allowlist is configured,
