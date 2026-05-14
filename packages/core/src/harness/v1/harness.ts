@@ -60,6 +60,7 @@ import type {
   AttachmentUploadOptions,
   HarnessConfig,
   HarnessMode,
+  HarnessSkill,
   ModelAuthStatus,
   ModelInfo,
   PermissionPolicy,
@@ -90,6 +91,55 @@ const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = 'ask';
 
+function cloneHarnessSkill(skill: HarnessSkill): HarnessSkill {
+  return {
+    ...skill,
+    ...(skill.metadata ? { metadata: cloneSkillMetadata(skill.metadata, new WeakMap()) } : {}),
+  };
+}
+
+function cloneSkillMetadata(
+  metadata: Record<string, unknown>,
+  seen: WeakMap<object, unknown>,
+): Record<string, unknown> {
+  const existing = seen.get(metadata);
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+    return existing as Record<string, unknown>;
+  }
+  const clone: Record<string, unknown> = {};
+  seen.set(metadata, clone);
+  for (const [key, value] of Object.entries(metadata)) {
+    clone[key] = cloneSkillMetadataValue(value, seen);
+  }
+  return clone;
+}
+
+function cloneSkillMetadataValue(value: unknown, seen: WeakMap<object, unknown>): unknown {
+  if (Array.isArray(value)) {
+    const existing = seen.get(value);
+    if (Array.isArray(existing)) return existing;
+    const clone: unknown[] = [];
+    seen.set(value, clone);
+    for (const child of value) {
+      clone.push(cloneSkillMetadataValue(child, seen));
+    }
+    return clone;
+  }
+  if (value && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      return cloneSkillMetadata(value as Record<string, unknown>, seen);
+    }
+  }
+  return value;
+}
+
+function isPlainSkillMetadata(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 export class Harness {
   /** Process-scoped owner id used as the lease holder for all sessions. */
   readonly ownerId: string;
@@ -118,6 +168,7 @@ export class Harness {
   private readonly _toolCategoryResolver?: (toolName: string) => ToolCategory | null;
   private readonly _modelCatalog: ReadonlyMap<string, ModelInfo>;
   private readonly _modelAuthStatusResolver?: (modelId: string) => ModelAuthStatus | Promise<ModelAuthStatus>;
+  private readonly _codeSkills: ReadonlyMap<string, HarnessSkill>;
   private readonly _emitter = new EventEmitter();
   /** Per-session unsubscribers so harness-level subscribers see session events too. */
   private readonly _sessionEventBridges = new Map<string, HarnessEventUnsubscribe>();
@@ -230,6 +281,40 @@ export class Harness {
     }
     this._modelCatalog = catalog;
     this._modelAuthStatusResolver = config.modelAuthStatusResolver;
+
+    // Code-registered skills (§4.6 / §9). Static deployment catalog; session
+    // workspace skills are layered after these and lose on name conflicts.
+    const codeSkills = new Map<string, HarnessSkill>();
+    if (config.skills !== undefined) {
+      if (!Array.isArray(config.skills)) {
+        throw new HarnessConfigError('skills', 'must be an array of HarnessSkill');
+      }
+      for (const entry of config.skills) {
+        if (!entry || typeof entry.name !== 'string' || entry.name.length === 0) {
+          throw new HarnessConfigError('skills', 'every entry must have a non-empty string `name`');
+        }
+        if (typeof entry.description !== 'string') {
+          throw new HarnessConfigError('skills', `entry "${entry.name}" must have a string \`description\``);
+        }
+        if (typeof entry.instructions !== 'string') {
+          throw new HarnessConfigError('skills', `entry "${entry.name}" must have a string \`instructions\``);
+        }
+        if (entry.category !== undefined && typeof entry.category !== 'string') {
+          throw new HarnessConfigError('skills', `entry "${entry.name}" must have a string \`category\``);
+        }
+        if (entry.filePath !== undefined && (typeof entry.filePath !== 'string' || entry.filePath.length === 0)) {
+          throw new HarnessConfigError('skills', `entry "${entry.name}" must have a non-empty string \`filePath\``);
+        }
+        if (entry.metadata !== undefined && !isPlainSkillMetadata(entry.metadata)) {
+          throw new HarnessConfigError('skills', `entry "${entry.name}" must have object \`metadata\``);
+        }
+        if (codeSkills.has(entry.name)) {
+          throw new HarnessConfigError('skills', `duplicate skill name "${entry.name}"`);
+        }
+        codeSkills.set(entry.name, cloneHarnessSkill(entry));
+      }
+    }
+    this._codeSkills = codeSkills;
 
     // Workspace (§2.7). Three ownership models; registry handles lifecycle.
     // Cross-checks against the subagent registry happen below.
@@ -480,6 +565,18 @@ export class Harness {
   /** @internal — Session reads this to render the `agentType` enum in the spawn tool's input schema. */
   _listSubagentTypeIds(): string[] {
     return Array.from(this._subagentTypes.keys());
+  }
+
+  /** @internal — Session merges static skills before workspace-discovered skills. */
+  _listCodeSkills(): HarnessSkill[] {
+    return Array.from(this._codeSkills.values()).map(cloneHarnessSkill);
+  }
+
+  /** @internal — Session resolves code-registered skills by name. */
+  _getCodeSkill(ref: string): HarnessSkill | undefined {
+    const byName = this._codeSkills.get(ref);
+    if (byName) return cloneHarnessSkill(byName);
+    return undefined;
   }
 
   /** @internal — Session enforces the subagent depth cap inside the spawn tool. */
