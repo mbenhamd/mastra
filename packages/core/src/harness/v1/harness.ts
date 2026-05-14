@@ -140,6 +140,26 @@ function isPlainSkillMetadata(value: unknown): value is Record<string, unknown> 
   return prototype === Object.prototype || prototype === null;
 }
 
+function hasOnlyCloneableSkillMetadataValues(value: unknown, seen: WeakSet<object>): boolean {
+  if (typeof value === 'function') return false;
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return true;
+    seen.add(value);
+    const supported = value.every(child => hasOnlyCloneableSkillMetadataValues(child, seen));
+    seen.delete(value);
+    return supported;
+  }
+  if (value && typeof value === 'object') {
+    if (!isPlainSkillMetadata(value)) return false;
+    if (seen.has(value)) return true;
+    seen.add(value);
+    const supported = Object.values(value).every(child => hasOnlyCloneableSkillMetadataValues(child, seen));
+    seen.delete(value);
+    return supported;
+  }
+  return true;
+}
+
 export class Harness {
   /** Process-scoped owner id used as the lease holder for all sessions. */
   readonly ownerId: string;
@@ -307,6 +327,15 @@ export class Harness {
         }
         if (entry.metadata !== undefined && !isPlainSkillMetadata(entry.metadata)) {
           throw new HarnessConfigError('skills', `entry "${entry.name}" must have object \`metadata\``);
+        }
+        if (
+          entry.metadata !== undefined &&
+          !hasOnlyCloneableSkillMetadataValues(entry.metadata, new WeakSet<object>())
+        ) {
+          throw new HarnessConfigError(
+            'skills',
+            `entry "${entry.name}" metadata must contain only primitives, arrays, and plain objects`,
+          );
         }
         if (codeSkills.has(entry.name)) {
           throw new HarnessConfigError('skills', `duplicate skill name "${entry.name}"`);

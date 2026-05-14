@@ -196,6 +196,9 @@ export interface HarnessSkill {
    * Pass-through skill metadata (e.g. `goal: true` for skills that should
    * appear under `/goal/<name>`). `session.skills.use()` validates the
    * optional `args` schema before dispatch; other fields remain caller-owned.
+   * Code-registered skills accept only primitives, arrays, and plain objects
+   * here so returned descriptors cannot share mutable class instances with
+   * the original config.
    */
   metadata?: Record<string, unknown>;
 }

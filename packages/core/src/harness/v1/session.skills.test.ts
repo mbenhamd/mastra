@@ -287,6 +287,40 @@ describe('Session skill discovery (§4.6)', () => {
           ],
         }),
     ).toThrow(HarnessConfigError);
+
+    expect(
+      () =>
+        new Harness({
+          agents: { default: new MockAgent({ id: 'default' }) } as any,
+          modes: [{ id: 'm', agentId: 'default' }],
+          defaultModeId: 'm',
+          skills: [
+            {
+              name: 'bad-nested-metadata',
+              description: 'Bad metadata',
+              instructions: 'Body',
+              metadata: { nested: new Date() },
+            },
+          ],
+        }),
+    ).toThrow(HarnessConfigError);
+
+    expect(
+      () =>
+        new Harness({
+          agents: { default: new MockAgent({ id: 'default' }) } as any,
+          modes: [{ id: 'm', agentId: 'default' }],
+          defaultModeId: 'm',
+          skills: [
+            {
+              name: 'bad-function-metadata',
+              description: 'Bad metadata',
+              instructions: 'Body',
+              metadata: { nested: () => 'bad' },
+            },
+          ],
+        }),
+    ).toThrow(HarnessConfigError);
   });
 
   it('rejects malformed code-registered skill categories at construction', () => {

@@ -613,6 +613,19 @@ describe('Session.skills.use() (§4.6)', () => {
     expect(agent.streamCalls).toHaveLength(0);
   });
 
+  it('accepts JSON data fields named toJSON', async () => {
+    const fakeSkills = new FakeWorkspaceSkills([
+      { name: 'json-field', description: 'JSON field', instructions: 'JSON field body.' },
+    ]);
+    const { harness, agent } = makeHarnessWithSkills(fakeSkills);
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.skills.use('json-field', { args: { value: { toJSON: 'literal' } } });
+
+    expect(agent.streamCalls).toHaveLength(1);
+    expect(extractSignalContents(agent.streamCalls[0]!.messages)).toContain('"toJSON": "literal"');
+  });
+
   it('rejects circular args before dispatch', async () => {
     const fakeSkills = new FakeWorkspaceSkills([
       { name: 'no-cycles', description: 'No cycles', instructions: 'No cycles body.' },

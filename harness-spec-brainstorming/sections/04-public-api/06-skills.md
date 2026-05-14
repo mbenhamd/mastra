@@ -48,7 +48,10 @@ interface UseSkillOptions {
 }
 ```
 
-Code-registered skills are supplied directly in this descriptor shape.
+Code-registered skills are supplied directly in this descriptor shape. Their
+`metadata` values must contain only primitives, arrays, and plain objects so
+returned descriptors cannot share mutable class instances with the original
+deployment config.
 Workspace-discovered skills are projected into this descriptor shape. Current
 core `Skill.source` values such as local, external, or managed content all
 project into the same `HarnessSkill` — v1 does not expose a source discriminator

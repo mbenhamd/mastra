@@ -1327,7 +1327,10 @@ export class Session {
       return;
     }
     if (typeof value !== 'object') return;
-    if (Object.prototype.hasOwnProperty.call(value, 'toJSON')) {
+    if (
+      Object.prototype.hasOwnProperty.call(value, 'toJSON') &&
+      typeof (value as { toJSON?: unknown }).toJSON === 'function'
+    ) {
       issues.push(`${path}.toJSON is not supported in skill args`);
       return;
     }
