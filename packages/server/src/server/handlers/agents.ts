@@ -1603,32 +1603,20 @@ export const SEND_AGENT_SIGNAL_ROUTE: ServerRoute<
     ifIdle,
   }) => {
     try {
-      const bodyRequestContext = ifIdle?.streamOptions?.requestContext;
-      mergeBodyRequestContext(serverRequestContext, bodyRequestContext);
+      const idleBodyRequestContext = runId
+        ? undefined
+        : (ifIdle?.streamOptions?.requestContext as Record<string, unknown> | undefined);
+      mergeBodyRequestContext(serverRequestContext, idleBodyRequestContext);
 
       const agent = await getAgentFromSystem({
         mastra,
         agentId,
-        versionOptions: extractVersionOptions(serverRequestContext, bodyRequestContext as Record<string, unknown>),
+        versionOptions: extractVersionOptions(serverRequestContext, idleBodyRequestContext),
         requestContext: serverRequestContext,
       });
 
       const effectiveResourceId = getEffectiveResourceId(serverRequestContext, resourceId);
       const effectiveThreadId = getEffectiveThreadId(serverRequestContext, threadId);
-      const ifIdleWithContext = {
-        ifIdle: {
-          ...(ifIdle ?? {}),
-          streamOptions: { ...(ifIdle?.streamOptions ?? {}), requestContext: serverRequestContext } as any,
-        },
-      };
-
-      if (effectiveThreadId && effectiveResourceId) {
-        const memory = await agent.getMemory({ requestContext: serverRequestContext });
-        if (memory) {
-          const thread = await memory.getThreadById({ threadId: effectiveThreadId });
-          await validateThreadOwnership(thread, effectiveResourceId);
-        }
-      }
 
       if (typeof (agent as { sendSignal?: unknown }).sendSignal !== 'function') {
         throw new HTTPException(501, { message: 'agent signals are not supported by this Mastra core version' });
@@ -1637,6 +1625,14 @@ export const SEND_AGENT_SIGNAL_ROUTE: ServerRoute<
       const agentSignal = signal as AgentSignalInput;
 
       if (runId) {
+        if (effectiveThreadId && effectiveResourceId) {
+          const memory = await agent.getMemory({ requestContext: serverRequestContext });
+          if (memory) {
+            const thread = await memory.getThreadById({ threadId: effectiveThreadId });
+            await validateThreadOwnership(thread, effectiveResourceId);
+          }
+        }
+
         const result = await agent.sendSignal(agentSignal, {
           runId,
           ...(effectiveResourceId ? { resourceId: effectiveResourceId } : {}),
@@ -1649,6 +1645,21 @@ export const SEND_AGENT_SIGNAL_ROUTE: ServerRoute<
       if (!effectiveResourceId || !effectiveThreadId) {
         throw new HTTPException(400, { message: 'resourceId and threadId are required when runId is not provided' });
       }
+
+      if (effectiveThreadId && effectiveResourceId) {
+        const memory = await agent.getMemory({ requestContext: serverRequestContext });
+        if (memory) {
+          const thread = await memory.getThreadById({ threadId: effectiveThreadId });
+          await validateThreadOwnership(thread, effectiveResourceId);
+        }
+      }
+
+      const ifIdleWithContext = {
+        ifIdle: {
+          ...(ifIdle ?? {}),
+          streamOptions: { ...(ifIdle?.streamOptions ?? {}), requestContext: serverRequestContext } as any,
+        },
+      };
 
       const result = await agent.sendSignal(agentSignal, {
         resourceId: effectiveResourceId,
