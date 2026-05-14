@@ -182,8 +182,7 @@ function normalizeWriteOpts(
     | Record<string, any>,
 ): { agentId?: string; requestContext?: RequestContext | Record<string, any> } {
   if (!opts || typeof opts !== 'object') return {};
-  const keys = Object.keys(opts);
-  if (keys.length > 0 && keys.every(key => key === 'agentId' || key === 'requestContext')) {
+  if ('agentId' in opts || 'requestContext' in opts) {
     const o = opts as { agentId?: string; requestContext?: RequestContext | Record<string, any> };
     return { agentId: o.agentId, requestContext: o.requestContext };
   }
