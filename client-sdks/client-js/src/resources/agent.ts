@@ -1391,7 +1391,7 @@ export class Agent extends BaseResource {
     const resourceId = processedParams.resourceId ?? resource;
 
     let requestBody = processedParams;
-    if (route === 'resume-stream') {
+    if (route === 'resume-stream' || route === 'resume-stream-until-idle') {
       const { messages: _messages, ...resumeStreamBody } = processedParams;
       requestBody = resumeStreamBody;
     }
