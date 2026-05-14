@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-feat(harness): v1 workspace integration — three ownership models (shared / per-resource / per-session) wired into Harness + Session
+Added Harness v1 workspace integration with shared, per-resource, and per-session ownership models.
 
 Adds the `WorkspaceProvider` contract (`providerId`, `resumable`, `create`, `resume`, optional `destroy`) plus `nonDurableProvider()` shorthand. `HarnessConfig.workspace` now accepts a discriminated union over the three ownership kinds; the `WorkspaceRegistry` handles lifecycle (lazy / eager provisioning, refcounting, state persistence via `pushState`).
 
@@ -13,3 +13,18 @@ Adds the `WorkspaceProvider` contract (`providerId`, `resumable`, `create`, `res
 - New error classes: `HarnessWorkspaceProviderMismatchError`, `HarnessWorkspaceLostError`, `HarnessWorkspaceProvisioningError`, `HarnessWorkspaceInUseError`.
 - New events: `workspace_status_changed`, `workspace_error`.
 - New exports from `@mastra/core/harness/v1`: `WorkspaceProvider`, `WorkspaceProviderContext`, `WorkspaceOwnershipKind`, `nonDurableProvider`, `HarnessWorkspaceConfig`.
+
+```ts
+const harness = new Harness({
+  /* ... */
+  workspace: {
+    kind: 'per-resource',
+    create: async ({ resourceId }) => {
+      return new LocalWorkspace({ basePath: `/workspaces/${resourceId}` });
+    },
+  },
+});
+
+const session = await harness.session({ resourceId: 'tenant-42' });
+const workspace = await session.getWorkspace();
+```

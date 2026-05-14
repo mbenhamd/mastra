@@ -35,7 +35,7 @@ authoritative):
 
     <rect style="fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 14;" x="175" y="300" width="200" height="68" />
     <text style="font: 600 18px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="275" y="328" text-anchor="middle">Catalogs</text>
-    <text style="font: 500 14px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="275" y="350" text-anchor="middle">modes / models / skills</text>
+    <text style="font: 500 14px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="275" y="350" text-anchor="middle">modes / models / categories</text>
 
     <rect style="fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 14;" x="420" y="300" width="200" height="68" />
     <text style="font: 600 18px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="520" y="328" text-anchor="middle">Events</text>
@@ -161,8 +161,6 @@ class Harness<TState = Record<string, unknown>> {
   // Catalogs
   listModes(): HarnessMode[];
   listAvailableModels(): Promise<AvailableModel[]>;
-  listSkills(): HarnessSkill[];
-  getSkill(name: string): HarnessSkill | undefined;
   getToolCategory(opts: { toolName: string }): ToolCategory | null;
   // Local/in-process convenience only. Returns the configured
   // `HarnessConfig.defaultResourceId`, or `undefined` when no default tenant is

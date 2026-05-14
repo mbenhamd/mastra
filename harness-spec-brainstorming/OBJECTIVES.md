@@ -91,7 +91,7 @@ The current Mastra primitives most commonly mistaken for Harness gaps:
   `subscribeWithReplay`, `subscribeFromOffset`, `deliveryAttempt`,
   `CachingPubSub`). Pubsub stream IDs/topic offsets/cache history are
   implementation inputs to the §10 event adapter, not v1 event IDs or replay
-  cursors; the `<epoch>-<seq>` ID and ring-buffer + `412` contract is
+  cursors; the `harness-v1:<epoch>:<seq>` ID and ring-buffer + `412` contract is
   Harness-owned because the cache-backed replay paths do not own the SSE
   epoch/`Last-Event-ID`/overflow/stale-cursor contract (§10.5:53-65 already
   states this).

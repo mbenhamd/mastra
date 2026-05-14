@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Harness v1: add `harness.models.*` catalog + auth-status surface.
+Added the Harness v1 `harness.models.*` catalog and auth-status surface.
 
 Lets UIs render a model picker and surface per-model metadata (display name, context window, capability hints) without going through provider plumbing. The catalog is a static UX surface declared on `HarnessConfig.models`; auth status is resolved on demand via `HarnessConfig.modelAuthStatusResolver`.
 
@@ -14,3 +14,9 @@ Lets UIs render a model picker and surface per-model metadata (display name, con
 - Construction-time validation rejects duplicate ids, missing/empty `id`, missing/empty `providerId`, and non-array `models`.
 
 The catalog is not validated against modes — modes may reference models outside the catalog, and the catalog may include models not bound to any mode.
+
+```ts
+const models = harness.models.list();
+const selected = harness.models.get('openai:gpt-4.1');
+const authStatus = await harness.models.getAuthStatus('openai:gpt-4.1');
+```

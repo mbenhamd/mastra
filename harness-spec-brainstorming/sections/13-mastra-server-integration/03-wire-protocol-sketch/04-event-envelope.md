@@ -3,7 +3,7 @@
 **Event envelope** for per-session `/events` SSE streams:
 
 ```
-id: <epoch>-<seq>
+id: harness-v1:<epoch>:<seq>
 event: <event-type>
 data: <json>
 ```

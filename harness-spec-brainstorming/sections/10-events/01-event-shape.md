@@ -5,7 +5,7 @@ Every event has the same four base fields plus a discriminated payload keyed by 
 ```ts
 interface HarnessEventBase {
   id: string;                        // Epoch-prefixed, per-session monotonic event ID, of the form
-                                     // `<epoch>-<seq>`. `epoch` is regenerated on every cold start
+                                     // `harness-v1:<epoch>:<seq>`. `epoch` is regenerated on every cold start
                                      // of the in-memory Session instance (initial hydration, or
                                      // rehydration after eviction), and `seq` is a monotonic int
                                      // within that epoch. Harness-scoped events use a parallel

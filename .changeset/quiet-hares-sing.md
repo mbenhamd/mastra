@@ -10,4 +10,14 @@ Wired Harness v1 into Mastra and shipped the first runnable slice of `Session.me
 - Per-turn overrides supported on `message()`: `mode`, `additionalTools`, `abortSignal`. Per-mode `tools`/`additionalTools` are merged into the agent's toolset surface for the call.
 - Added `getCurrentMode`, `getCurrentModel`, `setMode`, `setModel`, and `getDisplayState` to `Session`. Setters CAS-write through the harness storage lease.
 
+```ts
+const result = await session.message('Summarize the current thread.', {
+  mode: 'review',
+  additionalTools: { summarizeTable },
+  abortSignal: controller.signal,
+});
+
+const stream = await session.message('Draft a follow-up.', { stream: true });
+```
+
 Internal-only API; no breaking changes to existing surfaces.

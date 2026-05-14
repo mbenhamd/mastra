@@ -153,7 +153,9 @@ class HarnessRecoveryDeferredError extends Error {
 
 // Thrown by direct local session resolution and wire session-resolve routes
 // when `parentSessionId` would create a descendant beyond
-// `HarnessConfig.sessions.maxSubagentDepth`. The built-in `subagent` tool does not
-// throw this error; it returns a recoverable tool-result failure with the same
-// code/details so the parent agent can adapt. See §8 and §13.3.
+// `HarnessConfig.sessions.maxSubagentDepth`. The error class is
+// `HarnessSubagentDepthExceededError` (§4.5b), surfaced on the wire as
+// `harness.subagent_depth_exceeded` (§13.3). The built-in `subagent` tool does
+// not throw this error; it returns a recoverable tool-result failure with the
+// same code/details so the parent agent can adapt. See §8 and §13.3.
 ```

@@ -2,4 +2,9 @@
 '@mastra/core': patch
 ---
 
-Harness v1 signal integration cleanup. `Session._watchRunCompletion` no longer microtask-polls for the run output handle — `Agent.waitForRunOutput(runId)` now returns an event-driven Promise that resolves the moment `registerRun` is called (or immediately if already registered). The subscription drain loop is now event-emission only; `_waitUntilFinished()` is the single canonical settlement path for `_runCompletionPromises`. `MastraModelOutput._waitUntilFinished()` gained an explicit doc-comment documenting its ordering guarantee for test doubles. New shared test helpers `buildFakeOutput` and `extractSignalContents` (in `harness/v1/__test-utils__`) replace hand-rolled fakes and inline signal-envelope unwrapping across the v1 test suite.
+Improved Harness v1 signal-run settlement.
+
+- Signal-routed calls now wait for run output registration through `Agent.waitForRunOutput(runId)` instead of polling.
+- Run completion has a single settlement path through `_waitUntilFinished()`, which keeps subscription delivery and completion promises aligned.
+- `MastraModelOutput._waitUntilFinished()` now documents the ordering guarantee expected by tests and test doubles.
+- Shared Harness v1 test helpers replace repeated fake-output setup and signal-envelope unwrapping across the test suite.

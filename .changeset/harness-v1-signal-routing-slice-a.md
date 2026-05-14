@@ -2,4 +2,8 @@
 '@mastra/core': patch
 ---
 
-Route harness v1 `Session.message()` through `agent.sendSignal()` so user messages on an idle thread start a fresh run via the same signal-driven path the agent layer (and MastraCode) already use end-to-end. The structured + `sync: true` path still calls `agent.generate()` directly. Adds `Agent.getRunOutput(runId)` so signal-routed callers can resolve the `MastraModelOutput` for a registered run.
+Improved Harness v1 `Session.message()` routing for idle threads.
+
+- User messages on idle threads now start agent runs through `agent.sendSignal()`, matching the signal-driven path used by the agent layer and MastraCode.
+- Structured synchronous calls still use `agent.generate()` directly.
+- `Agent.getRunOutput(runId)` lets signal-routed callers resolve the registered `MastraModelOutput`.

@@ -21,12 +21,21 @@ events from session buffers and cannot reconnect with `Last-Event-ID`.
 **Epoch and event IDs.** Each in-memory Session instance has an `epoch` token,
 generated fresh whenever the instance is constructed — first hydration,
 rehydration after eviction, or hydration after a process restart. Event `id` is
-`<epoch>-<seq>`, where `seq` is monotonic within the epoch and resets when the
-epoch changes. Two events from different epochs are never comparable as a
-sequence, even if they share the same `seq`. Harness-scoped events use the same
-`<epoch>-<seq>` shape against the harness's own epoch+sequence.
+`harness-v1:<epoch>:<seq>`, where `seq` is monotonic within the epoch and resets
+when the epoch changes. Two events from different epochs are never comparable as
+a sequence, even if they share the same `seq`. Harness-scoped events use the
+same `harness-v1:<epoch>:<seq>` shape against the harness's own epoch+sequence.
 
-**Replay rules.** On reconnect with `Last-Event-ID: <epoch>-<seq>`:
+**Replay ID grammar.** `Last-Event-ID` is accepted only as
+`harness-v1:<epoch>:<seq>`. `<epoch>` is a non-empty base64url token generated
+by the Session instance and never contains `:`. `<seq>` is a base-10 unsigned
+integer with no sign, decimal point, exponent, or surrounding whitespace. The
+server must parse the whole header value; any prefix, suffix, alternate
+separator, empty field, non-decimal sequence, negative value, or value outside
+JavaScript's safe integer range is malformed.
+
+**Replay rules.** On reconnect with
+`Last-Event-ID: harness-v1:<epoch>:<seq>`:
 
 - If the epoch matches the current Session instance and `seq` is within the
 buffer, the server replays entries newer than the supplied ID and live-tails.
@@ -35,8 +44,8 @@ buffer has overflowed; the server returns `412 Precondition Failed`.
 - If the epoch does not match the current Session instance, the prior epoch's
 buffer is gone (eviction or process restart). The server returns
 `412 Precondition Failed`.
-- If `Last-Event-ID` is malformed (not `<epoch>-<seq>`) or absent, the server
-starts the SSE stream from the live tail with no replay.
+- If `Last-Event-ID` is malformed or absent, the server starts the SSE stream
+from the live tail with no replay.
 
 In every `412` case the client is expected to refetch the session snapshot via
 `GET /sessions/:sessionId` and resubscribe. That route returns the

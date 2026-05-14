@@ -2,7 +2,7 @@
 
 ```ts
 import { Harness, LocalWorkspace } from '@mastra/core/harness/v1';
-import { E2BWorkspace } from '@mastra/workspace-e2b';
+import { E2BWorkspace, e2bWorkspaceProvider } from '@mastra/workspace-e2b';
 
 // Shape 1 — shared (single-user TUI). Sugar form: bare Workspace.
 new Harness({
@@ -24,8 +24,6 @@ new Harness({
 // Shape 3 — per-session (Devin-style), durable across server restarts.
 // Use the full `WorkspaceProvider` shape so the harness can validate
 // resumability at startup and persist provider state.
-import { e2bWorkspaceProvider } from '@mastra/workspace-e2b';
-
 new Harness({
   /* ... */
   workspace: {

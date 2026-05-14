@@ -65,10 +65,10 @@ async function collectMarkdownFiles(rootDir, opts) {
 
     for (const entry of entries) {
       const abs = path.join(dirAbs, entry.name);
-      const rel = toPosix(path.relative(process.cwd(), abs));
+      const rel = toPosix(path.relative(rootAbs, abs));
 
       if (entry.isDirectory()) {
-        if (opts.excludeUsageExamples && rel === 'sections/12-usage-examples') {
+        if (opts.excludeUsageExamples && rel === '12-usage-examples') {
           continue;
         }
         await walk(abs);

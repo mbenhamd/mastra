@@ -78,7 +78,7 @@ model to browse the whole workspace.
 
 ```text
 Read-only critical review. You are reviewing Harness v1 spec work in
-/Users/mbenhamd/Project/mastra/harness-spec-brainstorming.
+<HARNESS_SPEC_ROOT>.
 
 Do not edit files. Do not inspect examples/ or reference/ unless explicitly
 listed in Scope. Your output is advisory only; the orchestrator will verify
@@ -115,6 +115,14 @@ the file contents to each CLI. Keep the prompt file out of the repo.
 ## Commands
 
 Run commands from the workspace root unless a command uses `-C` or `--dir`.
+Set `HARNESS_ROOT` to the local harness spec folder before copying the commands
+below:
+
+```sh
+export HARNESS_ROOT="$(pwd)"
+export MASTRA_REPO_ROOT="$(cd "$HARNESS_ROOT/.." && pwd)"
+```
+
 Before launching the full council, check that each reviewer command can run
 non-interactively, including every OpenCode model selector. A reviewer that
 prompts for login, browser authorization, or an API key is not usable for that
@@ -163,7 +171,7 @@ VERTEX_LOCATION=global \
 opencode run \
   --model google-vertex/gemini-3.1-pro-preview-customtools \
   --variant high \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "Read-only preflight. Return exactly: OK." \
   > /private/tmp/harness-council-preflight-opencode-gemini.out \
   2> /private/tmp/harness-council-preflight-opencode-gemini.err
@@ -178,7 +186,7 @@ codex -m gpt-5.5 \
   -c model_reasoning_effort=high \
   -s read-only \
   -a never \
-  -C /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  -C "$HARNESS_ROOT" \
   exec --ephemeral "Read-only preflight. Return exactly: OK." \
   > /private/tmp/harness-council-preflight-codex.out \
   2> /private/tmp/harness-council-preflight-codex.err
@@ -193,7 +201,7 @@ IDs to make the run pass.
 opencode run \
   --model deepseek/deepseek-v4-pro \
   --variant max \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "Read-only preflight. Return exactly: OK." \
   > /private/tmp/harness-council-preflight-opencode-deepseek.out \
   2> /private/tmp/harness-council-preflight-opencode-deepseek.err
@@ -201,7 +209,7 @@ opencode run \
 # OpenCode Qwen3.6-plus (Alibaba Coding Plan)
 opencode run \
   --model alibaba-coding-plan/qwen3.6-plus \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "Read-only preflight. Return exactly: OK." \
   > /private/tmp/harness-council-preflight-opencode-qwen.out \
   2> /private/tmp/harness-council-preflight-opencode-qwen.err
@@ -210,7 +218,7 @@ opencode run \
 opencode run \
   --model xai/grok-4.3 \
   --variant high \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "Read-only preflight. Return exactly: OK." \
   > /private/tmp/harness-council-preflight-opencode-grok.out \
   2> /private/tmp/harness-council-preflight-opencode-grok.err
@@ -246,7 +254,7 @@ reviewer as unavailable in the final update.
 
 ```sh
 claude --permission-mode plan \
-  --add-dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --add-dir "$HARNESS_ROOT" \
   -p "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-claude.out \
   2> /private/tmp/harness-council-claude.err
@@ -266,7 +274,7 @@ VERTEX_LOCATION=global \
 opencode run \
   --model google-vertex/gemini-3.1-pro-preview-customtools \
   --variant high \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-opencode-gemini.out \
   2> /private/tmp/harness-council-opencode-gemini.err
@@ -290,7 +298,7 @@ codex -m gpt-5.5 \
   -c model_reasoning_effort=high \
   -s read-only \
   -a never \
-  -C /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  -C "$HARNESS_ROOT" \
   exec --ephemeral "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-codex.out \
   2> /private/tmp/harness-council-codex.err
@@ -304,7 +312,7 @@ codex -m gpt-5.5 \
   -c model_reasoning_effort=high \
   -s read-only \
   -a never \
-  -C /Users/mbenhamd/Project/mastra \
+  -C "$MASTRA_REPO_ROOT" \
   exec --ephemeral "$(cat /private/tmp/harness-council-prompt.txt)"
 ```
 
@@ -322,7 +330,7 @@ separately so the issue's Council block can classify them independently.
 opencode run \
   --model deepseek/deepseek-v4-pro \
   --variant max \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-opencode-deepseek.out \
   2> /private/tmp/harness-council-opencode-deepseek.err
@@ -336,7 +344,7 @@ with `opencode models alibaba-coding-plan` before running.
 ```sh
 opencode run \
   --model alibaba-coding-plan/qwen3.6-plus \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-opencode-qwen.out \
   2> /private/tmp/harness-council-opencode-qwen.err
@@ -354,7 +362,7 @@ The xAI provider must be authenticated with an API key. Verify with
 opencode run \
   --model xai/grok-4.3 \
   --variant high \
-  --dir /Users/mbenhamd/Project/mastra/harness-spec-brainstorming \
+  --dir "$HARNESS_ROOT" \
   "$(cat /private/tmp/harness-council-prompt.txt)" \
   > /private/tmp/harness-council-opencode-grok.out \
   2> /private/tmp/harness-council-opencode-grok.err
