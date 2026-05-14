@@ -182,12 +182,13 @@ function normalizeWriteOpts(
     | Record<string, any>,
 ): { agentId?: string; requestContext?: RequestContext | Record<string, any> } {
   if (!opts || typeof opts !== 'object') return {};
-  if ('agentId' in opts || 'requestContext' in opts) {
+  const keys = Object.keys(opts);
+  if (keys.length > 0 && keys.every(key => key === 'agentId' || key === 'requestContext')) {
     const o = opts as { agentId?: string; requestContext?: RequestContext | Record<string, any> };
     return { agentId: o.agentId, requestContext: o.requestContext };
   }
   // Empty object → no agentId, no requestContext.
-  if (Object.keys(opts).length === 0) return {};
+  if (keys.length === 0) return {};
   // Legacy shape: caller passed a RequestContext / plain context object directly.
   return { requestContext: opts as RequestContext | Record<string, any> };
 }
