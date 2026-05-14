@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Agent } from '../agent';
-import { AgentThreadStreamRuntime } from '../agent/thread-stream-runtime';
+import { agentThreadStreamRuntime } from '../agent/thread-stream-runtime';
 import type { DurableAgentLike } from '../agent/types';
 import { isDurableAgentLike } from '../agent/types';
 import { BackgroundTaskManager } from '../background-tasks';
@@ -578,7 +578,6 @@ export class Mastra<
   #bundler?: BundlerConfig;
   #idGenerator?: MastraIdGenerator;
   #pubsub: PubSub;
-  #agentThreadStreamRuntime = new AgentThreadStreamRuntime();
   #backgroundTaskConfig?: BackgroundTaskManagerConfig;
   #backgroundTaskManager?: BackgroundTaskManager;
   #schedulerConfig?: WorkflowSchedulerConfig;
@@ -636,7 +635,7 @@ export class Mastra<
   }
 
   get agentThreadStreamRuntime() {
-    return this.#agentThreadStreamRuntime;
+    return agentThreadStreamRuntime;
   }
 
   get workers(): readonly MastraWorker[] {
