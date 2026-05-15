@@ -323,12 +323,15 @@ export class HarnessLibSQL extends HarnessStorage {
 
       const createdAt = Date.now();
       for (const ref of references) {
+        if (ref.harnessName !== undefined && this.#resolveHarnessName(ref.harnessName) !== harnessName) {
+          throw new HarnessStorageAttachmentUnavailableError(ref.sessionId, ref.attachmentId);
+        }
         const attachment = await tx.execute({
           sql: `SELECT attachment_id
                 FROM ${TABLE_HARNESS_ATTACHMENTS}
                 WHERE harness_name = ? AND session_id = ? AND attachment_id = ?
                 LIMIT 1`,
-          args: [this.#resolveHarnessName(ref.harnessName ?? harnessName), ref.sessionId, ref.attachmentId],
+          args: [harnessName, ref.sessionId, ref.attachmentId],
         });
         if (attachment.rows.length === 0) {
           throw new HarnessStorageAttachmentUnavailableError(ref.sessionId, ref.attachmentId);
@@ -340,7 +343,7 @@ export class HarnessLibSQL extends HarnessStorage {
             ON CONFLICT DO UPDATE SET
                   retained_until = excluded.retained_until`,
           args: [
-            this.#resolveHarnessName(ref.harnessName ?? harnessName),
+            harnessName,
             ref.sessionId,
             ref.attachmentId,
             ref.source,
@@ -475,6 +478,11 @@ export class HarnessLibSQL extends HarnessStorage {
         resourceId: existing.resourceId,
       });
     }
+    await this.#client.execute({
+      sql: `DELETE FROM ${TABLE_HARNESS_ATTACHMENT_REFERENCES}
+            WHERE harness_name = ? AND session_id = ?`,
+      args: [namespace, sessionId],
+    });
     // Cascade attachments first; we don't rely on FK cascades because the
     // schema deliberately doesn't declare a FK (sessions can be hard-deleted
     // independently of how attachments were uploaded).

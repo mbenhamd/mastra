@@ -1,5 +1,6 @@
 import {
   HarnessStorageAdmissionConflictError,
+  HarnessStorageAttachmentUnavailableError,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageVersionConflictError,
@@ -427,6 +428,34 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
 
         expect(await harness.loadAttachment({ sessionId: 'session-1', attachmentId: 'a1' })).toBeNull();
       });
+
+      it('clears attachment references before cascading owned attachments', async () => {
+        if (!harness) return;
+        await harness.saveSession(createSampleSessionRecord(), { ownerId: 'h', ifVersion: 0 });
+        await harness.saveAttachment({
+          sessionId: 'session-1',
+          attachmentId: 'a1',
+          name: 'note.txt',
+          mimeType: 'text/plain',
+          source: 'preupload',
+          data: new Uint8Array([1, 2, 3]),
+        });
+        await harness.recordAttachmentReferences([
+          {
+            sessionId: 'session-1',
+            attachmentId: 'a1',
+            source: 'queued_item',
+            sourceId: 'q1',
+          },
+        ]);
+
+        await harness.deleteSession({ sessionId: 'session-1' });
+
+        await expect(harness.listAttachmentReferences({ sessionId: 'session-1', attachmentId: 'a1' })).resolves.toEqual(
+          [],
+        );
+        await expect(harness.loadAttachment({ sessionId: 'session-1', attachmentId: 'a1' })).resolves.toBeNull();
+      });
     });
 
     describe('leases', () => {
@@ -772,6 +801,43 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
 
         expect(await harness.loadAttachment({ sessionId: 'session-a', attachmentId: 'a1' })).not.toBeNull();
         expect(await harness.loadAttachment({ sessionId: 'session-b', attachmentId: 'a2' })).not.toBeNull();
+      });
+
+      it('keeps transactional attachment references in the session harness namespace', async () => {
+        if (!harness) return;
+        await harness.saveSession(createSampleSessionRecord({ harnessName: 'harness-a', id: 'session-a' }), {
+          harnessName: 'harness-a',
+          ownerId: 'h',
+          ifVersion: 0,
+        });
+        await harness.saveAttachment({
+          harnessName: 'harness-b',
+          sessionId: 'session-a',
+          attachmentId: 'a1',
+          name: 'n',
+          mimeType: 'text/plain',
+          source: 'preupload',
+          data: new Uint8Array([1]),
+        });
+
+        await expect(
+          harness.saveSessionWithAttachmentReferences(
+            createSampleSessionRecord({ harnessName: 'harness-a', id: 'session-a', version: 1 }),
+            { harnessName: 'harness-a', ownerId: 'h', ifVersion: 1 },
+            [
+              {
+                harnessName: 'harness-b',
+                sessionId: 'session-a',
+                attachmentId: 'a1',
+                source: 'queued_item',
+                sourceId: 'q1',
+              },
+            ],
+          ),
+        ).rejects.toBeInstanceOf(HarnessStorageAttachmentUnavailableError);
+        await expect(
+          harness.listAttachmentReferences({ harnessName: 'harness-b', sessionId: 'session-a', attachmentId: 'a1' }),
+        ).resolves.toEqual([]);
       });
     });
 

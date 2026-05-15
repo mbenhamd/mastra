@@ -169,8 +169,10 @@ export class InMemoryHarness extends HarnessStorage {
     }
 
     for (const ref of references) {
-      const refHarnessName = resolveHarnessName(ref.harnessName, harnessName);
-      if (!this.db.harnessAttachmentRecords.has(attachmentKey(refHarnessName, ref.sessionId, ref.attachmentId))) {
+      if (ref.harnessName !== undefined && resolveHarnessName(ref.harnessName, harnessName) !== harnessName) {
+        throw new HarnessStorageAttachmentUnavailableError(ref.sessionId, ref.attachmentId);
+      }
+      if (!this.db.harnessAttachmentRecords.has(attachmentKey(harnessName, ref.sessionId, ref.attachmentId))) {
         throw new HarnessStorageAttachmentUnavailableError(ref.sessionId, ref.attachmentId);
       }
     }
@@ -185,8 +187,7 @@ export class InMemoryHarness extends HarnessStorage {
     };
     this.db.harnessSessions.set(sessionKey(harnessName, record.id), cloneSessionRecord(stored));
     for (const ref of references) {
-      const refHarnessName = resolveHarnessName(ref.harnessName, harnessName);
-      this.db.harnessAttachmentReferences.set(attachmentReferenceKey({ ...ref, harnessName: refHarnessName }), {
+      this.db.harnessAttachmentReferences.set(attachmentReferenceKey({ ...ref, harnessName }), {
         source: ref.source,
         sourceId: ref.sourceId,
         ...(ref.retainedUntil !== undefined ? { retainedUntil: ref.retainedUntil } : {}),
@@ -249,6 +250,12 @@ export class InMemoryHarness extends HarnessStorage {
         sessionId,
         resourceId: existing.resourceId,
       });
+    }
+    const refPrefix = `${namespace}\u0000${sessionId}\u0000`;
+    for (const key of this.db.harnessAttachmentReferences.keys()) {
+      if (key.startsWith(refPrefix)) {
+        this.db.harnessAttachmentReferences.delete(key);
+      }
     }
     this.db.harnessSessions.delete(sessionKey(namespace, sessionId));
     await this.deleteAttachmentsForSession({ harnessName: namespace, sessionId });
