@@ -18,4 +18,4 @@ const result = await harnessStorage.createOrLoadActiveSession(
 );
 ```
 
-The in-memory and LibSQL adapters implement the new contract with namespace-aware keys and focused conformance coverage.
+Tests and projects can now use namespace-scoped Harness storage without key collisions, with in-memory and LibSQL backends covered by the same conformance behavior.

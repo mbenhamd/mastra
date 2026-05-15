@@ -461,10 +461,15 @@ export class Harness {
     if (this._mastra && this._mastra !== mastra) {
       throw new HarnessConfigError('mastra', 'harness is already bound to a different Mastra instance');
     }
+    if (this._mastra === mastra) {
+      if (harnessName !== undefined && harnessName !== this._harnessName) {
+        throw new HarnessConfigError('mastra', 'harness is already registered under a different harness name');
+      }
+      return;
+    }
     if (harnessName !== undefined) {
       this._harnessName = harnessName;
     }
-    if (this._mastra === mastra) return;
     this._bindMastra(mastra);
   }
 

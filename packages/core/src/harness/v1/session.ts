@@ -3592,6 +3592,7 @@ export class Session {
     for (const attachment of item.attachments) {
       if (attachment.kind !== 'ref') continue;
       const loaded = await this._storage.loadAttachment({
+        harnessName: this._record.harnessName,
         sessionId: attachment.ownerSessionId,
         attachmentId: attachment.attachmentId,
       });

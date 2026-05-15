@@ -208,6 +208,21 @@ describe('Harness v1 — session(...) by thread', () => {
     });
   });
 
+  it('rejects re-registering the same Mastra under a different harness key', async () => {
+    const storage = new InMemoryStore();
+    const alpha = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage,
+      harnesses: { alpha },
+    });
+
+    expect(() => alpha.__registerMastra(mastra, 'renamed')).toThrow(HarnessConfigError);
+  });
+
   it('forces a brand-new thread when threadId is { fresh: true }', async () => {
     const a = await harness.session({ threadId: { fresh: true }, resourceId: 'r1' });
     const b = await harness.session({ threadId: { fresh: true }, resourceId: 'r1' });

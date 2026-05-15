@@ -46,6 +46,7 @@ import type {
 export class InMemoryHarness extends HarnessStorage {
   private db: InMemoryDB;
   private readonly harnessName: string;
+  private readonly compactionLocks = new Map<string, Promise<void>>();
 
   constructor({ db, harnessName = 'default' }: { db: InMemoryDB; harnessName?: string }) {
     super();
@@ -625,34 +626,37 @@ export class InMemoryHarness extends HarnessStorage {
       );
     }
 
-    const session = this.db.harnessSessions.get(sessionKey(namespace, sessionId));
-    if (session && session.resourceId !== resourceId) return null;
-    const receipt = queuedItemId ? session?.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    if (!session || !receipt) return null;
-    if (!isTerminalQueueReceipt(receipt)) return null;
-    const tombstone: OperationAdmissionTombstone = {
-      kind: 'queue',
-      harnessName: namespace,
-      sessionId,
-      resourceId,
-      threadId: session.threadId,
-      admissionId: receipt.admissionId,
-      admissionHash: receipt.admissionHash,
-      queuedItemId: receipt.queuedItemId,
-      ...(receipt.signalId !== undefined ? { signalId: receipt.signalId } : {}),
-      ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
-      terminalAt: receipt.completedAt ?? receipt.failedAt ?? receipt.deadAt ?? now,
-      compactedAt: now,
-      expiresAt: now,
-    };
-    await this.writeOperationAdmissionTombstone(tombstone);
-    const nextReceipts = { ...(session.queueAdmissionReceipts ?? {}) };
-    delete nextReceipts[queuedItemId!];
-    this.db.harnessSessions.set(sessionKey(namespace, sessionId), {
-      ...session,
-      queueAdmissionReceipts: Object.keys(nextReceipts).length > 0 ? nextReceipts : undefined,
+    const key = sessionKey(namespace, sessionId);
+    return this.withCompactionLock(key, async () => {
+      const session = this.db.harnessSessions.get(key);
+      if (session && session.resourceId !== resourceId) return null;
+      const receipt = queuedItemId ? session?.queueAdmissionReceipts?.[queuedItemId] : undefined;
+      if (!session || !receipt) return null;
+      if (!isTerminalQueueReceipt(receipt)) return null;
+      const tombstone: OperationAdmissionTombstone = {
+        kind: 'queue',
+        harnessName: namespace,
+        sessionId,
+        resourceId,
+        threadId: session.threadId,
+        admissionId: receipt.admissionId,
+        admissionHash: receipt.admissionHash,
+        queuedItemId: receipt.queuedItemId,
+        ...(receipt.signalId !== undefined ? { signalId: receipt.signalId } : {}),
+        ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
+        terminalAt: receipt.completedAt ?? receipt.failedAt ?? receipt.deadAt ?? now,
+        compactedAt: now,
+        expiresAt: now,
+      };
+      await this.writeOperationAdmissionTombstone(tombstone);
+      const nextReceipts = { ...(session.queueAdmissionReceipts ?? {}) };
+      delete nextReceipts[queuedItemId!];
+      this.db.harnessSessions.set(key, {
+        ...session,
+        queueAdmissionReceipts: Object.keys(nextReceipts).length > 0 ? nextReceipts : undefined,
+      });
+      return cloneJson(tombstone);
     });
-    return cloneJson(tombstone);
   }
 
   async deleteOperationAdmissionTombstonesForSession({
@@ -683,6 +687,25 @@ export class InMemoryHarness extends HarnessStorage {
       if (predicate(tombstone)) return tombstone;
     }
     return null;
+  }
+
+  private async withCompactionLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.compactionLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const queued = previous.catch(() => undefined).then(() => current);
+    this.compactionLocks.set(key, queued);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.compactionLocks.get(key) === queued) {
+        this.compactionLocks.delete(key);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------

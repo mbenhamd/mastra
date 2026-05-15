@@ -59,6 +59,7 @@ export class HarnessLibSQL extends HarnessStorage {
   #db: LibSQLDB;
   #client: Client;
   #harnessName: string;
+  #compactionLocks = new Map<string, Promise<void>>();
 
   constructor(config: LibSQLDomainConfig) {
     super();
@@ -114,6 +115,7 @@ export class HarnessLibSQL extends HarnessStorage {
     });
     await this.#backfillHarnessNamespace();
     await this.#backfillAttachmentMetadata();
+    await this.#assertNoDuplicateActiveSessions();
     await this.#client.execute({
       sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_sessions_active_key
             ON "${TABLE_HARNESS_SESSIONS}" ("harness_name", "resource_id", "thread_id")
@@ -950,35 +952,52 @@ export class HarnessLibSQL extends HarnessStorage {
   }): Promise<OperationAdmissionTombstone | null> {
     if (kind === 'message') return null;
     const namespace = this.#resolveHarnessName(harnessName);
-    const session = await this.loadSession({ harnessName: namespace, sessionId });
-    if (session && session.resourceId !== resourceId) return null;
-    const receipt = queuedItemId ? session?.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    if (!session || !receipt || !isTerminalQueueReceipt(receipt)) return null;
-    const tombstone: OperationAdmissionTombstone = {
-      kind: 'queue',
-      harnessName: namespace,
-      sessionId,
-      resourceId,
-      threadId: session.threadId,
-      admissionId: receipt.admissionId,
-      admissionHash: receipt.admissionHash,
-      queuedItemId: receipt.queuedItemId,
-      ...(receipt.signalId !== undefined ? { signalId: receipt.signalId } : {}),
-      ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
-      terminalAt: receipt.completedAt ?? receipt.failedAt ?? receipt.deadAt ?? now,
-      compactedAt: now,
-      expiresAt: now,
-    };
-    await this.writeOperationAdmissionTombstone(tombstone);
-    const nextReceipts = { ...(session.queueAdmissionReceipts ?? {}) };
-    delete nextReceipts[queuedItemId!];
-    await this.#client.execute({
-      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
-            SET queue_admission_receipts = ?
-            WHERE harness_name = ? AND id = ?`,
-      args: [Object.keys(nextReceipts).length > 0 ? JSON.stringify(nextReceipts) : null, namespace, sessionId],
+    return this.#withCompactionLock(`${namespace}\0${sessionId}`, async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const result = await this.#client.execute({
+          sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ?`,
+          args: [namespace, sessionId],
+        });
+        const row = result.rows[0] as Record<string, unknown> | undefined;
+        if (!row) return null;
+        const session = rowToSession(row);
+        if (session.resourceId !== resourceId) return null;
+        const receipt = queuedItemId ? session.queueAdmissionReceipts?.[queuedItemId] : undefined;
+        if (!receipt || !isTerminalQueueReceipt(receipt)) return null;
+        const tombstone: OperationAdmissionTombstone = {
+          kind: 'queue',
+          harnessName: namespace,
+          sessionId,
+          resourceId,
+          threadId: session.threadId,
+          admissionId: receipt.admissionId,
+          admissionHash: receipt.admissionHash,
+          queuedItemId: receipt.queuedItemId,
+          ...(receipt.signalId !== undefined ? { signalId: receipt.signalId } : {}),
+          ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
+          terminalAt: receipt.completedAt ?? receipt.failedAt ?? receipt.deadAt ?? now,
+          compactedAt: now,
+          expiresAt: now,
+        };
+        await this.writeOperationAdmissionTombstone(tombstone);
+        const nextReceipts = { ...(session.queueAdmissionReceipts ?? {}) };
+        delete nextReceipts[queuedItemId!];
+        const nextReceiptJson = Object.keys(nextReceipts).length > 0 ? JSON.stringify(nextReceipts) : null;
+        const originalReceiptJson = row.queue_admission_receipts == null ? null : String(row.queue_admission_receipts);
+        const updateResult = await this.#client.execute({
+          sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+                SET queue_admission_receipts = ?
+                WHERE harness_name = ? AND id = ?
+                  AND ${originalReceiptJson === null ? 'queue_admission_receipts IS NULL' : 'queue_admission_receipts = ?'}`,
+          args:
+            originalReceiptJson === null
+              ? [nextReceiptJson, namespace, sessionId]
+              : [nextReceiptJson, namespace, sessionId, originalReceiptJson],
+        });
+        if (updateResult.rowsAffected > 0) return tombstone;
+      }
+      throw new Error(`Harness LibSQL compaction for session "${sessionId}" conflicted after retries`);
     });
-    return tombstone;
   }
 
   async deleteOperationAdmissionTombstonesForSession({
@@ -1053,6 +1072,50 @@ export class HarnessLibSQL extends HarnessStorage {
             String(row.attachment_id),
           ],
         });
+      }
+    }
+  }
+
+  async #assertNoDuplicateActiveSessions(): Promise<void> {
+    const result = await this.#client.execute({
+      sql: `SELECT harness_name, resource_id, thread_id, COUNT(*) AS duplicate_count
+            FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE closed_at IS NULL
+            GROUP BY harness_name, resource_id, thread_id
+            HAVING COUNT(*) > 1
+            LIMIT 5`,
+      args: [],
+    });
+    if (result.rows.length === 0) return;
+
+    const examples = result.rows
+      .map(row => {
+        const record = row as Record<string, unknown>;
+        return `${String(record.harness_name)}:${String(record.resource_id)}:${String(record.thread_id)} (${String(
+          record.duplicate_count,
+        )})`;
+      })
+      .join(', ');
+    throw new Error(
+      `Cannot create Harness active-session uniqueness index while duplicate active rows exist. Close or migrate duplicate active rows for: ${examples}`,
+    );
+  }
+
+  async #withCompactionLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#compactionLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const queued = previous.catch(() => undefined).then(() => current);
+    this.#compactionLocks.set(key, queued);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.#compactionLocks.get(key) === queued) {
+        this.#compactionLocks.delete(key);
       }
     }
   }

@@ -955,6 +955,88 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
           queueAdmissionReceipts: undefined,
         });
       });
+
+      it('compacts concurrent terminal queue receipts without losing survivors', async () => {
+        if (!harness) return;
+        await harness.saveSession(
+          createSampleSessionRecord({
+            queueAdmissionReceipts: {
+              'queued-1': {
+                admissionId: 'admission-1',
+                admissionHash: 'hash-1',
+                queuedItemId: 'queued-1',
+                status: 'completed',
+                attempts: 1,
+                enqueuedAt: 1000,
+                acceptedAt: 1100,
+                completedAt: 2000,
+                updatedAt: 2000,
+              },
+              'queued-2': {
+                admissionId: 'admission-2',
+                admissionHash: 'hash-2',
+                queuedItemId: 'queued-2',
+                status: 'failed',
+                attempts: 1,
+                enqueuedAt: 1000,
+                acceptedAt: 1100,
+                failedAt: 2100,
+                updatedAt: 2100,
+              },
+              'queued-3': {
+                admissionId: 'admission-3',
+                admissionHash: 'hash-3',
+                queuedItemId: 'queued-3',
+                status: 'accepted',
+                attempts: 1,
+                enqueuedAt: 1000,
+                acceptedAt: 1100,
+                updatedAt: 1100,
+              },
+            },
+          }),
+          { ownerId: 'h', ifVersion: 0 },
+        );
+
+        const [first, second] = await Promise.all([
+          harness.compactOperationResultEvidence({
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            kind: 'queue',
+            queuedItemId: 'queued-1',
+            now: 3000,
+          }),
+          harness.compactOperationResultEvidence({
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            kind: 'queue',
+            queuedItemId: 'queued-2',
+            now: 3000,
+          }),
+        ]);
+
+        expect(first).toMatchObject({ queuedItemId: 'queued-1', admissionHash: 'hash-1' });
+        expect(second).toMatchObject({ queuedItemId: 'queued-2', admissionHash: 'hash-2' });
+        await expect(
+          harness.loadQueueResultEvidence({
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            queuedItemId: 'queued-1',
+          }),
+        ).resolves.toMatchObject({ queuedItemId: 'queued-1', admissionHash: 'hash-1' });
+        await expect(
+          harness.loadQueueResultEvidence({
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            queuedItemId: 'queued-2',
+          }),
+        ).resolves.toMatchObject({ queuedItemId: 'queued-2', admissionHash: 'hash-2' });
+        await expect(harness.loadSession({ sessionId: 'session-1' })).resolves.toMatchObject({
+          queueAdmissionReceipts: {
+            'queued-3': expect.objectContaining({ status: 'accepted' }),
+          },
+        });
+      });
     });
 
     describe('dangerouslyClearAll', () => {
