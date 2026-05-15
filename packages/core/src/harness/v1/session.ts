@@ -3405,6 +3405,7 @@ export class Session {
     const attachmentReferences = attachments
       .filter((attachment): attachment is Extract<PersistedAttachment, { kind: 'ref' }> => attachment.kind === 'ref')
       .map(attachment => ({
+        harnessName: this._record.harnessName,
         sessionId: attachment.ownerSessionId,
         attachmentId: attachment.attachmentId,
         source: 'queued_item' as const,
@@ -3447,6 +3448,7 @@ export class Session {
         throw new HarnessValidationError(`${field}[${i}].ownerSessionId`, 'attachment must belong to this session');
       }
       const record = await this._storage.getAttachmentRecord({
+        harnessName: this._record.harnessName,
         sessionId: this.id,
         attachmentId: ref.attachmentId,
       });
@@ -3797,6 +3799,7 @@ export class Session {
         lastActivityAt: Date.now(),
       };
       const saveOpts = {
+        harnessName: this._record.harnessName,
         ownerId: this._ownerId,
         ifVersion: this._record.version,
       };
