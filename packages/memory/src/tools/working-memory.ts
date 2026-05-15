@@ -5,6 +5,11 @@ import { createTool } from '@mastra/core/tools';
 import { standardSchemaToJSONSchema } from '@mastra/schema-compat/schema';
 import { z } from 'zod';
 
+type WorkingMemorySchema = { memory: any };
+type WorkingMemoryJsonSchemaProps = Parameters<
+  StandardSchemaWithJSON<WorkingMemorySchema>['~standard']['jsonSchema']['input']
+>[0];
+
 /**
  * Deep merges two objects, with special handling for null values (delete) and arrays (replace).
  * - Object properties are recursively merged
@@ -90,7 +95,7 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
   const schema = memoryConfig?.workingMemory?.schema;
 
   // Default input schema for markdown-based working memory
-  let inputSchema: PublicSchema<{ memory: any }> = z.object({
+  let inputSchema: PublicSchema<WorkingMemorySchema> = z.object({
     memory: z
       .string()
       .describe(`The Markdown formatted working memory content to store. This MUST be a string. Never pass an object.`),
@@ -105,7 +110,7 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
     const jsonSchema = standardSchemaToJSONSchema(standardSchema, { io: 'input' });
     delete jsonSchema.$schema;
 
-    const wrappedSchema = toStandardSchema<{ memory: any }>({
+    const wrappedMemorySchema: PublicSchema<WorkingMemorySchema> = {
       $schema: 'http://json-schema.org/draft-07/schema#',
       type: 'object',
       description: 'The JSON formatted working memory content to store.',
@@ -113,7 +118,8 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
         memory: jsonSchema,
       },
       required: ['memory'],
-    });
+    };
+    const wrappedSchema = toStandardSchema(wrappedMemorySchema);
 
     inputSchema = {
       '~standard': {
@@ -153,11 +159,11 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
           });
         },
         jsonSchema: {
-          input: props => wrappedSchema['~standard'].jsonSchema.input(props),
-          output: props => wrappedSchema['~standard'].jsonSchema.output(props),
+          input: (props: WorkingMemoryJsonSchemaProps) => wrappedSchema['~standard'].jsonSchema.input(props),
+          output: (props: WorkingMemoryJsonSchemaProps) => wrappedSchema['~standard'].jsonSchema.output(props),
         },
       },
-    } as StandardSchemaWithJSON<{ memory: any }>;
+    } as StandardSchemaWithJSON<WorkingMemorySchema>;
   }
 
   // For schema-based working memory, we use merge semantics
