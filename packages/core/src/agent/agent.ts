@@ -6157,7 +6157,7 @@ export class Agent<
   }
 
   #getThreadStreamRuntime() {
-    return agentThreadStreamRuntime;
+    return this.#mastra?.agentThreadStreamRuntime ?? agentThreadStreamRuntime;
   }
 
   /**

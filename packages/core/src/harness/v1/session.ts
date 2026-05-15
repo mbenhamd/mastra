@@ -1586,14 +1586,7 @@ export class Session {
     // loop is responsible for harness events; we still keep the turn
     // in-flight (so `isRunning()` reports true) until the run completes.
     if (opts.stream === true) {
-      const out = agent.getRunOutput(signal.runId) as MastraModelOutput<unknown> | undefined;
-      if (!out) {
-        this._endTurn(turnAbortController);
-        // Drop the completion waiter so the drain doesn't try to resolve into
-        // a dead listener.
-        this._runCompletionPromises.delete(signal.runId);
-        throw new HarnessConfigError('message()', 'agent did not register a run for the dispatched signal');
-      }
+      const out = (await agent.waitForRunOutput(signal.runId)) as MastraModelOutput<unknown>;
       void completion
         .then(full => {
           this._recordTurnCompletion(full);

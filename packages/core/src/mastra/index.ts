@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Agent } from '../agent';
-import { agentThreadStreamRuntime } from '../agent/thread-stream-runtime';
+import { AgentThreadStreamRuntime } from '../agent/thread-stream-runtime';
 import type { DurableAgentLike } from '../agent/types';
 import { isDurableAgentLike } from '../agent/types';
 import { BackgroundTaskManager } from '../background-tasks';
@@ -629,13 +629,14 @@ export class Mastra<
   #datasets?: DatasetsManager;
   // Global version overrides for primitives (agents, etc.)
   #versions?: VersionOverrides;
+  #agentThreadStreamRuntime = new AgentThreadStreamRuntime();
 
   get pubsub() {
     return this.#pubsub;
   }
 
   get agentThreadStreamRuntime() {
-    return agentThreadStreamRuntime;
+    return this.#agentThreadStreamRuntime;
   }
 
   get workers(): readonly MastraWorker[] {

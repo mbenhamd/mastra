@@ -1052,6 +1052,16 @@ describe('Agent signals', () => {
     await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
   });
 
+  it('scopes thread stream runtimes per Mastra instance', () => {
+    const first = new Mastra();
+    const second = new Mastra();
+
+    expect(first.agentThreadStreamRuntime).toBeInstanceOf(AgentThreadStreamRuntime);
+    expect(second.agentThreadStreamRuntime).toBeInstanceOf(AgentThreadStreamRuntime);
+    expect(first.agentThreadStreamRuntime).not.toBe(second.agentThreadStreamRuntime);
+    expect(first.agentThreadStreamRuntime).not.toBe(agentThreadStreamRuntime);
+  });
+
   it('allows a thread follower to abort the active run controller', () => {
     const runtime = new AgentThreadStreamRuntime();
     const options = runtime.prepareRunOptions({

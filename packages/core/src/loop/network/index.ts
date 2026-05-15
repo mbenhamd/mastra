@@ -1526,8 +1526,7 @@ export async function createNetworkLoop({
         throw mastraError;
       }
 
-      // @ts-expect-error - bad type
-      const toolId = tool.id;
+      const toolId = (tool as { id?: string }).id;
       // Use safeParseLLMJson to handle malformed JSON from LLM (truncated, unescaped chars, etc.)
       const inputDataToUse = await safeParseLLMJson(inputData.prompt);
       if (inputDataToUse === null) {

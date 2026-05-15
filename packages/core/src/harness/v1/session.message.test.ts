@@ -30,6 +30,7 @@ interface FakeCall {
 
 class FakeAgent extends Agent<any, any, any> {
   calls: FakeCall[] = [];
+  deferStreamRegistration = false;
   fullOutput: any = {
     text: 'hello back',
     usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
@@ -72,6 +73,9 @@ class FakeAgent extends Agent<any, any, any> {
       runId: options?.runId ?? this.fullOutput.runId,
       fullOutput: this.fullOutput,
     });
+    if (this.deferStreamRegistration) {
+      await Promise.resolve();
+    }
     this._internalRegisterStreamRun(out, (options ?? {}) as any);
     return out;
   }
@@ -159,6 +163,17 @@ describe('Session.message() — streaming path', () => {
 
     // Duck-typed output is what we returned from FakeAgent.stream — i.e. it
     // exposes the awaitable promises directly.
+    expect(await (stream as any).text).toBe('hello back');
+    expect(agent.calls[0]!.type).toBe('stream');
+  });
+
+  it('waits for async stream registration when stream: true wakes an idle thread', async () => {
+    const { harness, agent } = setup();
+    agent.deferStreamRegistration = true;
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const stream = await session.message({ content: 'go', stream: true });
+
     expect(await (stream as any).text).toBe('hello back');
     expect(agent.calls[0]!.type).toBe('stream');
   });
