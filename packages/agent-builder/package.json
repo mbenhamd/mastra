@@ -1,6 +1,6 @@
 {
   "name": "@mastra/agent-builder",
-  "version": "1.0.35-papersflow.sha.3f3c316.1",
+  "version": "1.0.35-papersflow.sha.69b3bec.0",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
