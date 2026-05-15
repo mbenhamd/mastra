@@ -3,4 +3,9 @@
 "@mastra/libsql": patch
 ---
 
-Added Harness v1 message admission idempotency with retained result evidence for duplicate retry handling.
+Added retry-safe `session.message()` admission for Harness v1 using the `admissionId` parameter.
+
+```ts
+await session.message({ content: 'Summarize this issue', admissionId: 'msg-123' });
+await session.message({ content: 'Summarize this issue', admissionId: 'msg-123' }); // duplicate retry
+```

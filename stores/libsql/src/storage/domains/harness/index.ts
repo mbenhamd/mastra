@@ -829,6 +829,16 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureMessageResultsTable();
     const namespacedRecord = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
     const id = messageEvidenceId(namespacedRecord);
+    const loadCurrent = async () => {
+      const current = await this.loadMessageResultEvidence({
+        harnessName: namespacedRecord.harnessName,
+        sessionId: namespacedRecord.sessionId,
+        resourceId: namespacedRecord.resourceId,
+        threadId: namespacedRecord.threadId,
+        signalId: namespacedRecord.signalId,
+      });
+      return current && 'status' in current ? current : null;
+    };
     const tx = await this.#client.transaction('write');
     let created = false;
     try {
@@ -844,6 +854,10 @@ export class HarnessLibSQL extends HarnessStorage {
             'message',
             namespacedRecord.admissionId ?? namespacedRecord.signalId,
           );
+        }
+        if (isTerminalMessageEvidence(current)) {
+          await tx.commit();
+          return { created: false };
         }
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
@@ -887,6 +901,17 @@ export class HarnessLibSQL extends HarnessStorage {
       return { created };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
+      if (isUniqueConstraintError(err)) {
+        const current = await loadCurrent();
+        if (current && sameMessageEvidenceIdentity(current as AgentSignalResultEvidence, namespacedRecord)) {
+          return { created: false };
+        }
+        throw new HarnessStorageAdmissionConflictError(
+          namespacedRecord.sessionId,
+          'message',
+          namespacedRecord.admissionId ?? namespacedRecord.signalId,
+        );
+      }
       throw err;
     }
   }
@@ -1540,6 +1565,10 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
     a.admissionId === b.admissionId &&
     a.admissionHash === b.admissionHash
   );
+}
+
+function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
+  return record.status === 'completed' || record.status === 'failed';
 }
 
 function isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {

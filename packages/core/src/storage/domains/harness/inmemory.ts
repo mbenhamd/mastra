@@ -529,6 +529,9 @@ export class InMemoryHarness extends HarnessStorage {
         namespacedRecord.admissionId ?? namespacedRecord.signalId,
       );
     }
+    if (existing && isTerminalMessageEvidence(existing)) {
+      return { created: false };
+    }
     this.db.harnessMessageResultEvidence.set(
       key,
       cloneJson({
@@ -864,6 +867,10 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
     a.admissionId === b.admissionId &&
     a.admissionHash === b.admissionHash
   );
+}
+
+function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
+  return record.status === 'completed' || record.status === 'failed';
 }
 
 function isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {

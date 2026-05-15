@@ -135,6 +135,8 @@ type MessageAdmissionStart = {
  */
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
+const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
+const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
   'required',
   'properties',
@@ -1445,9 +1447,9 @@ export class Session {
   // Signal-routing helpers (§4.2). One long-lived thread subscription per
   // Session multiplexes every run on the thread into a single chunk
   // stream. `message()` calls `agent.sendSignal()`, gets a `runId` back,
-  // and awaits the matching entry in `_runCompletionPromises`. The drain
-  // loop resolves that entry when a terminal chunk (`finish` / `error` /
-  // `abort` / `tool-call-suspended`) for the run arrives.
+  // and awaits the matching entry in `_runCompletionPromises`. Completion
+  // settlement is handled by `_watchRunCompletion()`; the drain loop only
+  // emits harness events from stream chunks.
   // -------------------------------------------------------------------------
 
   /**
@@ -2019,23 +2021,62 @@ export class Session {
     // loop is responsible for harness events; we still keep the turn
     // in-flight (so `isRunning()` reports true) until the run completes.
     if (opts.stream === true) {
-      const out = agent.getRunOutput(signal.runId) as MastraModelOutput<unknown> | undefined;
+      let out = agent.getRunOutput(signal.runId) as MastraModelOutput<unknown> | undefined;
+      if (!out && (signal.output || admissionIdentity !== undefined)) {
+        await pendingEvidenceWrite;
+        try {
+          out = signal.output
+            ? ((await signal.output) as MastraModelOutput<unknown>)
+            : ((await Promise.race([
+                agent.waitForRunOutput(signal.runId) as Promise<MastraModelOutput<unknown>>,
+                completion.then(
+                  () => undefined,
+                  () => undefined,
+                ),
+                delay(MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS).then(() => undefined),
+              ])) as MastraModelOutput<unknown> | undefined);
+        } catch (err) {
+          this._endTurn(turnAbortController);
+          void completion.catch(() => {});
+          const waiter = this._runCompletionPromises.get(signal.runId);
+          this._runCompletionPromises.delete(signal.runId);
+          this._rememberCompletedRun(signal.runId, { ok: false, err });
+          waiter?.reject(err);
+          if (admissionIdentity !== undefined) {
+            await this._writeMessageResultEvidence({
+              status: 'failed',
+              signalId: signal.signal.id,
+              runId: signal.runId,
+              error: projectHarnessPublicError(err),
+              admissionId: opts.admissionId!,
+              admissionHash: admissionHash!,
+            });
+          }
+          if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+          void this._maybeDrainQueue();
+          throw err;
+        }
+      }
       if (!out) {
         this._endTurn(turnAbortController);
-        // Drop the completion waiter so the drain doesn't try to resolve into
-        // a dead listener.
-        this._runCompletionPromises.delete(signal.runId);
         void pendingEvidenceWrite.catch(() => {});
         const err = new HarnessConfigError('message()', 'agent did not register a run for the dispatched signal');
+        // Drop the completion waiter so duplicate retries do not treat an
+        // unregistered run as live forever.
+        void completion.catch(() => {});
+        const waiter = this._runCompletionPromises.get(signal.runId);
+        this._runCompletionPromises.delete(signal.runId);
+        this._rememberCompletedRun(signal.runId, { ok: false, err });
+        waiter?.reject(err);
         if (admissionIdentity !== undefined) {
           await this._writeMessageResultEvidence({
             status: 'failed',
             signalId: signal.signal.id,
             runId: signal.runId,
             error: projectHarnessPublicError(err),
-            ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
-            ...(admissionHash !== undefined ? { admissionHash } : {}),
-          }).catch(() => {});
+            admissionId: opts.admissionId!,
+            admissionHash: admissionHash!,
+          });
         }
         throw err;
       }
@@ -2084,10 +2125,15 @@ export class Session {
       return out;
     }
 
-    // Default path: wait for the drain to deliver this run's terminal
-    // chunk and bundled `FullOutput`, then run post-turn bookkeeping.
+    // Default path: wait for stream startup and the completion watcher to
+    // deliver this run's bundled `FullOutput`, then run post-turn bookkeeping.
+    let streamStarted = signal.output === undefined;
     try {
       await pendingEvidenceWrite;
+      if (signal.output) {
+        await signal.output;
+        streamStarted = true;
+      }
       const full = await completion;
       this._recordTurnCompletion(full);
       if (admissionIdentity !== undefined) {
@@ -2109,6 +2155,13 @@ export class Session {
       await this._runGoalJudge(full, false);
       return full;
     } catch (err) {
+      if (!streamStarted) {
+        void completion.catch(() => {});
+        const waiter = this._runCompletionPromises.get(signal.runId);
+        this._runCompletionPromises.delete(signal.runId);
+        this._rememberCompletedRun(signal.runId, { ok: false, err });
+        waiter?.reject(err);
+      }
       if (admissionIdentity !== undefined) {
         await this._writeMessageResultEvidence({
           status: 'failed',
@@ -2185,7 +2238,7 @@ export class Session {
         const agent = this._harness.getAgentForMode(opts.mode ?? this._record.modeId);
         await this._ensureThreadSubscription(agent);
         if (!this._hasLiveMessageRun(agent, runId)) {
-          throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
+          return this._awaitDurableMessageResult(evidence, opts);
         }
         return this._awaitRunCompletion(runId);
       }
@@ -2208,6 +2261,36 @@ export class Session {
     return Boolean(
       agent.getRunOutput(runId) || this._runCompletionPromises.has(runId) || this._completedRuns.has(runId),
     );
+  }
+
+  private async _awaitDurableMessageResult(
+    evidence: AgentSignalResultEvidence,
+    opts: MessageOptions,
+  ): Promise<AgentResult> {
+    const deadline = Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
+    while (true) {
+      throwIfAborted(opts.abortSignal, 'message().admissionId');
+      const latest = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (!latest) {
+        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
+      }
+      if ('status' in latest) {
+        if (latest.status === 'completed') return latest.result as AgentResult;
+        if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
+      } else {
+        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
+      }
+      if (Date.now() >= deadline) {
+        throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
+      }
+      await delay(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, opts.abortSignal);
+    }
   }
 
   private _messageAdmissionIdentity(admissionId: string): MessageAdmissionIdentity {
@@ -4399,7 +4482,29 @@ function projectHarnessPublicError(err: unknown): { code: string; message: strin
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
   const projected = new Error(error.message);
   projected.name = error.code;
+  (projected as Error & { code: string }).code = error.code;
   return projected;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined, path: string): void {
+  if (!signal?.aborted) return;
+  throw signal.reason ?? new HarnessValidationError(path, 'operation aborted');
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal, 'delay()');
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new HarnessValidationError('delay()', 'operation aborted'));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function createDeferred<T>(): Deferred<T> {

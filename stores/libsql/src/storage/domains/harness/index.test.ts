@@ -120,20 +120,55 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {
-    await storage.writeMessageResultEvidence({
-      harnessName: 'default',
-      sessionId: 'session-1',
-      resourceId: 'resource-1',
-      threadId: 'thread-1',
-      signalId: 'signal-1',
-      runId: 'run-1',
-      admissionId: 'admission-1',
-      admissionHash: 'hash-1',
-      status: 'completed',
-      result: { text: 'done' },
-      createdAt: 1000,
-      updatedAt: 2000,
-    });
+    await expect(
+      storage.writeMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        signalId: 'signal-1',
+        runId: 'run-1',
+        admissionId: 'admission-1',
+        admissionHash: 'hash-1',
+        status: 'completed',
+        result: { text: 'done' },
+        createdAt: 1000,
+        updatedAt: 2000,
+      }),
+    ).resolves.toEqual({ created: true });
+
+    await expect(
+      storage.writeMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        signalId: 'signal-1',
+        runId: 'run-1',
+        admissionId: 'admission-1',
+        admissionHash: 'hash-1',
+        status: 'completed',
+        result: { text: 'done' },
+        createdAt: 1000,
+        updatedAt: 2000,
+      }),
+    ).resolves.toEqual({ created: false });
+
+    await expect(
+      storage.writeMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        signalId: 'signal-1',
+        runId: 'run-1',
+        admissionId: 'admission-1',
+        admissionHash: 'hash-1',
+        status: 'pending',
+        createdAt: 3000,
+        updatedAt: 3000,
+      }),
+    ).resolves.toEqual({ created: false });
 
     await expect(
       storage.loadMessageResultEvidence({

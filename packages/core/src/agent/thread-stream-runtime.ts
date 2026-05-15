@@ -17,6 +17,19 @@ import type {
 
 const AGENT_THREAD_KEY_SEPARATOR = '\u0000';
 
+function callerSignalPayloadKey(signal: AgentSignal): string | undefined {
+  try {
+    return JSON.stringify({
+      type: signal.type,
+      contents: signal.contents,
+      attributes: signal.attributes,
+      metadata: signal.metadata,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function withThreadMemory(memory: unknown, resourceId: string, threadId: string) {
   return {
     ...((memory && typeof memory === 'object' ? memory : {}) as Record<string, unknown>),
@@ -320,6 +333,7 @@ export class AgentThreadStreamRuntime {
     } catch {
       this.#threadKeysByRunId.delete(pendingIdle.runId);
       this.#cleanupPreparedRun(pendingIdle.runId);
+      this.#forgetCallerSignalsForRun(pendingIdle.runId);
       if (this.#activeThreadRunIds.get(key) === pendingIdle.runId) {
         this.#activeThreadRunIds.delete(key);
       }
@@ -475,14 +489,24 @@ export class AgentThreadStreamRuntime {
       }
     }
 
+    if (runId && !activeRecord) {
+      activeRecord = this.#threadRunsById.get(runId);
+    }
+    if (!key && activeRecord) {
+      key = this.#threadKey(activeRecord.resourceId, activeRecord.threadId);
+    }
     const isActiveTarget = Boolean(
       runId && (activeRecord?.output.status === 'running' || (key && this.#activeThreadRunIds.get(key) === runId)),
     );
     const resourceId = target.resourceId ?? activeRecord?.resourceId;
     const threadId = target.threadId ?? activeRecord?.threadId;
+    const scopedRunId = target.runId;
+    const signalPayloadKey = callerSignalPayloadKey(signalInput);
     const callerSignalKey =
-      callerSignalId !== undefined
-        ? [agent.id, resourceId ?? '', threadId ?? '', callerSignalId].join('\u0000')
+      callerSignalId !== undefined && signalPayloadKey !== undefined
+        ? [agent.id, resourceId ?? '', threadId ?? '', scopedRunId ?? '', callerSignalId, signalPayloadKey].join(
+            '\u0000',
+          )
         : undefined;
     if (callerSignalKey) {
       const accepted = this.#acceptedCallerSignals.get(callerSignalKey);
@@ -511,9 +535,9 @@ export class AgentThreadStreamRuntime {
           target.ifIdle?.streamOptions?.requestContext,
         );
         void persisted.catch(() => {});
-        return { accepted: true, runId: runId!, signal, persisted };
+        return acceptSignal({ accepted: true, runId: runId!, signal, persisted });
       }
-      return { accepted: true, runId: runId!, signal };
+      return acceptSignal({ accepted: true, runId: runId!, signal });
     }
 
     if (runId) {
@@ -556,9 +580,9 @@ export class AgentThreadStreamRuntime {
           target.ifIdle?.streamOptions?.requestContext,
         );
         void persisted.catch(() => {});
-        return { accepted: true, runId, signal, persisted };
+        return acceptSignal({ accepted: true, runId, signal, persisted });
       }
-      return { accepted: true, runId, signal };
+      return acceptSignal({ accepted: true, runId, signal });
     }
 
     key ??= this.#threadKey(resourceId, threadId);
@@ -578,22 +602,24 @@ export class AgentThreadStreamRuntime {
     // the idle stream so concurrent callers do not launch duplicate runs.
     this.#activeThreadRunIds.set(key, runId);
     this.#threadKeysByRunId.set(runId, key);
-    void agent
+    const output = agent
       .stream(signal, {
         ...(target.ifIdle?.streamOptions as any),
         runId,
         memory: withThreadMemory(target.ifIdle?.streamOptions?.memory, resourceId, threadId),
       })
-      .catch(() => {
+      .catch(err => {
         this.#threadKeysByRunId.delete(runId);
         this.#cleanupPreparedRun(runId);
         this.#forgetCallerSignalsForRun(runId);
         if (this.#activeThreadRunIds.get(key) === runId) {
           this.#activeThreadRunIds.delete(key);
         }
-      });
+        throw err;
+      }) as Promise<MastraModelOutput<unknown>>;
+    void output.catch(() => {});
 
-    return acceptSignal({ accepted: true, runId, signal });
+    return acceptSignal({ accepted: true, runId, signal, output });
   }
 }
 
