@@ -24,7 +24,7 @@
  * Callers must re-resolve via `harness.session(...)` to get a fresh instance.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
 import { Agent } from '../../agent';
@@ -33,14 +33,18 @@ import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
+import { HarnessStorageAdmissionConflictError } from '../../storage/domains/harness';
 import type {
   GoalJudgeDecision,
   GoalState,
+  AgentSignalResultEvidence,
+  AgentSignalResultStatus,
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   PendingResume,
   PermissionRules,
   PersistedAttachment,
+  OperationAdmissionTombstone,
   QueuedItem,
   SaveAttachmentReferenceInput,
   SessionGrants,
@@ -55,6 +59,7 @@ import type { StoredMessageRow } from '../_shared/message-conversion';
 import type { HarnessMessage } from '../types';
 
 import {
+  HarnessAdmissionConflictError,
   HarnessAttachmentUnavailableError,
   HarnessConfigError,
   HarnessOverrideConflictError,
@@ -105,6 +110,22 @@ import type {
   SessionSignalResult,
   ToolCategory,
 } from './types';
+
+type MessageAdmissionIdentity = {
+  signalId: string;
+  runId: string;
+};
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+};
+
+type MessageAdmissionStart = {
+  admissionHash: string;
+  promise: Promise<string>;
+};
 
 /**
  * Tool IDs the harness translates from `tool-call-approval` /
@@ -466,10 +487,9 @@ export class Session {
    *  Guards re-opens and re-entrant teardown. */
   private _threadSubscriptionClosed = false;
   /**
-   * Per-run completion promises, keyed by `runId`. The drain loop resolves
-   * (or rejects) the matching entry on a terminal chunk (`finish` / `error` /
-   * `abort` / `tool-call-suspended`). `_awaitRunCompletion(runId)` reads
-   * here. Entries left over on `close()` are rejected so callers don't hang.
+   * Per-run completion promises, keyed by `runId`. `_watchRunCompletion()`
+   * resolves or rejects the matching entry after the runtime output finishes.
+   * Entries left over on `close()` are rejected so callers don't hang.
    */
   private readonly _runCompletionPromises = new Map<
     string,
@@ -484,13 +504,14 @@ export class Session {
    * to register a waiter. `sendSignal()` returns synchronously and the runtime
    * can drive the entire run to completion in the same microtask tick, so by
    * the time `_awaitRunCompletion(runId)` runs the terminal chunk may already
-   * have been processed. Entries are consumed by the first matching
-   * `_awaitRunCompletion` call.
+   * have been processed. Entries are retained so duplicate admission waiters
+   * that converge on the same run can all observe the terminal result.
    */
   private readonly _completedRuns = new Map<
     string,
     { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown }
   >();
+  private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
 
   /** @internal — constructed by the Harness, not directly. */
   constructor(internals: SessionInternals) {
@@ -1475,10 +1496,11 @@ export class Session {
    */
   private _awaitRunCompletion(runId: string): Promise<FullOutput<unknown>> {
     // Fast path: the run may have already terminated before this call ran.
-    // Consume the cached result.
+    // Keep the cached result reusable so duplicate admission callers that
+    // converge on the same runId can still observe the terminal output even
+    // if another waiter arrived first.
     const cached = this._completedRuns.get(runId);
     if (cached) {
-      this._completedRuns.delete(runId);
       return cached.ok ? Promise.resolve(cached.full) : Promise.reject(cached.err);
     }
     // Multiple callers can await the same run (e.g. `message()` followed by
@@ -1575,19 +1597,31 @@ export class Session {
    * already dropped it from `getRunOutput()` by now).
    *
    * If no waiter is registered yet (very fast run), the result is stashed
-   * in `_completedRuns` so the next `_awaitRunCompletion(runId)` call can
-   * consume it.
+   * in `_completedRuns` so later `_awaitRunCompletion(runId)` calls can
+   * observe it.
    */
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
     const waiter = this._runCompletionPromises.get(runId);
     this._runCompletionPromises.delete(runId);
     try {
       const full = (await out.getFullOutput()) as FullOutput<unknown>;
+      this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
-      else this._completedRuns.set(runId, { ok: true, full });
     } catch (err) {
+      this._rememberCompletedRun(runId, { ok: false, err });
       if (waiter) waiter.reject(err);
-      else this._completedRuns.set(runId, { ok: false, err });
+    }
+  }
+
+  private _rememberCompletedRun(
+    runId: string,
+    entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown },
+  ): void {
+    this._completedRuns.set(runId, entry);
+    while (this._completedRuns.size > 64) {
+      const oldest = this._completedRuns.keys().next().value;
+      if (oldest === undefined) return;
+      this._completedRuns.delete(oldest);
     }
   }
 
@@ -1770,14 +1804,79 @@ export class Session {
     if (opts.output !== undefined && opts.sync !== true) {
       throw new HarnessConfigError('message()', 'structured `output` requires `sync: true` (typed turn boundary)');
     }
+    if (opts.admissionId !== undefined && opts.output !== undefined) {
+      throw new HarnessValidationError(
+        'message().admissionId',
+        'admissionId is not supported with sync structured output',
+      );
+    }
+    if (opts.admissionId !== undefined && opts.additionalTools !== undefined) {
+      throw new HarnessValidationError('message().admissionId', 'admissionId cannot be combined with additionalTools');
+    }
+    if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
+      throw new HarnessValidationError('message().admissionId', 'admissionId must be a non-empty string');
+    }
 
     // Resolve the effective mode (per-call override wins, else session's).
     const effectiveModeId = opts.mode ?? this._record.modeId;
     const mode = this._harness._getMode(effectiveModeId);
     const agent = this._harness.getAgentForMode(effectiveModeId);
+    const admissionHash =
+      opts.admissionId !== undefined
+        ? this._computeMessageAdmissionHash(opts, {
+            modeId: effectiveModeId,
+            modelId: opts.model ?? this._record.modelId,
+          })
+        : undefined;
+    const duplicate =
+      opts.admissionId !== undefined
+        ? await this._resolveMessageAdmissionDuplicate({
+            admissionId: opts.admissionId,
+            admissionHash: admissionHash!,
+          })
+        : undefined;
+    if (duplicate) {
+      return this._returnDuplicateMessageResult(duplicate, opts);
+    }
+    const admissionIdentity =
+      opts.admissionId !== undefined ? this._messageAdmissionIdentity(opts.admissionId) : undefined;
 
     // Per-turn additionalTools merge with the mode's surface, never replace.
     const toolsets = this._buildToolsets(mode, opts.additionalTools);
+
+    const admissionStart = opts.admissionId !== undefined ? createDeferred<string>() : undefined;
+    if (admissionStart) void admissionStart.promise.catch(() => {});
+    if (admissionIdentity !== undefined && admissionHash !== undefined && admissionStart !== undefined) {
+      const existingStart = this._messageAdmissionStarts.get(opts.admissionId!);
+      if (existingStart) {
+        if (existingStart.admissionHash !== admissionHash) {
+          throw new HarnessAdmissionConflictError(
+            this.id,
+            opts.admissionId!,
+            existingStart.admissionHash,
+            admissionHash,
+          );
+        }
+        const runId = await existingStart.promise;
+        return this._returnDuplicateMessageResult(
+          {
+            status: 'pending',
+            harnessName: this._record.harnessName,
+            sessionId: this.id,
+            resourceId: this.resourceId,
+            threadId: this.threadId,
+            signalId: admissionIdentity.signalId,
+            runId,
+            admissionId: opts.admissionId!,
+            admissionHash,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+          opts,
+        );
+      }
+      this._messageAdmissionStarts.set(opts.admissionId!, { admissionHash, promise: admissionStart.promise });
+    }
 
     // Every turn runs under a session-owned AbortController so
     // `session.abort()` can cancel the in-flight run. If the caller passes
@@ -1837,19 +1936,84 @@ export class Session {
     // paths surface chunks through the same subscription stream.
     await this._ensureThreadSubscription(agent);
 
-    const signal = agent.sendSignal(
-      { type: 'user-message', contents: opts.content as never },
-      {
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
-      },
-    );
+    if (admissionIdentity !== undefined && admissionHash !== undefined && admissionStart !== undefined) {
+      try {
+        const reservation = await this._writeMessageResultEvidence({
+          status: 'pending',
+          signalId: admissionIdentity.signalId,
+          runId: admissionIdentity.runId,
+          admissionId: opts.admissionId!,
+          admissionHash,
+        });
+        if (!reservation.created) {
+          this._messageAdmissionStarts.delete(opts.admissionId!);
+          admissionStart.resolve(admissionIdentity.runId);
+          const existing = await this._resolveMessageAdmissionDuplicate({
+            admissionId: opts.admissionId!,
+            admissionHash,
+          });
+          if (existing) {
+            try {
+              return await this._returnDuplicateMessageResult(existing, opts);
+            } finally {
+              this._endTurn(turnAbortController);
+            }
+          }
+        }
+      } catch (err) {
+        this._messageAdmissionStarts.delete(opts.admissionId!);
+        admissionStart.reject(err);
+        throw err;
+      }
+    }
+
+    let signal;
+    try {
+      signal = agent.sendSignal(
+        {
+          ...(admissionIdentity ? { id: admissionIdentity.signalId } : {}),
+          type: 'user-message',
+          contents: opts.content as never,
+        },
+        {
+          ...(admissionIdentity ? { runId: admissionIdentity.runId } : {}),
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
+        },
+      );
+    } catch (err) {
+      admissionStart?.reject(err);
+      if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+      if (admissionIdentity !== undefined && admissionHash !== undefined) {
+        await this._writeMessageResultEvidence({
+          status: 'failed',
+          signalId: admissionIdentity.signalId,
+          runId: admissionIdentity.runId,
+          admissionId: opts.admissionId!,
+          admissionHash,
+          error: projectHarnessPublicError(err),
+        }).catch(() => {});
+      }
+      throw err;
+    }
 
     // Register the completion waiter BEFORE the drain has a chance to see
     // a terminal chunk for this runId (the run can start synchronously on
     // the wake path).
     const completion = this._awaitRunCompletion(signal.runId);
+    admissionStart?.resolve(signal.runId);
+
+    const pendingEvidenceWrite =
+      admissionIdentity !== undefined
+        ? this._writeMessageResultEvidence({
+            status: 'pending',
+            signalId: signal.signal.id,
+            runId: signal.runId,
+            ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
+            ...(admissionHash !== undefined ? { admissionHash } : {}),
+          })
+        : Promise.resolve();
 
     // Streaming path: hand the live `MastraModelOutput` back. The drain
     // loop is responsible for harness events; we still keep the turn
@@ -1861,11 +2025,35 @@ export class Session {
         // Drop the completion waiter so the drain doesn't try to resolve into
         // a dead listener.
         this._runCompletionPromises.delete(signal.runId);
-        throw new HarnessConfigError('message()', 'agent did not register a run for the dispatched signal');
+        void pendingEvidenceWrite.catch(() => {});
+        const err = new HarnessConfigError('message()', 'agent did not register a run for the dispatched signal');
+        if (admissionIdentity !== undefined) {
+          await this._writeMessageResultEvidence({
+            status: 'failed',
+            signalId: signal.signal.id,
+            runId: signal.runId,
+            error: projectHarnessPublicError(err),
+            ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
+            ...(admissionHash !== undefined ? { admissionHash } : {}),
+          }).catch(() => {});
+        }
+        throw err;
       }
+      await pendingEvidenceWrite;
       void completion
         .then(full => {
           this._recordTurnCompletion(full);
+          if (admissionIdentity === undefined) return full;
+          return this._writeMessageResultEvidence({
+            status: 'completed',
+            signalId: signal.signal.id,
+            runId: signal.runId,
+            result: full,
+            admissionId: opts.admissionId!,
+            admissionHash: admissionHash!,
+          }).then(() => full);
+        })
+        .then(full => {
           return this._maybeCaptureSuspend(full).then(() => {
             this._emitTurnEvent({
               type: 'agent_end',
@@ -1875,10 +2063,21 @@ export class Session {
             return this._runGoalJudge(full, false);
           });
         })
-        .catch(() => {
+        .catch(err => {
+          if (admissionIdentity !== undefined) {
+            void this._writeMessageResultEvidence({
+              status: 'failed',
+              signalId: signal.signal.id,
+              runId: signal.runId,
+              error: projectHarnessPublicError(err),
+              admissionId: opts.admissionId!,
+              admissionHash: admissionHash!,
+            }).catch(() => {});
+          }
           // The caller owns the visible stream; swallow drain-side errors.
         })
         .finally(() => {
+          if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
           this._endTurn(turnAbortController);
           void this._maybeDrainQueue();
         });
@@ -1888,8 +2087,19 @@ export class Session {
     // Default path: wait for the drain to deliver this run's terminal
     // chunk and bundled `FullOutput`, then run post-turn bookkeeping.
     try {
+      await pendingEvidenceWrite;
       const full = await completion;
       this._recordTurnCompletion(full);
+      if (admissionIdentity !== undefined) {
+        await this._writeMessageResultEvidence({
+          status: 'completed',
+          signalId: signal.signal.id,
+          runId: signal.runId,
+          result: full,
+          admissionId: opts.admissionId!,
+          admissionHash: admissionHash!,
+        });
+      }
       await this._maybeCaptureSuspend(full);
       this._emitTurnEvent({
         type: 'agent_end',
@@ -1898,12 +2108,164 @@ export class Session {
       });
       await this._runGoalJudge(full, false);
       return full;
+    } catch (err) {
+      if (admissionIdentity !== undefined) {
+        await this._writeMessageResultEvidence({
+          status: 'failed',
+          signalId: signal.signal.id,
+          runId: signal.runId,
+          error: projectHarnessPublicError(err),
+          admissionId: opts.admissionId!,
+          admissionHash: admissionHash!,
+        }).catch(() => {});
+      }
+      throw err;
     } finally {
+      if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
       this._endTurn(turnAbortController);
       // Now that the manual turn has cleared the in-flight guard, kick
       // the queue drain so any item that was admitted mid-turn can run.
       void this._maybeDrainQueue();
     }
+  }
+
+  private async _resolveMessageAdmissionDuplicate({
+    admissionId,
+    admissionHash,
+  }: {
+    admissionId: string;
+    admissionHash: string;
+  }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | undefined> {
+    const resolved = await this._storage.resolveOperationAdmissionEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      kind: 'message',
+      admissionId,
+      attemptedAdmissionHash: admissionHash,
+    });
+    if (resolved.status === 'none') return undefined;
+    if (resolved.status === 'conflict') {
+      throw new HarnessAdmissionConflictError(this.id, admissionId, resolved.storedAdmissionHash ?? '', admissionHash);
+    }
+    return resolved.evidence as AgentSignalResultEvidence | OperationAdmissionTombstone | undefined;
+  }
+
+  private async _returnDuplicateMessageResult(
+    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone,
+    opts: MessageOptions,
+  ): Promise<AgentResult | AgentStream | unknown> {
+    if ('status' in evidence) {
+      if (opts.stream === true) {
+        if (evidence.status === 'pending') {
+          const agent = this._harness.getAgentForMode(opts.mode ?? this._record.modeId);
+          await this._ensureThreadSubscription(agent);
+          const runId = await this._pendingMessageRunId(evidence);
+          if (runId && !this._hasLiveMessageRun(agent, runId)) {
+            throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
+          }
+          const output = runId
+            ? ((agent.getRunOutput(runId) as AgentStream | undefined) ??
+              (await Promise.race([
+                agent.waitForRunOutput(runId) as Promise<AgentStream>,
+                this._awaitRunCompletion(runId).then(
+                  () => undefined,
+                  () => undefined,
+                ),
+              ])))
+            : undefined;
+          if (output) return output;
+        }
+        throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
+      }
+      if (evidence.status === 'completed') return evidence.result as AgentResult;
+      if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
+      const runId = await this._pendingMessageRunId(evidence);
+      if (runId) {
+        const agent = this._harness.getAgentForMode(opts.mode ?? this._record.modeId);
+        await this._ensureThreadSubscription(agent);
+        if (!this._hasLiveMessageRun(agent, runId)) {
+          throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
+        }
+        return this._awaitRunCompletion(runId);
+      }
+    }
+    throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
+  }
+
+  private async _pendingMessageRunId(evidence: AgentSignalResultEvidence): Promise<string | undefined> {
+    if (evidence.status !== 'pending') return evidence.runId;
+    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
+    if (!starting) return evidence.runId;
+    try {
+      return await starting.promise;
+    } catch {
+      return evidence.runId;
+    }
+  }
+
+  private _hasLiveMessageRun(agent: Agent, runId: string): boolean {
+    return Boolean(
+      agent.getRunOutput(runId) || this._runCompletionPromises.has(runId) || this._completedRuns.has(runId),
+    );
+  }
+
+  private _messageAdmissionIdentity(admissionId: string): MessageAdmissionIdentity {
+    const digest = sha256CanonicalJson({
+      kind: 'message-admission',
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      admissionId,
+    });
+    return {
+      signalId: `harness-message-${digest.slice(0, 32)}`,
+      runId: `harness-message-${digest.slice(32, 64)}`,
+    };
+  }
+
+  private async _writeMessageResultEvidence(
+    status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
+  ): Promise<{ created: boolean }> {
+    const now = Date.now();
+    try {
+      return await this._storage.writeMessageResultEvidence({
+        ...status,
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (err) {
+      if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
+        await this._resolveMessageAdmissionDuplicate({
+          admissionId: status.admissionId,
+          admissionHash: status.admissionHash,
+        });
+        throw new HarnessAdmissionConflictError(this.id, status.admissionId, '', status.admissionHash);
+      }
+      throw err;
+    }
+  }
+
+  private _computeMessageAdmissionHash(opts: MessageOptions, stable: { modeId: string; modelId: string }): string {
+    return sha256CanonicalJson({
+      kind: 'message',
+      content: opts.content,
+      mode: stable.modeId,
+      model: stable.modelId,
+      attachments: (opts.attachments ?? []).map(attachment => ({
+        attachmentId: attachment.attachmentId,
+        resourceId: attachment.resourceId,
+        ...(attachment.ownerSessionId !== undefined ? { ownerSessionId: attachment.ownerSessionId } : {}),
+        ...(attachment.bytes !== undefined ? { bytes: attachment.bytes } : {}),
+        ...(attachment.sha256 !== undefined ? { sha256: attachment.sha256 } : {}),
+        ...(attachment.source !== undefined ? { source: attachment.source } : {}),
+      })),
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -3977,4 +4339,75 @@ export class Session {
   get _internalStorage(): HarnessStorage {
     return this._storage;
   }
+}
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+function sha256CanonicalJson(value: unknown): string {
+  return createHash('sha256')
+    .update(canonicalJson(assertJsonValue(value)), 'utf8')
+    .digest('hex');
+}
+
+function assertJsonValue(value: unknown, path = 'value'): JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Object.is(value, -0)) {
+      throw new HarnessValidationError(path, 'must be a finite JSON number');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const out: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
+      out.push(assertJsonValue(value[index], `${path}[${index}]`));
+    }
+    return out;
+  }
+  if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry !== undefined) out[key] = assertJsonValue(entry, `${path}.${key}`);
+    }
+    return out;
+  }
+  throw new HarnessValidationError(path, 'must be JSON-serializable for admission hashing');
+}
+
+function isPlainJsonObject(value: object): value is Record<string, unknown> {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
+    .join(',')}}`;
+}
+
+function projectHarnessPublicError(err: unknown): { code: string; message: string } {
+  if (err instanceof Error) {
+    return { code: (err as { code?: string }).code ?? err.name ?? 'harness.message_failed', message: err.message };
+  }
+  return { code: 'harness.message_failed', message: String(err) };
+}
+
+function publicErrorProjectionToError(error: { code: string; message: string }): Error {
+  const projected = new Error(error.message);
+  projected.name = error.code;
+  return projected;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
