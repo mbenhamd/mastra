@@ -174,6 +174,62 @@ describe('Agent requestContextSchema', () => {
     });
   });
 
+  describe('resume validation', () => {
+    it('should validate requestContext before resumeStream loads a snapshot', async () => {
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+      });
+
+      const requestContext = new RequestContext<{ userId: string }>();
+      requestContext.set('userId', 'user-123');
+      // Missing apiKey
+
+      await expect(agent.resumeStream({ approved: true }, { runId: 'missing-run-id', requestContext })).rejects.toThrow(
+        /Request context validation failed for agent/,
+      );
+    });
+
+    it('should validate requestContext before resumeGenerate loads a snapshot', async () => {
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+      });
+
+      const requestContext = new RequestContext();
+      requestContext.set('userId', 123 as any); // Wrong type
+      requestContext.set('apiKey', 'key-456');
+
+      await expect(
+        agent.resumeGenerate({ approved: true }, { runId: 'missing-run-id', requestContext }),
+      ).rejects.toThrow(/Request context validation failed for agent/);
+    });
+
+    it('should validate requestContext before resumeStreamUntilIdle resolves memory', async () => {
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+      });
+
+      const requestContext = new RequestContext<{ userId: string }>();
+      requestContext.set('userId', 'user-123');
+      // Missing apiKey
+
+      await expect(
+        agent.resumeStreamUntilIdle({ approved: true }, { runId: 'missing-run-id', requestContext }),
+      ).rejects.toThrow(/Request context validation failed for agent/);
+    });
+  });
+
   describe('backwards compatibility', () => {
     it('should work without requestContextSchema on agent', async () => {
       const agent = new Agent({
