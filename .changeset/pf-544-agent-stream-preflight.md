@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed: `Agent.stream()` now avoids unnecessary thread allocations when request validation denies a run.
+Fixed: `Agent.stream()` validation failures now abort without unnecessary resource work.
