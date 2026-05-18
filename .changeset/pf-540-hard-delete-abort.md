@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed: Active session operations are now aborted when the session is deleted.
+Fixed: Active session operations now reject with `HarnessSessionDeletedError` when the session is deleted.

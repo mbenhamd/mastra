@@ -5052,8 +5052,10 @@ export class Session {
       ? await this._resolveQueueAdmissionDuplicate({ admissionId, admissionHash })
       : undefined;
     if (duplicate) {
-      this._assertLive('queue()');
-      return this._returnDuplicateQueueResult(duplicate);
+      this._assertOpenForTurn('queue()');
+      return this._withActiveDeletedWaiter(activeDeleted =>
+        this._raceActiveTurnWaiter(this._returnDuplicateQueueResult(duplicate, activeDeleted), activeDeleted),
+      );
     }
 
     const cap = this._harness._internalMaxQueueDepth;
@@ -5133,7 +5135,12 @@ export class Session {
       throw err;
     }
 
-    if (admittedReceipt) return this._returnDuplicateQueueResult(admittedReceipt);
+    if (admittedReceipt) {
+      this._assertOpenForTurn('queue()');
+      return this._withActiveDeletedWaiter(activeDeleted =>
+        this._raceActiveTurnWaiter(this._returnDuplicateQueueResult(admittedReceipt!, activeDeleted), activeDeleted),
+      );
+    }
 
     const queued = createDeferred<AgentResult>();
     const promise = queued.promise;
@@ -5170,6 +5177,7 @@ export class Session {
 
   private async _returnDuplicateQueueResult(
     evidence: QueueAdmissionReceipt | OperationAdmissionTombstone,
+    activeDeleted?: Promise<never>,
   ): Promise<AgentResult> {
     if ('kind' in evidence) {
       throw new HarnessValidationError('queue().admissionId', 'duplicate queue result evidence has expired');
@@ -5188,20 +5196,28 @@ export class Session {
       );
     }
     const resolver = this._queueResolvers.get(evidence.queuedItemId);
-    if (resolver) return resolver.promise;
+    if (resolver) return this._raceActiveTurnWaiter(resolver.promise, activeDeleted);
     void this._maybeDrainQueue();
-    return this._awaitDurableQueueResult(evidence);
+    return this._awaitDurableQueueResult(evidence, activeDeleted);
   }
 
-  private async _awaitDurableQueueResult(receipt: QueueAdmissionReceipt): Promise<AgentResult> {
+  private async _awaitDurableQueueResult(
+    receipt: QueueAdmissionReceipt,
+    activeDeleted?: Promise<never>,
+  ): Promise<AgentResult> {
     const deadline = Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
     while (true) {
-      const latest = await this._storage.loadQueueResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        queuedItemId: receipt.queuedItemId,
-      });
+      this._assertNotDeleted();
+      const latest = await this._raceActiveTurnWaiter(
+        this._storage.loadQueueResultEvidence({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          queuedItemId: receipt.queuedItemId,
+        }),
+        activeDeleted,
+      );
+      this._assertNotDeleted();
       if (!latest) {
         throw new HarnessValidationError('queue().admissionId', 'duplicate queue result evidence has expired');
       }
@@ -5223,7 +5239,7 @@ export class Session {
       if (waitMs === 0) {
         throw new HarnessValidationError('queue().admissionId', 'duplicate queue result evidence has expired');
       }
-      await delay(waitMs);
+      await this._raceActiveTurnWaiter(delay(waitMs), activeDeleted);
     }
   }
 
@@ -6177,6 +6193,12 @@ export class Session {
     }
     if (this._state !== 'live') {
       throw new HarnessSessionClosedError(this.id);
+    }
+  }
+
+  private _assertNotDeleted(): void {
+    if (this._state === 'deleted') {
+      throw new HarnessSessionDeletedError(this.id);
     }
   }
 
