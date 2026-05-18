@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed agent resume APIs so `resumeStream()`, `resumeStreamUntilIdle()`, and `resumeGenerate()` enforce request-context validation and `AGENTS_EXECUTE` FGA checks before loading persisted snapshots or resuming a run. Resume calls now fail closed when FGA is configured but no authenticated user is present.
+Fixed authorization checks in agent resume methods. When fine-grained access control is enabled, `resumeStream()`, `resumeStreamUntilIdle()`, and `resumeGenerate()` now require an authenticated user in the request context and will throw an error if called without one.

@@ -114,6 +114,25 @@ describe('Agent requestContextSchema', () => {
 
       await expect(agent.generate('Hello', { requestContext })).rejects.toThrow(/my-special-agent/);
     });
+
+    it('should validate the effective requestContext from default options', async () => {
+      const requestContext = new RequestContext<{ userId: string; apiKey: string }>();
+      requestContext.set('userId', 'default-user');
+      requestContext.set('apiKey', 'default-key');
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+        defaultOptions: { requestContext },
+      });
+
+      const result = await agent.generate('Hello');
+
+      expect(result.text).toContain('Hello');
+    });
   });
 
   describe('stream validation', () => {
@@ -171,6 +190,26 @@ describe('Agent requestContextSchema', () => {
       await expect(agent.stream('Hello', { requestContext })).rejects.toThrow(
         /Request context validation failed for agent/,
       );
+    });
+
+    it('should validate the effective requestContext from default options', async () => {
+      const requestContext = new RequestContext<{ userId: string; apiKey: string }>();
+      requestContext.set('userId', 'default-user');
+      requestContext.set('apiKey', 'default-key');
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+        defaultOptions: { requestContext },
+      });
+
+      const result = await agent.stream('Hello');
+
+      expect(result).toBeDefined();
+      await result.getFullOutput();
     });
   });
 

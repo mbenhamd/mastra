@@ -107,6 +107,33 @@ describe('Agent FGA checks', () => {
 
       expect(model.doGenerateCalls).toHaveLength(1);
     });
+
+    it('should authorize the effective request context from default options', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: { requestContext: requestContext as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      try {
+        await agent.generate('test');
+      } catch {
+        // Expected to fail due to no real model.
+      }
+
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
+      );
+    });
   });
 
   describe('stream()', () => {
@@ -143,6 +170,33 @@ describe('Agent FGA checks', () => {
       requestContext.set('user', { id: 'user-1' });
 
       await expect(agent.stream('test', { requestContext: requestContext as any })).rejects.toThrow(FGADeniedError);
+    });
+
+    it('should authorize the effective request context from default options', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: { requestContext: requestContext as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      try {
+        await agent.stream('test');
+      } catch {
+        // Expected to fail due to no real model.
+      }
+
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
+      );
     });
   });
 
@@ -229,7 +283,9 @@ describe('Agent FGA checks', () => {
       ).rejects.toThrow(FGADeniedError);
       expect(getStorage).not.toHaveBeenCalled();
     });
+  });
 
+  describe('resumeStreamUntilIdle()', () => {
     it('should reject denied users before resumeStreamUntilIdle resolves memory', async () => {
       const fgaProvider = createMockFGAProvider(false);
       const getMemory = vi.fn();

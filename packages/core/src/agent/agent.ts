@@ -6250,15 +6250,23 @@ export class Agent<
       structuredOutput?: PublicStructuredOutputOptions<any>;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<FullOutput<OUTPUT>> {
-    await this.#assertAgentExecutionPreflight(options?.requestContext);
+    const requestContextToUse = options?.requestContext;
+    if (requestContextToUse) {
+      await this.#assertAgentExecutionPreflight(requestContextToUse);
+    }
 
     const defaultOptions = await this.getDefaultOptions({
-      requestContext: options?.requestContext,
+      requestContext: requestContextToUse,
     });
     const mergedOptions = deepMerge(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as AgentExecutionOptions<any> & { model?: DynamicArgument<MastraModelConfig> };
+    if (requestContextToUse) {
+      mergedOptions.requestContext = requestContextToUse;
+    } else {
+      await this.#assertAgentExecutionPreflight(mergedOptions.requestContext);
+    }
 
     const llm = await this.getLLM({
       requestContext: mergedOptions.requestContext,
@@ -6547,15 +6555,24 @@ export class Agent<
     let preparedOptionsWithPubSub: (AgentExecutionOptionsBase<any> & { runId?: string; _pubsub: PubSub }) | undefined;
 
     try {
-      await this.#assertAgentExecutionPreflight(streamOptionsWithRunId.requestContext);
+      const requestContextToUse = streamOptionsWithRunId.requestContext;
+      if (requestContextToUse) {
+        await this.#assertAgentExecutionPreflight(requestContextToUse);
+      }
 
       const defaultOptions = await this.getDefaultOptions({
-        requestContext: streamOptionsWithRunId.requestContext,
+        requestContext: requestContextToUse,
       });
       const mergedOptions = deepMerge(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithRunId as Record<string, unknown>,
       ) as AgentExecutionOptions<OUTPUT> & { model?: DynamicArgument<MastraModelConfig> };
+      if (requestContextToUse) {
+        mergedOptions.requestContext = requestContextToUse;
+      } else {
+        await this.#assertAgentExecutionPreflight(mergedOptions.requestContext);
+      }
+
       const mergedThreadTarget = this.#getThreadTarget(mergedOptions);
       if (!mergedOptions.runId) {
         mergedOptions.runId = this.#generateStreamRunId(mergedThreadTarget);
@@ -6999,9 +7016,10 @@ export class Agent<
         }
       : undefined;
     const runId = streamOptionsWithPubSub?.runId ?? '';
+    const requestContextToUse = streamOptionsWithPubSub?.requestContext;
     if (!streamOptionsWithPubSub?.[SKIP_AGENT_EXECUTION_PREFLIGHT]) {
       // Keep resume preflight before snapshot loading/reservation so denied callers cannot touch persisted runs.
-      await this.#assertAgentExecutionPreflight(streamOptionsWithPubSub?.requestContext, { requireFgaUser: true });
+      await this.#assertAgentExecutionPreflight(requestContextToUse, { requireFgaUser: true });
     }
     const existingSnapshot = await this.#loadAgenticLoopSnapshotOrThrow({ runId, method: 'resumeStream' });
     const streamOptionsWithSnapshotTarget = this.#withSnapshotThreadTarget(
@@ -7034,13 +7052,17 @@ export class Agent<
 
     try {
       const defaultOptions = await this.getDefaultOptions({
-        requestContext: streamOptionsWithPubSub?.requestContext,
+        requestContext: requestContextToUse,
       });
 
       let mergedStreamOptions = deepMerge(
         defaultOptions as Record<string, unknown>,
         (streamOptionsWithSnapshotTarget ?? {}) as Record<string, unknown>,
       ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+      if (requestContextToUse) {
+        mergedStreamOptions.requestContext = requestContextToUse;
+      }
+
       if (ownsReservation && reservedThreadTarget) {
         const mergedThreadTarget = this.#getThreadTarget(mergedStreamOptions);
         if (!this.#sameThreadTarget(reservedThreadTarget, mergedThreadTarget)) {
@@ -7320,20 +7342,24 @@ export class Agent<
       toolCallId?: string;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<FullOutput<OUTPUT>> {
+    const requestContextToUse = options?.requestContext;
     // Keep resume preflight before snapshot loading/model resolution so denied callers cannot touch persisted runs.
-    await this.#assertAgentExecutionPreflight(options?.requestContext, { requireFgaUser: true });
+    await this.#assertAgentExecutionPreflight(requestContextToUse, { requireFgaUser: true });
 
     const runId = options?.runId ?? '';
     const existingSnapshot = await this.#loadAgenticLoopSnapshotOrThrow({ runId, method: 'resumeGenerate' });
 
     const defaultOptions = await this.getDefaultOptions({
-      requestContext: options?.requestContext,
+      requestContext: requestContextToUse,
     });
 
     const mergedOptions = deepMerge(
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    if (requestContextToUse) {
+      mergedOptions.requestContext = requestContextToUse;
+    }
 
     const llm = await this.getLLM({
       requestContext: mergedOptions.requestContext,
