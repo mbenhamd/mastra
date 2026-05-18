@@ -1924,20 +1924,29 @@ export class HarnessLibSQL extends HarnessStorage {
     const next = { ...record, harnessName: namespace };
     assertLegalChannelInboxUpdate(current, next);
     const cols = channelInboxColumnValues(next);
-    const updateNames = cols.names.filter(name => name !== 'id');
+    const currentCols = channelInboxColumnValues(current);
+    const preservesCurrentClaim = next.claimId === opts.claimId && next.claimExpiresAt !== undefined;
+    const updateNames = cols.names.filter(
+      name => name !== 'id' && (!preservesCurrentClaim || (name !== 'claim_id' && name !== 'claim_expires_at')),
+    );
+    const stateCompareNames = cols.names.filter(
+      name => name !== 'id' && name !== 'claim_id' && name !== 'claim_expires_at' && name !== 'updated_at',
+    );
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
             WHERE harness_name = ? AND id = ? AND claim_id = ?
               AND claim_expires_at IS NOT NULL
               AND claim_expires_at > ?
-              AND status NOT IN ('accepted', 'queued', 'dead')`,
+              AND status NOT IN ('accepted', 'queued', 'dead')
+              AND ${stateCompareNames.map(name => `${name} IS ?`).join(' AND ')}`,
       args: [
         ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
         namespace,
         next.id,
         opts.claimId,
         storageNow,
+        ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
       ],
     });
     if (result.rowsAffected === 0) {

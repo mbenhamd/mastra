@@ -1114,6 +1114,120 @@ describe('HarnessLibSQL channel inbox ledger', () => {
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
   });
 
+  it('rejects stale same-claim updates when another writer changes the row after the validation read', async () => {
+    const client = createHarnessTestClient();
+    storage = new HarnessLibSQL({ client });
+    await storage.init();
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
+    });
+    const originalExecute = client.execute.bind(client);
+    let injectConcurrentUpdate = false;
+    try {
+      vi.spyOn(client, 'execute').mockImplementation(async statement => {
+        const result = await originalExecute(statement);
+        const sql = typeof statement === 'string' ? statement : statement.sql;
+        if (
+          injectConcurrentUpdate &&
+          sql.includes(`SELECT * FROM ${TABLE_HARNESS_CHANNEL_INBOX}`) &&
+          sql.includes('WHERE harness_name = ? AND id = ?')
+        ) {
+          injectConcurrentUpdate = false;
+          await originalExecute({
+            sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+                  SET attempts = ?
+                  WHERE id = ?`,
+            args: [1, 'inbox-1'],
+          });
+        }
+        return result;
+      });
+      injectConcurrentUpdate = true;
+
+      await expect(
+        storage.updateChannelInboxItem(
+          sampleChannelInbox({
+            attempts: 2,
+            claimId: 'claim-1',
+            claimExpiresAt: now + 5000,
+            updatedAt: now + 100,
+          }),
+          { claimId: 'claim-1' },
+        ),
+      ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('allows same-claim updates after a concurrent lease renewal and preserves the renewed expiry', async () => {
+    const client = createHarnessTestClient();
+    storage = new HarnessLibSQL({ client });
+    await storage.init();
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
+    });
+    await storage.renewChannelInboxClaim({
+      inboxItemId: 'inbox-1',
+      claimId: 'claim-1',
+      now: now + 50,
+      claimTtlMs: 8950,
+    });
+    const originalExecute = client.execute.bind(client);
+    let injectRenewal = false;
+    try {
+      vi.spyOn(client, 'execute').mockImplementation(async statement => {
+        const result = await originalExecute(statement);
+        const sql = typeof statement === 'string' ? statement : statement.sql;
+        if (
+          injectRenewal &&
+          sql.includes(`SELECT * FROM ${TABLE_HARNESS_CHANNEL_INBOX}`) &&
+          sql.includes('WHERE harness_name = ? AND id = ?')
+        ) {
+          injectRenewal = false;
+          await originalExecute({
+            sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+                  SET claim_expires_at = ?, updated_at = ?
+                  WHERE id = ? AND claim_id = ?`,
+            args: [now + 10_000, now + 75, 'inbox-1', 'claim-1'],
+          });
+        }
+        return result;
+      });
+      injectRenewal = true;
+
+      await storage.updateChannelInboxItem(
+        sampleChannelInbox({
+          status: 'admitted',
+          delivery: 'message',
+          admittedAt: now + 100,
+          updatedAt: now + 100,
+          claimId: 'claim-1',
+          claimExpiresAt: now + 5000,
+        }),
+        { claimId: 'claim-1' },
+      );
+
+      await expect(
+        storage.loadChannelInboxItemByIdempotencyKey({
+          harnessName: 'default',
+          channelId: 'support',
+          idempotencyKey: 'provider-event-1',
+        }),
+      ).resolves.toMatchObject({
+        status: 'admitted',
+        claimId: 'claim-1',
+        claimExpiresAt: now + 10_000,
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('records retryable failed evidence, releases the claim, and reclaims after backoff', async () => {
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
