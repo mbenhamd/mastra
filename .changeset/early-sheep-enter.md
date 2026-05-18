@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed message admission idempotency so omitted mode and model inputs stay stable across default changes while explicit overrides remain distinct.
+Fixed Session.message() duplicate detection so default changes do not affect messages that omitted mode or model, while explicit overrides still apply.
