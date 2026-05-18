@@ -2213,11 +2213,13 @@ export class Session {
         if (!reservation.created) {
           this._messageAdmissionStarts.delete(opts.admissionId!);
           admissionStart.resolve(admissionIdentity.runId);
-          const existing = await this._resolveMessageAdmissionDuplicate({
-            admissionId: opts.admissionId!,
-            admissionHash,
-            compatibleAdmissionHashes,
-          });
+          const existing =
+            reservation.evidence ??
+            (await this._resolveMessageAdmissionDuplicate({
+              admissionId: opts.admissionId!,
+              admissionHash,
+              compatibleAdmissionHashes,
+            }));
           if (existing) {
             try {
               return await this._returnDuplicateMessageResult(existing, opts);
@@ -2225,6 +2227,7 @@ export class Session {
               finishOwnedMessageTurn();
             }
           }
+          throw new HarnessAdmissionConflictError(this.id, opts.admissionId!, '', admissionHash);
         }
       } catch (err) {
         failOwnedMessageTurnBeforeDispatch(err);
@@ -2703,7 +2706,7 @@ export class Session {
   private async _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
-  ): Promise<{ created: boolean }> {
+  ): Promise<{ created: boolean; evidence?: AgentSignalResultEvidence | OperationAdmissionTombstone }> {
     const now = Date.now();
     this._operationEvidenceSignalIds.add(status.signalId);
     try {
@@ -2725,7 +2728,7 @@ export class Session {
           admissionHash: status.admissionHash,
           compatibleAdmissionHashes: options?.compatibleAdmissionHashes,
         });
-        if (duplicate) return { created: false };
+        if (duplicate) return { created: false, evidence: duplicate };
         throw new HarnessAdmissionConflictError(this.id, status.admissionId, '', status.admissionHash);
       }
       throw err;
