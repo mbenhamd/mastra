@@ -96,12 +96,12 @@ export class HarnessChannelRegistry {
   }
 
   bind(mastra: Mastra, harnessName: string): void {
-    assertNonEmptyString(harnessName, 'harnessName');
-    assertDurableComponent(harnessName, 'harnessName');
     if (this.pending.size === 0) {
       this.bindings = new Map();
       return;
     }
+    assertNonEmptyString(harnessName, 'harnessName');
+    assertDurableComponent(harnessName, 'harnessName');
 
     const providers = mastra.getChannelProviders() ?? {};
     const next = new Map<string, HarnessChannelBinding>();

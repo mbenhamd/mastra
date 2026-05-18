@@ -165,6 +165,22 @@ describe('Harness v1 — construction', () => {
     expect(harness.getChannelBinding('missing')).toBeUndefined();
   });
 
+  it('does not validate harness names for durable channel ids when no channels are configured', () => {
+    expect(
+      () =>
+        new Mastra({
+          agents: { default: makeAgent() },
+          storage: new InMemoryStore(),
+          harnesses: {
+            'legacy.name:ok-without-channels': new Harness({
+              modes: [{ id: 'default', agentId: 'default' }],
+              defaultModeId: 'default',
+            }),
+          },
+        }),
+    ).not.toThrow();
+  });
+
   it('rejects harness channel bindings that reference a missing provider', () => {
     const harness = new Harness({
       modes: [{ id: 'default', agentId: 'default' }],
