@@ -8,6 +8,7 @@ import type { Client } from '@libsql/client';
 import {
   TABLE_HARNESS_ATTACHMENT_REFERENCES,
   TABLE_HARNESS_ATTACHMENTS,
+  TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
@@ -960,6 +961,24 @@ describe('HarnessLibSQL channel inbox ledger', () => {
     });
   });
 
+  it('creates claim and idempotency indexes on the lazy ensure path', async () => {
+    const client = createHarnessTestClient();
+    const lazyStorage = new HarnessLibSQL({ client });
+    const executeSpy = vi.spyOn(client, 'execute');
+
+    await lazyStorage.createOrLoadChannelInboxItem(sampleChannelInbox());
+    await lazyStorage.loadChannelInboxItemByIdempotencyKey({
+      harnessName: 'default',
+      channelId: 'support',
+      idempotencyKey: 'provider-event-1',
+    });
+
+    await expect(indexNames(client, TABLE_HARNESS_CHANNEL_INBOX)).resolves.toEqual(
+      expect.arrayContaining(['idx_harness_channel_inbox_idempotency', 'idx_harness_channel_inbox_claim']),
+    );
+    expect(indexCreateStatements(executeSpy.mock.calls)).toHaveLength(2);
+  });
+
   it('flags same idempotency key with a different payload hash as a conflict', async () => {
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox());
 
@@ -1224,6 +1243,17 @@ async function primaryKeyColumns(client: Client, tableName: string): Promise<str
     .filter(row => row.order > 0)
     .sort((a, b) => a.order - b.order)
     .map(row => row.name);
+}
+
+async function indexNames(client: Client, tableName: string): Promise<string[]> {
+  const result = await client.execute({ sql: `PRAGMA index_list("${tableName}")`, args: [] });
+  return result.rows.map(row => String(row.name));
+}
+
+function indexCreateStatements(calls: Parameters<Client['execute']>[]): string[] {
+  return calls
+    .map(([statement]) => (typeof statement === 'string' ? statement : statement.sql))
+    .filter(sql => sql.includes('idx_harness_channel_inbox_'));
 }
 
 async function createLegacySessionsTable(client: Client): Promise<void> {

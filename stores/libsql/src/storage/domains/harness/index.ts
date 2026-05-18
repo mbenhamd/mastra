@@ -81,6 +81,7 @@ export class HarnessLibSQL extends HarnessStorage {
   #client: Client;
   #harnessName: string;
   #compactionLocks = new Map<string, Promise<void>>();
+  #channelInboxIndexesReady: Promise<void> | undefined;
   #localThreadDeleteFences = new Map<string, { ownerId: string; leaseId: string; ttlMs: number }>();
 
   constructor(config: LibSQLDomainConfig) {
@@ -193,7 +194,6 @@ export class HarnessLibSQL extends HarnessStorage {
             WHERE "closed_at" IS NULL`,
       args: [],
     });
-    await this.#ensureChannelInboxIndexes();
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -2026,9 +2026,21 @@ export class HarnessLibSQL extends HarnessStorage {
       schema: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_INBOX],
       compositePrimaryKey: inboxConfig?.compositePrimaryKey,
     });
+    await this.#ensureChannelInboxIndexes();
   }
 
   async #ensureChannelInboxIndexes(): Promise<void> {
+    if (this.#channelInboxIndexesReady !== undefined) {
+      return this.#channelInboxIndexesReady;
+    }
+    this.#channelInboxIndexesReady = this.#createChannelInboxIndexes().catch(error => {
+      this.#channelInboxIndexesReady = undefined;
+      throw error;
+    });
+    return this.#channelInboxIndexesReady;
+  }
+
+  async #createChannelInboxIndexes(): Promise<void> {
     await this.#client.execute({
       sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_channel_inbox_idempotency
             ON "${TABLE_HARNESS_CHANNEL_INBOX}" ("harness_name", "channel_id", "idempotency_key")`,
