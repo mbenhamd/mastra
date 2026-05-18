@@ -948,7 +948,7 @@ export class InMemoryHarness extends HarnessStorage {
         'idempotency key is already owned by another inbox item',
       );
     }
-    const existing = this.db.harnessChannelInbox.get(channelInboxKey(namespaced.harnessName, namespaced.id));
+    const existing = this.findChannelInboxById(namespaced.id);
     if (existing) assertLegalChannelInboxUpdate(existing, namespaced);
     this.db.harnessChannelInbox.set(channelInboxKey(namespaced.harnessName, namespaced.id), cloneJson(namespaced));
   }
@@ -979,6 +979,15 @@ export class InMemoryHarness extends HarnessStorage {
         claimed = true;
       }
       return { item: cloneJson(item), duplicate: true, conflict, claimed };
+    }
+    const existingById = this.findChannelInboxById(incoming.id);
+    if (existingById) {
+      throw new HarnessStorageChannelInboxTransitionError(
+        incoming.id,
+        existingById.status,
+        incoming.status,
+        'id is already owned by another inbox item',
+      );
     }
 
     const item =
@@ -1056,7 +1065,13 @@ export class InMemoryHarness extends HarnessStorage {
     claimTtlMs: number;
   }): Promise<{ claimExpiresAt: number; storageNow: number }> {
     const current = this.findChannelInboxById(inboxItemId);
-    if (!current || current.claimId !== claimId || isTerminalChannelInboxStatus(current.status)) {
+    if (
+      !current ||
+      current.claimId !== claimId ||
+      current.claimExpiresAt === undefined ||
+      current.claimExpiresAt <= now ||
+      isTerminalChannelInboxStatus(current.status)
+    ) {
       throw new HarnessStorageChannelInboxClaimConflictError(inboxItemId, claimId);
     }
     const claimExpiresAt = now + claimTtlMs;
@@ -1068,7 +1083,14 @@ export class InMemoryHarness extends HarnessStorage {
   async updateChannelInboxItem(record: ChannelInboxItem, opts: { claimId: string }): Promise<void> {
     const namespace = resolveHarnessName(record.harnessName, this.harnessName);
     const current = this.db.harnessChannelInbox.get(channelInboxKey(namespace, record.id));
-    if (!current || current.claimId !== opts.claimId || isTerminalChannelInboxStatus(current.status)) {
+    const storageNow = Date.now();
+    if (
+      !current ||
+      current.claimId !== opts.claimId ||
+      current.claimExpiresAt === undefined ||
+      current.claimExpiresAt <= storageNow ||
+      isTerminalChannelInboxStatus(current.status)
+    ) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
     }
     const next = { ...record, harnessName: namespace };
@@ -1179,8 +1201,8 @@ function messageEvidenceKey(harnessName: string, sessionId: string, signalId: st
   return `${harnessName}\u0000${sessionId}\u0000${signalId}`;
 }
 
-function channelInboxKey(harnessName: string, inboxItemId: string): string {
-  return `${harnessName}\u0000${inboxItemId}`;
+function channelInboxKey(_harnessName: string, inboxItemId: string): string {
+  return inboxItemId;
 }
 
 function resolveHarnessName(input: string | undefined, fallback: string): string {

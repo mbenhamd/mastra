@@ -973,6 +973,34 @@ describe('HarnessLibSQL channel inbox ledger', () => {
     });
   });
 
+  it('rejects duplicate global ids and save-time idempotency collisions', async () => {
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox());
+
+    await expect(
+      storage.saveChannelInboxItem(sampleChannelInbox({ id: 'inbox-2', admissionId: 'inbox-2' })),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+    await expect(
+      storage.saveChannelInboxItem(
+        sampleChannelInbox({
+          harnessName: 'other',
+          channelId: 'other-support',
+          idempotencyKey: 'other-provider-event',
+          admissionId: 'other-inbox-1',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+    await expect(
+      storage.createOrLoadChannelInboxItem(
+        sampleChannelInbox({
+          harnessName: 'other',
+          channelId: 'other-support',
+          idempotencyKey: 'other-provider-event-2',
+          admissionId: 'other-inbox-2',
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+
   it('reclaims crashed received work after claim expiry but respects nextAttemptAt backoff', async () => {
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox({ nextAttemptAt: 7000 }), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
@@ -1002,47 +1030,86 @@ describe('HarnessLibSQL channel inbox ledger', () => {
   });
 
   it('guards claim renewal and terminal dead updates by owner claim', async () => {
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+        initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
+      });
+
+      await expect(
+        storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'other', now: now + 100, claimTtlMs: 5000 }),
+      ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
+      await expect(
+        storage.renewChannelInboxClaim({
+          inboxItemId: 'inbox-1',
+          claimId: 'claim-1',
+          now: now + 100,
+          claimTtlMs: 5000,
+        }),
+      ).resolves.toEqual({ claimExpiresAt: now + 5100, storageNow: now + 100 });
+
+      await storage.updateChannelInboxItem(
+        sampleChannelInbox({
+          status: 'dead',
+          deadAt: now + 200,
+          updatedAt: now + 200,
+          claimId: undefined,
+          claimExpiresAt: undefined,
+          lastError: { code: 'live_session_limit', message: 'capacity exhausted', retryable: false },
+        }),
+        { claimId: 'claim-1' },
+      );
+      await expect(
+        storage.renewChannelInboxClaim({
+          inboxItemId: 'inbox-1',
+          claimId: 'claim-1',
+          now: now + 300,
+          claimTtlMs: 5000,
+        }),
+      ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('rejects renewals and updates from expired claims', async () => {
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
-      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
     });
 
     await expect(
-      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'other', now: 2000, claimTtlMs: 5000 }),
+      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'claim-1', now: 2001, claimTtlMs: 1000 }),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
     await expect(
-      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'claim-1', now: 2000, claimTtlMs: 5000 }),
-    ).resolves.toEqual({ claimExpiresAt: 7000, storageNow: 2000 });
-
-    await storage.updateChannelInboxItem(
-      sampleChannelInbox({
-        status: 'dead',
-        deadAt: 3000,
-        updatedAt: 3000,
-        claimId: undefined,
-        claimExpiresAt: undefined,
-        lastError: { code: 'live_session_limit', message: 'capacity exhausted', retryable: false },
-      }),
-      { claimId: 'claim-1' },
-    );
-    await expect(
-      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'claim-1', now: 4000, claimTtlMs: 5000 }),
+      storage.updateChannelInboxItem(
+        sampleChannelInbox({
+          status: 'failed',
+          attempts: 1,
+          failedAt: 2001,
+          updatedAt: 2001,
+          lastError: { code: 'session_locked', message: 'locked', retryable: true },
+        }),
+        { claimId: 'claim-1' },
+      ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
   });
 
   it('records retryable failed evidence, releases the claim, and reclaims after backoff', async () => {
+    const now = Date.now();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
-      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+      initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
     });
 
     await storage.updateChannelInboxItem(
       sampleChannelInbox({
         status: 'failed',
         attempts: 1,
-        failedAt: 2000,
-        updatedAt: 2000,
+        failedAt: now + 100,
+        updatedAt: now + 100,
         claimId: undefined,
         claimExpiresAt: undefined,
-        nextAttemptAt: 3000,
+        nextAttemptAt: now + 200,
         lastError: { code: 'session_locked', message: 'locked', retryable: true },
       }),
       { claimId: 'claim-1' },
@@ -1054,7 +1121,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
         statuses: ['failed'],
         claimId: 'too-soon',
         limit: 10,
-        now: 2500,
+        now: now + 150,
         claimTtlMs: 1000,
       }),
     ).resolves.toEqual([]);
@@ -1064,7 +1131,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
         statuses: ['failed'],
         claimId: 'retry',
         limit: 10,
-        now: 3000,
+        now: now + 200,
         claimTtlMs: 1000,
       }),
     ).resolves.toEqual([
@@ -1079,16 +1146,17 @@ describe('HarnessLibSQL channel inbox ledger', () => {
   });
 
   it('rejects illegal accepted transitions without message evidence', async () => {
+    const now = Date.now();
     await storage.createOrLoadChannelInboxItem(
-      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: 1500 }),
+      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: now + 50 }),
       {
-        initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+        initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
       },
     );
 
     await expect(
       storage.updateChannelInboxItem(
-        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: 2000, admittedAt: 1500 }),
+        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: now + 100, admittedAt: now + 50 }),
         { claimId: 'claim-1' },
       ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);

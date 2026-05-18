@@ -1639,20 +1639,87 @@ export class HarnessLibSQL extends HarnessStorage {
   async saveChannelInboxItem(record: ChannelInboxItem): Promise<void> {
     await this.#ensureChannelInboxTable();
     const namespaced = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
-    const existing = await this.#loadChannelInboxItemById(namespaced.id, namespaced.harnessName);
+    const existingByKey = await this.loadChannelInboxItemByIdempotencyKey({
+      harnessName: namespaced.harnessName,
+      channelId: namespaced.channelId,
+      idempotencyKey: namespaced.idempotencyKey,
+    });
+    if (existingByKey && existingByKey.id !== namespaced.id) {
+      throw new HarnessStorageChannelInboxTransitionError(
+        namespaced.id,
+        undefined,
+        namespaced.status,
+        'idempotency key is already owned by another inbox item',
+      );
+    }
+    const existing = await this.#loadChannelInboxItemById(namespaced.id);
     if (existing) assertLegalChannelInboxUpdate(existing, namespaced);
     const cols = channelInboxColumnValues(namespaced);
-    await this.#client.execute({
-      sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
-            (${cols.names.join(', ')})
-            VALUES (${cols.names.map(() => '?').join(', ')})
-            ON CONFLICT(id) DO UPDATE SET
-              ${cols.names
-                .filter(name => name !== 'id')
-                .map(name => `${name} = excluded.${name}`)
-                .join(', ')}`,
-      args: cols.values,
-    });
+    try {
+      const result = await this.#client.execute({
+        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
+              (${cols.names.join(', ')})
+              VALUES (${cols.names.map(() => '?').join(', ')})
+              ON CONFLICT(id) DO UPDATE SET
+                ${cols.names
+                  .filter(name => name !== 'id')
+                  .map(name => `${name} = excluded.${name}`)
+                  .join(', ')}
+              WHERE ${TABLE_HARNESS_CHANNEL_INBOX}.harness_name = excluded.harness_name
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.channel_id = excluded.channel_id
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.provider_id = excluded.provider_id
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.idempotency_key = excluded.idempotency_key
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.payload_hash = excluded.payload_hash
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.admission_id = excluded.admission_id
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.external_message_id = excluded.external_message_id
+                AND ${TABLE_HARNESS_CHANNEL_INBOX}.received_at = excluded.received_at
+                AND (
+                  (
+                    ${TABLE_HARNESS_CHANNEL_INBOX}.status = excluded.status
+                    AND ${TABLE_HARNESS_CHANNEL_INBOX}.status NOT IN ('accepted', 'queued', 'dead')
+                  )
+                  OR (
+                    ${TABLE_HARNESS_CHANNEL_INBOX}.status = 'received'
+                    AND excluded.status IN ('admitted', 'failed', 'dead')
+                  )
+                  OR (
+                    ${TABLE_HARNESS_CHANNEL_INBOX}.status = 'admitted'
+                    AND excluded.status IN ('accepted', 'queued', 'failed', 'dead')
+                  )
+                  OR (
+                    ${TABLE_HARNESS_CHANNEL_INBOX}.status = 'failed'
+                    AND excluded.status IN ('received', 'admitted', 'failed', 'dead')
+                  )
+                )`,
+        args: cols.values,
+      });
+      if (result.rowsAffected === 0) {
+        const conflict = await this.#loadChannelInboxItemById(namespaced.id);
+        if (conflict) assertLegalChannelInboxUpdate(conflict, namespaced);
+        throw new HarnessStorageChannelInboxTransitionError(
+          namespaced.id,
+          conflict?.status,
+          namespaced.status,
+          'id is already owned by another inbox item',
+        );
+      }
+    } catch (err) {
+      if (!isUniqueConstraintError(err)) throw err;
+      const conflictingByKey = await this.loadChannelInboxItemByIdempotencyKey({
+        harnessName: namespaced.harnessName,
+        channelId: namespaced.channelId,
+        idempotencyKey: namespaced.idempotencyKey,
+      });
+      if (conflictingByKey && conflictingByKey.id !== namespaced.id) {
+        throw new HarnessStorageChannelInboxTransitionError(
+          namespaced.id,
+          undefined,
+          namespaced.status,
+          'idempotency key is already owned by another inbox item',
+        );
+      }
+      throw err;
+    }
   }
 
   async createOrLoadChannelInboxItem(
@@ -1695,7 +1762,17 @@ export class HarnessLibSQL extends HarnessStorage {
       channelId: incoming.channelId,
       idempotencyKey: incoming.idempotencyKey,
     });
-    if (!existing) existing = await this.#loadChannelInboxItemById(incoming.id, namespace);
+    if (!existing) {
+      const existingById = await this.#loadChannelInboxItemById(incoming.id);
+      if (existingById) {
+        throw new HarnessStorageChannelInboxTransitionError(
+          incoming.id,
+          existingById.status,
+          incoming.status,
+          'id is already owned by another inbox item',
+        );
+      }
+    }
     if (!existing) throw new HarnessStorageChannelInboxClaimConflictError(incoming.id);
     const conflict = existing.payloadHash !== incoming.payloadHash;
     let claimed = false;
@@ -1818,8 +1895,11 @@ export class HarnessLibSQL extends HarnessStorage {
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET claim_expires_at = ?, updated_at = ?
-            WHERE id = ? AND claim_id = ? AND status NOT IN ('accepted', 'queued', 'dead')`,
-      args: [claimExpiresAt, now, inboxItemId, claimId],
+            WHERE id = ? AND claim_id = ?
+              AND claim_expires_at IS NOT NULL
+              AND claim_expires_at > ?
+              AND status NOT IN ('accepted', 'queued', 'dead')`,
+      args: [claimExpiresAt, now, inboxItemId, claimId, now],
     });
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(inboxItemId, claimId);
@@ -1831,7 +1911,14 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelInboxTable();
     const namespace = this.#resolveHarnessName(record.harnessName);
     const current = await this.#loadChannelInboxItemById(record.id, namespace);
-    if (!current || current.claimId !== opts.claimId || isTerminalChannelInboxStatus(current.status)) {
+    const storageNow = Date.now();
+    if (
+      !current ||
+      current.claimId !== opts.claimId ||
+      current.claimExpiresAt === undefined ||
+      current.claimExpiresAt <= storageNow ||
+      isTerminalChannelInboxStatus(current.status)
+    ) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
     }
     const next = { ...record, harnessName: namespace };
@@ -1841,8 +1928,17 @@ export class HarnessLibSQL extends HarnessStorage {
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
-            WHERE harness_name = ? AND id = ? AND claim_id = ? AND status NOT IN ('accepted', 'queued', 'dead')`,
-      args: [...updateNames.map(name => cols.values[cols.names.indexOf(name)]), namespace, next.id, opts.claimId],
+            WHERE harness_name = ? AND id = ? AND claim_id = ?
+              AND claim_expires_at IS NOT NULL
+              AND claim_expires_at > ?
+              AND status NOT IN ('accepted', 'queued', 'dead')`,
+      args: [
+        ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
+        namespace,
+        next.id,
+        opts.claimId,
+        storageNow,
+      ],
     });
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
