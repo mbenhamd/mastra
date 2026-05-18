@@ -11,11 +11,17 @@ import {
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
+  HarnessStorageChannelInboxClaimConflictError,
+  HarnessStorageChannelInboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
 } from '@mastra/core/storage';
-import type { SessionRecord, HarnessStorageParentSessionUnavailableError } from '@mastra/core/storage';
+import type {
+  ChannelInboxItem,
+  SessionRecord,
+  HarnessStorageParentSessionUnavailableError,
+} from '@mastra/core/storage';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { HarnessLibSQL } from './index';
@@ -928,6 +934,167 @@ describe('HarnessLibSQL inbox response receipts', () => {
   });
 });
 
+describe('HarnessLibSQL channel inbox ledger', () => {
+  let storage: HarnessLibSQL;
+
+  beforeEach(async () => {
+    const client = createHarnessTestClient();
+    storage = new HarnessLibSQL({ client });
+    await storage.init();
+  });
+
+  it('dedupes exact provider callbacks and does not steal an active initial claim', async () => {
+    const first = await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+    });
+    const duplicate = await storage.createOrLoadChannelInboxItem(sampleChannelInbox({ id: 'inbox-retry' }), {
+      initialClaim: { claimId: 'claim-2', now: 2000, claimTtlMs: 5000 },
+    });
+
+    expect(first).toMatchObject({ duplicate: false, conflict: false, claimed: true });
+    expect(duplicate).toMatchObject({
+      duplicate: true,
+      conflict: false,
+      claimed: false,
+      item: { id: 'inbox-1', claimId: 'claim-1', claimExpiresAt: 6000 },
+    });
+  });
+
+  it('flags same idempotency key with a different payload hash as a conflict', async () => {
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox());
+
+    await expect(
+      storage.createOrLoadChannelInboxItem(sampleChannelInbox({ id: 'inbox-2', payloadHash: 'payload-hash-2' })),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: true,
+      claimed: false,
+      item: { id: 'inbox-1', payloadHash: 'payload-hash-1' },
+    });
+  });
+
+  it('reclaims crashed received work after claim expiry but respects nextAttemptAt backoff', async () => {
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox({ nextAttemptAt: 7000 }), {
+      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
+    });
+
+    await expect(
+      storage.claimChannelInboxItems({
+        harnessName: 'default',
+        statuses: ['received'],
+        claimId: 'early',
+        limit: 10,
+        now: 6500,
+        claimTtlMs: 1000,
+      }),
+    ).resolves.toEqual([]);
+
+    await expect(
+      storage.claimChannelInboxItems({
+        harnessName: 'default',
+        statuses: ['received'],
+        claimId: 'recovery',
+        limit: 10,
+        now: 7000,
+        claimTtlMs: 1000,
+      }),
+    ).resolves.toEqual([expect.objectContaining({ id: 'inbox-1', claimId: 'recovery', claimExpiresAt: 8000 })]);
+  });
+
+  it('guards claim renewal and terminal dead updates by owner claim', async () => {
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+    });
+
+    await expect(
+      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'other', now: 2000, claimTtlMs: 5000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
+    await expect(
+      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'claim-1', now: 2000, claimTtlMs: 5000 }),
+    ).resolves.toEqual({ claimExpiresAt: 7000, storageNow: 2000 });
+
+    await storage.updateChannelInboxItem(
+      sampleChannelInbox({
+        status: 'dead',
+        deadAt: 3000,
+        updatedAt: 3000,
+        claimId: undefined,
+        claimExpiresAt: undefined,
+        lastError: { code: 'live_session_limit', message: 'capacity exhausted', retryable: false },
+      }),
+      { claimId: 'claim-1' },
+    );
+    await expect(
+      storage.renewChannelInboxClaim({ inboxItemId: 'inbox-1', claimId: 'claim-1', now: 4000, claimTtlMs: 5000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxClaimConflictError);
+  });
+
+  it('records retryable failed evidence, releases the claim, and reclaims after backoff', async () => {
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+    });
+
+    await storage.updateChannelInboxItem(
+      sampleChannelInbox({
+        status: 'failed',
+        attempts: 1,
+        failedAt: 2000,
+        updatedAt: 2000,
+        claimId: undefined,
+        claimExpiresAt: undefined,
+        nextAttemptAt: 3000,
+        lastError: { code: 'session_locked', message: 'locked', retryable: true },
+      }),
+      { claimId: 'claim-1' },
+    );
+
+    await expect(
+      storage.claimChannelInboxItems({
+        harnessName: 'default',
+        statuses: ['failed'],
+        claimId: 'too-soon',
+        limit: 10,
+        now: 2500,
+        claimTtlMs: 1000,
+      }),
+    ).resolves.toEqual([]);
+    await expect(
+      storage.claimChannelInboxItems({
+        harnessName: 'default',
+        statuses: ['failed'],
+        claimId: 'retry',
+        limit: 10,
+        now: 3000,
+        claimTtlMs: 1000,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: 'inbox-1',
+        status: 'failed',
+        attempts: 1,
+        claimId: 'retry',
+        lastError: { code: 'session_locked', message: 'locked', retryable: true },
+      }),
+    ]);
+  });
+
+  it('rejects illegal accepted transitions without message evidence', async () => {
+    await storage.createOrLoadChannelInboxItem(
+      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: 1500 }),
+      {
+        initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
+      },
+    );
+
+    await expect(
+      storage.updateChannelInboxItem(
+        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: 2000, admittedAt: 1500 }),
+        { claimId: 'claim-1' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+});
+
 function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     harnessName: 'default',
@@ -947,6 +1114,37 @@ function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     createdAt: 1000,
     lastActivityAt: 1000,
     version: 0,
+    ...overrides,
+  };
+}
+
+function sampleChannelInbox(overrides: Partial<ChannelInboxItem> = {}): ChannelInboxItem {
+  return {
+    id: 'inbox-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    idempotencyKey: 'provider-event-1',
+    payloadHash: 'payload-hash-1',
+    admissionId: 'inbox-1',
+    externalMessageId: 'message-1',
+    receivedAt: 1000,
+    updatedAt: 1000,
+    status: 'received',
+    attempts: 0,
+    requestContext: {
+      channel: {
+        origin: 'inbound',
+        harnessName: 'default',
+        channelId: 'support',
+        providerId: 'slack',
+        platform: 'slack',
+        externalThreadId: 'thread-ext-1',
+        externalMessageId: 'message-1',
+      },
+    },
+    content: 'hello',
+    attachments: [],
     ...overrides,
   };
 }

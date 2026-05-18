@@ -6,6 +6,8 @@ import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageAttachmentInUseError,
   HarnessStorageAttachmentUnavailableError,
+  HarnessStorageChannelInboxClaimConflictError,
+  HarnessStorageChannelInboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
@@ -21,7 +23,9 @@ import type {
   AttachmentReference,
   AttachmentRecord,
   AttachmentSemanticMetadata,
+  ChannelInboxItem,
   CreateOrLoadActiveSessionOptions,
+  CreateOrLoadChannelInboxItemResult,
   CreateOrLoadActiveSessionResult,
   DeleteSessionOptions,
   ListActiveSessionsByThreadInput,
@@ -696,10 +700,7 @@ export class InMemoryHarness extends HarnessStorage {
       ...namespacedRecord,
       createdAt: existing?.createdAt ?? namespacedRecord.createdAt,
     };
-    this.db.harnessMessageResultEvidence.set(
-      key,
-      cloneJson(stored),
-    );
+    this.db.harnessMessageResultEvidence.set(key, cloneJson(stored));
     return existing === undefined ? { created: true } : { created: false, evidence: cloneJson(stored) };
   }
 
@@ -928,6 +929,177 @@ export class InMemoryHarness extends HarnessStorage {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Channel inbox ledger
+  // -------------------------------------------------------------------------
+
+  async saveChannelInboxItem(record: ChannelInboxItem): Promise<void> {
+    const namespaced = { ...record, harnessName: resolveHarnessName(record.harnessName, this.harnessName) };
+    const existingByKey = this.findChannelInboxByIdempotencyKey({
+      harnessName: namespaced.harnessName,
+      channelId: namespaced.channelId,
+      idempotencyKey: namespaced.idempotencyKey,
+    });
+    if (existingByKey && existingByKey.id !== namespaced.id) {
+      throw new HarnessStorageChannelInboxTransitionError(
+        namespaced.id,
+        undefined,
+        namespaced.status,
+        'idempotency key is already owned by another inbox item',
+      );
+    }
+    const existing = this.db.harnessChannelInbox.get(channelInboxKey(namespaced.harnessName, namespaced.id));
+    if (existing) assertLegalChannelInboxUpdate(existing, namespaced);
+    this.db.harnessChannelInbox.set(channelInboxKey(namespaced.harnessName, namespaced.id), cloneJson(namespaced));
+  }
+
+  async createOrLoadChannelInboxItem(
+    record: ChannelInboxItem,
+    opts?: { initialClaim?: { claimId: string; now: number; claimTtlMs: number } },
+  ): Promise<CreateOrLoadChannelInboxItemResult> {
+    const namespace = resolveHarnessName(record.harnessName, this.harnessName);
+    const incoming: ChannelInboxItem = { ...record, harnessName: namespace };
+    const existing = this.findChannelInboxByIdempotencyKey({
+      harnessName: namespace,
+      channelId: incoming.channelId,
+      idempotencyKey: incoming.idempotencyKey,
+    });
+    if (existing) {
+      const conflict = existing.payloadHash !== incoming.payloadHash;
+      let claimed = false;
+      let item = existing;
+      if (!conflict && opts?.initialClaim && isChannelInboxClaimable(existing, opts.initialClaim.now)) {
+        item = {
+          ...existing,
+          claimId: opts.initialClaim.claimId,
+          claimExpiresAt: opts.initialClaim.now + opts.initialClaim.claimTtlMs,
+          updatedAt: opts.initialClaim.now,
+        };
+        this.db.harnessChannelInbox.set(channelInboxKey(namespace, item.id), cloneJson(item));
+        claimed = true;
+      }
+      return { item: cloneJson(item), duplicate: true, conflict, claimed };
+    }
+
+    const item =
+      opts?.initialClaim === undefined
+        ? incoming
+        : {
+            ...incoming,
+            claimId: opts.initialClaim.claimId,
+            claimExpiresAt: opts.initialClaim.now + opts.initialClaim.claimTtlMs,
+            updatedAt: opts.initialClaim.now,
+          };
+    this.db.harnessChannelInbox.set(channelInboxKey(namespace, item.id), cloneJson(item));
+    return { item: cloneJson(item), duplicate: false, conflict: false, claimed: opts?.initialClaim !== undefined };
+  }
+
+  async loadChannelInboxItemByIdempotencyKey(opts: {
+    harnessName: string;
+    channelId: string;
+    idempotencyKey: string;
+  }): Promise<ChannelInboxItem | null> {
+    const item = this.findChannelInboxByIdempotencyKey({
+      ...opts,
+      harnessName: resolveHarnessName(opts.harnessName, this.harnessName),
+    });
+    return item ? cloneJson(item) : null;
+  }
+
+  async claimChannelInboxItems({
+    harnessName,
+    channelId,
+    statuses,
+    claimId,
+    limit,
+    now,
+    claimTtlMs,
+  }: {
+    harnessName: string;
+    channelId?: string;
+    statuses: Array<'received' | 'admitted' | 'failed'>;
+    claimId: string;
+    limit: number;
+    now: number;
+    claimTtlMs: number;
+  }): Promise<ChannelInboxItem[]> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const claimed: ChannelInboxItem[] = [];
+    const sorted = Array.from(this.db.harnessChannelInbox.values()).sort((a, b) => a.receivedAt - b.receivedAt);
+    for (const item of sorted) {
+      if (claimed.length >= limit) break;
+      if (item.harnessName !== namespace) continue;
+      if (channelId !== undefined && item.channelId !== channelId) continue;
+      if (!statuses.includes(item.status as 'received' | 'admitted' | 'failed')) continue;
+      if (!isChannelInboxClaimable(item, now)) continue;
+      const next = {
+        ...item,
+        claimId,
+        claimExpiresAt: now + claimTtlMs,
+        updatedAt: now,
+      };
+      this.db.harnessChannelInbox.set(channelInboxKey(namespace, next.id), cloneJson(next));
+      claimed.push(cloneJson(next));
+    }
+    return claimed;
+  }
+
+  async renewChannelInboxClaim({
+    inboxItemId,
+    claimId,
+    now,
+    claimTtlMs,
+  }: {
+    inboxItemId: string;
+    claimId: string;
+    now: number;
+    claimTtlMs: number;
+  }): Promise<{ claimExpiresAt: number; storageNow: number }> {
+    const current = this.findChannelInboxById(inboxItemId);
+    if (!current || current.claimId !== claimId || isTerminalChannelInboxStatus(current.status)) {
+      throw new HarnessStorageChannelInboxClaimConflictError(inboxItemId, claimId);
+    }
+    const claimExpiresAt = now + claimTtlMs;
+    const next = { ...current, claimExpiresAt, updatedAt: now };
+    this.db.harnessChannelInbox.set(channelInboxKey(next.harnessName, next.id), cloneJson(next));
+    return { claimExpiresAt, storageNow: now };
+  }
+
+  async updateChannelInboxItem(record: ChannelInboxItem, opts: { claimId: string }): Promise<void> {
+    const namespace = resolveHarnessName(record.harnessName, this.harnessName);
+    const current = this.db.harnessChannelInbox.get(channelInboxKey(namespace, record.id));
+    if (!current || current.claimId !== opts.claimId || isTerminalChannelInboxStatus(current.status)) {
+      throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
+    }
+    const next = { ...record, harnessName: namespace };
+    assertLegalChannelInboxUpdate(current, next);
+    this.db.harnessChannelInbox.set(channelInboxKey(namespace, record.id), cloneJson(next));
+  }
+
+  private findChannelInboxByIdempotencyKey({
+    harnessName,
+    channelId,
+    idempotencyKey,
+  }: {
+    harnessName: string;
+    channelId: string;
+    idempotencyKey: string;
+  }): ChannelInboxItem | null {
+    for (const item of this.db.harnessChannelInbox.values()) {
+      if (item.harnessName === harnessName && item.channelId === channelId && item.idempotencyKey === idempotencyKey) {
+        return cloneJson(item);
+      }
+    }
+    return null;
+  }
+
+  private findChannelInboxById(inboxItemId: string): ChannelInboxItem | null {
+    for (const item of this.db.harnessChannelInbox.values()) {
+      if (item.id === inboxItemId) return cloneJson(item);
+    }
+    return null;
+  }
+
   private findTombstone(
     predicate: (tombstone: OperationAdmissionTombstone) => boolean,
   ): OperationAdmissionTombstone | null {
@@ -967,6 +1139,7 @@ export class InMemoryHarness extends HarnessStorage {
     this.db.harnessAttachmentReferences.clear();
     this.db.harnessMessageResultEvidence.clear();
     this.db.harnessOperationTombstones.clear();
+    this.db.harnessChannelInbox.clear();
     this.db.harnessThreadDeleteFences.clear();
   }
 }
@@ -1004,6 +1177,10 @@ function tombstoneKey(record: OperationAdmissionTombstone): string {
 
 function messageEvidenceKey(harnessName: string, sessionId: string, signalId: string): string {
   return `${harnessName}\u0000${sessionId}\u0000${signalId}`;
+}
+
+function channelInboxKey(harnessName: string, inboxItemId: string): string {
+  return `${harnessName}\u0000${inboxItemId}`;
 }
 
 function resolveHarnessName(input: string | undefined, fallback: string): string {
@@ -1051,6 +1228,89 @@ function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
 
 function isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {
   return receipt.status === 'completed' || receipt.status === 'failed' || receipt.status === 'dead';
+}
+
+function isTerminalChannelInboxStatus(status: ChannelInboxItem['status']): boolean {
+  return status === 'accepted' || status === 'queued' || status === 'dead';
+}
+
+function isChannelInboxClaimable(item: ChannelInboxItem, now: number): boolean {
+  if (isTerminalChannelInboxStatus(item.status)) return false;
+  if (item.nextAttemptAt !== undefined && item.nextAttemptAt > now) return false;
+  return item.claimId === undefined || item.claimExpiresAt === undefined || item.claimExpiresAt <= now;
+}
+
+function assertLegalChannelInboxUpdate(current: ChannelInboxItem, next: ChannelInboxItem): void {
+  const immutableMismatch =
+    current.id !== next.id ||
+    current.harnessName !== next.harnessName ||
+    current.channelId !== next.channelId ||
+    current.providerId !== next.providerId ||
+    current.idempotencyKey !== next.idempotencyKey ||
+    current.payloadHash !== next.payloadHash ||
+    current.admissionId !== next.admissionId ||
+    current.externalMessageId !== next.externalMessageId ||
+    current.receivedAt !== next.receivedAt;
+  if (immutableMismatch) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'immutable provider identity fields cannot change',
+    );
+  }
+
+  const allowed =
+    current.status === next.status ||
+    (current.status === 'received' &&
+      (next.status === 'admitted' || next.status === 'failed' || next.status === 'dead')) ||
+    (current.status === 'admitted' &&
+      (next.status === 'accepted' || next.status === 'queued' || next.status === 'failed' || next.status === 'dead')) ||
+    (current.status === 'failed' &&
+      (next.status === 'received' || next.status === 'admitted' || next.status === 'failed' || next.status === 'dead'));
+  if (!allowed || isTerminalChannelInboxStatus(current.status)) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'transition is not legal for channel inbox state machine',
+    );
+  }
+  if (next.status === 'admitted' && (next.delivery === undefined || next.admittedAt === undefined)) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'admitted rows require delivery and admittedAt',
+    );
+  }
+  if (
+    next.status === 'accepted' &&
+    (next.delivery !== 'message' || !next.runId || !next.signalId || !next.acceptedAt)
+  ) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'accepted rows require message delivery, runId, signalId, and acceptedAt',
+    );
+  }
+  if (next.status === 'queued' && (next.delivery !== 'queue' || !next.queuedItemId || !next.queuedAt)) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'queued rows require queue delivery, queuedItemId, and queuedAt',
+    );
+  }
+  if ((next.status === 'failed' || next.status === 'dead') && next.lastError === undefined) {
+    throw new HarnessStorageChannelInboxTransitionError(
+      current.id,
+      current.status,
+      next.status,
+      'failed and dead rows require lastError',
+    );
+  }
 }
 
 function sha256Hex(bytes: Uint8Array): string {
