@@ -1639,6 +1639,7 @@ export class HarnessLibSQL extends HarnessStorage {
   async saveChannelInboxItem(record: ChannelInboxItem): Promise<void> {
     await this.#ensureChannelInboxTable();
     const namespaced = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
+    assertValidChannelInboxState(namespaced);
     const existingByKey = await this.loadChannelInboxItemByIdempotencyKey({
       harnessName: namespaced.harnessName,
       channelId: namespaced.channelId,
@@ -1653,7 +1654,10 @@ export class HarnessLibSQL extends HarnessStorage {
       );
     }
     const existing = await this.#loadChannelInboxItemById(namespaced.id);
-    if (existing) assertLegalChannelInboxUpdate(existing, namespaced);
+    if (existing) {
+      if (channelInboxItemsEqual(existing, namespaced)) return;
+      assertLegalChannelInboxUpdate(existing, namespaced);
+    }
     const cols = channelInboxColumnValues(namespaced);
     try {
       const result = await this.#client.execute({
@@ -1695,6 +1699,7 @@ export class HarnessLibSQL extends HarnessStorage {
       });
       if (result.rowsAffected === 0) {
         const conflict = await this.#loadChannelInboxItemById(namespaced.id);
+        if (conflict && channelInboxItemsEqual(conflict, namespaced)) return;
         if (conflict) assertLegalChannelInboxUpdate(conflict, namespaced);
         throw new HarnessStorageChannelInboxTransitionError(
           namespaced.id,
@@ -1729,6 +1734,7 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelInboxTable();
     const namespace = this.#resolveHarnessName(record.harnessName);
     const incoming: ChannelInboxItem = { ...record, harnessName: namespace };
+    assertValidChannelInboxState(incoming);
     const initialClaim = opts?.initialClaim;
     const insertItem =
       initialClaim === undefined
@@ -2702,41 +2708,113 @@ function assertLegalChannelInboxUpdate(current: ChannelInboxItem, next: ChannelI
       'transition is not legal for channel inbox state machine',
     );
   }
-  if (next.status === 'admitted' && (next.delivery === undefined || next.admittedAt === undefined)) {
+  assertValidChannelInboxState(next, current.status);
+}
+
+function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: ChannelInboxItem['status']): void {
+  if (
+    record.status === 'admitted' &&
+    (record.delivery === undefined ||
+      (record.delivery !== 'message' && record.delivery !== 'queue') ||
+      record.admittedAt == null)
+  ) {
     throw new HarnessStorageChannelInboxTransitionError(
-      current.id,
-      current.status,
-      next.status,
+      record.id,
+      currentStatus,
+      record.status,
       'admitted rows require delivery and admittedAt',
     );
   }
   if (
-    next.status === 'accepted' &&
-    (next.delivery !== 'message' || !next.runId || !next.signalId || !next.acceptedAt)
+    record.status === 'accepted' &&
+    (record.delivery !== 'message' || !record.runId || !record.signalId || record.acceptedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
-      current.id,
-      current.status,
-      next.status,
+      record.id,
+      currentStatus,
+      record.status,
       'accepted rows require message delivery, runId, signalId, and acceptedAt',
     );
   }
-  if (next.status === 'queued' && (next.delivery !== 'queue' || !next.queuedItemId || !next.queuedAt)) {
+  if (record.status === 'queued' && (record.delivery !== 'queue' || !record.queuedItemId || record.queuedAt == null)) {
     throw new HarnessStorageChannelInboxTransitionError(
-      current.id,
-      current.status,
-      next.status,
+      record.id,
+      currentStatus,
+      record.status,
       'queued rows require queue delivery, queuedItemId, and queuedAt',
     );
   }
-  if ((next.status === 'failed' || next.status === 'dead') && next.lastError === undefined) {
+  if ((record.status === 'failed' || record.status === 'dead') && record.lastError == null) {
     throw new HarnessStorageChannelInboxTransitionError(
-      current.id,
-      current.status,
-      next.status,
+      record.id,
+      currentStatus,
+      record.status,
       'failed and dead rows require lastError',
     );
   }
+}
+
+function channelInboxItemsEqual(a: ChannelInboxItem, b: ChannelInboxItem): boolean {
+  const aValues = channelInboxComparableValues(a);
+  const bValues = channelInboxComparableValues(b);
+  return aValues.length === bValues.length && aValues.every((value, index) => Object.is(value, bValues[index]));
+}
+
+function channelInboxComparableValues(record: ChannelInboxItem): unknown[] {
+  return [
+    record.id,
+    record.harnessName,
+    record.channelId,
+    record.providerId,
+    record.idempotencyKey,
+    record.payloadHash,
+    record.admissionHash,
+    record.admissionId,
+    record.bindingId,
+    record.resourceId,
+    record.threadId,
+    record.sessionId,
+    record.runId,
+    record.signalId,
+    record.queuedItemId,
+    record.externalMessageId,
+    record.receivedAt,
+    record.admittedAt,
+    record.acceptedAt,
+    record.queuedAt,
+    record.failedAt,
+    record.deadAt,
+    record.updatedAt,
+    record.status,
+    record.delivery,
+    record.mode,
+    record.model,
+    record.attempts,
+    record.claimId,
+    record.claimExpiresAt,
+    record.nextAttemptAt,
+    stableJsonString(record.requestContext),
+    record.content,
+    stableJsonString(record.attachments),
+    record.lastError ? stableJsonString(record.lastError) : undefined,
+  ];
+}
+
+function stableJsonString(value: unknown): string {
+  return JSON.stringify(canonicalJsonValue(value));
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonicalJsonValue(entry)]),
+    );
+  }
+  return value;
 }
 
 function arraysEqual(a: string[], b: string[]): boolean {

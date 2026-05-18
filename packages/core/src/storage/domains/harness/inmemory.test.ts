@@ -847,6 +847,46 @@ describe('InMemoryHarness channel inbox ledger', () => {
     ]);
   });
 
+  it('validates new channel inbox rows before insert', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+
+    await expect(
+      storage.createOrLoadChannelInboxItem(sampleChannelInbox({ status: 'admitted' })),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+    await expect(storage.saveChannelInboxItem(sampleChannelInbox({ status: 'queued' }))).rejects.toBeInstanceOf(
+      HarnessStorageChannelInboxTransitionError,
+    );
+    await expect(
+      storage.saveChannelInboxItem(
+        sampleChannelInbox({
+          status: 'dead',
+          deadAt: 0,
+          lastError: null as any,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+
+  it('keeps identical terminal channel inbox saves idempotent', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const terminal = sampleChannelInbox({
+      status: 'accepted',
+      delivery: 'message',
+      runId: 'run-1',
+      signalId: 'signal-1',
+      acceptedAt: 0,
+      updatedAt: 1500,
+      requestContext: { metadata: { b: 2, a: 1 } },
+    });
+    const replay = { ...terminal, requestContext: { metadata: { a: 1, b: 2 } } };
+
+    await storage.saveChannelInboxItem(terminal);
+    await expect(storage.saveChannelInboxItem(replay)).resolves.toBeUndefined();
+    await expect(
+      storage.saveChannelInboxItem({ ...terminal, content: 'changed', updatedAt: 1600 }),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+
   it('rejects illegal accepted transitions without message evidence', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const now = Date.now();
