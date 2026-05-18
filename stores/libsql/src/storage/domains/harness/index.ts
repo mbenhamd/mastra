@@ -2608,7 +2608,8 @@ export class HarnessLibSQL extends HarnessStorage {
       if (await this.#hasEarlierUnsettledChannelOutboxItem(item)) continue;
       const update = await this.#client.execute({
         sql: `UPDATE ${TABLE_HARNESS_CHANNEL_OUTBOX}
-              SET status = 'claimed', attempts = attempts + 1, claim_id = ?, claim_expires_at = ?, updated_at = ?
+              SET status = 'claimed', attempts = attempts + 1, claim_id = ?, claim_expires_at = ?,
+                  next_attempt_at = NULL, failed_at = NULL, last_error = NULL, updated_at = ?
               WHERE harness_name = ? AND id = ?
                 AND status IN ('pending', 'failed', 'claimed')
                 AND (claim_id IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)

@@ -1246,15 +1246,25 @@ describe('InMemoryHarness channel outbox ledger', () => {
         claimTtlMs: 1000,
       }),
     ).resolves.toEqual([]);
-    await expect(
-      storage.claimChannelOutbox({
-        harnessName: 'default',
+    const retried = await storage.claimChannelOutbox({
+      harnessName: 'default',
+      claimId: 'retry',
+      limit: 10,
+      now: 7000,
+      claimTtlMs: 1000,
+    });
+    expect(retried).toEqual([
+      expect.objectContaining({
+        id: 'outbox-1',
+        status: 'claimed',
+        attempts: 2,
         claimId: 'retry',
-        limit: 10,
-        now: 7000,
-        claimTtlMs: 1000,
+        claimExpiresAt: 8000,
       }),
-    ).resolves.toEqual([expect.objectContaining({ id: 'outbox-1', claimId: 'retry', claimExpiresAt: 8000 })]);
+    ]);
+    expect(retried[0]?.nextAttemptAt).toBeUndefined();
+    expect(retried[0]?.failedAt).toBeUndefined();
+    expect(retried[0]?.lastError).toBeUndefined();
   });
 
   it('guards sent and failed transitions by the active outbox claim', async () => {
@@ -1335,7 +1345,9 @@ describe('InMemoryHarness channel outbox ledger', () => {
           id: 'outbox-1',
           status: 'claimed',
           attempts: 2,
-          lastError: { code: 'worker_unavailable', message: 'provider timeout', retryable: true },
+          nextAttemptAt: undefined,
+          failedAt: undefined,
+          lastError: undefined,
         }),
       ]);
 

@@ -1470,6 +1470,9 @@ export class InMemoryHarness extends HarnessStorage {
         attempts: item.attempts + 1,
         claimId,
         claimExpiresAt: now + claimTtlMs,
+        nextAttemptAt: undefined,
+        failedAt: undefined,
+        lastError: undefined,
         updatedAt: now,
       };
       this.db.harnessChannelOutbox.set(channelOutboxKey(namespace, next.id), cloneJson(next));

@@ -1700,6 +1700,49 @@ describe('HarnessLibSQL channel outbox ledger', () => {
     ]);
   });
 
+  it('clears stale failure metadata when reclaiming retryable outbox rows', async () => {
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.enqueueChannelOutbox(sampleChannelOutbox());
+      await storage.claimChannelOutbox({
+        harnessName: 'default',
+        claimId: 'first',
+        limit: 1,
+        now,
+        claimTtlMs: 1000,
+      });
+      await storage.markChannelOutboxFailed({
+        outboxItemId: 'outbox-1',
+        claimId: 'first',
+        retryAt: now + 2000,
+        error: { code: 'worker_unavailable', message: 'provider timeout' },
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+
+    const retried = await storage.claimChannelOutbox({
+      harnessName: 'default',
+      claimId: 'retry',
+      limit: 10,
+      now: now + 2000,
+      claimTtlMs: 1000,
+    });
+    expect(retried).toEqual([
+      expect.objectContaining({
+        id: 'outbox-1',
+        status: 'claimed',
+        attempts: 2,
+        claimId: 'retry',
+        claimExpiresAt: now + 3000,
+      }),
+    ]);
+    expect(retried[0]?.nextAttemptAt).toBeUndefined();
+    expect(retried[0]?.failedAt).toBeUndefined();
+    expect(retried[0]?.lastError).toBeUndefined();
+  });
+
   it('does not starve due rows for other bindings behind one blocked binding', async () => {
     await storage.enqueueChannelOutbox(sampleChannelOutbox({ id: 'outbox-1', idempotencyKey: 'key-1', createdAt: 1000 }));
     await storage.claimChannelOutbox({
