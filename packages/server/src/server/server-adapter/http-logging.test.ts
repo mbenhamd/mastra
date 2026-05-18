@@ -257,12 +257,18 @@ describe('HTTP Logging Configuration', () => {
           subscriptionToken: 'scoped',
           apiKey: 'secret',
           access_token: 'secret',
+          'apiKey[0]': 'secret',
+          'token.value': 'secret',
+          'access_token[1]': 'secret',
         }),
       ).toEqual({
         foo: 'bar',
         subscriptionToken: '[REDACTED]',
         apiKey: '[REDACTED]',
         access_token: '[REDACTED]',
+        'apiKey[0]': '[REDACTED]',
+        'token.value': '[REDACTED]',
+        'access_token[1]': '[REDACTED]',
       });
     });
   });

@@ -13,7 +13,7 @@ export const HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM = 'subscriptionToken';
 const HARNESS_ROUTE_PREFIX = '/harness/';
 const HARNESS_SESSION_EVENTS_ROUTE_PATTERN = /^\/harness\/:[^/]+\/sessions\/:sessionId\/events$/;
 
-const BEARER_EQUIVALENT_QUERY_PARAMS = [
+const BEARER_EQUIVALENT_QUERY_PARAM_NAMES = [
   'apiKey',
   'access_token',
   'accessToken',
@@ -63,7 +63,13 @@ export function isHarnessClientRoute(route: HarnessRouteAuthShape): boolean {
 }
 
 export function findBearerEquivalentHarnessQueryParam(getQuery: (name: string) => unknown): string | null {
-  for (const name of BEARER_EQUIVALENT_QUERY_PARAMS) {
+  const names = new Set<string>();
+  for (const name of BEARER_EQUIVALENT_QUERY_PARAM_NAMES) {
+    names.add(name);
+    names.add(name.toLowerCase());
+  }
+
+  for (const name of names) {
     if (getQueryValue(getQuery, name)) {
       return name;
     }

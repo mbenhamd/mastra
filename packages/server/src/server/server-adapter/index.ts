@@ -118,11 +118,17 @@ const SENSITIVE_QUERY_PARAMS = new Set([
   'token',
 ]);
 
+function normalizeSensitiveQueryParamKey(key: string): string {
+  return key.toLowerCase().split('[')[0]?.split('.')[0] ?? key.toLowerCase();
+}
+
 export function redactSensitiveQueryParams<T extends Record<string, unknown>>(queryParams: T): T {
   const redacted: Record<string, unknown> = { ...queryParams };
 
   for (const key of Object.keys(redacted)) {
-    if (SENSITIVE_QUERY_PARAMS.has(key.toLowerCase())) {
+    const normalizedKey = key.toLowerCase();
+    const baseKey = normalizeSensitiveQueryParamKey(key);
+    if (SENSITIVE_QUERY_PARAMS.has(normalizedKey) || SENSITIVE_QUERY_PARAMS.has(baseKey)) {
       redacted[key] = '[REDACTED]';
     }
   }

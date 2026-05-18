@@ -39,6 +39,8 @@ describe('auth helpers', () => {
     it('finds bearer-equivalent query credentials for Harness rejection', () => {
       expect(findBearerEquivalentHarnessQueryParam(getQuery({ apiKey: 'secret' }))).toBe('apiKey');
       expect(findBearerEquivalentHarnessQueryParam(getQuery({ access_token: 'secret' }))).toBe('access_token');
+      expect(findBearerEquivalentHarnessQueryParam(getQuery({ apikey: 'secret' }))).toBe('apikey');
+      expect(findBearerEquivalentHarnessQueryParam(getQuery({ authtoken: 'secret' }))).toBe('authtoken');
       expect(findBearerEquivalentHarnessQueryParam(getQuery({ token: [' ', 'secret'] }))).toBe('token');
       expect(findBearerEquivalentHarnessQueryParam(getQuery({ apiKey: { nested: 'secret' } }))).toBeNull();
       expect(findBearerEquivalentHarnessQueryParam(getQuery({ subscriptionToken: 'scoped' }))).toBeNull();
