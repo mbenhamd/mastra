@@ -3,4 +3,4 @@
 '@mastra/libsql': patch
 ---
 
-Fixed message admission retries so exact duplicate write races reuse the stored evidence without dispatching a second signal.
+Fixed duplicate message admission retries to reuse existing evidence, preventing duplicate processing during race conditions.
