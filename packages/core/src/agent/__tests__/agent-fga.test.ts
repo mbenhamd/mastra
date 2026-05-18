@@ -283,6 +283,31 @@ describe('Agent FGA checks', () => {
       ).rejects.toThrow(FGADeniedError);
       expect(getStorage).not.toHaveBeenCalled();
     });
+
+    it('should authorize default requestContext before loading a persisted snapshot', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: { requestContext: requestContext as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.resumeStream({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
+      );
+    });
   });
 
   describe('resumeStreamUntilIdle()', () => {
@@ -356,6 +381,32 @@ describe('Agent FGA checks', () => {
         { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
       );
     });
+
+    it('should authorize default requestContext before resolving idle memory', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: { requestContext: requestContext as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.resumeStreamUntilIdle({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
+      );
+    });
   });
 
   describe('resumeGenerate()', () => {
@@ -417,6 +468,31 @@ describe('Agent FGA checks', () => {
       );
       expect(getStorage).not.toHaveBeenCalled();
       expect(fgaProvider.require).not.toHaveBeenCalled();
+    });
+
+    it('should authorize default requestContext before loading a persisted snapshot', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: { requestContext: requestContext as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.resumeGenerate({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
+      );
     });
   });
 });

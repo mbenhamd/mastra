@@ -232,6 +232,25 @@ describe('Agent requestContextSchema', () => {
       );
     });
 
+    it('should validate default requestContext before resumeStream loads a snapshot', async () => {
+      const requestContext = new RequestContext<{ userId: string; apiKey: string }>();
+      requestContext.set('userId', 'default-user');
+      requestContext.set('apiKey', 'default-key');
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+        defaultOptions: { requestContext },
+      });
+
+      await expect(agent.resumeStream({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+    });
+
     it('should validate requestContext before resumeGenerate loads a snapshot', async () => {
       const agent = new Agent({
         id: 'test-agent',
@@ -250,6 +269,25 @@ describe('Agent requestContextSchema', () => {
       ).rejects.toThrow(/Request context validation failed for agent/);
     });
 
+    it('should validate default requestContext before resumeGenerate loads a snapshot', async () => {
+      const requestContext = new RequestContext<{ userId: string; apiKey: string }>();
+      requestContext.set('userId', 'default-user');
+      requestContext.set('apiKey', 'default-key');
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+        defaultOptions: { requestContext },
+      });
+
+      await expect(agent.resumeGenerate({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+    });
+
     it('should validate requestContext before resumeStreamUntilIdle resolves memory', async () => {
       const agent = new Agent({
         id: 'test-agent',
@@ -266,6 +304,25 @@ describe('Agent requestContextSchema', () => {
       await expect(
         agent.resumeStreamUntilIdle({ approved: true }, { runId: 'missing-run-id', requestContext }),
       ).rejects.toThrow(/Request context validation failed for agent/);
+    });
+
+    it('should validate default requestContext before resumeStreamUntilIdle resolves memory', async () => {
+      const requestContext = new RequestContext<{ userId: string; apiKey: string }>();
+      requestContext.set('userId', 'default-user');
+      requestContext.set('apiKey', 'default-key');
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel,
+        requestContextSchema,
+        defaultOptions: { requestContext },
+      });
+
+      await expect(agent.resumeStreamUntilIdle({ approved: true }, { runId: 'missing-run-id' })).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
     });
   });
 
