@@ -789,6 +789,39 @@ describe('Session.message() — default path', () => {
     expect(waitForRunOutput).not.toHaveBeenCalled();
   });
 
+  it('keeps the original startup failure when a later run watcher failure arrives', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const startupError = new Error('post-dispatch pending evidence unavailable');
+    const watcherError = new Error('Agent thread run id "startup-failed-run" has been aborted');
+
+    (session as any)._rememberCompletedRun('startup-failed-run', { ok: false, err: startupError });
+    (session as any)._rememberCompletedRun('startup-failed-run', { ok: false, err: watcherError });
+
+    await expect(
+      (session as any)._returnDuplicateMessageResult(
+        { status: 'pending', signalId: 'startup-failed-signal', runId: 'startup-failed-run' },
+        { content: 'hi' },
+      ),
+    ).rejects.toBe(startupError);
+  });
+
+  it('keeps the completed result when a later run watcher failure arrives', async () => {
+    const { harness, agent } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const watcherError = new Error('Agent thread run id "completed-run" has been aborted');
+
+    (session as any)._rememberCompletedRun('completed-run', { ok: true, full: agent.fullOutput });
+    (session as any)._rememberCompletedRun('completed-run', { ok: false, err: watcherError });
+
+    await expect(
+      (session as any)._returnDuplicateMessageResult(
+        { status: 'pending', signalId: 'completed-signal', runId: 'completed-run' },
+        { content: 'hi' },
+      ),
+    ).resolves.toBe(agent.fullOutput);
+  });
+
   it('does not return retained completed output for duplicate stream retries', async () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

@@ -1837,6 +1837,7 @@ export class Session {
     runId: string,
     entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown },
   ): void {
+    if (this._completedRuns.has(runId)) return;
     this._completedRuns.set(runId, entry);
     while (this._completedRuns.size > 64) {
       const oldest = this._completedRuns.keys().next().value;
