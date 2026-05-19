@@ -162,6 +162,7 @@ const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
 const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
+const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
 const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
@@ -2333,24 +2334,21 @@ export class Session {
       this._runCompletionPromises.delete(signal.runId);
       this._rememberCompletedRun(signal.runId, { ok: false, err });
       waiter?.reject(err);
-      try {
-        if (admissionIdentity !== undefined && this._shouldWriteTurnFailureEvidence(err)) {
-          await this._writeMessageResultEvidenceBestEffort(
-            {
-              status: 'failed',
-              signalId: signal.signal.id,
-              runId: signal.runId,
-              error: projectHarnessPublicError(err),
-              admissionId: opts.admissionId!,
-              admissionHash: admissionHash!,
-            },
-            { compatibleAdmissionHashes },
-          ).catch(() => {});
-        }
-      } finally {
-        if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
-        void this._maybeDrainQueue();
+      if (admissionIdentity !== undefined && this._shouldWriteTurnFailureEvidence(err)) {
+        this._writeMessageResultEvidenceBestEffortInBackground(
+          {
+            status: 'failed',
+            signalId: signal.signal.id,
+            runId: signal.runId,
+            error: projectHarnessPublicError(err),
+            admissionId: opts.admissionId!,
+            admissionHash: admissionHash!,
+          },
+          { compatibleAdmissionHashes },
+        );
       }
+      if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+      void this._maybeDrainQueue();
     };
 
     const awaitPendingMessageEvidence = async () => {
@@ -2390,7 +2388,7 @@ export class Session {
           this._rememberCompletedRun(signal.runId, { ok: false, err });
           waiter?.reject(err);
           if (admissionIdentity !== undefined && this._shouldWriteTurnFailureEvidence(err)) {
-            await this._writeMessageResultEvidenceBestEffort(
+            this._writeMessageResultEvidenceBestEffortInBackground(
               {
                 status: 'failed',
                 signalId: signal.signal.id,
@@ -2816,6 +2814,23 @@ export class Session {
       // Non-idempotent callers have no durable replay contract, so storage
       // evidence is only best-effort for them.
     }
+  }
+
+  private _writeMessageResultEvidenceBestEffortInBackground(
+    status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
+    options?: { compatibleAdmissionHashes?: readonly string[] },
+  ): void {
+    const write = this._writeMessageResultEvidenceBestEffort(status, options);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    void Promise.race([write, timeout])
+      .catch(() => {})
+      .finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+      });
   }
 
   private _computeMessageAdmissionHashes(
