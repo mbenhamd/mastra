@@ -2663,8 +2663,8 @@ export class HarnessLibSQL extends HarnessStorage {
       deadAt: undefined,
       lastError: undefined,
       sentAt: opts.sentAt ?? storageNow,
-      ...(opts.providerMessageId !== undefined ? { providerMessageId: opts.providerMessageId } : {}),
-      ...(opts.providerReceipt !== undefined ? { providerReceipt: opts.providerReceipt } : {}),
+      providerMessageId: opts.providerMessageId,
+      providerReceipt: opts.providerReceipt,
       updatedAt: storageNow,
     };
     assertLegalChannelOutboxUpdate(current, next);

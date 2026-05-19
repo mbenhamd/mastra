@@ -10,6 +10,7 @@ import {
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
   TABLE_HARNESS_CHANNEL_INBOX,
+  TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
@@ -1629,10 +1630,11 @@ describe('HarnessLibSQL channel action ledger', () => {
 });
 
 describe('HarnessLibSQL channel outbox ledger', () => {
+  let client: Client;
   let storage: HarnessLibSQL;
 
   beforeEach(async () => {
-    const client = createHarnessTestClient();
+    client = createHarnessTestClient();
     storage = new HarnessLibSQL({ client });
     await storage.init();
   });
@@ -1818,6 +1820,46 @@ describe('HarnessLibSQL channel outbox ledger', () => {
           error: { code: 'unknown', message: 'too late' },
         }),
       ).rejects.toBeInstanceOf(HarnessStorageChannelOutboxClaimConflictError);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('clears stale provider metadata when marking outbox rows sent without provider metadata', async () => {
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.enqueueChannelOutbox(sampleChannelOutbox());
+      await storage.claimChannelOutbox({
+        harnessName: 'default',
+        claimId: 'claim-1',
+        limit: 1,
+        now,
+        claimTtlMs: 5000,
+      });
+      await client.execute({
+        sql: `UPDATE ${TABLE_HARNESS_CHANNEL_OUTBOX}
+              SET provider_message_id = ?, provider_receipt = ?
+              WHERE id = ?`,
+        args: ['stale-provider-message', JSON.stringify({ deliveryId: 'stale-delivery' }), 'outbox-1'],
+      });
+
+      await storage.markChannelOutboxSent({
+        outboxItemId: 'outbox-1',
+        claimId: 'claim-1',
+        sentAt: now + 200,
+      });
+
+      const result = await client.execute({
+        sql: `SELECT provider_message_id, provider_receipt
+              FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+              WHERE id = ?`,
+        args: ['outbox-1'],
+      });
+      expect(result.rows[0]).toMatchObject({
+        provider_message_id: null,
+        provider_receipt: null,
+      });
     } finally {
       dateNow.mockRestore();
     }
