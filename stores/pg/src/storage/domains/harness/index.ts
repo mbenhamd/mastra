@@ -477,7 +477,9 @@ export class HarnessPG extends HarnessStorage {
       ifNotExists: ['harness_name'],
     });
     await this.#backfillHarnessNamespace();
-    await this.#assertNoDuplicateActiveSessions();
+    if (!this.#skipDefaultIndexes) {
+      await this.#assertNoDuplicateActiveSessions();
+    }
     await this.#backfillAttachmentMetadata();
     await this.createDefaultIndexes();
     await this.createCustomIndexes();

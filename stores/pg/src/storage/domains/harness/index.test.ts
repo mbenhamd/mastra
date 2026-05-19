@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import { HarnessStorageThreadDeleteFenceConflictError } from '@mastra/core/storage';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
@@ -53,6 +55,56 @@ describe('HarnessPG', () => {
       'idx_harness_sessions_active_key',
       'idx_harness_wakeups_idempotency',
     ]);
+  });
+
+  it('allows legacy duplicate active sessions when default indexes are skipped', async () => {
+    const schemaName = `harness_skip_${randomUUID().replaceAll('-', '_')}`;
+    let seedStore: PostgresStore | undefined;
+    let reopenedStore: PostgresStore | undefined;
+    try {
+      seedStore = new PostgresStore({
+        ...TEST_CONFIG,
+        id: 'pg-harness-skip-index-seed',
+        schemaName,
+        skipDefaultIndexes: true,
+      });
+      await seedStore.init();
+      await seedStore.stores.harness!.saveSession(
+        createSampleSessionRecord({
+          id: 'legacy-active-a',
+          resourceId: 'legacy-resource',
+          threadId: 'legacy-thread',
+        }),
+        { ownerId: 'owner-a', ifVersion: 0 },
+      );
+      await seedStore.stores.harness!.saveSession(
+        createSampleSessionRecord({
+          id: 'legacy-active-b',
+          resourceId: 'legacy-resource',
+          threadId: 'legacy-thread',
+        }),
+        { ownerId: 'owner-b', ifVersion: 0 },
+      );
+      await seedStore.close();
+      seedStore = undefined;
+
+      reopenedStore = new PostgresStore({
+        ...TEST_CONFIG,
+        id: 'pg-harness-skip-index-reopen',
+        schemaName,
+        skipDefaultIndexes: true,
+      });
+      await expect(reopenedStore.init()).resolves.toBeUndefined();
+    } finally {
+      await reopenedStore?.close().catch(() => {});
+      await seedStore?.close().catch(() => {});
+      const cleanupStore = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-skip-index-cleanup' });
+      try {
+        await cleanupStore.db.none(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+      } finally {
+        await cleanupStore.close();
+      }
+    }
   });
 
   it('persists primitive and element attachment metadata including object pointers', async () => {
