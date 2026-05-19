@@ -1817,6 +1817,11 @@ export class Session {
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
     const waiter = this._runCompletionPromises.get(runId);
     this._runCompletionPromises.delete(runId);
+    const cached = this._completedRuns.get(runId);
+    if (cached && !cached.ok) {
+      if (waiter) waiter.reject(cached.err);
+      return;
+    }
     try {
       const full = (await out.getFullOutput()) as FullOutput<unknown>;
       this._rememberCompletedRun(runId, { ok: true, full });
@@ -2272,7 +2277,17 @@ export class Session {
     // the wake path).
     const completion = this._awaitRunCompletion(signal.runId);
     void completion.catch(() => {});
-    if (admissionStart && admissionIdentity !== undefined && admissionHash !== undefined) {
+    let admissionStartSettled = false;
+    const resolveMessageAdmissionStart = () => {
+      if (
+        admissionStartSettled ||
+        admissionStart === undefined ||
+        admissionIdentity === undefined ||
+        admissionHash === undefined
+      ) {
+        return;
+      }
+      admissionStartSettled = true;
       const now = Date.now();
       admissionStart.resolve({
         status: 'pending',
@@ -2287,7 +2302,12 @@ export class Session {
         createdAt: now,
         updatedAt: now,
       });
-    }
+    };
+    const rejectMessageAdmissionStart = (err: unknown) => {
+      if (admissionStartSettled || admissionStart === undefined) return;
+      admissionStartSettled = true;
+      admissionStart.reject(err);
+    };
 
     const pendingEvidenceWrite =
       admissionIdentity !== undefined
@@ -2302,6 +2322,41 @@ export class Session {
             { compatibleAdmissionHashes },
           )
         : Promise.resolve();
+    void pendingEvidenceWrite.catch(() => {});
+
+    const failDispatchedMessageTurn = async (err: unknown) => {
+      turnAbortController.abort(err);
+      finishOwnedMessageTurn();
+      rejectMessageAdmissionStart(err);
+      void completion.catch(() => {});
+      const waiter = this._runCompletionPromises.get(signal.runId);
+      this._runCompletionPromises.delete(signal.runId);
+      this._rememberCompletedRun(signal.runId, { ok: false, err });
+      waiter?.reject(err);
+      try {
+        if (admissionIdentity !== undefined && this._shouldWriteTurnFailureEvidence(err)) {
+          await this._writeMessageResultEvidenceBestEffort(
+            {
+              status: 'failed',
+              signalId: signal.signal.id,
+              runId: signal.runId,
+              error: projectHarnessPublicError(err),
+              admissionId: opts.admissionId!,
+              admissionHash: admissionHash!,
+            },
+            { compatibleAdmissionHashes },
+          ).catch(() => {});
+        }
+      } finally {
+        if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
+        void this._maybeDrainQueue();
+      }
+    };
+
+    const awaitPendingMessageEvidence = async () => {
+      await Promise.race([pendingEvidenceWrite, activeTurnWaiter.promise]);
+      resolveMessageAdmissionStart();
+    };
 
     // Streaming path: hand the live `MastraModelOutput` back. The drain
     // loop is responsible for harness events; we still keep the turn
@@ -2309,7 +2364,12 @@ export class Session {
     if (opts.stream === true) {
       let out = agent.getRunOutput(signal.runId) as MastraModelOutput<unknown> | undefined;
       if (!out && (signal.output || admissionIdentity !== undefined)) {
-        await Promise.race([pendingEvidenceWrite.catch(() => {}), activeTurnWaiter.promise]);
+        try {
+          await awaitPendingMessageEvidence();
+        } catch (err) {
+          await failDispatchedMessageTurn(err);
+          throw err;
+        }
         try {
           out = signal.output
             ? ((await Promise.race([signal.output, activeTurnWaiter.promise])) as MastraModelOutput<unknown>)
@@ -2348,32 +2408,18 @@ export class Session {
         }
       }
       if (!out) {
-        finishOwnedMessageTurn();
-        void pendingEvidenceWrite.catch(() => {});
         const err = new HarnessConfigError('message()', 'agent did not register a run for the dispatched signal');
         // Drop the completion waiter so duplicate retries do not treat an
         // unregistered run as live forever.
-        void completion.catch(() => {});
-        const waiter = this._runCompletionPromises.get(signal.runId);
-        this._runCompletionPromises.delete(signal.runId);
-        this._rememberCompletedRun(signal.runId, { ok: false, err });
-        waiter?.reject(err);
-        if (admissionIdentity !== undefined) {
-          await this._writeMessageResultEvidenceBestEffort(
-            {
-              status: 'failed',
-              signalId: signal.signal.id,
-              runId: signal.runId,
-              error: projectHarnessPublicError(err),
-              admissionId: opts.admissionId!,
-              admissionHash: admissionHash!,
-            },
-            { compatibleAdmissionHashes },
-          );
-        }
+        await failDispatchedMessageTurn(err);
         throw err;
       }
-      await Promise.race([pendingEvidenceWrite.catch(() => {}), activeTurnWaiter.promise]);
+      try {
+        await awaitPendingMessageEvidence();
+      } catch (err) {
+        await failDispatchedMessageTurn(err);
+        throw err;
+      }
       let streamCompletedEvidenceWriteFailed = false;
       void Promise.race([completion, activeTurnWaiter.promise])
         .then(async full => {
@@ -2440,7 +2486,11 @@ export class Session {
     let streamStarted = signal.output === undefined;
     let completedEvidenceWriteFailed = false;
     try {
+      // The pre-dispatch reservation is the durable admission barrier here.
+      // Keep the post-dispatch pending refresh best-effort so completion
+      // evidence remains the authoritative default-path result.
       await Promise.race([pendingEvidenceWrite.catch(() => {}), activeTurnWaiter.promise]);
+      resolveMessageAdmissionStart();
       if (signal.output) {
         await Promise.race([signal.output, activeTurnWaiter.promise]);
         streamStarted = true;
