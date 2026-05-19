@@ -208,9 +208,16 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const result = await CREATE_HARNESS_SESSION_ROUTE.handler(
-      makeParams({ mastra, name: 'code', threadId: 'thread-1', resourceId: 'attacker' }),
+      makeParams({
+        mastra,
+        name: 'query-code',
+        requestPathParams: { name: 'code' },
+        requestBody: { threadId: 'thread-1' },
+        resourceId: 'attacker',
+      }),
     );
 
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
     expect(harness.session).toHaveBeenCalledWith({
       threadId: 'thread-1',
       resourceId: 'resource-1',
@@ -224,6 +231,39 @@ describe('Harness server routes', () => {
     });
   });
 
+  it('ignores create options supplied only through flattened query params', async () => {
+    const record = makeRecord();
+    const session = {
+      getRecord: () => record,
+      getDisplayState: () => makeDisplayState(record),
+      getState: vi.fn(async () => record.state),
+      listMessages: vi.fn(async () => []),
+    };
+    const harness = {
+      loadSession: vi.fn(),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await CREATE_HARNESS_SESSION_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'query-code',
+        requestPathParams: { name: 'code' },
+        sessionId: 'query-session',
+        threadId: 'query-thread',
+        parentSessionId: 'query-parent',
+        origin: 'subagent-tool',
+        modeId: 'query-mode',
+        modelId: 'query-model',
+      }),
+    );
+
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.loadSession).not.toHaveBeenCalled();
+    expect(harness.session).toHaveBeenCalledWith({ resourceId: 'resource-1' });
+  });
+
   it('rejects create when the requested memory thread belongs to another resource', async () => {
     const harness = { session: vi.fn() };
     const memoryStore = {
@@ -235,7 +275,7 @@ describe('Harness server routes', () => {
     };
 
     await expectHarnessHttpError(
-      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', threadId: 'thread-1' })),
+      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', requestBody: { threadId: 'thread-1' } })),
       403,
       'harness.permission_denied',
     );
@@ -256,7 +296,7 @@ describe('Harness server routes', () => {
     };
 
     await expectHarnessHttpError(
-      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', threadId: 'thread-1' })),
+      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', requestBody: { threadId: 'thread-1' } })),
       403,
       'harness.permission_denied',
     );
@@ -280,7 +320,9 @@ describe('Harness server routes', () => {
     };
 
     await expectHarnessHttpError(
-      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      CREATE_HARNESS_SESSION_ROUTE.handler(
+        makeParams({ mastra, name: 'code', requestBody: { sessionId: 'session-1' } }),
+      ),
       403,
       'harness.permission_denied',
     );
@@ -304,7 +346,7 @@ describe('Harness server routes', () => {
 
     await expectHarnessHttpError(
       CREATE_HARNESS_SESSION_ROUTE.handler(
-        makeParams({ mastra, name: 'code', sessionId: 'session-1', threadId: 'thread-1' }),
+        makeParams({ mastra, name: 'code', requestBody: { sessionId: 'session-1', threadId: 'thread-1' } }),
       ),
       409,
       'harness.session_conflict',
@@ -328,7 +370,7 @@ describe('Harness server routes', () => {
 
     await expectHarnessHttpError(
       CREATE_HARNESS_SESSION_ROUTE.handler(
-        makeParams({ mastra, name: 'code', parentSessionId: 'parent-1', threadId: 'thread-1' }),
+        makeParams({ mastra, name: 'code', requestBody: { parentSessionId: 'parent-1', threadId: 'thread-1' } }),
       ),
       409,
       'harness.session_conflict',
@@ -371,7 +413,9 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     await expectHarnessHttpError(
-      CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', parentSessionId: 'parent-1' })),
+      CREATE_HARNESS_SESSION_ROUTE.handler(
+        makeParams({ mastra, name: 'code', requestBody: { parentSessionId: 'parent-1' } }),
+      ),
       404,
       'harness.session_not_found',
     );
@@ -388,7 +432,7 @@ describe('Harness server routes', () => {
 
     await expectHarnessHttpError(
       CREATE_HARNESS_SESSION_ROUTE.handler(
-        makeParams({ mastra, name: 'code', sessionId: 'session-1', threadId: 'thread-1' }),
+        makeParams({ mastra, name: 'code', requestBody: { sessionId: 'session-1', threadId: 'thread-1' } }),
       ),
       404,
       'harness.session_closed',
@@ -411,7 +455,9 @@ describe('Harness server routes', () => {
     };
     const mastra = { getHarness: vi.fn(() => harness) };
 
-    await CREATE_HARNESS_SESSION_ROUTE.handler(makeParams({ mastra, name: 'code', parentSessionId: 'parent-1' }));
+    await CREATE_HARNESS_SESSION_ROUTE.handler(
+      makeParams({ mastra, name: 'code', requestBody: { parentSessionId: 'parent-1' } }),
+    );
 
     expect(harness.session).toHaveBeenCalledWith({
       threadId: { fresh: true },
@@ -436,7 +482,7 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     await CREATE_HARNESS_SESSION_ROUTE.handler(
-      makeParams({ mastra, name: 'code', sessionId: 'child-1', parentSessionId: 'parent-1' }),
+      makeParams({ mastra, name: 'code', requestBody: { sessionId: 'child-1', parentSessionId: 'parent-1' } }),
     );
 
     expect(harness.session).toHaveBeenCalledWith({
@@ -465,11 +511,18 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const response = await GET_HARNESS_SESSION_ROUTE.handler(
-      makeParams({ mastra, name: 'code', sessionId: 'session-1' }),
+      makeParams({
+        mastra,
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
+      }),
     );
     const body = await response.json();
 
     expect(response.headers.get('etag')).toBe('"7"');
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
     expect(harness.session).not.toHaveBeenCalled();
     expect(body).toMatchObject({
       summary: { sessionId: 'session-1', lifecycle: 'active' },
@@ -486,10 +539,17 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const response = await GET_HARNESS_STATE_ROUTE.handler(
-      makeParams({ mastra, name: 'code', sessionId: 'session-1' }),
+      makeParams({
+        mastra,
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
+      }),
     );
 
     expect(response.headers.get('etag')).toBe('"11"');
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
     await expect(response.json()).resolves.toEqual({ view: 'open' });
   });
 
@@ -508,8 +568,9 @@ describe('Harness server routes', () => {
     const result = await POST_HARNESS_MESSAGE_ROUTE.handler(
       makeParams({
         mastra,
-        name: 'code',
-        sessionId: 'session-1',
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
         requestBody: {
           content: 'hello',
           admissionId: 'admission-1',
@@ -518,6 +579,7 @@ describe('Harness server routes', () => {
       }),
     );
 
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
     expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.admitMessage).toHaveBeenCalledWith({
       content: 'hello',
@@ -565,8 +627,9 @@ describe('Harness server routes', () => {
     const result = await POST_HARNESS_QUEUE_ROUTE.handler(
       makeParams({
         mastra,
-        name: 'code',
-        sessionId: 'session-1',
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
         requestBody: {
           content: 'next',
           admissionId: 'admission-queue-1',
@@ -575,6 +638,8 @@ describe('Harness server routes', () => {
       }),
     );
 
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.admitQueue).toHaveBeenCalledWith({
       content: 'next',
       admissionId: 'admission-queue-1',
@@ -734,14 +799,27 @@ describe('Harness server routes', () => {
 
     await expect(
       PATCH_HARNESS_MODE_ROUTE.handler(
-        makeParams({ mastra, name: 'code', sessionId: 'session-1', requestBody: { mode: 'build' } }),
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+          requestBody: { mode: 'build' },
+        }),
       ),
     ).resolves.toEqual({ modeId: 'build' });
     await expect(
       PATCH_HARNESS_MODEL_ROUTE.handler(
-        makeParams({ mastra, name: 'code', sessionId: 'session-1', requestBody: { model: 'gpt-x' } }),
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+          requestBody: { model: 'gpt-x' },
+        }),
       ),
     ).resolves.toEqual({ modelId: 'gpt-x' });
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
     expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
   });
 
@@ -767,12 +845,15 @@ describe('Harness server routes', () => {
     const result = await PATCH_HARNESS_PERMISSIONS_ROUTE.handler(
       makeParams({
         mastra,
-        name: 'code',
-        sessionId: 'session-1',
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
         requestBody: { action: 'grantCategory', category: 'write' },
       }),
     );
 
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.permissions.grantCategory).toHaveBeenCalledWith({ category: 'write' });
     expect(result).toEqual({
       grants: { categories: ['read', 'write'], tools: [] },
@@ -798,9 +879,10 @@ describe('Harness server routes', () => {
       RESPOND_HARNESS_INBOX_ROUTE.handler(
         makeParams({
           mastra,
-          name: 'code',
-          sessionId: 'session-1',
-          itemId: 'item-1',
+          name: 'query-code',
+          sessionId: 'query-session',
+          itemId: 'query-item',
+          requestPathParams: { name: 'code', sessionId: 'session-1', itemId: 'item-1' },
           requestBody: {
             kind: 'question',
             answer: 'yes',
@@ -809,6 +891,8 @@ describe('Harness server routes', () => {
         }),
       ),
     ).resolves.toEqual(response);
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.respondToQuestion).toHaveBeenCalledWith({
       itemId: 'item-1',
       responseId: 'response-1',
@@ -877,21 +961,57 @@ describe('Harness server routes', () => {
 
     await expect(
       PUT_HARNESS_GOAL_ROUTE.handler(
-        makeParams({ mastra, name: 'code', sessionId: 'session-1', requestBody: { objective: 'ship', maxTurns: 3 } }),
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+          requestBody: { objective: 'ship', maxTurns: 3 },
+        }),
       ),
     ).resolves.toEqual({ goal });
     await expect(
-      GET_HARNESS_GOAL_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      GET_HARNESS_GOAL_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+        }),
+      ),
     ).resolves.toEqual({ goal });
     expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
     await expect(
-      PAUSE_HARNESS_GOAL_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      PAUSE_HARNESS_GOAL_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+        }),
+      ),
     ).resolves.toMatchObject({ goal: { status: 'paused' } });
     await expect(
-      RESUME_HARNESS_GOAL_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' })),
+      RESUME_HARNESS_GOAL_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'query-code',
+          sessionId: 'query-session',
+          requestPathParams: { name: 'code', sessionId: 'session-1' },
+        }),
+      ),
     ).resolves.toMatchObject({ goal: { status: 'active' } });
-    const response = await DELETE_HARNESS_GOAL_ROUTE.handler(makeParams({ mastra, name: 'code', sessionId: 'session-1' }));
+    const response = await DELETE_HARNESS_GOAL_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
+      }),
+    );
     expect(response.status).toBe(204);
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.session).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
     expect(session.clearGoal).toHaveBeenCalled();
   });
 
@@ -936,10 +1056,17 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const response = await CLOSE_HARNESS_SESSION_ROUTE.handler(
-      makeParams({ mastra, name: 'code', sessionId: 'session-1' }),
+      makeParams({
+        mastra,
+        name: 'query-code',
+        sessionId: 'query-session',
+        requestPathParams: { name: 'code', sessionId: 'session-1' },
+      }),
     );
 
     expect(response.status).toBe(204);
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(harness.loadSession).toHaveBeenCalledWith({ sessionId: 'session-1', includeClosed: true });
     expect(harness.closeSession).toHaveBeenCalledWith({ sessionId: 'session-1', resourceId: 'resource-1' });
   });
 

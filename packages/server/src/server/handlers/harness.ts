@@ -213,6 +213,14 @@ type HarnessLike = {
 };
 
 type HarnessSessionLike = Awaited<ReturnType<HarnessLike['session']>>;
+type CreateHarnessSessionBody = {
+  sessionId?: string;
+  threadId?: string | { fresh: true };
+  parentSessionId?: string;
+  origin?: 'top-level';
+  modeId?: string;
+  modelId?: string;
+};
 type MessageAdmissionBody = Parameters<HarnessSessionLike['admitMessage']>[0];
 type QueueAdmissionBody = Parameters<HarnessSessionLike['admitQueue']>[0];
 
@@ -328,6 +336,17 @@ function stringPathParam(
     });
   }
   return value;
+}
+
+function harnessSessionPathIdentity(
+  requestPathParams: Record<string, unknown> | undefined,
+  fallbackName: unknown,
+  fallbackSessionId: unknown,
+): { pathName: string; pathSessionId: string } {
+  return {
+    pathName: stringPathParam(requestPathParams, fallbackName, 'name'),
+    pathSessionId: stringPathParam(requestPathParams, fallbackSessionId, 'sessionId'),
+  };
 }
 
 function isClosingUnderActiveForeignLease(record: SessionRecord, harness: Pick<HarnessLike, 'ownerId'>): boolean {
@@ -876,10 +895,22 @@ export const CREATE_HARNESS_SESSION_ROUTE = createRoute({
   summary: 'Create or resolve a Harness session',
   description: 'Creates or resolves a resource-scoped Harness session for the authenticated caller.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, threadId, parentSessionId, origin, modeId, modelId }) => {
+  handler: async ({
+    mastra,
+    requestContext,
+    name,
+    requestBody,
+    requestPathParams,
+  }) => {
     try {
+      const pathName = stringPathParam(requestPathParams, name, 'name');
+      const body =
+        requestBody === undefined
+          ? ({} as CreateHarnessSessionBody)
+          : (objectRequestBody(requestBody, 'Create session') as CreateHarnessSessionBody);
+      const { sessionId, threadId, parentSessionId, origin, modeId, modelId } = body;
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
       let existingById: SessionRecord | null = null;
       if (sessionId !== undefined) {
         existingById = await harness.loadSession({ sessionId, includeClosed: true });
@@ -962,13 +993,14 @@ export const GET_HARNESS_SESSION_ROUTE = createRoute({
   summary: 'Get Harness session snapshot',
   description: 'Returns a tenant-scoped stored snapshot for a Harness session.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const stored = await harness.loadSession({ sessionId, includeClosed: true });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const stored = await harness.loadSession({ sessionId: pathSessionId, includeClosed: true });
       if (!stored || stored.resourceId !== resourceId) {
-        throwSessionNotFound(sessionId);
+        throwSessionNotFound(pathSessionId);
       }
 
       const displayState = displayStateFromRecord(stored);
@@ -997,12 +1029,13 @@ export const POST_HARNESS_MESSAGE_ROUTE = createRoute({
   summary: 'Admit a Harness session message',
   description: 'Admits a retry-safe message turn and returns the durable signal identity.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Message admission') as MessageAdmissionBody;
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       return await session.admitMessage(body);
     } catch (error) {
       return mapHarnessError(error);
@@ -1023,12 +1056,13 @@ export const POST_HARNESS_QUEUE_ROUTE = createRoute({
   summary: 'Admit a Harness queued turn',
   description: 'Appends a retry-safe queued turn and returns the durable queued item identity.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Queue admission') as QueueAdmissionBody;
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       return await session.admitQueue(body);
     } catch (error) {
       return mapHarnessError(error);
@@ -1047,13 +1081,14 @@ export const GET_HARNESS_STATE_ROUTE = createRoute({
   summary: 'Get Harness session state',
   description: 'Returns the tenant-scoped Harness session state with the session ETag.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const stored = await harness.loadSession({ sessionId, includeClosed: true });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const stored = await harness.loadSession({ sessionId: pathSessionId, includeClosed: true });
       if (!stored || stored.resourceId !== resourceId) {
-        throwSessionNotFound(sessionId);
+        throwSessionNotFound(pathSessionId);
       }
       return jsonResponse(stored.state ?? {}, { status: 200, headers: { etag: `"${stored.version}"` } });
     } catch (error) {
@@ -1076,8 +1111,7 @@ export const PATCH_HARNESS_STATE_ROUTE = createRoute({
   tags: ['Harness'],
   handler: async ({ mastra, requestContext, name, sessionId, getHeader, requestBody, requestPathParams }) => {
     try {
-      const pathName = stringPathParam(requestPathParams, name, 'name');
-      const pathSessionId = stringPathParam(requestPathParams, sessionId, 'sessionId');
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
       const expectedVersion = parseStrongIfMatch(getHeader?.('if-match'));
       const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
@@ -1110,12 +1144,13 @@ export const PATCH_HARNESS_MODE_ROUTE = createRoute({
   summary: 'Switch Harness session mode',
   description: 'Switches the active mode for future Harness turns.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Mode patch') as { mode: string };
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       await session.switchMode({ mode: body.mode });
       return { modeId: (session.getRecord() as SessionRecord).modeId };
     } catch (error) {
@@ -1137,12 +1172,13 @@ export const PATCH_HARNESS_MODEL_ROUTE = createRoute({
   summary: 'Switch Harness session model',
   description: 'Switches the default model for future Harness turns.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Model patch') as { model: string };
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       await session.models.switch({ model: body.model });
       return { modelId: (session.getRecord() as SessionRecord).modelId };
     } catch (error) {
@@ -1164,8 +1200,9 @@ export const PATCH_HARNESS_PERMISSIONS_ROUTE = createRoute({
   summary: 'Mutate Harness session permissions',
   description: 'Applies a single session permission grant, revoke, or policy mutation.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Permissions patch') as {
         action: 'grantCategory' | 'grantTool' | 'revokeCategory' | 'revokeTool' | 'setPolicy';
         category?: string;
@@ -1173,8 +1210,8 @@ export const PATCH_HARNESS_PERMISSIONS_ROUTE = createRoute({
         policy?: 'allow' | 'ask' | 'deny';
       };
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       switch (body.action) {
         case 'grantCategory':
           await session.permissions.grantCategory({ category: body.category! });
@@ -1218,6 +1255,7 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
   tags: ['Harness'],
   handler: async ({ mastra, requestContext, name, sessionId, itemId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const pathItemId = stringPathParam(requestPathParams, itemId, 'itemId');
       const body = objectRequestBody(requestBody, 'Inbox response') as {
         kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
@@ -1230,8 +1268,8 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
         transitionToMode?: string;
       };
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       switch (body.kind) {
         case 'tool-approval':
           return await session.respondToToolApproval({
@@ -1280,12 +1318,13 @@ export const PUT_HARNESS_GOAL_ROUTE = createRoute({
   summary: 'Set Harness session goal',
   description: 'Sets or replaces the active session goal.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, requestBody }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestBody, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Goal') as unknown as GoalOptions;
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       const goal = await session.setGoal(body);
       return { goal };
     } catch (error) {
@@ -1306,13 +1345,14 @@ export const GET_HARNESS_GOAL_ROUTE = createRoute({
   summary: 'Get Harness session goal',
   description: 'Reads the current session goal.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const stored = await harness.loadSession({ sessionId, includeClosed: true });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const stored = await harness.loadSession({ sessionId: pathSessionId, includeClosed: true });
       if (!stored || stored.resourceId !== resourceId) {
-        throwSessionNotFound(sessionId);
+        throwSessionNotFound(pathSessionId);
       }
       return { goal: stored.goal ?? null };
     } catch (error) {
@@ -1333,11 +1373,12 @@ export const PAUSE_HARNESS_GOAL_ROUTE = createRoute({
   summary: 'Pause Harness session goal',
   description: 'Pauses the current session goal if present.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       return { goal: (await session.pauseGoal()) ?? null };
     } catch (error) {
       return mapHarnessError(error);
@@ -1357,11 +1398,12 @@ export const RESUME_HARNESS_GOAL_ROUTE = createRoute({
   summary: 'Resume Harness session goal',
   description: 'Resumes the current session goal if present.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       return { goal: (await session.resumeGoal()) ?? null };
     } catch (error) {
       return mapHarnessError(error);
@@ -1380,11 +1422,12 @@ export const DELETE_HARNESS_GOAL_ROUTE = createRoute({
   summary: 'Clear Harness session goal',
   description: 'Clears the current session goal if present.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const session = await harness.session({ sessionId, resourceId });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const session = await harness.session({ sessionId: pathSessionId, resourceId });
       await session.clearGoal();
       return new Response(null, { status: 204 });
     } catch (error) {
@@ -1404,13 +1447,14 @@ export const CLOSE_HARNESS_SESSION_ROUTE = createRoute({
   summary: 'Close a Harness session',
   description: 'Closes a tenant-owned Harness session idempotently.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId }) => {
+  handler: async ({ mastra, requestContext, name, sessionId, requestPathParams }) => {
     try {
+      const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const resourceId = getAuthResourceId(requestContext);
-      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, name);
-      const stored = await harness.loadSession({ sessionId, includeClosed: true });
+      const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+      const stored = await harness.loadSession({ sessionId: pathSessionId, includeClosed: true });
       if (!stored || stored.resourceId !== resourceId) {
-        throwSessionNotFound(sessionId);
+        throwSessionNotFound(pathSessionId);
       }
       if (stored.closedAt !== undefined) {
         return new Response(null, { status: 204 });
@@ -1418,7 +1462,7 @@ export const CLOSE_HARNESS_SESSION_ROUTE = createRoute({
       if (isClosingUnderActiveForeignLease(stored, harness)) {
         return new Response(null, { status: 204 });
       }
-      await harness.closeSession({ sessionId, resourceId });
+      await harness.closeSession({ sessionId: pathSessionId, resourceId });
       return new Response(null, { status: 204 });
     } catch (error) {
       return mapHarnessError(error);

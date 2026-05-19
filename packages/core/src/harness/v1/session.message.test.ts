@@ -172,7 +172,19 @@ function setupTwoModes() {
   return { harness, defaultAgent, otherAgent, storage };
 }
 
-function legacyMessageAdmissionHash(opts: { content: unknown; modeId: string; modelId: string }) {
+function legacyMessageAdmissionHash(opts: {
+  content: unknown;
+  modeId: string;
+  modelId: string;
+  attachments?: Array<{
+    attachmentId: string;
+    resourceId: string;
+    ownerSessionId?: string;
+    bytes?: number;
+    sha256?: string;
+    source?: unknown;
+  }>;
+}) {
   return createHash('sha256')
     .update(
       canonicalJsonForTest({
@@ -180,7 +192,7 @@ function legacyMessageAdmissionHash(opts: { content: unknown; modeId: string; mo
         content: opts.content,
         mode: opts.modeId,
         model: opts.modelId,
-        attachments: [],
+        attachments: opts.attachments ?? [],
       }),
       'utf8',
     )
@@ -373,6 +385,59 @@ describe('Session.message() — default path', () => {
         attachments: [{ attachmentId: 'att-1', resourceId: 'u1', kind: 'file' }],
       }),
     ).rejects.toBeInstanceOf(HarnessAdmissionConflictError);
+  });
+
+  it('replays legacy duplicate admissions hashed before attachment metadata fields existed', async () => {
+    const { harness, agent, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const legacyAdmissionHash = legacyMessageAdmissionHash({
+      content: 'render this',
+      modeId: 'default',
+      modelId: (session as any)._record.modelId,
+      attachments: [
+        {
+          attachmentId: 'att-legacy',
+          resourceId: 'u1',
+          bytes: 42,
+          sha256: 'abc123',
+        },
+      ],
+    });
+
+    await storage.writeMessageResultEvidence({
+      harnessName: (session as any)._record.harnessName,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      status: 'completed',
+      signalId: 'legacy-attachment-signal',
+      runId: 'legacy-attachment-run',
+      result: agent.fullOutput,
+      admissionId: 'legacy-attachment-admission',
+      admissionHash: legacyAdmissionHash,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const duplicate = await session.message({
+      content: 'render this',
+      admissionId: 'legacy-attachment-admission',
+      attachments: [
+        {
+          attachmentId: 'att-legacy',
+          resourceId: 'u1',
+          bytes: 42,
+          sha256: 'abc123',
+          kind: 'primitive',
+          primitiveType: 'markdown',
+          schemaId: 'schema-v1',
+          metadata: { display: 'inline' },
+        },
+      ],
+    });
+
+    expect(duplicate.text).toBe('hello back');
+    expect(agent.calls).toHaveLength(0);
   });
 
   it('admits duplicate messages from durable evidence when the retry races past the first lookup', async () => {

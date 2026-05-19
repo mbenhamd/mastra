@@ -2972,17 +2972,23 @@ export class Session {
     stable: { modeId: string; modelId: string },
   ): MessageAdmissionHashes {
     const primary = sha256CanonicalJson(this._messageAdmissionHashInput(opts, undefined, { hashVersion: 2 }));
-    // Pre-v2 evidence hashed the effective mode/model. Keep one exact legacy
-    // candidate for the current effective tuple only; old evidence does not
+    // Pre-v2 evidence hashed the effective mode/model. Keep compatibility
+    // candidates for the current effective tuple only; old evidence does not
     // persist enough metadata to safely infer previous defaults after drift.
-    const legacyCompatible = sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable));
-    return { primary, legacyCompatible: legacyCompatible === primary ? [] : [legacyCompatible] };
+    const legacyCompatible = [
+      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable)),
+      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable, { includeAttachmentMetadata: false })),
+    ];
+    return {
+      primary,
+      legacyCompatible: [...new Set(legacyCompatible)].filter(hash => hash !== primary),
+    };
   }
 
   private _messageAdmissionHashInput(
     opts: MessageOptions,
     stable?: { modeId: string; modelId: string },
-    options?: { hashVersion?: number },
+    options?: { hashVersion?: number; includeAttachmentMetadata?: boolean },
   ) {
     return {
       kind: 'message',
@@ -3001,15 +3007,19 @@ export class Session {
         ...(attachment.bytes !== undefined ? { bytes: attachment.bytes } : {}),
         ...(attachment.sha256 !== undefined ? { sha256: attachment.sha256 } : {}),
         ...(attachment.source !== undefined ? { source: attachment.source } : {}),
-        ...(attachment.kind !== undefined ? { kind: attachment.kind } : {}),
-        ...(attachment.name !== undefined ? { name: attachment.name } : {}),
-        ...(attachment.mimeType !== undefined ? { mimeType: attachment.mimeType } : {}),
-        ...(attachment.primitiveType !== undefined ? { primitiveType: attachment.primitiveType } : {}),
-        ...(attachment.elementType !== undefined ? { elementType: attachment.elementType } : {}),
-        ...(attachment.renderer !== undefined ? { renderer: attachment.renderer } : {}),
-        ...(attachment.schemaId !== undefined ? { schemaId: attachment.schemaId } : {}),
-        ...(attachment.metadata !== undefined ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
-        ...(attachment.object !== undefined ? { object: attachment.object } : {}),
+        ...(options?.includeAttachmentMetadata !== false
+          ? {
+              ...(attachment.kind !== undefined ? { kind: attachment.kind } : {}),
+              ...(attachment.name !== undefined ? { name: attachment.name } : {}),
+              ...(attachment.mimeType !== undefined ? { mimeType: attachment.mimeType } : {}),
+              ...(attachment.primitiveType !== undefined ? { primitiveType: attachment.primitiveType } : {}),
+              ...(attachment.elementType !== undefined ? { elementType: attachment.elementType } : {}),
+              ...(attachment.renderer !== undefined ? { renderer: attachment.renderer } : {}),
+              ...(attachment.schemaId !== undefined ? { schemaId: attachment.schemaId } : {}),
+              ...(attachment.metadata !== undefined ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
+              ...(attachment.object !== undefined ? { object: attachment.object } : {}),
+            }
+          : {}),
       })),
     };
   }
