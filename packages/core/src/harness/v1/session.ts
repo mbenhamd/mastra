@@ -6996,24 +6996,30 @@ function toJsonEventSnapshot(value: unknown, path = 'event', seen = new WeakSet<
   if (Array.isArray(value)) {
     if (seen.has(value)) throw new HarnessValidationError(path, 'must not contain cycles for event replay');
     seen.add(value);
-    const out: JsonValue[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
-      out.push(toJsonEventSnapshot(value[index], `${path}[${index}]`, seen));
+    try {
+      const out: JsonValue[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
+        out.push(toJsonEventSnapshot(value[index], `${path}[${index}]`, seen));
+      }
+      return out;
+    } finally {
+      seen.delete(value);
     }
-    return out;
   }
   if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
     if (seen.has(value)) throw new HarnessValidationError(path, 'must not contain cycles for event replay');
     seen.add(value);
-    const out: Record<string, JsonValue> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      if (entry === undefined) {
-        throw new HarnessValidationError(`${path}.${key}`, 'must be JSON-serializable for event replay');
+    try {
+      const out: Record<string, JsonValue> = {};
+      for (const [key, entry] of Object.entries(value)) {
+        if (entry === undefined) continue;
+        out[key] = toJsonEventSnapshot(entry, `${path}.${key}`, seen);
       }
-      out[key] = toJsonEventSnapshot(entry, `${path}.${key}`, seen);
+      return out;
+    } finally {
+      seen.delete(value);
     }
-    return out;
   }
   throw new HarnessValidationError(path, 'must be JSON-serializable for event replay');
 }

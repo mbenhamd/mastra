@@ -1768,21 +1768,33 @@ export class HarnessPG extends HarnessStorage {
   }): Promise<HarnessSessionEventReplayState | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureSessionEventsTable();
-    const result = await this.#client.execute({
-      sql: `SELECT
-              CASE WHEN COUNT(DISTINCT epoch) = 1 THEN MIN(epoch) END AS epoch,
-              CASE WHEN COUNT(DISTINCT epoch) = 1 THEN MIN(sequence) END AS oldest_sequence,
-              CASE WHEN COUNT(DISTINCT epoch) = 1 THEN MAX(sequence) END AS newest_sequence
+    const newest = await this.#client.execute({
+      sql: `SELECT epoch, sequence AS newest_sequence
             FROM ${TABLE_HARNESS_SESSION_EVENTS}
-            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
+            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
+            ORDER BY epoch DESC, sequence DESC
+            LIMIT 1`,
       args: [namespace, sessionId, resourceId, threadId],
     });
-    const row = result.rows[0];
-    if (!row || row.epoch == null || row.oldest_sequence == null || row.newest_sequence == null) return null;
+    const newestRow = newest.rows[0];
+    if (!newestRow || newestRow.epoch == null || newestRow.newest_sequence == null) return null;
+
+    const oldest = await this.#client.execute({
+      sql: `SELECT epoch, sequence AS oldest_sequence
+            FROM ${TABLE_HARNESS_SESSION_EVENTS}
+            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
+            ORDER BY epoch ASC, sequence ASC
+            LIMIT 1`,
+      args: [namespace, sessionId, resourceId, threadId],
+    });
+    const oldestRow = oldest.rows[0];
+    if (!oldestRow || oldestRow.epoch == null || oldestRow.oldest_sequence == null) return null;
+    if (String(oldestRow.epoch) !== String(newestRow.epoch)) return null;
+
     return {
-      epoch: String(row.epoch),
-      oldestSequence: Number(row.oldest_sequence),
-      newestSequence: Number(row.newest_sequence),
+      epoch: String(newestRow.epoch),
+      oldestSequence: Number(oldestRow.oldest_sequence),
+      newestSequence: Number(newestRow.newest_sequence),
     };
   }
 

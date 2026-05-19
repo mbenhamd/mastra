@@ -673,6 +673,18 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
           emittedAt: 1002,
           storedAt: 1003,
         });
+        await harnessWithEvents.appendSessionEvent({
+          harnessName: 'default',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          eventId: 'harness-v1:epoch-1:2',
+          epoch: 'epoch-1',
+          sequence: 2,
+          event: { type: 'app.event', id: 'harness-v1:epoch-1:2', timestamp: 1004, payload: { next: true } },
+          emittedAt: 1004,
+          storedAt: 1005,
+        });
 
         await expect(
           harnessWithEvents.getSessionEventReplayState({
@@ -681,7 +693,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
             resourceId: 'resource-1',
             threadId: 'thread-1',
           }),
-        ).resolves.toEqual({ epoch: 'epoch-1', oldestSequence: 1, newestSequence: 1 });
+        ).resolves.toEqual({ epoch: 'epoch-1', oldestSequence: 1, newestSequence: 2 });
         await expect(
           harnessWithEvents.getSessionEventReplayState({
             harnessName: 'default',
@@ -697,15 +709,35 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
             resourceId: 'resource-1',
             threadId: 'thread-1',
             epoch: 'epoch-1',
-            afterSequence: 0,
+            afterSequence: 1,
             limit: 10,
           }),
         ).resolves.toMatchObject([
           {
-            eventId: 'harness-v1:epoch-1:1',
-            event: { payload: { ok: true } },
+            eventId: 'harness-v1:epoch-1:2',
+            event: { payload: { next: true } },
           },
         ]);
+        await harnessWithEvents.appendSessionEvent({
+          harnessName: 'default',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          eventId: 'harness-v1:epoch-2:0',
+          epoch: 'epoch-2',
+          sequence: 0,
+          event: { type: 'app.event', id: 'harness-v1:epoch-2:0', timestamp: 999, payload: { stale: true } },
+          emittedAt: 999,
+          storedAt: 1004,
+        });
+        await expect(
+          harnessWithEvents.getSessionEventReplayState({
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+          }),
+        ).resolves.toBeNull();
 
         await harness.deleteSession({ sessionId: 'session-1' });
 

@@ -224,18 +224,22 @@ describe('Session.subscribe()', () => {
       defaultModeId: 'default',
       sessions: { storage },
     });
-    const hydrated = await resumed.session({ resourceId: session.resourceId, threadId: session.threadId });
-    const events: HarnessEvent[] = [];
-    hydrated.subscribe(e => {
-      events.push(e);
-    });
+    try {
+      const hydrated = await resumed.session({ resourceId: session.resourceId, threadId: session.threadId });
+      const events: HarnessEvent[] = [];
+      hydrated.subscribe(e => {
+        events.push(e);
+      });
 
-    await hydrated.message({ content: 'again' });
+      await hydrated.message({ content: 'again' });
 
-    expect(events.length).toBeGreaterThan(0);
-    const first = parseHarnessEventId(events[0]!.id);
-    expect(first.epoch).toBe(state!.epoch);
-    expect(first.sequence).toBeGreaterThan(state!.newestSequence);
+      expect(events.length).toBeGreaterThan(0);
+      const first = parseHarnessEventId(events[0]!.id);
+      expect(first.epoch).toBe(state!.epoch);
+      expect(first.sequence).toBeGreaterThan(state!.newestSequence);
+    } finally {
+      await resumed.shutdown();
+    }
   });
 });
 
@@ -337,6 +341,50 @@ describe('Session events — fullStream drain', () => {
       isError: true,
       result: { name: 'Error', code: 'Error', message: 'lookup failed' },
     });
+  });
+
+  it('persists repeated object references and undefined event fields without poisoning replay', async () => {
+    const { harness, agent, storage } = setup();
+    const shared = { ok: true };
+    agent.chunks = [
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'mastra' } },
+        runId: 'fake-run',
+      },
+      {
+        type: 'tool-result',
+        payload: { toolCallId: 'tc1', result: { first: shared, second: shared, omitted: undefined } },
+        runId: 'fake-run',
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'hi' });
+
+    await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    expect(state).not.toBeNull();
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    const toolEnd = rows.map(row => row.event).find((event: any) => event.type === 'tool_end') as any;
+    expect(toolEnd).toMatchObject({
+      type: 'tool_end',
+      toolCallId: 'tc1',
+      isError: false,
+      result: { first: { ok: true }, second: { ok: true } },
+    });
+    expect(toolEnd.result).not.toHaveProperty('omitted');
   });
 
   it('bridges a data-task-updated writer chunk into a task_updated event', async () => {
