@@ -822,6 +822,7 @@ export class HarnessLibSQL extends HarnessStorage {
 
   async deleteSessions({ sessions }: { sessions: DeleteSessionOptions[] }): Promise<void> {
     await this.#ensureMessageResultsTable();
+    await this.#ensureSessionEventsTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,

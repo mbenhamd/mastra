@@ -1,11 +1,8 @@
 ---
 '@mastra/server': patch
-'@mastra/core': patch
-'@mastra/libsql': patch
-'@mastra/pg': patch
 ---
 
-Added reconnectable Harness session event replay and result recovery APIs for remote clients.
+Harness sessions can now recover from disconnections. Remote clients can resume event streaming with `Last-Event-ID` and retrieve results for interrupted message or queue operations.
 
 ```ts
 const eventStream = await fetch(`/harness/${name}/sessions/${sessionId}/events`, {

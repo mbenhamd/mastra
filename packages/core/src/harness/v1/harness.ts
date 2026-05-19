@@ -1878,7 +1878,11 @@ export class Harness {
       version: lease.version,
     };
     if ((leasedRecord.pendingQueue?.length ?? 0) > 0) {
-      const recovered = this._adoptSession(storage, leasedRecord, { emitCreated: false, kickQueueDrain: false });
+      const recovered = this._adoptSession(storage, leasedRecord, {
+        emitCreated: false,
+        kickQueueDrain: false,
+        eventReplaySeed: await this._eventReplaySeedFor(storage, leasedRecord),
+      });
       return {
         record: recovered.getRecord(),
         depth,

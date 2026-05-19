@@ -12,7 +12,7 @@
  * their replay cursor (§10.5).
  *
  * Subscribers see only events emitted after `subscribe()` returns. Remote
- * callers that need history replay through the durable session event ledger.
+ * callers that need history replay query the durable session event ledger.
  */
 
 import { randomUUID } from 'node:crypto';

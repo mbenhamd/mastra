@@ -47,7 +47,6 @@ import type {
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   InboxResponseReceipt,
-  JsonValue,
   QueueAdmissionReceipt,
   PendingResume,
   PermissionRules,

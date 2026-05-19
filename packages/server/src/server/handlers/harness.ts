@@ -1311,6 +1311,7 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
       const liveQueue: HarnessEvent[] = [];
       const replayedEventIds = new Set<string>();
       let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let replaying = parsed !== undefined;
       let closed = false;
       const cleanup = () => {
         if (closed) return;
@@ -1320,45 +1321,56 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
       };
       unsubscribe = session.subscribe(event => {
         if (closed) return;
-        if (controller) {
-          if (replayedEventIds.has(event.id)) return;
-          try {
-            controller.enqueue(encodeHarnessSseEvent(event));
-          } catch {
-            cleanup();
-          }
+        if (!controller || replaying) {
+          liveQueue.push(event);
           return;
         }
-        liveQueue.push(event);
+        if (replayedEventIds.has(event.id)) return;
+        try {
+          controller.enqueue(encodeHarnessSseEvent(event));
+        } catch {
+          cleanup();
+        }
       });
 
-      const replayEvents: HarnessEvent[] = [];
+      let replayState:
+        | {
+            epoch: string;
+            oldestSequence: number;
+            newestSequence: number;
+          }
+        | null
+        | undefined;
       if (parsed) {
-        const state = await session.getEventReplayState();
+        replayState = await session.getEventReplayState();
         if (
-          !state ||
-          state.epoch !== parsed.epoch ||
-          parsed.sequence < state.oldestSequence - 1 ||
-          parsed.sequence > state.newestSequence
+          !replayState ||
+          replayState.epoch !== parsed.epoch ||
+          parsed.sequence < replayState.oldestSequence - 1 ||
+          parsed.sequence > replayState.newestSequence
         ) {
           cleanup();
           return preconditionFailedResponse({
-            reason: !state || state.epoch !== parsed.epoch ? 'stale_epoch' : 'unreplayable_gap',
+            reason: !replayState || replayState.epoch !== parsed.epoch ? 'stale_epoch' : 'unreplayable_gap',
             lastEventId,
             sessionId: pathSessionId,
           });
         }
-        const rows: Array<{ event: HarnessEvent; sequence: number }> = [];
+
         let afterSequence = parsed.sequence;
         let expectedSequence = parsed.sequence + 1;
-        while (expectedSequence <= state.newestSequence) {
+        while (expectedSequence <= replayState.newestSequence) {
+          if (abortSignal?.aborted) {
+            cleanup();
+            return new Response(null, { status: 204 });
+          }
           const page = (
             await session.listEventsAfter({
               epoch: parsed.epoch,
               afterSequence,
               limit: 1000,
             })
-          ).filter(row => row.sequence <= state.newestSequence);
+          ).filter(row => row.sequence <= replayState!.newestSequence);
           if (page.length === 0) {
             cleanup();
             return preconditionFailedResponse({ reason: 'unreplayable_gap', lastEventId, sessionId: pathSessionId });
@@ -1368,19 +1380,14 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
               cleanup();
               return preconditionFailedResponse({ reason: 'unreplayable_gap', lastEventId, sessionId: pathSessionId });
             }
-            rows.push(row);
             afterSequence = row.sequence;
             expectedSequence += 1;
           }
         }
-        for (const row of rows) {
-          replayEvents.push(row.event);
-          replayedEventIds.add(row.event.id);
-        }
       }
 
       const stream = new ReadableStream<Uint8Array>({
-        start(streamController) {
+        async start(streamController) {
           controller = streamController;
           const abortCleanup = () => {
             cleanup();
@@ -1389,12 +1396,50 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
             } catch {}
           };
           abortSignal?.addEventListener('abort', abortCleanup, { once: true });
-          for (const event of replayEvents) {
-            streamController.enqueue(encodeHarnessSseEvent(event));
+          if (abortSignal?.aborted) {
+            abortCleanup();
+            return;
           }
-          for (const event of liveQueue.splice(0)) {
-            if (replayedEventIds.has(event.id)) continue;
-            streamController.enqueue(encodeHarnessSseEvent(event));
+
+          try {
+            if (parsed && replayState) {
+              let afterSequence = parsed.sequence;
+              let expectedSequence = parsed.sequence + 1;
+              while (expectedSequence <= replayState.newestSequence) {
+                if (abortSignal?.aborted || closed) return;
+                const page = (
+                  await session.listEventsAfter({
+                    epoch: parsed.epoch,
+                    afterSequence,
+                    limit: 1000,
+                  })
+                ).filter(row => row.sequence <= replayState!.newestSequence);
+                if (page.length === 0) {
+                  cleanup();
+                  streamController.error(new Error('Harness event replay gap appeared after preflight'));
+                  return;
+                }
+                for (const row of page) {
+                  if (row.sequence !== expectedSequence) {
+                    cleanup();
+                    streamController.error(new Error('Harness event replay gap appeared after preflight'));
+                    return;
+                  }
+                  replayedEventIds.add(row.event.id);
+                  streamController.enqueue(encodeHarnessSseEvent(row.event));
+                  afterSequence = row.sequence;
+                  expectedSequence += 1;
+                }
+              }
+            }
+            replaying = false;
+            for (const event of liveQueue.splice(0)) {
+              if (replayedEventIds.has(event.id)) continue;
+              streamController.enqueue(encodeHarnessSseEvent(event));
+            }
+          } catch (error) {
+            cleanup();
+            streamController.error(error);
           }
         },
         cancel() {

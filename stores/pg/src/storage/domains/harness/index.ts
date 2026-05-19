@@ -1131,6 +1131,7 @@ export class HarnessPG extends HarnessStorage {
 
   async deleteSessions({ sessions }: { sessions: DeleteSessionOptions[] }): Promise<void> {
     await this.#ensureMessageResultsTable();
+    await this.#ensureSessionEventsTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,
@@ -1730,10 +1731,9 @@ export class HarnessPG extends HarnessStorage {
       sql: `INSERT INTO ${TABLE_HARNESS_SESSION_EVENTS}
             (harness_name, session_id, resource_id, thread_id, event_id, epoch, sequence, event, emitted_at, stored_at)
             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE EXISTS (
-              SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
-              WHERE harness_name = ? AND id = ? AND resource_id = ? AND thread_id = ?
-            )
+            FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ? AND resource_id = ? AND thread_id = ?
+            FOR KEY SHARE
             ON CONFLICT (harness_name, session_id, epoch, sequence) DO NOTHING`,
       args: [
         namespace,
