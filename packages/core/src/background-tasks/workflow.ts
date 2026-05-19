@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { SuspendOptions } from '../workflows';
 import { createStep, createWorkflow } from '../workflows/evented';
 import type { BackgroundTaskManager } from './manager';
+import { BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE } from './shutdown';
 import type { BackgroundTaskStatus } from './types';
 import { BACKGROUND_TASK_WORKFLOW_ID } from './workflow-id';
 
@@ -59,6 +60,10 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       const storage = await manager.getStorage();
       const task = await storage.getTask(taskId);
       if (!task || task.status === 'cancelled') {
+        manager.deregisterTaskContext(taskId);
+        return { taskId, outcome: 'cancelled' as const };
+      }
+      if (manager.isShuttingDown()) {
         manager.deregisterTaskContext(taskId);
         return { taskId, outcome: 'cancelled' as const };
       }
@@ -168,11 +173,18 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           return { taskId, outcome: 'cancelled' as const };
         }
 
-        // Treat any aborted-signal exit as a timeout. The cancel path is
-        // already handled by the storage-status check above, so if we reach
-        // here with `signal.aborted`, it's the timeout abort. The
-        // `AbortError` / message checks are belt-and-braces for executors
-        // that throw their own abort error instead of propagating ours.
+        // Shutdown aborts are local process teardown, not task timeouts. Other
+        // aborted-signal exits are treated as timeouts; explicit cancellation is
+        // already handled by the storage-status check above.
+        if (
+          abortController.signal.aborted &&
+          abortController.signal.reason instanceof Error &&
+          abortController.signal.reason.message === BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE
+        ) {
+          manager.deregisterTaskContext(taskId);
+          return { taskId, outcome: 'cancelled' as const };
+        }
+
         if (
           abortController.signal.aborted ||
           error?.name === 'AbortError' ||

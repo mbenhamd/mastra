@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Mastra } from '..';
 import type { PubSub } from '../events/pubsub';
 import type { Event, EventCallback } from '../events/types';
+import { BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE } from './shutdown';
 import type {
   BackgroundTask,
   BackgroundTaskManagerConfig,
@@ -22,6 +23,13 @@ const WORKER_GROUP = 'background-task-workers';
 
 const isTerminalBackgroundTaskStatus = (status: BackgroundTaskStatus) =>
   status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'timed_out';
+
+const createUnrecoverableTaskError = (task: BackgroundTask): { message: string } => ({
+  message:
+    `Background task "${task.id}" for tool "${task.toolName}" could not be recovered after restart because ` +
+    `no local task context or registered static executor is available. Closure-backed tasks must stay behind ` +
+    `an owning durable Harness row that can retry or repair the work.`,
+});
 
 export class BackgroundTaskManager {
   private pubsub!: PubSub;
@@ -55,6 +63,7 @@ export class BackgroundTaskManager {
 
   // Cleanup interval handle
   private cleanupInterval?: ReturnType<typeof setInterval>;
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
 
   // Tracks the in-flight `init(pubsub)` so consumers can await readiness.
   // Mastra fires init as fire-and-forget in `#ensureBackgroundTaskManager`,
@@ -212,6 +221,21 @@ export class BackgroundTaskManager {
    */
   getStaticExecutor(toolName: string): ToolExecutor | undefined {
     return this.staticExecutors.get(toolName);
+  }
+
+  /** @internal — read by workflow step bodies before starting local execution. */
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  private canResolveTaskExecutor(task: BackgroundTask): boolean {
+    return this.taskContexts.has(task.id) || this.staticExecutors.has(task.toolName);
+  }
+
+  private isRunningTaskExpired(task: BackgroundTask, now: Date): boolean {
+    if (!task.startedAt) return true;
+    const expiresAt = task.startedAt.getTime() + task.timeoutMs;
+    return Number.isFinite(expiresAt) && expiresAt <= now.getTime();
   }
 
   // --- Core operations ---
@@ -727,6 +751,10 @@ export class BackgroundTaskManager {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = undefined;
     }
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
 
     if (this.workerCallback) {
       await this.pubsub.unsubscribe(TOPIC_DISPATCH, this.workerCallback);
@@ -734,6 +762,14 @@ export class BackgroundTaskManager {
     if (this.resultCallback) {
       await this.pubsub.unsubscribe(TOPIC_RESULT, this.resultCallback);
     }
+
+    const shutdownError = new Error(BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE);
+    for (const controller of this.activeAbortControllers.values()) {
+      if (!controller.signal.aborted) {
+        controller.abort(shutdownError);
+      }
+    }
+    this.activeAbortControllers.clear();
 
     this.taskContexts.clear();
     await this.pubsub.flush();
@@ -807,7 +843,7 @@ export class BackgroundTaskManager {
     const claimed = await storage.updateTaskIfStatus(taskId, 'pending', {
       status: 'running',
       startedAt: new Date(),
-      retryCount: deliveryAttempt - 1,
+      retryCount: Math.max(task.retryCount, deliveryAttempt - 1),
     });
     if (!claimed) {
       const latestTask = await storage.getTask(taskId);
@@ -1250,20 +1286,35 @@ export class BackgroundTaskManager {
   private async recoverStaleTasks(): Promise<void> {
     try {
       if (this.shuttingDown) return;
+      if (this.recoveryTimer) {
+        clearTimeout(this.recoveryTimer);
+        this.recoveryTimer = undefined;
+      }
 
       const storage = await this.getStorage();
       const { tasks: staleTasks } = await storage.listTasks({ status: 'running' });
+      const now = new Date();
+      let nextRecoveryAt: number | undefined;
       for (const task of staleTasks) {
         if (this.shuttingDown) return;
-        if (task.maxRetries > 0) {
-          await storage.updateTask(task.id, {
+        if (!this.isRunningTaskExpired(task, now)) {
+          const retryAt = task.startedAt ? task.startedAt.getTime() + task.timeoutMs : now.getTime();
+          nextRecoveryAt = Math.min(nextRecoveryAt ?? retryAt, retryAt);
+          continue;
+        }
+
+        if (task.retryCount < task.maxRetries && this.canResolveTaskExecutor(task)) {
+          await storage.updateTaskIfStatus(task.id, 'running', {
             status: 'pending',
             startedAt: undefined,
+            retryCount: task.retryCount + 1,
           });
         } else {
-          await storage.updateTask(task.id, {
+          await storage.updateTaskIfStatus(task.id, 'running', {
             status: 'failed',
-            error: { message: 'Worker process terminated before task completed' },
+            error: this.canResolveTaskExecutor(task)
+              ? { message: 'Worker process terminated before task completed' }
+              : createUnrecoverableTaskError(task),
             completedAt: new Date(),
           });
         }
@@ -1276,15 +1327,26 @@ export class BackgroundTaskManager {
       });
       for (const task of pendingTasks) {
         if (this.shuttingDown) return;
+        if (!this.canResolveTaskExecutor(task)) continue;
         if (await this.checkConcurrency(task.agentId)) {
           await this.dispatch(task);
         }
       }
+      this.scheduleRecovery(nextRecoveryAt, now.getTime());
     } catch (error) {
       const logger = this.#mastra?.getLogger();
       if (logger) {
         logger.error('Failed to recover stale background tasks', error);
       }
     }
+  }
+
+  private scheduleRecovery(retryAt: number | undefined, nowMs: number): void {
+    if (this.shuttingDown || retryAt === undefined) return;
+    const delayMs = Math.min(Math.max(retryAt - nowMs, 0), 2_147_483_647);
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = undefined;
+      void this.recoverStaleTasks();
+    }, delayMs);
   }
 }
