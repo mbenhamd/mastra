@@ -1038,12 +1038,13 @@ export class Harness {
     const claimRenewMs = config?.outbox?.claimRenewMs ?? Math.max(1, Math.floor(claimTtlMs / 2));
     const markFailure = async (code: HarnessRowErrorCode, message: string, retryable = true) => {
       const dead = !retryable || item.attempts >= maxAttempts;
+      const retryBaseNow = opts.now ?? Date.now();
       try {
         await storage.markChannelOutboxFailed({
           outboxItemId: item.id,
           claimId,
           dead,
-          ...(!dead ? { retryAt: Date.now() + this._channelOutboxRetryBackoffMs(config, item.attempts) } : {}),
+          ...(!dead ? { retryAt: retryBaseNow + this._channelOutboxRetryBackoffMs(config, item.attempts) } : {}),
           error: { code, message, retryable: !dead },
         });
       } catch (err) {

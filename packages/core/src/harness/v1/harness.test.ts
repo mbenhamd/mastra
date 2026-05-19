@@ -626,6 +626,130 @@ describe('Harness v1 — construction', () => {
     });
   });
 
+  it('uses the dispatch clock for retryable outbox failure backoff', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const storage = makeStorage();
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+        sessions: { storage },
+        channels: {
+          support: makeHarnessChannelConfig({
+            outbox: { maxAttempts: 3, retryBackoffMs: () => 5_000 },
+            adapter: {
+              deliver: async () => {
+                throw new Error('provider temporarily unavailable');
+              },
+            },
+          }),
+        },
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        channels: { slack: makeChannelProvider('slack') },
+        harnesses: { primary: harness },
+      });
+
+      await harness.channels.enqueueOutbox(channelOutboxInput());
+
+      await expect(
+        harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-clock-1', now: 100_000 }),
+      ).resolves.toMatchObject({
+        claimed: 1,
+        sent: 0,
+        failed: 1,
+        dead: 0,
+      });
+      await expect(
+        harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-clock-early', now: 104_999 }),
+      ).resolves.toMatchObject({
+        claimed: 0,
+        sent: 0,
+        failed: 0,
+        dead: 0,
+      });
+      await expect(
+        harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-clock-2', now: 105_000 }),
+      ).resolves.toMatchObject({
+        claimed: 1,
+        sent: 0,
+        failed: 1,
+        dead: 0,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off from failure time for delayed outbox delivery failures', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const storage = makeStorage();
+      let deliverCalls = 0;
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+        sessions: { storage },
+        channels: {
+          support: makeHarnessChannelConfig({
+            outbox: { maxAttempts: 3, retryBackoffMs: () => 5_000 },
+            adapter: {
+              deliver: async () => {
+                deliverCalls += 1;
+                if (deliverCalls === 1) {
+                  await new Promise(resolve => setTimeout(resolve, 10_000));
+                  throw new Error('delayed provider failure');
+                }
+                throw new Error('provider still unavailable');
+              },
+            },
+          }),
+        },
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        channels: { slack: makeChannelProvider('slack') },
+        harnesses: { primary: harness },
+      });
+
+      await harness.channels.enqueueOutbox(channelOutboxInput());
+      const firstDispatch = harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-delayed-1' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(firstDispatch).resolves.toMatchObject({
+        claimed: 1,
+        sent: 0,
+        failed: 1,
+        dead: 0,
+      });
+      expect(deliverCalls).toBe(1);
+
+      await expect(
+        harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-delayed-early', now: 14_999 }),
+      ).resolves.toMatchObject({
+        claimed: 0,
+        sent: 0,
+        failed: 0,
+        dead: 0,
+      });
+      await expect(
+        harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-delayed-2', now: 15_000 }),
+      ).resolves.toMatchObject({
+        claimed: 1,
+        sent: 0,
+        failed: 1,
+        dead: 0,
+      });
+      expect(deliverCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('throws HarnessConfigError for unknown agentId on a mode', () => {
     expect(
       () =>
