@@ -127,6 +127,10 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       const timeoutHandle = setTimeout(() => {
         abortController.abort(new Error(`Task timed out after ${task.timeoutMs}ms`));
       }, task.timeoutMs);
+      const wasShutdownAbort = () =>
+        abortController.signal.aborted &&
+        abortController.signal.reason instanceof Error &&
+        abortController.signal.reason.message === BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE;
 
       // Wrap the workflow runtime's `suspend` so we persist
       // `status: 'suspended'` + `suspendPayload`, fire the per-task
@@ -140,6 +144,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
       // tool's call.
       let pendingSuspend: { data?: unknown; suspendOptions?: SuspendOptions } | undefined;
       const wrappedSuspend = async (data?: unknown, suspendOptions?: SuspendOptions) => {
+        if (wasShutdownAbort()) return;
         await storage.updateTask(taskId, {
           status: 'suspended',
           suspendPayload: data,
@@ -171,6 +176,11 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           return suspend(pendingSuspend.data, pendingSuspend.suspendOptions as SuspendOptions);
         }
 
+        if (wasShutdownAbort()) {
+          manager.deregisterTaskContext(taskId);
+          return { taskId, outcome: 'cancelled' as const };
+        }
+
         return { taskId, outcome: 'success' as const, result };
       } catch (error: any) {
         const currentTask = await storage.getTask(taskId);
@@ -182,11 +192,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         // Shutdown aborts are local process teardown, not task timeouts. Other
         // aborted-signal exits are treated as timeouts; explicit cancellation is
         // already handled by the storage-status check above.
-        if (
-          abortController.signal.aborted &&
-          abortController.signal.reason instanceof Error &&
-          abortController.signal.reason.message === BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE
-        ) {
+        if (wasShutdownAbort()) {
           manager.deregisterTaskContext(taskId);
           return { taskId, outcome: 'cancelled' as const };
         }

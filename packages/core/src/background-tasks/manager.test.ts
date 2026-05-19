@@ -1751,5 +1751,80 @@ describe('BackgroundTaskManager', () => {
       expect(manager.activeAbortControllers.size).toBe(0);
       expect((await manager.getTask(task.id))?.status).toBe('running');
     });
+
+    it('does not complete a task when the executor resolves after shutdown abort', async () => {
+      let taskSignal: AbortSignal | undefined;
+      let sawAbort!: () => void;
+      const abortSeen = new Promise<void>(resolve => {
+        sawAbort = resolve;
+      });
+      const executeFn = vi.fn(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise(resolve => {
+            taskSignal = opts.abortSignal;
+            opts.abortSignal.addEventListener(
+              'abort',
+              () => {
+                sawAbort();
+                resolve('resolved-after-shutdown');
+              },
+              { once: true },
+            );
+          }),
+      );
+
+      const { task } = await manager.enqueue(
+        { toolName: 'shutdown-resolve-tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('running');
+
+      await manager.shutdown();
+      await abortSeen;
+      await tick(100);
+
+      expect(taskSignal?.aborted).toBe(true);
+      expect((await manager.getTask(task.id))?.status).toBe('running');
+    });
+
+    it('does not suspend a task when the executor reacts to shutdown abort by suspending', async () => {
+      let taskSignal: AbortSignal | undefined;
+      let sawAbort!: () => void;
+      const abortSeen = new Promise<void>(resolve => {
+        sawAbort = resolve;
+      });
+      const executeFn = vi.fn(
+        (_args: any, opts: { abortSignal: AbortSignal; suspend: (data?: unknown) => Promise<void> }) =>
+          new Promise(resolve => {
+            taskSignal = opts.abortSignal;
+            opts.abortSignal.addEventListener(
+              'abort',
+              async () => {
+                await opts.suspend({ after: 'shutdown' });
+                sawAbort();
+                resolve('resolved-after-shutdown-suspend');
+              },
+              { once: true },
+            );
+          }),
+      );
+
+      const { task } = await manager.enqueue(
+        { toolName: 'shutdown-suspend-tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('running');
+
+      await manager.shutdown();
+      await abortSeen;
+      await tick(100);
+
+      const current = await manager.getTask(task.id);
+      expect(taskSignal?.aborted).toBe(true);
+      expect(current?.status).toBe('running');
+      expect(current?.suspendPayload).toBeUndefined();
+    });
   });
 });
