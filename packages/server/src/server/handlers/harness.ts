@@ -837,7 +837,38 @@ function isPrivateIpAddress(address: string): boolean {
   return false;
 }
 
-async function resolveUrlIngestionTarget(url: URL, policy: HarnessFilePolicy): Promise<UrlIngestionTarget> {
+function throwUrlIngestionAborted(url: URL): never {
+  throwHarnessHttpError(400, 'harness.attachment_unavailable', 'URL attachment fetch timed out', {
+    reason: 'fetch_timeout',
+    url: url.toString(),
+  });
+}
+
+async function abortableLookup(hostname: string, url: URL, signal: AbortSignal) {
+  if (signal.aborted) throwUrlIngestionAborted(url);
+  let abort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => {
+      try {
+        throwUrlIngestionAborted(url);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try {
+    return await Promise.race([lookup(hostname, { all: true }), aborted]);
+  } finally {
+    if (abort) signal.removeEventListener('abort', abort);
+  }
+}
+
+async function resolveUrlIngestionTargets(
+  url: URL,
+  policy: HarnessFilePolicy,
+  signal: AbortSignal,
+): Promise<UrlIngestionTarget[]> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throwHarnessHttpError(400, 'harness.attachment_unavailable', 'URL attachments must use http or https', {
       reason: 'unsupported_url',
@@ -846,7 +877,7 @@ async function resolveUrlIngestionTarget(url: URL, policy: HarnessFilePolicy): P
   }
   const hostname = normalizeUrlHostname(url.hostname);
   if (policy.allowPrivateNetworkUrls) {
-    return { hostname, hostHeader: url.host, ...(url.protocol === 'https:' ? { servername: hostname } : {}) };
+    return [{ hostname, hostHeader: url.host, ...(url.protocol === 'https:' ? { servername: hostname } : {}) }];
   }
   if (
     hostname === 'localhost' ||
@@ -866,10 +897,10 @@ async function resolveUrlIngestionTarget(url: URL, policy: HarnessFilePolicy): P
     });
   }
   if (isIP(hostname)) {
-    return { hostname, hostHeader: url.host, ...(url.protocol === 'https:' ? { servername: hostname } : {}) };
+    return [{ hostname, hostHeader: url.host, ...(url.protocol === 'https:' ? { servername: hostname } : {}) }];
   }
   try {
-    const addresses = await lookup(hostname, { all: true });
+    const addresses = await abortableLookup(hostname, url, signal);
     if (addresses.some(entry => isPrivateIpAddress(entry.address))) {
       throwHarnessHttpError(
         400,
@@ -881,13 +912,13 @@ async function resolveUrlIngestionTarget(url: URL, policy: HarnessFilePolicy): P
         },
       );
     }
-    const address = addresses[0]?.address;
-    if (address) {
-      return {
-        hostname: address,
-        hostHeader: url.host,
-        ...(url.protocol === 'https:' ? { servername: hostname } : {}),
-      };
+    const targets = addresses.map(entry => ({
+      hostname: entry.address,
+      hostHeader: url.host,
+      ...(url.protocol === 'https:' ? { servername: hostname } : {}),
+    }));
+    if (targets.length > 0) {
+      return targets;
     }
   } catch (error) {
     if (error instanceof HTTPException) throw error;
@@ -910,6 +941,7 @@ function makeUrlIngestionSignal(
   const timeout = setTimeout(() => controller.abort(), policy.urlFetchTimeoutMs);
   const abort = () => controller.abort();
   parentSignal?.addEventListener('abort', abort, { once: true });
+  if (parentSignal?.aborted) controller.abort();
   return {
     signal: controller.signal,
     cleanup: () => {
@@ -997,6 +1029,7 @@ async function requestUrlAttachmentBytes(
   policy: HarnessFilePolicy,
   signal: AbortSignal,
 ): Promise<{ status: number; headers: IncomingHttpHeaders; data: Uint8Array }> {
+  if (signal.aborted) throwUrlIngestionAborted(url);
   const client = url.protocol === 'https:' ? httpsRequest : httpRequest;
   const options: RequestOptions = {
     protocol: url.protocol,
@@ -1012,12 +1045,20 @@ async function requestUrlAttachmentBytes(
   };
   return await new Promise((resolve, reject) => {
     const req = client(options, response => {
+      const status = response.statusCode ?? 0;
+      if (status < 200 || status >= 300) {
+        const headers = response.headers;
+        response.destroy();
+        resolve({ status, headers, data: new Uint8Array() });
+        return;
+      }
       readIncomingBytes(response, url.toString(), policy)
-        .then(data => resolve({ status: response.statusCode ?? 0, headers: response.headers, data }))
+        .then(data => resolve({ status, headers: response.headers, data }))
         .catch(reject);
     });
     const abort = () => req.destroy(new Error('aborted'));
     signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
     req.on('error', reject);
     req.on('close', () => signal.removeEventListener('abort', abort));
     req.end();
@@ -1033,8 +1074,26 @@ async function fetchUrlAttachmentBytes(
   const { signal, cleanup } = makeUrlIngestionSignal(policy, abortSignal);
   try {
     for (let redirect = 0; redirect <= policy.maxUrlRedirects; redirect += 1) {
-      const target = await resolveUrlIngestionTarget(current, policy);
-      const response = await requestUrlAttachmentBytes(current, target, input, policy, signal);
+      const targets = await resolveUrlIngestionTargets(current, policy, signal);
+      let response: Awaited<ReturnType<typeof requestUrlAttachmentBytes>> | undefined;
+      let fetchError: unknown;
+      for (const target of targets) {
+        try {
+          response = await requestUrlAttachmentBytes(current, target, input, policy, signal);
+          break;
+        } catch (error) {
+          if (error instanceof HTTPException) throw error;
+          if (signal.aborted) throwUrlIngestionAborted(current);
+          fetchError = error;
+        }
+      }
+      if (!response) {
+        if (fetchError) throw fetchError;
+        throwHarnessHttpError(400, 'harness.attachment_unavailable', 'URL attachment target could not be resolved', {
+          reason: 'not_found',
+          url: current.toString(),
+        });
+      }
       if (REDIRECT_STATUSES.has(response.status)) {
         const location = headerValue(response.headers, 'location');
         if (!location || redirect === policy.maxUrlRedirects) {

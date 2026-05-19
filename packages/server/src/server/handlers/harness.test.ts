@@ -1023,6 +1023,65 @@ describe('Harness server routes', () => {
     expect(secondId).toBe(firstId);
   });
 
+  it('does not buffer redirect bodies before following URL attachment redirects', async () => {
+    const session = {
+      admitMessage: vi.fn(async () => ({
+        accepted: true as const,
+        signalId: 'signal-1',
+        duplicate: false,
+      })),
+    };
+    const harness = {
+      getFileConfig: vi.fn(() => ({ allowPrivateNetworkUrls: true, maxUrlBytes: 4 })),
+      session: vi.fn(async () => session),
+      attachments: {
+        upload: vi.fn(async (opts: any) => ({
+          attachmentId: opts.attachmentId,
+          resourceId: 'resource-1',
+          ownerSessionId: 'session-1',
+          bytes: opts.data.byteLength,
+          sha256: 'stored-sha',
+          source: 'url',
+          kind: 'file',
+          name: opts.filename,
+          mimeType: opts.contentType,
+        })),
+      },
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await withUrlServer(
+      (request, response) => {
+        if (request.url === '/redirect') {
+          response.writeHead(302, { location: '/remote.txt', 'content-type': 'text/plain' });
+          response.end('too-large-for-policy');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('ok');
+      },
+      async baseUrl => {
+        await expect(
+          POST_HARNESS_MESSAGE_ROUTE.handler(
+            makeParams({
+              mastra,
+              name: 'code',
+              sessionId: 'session-1',
+              requestBody: {
+                content: 'hello',
+                admissionId: 'admission-1',
+                files: [{ kind: 'url', url: `${baseUrl}/redirect`, name: 'remote.txt', mimeType: 'text/plain' }],
+              },
+            }),
+          ),
+        ).resolves.toEqual({ accepted: true, signalId: 'signal-1', duplicate: false });
+      },
+    );
+
+    expect(harness.attachments.upload).toHaveBeenCalledTimes(1);
+    expect(harness.attachments.upload.mock.calls[0]?.[0].data).toEqual(new Uint8Array(Buffer.from('ok')));
+  });
+
   it('normalizes spec ref attachments before message admission', async () => {
     const session = {
       admitMessage: vi.fn(async () => ({

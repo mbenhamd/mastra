@@ -122,8 +122,8 @@ describe('Harness.attachments', () => {
 
     allowedUrlMimeTypes.push('image/png');
     const exposed = harness.getFileConfig().allowedUrlMimeTypes as string[];
-    exposed.push('application/json');
 
+    expect(() => exposed.push('application/json')).toThrow(TypeError);
     expect(harness.getFileConfig().allowedUrlMimeTypes).toEqual(['text/plain']);
   });
 

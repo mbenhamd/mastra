@@ -1025,11 +1025,12 @@ export class HarnessLibSQL extends HarnessStorage {
     const bytes = data.byteLength;
     const dataB64 = bytesToBase64(data);
     await this.#client.execute({
-      sql: `INSERT OR IGNORE INTO ${TABLE_HARNESS_ATTACHMENTS}
+      sql: `INSERT INTO ${TABLE_HARNESS_ATTACHMENTS}
             (harness_name, session_id, attachment_id, name, mime_type, size_bytes, sha256, source,
              kind, primitive_type, element_type, renderer_json, schema_id, metadata_json, object_json,
              created_at, data_b64)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(harness_name, session_id, attachment_id) DO NOTHING`,
       args: [
         namespace,
         sessionId,

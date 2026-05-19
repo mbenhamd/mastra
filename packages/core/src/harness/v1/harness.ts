@@ -2954,12 +2954,12 @@ export class Harness {
   };
 
   getFileConfig(): Readonly<HarnessFileConfig> {
-    return {
+    return Object.freeze({
       ...this._fileConfig,
       ...(this._fileConfig.allowedUrlMimeTypes
-        ? { allowedUrlMimeTypes: [...this._fileConfig.allowedUrlMimeTypes] }
+        ? { allowedUrlMimeTypes: Object.freeze([...this._fileConfig.allowedUrlMimeTypes]) }
         : {}),
-    };
+    });
   }
 
   attachments = {
