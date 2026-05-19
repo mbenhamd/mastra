@@ -127,6 +127,19 @@ describe('Agent FGA checks', () => {
       await expect(agent.generate('test', { requestContext: requestContext as any })).rejects.toThrow(FGADeniedError);
     });
 
+    it('should reject missing users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const model = createMockModel();
+
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.generate('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+      expect(model.doGenerateCalls).toHaveLength(0);
+    });
+
     it('should not call FGA check when no FGA provider configured', async () => {
       const mastra = createMockMastra();
       const model = createMockModel();
@@ -138,6 +151,18 @@ describe('Agent FGA checks', () => {
       requestContext.set('user', { id: 'user-1' });
 
       await agent.generate('test', { requestContext: requestContext as any });
+
+      expect(model.doGenerateCalls).toHaveLength(1);
+    });
+
+    it('should still run local calls without a user when no FGA provider is configured', async () => {
+      const mastra = createMockMastra();
+      const model = createMockModel();
+
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
+      (agent as any).__registerMastra(mastra);
+
+      await agent.generate('test');
 
       expect(model.doGenerateCalls).toHaveLength(1);
     });
@@ -167,6 +192,41 @@ describe('Agent FGA checks', () => {
         { id: 'default-user', organizationMembershipId: 'default-om' },
         { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
       );
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject default request contexts without users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        defaultOptions: { requestContext: new RequestContext() as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.generate('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+    });
+
+    it('should reject function default options without users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        defaultOptions: () => ({ requestContext: new RequestContext() as any }),
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.generate('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
     });
   });
 
@@ -206,6 +266,31 @@ describe('Agent FGA checks', () => {
       await expect(agent.stream('test', { requestContext: requestContext as any })).rejects.toThrow(FGADeniedError);
     });
 
+    it('should reject missing users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model: createMockModel() });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.stream('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+    });
+
+    it('should still run local calls without a user when no FGA provider is configured', async () => {
+      const mastra = createMockMastra();
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await agent.stream('test');
+    });
+
     it('should authorize the effective request context from default options', async () => {
       const fgaProvider = createMockFGAProvider(true);
       const mastra = createMockMastra(fgaProvider);
@@ -231,6 +316,40 @@ describe('Agent FGA checks', () => {
         { id: 'default-user', organizationMembershipId: 'default-om' },
         { resource: { type: 'agent', id: 'test-agent' }, permission: 'agents:execute' },
       );
+    });
+
+    it('should reject default request contexts without users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        defaultOptions: { requestContext: new RequestContext() as any },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.stream('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+    });
+
+    it('should reject function default options without users when FGA is configured', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        defaultOptions: () => ({}),
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(agent.stream('test')).rejects.toThrow(FGADeniedError);
+      expect(fgaProvider.require).not.toHaveBeenCalled();
     });
   });
 
