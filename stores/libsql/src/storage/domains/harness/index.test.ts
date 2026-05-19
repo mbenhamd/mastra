@@ -1702,6 +1702,46 @@ describe('HarnessLibSQL channel outbox ledger', () => {
     ]);
   });
 
+  it('rechecks per-binding head-of-line ordering in the claim update', async () => {
+    await storage.enqueueChannelOutbox(
+      sampleChannelOutbox({ id: 'outbox-later', idempotencyKey: 'key-later', createdAt: 1001 }),
+    );
+    const execute = client.execute.bind(client);
+    const executeSpy = vi.spyOn(client, 'execute').mockImplementation(async statement => {
+      if (
+        typeof statement === 'object' &&
+        typeof statement.sql === 'string' &&
+        statement.sql.includes(`UPDATE ${TABLE_HARNESS_CHANNEL_OUTBOX}`) &&
+        statement.sql.includes("SET status = 'claimed'")
+      ) {
+        executeSpy.mockRestore();
+        await storage.enqueueChannelOutbox(
+          sampleChannelOutbox({ id: 'outbox-earlier', idempotencyKey: 'key-earlier', createdAt: 1000 }),
+        );
+      }
+      return execute(statement);
+    });
+
+    await expect(
+      storage.claimChannelOutbox({
+        harnessName: 'default',
+        claimId: 'claim-race',
+        limit: 1,
+        now: 2000,
+        claimTtlMs: 5000,
+      }),
+    ).resolves.toEqual([]);
+
+    const claimed = await storage.claimChannelOutbox({
+      harnessName: 'default',
+      claimId: 'claim-next',
+      limit: 1,
+      now: 2000,
+      claimTtlMs: 5000,
+    });
+    expect(claimed).toEqual([expect.objectContaining({ id: 'outbox-earlier', claimId: 'claim-next' })]);
+  });
+
   it('clears stale failure metadata when reclaiming retryable outbox rows', async () => {
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);

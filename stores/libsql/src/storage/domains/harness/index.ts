@@ -2613,7 +2613,21 @@ export class HarnessLibSQL extends HarnessStorage {
               WHERE harness_name = ? AND id = ?
                 AND status IN ('pending', 'failed', 'claimed')
                 AND (claim_id IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)
-                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                AND NOT EXISTS (
+                  SELECT 1 FROM ${TABLE_HARNESS_CHANNEL_OUTBOX} AS earlier
+                  WHERE earlier.harness_name = ${TABLE_HARNESS_CHANNEL_OUTBOX}.harness_name
+                    AND earlier.binding_id = ${TABLE_HARNESS_CHANNEL_OUTBOX}.binding_id
+                    AND earlier.id != ${TABLE_HARNESS_CHANNEL_OUTBOX}.id
+                    AND earlier.status NOT IN ('sent', 'dead')
+                    AND (
+                      earlier.created_at < ${TABLE_HARNESS_CHANNEL_OUTBOX}.created_at
+                      OR (
+                        earlier.created_at = ${TABLE_HARNESS_CHANNEL_OUTBOX}.created_at
+                        AND earlier.id < ${TABLE_HARNESS_CHANNEL_OUTBOX}.id
+                      )
+                    )
+                )`,
         args: [opts.claimId, opts.now + opts.claimTtlMs, opts.now, namespace, id, opts.now, opts.now],
       });
       if (update.rowsAffected === 0) continue;
