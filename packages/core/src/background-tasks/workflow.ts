@@ -110,6 +110,12 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
 
       const abortController = new AbortController();
       manager.activeAbortControllers.set(taskId, abortController);
+      if (manager.isShuttingDown()) {
+        abortController.abort(new Error(BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE));
+        manager.activeAbortControllers.delete(taskId);
+        manager.deregisterTaskContext(taskId);
+        return { taskId, outcome: 'cancelled' as const };
+      }
       // Wire the workflow's run-level abort signal into our local controller
       // so `workflow.getRun(taskId).cancel()` propagates to the executor.
       const onWorkflowAbort = () => abortController.abort(new Error('Task cancelled'));

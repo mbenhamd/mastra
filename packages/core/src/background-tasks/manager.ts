@@ -20,6 +20,7 @@ import { BACKGROUND_TASK_WORKFLOW_ID } from './workflow-id';
 const TOPIC_DISPATCH = 'background-tasks';
 const TOPIC_RESULT = 'background-tasks-result';
 const WORKER_GROUP = 'background-task-workers';
+const RECOVERY_ERROR_RETRY_MS = 60_000;
 
 const isTerminalBackgroundTaskStatus = (status: BackgroundTaskStatus) =>
   status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'timed_out';
@@ -1284,6 +1285,7 @@ export class BackgroundTaskManager {
    * Recovers tasks left in 'running' or 'pending' state from a previous process.
    */
   private async recoverStaleTasks(): Promise<void> {
+    let nextRecoveryAt: number | undefined;
     try {
       if (this.shuttingDown) return;
       if (this.recoveryTimer) {
@@ -1294,7 +1296,6 @@ export class BackgroundTaskManager {
       const storage = await this.getStorage();
       const { tasks: staleTasks } = await storage.listTasks({ status: 'running' });
       const now = new Date();
-      let nextRecoveryAt: number | undefined;
       for (const task of staleTasks) {
         if (this.shuttingDown) return;
         if (!this.isRunningTaskExpired(task, now)) {
@@ -1332,11 +1333,15 @@ export class BackgroundTaskManager {
           await this.dispatch(task);
         }
       }
-      this.scheduleRecovery(nextRecoveryAt, now.getTime());
     } catch (error) {
       const logger = this.#mastra?.getLogger();
       if (logger) {
         logger.error('Failed to recover stale background tasks', error);
+      }
+      nextRecoveryAt = Date.now() + RECOVERY_ERROR_RETRY_MS;
+    } finally {
+      if (!this.recoveryTimer) {
+        this.scheduleRecovery(nextRecoveryAt, Date.now());
       }
     }
   }

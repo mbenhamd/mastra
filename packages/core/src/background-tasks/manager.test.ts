@@ -1213,6 +1213,42 @@ describe('BackgroundTaskManager', () => {
       }
     });
 
+    it('retries recovery after a transient storage failure', async () => {
+      vi.useFakeTimers();
+      const seedStorage = new MockStore();
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      await bgStore!.createTask({
+        id: 'recovery-after-error',
+        status: 'running',
+        toolName: 'missing-tool',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 5,
+        createdAt: new Date(),
+        startedAt: new Date(Date.now() - 60_000),
+      });
+      const listTasks = vi.spyOn(bgStore!, 'listTasks').mockRejectedValueOnce(new Error('temporary storage failure'));
+
+      try {
+        await withRecoveringManager(seedStorage, async () => {
+          expect((await bgStore!.getTask('recovery-after-error'))?.status).toBe('running');
+
+          await vi.advanceTimersByTimeAsync(60_000);
+
+          const failed = await bgStore!.getTask('recovery-after-error');
+          expect(failed?.status).toBe('failed');
+          expect(failed?.error?.message).toContain('could not be recovered after restart');
+        });
+      } finally {
+        listTasks.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
     it('re-dispatches stale pending tasks on init', async () => {
       const seedStorage = new MockStore();
       const local = new Mastra({
