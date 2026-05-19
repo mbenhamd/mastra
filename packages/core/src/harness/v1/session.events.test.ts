@@ -345,6 +345,9 @@ describe('Session events — fullStream drain', () => {
 
   it('persists repeated object references and undefined event fields without poisoning replay', async () => {
     const { harness, agent, storage } = setup();
+    class Box {
+      constructor(readonly value: string) {}
+    }
     const shared = { ok: true };
     agent.chunks = [
       {
@@ -354,7 +357,16 @@ describe('Session events — fullStream drain', () => {
       },
       {
         type: 'tool-result',
-        payload: { toolCallId: 'tc1', result: { first: shared, second: shared, omitted: undefined } },
+        payload: {
+          toolCallId: 'tc1',
+          result: {
+            first: shared,
+            second: shared,
+            at: new Date('2026-05-19T00:00:00.000Z'),
+            boxed: new Box('ok'),
+            omitted: undefined,
+          },
+        },
         runId: 'fake-run',
       },
     ];
@@ -382,7 +394,12 @@ describe('Session events — fullStream drain', () => {
       type: 'tool_end',
       toolCallId: 'tc1',
       isError: false,
-      result: { first: { ok: true }, second: { ok: true } },
+      result: {
+        first: { ok: true },
+        second: { ok: true },
+        at: '2026-05-19T00:00:00.000Z',
+        boxed: { value: 'ok' },
+      },
     });
     expect(toolEnd.result).not.toHaveProperty('omitted');
   });

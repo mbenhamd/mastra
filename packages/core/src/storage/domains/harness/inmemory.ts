@@ -427,12 +427,7 @@ export class InMemoryHarness extends HarnessStorage {
       threadId,
     });
     for (const [key, event] of this.db.harnessSessionEvents) {
-      if (
-        event.harnessName === namespace &&
-        event.sessionId === sessionId &&
-        event.resourceId === resourceId &&
-        event.threadId === threadId
-      ) {
+      if (event.harnessName === namespace && event.sessionId === sessionId) {
         this.db.harnessSessionEvents.delete(key);
       }
     }

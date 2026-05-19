@@ -375,6 +375,51 @@ describe('InMemoryHarness admission storage contract', () => {
     ).resolves.toBeNull();
   });
 
+  it('hard-deletes all session event replay rows for the session id', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch:1',
+      epoch: 'epoch',
+      sequence: 1,
+      event: { type: 'app.event', id: 'harness-v1:epoch:1', timestamp: 1000 },
+      emittedAt: 1000,
+      storedAt: 1000,
+    });
+
+    const active = await storage.loadSession({ sessionId: 'session-1' });
+    if (!active) throw new Error('expected session');
+    await storage.saveSession(
+      { ...active, threadId: 'thread-2', closedAt: 2000, lastActivityAt: 2000 },
+      { ownerId: 'h-1', ifVersion: active.version },
+    );
+    const closed = await storage.loadSession({ sessionId: 'session-1' });
+    if (!closed) throw new Error('expected session');
+
+    await storage.deleteSession({
+      sessionId: 'session-1',
+      ifVersion: closed.version,
+      expectedResourceId: closed.resourceId,
+      expectedThreadId: closed.threadId,
+      expectedParentSessionId: closed.parentSessionId ?? null,
+      expectedCreatedAt: closed.createdAt,
+      requireClosed: true,
+    });
+
+    await expect(
+      storage.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toBeNull();
+  });
+
   it('lists sessions by exact resource/thread and can include closed records', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await storage.saveSession(

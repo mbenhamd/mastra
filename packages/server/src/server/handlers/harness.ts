@@ -302,8 +302,19 @@ function preconditionFailedResponse(details: Record<string, unknown>): Response 
 }
 
 function encodeHarnessSseEvent(event: HarnessEvent): Uint8Array {
-  const data = JSON.stringify(event);
+  const data = JSON.stringify(event, harnessSseJsonReplacer);
   return new TextEncoder().encode(`id: ${event.id}\nevent: ${event.type}\ndata: ${data}\n\n`);
+}
+
+function harnessSseJsonReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      code: (value as { code?: string }).code ?? value.name ?? 'harness.message_failed',
+      message: value.message,
+    };
+  }
+  return value;
 }
 
 function projectOperationLookup(source: 'message' | 'queue', evidence: unknown): OperationLookupResponse {

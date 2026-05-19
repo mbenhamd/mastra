@@ -882,8 +882,8 @@ export class HarnessLibSQL extends HarnessStorage {
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSION_EVENTS}
-                WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
-          args: [namespace, sessionId, resourceId, threadId],
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_ATTACHMENT_REFERENCES}
@@ -1439,33 +1439,37 @@ export class HarnessLibSQL extends HarnessStorage {
   }): Promise<HarnessSessionEventReplayState | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureSessionEventsTable();
-    const newest = await this.#client.execute({
-      sql: `SELECT epoch, sequence AS newest_sequence
-            FROM ${TABLE_HARNESS_SESSION_EVENTS}
-            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-            ORDER BY epoch DESC, sequence DESC
-            LIMIT 1`,
-      args: [namespace, sessionId, resourceId, threadId],
+    const bounds = await this.#client.execute({
+      sql: `SELECT
+              oldest.epoch AS oldest_epoch,
+              oldest.sequence AS oldest_sequence,
+              newest.epoch AS newest_epoch,
+              newest.sequence AS newest_sequence
+            FROM (
+              SELECT epoch, sequence
+              FROM ${TABLE_HARNESS_SESSION_EVENTS}
+              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
+              ORDER BY epoch ASC, sequence ASC
+              LIMIT 1
+            ) AS oldest
+            CROSS JOIN (
+              SELECT epoch, sequence
+              FROM ${TABLE_HARNESS_SESSION_EVENTS}
+              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
+              ORDER BY epoch DESC, sequence DESC
+              LIMIT 1
+            ) AS newest`,
+      args: [namespace, sessionId, resourceId, threadId, namespace, sessionId, resourceId, threadId],
     });
-    const newestRow = newest.rows[0];
-    if (!newestRow || newestRow.epoch == null || newestRow.newest_sequence == null) return null;
-
-    const oldest = await this.#client.execute({
-      sql: `SELECT epoch, sequence AS oldest_sequence
-            FROM ${TABLE_HARNESS_SESSION_EVENTS}
-            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-            ORDER BY epoch ASC, sequence ASC
-            LIMIT 1`,
-      args: [namespace, sessionId, resourceId, threadId],
-    });
-    const oldestRow = oldest.rows[0];
-    if (!oldestRow || oldestRow.epoch == null || oldestRow.oldest_sequence == null) return null;
-    if (String(oldestRow.epoch) !== String(newestRow.epoch)) return null;
+    const row = bounds.rows[0];
+    if (!row || row.oldest_epoch == null || row.newest_epoch == null) return null;
+    if (row.oldest_sequence == null || row.newest_sequence == null) return null;
+    if (String(row.oldest_epoch) !== String(row.newest_epoch)) return null;
 
     return {
-      epoch: String(newestRow.epoch),
-      oldestSequence: Number(oldestRow.oldest_sequence),
-      newestSequence: Number(newestRow.newest_sequence),
+      epoch: String(row.newest_epoch),
+      oldestSequence: Number(row.oldest_sequence),
+      newestSequence: Number(row.newest_sequence),
     };
   }
 

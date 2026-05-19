@@ -17,7 +17,13 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { GoalJudgeDecision, GoalState, PendingResume, SessionRecord } from '../../storage/domains/harness';
+import type {
+  GoalJudgeDecision,
+  GoalState,
+  JsonValue,
+  PendingResume,
+  SessionRecord,
+} from '../../storage/domains/harness';
 import type { TaskItem } from '../../tools/builtin/shared';
 
 import { HarnessEventSerializationError, HarnessValidationError } from './errors';
@@ -605,6 +611,36 @@ export function parseHarnessEventId(eventId: string): ParsedHarnessEventId {
     throw new HarnessValidationError('lastEventId', 'event id sequence must be within JavaScript safe integer range');
   }
   return { epoch: parts[1]!, sequence };
+}
+
+export function snapshotHarnessEventForJson(value: unknown, path = 'event'): JsonValue {
+  try {
+    const encoded = JSON.stringify(value, harnessEventJsonReplacer);
+    if (encoded === undefined) {
+      throw new HarnessValidationError(path, 'must be JSON-serializable for event replay');
+    }
+    return JSON.parse(encoded) as JsonValue;
+  } catch (err) {
+    if (err instanceof HarnessValidationError) throw err;
+    throw new HarnessValidationError(path, 'must be JSON-serializable for event replay');
+  }
+}
+
+export function projectHarnessPublicError(err: unknown): { code: string; message: string } {
+  if (err instanceof Error) {
+    return { code: (err as { code?: string }).code ?? err.name ?? 'harness.message_failed', message: err.message };
+  }
+  return { code: 'harness.message_failed', message: String(err) };
+}
+
+function harnessEventJsonReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      ...projectHarnessPublicError(value),
+    };
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------

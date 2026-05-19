@@ -826,6 +826,60 @@ describe('Harness server routes', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('serializes live Harness SSE events with the replay-safe JSON projection', async () => {
+    class Box {
+      constructor(readonly value: string) {}
+    }
+    let listener: ((event: any) => void) | undefined;
+    const session = {
+      subscribe: vi.fn((next: (event: any) => void) => {
+        listener = next;
+        return vi.fn();
+      }),
+      getEventReplayState: vi.fn(),
+      listEventsAfter: vi.fn(),
+    };
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord()),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await GET_HARNESS_SESSION_EVENTS_ROUTE.handler(
+      makeParams({ mastra, name: 'code', sessionId: 'session-1' }),
+    );
+
+    const reader = response.body!.getReader();
+    listener?.(
+      makeEvent({
+        type: 'tool_end',
+        toolCallId: 'tc1',
+        isError: true,
+        result: {
+          error: new Error('lookup failed'),
+          at: new Date('2026-05-19T00:00:00.000Z'),
+          boxed: new Box('ok'),
+          omitted: undefined,
+        },
+      }),
+    );
+    const chunk = await reader.read();
+    await reader.cancel();
+    const text = new TextDecoder().decode(chunk.value);
+    const data = JSON.parse(
+      text
+        .split('\n')
+        .find(line => line.startsWith('data: '))!
+        .slice('data: '.length),
+    );
+    expect(text).toContain('event: tool_end');
+    expect(data.result).toEqual({
+      error: { name: 'Error', code: 'Error', message: 'lookup failed' },
+      at: '2026-05-19T00:00:00.000Z',
+      boxed: { value: 'ok' },
+    });
+  });
+
   it('replays missed events from Last-Event-ID without duplicating queued live events', async () => {
     let listener: ((event: any) => void) | undefined;
     const session = {
