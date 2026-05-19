@@ -319,6 +319,51 @@ function objectRequestBody(requestBody: unknown, label: string): Record<string, 
   return { ...(requestBody as Record<string, unknown>) };
 }
 
+function requiredStringField(body: Record<string, unknown>, field: string, label: string): string {
+  const value = body[field];
+  if (typeof value !== 'string' || value.length === 0) {
+    throwHarnessHttpError(400, 'harness.validation', `${label} requires "${field}"`, {
+      field,
+      reason: 'required',
+    });
+  }
+  return value;
+}
+
+function requiredPermissionPolicy(body: Record<string, unknown>, label: string): 'allow' | 'ask' | 'deny' {
+  const value = body.policy;
+  if (value === undefined) {
+    throwHarnessHttpError(400, 'harness.validation', `${label} requires "policy"`, {
+      field: 'policy',
+      reason: 'required',
+    });
+  }
+  if (value !== 'allow' && value !== 'ask' && value !== 'deny') {
+    throwHarnessHttpError(400, 'harness.validation', `${label} policy is invalid`, {
+      field: 'policy',
+      reason: 'invalid',
+    });
+  }
+  return value;
+}
+
+function requiredPermissionTarget(
+  body: Record<string, unknown>,
+  label: string,
+): { category: string } | { toolName: string } {
+  const hasCategory = body.category !== undefined;
+  const hasToolName = body.toolName !== undefined;
+  if (hasCategory === hasToolName) {
+    throwHarnessHttpError(400, 'harness.validation', `${label} requires exactly one permission target`, {
+      field: 'category',
+      reason: 'exclusive',
+    });
+  }
+  return hasCategory
+    ? { category: requiredStringField(body, 'category', label) }
+    : { toolName: requiredStringField(body, 'toolName', label) };
+}
+
 function statePatchFromRequestBody(requestBody: unknown): Record<string, unknown> {
   return objectRequestBody(requestBody, 'State patch');
 }
@@ -1214,24 +1259,22 @@ export const PATCH_HARNESS_PERMISSIONS_ROUTE = createRoute({
       const session = await harness.session({ sessionId: pathSessionId, resourceId });
       switch (body.action) {
         case 'grantCategory':
-          await session.permissions.grantCategory({ category: body.category! });
+          await session.permissions.grantCategory({ category: requiredStringField(body, 'category', 'Permissions patch') });
           break;
         case 'grantTool':
-          await session.permissions.grantTool({ toolName: body.toolName! });
+          await session.permissions.grantTool({ toolName: requiredStringField(body, 'toolName', 'Permissions patch') });
           break;
         case 'revokeCategory':
-          await session.permissions.revokeCategory({ category: body.category! });
+          await session.permissions.revokeCategory({ category: requiredStringField(body, 'category', 'Permissions patch') });
           break;
         case 'revokeTool':
-          await session.permissions.revokeTool({ toolName: body.toolName! });
+          await session.permissions.revokeTool({ toolName: requiredStringField(body, 'toolName', 'Permissions patch') });
           break;
-        case 'setPolicy':
-          if (body.category !== undefined) {
-            await session.permissions.setPolicy({ category: body.category, policy: body.policy! });
-          } else {
-            await session.permissions.setPolicy({ toolName: body.toolName!, policy: body.policy! });
-          }
+        case 'setPolicy': {
+          const policy = requiredPermissionPolicy(body, 'Permissions patch');
+          await session.permissions.setPolicy({ ...requiredPermissionTarget(body, 'Permissions patch'), policy });
           break;
+        }
       }
       return permissionsSnapshot(session);
     } catch (error) {
@@ -1298,6 +1341,15 @@ export const RESPOND_HARNESS_INBOX_ROUTE = createRoute({
             ...(body.revision !== undefined ? { revision: body.revision } : {}),
             ...(body.transitionToMode !== undefined ? { transitionToMode: body.transitionToMode } : {}),
           });
+        default: {
+          const unsupportedKind: never = body.kind;
+          throwHarnessHttpError(400, 'harness.validation', `Unsupported inbox response kind for "${pathItemId}"`, {
+            field: 'kind',
+            reason: 'unsupported',
+            kind: unsupportedKind,
+            itemId: pathItemId,
+          });
+        }
       }
     } catch (error) {
       return mapHarnessError(error);

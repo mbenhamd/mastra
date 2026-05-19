@@ -861,6 +861,64 @@ describe('Harness server routes', () => {
     });
   });
 
+  it('rejects permission mutations with invalid direct handler bodies', async () => {
+    const session = {
+      permissions: {
+        grantCategory: vi.fn(),
+        grantTool: vi.fn(),
+        revokeCategory: vi.fn(),
+        revokeTool: vi.fn(),
+        setPolicy: vi.fn(),
+        getGrants: vi.fn(() => ({ categories: [], tools: [] })),
+        getRules: vi.fn(() => ({ categories: {}, tools: {} })),
+      },
+    };
+    const harness = { session: vi.fn(async () => session) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expectHarnessHttpError(
+      PATCH_HARNESS_PERMISSIONS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          requestBody: { action: 'grantCategory', category: '' },
+        }),
+      ),
+      400,
+      'harness.validation',
+    );
+
+    await expectHarnessHttpError(
+      PATCH_HARNESS_PERMISSIONS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          requestBody: { action: 'setPolicy', category: 'write', toolName: 'shell', policy: 'allow' },
+        }),
+      ),
+      400,
+      'harness.validation',
+    );
+
+    await expectHarnessHttpError(
+      PATCH_HARNESS_PERMISSIONS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          requestBody: { action: 'setPolicy', toolName: 'shell', policy: 'sometimes' },
+        }),
+      ),
+      400,
+      'harness.validation',
+    );
+
+    expect(session.permissions.grantCategory).not.toHaveBeenCalled();
+    expect(session.permissions.setPolicy).not.toHaveBeenCalled();
+  });
+
   it('responds to inbox questions with the route item id and response id', async () => {
     const response = {
       itemId: 'item-1',
@@ -898,6 +956,39 @@ describe('Harness server routes', () => {
       responseId: 'response-1',
       answer: 'yes',
     });
+  });
+
+  it('rejects unsupported inbox response kinds from direct handler calls', async () => {
+    const session = {
+      respondToToolApproval: vi.fn(),
+      respondToToolSuspension: vi.fn(),
+      respondToQuestion: vi.fn(),
+      respondToPlanApproval: vi.fn(),
+    };
+    const harness = { session: vi.fn(async () => session) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expectHarnessHttpError(
+      RESPOND_HARNESS_INBOX_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          itemId: 'item-1',
+          requestBody: {
+            kind: 'future-kind',
+            responseId: 'response-1',
+          },
+        }),
+      ),
+      400,
+      'harness.validation',
+    );
+
+    expect(session.respondToToolApproval).not.toHaveBeenCalled();
+    expect(session.respondToToolSuspension).not.toHaveBeenCalled();
+    expect(session.respondToQuestion).not.toHaveBeenCalled();
+    expect(session.respondToPlanApproval).not.toHaveBeenCalled();
   });
 
   it('maps inbox response conflicts to the wire error code', async () => {
