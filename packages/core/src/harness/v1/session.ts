@@ -82,7 +82,7 @@ import {
   HarnessValidationError,
   HarnessWorkspaceLostError,
 } from './errors';
-import { assertJsonSerializable, EventEmitter, parseHarnessEventId } from './events';
+import { EventEmitter, parseHarnessEventId } from './events';
 import type {
   EmitInput,
   HarnessEvent,
@@ -693,12 +693,12 @@ export class Session {
   }
 
   private _enqueueSessionEventPersistence(event: HarnessEvent): void {
+    if (this._eventPersistenceError !== undefined) return;
     let parsed: ReturnType<typeof parseHarnessEventId>;
     let storedEvent: JsonValue;
     try {
       parsed = parseHarnessEventId(event.id);
-      assertJsonSerializable(event.type, event.sessionId, event);
-      storedEvent = JSON.parse(JSON.stringify(event)) as JsonValue;
+      storedEvent = toJsonEventSnapshot(event);
     } catch (err) {
       this._eventPersistenceError = err;
       console.error('[harness/v1] session event serialization failed:', err);
@@ -708,6 +708,7 @@ export class Session {
     const task = this._eventPersistenceTail
       .catch(() => undefined)
       .then(async () => {
+        if (this._eventPersistenceError !== undefined) return;
         await this._storage.appendSessionEvent({
           harnessName: record.harnessName,
           sessionId: record.id,
@@ -6976,6 +6977,45 @@ function assertJsonValue(value: unknown, path = 'value'): JsonValue {
     return out;
   }
   throw new HarnessValidationError(path, 'must be JSON-serializable for admission hashing');
+}
+
+function toJsonEventSnapshot(value: unknown, path = 'event', seen = new WeakSet<object>()): JsonValue {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      ...projectHarnessPublicError(value),
+    };
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Object.is(value, -0)) {
+      throw new HarnessValidationError(path, 'must be a finite JSON number for event replay');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new HarnessValidationError(path, 'must not contain cycles for event replay');
+    seen.add(value);
+    const out: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
+      out.push(toJsonEventSnapshot(value[index], `${path}[${index}]`, seen));
+    }
+    return out;
+  }
+  if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
+    if (seen.has(value)) throw new HarnessValidationError(path, 'must not contain cycles for event replay');
+    seen.add(value);
+    const out: Record<string, JsonValue> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry === undefined) {
+        throw new HarnessValidationError(`${path}.${key}`, 'must be JSON-serializable for event replay');
+      }
+      out[key] = toJsonEventSnapshot(entry, `${path}.${key}`, seen);
+    }
+    return out;
+  }
+  throw new HarnessValidationError(path, 'must be JSON-serializable for event replay');
 }
 
 function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {

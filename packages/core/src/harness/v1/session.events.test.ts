@@ -298,6 +298,47 @@ describe('Session events — fullStream drain', () => {
     expect(end).toMatchObject({ type: 'tool_end', toolCallId: 'tc1', isError: false });
   });
 
+  it('persists tool error events without poisoning event replay', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'mastra' } },
+        runId: 'fake-run',
+      },
+      {
+        type: 'tool-error',
+        payload: { toolCallId: 'tc1', error: new Error('lookup failed') },
+        runId: 'fake-run',
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'hi' });
+
+    await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    expect(state).not.toBeNull();
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    expect(rows.map(row => row.event).find((event: any) => event.type === 'tool_end')).toMatchObject({
+      type: 'tool_end',
+      toolCallId: 'tc1',
+      isError: true,
+      result: { name: 'Error', code: 'Error', message: 'lookup failed' },
+    });
+  });
+
   it('bridges a data-task-updated writer chunk into a task_updated event', async () => {
     // Round-trips the taskWrite tool's emission path: tools publish via
     // `ctx.writer?.custom({ type: 'data-task-updated', data: { tasks } })`
