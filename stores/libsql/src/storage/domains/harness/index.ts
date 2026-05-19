@@ -4829,6 +4829,13 @@ function assertLegalHarnessWakeupUpdate(current: HarnessWakeupItem, next: Harnes
 }
 
 function assertValidHarnessWakeupState(record: HarnessWakeupItem, currentStatus?: HarnessWakeupItem['status']): void {
+  const hasClaimMetadata =
+    record.claimId != null || record.claimExpiresAt != null || record.claimedAt != null;
+  const hasQueueMetadata = record.queuedItemId != null || record.queuedAt != null;
+  const hasCompletedMetadata = record.completedAt != null || record.result !== undefined;
+  const hasFailedMetadata = record.failedAt != null || record.lastError != null;
+  const hasDeadMetadata = record.deadAt != null;
+
   if (record.source !== 'schedule' && record.source !== 'proactive') {
     throw new HarnessStorageWakeupTransitionError(record.id, currentStatus, record.status, 'source is not supported');
   }
@@ -4848,6 +4855,17 @@ function assertValidHarnessWakeupState(record: HarnessWakeupItem, currentStatus?
     );
   }
   if (
+    record.status === 'due' &&
+    (hasClaimMetadata || hasQueueMetadata || hasCompletedMetadata || hasFailedMetadata || hasDeadMetadata)
+  ) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'due wakeups must not include claim, queue, terminal, or error metadata',
+    );
+  }
+  if (
     record.status === 'claimed' &&
     (record.claimId == null || record.claimExpiresAt == null || record.claimedAt == null)
   ) {
@@ -4858,10 +4876,15 @@ function assertValidHarnessWakeupState(record: HarnessWakeupItem, currentStatus?
       'claimed wakeups require claimId, claimExpiresAt, and claimedAt',
     );
   }
-  if (
-    record.status !== 'claimed' &&
-    (record.claimId != null || record.claimExpiresAt != null || record.claimedAt != null)
-  ) {
+  if (record.status === 'claimed' && (hasQueueMetadata || hasCompletedMetadata || hasFailedMetadata || hasDeadMetadata)) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'claimed wakeups must not include queue, terminal, or error metadata',
+    );
+  }
+  if (record.status !== 'claimed' && hasClaimMetadata) {
     throw new HarnessStorageWakeupTransitionError(
       record.id,
       currentStatus,
@@ -4877,12 +4900,28 @@ function assertValidHarnessWakeupState(record: HarnessWakeupItem, currentStatus?
       'queued wakeups require queuedItemId and queuedAt',
     );
   }
+  if (record.status === 'queued' && (hasCompletedMetadata || hasFailedMetadata || hasDeadMetadata)) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'queued wakeups must not include terminal or error metadata',
+    );
+  }
   if (record.status === 'completed' && (record.completedAt == null || record.result === undefined)) {
     throw new HarnessStorageWakeupTransitionError(
       record.id,
       currentStatus,
       record.status,
       'completed wakeups require completedAt and result',
+    );
+  }
+  if (record.status === 'completed' && (hasQueueMetadata || hasFailedMetadata || hasDeadMetadata)) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'completed wakeups must not include queue, error, or dead metadata',
     );
   }
   if (record.status === 'failed' && (record.failedAt == null || record.lastError == null)) {
@@ -4893,12 +4932,28 @@ function assertValidHarnessWakeupState(record: HarnessWakeupItem, currentStatus?
       'failed wakeups require failedAt and lastError',
     );
   }
+  if (record.status === 'failed' && (hasQueueMetadata || hasCompletedMetadata || hasDeadMetadata)) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'failed wakeups must not include queue, completed, or dead metadata',
+    );
+  }
   if (record.status === 'dead' && (record.deadAt == null || record.lastError == null)) {
     throw new HarnessStorageWakeupTransitionError(
       record.id,
       currentStatus,
       record.status,
       'dead wakeups require deadAt and lastError',
+    );
+  }
+  if (record.status === 'dead' && (hasQueueMetadata || hasCompletedMetadata || record.failedAt != null)) {
+    throw new HarnessStorageWakeupTransitionError(
+      record.id,
+      currentStatus,
+      record.status,
+      'dead wakeups must not include queue, completed, or failed metadata',
     );
   }
 }

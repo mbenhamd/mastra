@@ -1241,6 +1241,40 @@ describe('InMemoryHarness wakeup ledger', () => {
         }),
       ),
     ).rejects.toBeInstanceOf(HarnessStorageWakeupTransitionError);
+
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(2100);
+    try {
+      await storage.createOrLoadHarnessWakeupItem(sampleWakeup(), {
+        initialClaim: { claimId: 'claim-1', now: 2000, claimTtlMs: 1000 },
+      });
+      await expect(
+        storage.updateHarnessWakeupItem(
+          sampleWakeup({
+            status: 'completed',
+            completedAt: 2100,
+            result: { ok: true },
+            queuedItemId: 'stale-queue',
+            queuedAt: 2050,
+            updatedAt: 2100,
+          }),
+          { claimId: 'claim-1' },
+        ),
+      ).rejects.toBeInstanceOf(HarnessStorageWakeupTransitionError);
+      await expect(
+        storage.updateHarnessWakeupItem(
+          sampleWakeup({
+            status: 'queued',
+            queuedItemId: 'queue-1',
+            queuedAt: 2100,
+            lastError: { code: 'stale', message: 'stale' },
+            updatedAt: 2100,
+          }),
+          { claimId: 'claim-1' },
+        ),
+      ).rejects.toBeInstanceOf(HarnessStorageWakeupTransitionError);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 });
 
