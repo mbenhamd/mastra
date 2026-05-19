@@ -785,17 +785,25 @@ export class BackgroundTaskManager {
       this.deregisterTaskContext(taskId);
       return false;
     }
-    if (!task || task.status === 'cancelled') {
+    if (!task || task.status !== 'pending') {
       this.deregisterTaskContext(taskId);
       return false;
     }
 
     const restorePending = async () => {
-      await storage.updateTask(taskId, { status: 'pending', startedAt: undefined });
-      this.deregisterTaskContext(taskId);
+      const restored = await storage.updateTaskIfStatus(taskId, 'running', { status: 'pending', startedAt: undefined });
+      if (restored) this.deregisterTaskContext(taskId);
     };
 
-    await storage.updateTask(taskId, { status: 'running', startedAt: new Date(), retryCount: deliveryAttempt - 1 });
+    const claimed = await storage.updateTaskIfStatus(taskId, 'pending', {
+      status: 'running',
+      startedAt: new Date(),
+      retryCount: deliveryAttempt - 1,
+    });
+    if (!claimed) {
+      this.deregisterTaskContext(taskId);
+      return false;
+    }
 
     // Publish running lifecycle event (fan-out, for stream consumers)
     const runningTask = await storage.getTask(taskId);
@@ -864,7 +872,7 @@ export class BackgroundTaskManager {
     }
 
     const restoreSuspended = async () => {
-      await storage.updateTask(taskId, {
+      await storage.updateTaskIfStatus(taskId, 'running', {
         status: 'suspended',
         startedAt: task.startedAt,
         suspendPayload: task.suspendPayload,
@@ -872,12 +880,13 @@ export class BackgroundTaskManager {
       });
     };
 
-    await storage.updateTask(taskId, {
+    const claimed = await storage.updateTaskIfStatus(taskId, 'suspended', {
       status: 'running',
       startedAt: new Date(),
       suspendPayload: undefined,
       suspendedAt: undefined,
     });
+    if (!claimed) return;
     const resumedTask = await storage.getTask(taskId);
     if (this.shuttingDown) {
       await restoreSuspended();
