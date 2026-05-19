@@ -2690,7 +2690,7 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelOutboxTable();
     const current = await this.#claimedChannelOutboxItem(opts.outboxItemId, opts.claimId);
     const storageNow = Date.now();
-    const terminal = opts.dead === true;
+    const terminal = opts.dead === true || opts.error.retryable === false;
     const next: ChannelOutboxItem = {
       ...current,
       status: terminal ? 'dead' : 'failed',

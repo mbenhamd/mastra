@@ -1865,6 +1865,51 @@ describe('HarnessLibSQL channel outbox ledger', () => {
     }
   });
 
+  it('treats non-retryable outbox delivery failures as terminal', async () => {
+    const now = 30_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.enqueueChannelOutbox(sampleChannelOutbox());
+      await storage.claimChannelOutbox({
+        harnessName: 'default',
+        claimId: 'claim-1',
+        limit: 1,
+        now,
+        claimTtlMs: 5000,
+      });
+      await storage.markChannelOutboxFailed({
+        outboxItemId: 'outbox-1',
+        claimId: 'claim-1',
+        retryAt: now + 1000,
+        error: { code: 'provider_payload_invalid', message: 'bad payload', retryable: false },
+      });
+
+      await expect(
+        storage.claimChannelOutbox({
+          harnessName: 'default',
+          claimId: 'claim-2',
+          limit: 1,
+          now: now + 1000,
+          claimTtlMs: 5000,
+        }),
+      ).resolves.toEqual([]);
+      const result = await client.execute({
+        sql: `SELECT status, dead_at, next_attempt_at, last_error
+              FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+              WHERE id = ?`,
+        args: ['outbox-1'],
+      });
+      expect(result.rows[0]).toMatchObject({
+        status: 'dead',
+        dead_at: now,
+        next_attempt_at: null,
+      });
+      expect(JSON.parse(String(result.rows[0]?.last_error))).toMatchObject({ retryable: false });
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('validates new outbox rows before insert', async () => {
     await expect(
       storage.enqueueChannelOutbox(sampleChannelOutbox({ status: 'sent', sentAt: 1001 })),

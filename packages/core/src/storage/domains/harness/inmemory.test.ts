@@ -1371,6 +1371,47 @@ describe('InMemoryHarness channel outbox ledger', () => {
     }
   });
 
+  it('treats non-retryable outbox delivery failures as terminal', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const now = 30_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.enqueueChannelOutbox(sampleChannelOutbox());
+      await storage.claimChannelOutbox({
+        harnessName: 'default',
+        claimId: 'claim-1',
+        limit: 1,
+        now,
+        claimTtlMs: 5000,
+      });
+      await storage.markChannelOutboxFailed({
+        outboxItemId: 'outbox-1',
+        claimId: 'claim-1',
+        retryAt: now + 1000,
+        error: { code: 'provider_payload_invalid', message: 'bad payload', retryable: false },
+      });
+
+      await expect(
+        storage.claimChannelOutbox({
+          harnessName: 'default',
+          claimId: 'claim-2',
+          limit: 1,
+          now: now + 1000,
+          claimTtlMs: 5000,
+        }),
+      ).resolves.toEqual([]);
+      expect([...db.harnessChannelOutbox.values()][0]).toMatchObject({
+        status: 'dead',
+        deadAt: now,
+        nextAttemptAt: undefined,
+        lastError: { retryable: false },
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('validates new outbox rows before insert', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await expect(

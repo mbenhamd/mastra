@@ -1556,7 +1556,7 @@ export class InMemoryHarness extends HarnessStorage {
   }): Promise<void> {
     const current = this.claimedChannelOutboxItem(outboxItemId, claimId);
     const storageNow = Date.now();
-    const terminal = dead === true;
+    const terminal = dead === true || error.retryable === false;
     const next: ChannelOutboxItem = {
       ...current,
       status: terminal ? 'dead' : 'failed',
