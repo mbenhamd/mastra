@@ -2,7 +2,7 @@
 '@mastra/core': patch
 ---
 
-Tightened agent execution authorization when a Mastra server FGA provider is configured. Fresh `agent.generate(...)` and `agent.stream(...)` calls now fail closed unless the effective `requestContext` includes a `user`, matching the existing resume API boundary. Existing callers that execute agents against an FGA-enabled server without a request-context user now receive an authorization error before the model runs.
+Fixed agent execution authorization when using a server-side fine-grained access control provider. New `agent.generate(...)` and `agent.stream(...)` calls now require a `user` in `requestContext`; calls without a user are denied with an authorization error before the model runs.
 
 ```ts
 const requestContext = new RequestContext();
