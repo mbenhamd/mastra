@@ -510,55 +510,60 @@ describe('Session.message() — default path', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    await expect(
-      session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
-    ).rejects.toThrow('post-dispatch pending evidence unavailable');
+    try {
+      await expect(
+        session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
+      ).rejects.toThrow('post-dispatch pending evidence unavailable');
 
-    expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
-    await nextTick();
-    const failedWrite = storage.writes.find(record => record.status === 'failed');
-    expect(failedWrite).toBeDefined();
-    expect(failedWrite).toMatchObject({
-      admissionId: 'stream-pending-failure',
-      status: 'failed',
-    });
-    await expect(
-      storage.loadMessageResultEvidence({
-        harnessName: (session as any)._record.harnessName,
-        sessionId: session.id,
-        resourceId: session.resourceId,
-        threadId: session.threadId,
-        signalId: failedWrite.signalId,
-      }),
-    ).resolves.toMatchObject({
-      admissionId: 'stream-pending-failure',
-      status: 'failed',
-    });
+      expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
+      await nextTick();
+      const failedWrite = storage.writes.find(record => record.status === 'failed');
+      expect(failedWrite).toBeDefined();
+      expect(failedWrite).toMatchObject({
+        admissionId: 'stream-pending-failure',
+        status: 'failed',
+      });
+      await expect(
+        storage.loadMessageResultEvidence({
+          harnessName: (session as any)._record.harnessName,
+          sessionId: session.id,
+          resourceId: session.resourceId,
+          threadId: session.threadId,
+          signalId: failedWrite.signalId,
+        }),
+      ).resolves.toMatchObject({
+        admissionId: 'stream-pending-failure',
+        status: 'failed',
+      });
 
-    agent.releaseStream?.();
-    await nextTick();
-    await nextTick();
+      agent.releaseStream?.();
+      await nextTick();
+      await nextTick();
 
-    expect(failedWrite).toBeDefined();
-    await expect(
-      storage.loadMessageResultEvidence({
-        harnessName: (session as any)._record.harnessName,
-        sessionId: session.id,
-        resourceId: session.resourceId,
-        threadId: session.threadId,
-        signalId: failedWrite.signalId,
-      }),
-    ).resolves.toMatchObject({
-      admissionId: 'stream-pending-failure',
-      status: 'failed',
-    });
-    await expect(
-      session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
-    ).rejects.toMatchObject({
-      name: 'HarnessValidationError',
-      message: expect.stringContaining('duplicate stream is no longer live'),
-    });
-    expect(agent.calls).toHaveLength(1);
+      expect(failedWrite).toBeDefined();
+      await expect(
+        storage.loadMessageResultEvidence({
+          harnessName: (session as any)._record.harnessName,
+          sessionId: session.id,
+          resourceId: session.resourceId,
+          threadId: session.threadId,
+          signalId: failedWrite.signalId,
+        }),
+      ).resolves.toMatchObject({
+        admissionId: 'stream-pending-failure',
+        status: 'failed',
+      });
+      await expect(
+        session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
+      ).rejects.toMatchObject({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('duplicate stream is no longer live'),
+      });
+      expect(agent.calls).toHaveLength(1);
+    } finally {
+      agent.releaseStream?.();
+      await nextTick();
+    }
   });
 
   it('does not wait for failed evidence persistence before rejecting stream admission startup', async () => {
@@ -615,45 +620,51 @@ describe('Session.message() — default path', () => {
       outcome = value;
     });
 
-    await failedWriteStarted;
-    await nextTick();
+    try {
+      await failedWriteStarted;
+      await nextTick();
 
-    expect(outcome).toBeDefined();
-    expect(outcome!.ok).toBe(false);
-    if (!outcome!.ok) {
-      expect(outcome!.err).toMatchObject({ message: 'post-dispatch pending evidence unavailable' });
+      expect(outcome).toBeDefined();
+      expect(outcome!.ok).toBe(false);
+      if (!outcome!.ok) {
+        expect(outcome!.err).toMatchObject({ message: 'post-dispatch pending evidence unavailable' });
+      }
+      expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
+
+      await expect(
+        session.message({ content: 'go', admissionId: 'stream-pending-stalled-failure', stream: true }),
+      ).rejects.toMatchObject({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('duplicate stream is no longer live'),
+      });
+      expect(agent.calls).toHaveLength(1);
+
+      releaseFailedWrite();
+      await failedWriteFinished;
+      await expect(
+        storage.loadMessageResultEvidence({
+          harnessName: (session as any)._record.harnessName,
+          sessionId: session.id,
+          resourceId: session.resourceId,
+          threadId: session.threadId,
+          signalId: failedSignalId,
+        }),
+      ).resolves.toMatchObject({
+        admissionId: 'stream-pending-stalled-failure',
+        status: 'failed',
+      });
+      await expect(
+        session.message({ content: 'go', admissionId: 'stream-pending-stalled-failure', stream: true }),
+      ).rejects.toMatchObject({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('duplicate stream is no longer live'),
+      });
+      expect(agent.calls).toHaveLength(1);
+    } finally {
+      agent.releaseStream?.();
+      if (typeof releaseFailedWrite === 'function') releaseFailedWrite();
+      await nextTick();
     }
-    expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
-
-    await expect(
-      session.message({ content: 'go', admissionId: 'stream-pending-stalled-failure', stream: true }),
-    ).rejects.toMatchObject({
-      name: 'HarnessValidationError',
-      message: expect.stringContaining('duplicate stream is no longer live'),
-    });
-    expect(agent.calls).toHaveLength(1);
-
-    releaseFailedWrite();
-    await failedWriteFinished;
-    await expect(
-      storage.loadMessageResultEvidence({
-        harnessName: (session as any)._record.harnessName,
-        sessionId: session.id,
-        resourceId: session.resourceId,
-        threadId: session.threadId,
-        signalId: failedSignalId,
-      }),
-    ).resolves.toMatchObject({
-      admissionId: 'stream-pending-stalled-failure',
-      status: 'failed',
-    });
-    await expect(
-      session.message({ content: 'go', admissionId: 'stream-pending-stalled-failure', stream: true }),
-    ).rejects.toMatchObject({
-      name: 'HarnessValidationError',
-      message: expect.stringContaining('duplicate stream is no longer live'),
-    });
-    expect(agent.calls).toHaveLength(1);
   });
 
   it('deduplicates concurrent exact admissionId retries before dispatching a second signal', async () => {
