@@ -623,6 +623,103 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
       });
     });
 
+    describe('session event replay', () => {
+      it('persists session events by thread and clears them when deleting the session', async () => {
+        if (!harness) return;
+        const harnessWithEvents = harness as HarnessStorage & {
+          getSessionEventReplayState(opts: {
+            harnessName?: string;
+            sessionId: string;
+            resourceId: string;
+            threadId: string;
+          }): ReturnType<HarnessStorage['getSessionEventReplayState']>;
+          listSessionEvents(opts: {
+            harnessName?: string;
+            sessionId: string;
+            resourceId: string;
+            threadId: string;
+            epoch: string;
+            afterSequence: number;
+            limit: number;
+          }): ReturnType<HarnessStorage['listSessionEvents']>;
+        };
+        await harness.saveSession(createSampleSessionRecord(), { ownerId: 'h', ifVersion: 0 });
+        await harnessWithEvents.appendSessionEvent({
+          harnessName: 'default',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          eventId: 'harness-v1:epoch-1:1',
+          epoch: 'epoch-1',
+          sequence: 1,
+          event: { type: 'app.event', id: 'harness-v1:epoch-1:1', timestamp: 1000, payload: { ok: true } },
+          emittedAt: 1000,
+          storedAt: 1001,
+        });
+        await harnessWithEvents.appendSessionEvent({
+          harnessName: 'default',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          eventId: 'harness-v1:epoch-1:1',
+          epoch: 'epoch-1',
+          sequence: 1,
+          event: {
+            type: 'app.event',
+            id: 'harness-v1:epoch-1:1',
+            timestamp: 1002,
+            payload: { ignoredDuplicate: true },
+          },
+          emittedAt: 1002,
+          storedAt: 1003,
+        });
+
+        await expect(
+          harnessWithEvents.getSessionEventReplayState({
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+          }),
+        ).resolves.toEqual({ epoch: 'epoch-1', oldestSequence: 1, newestSequence: 1 });
+        await expect(
+          harnessWithEvents.getSessionEventReplayState({
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-2',
+          }),
+        ).resolves.toBeNull();
+        await expect(
+          harnessWithEvents.listSessionEvents({
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+            epoch: 'epoch-1',
+            afterSequence: 0,
+            limit: 10,
+          }),
+        ).resolves.toMatchObject([
+          {
+            eventId: 'harness-v1:epoch-1:1',
+            event: { payload: { ok: true } },
+          },
+        ]);
+
+        await harness.deleteSession({ sessionId: 'session-1' });
+
+        await expect(
+          harnessWithEvents.getSessionEventReplayState({
+            harnessName: 'default',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+          }),
+        ).resolves.toBeNull();
+      });
+    });
+
     describe('deleteSession', () => {
       it('removes the session record', async () => {
         if (!harness) return;

@@ -20,6 +20,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { buildFakeOutput } from './__test-utils__/fake-output';
 
+import { parseHarnessEventId } from './events';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 
@@ -188,12 +189,53 @@ describe('Session.subscribe()', () => {
     await session.message({ content: 'hi' });
 
     expect(events.length).toBeGreaterThan(1);
-    const epochs = new Set(events.map(e => e.id.split('-').slice(0, 5).join('-')));
+    const parsed = events.map(e => parseHarnessEventId(e.id));
+    expect(events.every(e => e.id.startsWith('harness-v1:'))).toBe(true);
+    const epochs = new Set(parsed.map(e => e.epoch));
     expect(epochs.size).toBe(1);
-    const seqs = events.map(e => Number(e.id.split('-').slice(-1)[0]));
+    const seqs = parsed.map(e => e.sequence);
     for (let i = 1; i < seqs.length; i += 1) {
       expect(seqs[i]).toBeGreaterThan(seqs[i - 1]!);
     }
+  });
+
+  it('resumes the durable event epoch and sequence when a session is rehydrated', async () => {
+    const { harness, agent, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+    await harness.shutdown();
+    await session._flushEventPersistence();
+
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    expect(state).not.toBeNull();
+
+    const resumed = new Harness({
+      agents: { default: agent } as any,
+      modes: [
+        { id: 'default', agentId: 'default' },
+        { id: 'other', agentId: 'default' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const hydrated = await resumed.session({ resourceId: session.resourceId, threadId: session.threadId });
+    const events: HarnessEvent[] = [];
+    hydrated.subscribe(e => {
+      events.push(e);
+    });
+
+    await hydrated.message({ content: 'again' });
+
+    expect(events.length).toBeGreaterThan(0);
+    const first = parseHarnessEventId(events[0]!.id);
+    expect(first.epoch).toBe(state!.epoch);
+    expect(first.sequence).toBeGreaterThan(state!.newestSequence);
   });
 });
 
