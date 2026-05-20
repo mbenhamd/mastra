@@ -230,7 +230,12 @@ describe('HarnessWakeupWorker', () => {
   });
 
   it('claims wakeups and marks them queued after durable queue admission', async () => {
-    const item = sampleWakeup();
+    const item = sampleWakeup({
+      failedAt: 100,
+      deadAt: 101,
+      nextAttemptAt: 102,
+      lastError: { code: 'session_locked', message: 'locked', retryable: true },
+    });
     const storage = createWakeupStorage([item]);
     const admit = vi.fn().mockResolvedValue({ accepted: true, queuedItemId: 'queued-1', duplicate: false });
     const worker = new HarnessWakeupWorker({ pollIntervalMs: 60_000 });
@@ -261,6 +266,10 @@ describe('HarnessWakeupWorker', () => {
         id: item.id,
         status: 'queued',
         queuedItemId: 'queued-1',
+        failedAt: undefined,
+        deadAt: undefined,
+        nextAttemptAt: undefined,
+        lastError: undefined,
         claimId: undefined,
         claimExpiresAt: undefined,
         claimedAt: undefined,
