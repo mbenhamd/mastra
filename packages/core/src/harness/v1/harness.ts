@@ -14,8 +14,8 @@
  *     resolver.
  *
  * Known remaining gaps are deliberately visible here: production server routes,
- * remote SDKs, durable admission/result rows, channels, wakeups, and worker
- * recovery live in follow-up Harness v1 lanes.
+ * remote SDKs, full channel routing, wakeup producers/completion, and
+ * acceptance evidence live in follow-up Harness v1 lanes.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -1707,6 +1707,9 @@ export class Harness {
     // In-memory hit by (threadId, resourceId)?
     for (const live of this._liveSessions.values()) {
       if (live.threadId === threadId && live.resourceId === resourceId) {
+        if (opts.sessionId !== undefined && live.id !== opts.sessionId) {
+          throw new HarnessSessionNotFoundError(opts.sessionId);
+        }
         if (live.isClosing) {
           throw new HarnessSessionClosingError(live.id);
         }
@@ -1717,6 +1720,9 @@ export class Harness {
     // Storage lookup — adapters filter out closed records.
     const stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
     if (stored) {
+      if (opts.sessionId !== undefined && stored.id !== opts.sessionId) {
+        throw new HarnessSessionNotFoundError(opts.sessionId);
+      }
       if (stored.closingAt !== undefined) {
         throw new HarnessSessionClosingError(stored.id);
       }
@@ -3506,6 +3512,11 @@ export class Harness {
 
   private _getEffectiveSessionStorage(): HarnessStorage | undefined {
     return this._storageOverride ?? this._mastra?.getStorage()?.stores?.harness;
+  }
+
+  /** @internal — used by Harness wakeup workers to honor session storage overrides. */
+  _internalGetSessionStorage(): HarnessStorage | undefined {
+    return this._getEffectiveSessionStorage();
   }
 
   private _usesSeparateSessionStorage(): boolean {
