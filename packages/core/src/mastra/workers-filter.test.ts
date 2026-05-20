@@ -3,6 +3,7 @@ import { Harness } from '../harness/v1/harness';
 import { InMemoryHarness } from '../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../storage/domains/inmemory-db';
 import { MockStore } from '../storage/mock';
+import { HarnessWakeupWorker } from '../worker';
 import { Mastra } from './index';
 
 const ORIGINAL_ENV = process.env.MASTRA_WORKERS;
@@ -79,6 +80,141 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
     expect(mastra.workers.map(worker => worker.name)).toContain('harnessWakeups');
   });
 
+  it('registers harness wakeup worker when storage is attached after construction', () => {
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+
+    expect(mastra.workers.map(worker => worker.name)).not.toContain('harnessWakeups');
+
+    mastra.setStorage(new MockStore());
+
+    expect(mastra.workers.map(worker => worker.name)).toContain('harnessWakeups');
+  });
+
+  it('starts a late-registered harness wakeup worker when workers are already running', async () => {
+    const init = vi.spyOn(HarnessWakeupWorker.prototype, 'init').mockResolvedValue(undefined);
+    const start = vi.spyOn(HarnessWakeupWorker.prototype, 'start').mockResolvedValue(undefined);
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+
+    await mastra.startWorkers();
+    mastra.setStorage(new MockStore());
+
+    await vi.waitFor(() => {
+      expect(start).toHaveBeenCalledTimes(1);
+    });
+    expect(init).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a late-registered harness wakeup worker while workers are still starting', async () => {
+    const init = vi.spyOn(HarnessWakeupWorker.prototype, 'init').mockResolvedValue(undefined);
+    const start = vi.spyOn(HarnessWakeupWorker.prototype, 'start').mockResolvedValue(undefined);
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+    const initialWorker = mastra.workers[0];
+    if (!initialWorker) {
+      throw new Error('expected an initial worker to hold startWorkers in flight');
+    }
+    let releaseStart!: () => void;
+    vi.spyOn(initialWorker, 'init').mockResolvedValue(undefined);
+    const initialStart = vi.spyOn(initialWorker, 'start').mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          releaseStart = resolve;
+        }),
+    );
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(initialStart).toHaveBeenCalledTimes(1);
+    });
+    mastra.setStorage(new MockStore());
+
+    await vi.waitFor(() => {
+      expect(start).toHaveBeenCalledTimes(1);
+    });
+    expect(init).toHaveBeenCalledTimes(1);
+
+    releaseStart();
+    await starting;
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(init).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start a late-registered harness wakeup worker after workers are stopped', async () => {
+    const init = vi.spyOn(HarnessWakeupWorker.prototype, 'init').mockResolvedValue(undefined);
+    const start = vi.spyOn(HarnessWakeupWorker.prototype, 'start').mockResolvedValue(undefined);
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+
+    await mastra.startWorkers();
+    await mastra.stopWorkers();
+    mastra.setStorage(new MockStore());
+
+    expect(mastra.workers.map(worker => worker.name)).toContain('harnessWakeups');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(init).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('does not keep late worker startup armed after all-worker startup fails', async () => {
+    const init = vi.spyOn(HarnessWakeupWorker.prototype, 'init').mockResolvedValue(undefined);
+    const start = vi.spyOn(HarnessWakeupWorker.prototype, 'start').mockResolvedValue(undefined);
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+    const initialWorker = mastra.workers[0];
+    if (!initialWorker) {
+      throw new Error('expected an initial worker to fail startWorkers');
+    }
+    vi.spyOn(initialWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(initialWorker, 'start').mockRejectedValue(new Error('worker startup failed'));
+
+    await expect(mastra.startWorkers()).rejects.toThrow('worker startup failed');
+    mastra.setStorage(new MockStore());
+
+    expect(mastra.workers.map(worker => worker.name)).toContain('harnessWakeups');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(init).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('does not start a late-registered harness wakeup worker while workers are stopping', async () => {
+    let resolveInit!: () => void;
+    const init = vi.spyOn(HarnessWakeupWorker.prototype, 'init').mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveInit = resolve;
+        }),
+    );
+    const start = vi.spyOn(HarnessWakeupWorker.prototype, 'start').mockResolvedValue(undefined);
+    const mastra = new Mastra({
+      harness: new Harness({ modes: [] }),
+      logger: false,
+    });
+
+    await mastra.startWorkers();
+    mastra.setStorage(new MockStore());
+    await vi.waitFor(() => {
+      expect(init).toHaveBeenCalledTimes(1);
+    });
+
+    const stopped = mastra.stopWorkers();
+    resolveInit();
+    await stopped;
+
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it('disables all workers when MASTRA_WORKERS=false', async () => {
     process.env.MASTRA_WORKERS = 'false';
 
@@ -87,6 +223,8 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
       logger: false,
     });
 
+    expect(mastra.workers).toEqual([]);
+    mastra.setStorage(new MockStore());
     expect(mastra.workers).toEqual([]);
   });
 

@@ -613,6 +613,10 @@ export class Mastra<
   #toolPayloadTransform?: ToolPayloadTransformPolicy;
   #workers: MastraWorker[] = [];
   #workerFilter?: Set<string>;
+  #autoCreateWorkers = true;
+  #workersStarted = false;
+  #pendingWorkerStarts = new Set<Promise<void>>();
+  #harnessWakeupConfig?: HarnessWakeupWorkerConfig;
   // Lazily-constructed processor used by handleWorkflowEvent(). Shared between
   // pull-mode workers (OrchestrationWorker) and push-mode entry points
   // (in-process EventEmitter listener, the /api/workers/events HTTP route).
@@ -1005,10 +1009,12 @@ export class Mastra<
     //   - "false": disables all event processing in this instance
     //   - comma-separated names (e.g. "scheduler,orchestration"): only those
     //     workers will be started by `startWorkers()` when called without an
-    //     explicit `name` argument. Construction still creates all workers so
-    //     a later explicit `startWorkers('foo')` still works.
+    //     explicit `name` argument. Construction creates storage-independent
+    //     workers immediately; storage-gated workers can be added when storage
+    //     becomes available.
     const rawWorkersEnv = process.env.MASTRA_WORKERS;
     let workersOption: MastraWorker[] | false | undefined;
+    this.#harnessWakeupConfig = config?.harnessWakeups;
     if (rawWorkersEnv === 'false') {
       workersOption = false;
     } else {
@@ -1025,9 +1031,11 @@ export class Mastra<
     }
 
     if (workersOption === false) {
+      this.#autoCreateWorkers = false;
       // Explicitly disabled — no event processing in this instance.
       // PubSub still exists for publishing events.
     } else if (Array.isArray(workersOption)) {
+      this.#autoCreateWorkers = false;
       this.#workers = workersOption;
       for (const w of this.#workers) {
         w.__registerMastra(this);
@@ -1057,7 +1065,7 @@ export class Mastra<
         config?.storage !== undefined ||
         Object.values(configuredHarnesses).some(harness => harness?._internalGetSessionStorage() !== undefined);
       if (hasHarnessWakeupStorage && Object.keys(configuredHarnesses).length > 0) {
-        defaultWorkers.push(new HarnessWakeupWorker(config?.harnessWakeups));
+        defaultWorkers.push(new HarnessWakeupWorker(this.#harnessWakeupConfig));
       }
       this.#workers = defaultWorkers;
       for (const w of this.#workers) {
@@ -1341,6 +1349,36 @@ export class Mastra<
     void bgManager.init(this.#pubsub).catch(error => {
       this.#logger?.error('Failed to initialize background task manager', error);
     });
+  }
+
+  #ensureHarnessWakeupWorker(): void {
+    if (!this.#autoCreateWorkers || this.#workers.some(worker => worker.name === 'harnessWakeups')) {
+      return;
+    }
+    if (Object.keys(this.#harnesses).length === 0) {
+      return;
+    }
+    const hasHarnessWakeupStorage =
+      this.#storage !== undefined ||
+      Object.values(this.#harnesses).some(harness => harness?._internalGetSessionStorage() !== undefined);
+    if (!hasHarnessWakeupStorage) {
+      return;
+    }
+
+    const worker = new HarnessWakeupWorker(this.#harnessWakeupConfig);
+    worker.__registerMastra(this);
+    this.#workers.push(worker);
+
+    if (this.#workersStarted && (!this.#workerFilter || this.#workerFilter.has(worker.name))) {
+      const start = this.#startWorker(worker, { onlyIfWorkersStarted: true })
+        .catch(error => {
+          this.#logger?.error?.('Failed to start worker "harnessWakeups"', error);
+        })
+        .finally(() => {
+          this.#pendingWorkerStarts.delete(start);
+        });
+      this.#pendingWorkerStarts.add(start);
+    }
   }
 
   /**
@@ -3490,6 +3528,7 @@ export class Mastra<
     // would have bailed out early in __init(). Retry it now that storage
     // is available so declarative schedules still get registered + fired.
     this.#ensureScheduler();
+    this.#ensureHarnessWakeupWorker();
   }
 
   public setLogger({ logger }: { logger: TLogger }) {
@@ -4094,13 +4133,6 @@ export class Mastra<
    * user-defined event listeners.
    */
   public async startWorkers(name?: string): Promise<void> {
-    const deps: WorkerDeps = {
-      pubsub: this.#pubsub,
-      storage: this.#storage!,
-      logger: this.#logger as unknown as IMastraLogger,
-      mastra: this,
-    };
-
     let targets: MastraWorker[];
     if (name) {
       targets = this.#workers.filter(w => w.name === name);
@@ -4115,65 +4147,92 @@ export class Mastra<
         );
       }
     } else {
-      targets = this.#workers;
+      targets = [...this.#workers];
     }
 
-    for (const worker of targets) {
-      await worker.init(deps);
-      await worker.start();
-    }
-
-    // For push-mode pubsubs (e.g. EventEmitterPubSub) there is no
-    // OrchestrationWorker pulling events — wire handleWorkflowEvent directly
-    // to the pubsub so workflow events still get processed in-process.
     if (!name) {
-      const modes = this.#pubsub.supportedModes ?? ['pull'];
-      const pushOnly = modes.includes('push') && !modes.includes('pull');
-      if (pushOnly && !this.#pushSubscription) {
-        const cb: EventCallback = (event, ack) => {
-          void this.handleWorkflowEvent(event)
-            .then(result => {
-              if (result.ok && ack) {
-                return ack().catch(err =>
-                  this.#logger?.error?.('Error acking workflow event in push subscription', err),
-                );
-              }
-              // Push transports without nack semantics (EventEmitter) treat
-              // a non-ack as a failure signal; we already logged inside handle().
-            })
-            .catch(err => this.#logger?.error?.('Unhandled error in workflow event push subscription', err));
-        };
-        await this.#pubsub.subscribe('workflows', cb);
-        this.#pushSubscription = { topic: 'workflows', cb };
+      this.#workersStarted = true;
+    }
+
+    let startupComplete = false;
+    try {
+      for (const worker of targets) {
+        await this.#startWorker(worker);
       }
-    }
 
-    // Subscribe user-defined event listeners (non-workflow topics, or legacy inline WEP)
-    // Only when starting all workers (not when targeting a specific one).
-    // Idempotent: skip pairs we've already subscribed.
-    if (!name) {
-      for (const topic in this.#events) {
-        if (!this.#events[topic]) {
-          continue;
-        }
-
-        const listeners = Array.isArray(this.#events[topic]) ? this.#events[topic] : [this.#events[topic]];
-        for (const listener of listeners) {
-          const alreadySubscribed = this.#userEventSubscriptions.some(
-            sub => sub.topic === topic && sub.cb === listener,
-          );
-          if (alreadySubscribed) continue;
-          await this.#pubsub.subscribe(topic, listener);
-          this.#userEventSubscriptions.push({ topic, cb: listener });
+      // For push-mode pubsubs (e.g. EventEmitterPubSub) there is no
+      // OrchestrationWorker pulling events — wire handleWorkflowEvent directly
+      // to the pubsub so workflow events still get processed in-process.
+      if (!name) {
+        const modes = this.#pubsub.supportedModes ?? ['pull'];
+        const pushOnly = modes.includes('push') && !modes.includes('pull');
+        if (pushOnly && !this.#pushSubscription) {
+          const cb: EventCallback = (event, ack) => {
+            void this.handleWorkflowEvent(event)
+              .then(result => {
+                if (result.ok && ack) {
+                  return ack().catch(err =>
+                    this.#logger?.error?.('Error acking workflow event in push subscription', err),
+                  );
+                }
+                // Push transports without nack semantics (EventEmitter) treat
+                // a non-ack as a failure signal; we already logged inside handle().
+              })
+              .catch(err => this.#logger?.error?.('Unhandled error in workflow event push subscription', err));
+          };
+          await this.#pubsub.subscribe('workflows', cb);
+          this.#pushSubscription = { topic: 'workflows', cb };
         }
       }
+
+      // Subscribe user-defined event listeners (non-workflow topics, or legacy inline WEP)
+      // Only when starting all workers (not when targeting a specific one).
+      // Idempotent: skip pairs we've already subscribed.
+      if (!name) {
+        for (const topic in this.#events) {
+          if (!this.#events[topic]) {
+            continue;
+          }
+
+          const listeners = Array.isArray(this.#events[topic]) ? this.#events[topic] : [this.#events[topic]];
+          for (const listener of listeners) {
+            const alreadySubscribed = this.#userEventSubscriptions.some(
+              sub => sub.topic === topic && sub.cb === listener,
+            );
+            if (alreadySubscribed) continue;
+            await this.#pubsub.subscribe(topic, listener);
+            this.#userEventSubscriptions.push({ topic, cb: listener });
+          }
+        }
+      }
+
+      startupComplete = true;
+    } finally {
+      if (!name && !startupComplete) {
+        this.#workersStarted = false;
+      }
     }
+  }
+
+  async #startWorker(worker: MastraWorker, opts: { onlyIfWorkersStarted?: boolean } = {}): Promise<void> {
+    const deps: WorkerDeps = {
+      pubsub: this.#pubsub,
+      storage: this.#storage!,
+      logger: this.#logger as unknown as IMastraLogger,
+      mastra: this,
+    };
+    await worker.init(deps);
+    if (opts.onlyIfWorkersStarted && !this.#workersStarted) {
+      return;
+    }
+    await worker.start();
   }
 
   /**
    * Stop all running workers and unsubscribe event listeners.
    */
   public async stopWorkers(): Promise<void> {
+    this.#workersStarted = false;
     let stopError: unknown;
     let hasStopError = false;
     const recordStopError = (message: string, error: unknown) => {
@@ -4194,6 +4253,8 @@ export class Mastra<
         }
       }
     }
+
+    await Promise.all([...this.#pendingWorkerStarts]);
 
     // Tear down the in-process push subscription wired during startWorkers().
     if (this.#pushSubscription) {

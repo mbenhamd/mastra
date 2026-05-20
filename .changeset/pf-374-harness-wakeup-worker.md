@@ -6,9 +6,9 @@
 
 Harness sessions can now be reliably resumed from scheduled or proactive triggers, even after server restarts.
 
-LibSQL and PostgreSQL wakeup ledgers now preserve `yolo` queue-admission overrides during durable wakeup recovery.
+LibSQL and PostgreSQL now preserve the queue admission override flag while recovering scheduled Harness work.
 
-PostgreSQL storage now imports and includes the favorites domain in schema export, so store initialization and exported DDL include favorites consistently.
+PostgreSQL storage now includes favorites during setup and migrations, so favorites remain available after store initialization and restarts.
 
 ```ts
 import { Mastra } from '@mastra/core';
