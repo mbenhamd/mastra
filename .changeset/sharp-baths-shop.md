@@ -2,4 +2,4 @@
 '@mastra/client-js': patch
 ---
 
-Harness client preserves file, primitive, and element attachment references when admitting messages and queued work.
+Improved Harness client attachment admission to preserve file, primitive, and element references for messages and queued work.
