@@ -343,6 +343,40 @@ describe('Agent FGA checks', () => {
       expect(getMemory).not.toHaveBeenCalled();
       expect(fgaProvider.require).not.toHaveBeenCalled();
     });
+
+    it('should authorize merged streamUntilIdle options when caller memory overrides defaults', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: {
+          requestContext: requestContext as any,
+          memory: { resource: 'default-resource', thread: 'default-thread' },
+        },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      try {
+        await agent.streamUntilIdle('test', {
+          memory: { resource: 'caller-resource', thread: 'caller-thread' },
+        });
+      } catch {
+        // Expected to fail due to no real model.
+      }
+
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resourceId: 'caller-resource' },
+      );
+    });
   });
 
   describe('stream()', () => {
@@ -1402,6 +1436,41 @@ describe('Agent FGA checks', () => {
       expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
         runId: 'missing-run-id',
       });
+    });
+
+    it('should authorize merged resumeStreamUntilIdle options when caller memory overrides defaults', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const mastra = createMockMastra(fgaProvider);
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'default-user', organizationMembershipId: 'default-om' });
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: {} as any,
+        defaultOptions: {
+          requestContext: requestContext as any,
+          memory: { resource: 'default-resource', thread: 'default-thread' },
+        },
+      });
+      (agent as any).__registerMastra(mastra);
+
+      await expect(
+        agent.resumeStreamUntilIdle(
+          { approved: true },
+          { runId: 'missing-run-id', memory: { resource: 'caller-resource', thread: 'caller-thread' } },
+        ),
+      ).rejects.toMatchObject({
+        id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
+      });
+
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        { resourceId: 'caller-resource', runId: 'missing-run-id' },
+      );
     });
 
     it('should enforce run owner checks through resumeStreamUntilIdle', async () => {

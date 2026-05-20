@@ -115,16 +115,10 @@ const COMPATIBILITY_PERMISSIONS = [
 ] as const;
 
 /**
- * Compound permission patterns supported by the RBAC matcher.
+ * Additional wildcard permission patterns supported by the RBAC matcher
+ * that are not derived from compatibility permissions or server routes.
  */
-const ADDITIONAL_PERMISSION_PATTERNS = [
-  'stored:*',
-  'stored:read',
-  'stored:write',
-  'stored:delete',
-  'stored-agents:share',
-  'stored-skills:share',
-];
+const ADDITIONAL_PERMISSION_PATTERNS = ['stored:*'];
 
 /**
  * Generates a human-readable description for a permission pattern.

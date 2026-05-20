@@ -7241,13 +7241,17 @@ export class Agent<
       const defaultOptions = await this.getDefaultOptions({
         requestContext: streamOptionsWithPubSub.requestContext,
       });
-      await this.#assertAgentExecutionPreflight(defaultOptions.requestContext, {
-        memory: defaultOptions.memory,
-        runId: streamOptionsWithPubSub.runId,
+      const preflightOptions = deepMerge(
+        defaultOptions as Record<string, unknown>,
+        streamOptionsWithPubSub as Record<string, unknown>,
+      ) as AgentExecutionOptionsBase<any> & { requestContext?: RequestContext; runId?: string };
+      await this.#assertAgentExecutionPreflight(preflightOptions.requestContext, {
+        memory: preflightOptions.memory,
+        runId: preflightOptions.runId,
       });
       streamOptionsWithPubSub = {
         ...streamOptionsWithPubSub,
-        [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: defaultOptions,
+        [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: preflightOptions as AgentExecutionOptions<any>,
         [SKIP_AGENT_EXECUTION_PREFLIGHT]: true,
       };
     }
@@ -7340,14 +7344,18 @@ export class Agent<
       const defaultOptions = await this.getDefaultOptions({
         requestContext: streamOptionsWithPubSub.requestContext,
       });
-      await this.#assertAgentExecutionPreflight(defaultOptions.requestContext, {
-        memory: defaultOptions.memory,
-        runId: streamOptionsWithPubSub.runId,
+      const preflightOptions = deepMerge(
+        defaultOptions as Record<string, unknown>,
+        streamOptionsWithPubSub as Record<string, unknown>,
+      ) as AgentExecutionOptionsBase<any> & { requestContext?: RequestContext; runId?: string };
+      await this.#assertAgentExecutionPreflight(preflightOptions.requestContext, {
+        memory: preflightOptions.memory,
+        runId: preflightOptions.runId,
       });
       streamOptionsWithPubSub = {
         ...streamOptionsWithPubSub,
         _pubsub: pubsub,
-        [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: defaultOptions,
+        [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: preflightOptions as AgentExecutionOptions<TOutput>,
         [SKIP_AGENT_EXECUTION_PREFLIGHT]: true,
       };
     }

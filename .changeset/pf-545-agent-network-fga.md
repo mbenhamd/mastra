@@ -3,9 +3,9 @@
 "@mastra/server": patch
 ---
 
-Agent network execution now fails closed when Fine-Grained Authorization (FGA) is enabled.
+Agent network execution now fails closed when Fine-Grained Authorization is enabled.
 
-When FGA is enabled, `agent.network()` calls must include a trusted resource id in `requestContext`. Calls without that resource id are denied. If FGA is disabled, no caller changes are required.
+When Fine-Grained Authorization is enabled, `agent.network()` calls must include a trusted resource id in `requestContext`. Calls without that resource id are denied. If Fine-Grained Authorization is disabled, no caller changes are required.
 
 ```ts
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
