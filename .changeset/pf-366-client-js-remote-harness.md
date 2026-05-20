@@ -4,7 +4,13 @@
 
 Added first-party client-js RemoteHarness and RemoteSession resources for Harness v1 server routes.
 
-`MastraClient#getHarness(name)` now exposes remote session listing, creation/loading, snapshots, state/mode/model updates, permissions, inbox responses, goals, close, durable message admission, queued work admission, SSE subscription with Last-Event-ID replay, and result lookup settlement for interrupted message/queue operations. Remote skill APIs fail explicitly until matching server routes exist.
+`MastraClient#getHarness(name)` now exposes remote Harness sessions:
+
+- Added remote session management: list, create, load, and close sessions.
+- Added snapshot, state, mode, model, permissions, inbox, and goal APIs.
+- Added durable message admission and queued work admission.
+- Added event subscription with Last-Event-ID replay and result lookup for interrupted operations.
+- Improved remote skill APIs so they fail clearly until matching server routes exist.
 
 **Usage**
 

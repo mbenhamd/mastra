@@ -56,12 +56,16 @@ function mockJson(data: unknown, init: ResponseInit = {}) {
   );
 }
 
-function mockSse(events: unknown[]) {
+function mockSse(events: unknown[], newline = '\n') {
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       for (const event of events as Array<{ id: string; type: string }>) {
-        controller.enqueue(encoder.encode(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(
+          encoder.encode(
+            `id: ${event.id}${newline}event: ${event.type}${newline}data: ${JSON.stringify(event)}${newline}${newline}`,
+          ),
+        );
       }
       controller.close();
     },
@@ -123,6 +127,25 @@ describe('Harness Resource', () => {
 
     await expect(client.getHarness().session({ threadId: { fresh: true } })).rejects.toThrow('HTTP error! status: 500');
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry aborted requests', async () => {
+    const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(makeSnapshot()), {
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers({ 'content-type': 'application/json' }),
+        }),
+      )
+      .mockRejectedValueOnce(abortError);
+    const abortingClient = new MastraClient({ ...clientOptions, fetch });
+
+    const session = await abortingClient.getHarness().session({ sessionId: 'session-1' });
+    await expect(session.refresh()).rejects.toThrow('aborted');
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it('settles message promises through event stream plus result lookup without readmitting work', async () => {
@@ -449,6 +472,30 @@ describe('Harness Resource', () => {
         }),
       );
     });
+    unsubscribe();
+  });
+
+  it('parses CRLF-delimited event stream frames', async () => {
+    mockJson({ session: makeSnapshot() });
+    mockSse(
+      [
+        {
+          id: 'harness-v1:epoch-1:7',
+          type: 'agent_end',
+          sessionId: 'session-1',
+          signalId: 'signal-1',
+          runId: 'run-1',
+          reason: 'complete',
+          timestamp: 3,
+        },
+      ],
+      '\r\n',
+    );
+    const listener = vi.fn();
+
+    const session = await client.getHarness().session();
+    const unsubscribe = session.subscribe(listener);
+    await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
     unsubscribe();
   });
 

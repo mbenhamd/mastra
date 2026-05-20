@@ -689,7 +689,7 @@ class RemoteHarnessEventSubscription extends BaseResource {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split('\n\n');
+        const chunks = buffer.split(/\r?\n\r?\n/);
         buffer = chunks.pop() ?? '';
         for (const chunk of chunks) {
           const event = parseHarnessSseChunk(chunk);
@@ -793,6 +793,9 @@ async function requestRaw(
       return response;
     } catch (error) {
       lastError = error as Error;
+      if (isAbortError(error)) {
+        throw error;
+      }
       const status = (error as Error & { status?: number }).status;
       if (status !== undefined && status >= 400 && status < 500) {
         throw error;
@@ -823,7 +826,7 @@ function parseSessionVersionFromEtag(etag: string | null): number | undefined {
 
 function parseHarnessSseChunk(chunk: string): HarnessEvent | undefined {
   const dataLines: string[] = [];
-  for (const line of chunk.split('\n')) {
+  for (const line of chunk.split(/\r?\n/)) {
     if (line.startsWith('data:')) {
       dataLines.push(line.slice(line.startsWith('data: ') ? 6 : 5));
     }
@@ -873,7 +876,11 @@ function errorStatus(error: unknown): number | undefined {
 }
 
 function isAbortError(error: unknown): boolean {
-  return typeof (error as { name?: unknown })?.name === 'string' && (error as { name: string }).name === 'AbortError';
+  const candidate = error as { code?: unknown; name?: unknown };
+  return (
+    (typeof candidate.name === 'string' && candidate.name === 'AbortError') ||
+    (typeof candidate.code === 'string' && candidate.code === 'ERR_ABORTED')
+  );
 }
 
 async function delayUnlessClosed(ms: number, isClosed: () => boolean): Promise<void> {
