@@ -331,6 +331,29 @@ describe('useRemoteHarnessSession', () => {
     expect(session.subscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('trims retained events when maxEvents shrinks', async () => {
+    const session = new FakeRemoteSession([makeSnapshot()]);
+    const rendered = renderHarnessHookWithOptions(session, renderCount => ({
+      maxEvents: renderCount === 0 ? 3 : 1,
+      refreshOnEvent: false,
+    }));
+    const firstEvent = makeEvent({ id: 'harness-v1:epoch-1:1' });
+    const secondEvent = makeEvent({ id: 'harness-v1:epoch-1:2' });
+    const thirdEvent = makeEvent({ id: 'harness-v1:epoch-1:3' });
+
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBeDefined());
+    await act(async () => {
+      await session.emit(firstEvent);
+      await session.emit(secondEvent);
+      await session.emit(thirdEvent);
+    });
+
+    expect(rendered.latest().events).toEqual([firstEvent, secondEvent, thirdEvent]);
+    rendered.rerender(1);
+
+    expect(rendered.latest().events).toEqual([thirdEvent]);
+  });
+
   it('passes replay options through to client-js and refreshes on replay gaps', async () => {
     const first = makeSnapshot();
     const second = makeSnapshot({ durableWork: { active: [], recentTerminal: [], truncated: true, sessionOwnedOnly: true } });
@@ -478,6 +501,23 @@ describe('useRemoteHarnessSession', () => {
     expect(session.unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('clears subscribed state when a terminal stream error is reported', async () => {
+    const onError = vi.fn();
+    const session = new FakeRemoteSession([makeSnapshot()]);
+    const rendered = renderHarnessHook(session, { onError });
+
+    await vi.waitFor(() => expect(rendered.latest().isSubscribed).toBe(true));
+    const subscribeOptions = session.subscribe.mock.calls[0]?.[1];
+
+    await act(async () => {
+      await subscribeOptions.onError(Object.assign(new Error('forbidden'), { status: 403 }));
+    });
+
+    expect(rendered.latest().isSubscribed).toBe(false);
+    expect(rendered.latest().error?.message).toBe('forbidden');
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ status: 403 }));
+  });
+
   it('does not run queued event refreshes after cleanup', async () => {
     const initialRefresh = createDeferred<HarnessSessionSnapshot>();
     const session = new FakeRemoteSession([makeSnapshot()]);
@@ -506,5 +546,31 @@ describe('useRemoteHarnessSession', () => {
     expect(session.unsubscribe).toHaveBeenCalledTimes(1);
     expect(session.refresh).toHaveBeenCalledTimes(1);
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('resolves queued refresh waiters during cleanup', async () => {
+    const first = makeSnapshot();
+    const second = makeSnapshot({ pendingInbox: [{ itemId: 'question-2', kind: 'question' } as any] });
+    const firstRefresh = createDeferred<HarnessSessionSnapshot>();
+    const session = new FakeRemoteSession([first]);
+    const rendered = renderHarnessHook(session);
+
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(first));
+    session.refresh.mockReset();
+    session.refresh.mockImplementationOnce(() => firstRefresh.promise);
+
+    const firstRefreshPromise = rendered.latest().refresh();
+    const queuedRefreshPromise = rendered.latest().refresh();
+    expect(session.refresh).toHaveBeenCalledTimes(1);
+
+    act(() => root.unmount());
+    await expect(queuedRefreshPromise).resolves.toBeUndefined();
+
+    await act(async () => {
+      firstRefresh.resolve(second);
+      await expect(firstRefreshPromise).resolves.toBe(second);
+    });
+
+    expect(session.refresh).toHaveBeenCalledTimes(1);
   });
 });

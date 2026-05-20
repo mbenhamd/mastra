@@ -6,7 +6,7 @@ import type {
   RemoteSession,
 } from '@mastra/client-js';
 import type { HarnessEvent } from '@mastra/core/harness/v1';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { useMastraClient } from '../mastra-client-context';
 
@@ -53,6 +53,7 @@ const EMPTY_DURABLE_WORK: HarnessSessionSnapshot['durableWork'] = {
   truncated: false,
   sessionOwnedOnly: true,
 };
+const useCommittedRefEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
 export function useHarnessSession(options: UseHarnessSessionOptions = {}): UseRemoteHarnessSessionResult {
   const {
@@ -175,16 +176,20 @@ export function useRemoteHarnessSession(
     mounted.current = true;
     return () => {
       mounted.current = false;
+      refreshQueued.current = false;
+      resolveQueuedRefresh.current?.(undefined);
+      clearQueuedRefresh();
     };
-  }, []);
+  }, [clearQueuedRefresh]);
 
-  useEffect(() => {
+  useCommittedRefEffect(() => {
     callbacks.current = { onError, onEvent, onReplayGap };
-  }, [onError, onEvent, onReplayGap]);
+    eventOptions.current = { maxEvents, refreshOnEvent };
+  });
 
   useEffect(() => {
-    eventOptions.current = { maxEvents, refreshOnEvent };
-  }, [maxEvents, refreshOnEvent]);
+    setEvents(prev => trimEvents(prev, maxEvents));
+  }, [maxEvents]);
 
   useEffect(() => {
     refreshGeneration.current += 1;
@@ -273,7 +278,10 @@ export function useRemoteHarnessSession(
     const subscriptionOptions: RemoteHarnessSubscriptionOptions = {
       reconnect,
       lastEventId,
-      onError: reportError,
+      onError: async caught => {
+        if (isTerminalSubscriptionError(caught, reconnect) && active && mounted.current) setIsSubscribed(false);
+        await reportError(caught);
+      },
       onReplayGap: async () => {
         await refreshIfActive();
         try {
@@ -328,6 +336,16 @@ function asError(value: unknown): Error {
 }
 
 function appendEvent(events: HarnessEvent[], event: HarnessEvent, maxEvents: number): HarnessEvent[] {
-  if (maxEvents <= 0) return [];
-  return [...events, event].slice(-maxEvents);
+  return trimEvents([...events, event], maxEvents);
+}
+
+function trimEvents(events: HarnessEvent[], maxEvents: number): HarnessEvent[] {
+  if (maxEvents <= 0) return events.length === 0 ? events : [];
+  return events.length <= maxEvents ? events : events.slice(-maxEvents);
+}
+
+function isTerminalSubscriptionError(error: unknown, reconnect: boolean): boolean {
+  if (!reconnect) return true;
+  const status = typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : undefined;
+  return status !== undefined && status >= 400 && status < 500;
 }
