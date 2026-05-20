@@ -426,7 +426,6 @@ describe('Harness Resource', () => {
     const session = await client.getHarness().session();
     const result = session.message({ content: 'hello', admissionId: 'admission-1' });
     await vi.waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(5));
-    await new Promise(resolve => setTimeout(resolve, 1100));
 
     await expect(result).resolves.toEqual({ text: 'done after retry' });
   });
