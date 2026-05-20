@@ -655,34 +655,17 @@ describe('HarnessWakeupWorker', () => {
     );
   });
 
-  it('includes admission hash in synthetic queued ids for reconciled admissions', async () => {
-    const first = sampleWakeup({ admissionHash: 'admission-hash-1' });
-    const second = sampleWakeup({
-      id: 'wakeup-2',
-      sourceId: 'source-2',
-      fireId: 'fire-2',
-      idempotencyKey: 'wake-key-2',
-      payloadHash: 'payload-hash-2',
-      admissionHash: 'admission-hash-2',
+  it('dead-letters duplicate queue evidence that has no queued item id', async () => {
+    const item = sampleWakeup({ admissionHash: 'admission-hash-1' });
+    const storage = createWakeupStorage([item]);
+    storage.resolveOperationAdmissionEvidence.mockResolvedValueOnce({
+      status: 'duplicate',
+      storedAdmissionHash: item.admissionHash,
+      evidence: {
+        admissionId: item.admissionId,
+        admissionHash: item.admissionHash,
+      },
     });
-    const storage = createWakeupStorage([first, second]);
-    storage.resolveOperationAdmissionEvidence
-      .mockResolvedValueOnce({
-        status: 'duplicate',
-        storedAdmissionHash: first.admissionHash,
-        evidence: {
-          admissionId: first.admissionId,
-          admissionHash: first.admissionHash,
-        },
-      })
-      .mockResolvedValueOnce({
-        status: 'duplicate',
-        storedAdmissionHash: second.admissionHash,
-        evidence: {
-          admissionId: second.admissionId,
-          admissionHash: second.admissionHash,
-        },
-      });
     const worker = new HarnessWakeupWorker({ maxAttempts: 10 });
     const deps = createMockDeps();
     deps._storage.getStore.mockResolvedValue(storage);
@@ -698,9 +681,18 @@ describe('HarnessWakeupWorker', () => {
     await worker.init(deps);
     await worker.runOnce();
 
-    const queuedItemIds = storage.updateHarnessWakeupItem.mock.calls.map(([record]) => record.queuedItemId);
-    expect(queuedItemIds).toHaveLength(2);
-    expect(new Set(queuedItemIds).size).toBe(2);
+    expect(storage.updateHarnessWakeupItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: item.id,
+        status: 'dead',
+        lastError: expect.objectContaining({
+          code: 'provider_payload_invalid',
+          retryable: false,
+        }),
+      }),
+      { claimId: item.claimId },
+    );
+    expect(storage.updateHarnessWakeupItem.mock.calls[0]?.[0].queuedItemId).toBeUndefined();
   });
 
   it('renews unprocessed wakeups while a claimed batch is waiting', async () => {

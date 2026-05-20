@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import type { HarnessStorage, HarnessWakeupItem, HarnessRowErrorCode } from '../../storage/domains/harness';
 import { MastraWorker } from '../worker';
@@ -334,10 +334,13 @@ export class HarnessWakeupWorker extends MastraWorker {
       });
     }
     const queuedItemId =
-      resolved.evidence && 'queuedItemId' in resolved.evidence
-        ? resolved.evidence.queuedItemId
-        : queueAdmissionQueuedItemId(item);
-    if (!queuedItemId) return false;
+      resolved.evidence && 'queuedItemId' in resolved.evidence ? resolved.evidence.queuedItemId : undefined;
+    if (!queuedItemId) {
+      throw Object.assign(new Error('Duplicate wakeup queue admission evidence has expired'), {
+        name: 'HarnessValidationError',
+        retryable: false,
+      });
+    }
     await this.#markWakeupQueued(storage, item, claimId, queuedItemId);
     return true;
   }
@@ -469,51 +472,6 @@ async function withWakeupClaimRenewal<T>({
   } finally {
     if (interval) clearInterval(interval);
   }
-}
-
-function queueAdmissionQueuedItemId(item: HarnessWakeupItem): string | undefined {
-  if (!item.sessionId || !item.resourceId || !item.threadId || !item.admissionHash) return undefined;
-  const digest = sha256CanonicalJson({
-    kind: 'queue-admission',
-    harnessName: item.harnessName,
-    sessionId: item.sessionId,
-    resourceId: item.resourceId,
-    threadId: item.threadId,
-    admissionId: item.admissionId,
-    admissionHash: item.admissionHash,
-  });
-  return `q-${digest.slice(0, 32)}`;
-}
-
-function sha256CanonicalJson(value: unknown): string {
-  return createHash('sha256')
-    .update(canonicalJson(assertJsonValue(value)), 'utf8')
-    .digest('hex');
-}
-
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-
-function assertJsonValue(value: unknown): JsonValue {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return value;
-  if (Array.isArray(value)) return value.map(assertJsonValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .filter(([, entry]) => entry !== undefined)
-        .map(([key, entry]) => [key, assertJsonValue(entry)]),
-    );
-  }
-  throw new Error('Harness wakeup admission identity must be JSON serializable');
-}
-
-function canonicalJson(value: JsonValue): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
-    .join(',')}}`;
 }
 
 function defaultRetryBackoffMs(attempt: number): number {
