@@ -1313,11 +1313,11 @@ export class Harness {
       }
       for (const child of childrenByParent.get(parentId) ?? []) {
         if (visible.has(child.id)) continue;
-        visible.add(child.id);
         if (visible.size >= CHANNEL_DIAGNOSTICS_MAX_VISIBLE_SESSIONS) {
           truncated = true;
           return { sessionIds: Array.from(visible), truncated };
         }
+        visible.add(child.id);
         stack.push({ id: child.id, depth: depth + 1 });
       }
     }

@@ -779,6 +779,30 @@ describe('Harness server routes', () => {
     );
   });
 
+  it('maps unsupported channel diagnostics storage to 501', async () => {
+    const unsupported = Object.assign(new Error('Harness channel diagnostics are unavailable'), {
+      name: 'HarnessStorageChannelDiagnosticsUnsupportedError',
+    });
+    const harness = {
+      getChannelDiagnostics: vi.fn(async () => {
+        throw unsupported;
+      }),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expectHarnessHttpError(
+      GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+        }),
+      ),
+      501,
+      'harness.channel_diagnostics_unsupported',
+    );
+  });
+
   it('reads session state with a session ETag', async () => {
     const record = makeRecord({ state: { view: 'open' }, version: 11 });
     const harness = {

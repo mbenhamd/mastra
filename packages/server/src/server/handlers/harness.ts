@@ -1404,6 +1404,9 @@ function mapHarnessError(error: unknown): never {
   if (name === 'HarnessStorageSessionEventReplayUnsupportedError') {
     throwHarnessHttpError(501, 'harness.event_replay_unsupported', message, undefined, false);
   }
+  if (name === 'HarnessStorageChannelDiagnosticsUnsupportedError') {
+    throwHarnessHttpError(501, 'harness.channel_diagnostics_unsupported', message, undefined, false);
+  }
   if (name === 'HarnessQueueFullError') {
     throwHarnessHttpError(429, 'harness.queue_full', message, {
       sessionId: harnessErrorString(error, 'sessionId'),

@@ -1146,6 +1146,47 @@ describe('Harness v1 — construction', () => {
     expect(wire).not.toContain('claim-secret');
   });
 
+  it('marks channel diagnostics truncated only when visible sessions exceed the cap', async () => {
+    const storage = makeStorage();
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      harnesses: { primary: harness },
+    });
+    const root = await harness.session({ sessionId: 'session-1', resourceId: 'resource-1', threadId: { fresh: true } });
+    for (let index = 0; index < 255; index += 1) {
+      await harness.session({
+        sessionId: `child-${index}`,
+        resourceId: 'resource-1',
+        parentSessionId: root.id,
+        threadId: { fresh: true },
+      });
+    }
+
+    await expect(
+      harness.getChannelDiagnostics({ sessionId: root.id, resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({
+      visibleSessionIds: expect.arrayContaining([root.id, 'child-254']),
+      truncated: false,
+    });
+
+    await harness.session({
+      sessionId: 'child-over-cap',
+      resourceId: 'resource-1',
+      parentSessionId: root.id,
+      threadId: { fresh: true },
+    });
+
+    const diagnostics = await harness.getChannelDiagnostics({ sessionId: root.id, resourceId: 'resource-1' });
+    expect(diagnostics?.visibleSessionIds).toHaveLength(256);
+    expect(diagnostics?.truncated).toBe(true);
+  });
+
   it('uses lookup reconciliation before retrying lookup-reconcile outbox rows', async () => {
     const storage = makeStorage();
     let deliverCalls = 0;
