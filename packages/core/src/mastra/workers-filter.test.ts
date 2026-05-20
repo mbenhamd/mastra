@@ -68,6 +68,224 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
     }
   });
 
+  it('does not start an initial worker whose init completes after stopWorkers begins', async () => {
+    const mastra = new Mastra({
+      storage: new MockStore(),
+      backgroundTasks: { enabled: true },
+      logger: false,
+    });
+    const initialWorker = mastra.workers[0];
+    if (!initialWorker) {
+      throw new Error('expected an initial worker to hold startWorkers in flight');
+    }
+
+    let resolveInit!: () => void;
+    const init = vi.spyOn(initialWorker, 'init').mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveInit = resolve;
+        }),
+    );
+    const start = vi.spyOn(initialWorker, 'start').mockResolvedValue(undefined);
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(init).toHaveBeenCalledTimes(1);
+    });
+
+    const stopping = mastra.stopWorkers();
+    resolveInit();
+    await Promise.all([starting, stopping]);
+
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('stops an initial worker whose start completes after stopWorkers begins', async () => {
+    const mastra = new Mastra({
+      storage: new MockStore(),
+      backgroundTasks: { enabled: true },
+      logger: false,
+    });
+    const initialWorker = mastra.workers[0];
+    if (!initialWorker) {
+      throw new Error('expected an initial worker to hold startWorkers in flight');
+    }
+
+    let running = false;
+    let resolveStart!: () => void;
+    vi.spyOn(initialWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(initialWorker, 'isRunning', 'get').mockImplementation(() => running);
+    const start = vi.spyOn(initialWorker, 'start').mockImplementation(async () => {
+      await new Promise<void>(resolve => {
+        resolveStart = resolve;
+      });
+      running = true;
+    });
+    const stop = vi.spyOn(initialWorker, 'stop').mockImplementation(async () => {
+      running = false;
+    });
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(start).toHaveBeenCalledTimes(1);
+    });
+
+    const stopping = mastra.stopWorkers();
+    resolveStart();
+    await Promise.all([starting, stopping]);
+
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(running).toBe(false);
+  });
+
+  it('cleans up already-running workers when a pending startup rejects during stopWorkers', async () => {
+    const mastra = new Mastra({
+      storage: new MockStore(),
+      backgroundTasks: { enabled: true },
+      logger: false,
+    });
+    const [firstWorker, secondWorker] = mastra.workers;
+    if (!firstWorker || !secondWorker) {
+      throw new Error('expected at least two workers to model partial startup cleanup');
+    }
+
+    let firstRunning = false;
+    vi.spyOn(firstWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(firstWorker, 'isRunning', 'get').mockImplementation(() => firstRunning);
+    vi.spyOn(firstWorker, 'start').mockImplementation(async () => {
+      firstRunning = true;
+    });
+    const firstStop = vi.spyOn(firstWorker, 'stop').mockImplementation(async () => {
+      firstRunning = false;
+    });
+
+    let rejectSecondStart!: (error: Error) => void;
+    vi.spyOn(secondWorker, 'init').mockResolvedValue(undefined);
+    const secondStart = vi.spyOn(secondWorker, 'start').mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSecondStart = reject;
+        }),
+    );
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(secondStart).toHaveBeenCalledTimes(1);
+    });
+
+    const stopping = mastra.stopWorkers();
+    rejectSecondStart(new Error('worker startup failed'));
+
+    await expect(starting).rejects.toThrow('worker startup failed');
+    await expect(stopping).rejects.toThrow('worker startup failed');
+    expect(firstStop).toHaveBeenCalledTimes(1);
+    expect(firstRunning).toBe(false);
+  });
+
+  it('stops already-running workers before waiting for later pending startups', async () => {
+    const mastra = new Mastra({
+      storage: new MockStore(),
+      backgroundTasks: { enabled: true },
+      logger: false,
+    });
+    const [firstWorker, secondWorker] = mastra.workers;
+    if (!firstWorker || !secondWorker) {
+      throw new Error('expected at least two workers to model partial startup shutdown');
+    }
+
+    let firstRunning = false;
+    vi.spyOn(firstWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(firstWorker, 'isRunning', 'get').mockImplementation(() => firstRunning);
+    vi.spyOn(firstWorker, 'start').mockImplementation(async () => {
+      firstRunning = true;
+    });
+    const firstStop = vi.spyOn(firstWorker, 'stop').mockImplementation(async () => {
+      firstRunning = false;
+    });
+
+    let secondRunning = false;
+    let resolveSecondStart!: () => void;
+    vi.spyOn(secondWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(secondWorker, 'isRunning', 'get').mockImplementation(() => secondRunning);
+    const secondStart = vi.spyOn(secondWorker, 'start').mockImplementation(async () => {
+      await new Promise<void>(resolve => {
+        resolveSecondStart = resolve;
+      });
+      secondRunning = true;
+    });
+    const secondStop = vi.spyOn(secondWorker, 'stop').mockImplementation(async () => {
+      secondRunning = false;
+    });
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(secondStart).toHaveBeenCalledTimes(1);
+    });
+
+    const stopping = mastra.stopWorkers();
+    await vi.waitFor(() => {
+      expect(firstStop).toHaveBeenCalledTimes(1);
+    });
+    expect(firstRunning).toBe(false);
+
+    resolveSecondStart();
+    await Promise.all([starting, stopping]);
+
+    expect(secondStop).toHaveBeenCalledTimes(1);
+    expect(secondRunning).toBe(false);
+  });
+
+  it('keeps pending startup rejection evidence when it settles during a slow stop', async () => {
+    const mastra = new Mastra({
+      storage: new MockStore(),
+      backgroundTasks: { enabled: true },
+      logger: false,
+    });
+    const [firstWorker, secondWorker] = mastra.workers;
+    if (!firstWorker || !secondWorker) {
+      throw new Error('expected at least two workers to model startup rejection during slow stop');
+    }
+
+    let firstRunning = false;
+    let resolveFirstStop!: () => void;
+    vi.spyOn(firstWorker, 'init').mockResolvedValue(undefined);
+    vi.spyOn(firstWorker, 'isRunning', 'get').mockImplementation(() => firstRunning);
+    vi.spyOn(firstWorker, 'start').mockImplementation(async () => {
+      firstRunning = true;
+    });
+    const firstStop = vi.spyOn(firstWorker, 'stop').mockImplementation(async () => {
+      await new Promise<void>(resolve => {
+        resolveFirstStop = resolve;
+      });
+      firstRunning = false;
+    });
+
+    let rejectSecondStart!: (error: Error) => void;
+    vi.spyOn(secondWorker, 'init').mockResolvedValue(undefined);
+    const secondStart = vi.spyOn(secondWorker, 'start').mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSecondStart = reject;
+        }),
+    );
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(secondStart).toHaveBeenCalledTimes(1);
+    });
+
+    const stopping = mastra.stopWorkers();
+    await vi.waitFor(() => {
+      expect(firstStop).toHaveBeenCalledTimes(1);
+    });
+    rejectSecondStart(new Error('worker startup failed during stop'));
+    resolveFirstStop();
+
+    await expect(starting).rejects.toThrow('worker startup failed during stop');
+    await expect(stopping).rejects.toThrow('worker startup failed during stop');
+    expect(firstRunning).toBe(false);
+  });
+
   it('registers harness wakeup worker for harness session storage without top-level storage', () => {
     const mastra = new Mastra({
       harness: new Harness({

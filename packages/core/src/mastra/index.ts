@@ -4157,7 +4157,14 @@ export class Mastra<
     let startupComplete = false;
     try {
       for (const worker of targets) {
-        await this.#startWorker(worker);
+        const start = this.#startWorker(worker, { onlyIfWorkersStarted: !name }).finally(() => {
+          this.#pendingWorkerStarts.delete(start);
+        });
+        this.#pendingWorkerStarts.add(start);
+        await start;
+        if (!name && !this.#workersStarted) {
+          return;
+        }
       }
 
       // For push-mode pubsubs (e.g. EventEmitterPubSub) there is no
@@ -4242,19 +4249,31 @@ export class Mastra<
       }
       this.#logger?.error(message, error);
     };
-
-    // Stop registered workers in reverse order
-    for (const worker of [...this.#workers].reverse()) {
-      if (worker.isRunning) {
-        try {
-          await worker.stop();
-        } catch (error) {
-          recordStopError(`Failed to stop worker "${worker.name}"`, error);
+    const pendingWorkerStartsAtShutdown = [...this.#pendingWorkerStarts];
+    const settlePendingWorkerStarts = async (starts: Promise<void>[] = [...this.#pendingWorkerStarts]) => {
+      const pendingWorkerStartResults = await Promise.allSettled(starts);
+      for (const result of pendingWorkerStartResults) {
+        if (result.status === 'rejected') {
+          recordStopError('Failed to finish pending worker startup during shutdown', result.reason);
         }
       }
-    }
+    };
+    const stopRunningWorkers = async () => {
+      for (const worker of [...this.#workers].reverse()) {
+        if (worker.isRunning) {
+          try {
+            await worker.stop();
+          } catch (error) {
+            recordStopError(`Failed to stop worker "${worker.name}"`, error);
+          }
+        }
+      }
+    };
 
-    await Promise.all([...this.#pendingWorkerStarts]);
+    await stopRunningWorkers();
+    await settlePendingWorkerStarts(pendingWorkerStartsAtShutdown);
+    await settlePendingWorkerStarts();
+    await stopRunningWorkers();
 
     // Tear down the in-process push subscription wired during startWorkers().
     if (this.#pushSubscription) {
