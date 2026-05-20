@@ -439,6 +439,43 @@ describe('HarnessWakeupWorker', () => {
     );
   });
 
+  it('does not retry wakeups with unavailable attachment references', async () => {
+    const item = sampleWakeup();
+    const storage = createWakeupStorage([item]);
+    const worker = new HarnessWakeupWorker();
+    const deps = createMockDeps();
+    deps._storage.getStore.mockResolvedValue(storage);
+    deps.mastra = {
+      getHarnesses: () => ({
+        default: {
+          _internalGetSessionStorage: () => storage,
+          session: vi.fn().mockResolvedValue({
+            resourceId: item.resourceId,
+            threadId: item.threadId,
+            _admitWakeupQueue: vi
+              .fn()
+              .mockRejectedValue(
+                Object.assign(new Error('attachment missing'), { name: 'HarnessAttachmentUnavailableError' }),
+              ),
+          }),
+        },
+      }),
+    } as any;
+
+    await worker.init(deps);
+    await worker.runOnce();
+
+    expect(storage.updateHarnessWakeupItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: item.id,
+        status: 'dead',
+        lastError: expect.objectContaining({ code: 'provider_payload_invalid', retryable: false }),
+        nextAttemptAt: undefined,
+      }),
+      { claimId: item.claimId },
+    );
+  });
+
   it('continues processing later harnesses when one harness claim fails', async () => {
     const item = sampleWakeup({ harnessName: 'good' });
     const badStorage = createWakeupStorage([]);

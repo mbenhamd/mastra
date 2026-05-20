@@ -500,6 +500,9 @@ function projectWakeupError(error: unknown): { code: HarnessRowErrorCode; messag
   if (name === 'HarnessSessionLockedError') return { code: 'session_locked', message, retryable: true };
   if (name === 'HarnessQueueFullError') return { code: 'queue_full', message, retryable: true };
   if (name === 'HarnessValidationError') return { code: 'provider_payload_invalid', message, retryable: false };
+  if (name === 'HarnessAttachmentUnavailableError') {
+    return { code: 'provider_payload_invalid', message, retryable: false };
+  }
   if (name === 'HarnessAdmissionConflictError') {
     return { code: 'channel_payload_conflict', message, retryable: false };
   }
