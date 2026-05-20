@@ -301,10 +301,46 @@ describe('HarnessWakeupWorker', () => {
     await worker.init(deps);
     await worker.runOnce();
 
+    expect(storage.loadSessionByThread).toHaveBeenCalledWith({
+      harnessName: item.harnessName,
+      threadId: item.threadId,
+      resourceId: item.resourceId,
+    });
     expect(session).toHaveBeenCalledWith({
       sessionId: item.sessionId,
       resourceId: item.resourceId,
     });
+  });
+
+  it('does not create sessions when stale wakeups have no active thread record', async () => {
+    const item = sampleWakeup({ sessionId: 'stale-session' });
+    const storage = createWakeupStorage([item]);
+    storage.loadSessionByThread.mockResolvedValueOnce(null);
+    const session = vi.fn();
+    const worker = new HarnessWakeupWorker();
+    const deps = createMockDeps();
+    deps._storage.getStore.mockResolvedValue(storage);
+    deps.mastra = {
+      getHarnesses: () => ({
+        default: {
+          _internalGetSessionStorage: () => storage,
+          session,
+        },
+      }),
+    } as any;
+
+    await worker.init(deps);
+    await worker.runOnce();
+
+    expect(session).not.toHaveBeenCalled();
+    expect(storage.updateHarnessWakeupItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: item.id,
+        status: 'dead',
+        lastError: expect.objectContaining({ code: 'worker_unavailable', retryable: false }),
+      }),
+      { claimId: item.claimId },
+    );
   });
 
   it('fails closed when a wakeup session resolves to a different thread', async () => {
@@ -929,6 +965,14 @@ function createWakeupStorage(items: HarnessWakeupItem[]) {
     claimHarnessWakeupItems: vi.fn().mockResolvedValue(items),
     renewHarnessWakeupClaim: vi.fn().mockResolvedValue({ claimExpiresAt: Date.now() + 30_000, storageNow: Date.now() }),
     resolveOperationAdmissionEvidence: vi.fn().mockResolvedValue({ status: 'none' }),
+    loadSessionByThread: vi
+      .fn()
+      .mockImplementation(
+        async ({ threadId, resourceId }: { harnessName?: string; threadId: string; resourceId: string }) => {
+          const item = items.find(candidate => candidate.threadId === threadId && candidate.resourceId === resourceId);
+          return item?.sessionId ? { id: item.sessionId, threadId, resourceId } : null;
+        },
+      ),
     updateHarnessWakeupItem: vi.fn().mockResolvedValue(undefined),
   };
 }

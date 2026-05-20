@@ -1707,9 +1707,6 @@ export class Harness {
     // In-memory hit by (threadId, resourceId)?
     for (const live of this._liveSessions.values()) {
       if (live.threadId === threadId && live.resourceId === resourceId) {
-        if (opts.sessionId !== undefined && live.id !== opts.sessionId) {
-          throw new HarnessSessionNotFoundError(opts.sessionId);
-        }
         if (live.isClosing) {
           throw new HarnessSessionClosingError(live.id);
         }
@@ -1720,9 +1717,6 @@ export class Harness {
     // Storage lookup — adapters filter out closed records.
     const stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
     if (stored) {
-      if (opts.sessionId !== undefined && stored.id !== opts.sessionId) {
-        throw new HarnessSessionNotFoundError(opts.sessionId);
-      }
       if (stored.closingAt !== undefined) {
         throw new HarnessSessionClosingError(stored.id);
       }

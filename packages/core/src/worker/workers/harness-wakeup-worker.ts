@@ -251,7 +251,7 @@ export class HarnessWakeupWorker extends MastraWorker {
         claimTtlMs: this.#config.claimTtlMs,
         claimRenewMs: this.#config.claimRenewMs,
         operation: async () => {
-          const session = await this.#resolveSession(harness, item);
+          const session = await this.#resolveSession(harness, storage, item);
           if (session._admitWakeupQueue) return session._admitWakeupQueue(item);
           throw Object.assign(new Error('Harness session does not expose wakeup queue admission'), {
             code: 'harness.storage.wakeup_session_unavailable',
@@ -345,10 +345,28 @@ export class HarnessWakeupWorker extends MastraWorker {
     return true;
   }
 
-  async #resolveSession(harness: WakeupHarness, item: HarnessWakeupItem): Promise<WakeupSession> {
+  async #resolveSession(
+    harness: WakeupHarness,
+    storage: HarnessStorage,
+    item: HarnessWakeupItem,
+  ): Promise<WakeupSession> {
     if (item.sessionId) {
+      const active =
+        item.threadId && item.resourceId
+          ? await storage.loadSessionByThread({
+              harnessName: item.harnessName,
+              threadId: item.threadId,
+              resourceId: item.resourceId,
+            })
+          : undefined;
+      if (item.threadId && item.resourceId && !active) {
+        throw Object.assign(new Error('Harness wakeup item does not identify an active recoverable session'), {
+          code: 'harness.storage.wakeup_session_unavailable',
+          retryable: false,
+        });
+      }
       const session = await harness.session({
-        sessionId: item.sessionId,
+        sessionId: active?.id ?? item.sessionId,
         ...(item.resourceId ? { resourceId: item.resourceId } : {}),
       });
       if (item.threadId && session.threadId !== item.threadId) {

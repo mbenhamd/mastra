@@ -5701,6 +5701,7 @@ export class Session {
     admissionHash?: string;
     mode?: string;
     model?: string;
+    yolo?: boolean;
     attachments: PersistedAttachment[];
     requestContext?: PersistedRequestContextInput;
   }): Promise<QueueAdmissionResult> {
@@ -5710,6 +5711,7 @@ export class Session {
         admissionId: item.admissionId,
         ...(item.mode !== undefined ? { mode: item.mode } : {}),
         ...(item.model !== undefined ? { model: item.model } : {}),
+        ...(item.yolo === true ? { yolo: true } : {}),
       },
       'admitQueue()',
       {

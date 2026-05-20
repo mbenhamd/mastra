@@ -817,6 +817,7 @@ export interface HarnessWakeupItem {
   status: 'due' | 'claimed' | 'queued' | 'completed' | 'failed' | 'dead';
   mode?: string;
   model?: string;
+  yolo?: boolean;
   attempts: number;
   missedCount?: number;
   claimId?: string;

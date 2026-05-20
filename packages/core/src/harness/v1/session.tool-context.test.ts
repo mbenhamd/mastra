@@ -9,7 +9,7 @@
  * actually wiring a real tool execution.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { setupHarness } from './__test-utils__/setup';
 import { HarnessStateConflictError, HarnessValidationError } from './errors';
@@ -192,6 +192,34 @@ describe('HarnessRequestContext — queued turns', () => {
       externalMessageId: 'message-1',
       actor: { platformUserId: 'user-1', displayName: 'Ada' },
     });
+  });
+
+  it('preserves yolo when admitting durable wakeup queue rows', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const admitQueue = vi.spyOn(session as any, '_admitQueue').mockResolvedValue({
+      queuedItemId: 'queued-yolo',
+      evidence: {},
+      duplicate: false,
+    });
+
+    await (session as any)._admitWakeupQueue({
+      content: 'scheduled work',
+      admissionId: 'wakeup-admission-yolo',
+      yolo: true,
+      attachments: [],
+    });
+
+    expect(admitQueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: 'scheduled work',
+        admissionId: 'wakeup-admission-yolo',
+        yolo: true,
+      }),
+      'admitQueue()',
+      expect.objectContaining({ persistedAttachments: [] }),
+    );
+    admitQueue.mockRestore();
   });
 
   it('wakeup admission rejects persisted refs owned by another session', async () => {
