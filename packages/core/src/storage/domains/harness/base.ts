@@ -879,7 +879,7 @@ export abstract class HarnessStorage extends StorageDomain {
    * push `resourceId` and `sessionIds` filters to storage and must not mutate,
    * claim, dispatch, retry, or reconcile rows.
    */
-  listChannelDiagnosticsRows(_opts: ListChannelDiagnosticsInput): Promise<ChannelDiagnosticsRows> {
+  async listChannelDiagnosticsRows(_opts: ListChannelDiagnosticsInput): Promise<ChannelDiagnosticsRows> {
     throw new HarnessStorageChannelDiagnosticsUnsupportedError();
   }
 
