@@ -222,8 +222,11 @@ export function useRemoteHarnessSession(
           refreshQueued.current = false;
 
           if (shouldRefreshAgain) {
+            const resolveQueued = resolveQueuedRefresh.current;
+            const rejectQueued = rejectQueuedRefresh.current;
+            clearQueuedRefresh();
             const queuedRefresh = refreshSessionRef.current();
-            void queuedRefresh.then(resolveQueuedRefresh.current, rejectQueuedRefresh.current).finally(clearQueuedRefresh);
+            void queuedRefresh.then(resolveQueued, rejectQueued);
           } else {
             setIsLoading(false);
           }
@@ -281,17 +284,18 @@ export function useRemoteHarnessSession(
       },
     };
 
+    setIsSubscribed(false);
     try {
       unsubscribe = session.subscribe(async event => {
         if (!active || !mounted.current) return;
         setEvents(prev => appendEvent(prev, event, eventOptions.current.maxEvents));
+        if (eventOptions.current.refreshOnEvent) {
+          void refreshIfActive();
+        }
         try {
           await callbacks.current.onEvent?.(event);
         } catch (caught) {
           await reportError(caught);
-        }
-        if (eventOptions.current.refreshOnEvent) {
-          void refreshIfActive();
         }
       }, subscriptionOptions);
     } catch (caught) {

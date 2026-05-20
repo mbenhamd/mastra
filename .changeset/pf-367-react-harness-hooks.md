@@ -1,5 +1,5 @@
 ---
-'@mastra/react': patch
+'@mastra/react': minor
 ---
 
 Add React Harness hooks for building reconnectable session UIs that stay in sync with remote Harness state.

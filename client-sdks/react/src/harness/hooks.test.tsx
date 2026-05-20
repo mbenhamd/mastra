@@ -69,6 +69,16 @@ function makeEvent(overrides: Partial<HarnessEvent> = {}): HarnessEvent {
   } as HarnessEvent;
 }
 
+function createDeferred<T>() {
+  let resolve: (value: T) => void;
+  let reject: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject: reject!, resolve: resolve! };
+}
+
 class FakeRemoteSession {
   readonly refresh = vi.fn<() => Promise<HarnessSessionSnapshot>>();
   readonly subscribe = vi.fn<
@@ -256,6 +266,31 @@ describe('useRemoteHarnessSession', () => {
     expect(session.refresh).toHaveBeenCalledTimes(2);
   });
 
+  it('refreshes from events before waiting for slow consumer callbacks', async () => {
+    const first = makeSnapshot();
+    const second = makeSnapshot({ pendingInbox: [{ itemId: 'approval-1', kind: 'tool-approval' } as any] });
+    const eventCallback = createDeferred<void>();
+    const onEvent = vi.fn(() => eventCallback.promise);
+    const session = new FakeRemoteSession([first, second]);
+    const rendered = renderHarnessHook(session, { onEvent });
+
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(first));
+    const event = makeEvent();
+    let eventPromise: void | Promise<void>;
+    act(() => {
+      eventPromise = session.emit(event);
+    });
+
+    await vi.waitFor(() => expect(session.refresh).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(second));
+    expect(onEvent).toHaveBeenCalledWith(event);
+
+    await act(async () => {
+      eventCallback.resolve();
+      await eventPromise;
+    });
+  });
+
   it('keeps event cursors moving when consumer event callbacks reject', async () => {
     const first = makeSnapshot();
     const second = makeSnapshot({ pendingInbox: [{ itemId: 'question-1', kind: 'question' } as any] });
@@ -353,6 +388,50 @@ describe('useRemoteHarnessSession', () => {
     await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(third));
   });
 
+  it('allocates a fresh queued refresh promise for each queued refresh cycle', async () => {
+    const first = makeSnapshot();
+    const second = makeSnapshot({ pendingInbox: [{ itemId: 'question-2', kind: 'question' } as any] });
+    const third = makeSnapshot({ pendingInbox: [{ itemId: 'question-3', kind: 'question' } as any] });
+    const fourth = makeSnapshot({ pendingInbox: [{ itemId: 'question-4', kind: 'question' } as any] });
+    const firstRefresh = createDeferred<HarnessSessionSnapshot>();
+    const secondRefresh = createDeferred<HarnessSessionSnapshot>();
+    const thirdRefresh = createDeferred<HarnessSessionSnapshot>();
+    const session = new FakeRemoteSession([first]);
+    const rendered = renderHarnessHook(session);
+
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(first));
+    session.refresh.mockReset();
+    session.refresh
+      .mockImplementationOnce(() => firstRefresh.promise)
+      .mockImplementationOnce(() => secondRefresh.promise)
+      .mockImplementationOnce(() => thirdRefresh.promise);
+
+    const firstRefreshPromise = rendered.latest().refresh();
+    const queuedRefreshPromise = rendered.latest().refresh();
+    expect(session.refresh).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstRefresh.resolve(second);
+      await expect(firstRefreshPromise).resolves.toBe(second);
+    });
+    await vi.waitFor(() => expect(session.refresh).toHaveBeenCalledTimes(2));
+
+    const nextQueuedRefreshPromise = rendered.latest().refresh();
+    expect(session.refresh).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondRefresh.resolve(third);
+      await expect(queuedRefreshPromise).resolves.toBe(third);
+    });
+    await vi.waitFor(() => expect(session.refresh).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      thirdRefresh.resolve(fourth);
+      await expect(nextQueuedRefreshPromise).resolves.toBe(fourth);
+    });
+    await vi.waitFor(() => expect(rendered.latest().snapshot).toBe(fourth));
+  });
+
   it('unsubscribes from the RemoteSession stream on cleanup', async () => {
     const session = new FakeRemoteSession([makeSnapshot()]);
     renderHarnessHook(session);
@@ -378,8 +457,33 @@ describe('useRemoteHarnessSession', () => {
     expect(rendered.latest().isSubscribed).toBe(false);
   });
 
-  it('does not refresh from an in-flight event callback after cleanup', async () => {
-    const session = new FakeRemoteSession([makeSnapshot(), makeSnapshot()]);
+  it('clears subscribed state when a resubscribe fails', async () => {
+    const subscribeError = new Error('resubscribe failed');
+    const onError = vi.fn();
+    const session = new FakeRemoteSession([makeSnapshot()]);
+    const rendered = renderHarnessHookWithOptions(session, renderCount => ({
+      lastEventId: `harness-v1:epoch-1:${renderCount + 1}`,
+      onError,
+    }));
+
+    await vi.waitFor(() => expect(rendered.latest().isSubscribed).toBe(true));
+    session.subscribe.mockImplementationOnce(() => {
+      throw subscribeError;
+    });
+    rendered.rerender(1);
+
+    await vi.waitFor(() => expect(rendered.latest().error).toBe(subscribeError));
+    expect(onError).toHaveBeenCalledWith(subscribeError);
+    expect(rendered.latest().isSubscribed).toBe(false);
+    expect(session.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run queued event refreshes after cleanup', async () => {
+    const initialRefresh = createDeferred<HarnessSessionSnapshot>();
+    const session = new FakeRemoteSession([makeSnapshot()]);
+    session.refresh.mockReset();
+    session.refresh.mockImplementationOnce(() => initialRefresh.promise);
+    session.refresh.mockResolvedValue(makeSnapshot());
     const onError = vi.fn();
     let resolveEvent: (() => void) | undefined;
     const onEvent = vi.fn(
@@ -393,8 +497,11 @@ describe('useRemoteHarnessSession', () => {
     await vi.waitFor(() => expect(session.refresh).toHaveBeenCalledTimes(1));
     const eventPromise = session.emit(makeEvent());
     act(() => root.unmount());
-    resolveEvent?.();
-    await eventPromise;
+    await act(async () => {
+      initialRefresh.resolve(makeSnapshot());
+      resolveEvent?.();
+      await eventPromise;
+    });
 
     expect(session.unsubscribe).toHaveBeenCalledTimes(1);
     expect(session.refresh).toHaveBeenCalledTimes(1);
