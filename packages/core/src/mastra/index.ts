@@ -60,6 +60,16 @@ import type { AnyWorkspace, RegisteredWorkspace, Workspace } from '../workspace'
 import { createOnScorerHook } from './hooks';
 import type { VersionOverrides, VersionSelector } from './types';
 
+const PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS = 30_000;
+
+type PendingWorkerStart = {
+  worker: MastraWorker;
+  promise: Promise<void>;
+  phase: 'init' | 'start' | 'settled';
+  token: number;
+  ignoreShutdownError?: boolean;
+};
+
 /**
  * Creates an error for when a null/undefined value is passed to an add* method.
  * This commonly occurs when config is spread ({ ...config }) and the original
@@ -615,7 +625,15 @@ export class Mastra<
   #workerFilter?: Set<string>;
   #autoCreateWorkers = true;
   #workersStarted = false;
-  #pendingWorkerStarts = new Set<Promise<void>>();
+  #workerLifecycleGeneration = 0;
+  #workerShutdownGeneration = 0;
+  #workerStartSequence = 0;
+  #allWorkersStartPromise?: Promise<void>;
+  #workersStopPromise?: Promise<void>;
+  #pendingWorkerStarts = new Set<PendingWorkerStart>();
+  #workerStartPromises = new WeakMap<MastraWorker, Promise<void>>();
+  #latestWorkerStartTokens = new WeakMap<MastraWorker, number>();
+  #latestWorkerStartLifecycleGenerations = new WeakMap<MastraWorker, number>();
   #harnessWakeupConfig?: HarnessWakeupWorkerConfig;
   // Lazily-constructed processor used by handleWorkflowEvent(). Shared between
   // pull-mode workers (OrchestrationWorker) and push-mode entry points
@@ -1370,14 +1388,16 @@ export class Mastra<
     this.#workers.push(worker);
 
     if (this.#workersStarted && (!this.#workerFilter || this.#workerFilter.has(worker.name))) {
-      const start = this.#startWorker(worker, { onlyIfWorkersStarted: true })
-        .catch(error => {
+      void this.#trackWorkerStart(worker, {
+        onlyIfWorkersStarted: true,
+        onlyIfLifecycleGeneration: this.#workerLifecycleGeneration,
+        startLifecycleGeneration: this.#workerLifecycleGeneration,
+        stopIfWorkersStopped: true,
+        stopIfLifecycleGenerationChangesFrom: this.#workerLifecycleGeneration,
+        onError: error => {
           this.#logger?.error?.('Failed to start worker "harnessWakeups"', error);
-        })
-        .finally(() => {
-          this.#pendingWorkerStarts.delete(start);
-        });
-      this.#pendingWorkerStarts.add(start);
+        },
+      });
     }
   }
 
@@ -4133,6 +4153,31 @@ export class Mastra<
    * user-defined event listeners.
    */
   public async startWorkers(name?: string): Promise<void> {
+    if (this.#workersStopPromise) {
+      await this.#workersStopPromise;
+    }
+
+    if (!name) {
+      if (this.#allWorkersStartPromise) {
+        return this.#allWorkersStartPromise;
+      }
+
+      const start = this.#startWorkers(name);
+      this.#allWorkersStartPromise = start;
+      try {
+        await start;
+      } finally {
+        if (this.#allWorkersStartPromise === start) {
+          this.#allWorkersStartPromise = undefined;
+        }
+      }
+      return;
+    }
+
+    return this.#startWorkers(name);
+  }
+
+  async #startWorkers(name?: string): Promise<void> {
     let targets: MastraWorker[];
     if (name) {
       targets = this.#workers.filter(w => w.name === name);
@@ -4150,19 +4195,52 @@ export class Mastra<
       targets = [...this.#workers];
     }
 
-    if (!name) {
+    let startupLifecycleGeneration: number | undefined;
+    let startupShutdownGeneration: number | undefined;
+    let workersRunningBeforeStartup: WeakSet<MastraWorker> | undefined;
+    let workersStartingBeforeStartup: WeakSet<MastraWorker> | undefined;
+    let workersStartedBeforeStartup = false;
+    let startupPushSubscription:
+      | {
+          topic: string;
+          cb: EventCallback;
+          subscribed: boolean;
+        }
+      | undefined;
+    const startupUserEventSubscriptions: Array<{
+      topic: string;
+      cb: (event: Event, ack?: () => Promise<void>) => Promise<void>;
+      subscribed: boolean;
+    }> = [];
+    if (name) {
+      startupShutdownGeneration = this.#workerShutdownGeneration;
+    } else {
+      workersStartedBeforeStartup = this.#workersStarted;
+      workersRunningBeforeStartup = new WeakSet(this.#workers.filter(worker => worker.isRunning));
+      workersStartingBeforeStartup = new WeakSet([...this.#pendingWorkerStarts].map(start => start.worker));
+      this.#workerLifecycleGeneration += 1;
+      startupLifecycleGeneration = this.#workerLifecycleGeneration;
       this.#workersStarted = true;
     }
 
     let startupComplete = false;
     try {
       for (const worker of targets) {
-        const start = this.#startWorker(worker, { onlyIfWorkersStarted: !name }).finally(() => {
-          this.#pendingWorkerStarts.delete(start);
+        await this.#trackWorkerStart(worker, {
+          onlyIfWorkersStarted: !name,
+          onlyIfLifecycleGeneration: name ? undefined : startupLifecycleGeneration,
+          onlyIfShutdownGeneration: name ? startupShutdownGeneration : undefined,
+          startLifecycleGeneration: name ? undefined : startupLifecycleGeneration,
+          stopIfWorkersStopped: !name,
+          stopIfLifecycleGenerationChangesFrom: startupLifecycleGeneration,
         });
-        this.#pendingWorkerStarts.add(start);
-        await start;
-        if (!name && !this.#workersStarted) {
+        if (
+          startupLifecycleGeneration !== undefined &&
+          ((!name && !this.#workersStarted) || this.#workerLifecycleGeneration !== startupLifecycleGeneration)
+        ) {
+          return;
+        }
+        if (startupShutdownGeneration !== undefined && this.#workerShutdownGeneration !== startupShutdownGeneration) {
           return;
         }
       }
@@ -4187,8 +4265,30 @@ export class Mastra<
               })
               .catch(err => this.#logger?.error?.('Unhandled error in workflow event push subscription', err));
           };
+          startupPushSubscription = { topic: 'workflows', cb, subscribed: false };
+          this.#pushSubscription = startupPushSubscription;
           await this.#pubsub.subscribe('workflows', cb);
-          this.#pushSubscription = { topic: 'workflows', cb };
+          startupPushSubscription.subscribed = true;
+          if (
+            !this.#workersStarted ||
+            (startupLifecycleGeneration !== undefined && this.#workerLifecycleGeneration !== startupLifecycleGeneration)
+          ) {
+            const ownsPushSubscription = this.#pushSubscription === startupPushSubscription;
+            try {
+              await this.#pubsub.unsubscribe('workflows', cb);
+            } catch (error) {
+              if (ownsPushSubscription || !this.#pushSubscription) {
+                this.#pushSubscription = startupPushSubscription;
+                throw error;
+              }
+              this.#logger?.error('Failed to cleanup stale workflow push subscription after shutdown', error);
+            }
+            if (ownsPushSubscription && this.#pushSubscription === startupPushSubscription) {
+              this.#pushSubscription = undefined;
+            }
+            startupPushSubscription = undefined;
+            return;
+          }
         }
       }
 
@@ -4207,21 +4307,247 @@ export class Mastra<
               sub => sub.topic === topic && sub.cb === listener,
             );
             if (alreadySubscribed) continue;
+            const subscription = { topic, cb: listener, subscribed: false };
+            this.#userEventSubscriptions.push(subscription);
+            startupUserEventSubscriptions.push(subscription);
             await this.#pubsub.subscribe(topic, listener);
-            this.#userEventSubscriptions.push({ topic, cb: listener });
+            subscription.subscribed = true;
+            if (
+              !this.#workersStarted ||
+              (startupLifecycleGeneration !== undefined &&
+                this.#workerLifecycleGeneration !== startupLifecycleGeneration)
+            ) {
+              const ownsUserEventSubscription = this.#userEventSubscriptions.some(
+                sub => sub === subscription || (sub.topic === topic && sub.cb === listener),
+              );
+              try {
+                await this.#pubsub.unsubscribe(topic, listener);
+              } catch (error) {
+                if (ownsUserEventSubscription) {
+                  throw error;
+                }
+                if (!this.#userEventSubscriptions.includes(subscription)) {
+                  this.#userEventSubscriptions.push(subscription);
+                  throw error;
+                }
+                this.#logger?.error(
+                  `Failed to cleanup stale event listener for topic "${topic}" after shutdown`,
+                  error,
+                );
+              }
+              this.#userEventSubscriptions = this.#userEventSubscriptions.filter(
+                sub => sub !== subscription && (sub.topic !== topic || sub.cb !== listener),
+              );
+              const startupIndex = startupUserEventSubscriptions.indexOf(subscription);
+              if (startupIndex >= 0) {
+                startupUserEventSubscriptions.splice(startupIndex, 1);
+              }
+              if (this.#pushSubscription !== startupPushSubscription) {
+                startupPushSubscription = undefined;
+              }
+              return;
+            }
           }
         }
       }
 
       startupComplete = true;
     } finally {
-      if (!name && !startupComplete) {
-        this.#workersStarted = false;
+      if (
+        !name &&
+        !startupComplete &&
+        (this.#workerLifecycleGeneration === startupLifecycleGeneration || !this.#workersStarted)
+      ) {
+        this.#workersStarted =
+          this.#workerLifecycleGeneration === startupLifecycleGeneration ? workersStartedBeforeStartup : false;
+        this.#workerLifecycleGeneration += 1;
+        for (const worker of [...this.#workers].reverse()) {
+          if (
+            worker.isRunning &&
+            !workersRunningBeforeStartup?.has(worker) &&
+            !workersStartingBeforeStartup?.has(worker) &&
+            this.#latestWorkerStartLifecycleGenerations.get(worker) === startupLifecycleGeneration
+          ) {
+            try {
+              await worker.stop();
+              this.#latestWorkerStartTokens.delete(worker);
+              this.#latestWorkerStartLifecycleGenerations.delete(worker);
+            } catch (error) {
+              this.#logger?.error(`Failed to stop worker "${worker.name}" after failed startup`, error);
+            }
+          }
+        }
+        if (startupPushSubscription) {
+          try {
+            await this.#pubsub.unsubscribe(startupPushSubscription.topic, startupPushSubscription.cb);
+            if (this.#pushSubscription === startupPushSubscription) {
+              this.#pushSubscription = undefined;
+            }
+          } catch (error) {
+            this.#logger?.error('Failed to unsubscribe workflow push subscription after failed startup', error);
+            if (!startupPushSubscription.subscribed && this.#pushSubscription === startupPushSubscription) {
+              this.#pushSubscription = undefined;
+            }
+          }
+        }
+        for (const subscription of startupUserEventSubscriptions) {
+          const { topic, cb } = subscription;
+          try {
+            await this.#pubsub.unsubscribe(topic, cb);
+            this.#userEventSubscriptions = this.#userEventSubscriptions.filter(
+              sub => sub !== subscription && (sub.topic !== topic || sub.cb !== cb),
+            );
+          } catch (error) {
+            this.#logger?.error(
+              `Failed to unsubscribe event listener for topic "${topic}" after failed startup`,
+              error,
+            );
+            if (!subscription.subscribed) {
+              this.#userEventSubscriptions = this.#userEventSubscriptions.filter(sub => sub !== subscription);
+            }
+          }
+        }
       }
     }
   }
 
-  async #startWorker(worker: MastraWorker, opts: { onlyIfWorkersStarted?: boolean } = {}): Promise<void> {
+  #trackWorkerStart(
+    worker: MastraWorker,
+    opts: {
+      onlyIfWorkersStarted?: boolean;
+      onlyIfLifecycleGeneration?: number;
+      onlyIfShutdownGeneration?: number;
+      onError?: (error: unknown) => void;
+      startLifecycleGeneration?: number;
+      stopIfWorkersStopped?: boolean;
+      stopIfLifecycleGenerationChangesFrom?: number;
+    } = {},
+  ): Promise<void> {
+    const existingStart = this.#workerStartPromises.get(worker);
+    if (existingStart) {
+      const queuedStart = existingStart.then(() => {
+        if (worker.isRunning) {
+          return;
+        }
+        return this.#trackWorkerStart(worker, opts);
+      });
+      if (opts.onError) {
+        return queuedStart.catch(error => {
+          opts.onError?.(error);
+        });
+      }
+      return queuedStart;
+    }
+
+    const startToken = ++this.#workerStartSequence;
+    let didStart = false;
+    const wasRunningBeforeStart = worker.isRunning;
+    const previousStartToken = this.#latestWorkerStartTokens.get(worker);
+    const hadPreviousStartLifecycleGeneration = this.#latestWorkerStartLifecycleGenerations.has(worker);
+    const previousStartLifecycleGeneration = this.#latestWorkerStartLifecycleGenerations.get(worker);
+    const removeCurrentStartToken = () => {
+      if (previousStartToken !== undefined) {
+        this.#latestWorkerStartTokens.set(worker, previousStartToken);
+        if (hadPreviousStartLifecycleGeneration) {
+          this.#latestWorkerStartLifecycleGenerations.set(worker, previousStartLifecycleGeneration!);
+        } else {
+          this.#latestWorkerStartLifecycleGenerations.delete(worker);
+        }
+      } else {
+        this.#latestWorkerStartTokens.delete(worker);
+        this.#latestWorkerStartLifecycleGenerations.delete(worker);
+      }
+    };
+    const recordLatestStartToken = () => {
+      const latestStartToken = this.#latestWorkerStartTokens.get(worker);
+      if (latestStartToken === undefined || latestStartToken < startToken) {
+        this.#latestWorkerStartTokens.set(worker, startToken);
+        if (opts.startLifecycleGeneration !== undefined) {
+          this.#latestWorkerStartLifecycleGenerations.set(worker, opts.startLifecycleGeneration);
+        } else {
+          this.#latestWorkerStartLifecycleGenerations.delete(worker);
+        }
+      }
+    };
+    const pending: PendingWorkerStart = {
+      worker,
+      phase: 'init',
+      token: startToken,
+      ignoreShutdownError: Boolean(opts.onError),
+      promise: Promise.resolve(),
+    };
+    const start = this.#startWorker(worker, {
+      ...opts,
+      onBeforeStart: () => {
+        pending.phase = 'start';
+        recordLatestStartToken();
+      },
+      onAfterStart: () => {
+        didStart = true;
+        recordLatestStartToken();
+      },
+    });
+    const promise = start.finally(async () => {
+      pending.phase = 'settled';
+      if (this.#workerStartPromises.get(worker) === promise) {
+        this.#workerStartPromises.delete(worker);
+      }
+      this.#pendingWorkerStarts.delete(pending);
+      if (!didStart && this.#latestWorkerStartTokens.get(worker) === startToken) {
+        if (!wasRunningBeforeStart && worker.isRunning) {
+          try {
+            await worker.stop();
+            if (this.#latestWorkerStartTokens.get(worker) === startToken) {
+              removeCurrentStartToken();
+            }
+          } catch (error) {
+            this.#logger?.error(`Failed to stop worker "${worker.name}" after failed startup`, error);
+          }
+        } else {
+          removeCurrentStartToken();
+        }
+      }
+      const lifecycleChanged =
+        opts.stopIfLifecycleGenerationChangesFrom !== undefined &&
+        this.#workerLifecycleGeneration !== opts.stopIfLifecycleGenerationChangesFrom;
+      const isLatestStart = this.#latestWorkerStartTokens.get(worker) === startToken;
+      if (
+        opts.stopIfWorkersStopped &&
+        isLatestStart &&
+        (!this.#workersStarted || lifecycleChanged) &&
+        worker.isRunning
+      ) {
+        try {
+          await worker.stop();
+          if (this.#latestWorkerStartTokens.get(worker) === startToken) {
+            removeCurrentStartToken();
+          }
+        } catch (error) {
+          this.#logger?.error(`Failed to stop worker "${worker.name}" after late startup completion`, error);
+        }
+      }
+    });
+    pending.promise = promise;
+    this.#pendingWorkerStarts.add(pending);
+    this.#workerStartPromises.set(worker, promise);
+    if (opts.onError) {
+      return promise.catch(error => {
+        opts.onError?.(error);
+      });
+    }
+    return promise;
+  }
+
+  async #startWorker(
+    worker: MastraWorker,
+    opts: {
+      onlyIfWorkersStarted?: boolean;
+      onlyIfLifecycleGeneration?: number;
+      onlyIfShutdownGeneration?: number;
+      onBeforeStart?: () => void;
+      onAfterStart?: () => void;
+    } = {},
+  ): Promise<void> {
     const deps: WorkerDeps = {
       pubsub: this.#pubsub,
       storage: this.#storage!,
@@ -4232,14 +4558,46 @@ export class Mastra<
     if (opts.onlyIfWorkersStarted && !this.#workersStarted) {
       return;
     }
+    if (
+      opts.onlyIfLifecycleGeneration !== undefined &&
+      this.#workerLifecycleGeneration !== opts.onlyIfLifecycleGeneration
+    ) {
+      return;
+    }
+    if (
+      opts.onlyIfShutdownGeneration !== undefined &&
+      this.#workerShutdownGeneration !== opts.onlyIfShutdownGeneration
+    ) {
+      return;
+    }
+    opts.onBeforeStart?.();
     await worker.start();
+    opts.onAfterStart?.();
   }
 
   /**
    * Stop all running workers and unsubscribe event listeners.
    */
   public async stopWorkers(): Promise<void> {
+    if (this.#workersStopPromise) {
+      return this.#workersStopPromise;
+    }
+
+    const stop = this.#stopWorkers();
+    this.#workersStopPromise = stop;
+    try {
+      await stop;
+    } finally {
+      if (this.#workersStopPromise === stop) {
+        this.#workersStopPromise = undefined;
+      }
+    }
+  }
+
+  async #stopWorkers(): Promise<void> {
     this.#workersStarted = false;
+    this.#workerLifecycleGeneration += 1;
+    this.#workerShutdownGeneration += 1;
     let stopError: unknown;
     let hasStopError = false;
     const recordStopError = (message: string, error: unknown) => {
@@ -4250,11 +4608,71 @@ export class Mastra<
       this.#logger?.error(message, error);
     };
     const pendingWorkerStartsAtShutdown = [...this.#pendingWorkerStarts];
-    const settlePendingWorkerStarts = async (starts: Promise<void>[] = [...this.#pendingWorkerStarts]) => {
-      const pendingWorkerStartResults = await Promise.allSettled(starts);
+    const timedOutWorkerStarts = new Set<PendingWorkerStart>();
+    const waitForPendingWorkerStart = async (start: PendingWorkerStart) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          start.promise.then(
+            () => ({ status: 'fulfilled' as const, start }),
+            reason => ({ status: 'rejected' as const, reason, start }),
+          ),
+          new Promise<{ status: 'timed-out'; reason: Error; start: PendingWorkerStart }>(resolve => {
+            timeout = setTimeout(() => {
+              resolve({
+                status: 'timed-out',
+                reason: new Error(
+                  `Timed out waiting for worker "${start.worker.name}" startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
+                ),
+                start,
+              });
+            }, PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+      }
+    };
+    const cleanupTimedOutWorkerStart = (start: PendingWorkerStart) => {
+      void start.promise.then(
+        async () => {
+          if (this.#latestWorkerStartTokens.get(start.worker) === start.token && start.worker.isRunning) {
+            try {
+              await start.worker.stop();
+              if (this.#latestWorkerStartTokens.get(start.worker) === start.token) {
+                this.#latestWorkerStartTokens.delete(start.worker);
+                this.#latestWorkerStartLifecycleGenerations.delete(start.worker);
+              }
+            } catch (error) {
+              this.#logger?.error(`Failed to stop worker "${start.worker.name}" after late startup completion`, error);
+            }
+          }
+        },
+        () => {},
+      );
+    };
+    const settlePendingWorkerStarts = async (starts: PendingWorkerStart[] = [...this.#pendingWorkerStarts]) => {
+      const unsettledStarts = starts.filter(start => !timedOutWorkerStarts.has(start));
+      const pendingWorkerStartResults = await Promise.all(unsettledStarts.map(waitForPendingWorkerStart));
       for (const result of pendingWorkerStartResults) {
         if (result.status === 'rejected') {
-          recordStopError('Failed to finish pending worker startup during shutdown', result.reason);
+          if (!result.start.ignoreShutdownError) {
+            recordStopError('Failed to finish pending worker startup during shutdown', result.reason);
+          }
+        } else if (result.status === 'timed-out') {
+          timedOutWorkerStarts.add(result.start);
+          if (result.start.phase !== 'start') {
+            this.#pendingWorkerStarts.delete(result.start);
+            if (this.#workerStartPromises.get(result.start.worker) === result.start.promise) {
+              this.#workerStartPromises.delete(result.start.worker);
+            }
+          }
+          cleanupTimedOutWorkerStart(result.start);
+          if (!result.start.ignoreShutdownError) {
+            recordStopError('Timed out waiting for pending worker startup during shutdown', result.reason);
+          }
         }
       }
     };
@@ -4263,6 +4681,8 @@ export class Mastra<
         if (worker.isRunning) {
           try {
             await worker.stop();
+            this.#latestWorkerStartTokens.delete(worker);
+            this.#latestWorkerStartLifecycleGenerations.delete(worker);
           } catch (error) {
             recordStopError(`Failed to stop worker "${worker.name}"`, error);
           }
@@ -4273,6 +4693,9 @@ export class Mastra<
     await stopRunningWorkers();
     await settlePendingWorkerStarts(pendingWorkerStartsAtShutdown);
     await settlePendingWorkerStarts();
+    if (timedOutWorkerStarts.size > 0 && ![...timedOutWorkerStarts].some(start => start.phase === 'start')) {
+      this.#allWorkersStartPromise = undefined;
+    }
     await stopRunningWorkers();
 
     // Tear down the in-process push subscription wired during startWorkers().
