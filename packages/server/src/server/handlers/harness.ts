@@ -1408,11 +1408,17 @@ function mapHarnessError(error: unknown): never {
   if (name === 'HarnessStorageChannelDiagnosticsUnsupportedError') {
     throwHarnessHttpError(501, 'harness.channel_diagnostics_unsupported', message, undefined, false);
   }
-  if (name === 'HarnessRuntimeDependencyDriftError' || name === 'harness.runtime_dependency_drifted') {
+  if (
+    name === 'HarnessRuntimeDependencyDriftError' ||
+    name === 'harness.runtime_dependency_drifted' ||
+    harnessErrorString(error, 'code') === 'harness.runtime_dependency_drifted'
+  ) {
+    const context = harnessErrorProp(error, 'context');
     throwHarnessHttpError(409, 'harness.runtime_dependency_drifted', message, {
-      dependencyKind: harnessErrorString(error, 'dependencyKind'),
-      dependencyId: harnessErrorString(error, 'dependencyId'),
-      context: harnessErrorString(error, 'context'),
+      dependencyKind: harnessErrorString(error, 'dependencyKind') ?? harnessErrorString(error, 'kind'),
+      dependencyId: harnessErrorString(error, 'dependencyId') ?? harnessErrorString(error, 'id'),
+      reason: harnessErrorString(error, 'reason'),
+      ...(context !== undefined ? { context } : {}),
     });
   }
   if (name === 'HarnessQueueFullError') {

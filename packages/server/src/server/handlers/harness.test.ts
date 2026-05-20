@@ -132,6 +132,7 @@ async function expectHarnessHttpError(promise: Promise<unknown>, status: number,
     expect(httpError.status).toBe(status);
     const body = await httpError.getResponse().json();
     expect(body).toMatchObject({ code });
+    return body;
   }
 }
 
@@ -2385,7 +2386,7 @@ describe('Harness server routes', () => {
     const harness = { session: vi.fn(async () => session) };
     const mastra = { getHarness: vi.fn(() => harness) };
 
-    await expectHarnessHttpError(
+    const body = await expectHarnessHttpError(
       RESPOND_HARNESS_INBOX_ROUTE.handler(
         makeParams({
           mastra,
@@ -2402,6 +2403,14 @@ describe('Harness server routes', () => {
       409,
       'harness.runtime_dependency_drifted',
     );
+    expect(body).toMatchObject({
+      details: {
+        dependencyKind: 'workspace_provider',
+        dependencyId: 'unconfigured',
+        reason: 'was recorded, but the current workspace dependency is "workspace-now-configured"',
+        context: 'pending question resume',
+      },
+    });
   });
 
   it('sets, reads, pauses, resumes, and clears session goals', async () => {

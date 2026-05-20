@@ -3,4 +3,5 @@
 "@mastra/server": patch
 ---
 
-Added fail-closed runtime dependency drift checks for recovered Harness queue and resume work, and mapped runtime drift responses on Harness server routes.
+Improved Harness recovery safety by rejecting resumed or queued work when runtime dependencies changed after restart.
+Added HTTP 409 (`harness.runtime_dependency_drifted`) responses for these drift conflicts on Harness routes.

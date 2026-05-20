@@ -1064,7 +1064,12 @@ export class Harness {
     if (!mode) {
       throw new HarnessConfigError('modeId', `unknown mode "${modeId}"`);
     }
-    const agent = this.mastra.getAgent(mode.agentId as never) as Agent | undefined;
+    let agent: Agent | undefined;
+    try {
+      agent = this.mastra.getAgent(mode.agentId as never) as Agent | undefined;
+    } catch {
+      agent = undefined;
+    }
     if (!agent) {
       throw new HarnessConfigError(
         `modes[${mode.id}].agentId`,

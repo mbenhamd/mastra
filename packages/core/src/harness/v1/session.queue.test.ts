@@ -1858,7 +1858,7 @@ describe('Session.queue() — crash replay', () => {
     expect(receipt?.signalId).not.toBe('stale-signal');
   });
 
-  it('completes an accepted receipt from durable signal result evidence after hydration', async () => {
+  it('completes an accepted receipt from durable signal result evidence after hydration even if runtime deps drifted', async () => {
     const storage = new InMemoryStore();
     const harnessStore = await storage.getStore('harness');
     if (!harnessStore) throw new Error('expected harness storage');
@@ -1897,6 +1897,7 @@ describe('Session.queue() — crash replay', () => {
             status: 'accepted',
             runId: 'stale-run',
             signalId: 'stale-signal',
+            runtimeDependencies: { modeId: 'default', agentId: 'old-agent', modelId: 'default' },
             attempts: 1,
             enqueuedAt: now,
             acceptedAt: now,
@@ -1924,12 +1925,12 @@ describe('Session.queue() — crash replay', () => {
       updatedAt: now,
     });
 
-    const replayAgent = new MockAgent({ id: 'default' });
+    const replayAgent = new MockAgent({ id: 'new-agent' });
     replayAgent.enqueueRun({ finishReason: 'stop', text: 'must not run' });
     const replayHarness = new Harness({
-      agents: { default: replayAgent } as any,
+      agents: { 'new-agent': replayAgent } as any,
       storage,
-      modes: [{ id: 'default', agentId: 'default' }],
+      modes: [{ id: 'default', agentId: 'new-agent' }],
       defaultModeId: 'default',
     });
 

@@ -5986,6 +5986,17 @@ export class Session {
         );
       }
     }
+    if (
+      currentReceipt &&
+      (currentReceipt.status === 'admitting' || currentReceipt.status === 'accepted') &&
+      currentReceipt.runId &&
+      currentReceipt.signalId
+    ) {
+      const recoveredTerminal = await this._withActiveDeletedWaiter(activeDeleted =>
+        this._recoverQueuedTerminalEvidence(item, currentReceipt, effectiveModeId, activeDeleted),
+      );
+      if (recoveredTerminal) return recoveredTerminal;
+    }
     const runtimeDependencies = this._runtimeDependenciesForQueuedTurn(item, currentReceipt, effectiveModeId);
     const { mode, agent } = this._harness._resolveAgentForRuntimeDependencies(
       runtimeDependencies,
@@ -6132,20 +6143,8 @@ export class Session {
         return this._awaitQueuedRunCompletion(item, receipt.runId!, receipt.signalId!, modeId, activeDeleted);
       }
 
-      const evidence = await this._raceActiveTurnWaiter(this._loadQueueSignalResultEvidence(receipt), activeDeleted);
-      if (evidence.status === 'completed') {
-        const full = evidence.result as FullOutput<unknown>;
-        await this._raceActiveTurnWaiter(this._markQueuedTurnCompleted(item.id, full), activeDeleted);
-        if (receipt.postRunFinalizedAt === undefined) {
-          await this._finalizeCompletedQueuedTurn(item, full, modeId, activeDeleted);
-        }
-        return full;
-      }
-      if (evidence.status === 'failed') {
-        throw publicErrorProjectionToError(
-          evidence.error ?? { code: 'harness.queue_failed', message: 'queued turn failed' },
-        );
-      }
+      const terminalEvidence = await this._recoverQueuedTerminalEvidence(item, receipt, modeId, activeDeleted);
+      if (terminalEvidence) return terminalEvidence;
 
       const recovery = await this._raceActiveTurnWaiter(this._inspectQueueReceiptMemory(receipt), activeDeleted);
       if (recovery.status === 'pending') {
@@ -6157,6 +6156,32 @@ export class Session {
 
       return undefined;
     });
+  }
+
+  private async _recoverQueuedTerminalEvidence(
+    item: QueuedItem,
+    receipt: QueueAdmissionReceipt,
+    modeId: string,
+    activeTurnWaiter?: Promise<never>,
+  ): Promise<FullOutput<unknown> | undefined> {
+    if (!receipt.runId || !receipt.signalId) return undefined;
+
+    const evidence = await this._raceActiveTurnWaiter(this._loadQueueSignalResultEvidence(receipt), activeTurnWaiter);
+    if (evidence.status === 'completed') {
+      const full = evidence.result as FullOutput<unknown>;
+      await this._raceActiveTurnWaiter(this._markQueuedTurnCompleted(item.id, full), activeTurnWaiter);
+      if (receipt.postRunFinalizedAt === undefined) {
+        await this._finalizeCompletedQueuedTurn(item, full, modeId, activeTurnWaiter);
+      }
+      return full;
+    }
+    if (evidence.status === 'failed') {
+      throw publicErrorProjectionToError(
+        evidence.error ?? { code: 'harness.queue_failed', message: 'queued turn failed' },
+      );
+    }
+
+    return undefined;
   }
 
   private _queueReceiptTerminalFailureError(queuedItemId: string): Error | undefined {
