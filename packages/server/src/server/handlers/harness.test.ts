@@ -7,6 +7,7 @@ import {
   HarnessAttachmentInUseError,
   HarnessAttachmentUnavailableError,
   HarnessInboxResponseConflictError,
+  HarnessRuntimeDependencyDriftError,
 } from '@mastra/core/harness/v1';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
 import { describe, expect, it, vi } from 'vitest';
@@ -2367,6 +2368,39 @@ describe('Harness server routes', () => {
       ),
       409,
       'harness.inbox_response_conflict',
+    );
+  });
+
+  it('maps runtime dependency drift to the wire error code', async () => {
+    const session = {
+      respondToQuestion: vi.fn(async () => {
+        throw new HarnessRuntimeDependencyDriftError(
+          'workspace_provider',
+          'unconfigured',
+          'was recorded, but the current workspace dependency is "workspace-now-configured"',
+          'pending question resume',
+        );
+      }),
+    };
+    const harness = { session: vi.fn(async () => session) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    await expectHarnessHttpError(
+      RESPOND_HARNESS_INBOX_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          itemId: 'item-1',
+          requestBody: {
+            kind: 'question',
+            answer: 'yes',
+            responseId: 'response-1',
+          },
+        }),
+      ),
+      409,
+      'harness.runtime_dependency_drifted',
     );
   });
 
