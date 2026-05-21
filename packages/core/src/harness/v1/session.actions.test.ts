@@ -157,6 +157,13 @@ class GatedMcpServer extends MockMcpServer {
 class FakeWorkspaceSkills {
   public getCallCount = 0;
   public listCallCount = 0;
+  public refreshCallCount = 0;
+  private pendingEntries: Array<{
+    name: string;
+    description: string;
+    path?: string;
+    metadata?: Record<string, unknown>;
+  }> = [];
 
   constructor(
     private readonly entries: Array<{
@@ -166,6 +173,10 @@ class FakeWorkspaceSkills {
       metadata?: Record<string, unknown>;
     }>,
   ) {}
+
+  addOnRefresh(entry: { name: string; description: string; path?: string; metadata?: Record<string, unknown> }): void {
+    this.pendingEntries.push(entry);
+  }
 
   async list() {
     this.listCallCount++;
@@ -197,7 +208,11 @@ class FakeWorkspaceSkills {
     return this.entries.some(entry => entry.name === name);
   }
 
-  async refresh() {}
+  async refresh() {
+    this.refreshCallCount++;
+    this.entries.push(...this.pendingEntries);
+    this.pendingEntries = [];
+  }
   async maybeRefresh() {}
   async search() {
     return [];
@@ -461,6 +476,50 @@ describe('Session action catalog (PF-576)', () => {
     await session.skills.refresh();
     await session.actions.list({ source: 'skill' });
     expect(skills.listCallCount).toBe(2);
+  });
+
+  it('refreshes an already-materialized workspace skill source before rebuilding skill actions', async () => {
+    const skills = new FakeWorkspaceSkills([
+      {
+        name: 'workspace-action',
+        description: 'Workspace action',
+        path: 'skills/workspace-action/SKILL.md',
+        metadata: {
+          action: {
+            displayName: 'Workspace action',
+          },
+        },
+      },
+    ]);
+    const harness = makeHarnessWithWorkspaceSkills(skills);
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.actions.list({ source: 'skill' })).resolves.toMatchObject([
+      { id: 'skill:skills%2Fworkspace-action%2FSKILL.md' },
+    ]);
+    await expect(session.skills.list()).resolves.toMatchObject([{ name: 'workspace-action' }]);
+
+    skills.addOnRefresh({
+      name: 'new-workspace-action',
+      description: 'New workspace action',
+      path: 'skills/new-workspace-action/SKILL.md',
+      metadata: {
+        action: {
+          displayName: 'New workspace action',
+        },
+      },
+    });
+
+    await session.actions.refresh();
+    await expect(session.actions.list({ source: 'skill' })).resolves.toMatchObject([
+      { id: 'skill:skills%2Fnew-workspace-action%2FSKILL.md' },
+      { id: 'skill:skills%2Fworkspace-action%2FSKILL.md' },
+    ]);
+    await expect(session.skills.list()).resolves.toMatchObject([
+      { name: 'workspace-action' },
+      { name: 'new-workspace-action' },
+    ]);
+    expect(skills.refreshCallCount).toBe(1);
   });
 
   it('caches successful MCP action entries and negative-caches failing MCP servers', async () => {

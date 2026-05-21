@@ -1519,7 +1519,7 @@ export class Session {
       query: string,
       options?: Omit<HarnessActionCatalogListOptions, 'query'>,
     ): Promise<HarnessActionCatalogEntry[]> => this._actionsSearch(query, options),
-    /** Clear cached action catalog discovery for this in-memory session. */
+    /** Refresh already-materialized workspace skills and clear cached action catalog discovery. */
     refresh: (): Promise<void> => this._actionsRefresh(),
   });
 
@@ -1634,10 +1634,20 @@ export class Session {
 
   private async _actionsRefresh(): Promise<void> {
     this._assertLive('actions.refresh()');
-    this._actionsSkillEntriesCache = undefined;
-    this._actionsSkillEntriesResolving = undefined;
-    this._actionsMcpEntriesCacheByServer.clear();
-    this._actionsMcpEntriesResolvingByServer.clear();
+    const clearActionAndSkillCatalogCaches = () => {
+      this._skillsCache = undefined;
+      this._skillsResolving = undefined;
+      this._actionsSkillEntriesCache = undefined;
+      this._actionsSkillEntriesResolving = undefined;
+      this._actionsMcpEntriesCacheByServer.clear();
+      this._actionsMcpEntriesResolvingByServer.clear();
+    };
+    clearActionAndSkillCatalogCaches();
+    try {
+      await this._workspace?.skills?.refresh();
+    } finally {
+      clearActionAndSkillCatalogCaches();
+    }
   }
 
   private _normalizeActionCatalogOptions(options?: HarnessActionCatalogListOptions): {
