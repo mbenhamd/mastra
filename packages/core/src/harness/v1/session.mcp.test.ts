@@ -12,6 +12,7 @@ import { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
 import { MCPServerBase } from '../../mcp';
 import type { MCPServerConfig, MCPServerHonoSSEOptions, MCPServerHTTPOptions, MCPServerSSEOptions } from '../../mcp';
+import type { RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage/mock';
 import type { InternalCoreTool, MCPToolType } from '../../tools';
 
@@ -31,6 +32,8 @@ type MockToolListInfo = {
 };
 
 class MockMcpServer extends MCPServerBase {
+  lastToolListRequestContext?: RequestContext;
+
   constructor(config: MCPServerConfig) {
     super(config);
   }
@@ -70,7 +73,8 @@ class MockMcpServer extends MCPServerBase {
     };
   }
 
-  getToolListInfo(): MockToolListInfo | Promise<MockToolListInfo> {
+  getToolListInfo(requestContext?: RequestContext): MockToolListInfo | Promise<MockToolListInfo> {
+    this.lastToolListRequestContext = requestContext;
     return {
       tools: Object.entries(this.convertedTools).map(([name, tool]) => ({
         name,
@@ -111,13 +115,23 @@ class MockMcpServer extends MCPServerBase {
 
 class LazyMockMcpServer extends MockMcpServer {
   private readonly lazyTools: MockToolListInfo;
+  private readonly hydratedTools?: Record<string, InternalCoreTool>;
 
-  constructor(config: Omit<MCPServerConfig, 'tools'>, tools: MockToolListInfo['tools']) {
+  constructor(
+    config: Omit<MCPServerConfig, 'tools'>,
+    tools: MockToolListInfo['tools'],
+    hydratedTools?: Record<string, InternalCoreTool>,
+  ) {
     super({ ...config, tools: {} });
     this.lazyTools = { tools };
+    this.hydratedTools = hydratedTools;
   }
 
-  getToolListInfo(): MockToolListInfo | Promise<MockToolListInfo> {
+  getToolListInfo(requestContext?: RequestContext): MockToolListInfo | Promise<MockToolListInfo> {
+    this.lastToolListRequestContext = requestContext;
+    if (this.hydratedTools) {
+      this.convertedTools = this.hydratedTools;
+    }
     return Promise.resolve(this.lazyTools);
   }
 }
@@ -213,7 +227,7 @@ describe('Session MCP catalog (PF-562)', () => {
   });
 
   it('lists registered MCP tool descriptors through the server tool-list contract', async () => {
-    const { session } = await makeSession();
+    const { session, server } = await makeSession();
 
     await expect(session.mcp.listTools('files')).resolves.toEqual([
       {
@@ -233,6 +247,11 @@ describe('Session MCP catalog (PF-562)', () => {
         strict: true,
       },
     ]);
+    expect(server.lastToolListRequestContext?.get('harness')).toMatchObject({
+      resourceId: 'u1',
+      sessionId: session.id,
+      modeId: 'default',
+    });
     await expect(session.mcp.listTools('missing')).resolves.toBeUndefined();
   });
 
@@ -265,6 +284,15 @@ describe('Session MCP catalog (PF-562)', () => {
           _meta: { ui: { resourceUri: 'ui://remote/search' } },
         },
       ],
+      {
+        remote_search: makeTool({
+          strict: true,
+          mcp: {
+            toolType: 'tool' as MCPToolType,
+            _meta: { ui: { resourceUri: 'ui://remote/search' } },
+          },
+        }),
+      },
     );
     const harness = new Harness({
       modes: [{ id: 'default', agentId: 'default' }],
@@ -293,8 +321,14 @@ describe('Session MCP catalog (PF-562)', () => {
         },
         toolType: 'tool',
         meta: { ui: { resourceUri: 'ui://remote/search' } },
+        strict: true,
       },
     ]);
+    expect(server.lastToolListRequestContext?.get('harness')).toMatchObject({
+      resourceId: 'u1',
+      sessionId: session.id,
+      modeId: 'default',
+    });
   });
 
   it('returns clone-safe MCP server and tool snapshots', async () => {

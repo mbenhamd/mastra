@@ -1388,8 +1388,13 @@ export class Session {
   private async _mcpListTools(key: string): Promise<HarnessMcpToolDescriptor[] | undefined> {
     const server = this._harness._getMcpServer(key);
     if (!server) return undefined;
+    const requestContext = await this._buildRequestContext({
+      modeId: this._record.modeId,
+      modelId: this._record.modelId,
+      abortSignal: new AbortController().signal,
+    });
+    const toolList = await server.getToolListInfo(requestContext);
     const convertedTools = server.tools();
-    const toolList = await server.getToolListInfo();
     return toolList.tools.map(toolInfo => {
       const infoWithId = toolInfo as typeof toolInfo & { id?: unknown };
       const toolName = typeof infoWithId.id === 'string' && infoWithId.id.length > 0 ? infoWithId.id : toolInfo.name;
