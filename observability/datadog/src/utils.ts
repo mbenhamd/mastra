@@ -164,12 +164,6 @@ function isModelDataSpan(spanType: SpanType): boolean {
   );
 }
 
-function isModelDataSpan(spanType: SpanType): boolean {
-  return (
-    spanType === SpanType.MODEL_GENERATION || spanType === SpanType.MODEL_STEP || spanType === SpanType.MODEL_INFERENCE
-  );
-}
-
 /**
  * Checks if data is in Gemini content array format ({role, parts}[]).
  */
