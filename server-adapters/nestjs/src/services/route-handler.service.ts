@@ -36,8 +36,6 @@ export interface RouteHandlerParams {
   requestContext: RequestContext;
   /** Abort signal for request cancellation */
   abortSignal: AbortSignal;
-  /** Adapter-normalized request header lookup. */
-  getHeader?: (name: string) => string | undefined;
 }
 
 export interface RouteHandlerResult {
@@ -64,9 +62,6 @@ export class RouteHandlerService {
     'taskStore',
     'abortSignal',
     'routePrefix',
-    'getHeader',
-    'requestBody',
-    'requestPathParams',
   ]);
 
   constructor(
@@ -222,9 +217,6 @@ export class RouteHandlerService {
       taskStore: this.options.taskStore,
       abortSignal: params.abortSignal,
       routePrefix: this.options.prefix,
-      getHeader: params.getHeader,
-      requestBody: validatedBody,
-      requestPathParams: validatedPathParams,
     };
 
     const handlerParams = {

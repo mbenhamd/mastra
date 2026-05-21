@@ -11,14 +11,7 @@ import type { ZodError } from 'zod/v4';
 import { z } from 'zod/v4';
 
 import type { InMemoryTaskStore } from '../a2a/store';
-import {
-  allowsHarnessSseSubscriptionToken,
-  coreAuthMiddleware,
-  findBearerEquivalentHarnessQueryParam,
-  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM,
-  hasHarnessSseSubscriptionToken,
-  isHarnessClientRoute,
-} from '../auth/helpers';
+import { coreAuthMiddleware } from '../auth/helpers';
 import {
   MASTRA_CLIENT_TYPE_HEADER,
   MASTRA_IS_STUDIO_KEY,
@@ -123,57 +116,54 @@ export interface ParsedRequestParams {
   };
 }
 
-const SENSITIVE_QUERY_PARAMS = new Set([
-  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM.toLowerCase(),
-  'access_token',
-  'accesstoken',
-  'apikey',
-  'authorization',
-  'authtoken',
-  'bearer',
-  'token',
-]);
-
-function normalizeSensitiveQueryParamKey(key: string): string {
-  return key.toLowerCase().split('[')[0]?.split('.')[0] ?? key.toLowerCase();
+function isProtectedFGARoute(route: Pick<ServerRoute, 'requiresAuth'>): boolean {
+  return route.requiresAuth !== false;
 }
 
-export function redactSensitiveQueryParams<T extends Record<string, unknown>>(queryParams: T): T {
-  const redacted: Record<string, unknown> = { ...queryParams };
+function formatRoute(route: Pick<ServerRoute, 'method' | 'path'>): string {
+  return `${route.method} ${route.path}`;
+}
 
-  for (const key of Object.keys(redacted)) {
-    const normalizedKey = key.toLowerCase();
-    const baseKey = normalizeSensitiveQueryParamKey(key);
-    if (SENSITIVE_QUERY_PARAMS.has(normalizedKey) || SENSITIVE_QUERY_PARAMS.has(baseKey)) {
-      redacted[key] = '[REDACTED]';
-    }
+function getFGAProvider(mastra: any): IFGAProvider | undefined {
+  return mastra?.getServer?.()?.fga as IFGAProvider | undefined;
+}
+
+function getFGARouteInfo(route: ServerRoute): FGARouteInfo {
+  return {
+    path: route.path,
+    method: route.method,
+    requiresAuth: route.requiresAuth,
+    requiresPermission: route.requiresPermission,
+    fga: route.fga,
+  };
+}
+
+function getRoutePermissions(route: ServerRoute): MastraFGAPermissionInput[] {
+  return [getEffectivePermission(route), route.fga?.permission]
+    .flatMap(value => (Array.isArray(value) ? value : [value]))
+    .filter((permission): permission is MastraFGAPermissionInput => Boolean(permission));
+}
+
+async function resolveRouteFGAConfig(
+  fgaProvider: IFGAProvider,
+  route: ServerRoute,
+  requestContext: RequestContext,
+  params: Record<string, unknown>,
+): Promise<FGARouteConfig | null | undefined> {
+  if (route.fga) {
+    return route.fga;
   }
 
-  return redacted as T;
-}
+  const resolvedConfig = await fgaProvider.resolveRouteFGA?.({
+    route: getFGARouteInfo(route),
+    params,
+    requestContext,
+  });
+  if (resolvedConfig) {
+    return resolvedConfig;
+  }
 
-function isAbortSignalError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-
-  const { code, name } = error as { code?: string; name?: string };
-  return name === 'AbortError' || code === 'ABORT_ERR';
-}
-
-function isExpectedResponseCloseError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-
-  const { code } = error as { code?: string };
-  return (
-    code === 'ECONNRESET' ||
-    code === 'EPIPE' ||
-    code === 'ERR_STREAM_DESTROYED' ||
-    code === 'ERR_STREAM_WRITE_AFTER_END' ||
-    code === 'ERR_STREAM_PREMATURE_CLOSE'
-  );
-}
-
-function isResponseClosed(response: { writableEnded?: boolean; destroyed?: boolean }): boolean {
-  return Boolean(response.writableEnded || response.destroyed);
+  return getBuiltInRouteFGAConfig(route);
 }
 
 function getSchemaTypeName(schema: z.ZodTypeAny): string | undefined {
@@ -852,8 +842,8 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
         });
     }
 
-    const init: RequestInit = { method, headers: fetchHeaders, signal };
-    if (['POST', 'PUT', 'PATCH'].includes(method) && body !== undefined) {
+    const init: RequestInit = { method, headers: fetchHeaders };
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && body !== undefined) {
       if (body instanceof ArrayBuffer || body instanceof Uint8Array || body instanceof ReadableStream) {
         init.body = body as any;
         if (body instanceof ReadableStream) {
@@ -1079,11 +1069,20 @@ export async function checkRouteFGA(
   requestContext: RequestContext,
   params: Record<string, unknown>,
 ): Promise<{ status: number; error: string; message: string } | null> {
-  const fgaConfig = route.fga;
-  if (!fgaConfig) return null;
-
-  const fgaProvider = mastra?.getServer?.()?.fga;
+  const fgaProvider = getFGAProvider(mastra);
   if (!fgaProvider) return null;
+
+  const fgaConfig = await resolveRouteFGAConfig(fgaProvider, route, requestContext, params);
+  if (!fgaConfig) {
+    if (fgaProvider.requireForProtectedRoutes && isProtectedFGARoute(route)) {
+      return {
+        status: 403,
+        error: 'Forbidden',
+        message: 'FGA authorization denied: route FGA metadata is required',
+      };
+    }
+    return null;
+  }
 
   const user = requestContext?.get('user');
   if (!user) {
@@ -1105,9 +1104,10 @@ export async function checkRouteFGA(
       message: 'FGA authorization denied: route FGA metadata is incomplete',
     };
   }
+  const effectivePermission = route.path ? getEffectivePermission(route) : null;
   const permission =
     fgaConfig.permission ||
-    (route.path ? getEffectivePermission(route) : null) ||
+    effectivePermission ||
     `${getFGAResourcePermissionSlug(fgaConfig.resourceType)}:${deriveFGAAction(route.method)}`;
 
   const authorized = await fgaProvider.check(user, {

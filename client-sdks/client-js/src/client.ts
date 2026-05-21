@@ -89,7 +89,6 @@ import {
   Workspace,
   Responses,
   Channels,
-  RemoteHarness,
 } from './resources';
 import type {
   ListScoresBySpanParams,

@@ -1,5 +1,78 @@
 # @mastra/pg
 
+## 1.11.1-alpha.0
+
+### Patch Changes
+
+- Fixed scheduler performance and correctness issues that could cause excessive Postgres CPU and noisy failed runs. ([#16805](https://github.com/mastra-ai/mastra/pull/16805))
+  - Added missing indexes on the schedules tables that the tick loop polls every 10 seconds: `(status, next_fire_at)` on `mastra_schedules` and `(schedule_id, actual_fire_at)` on `mastra_schedule_triggers`. Without these the scheduler performed a full sequential scan on every tick.
+  - The scheduler tick loop is now only started when at least one workflow declares a schedule (or `scheduler.enabled` is set explicitly), so deployments without scheduled workflows no longer poll the database at all.
+  - The scheduler now validates that a schedule's target workflow is still registered before firing it. Schedules whose target workflow has been removed from the Mastra config are skipped for a short grace window and then deleted, so stale rows stop producing failed workflow runs forever.
+  - The scheduler is now lazily initialized inside `startWorkers()`. Accessing `mastra.scheduler` before `startWorkers()` runs throws a descriptive error instead of returning a half-initialized instance.
+
+- Updated dependencies [[`27fd1b7`](https://github.com/mastra-ai/mastra/commit/27fd1b79ac62eb7694f92587eb7d1be05b59be01), [`a702009`](https://github.com/mastra-ai/mastra/commit/a702009d3cfaa745120f501e21c783ed4d6a3072), [`8534d79`](https://github.com/mastra-ai/mastra/commit/8534d791fa1cb70fe1c19e2604c4b63cc10dd051), [`c78f8cd`](https://github.com/mastra-ai/mastra/commit/c78f8cd6222a86e6c60ae5210b6929ad5221b6fb), [`e146aad`](https://github.com/mastra-ai/mastra/commit/e146aadbba66c410ba0e74bac4c50135495cb8dd), [`1a0ec78`](https://github.com/mastra-ai/mastra/commit/1a0ec789a26cae443744e9abbd62ed6ee676af39), [`d52b6fe`](https://github.com/mastra-ai/mastra/commit/d52b6fe1c56853eb38864baae0bbfa75cc739ccb)]:
+  - @mastra/core@1.36.0-alpha.10
+
+## 1.11.0
+
+### Minor Changes
+
+- Added favorites support to storage adapters so callers can favorite/unfavorite stored agents and skills, query favorite state alongside list results, and filter listings by visibility. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+  **Example**
+
+  ```ts
+  const storage = new LibSQLStore({
+    /* config */
+  });
+  const favorites = await storage.getStore('favorites');
+
+  await favorites?.favorite({
+    userId: 'user-1',
+    entityType: 'agent',
+    entityId: 'agent-42',
+  });
+  ```
+
+### Patch Changes
+
+- Fixed a workspace PATCH bug: omitted config fields in a PATCH no longer overwrite previously-persisted values with `undefined`. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+- Bumped `@mastra/core` peer dependency floor to `>=1.34.0-0` so the new `@mastra/core/storage/domains/favorites` subpath is available. Older `@mastra/core` versions don't ship the `FavoritesStorage` base class these adapters now extend. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+- Updated dependencies [[`b661349`](https://github.com/mastra-ai/mastra/commit/b661349281514691db78941a9044e6e4f1cde7a7), [`816b974`](https://github.com/mastra-ai/mastra/commit/816b974b424e4a1bfae3af30cc41263b6f1c0344), [`271c044`](https://github.com/mastra-ai/mastra/commit/271c044f6b79ff38cfa3409f4385fbd26a0f3185), [`bad08e9`](https://github.com/mastra-ai/mastra/commit/bad08e99c5291884c3ac76743c78c74f53a302c2), [`816b974`](https://github.com/mastra-ai/mastra/commit/816b974b424e4a1bfae3af30cc41263b6f1c0344), [`b32ba5f`](https://github.com/mastra-ai/mastra/commit/b32ba5fde524b46a4ff1bdf38e30d62a2bb29b04), [`75c7c38`](https://github.com/mastra-ai/mastra/commit/75c7c38a4e9af9821931539dd339f57fcc6414e3)]:
+  - @mastra/core@1.35.0
+
+## 1.11.0-alpha.0
+
+### Minor Changes
+
+- Added favorites support to storage adapters so callers can favorite/unfavorite stored agents and skills, query favorite state alongside list results, and filter listings by visibility. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+  **Example**
+
+  ```ts
+  const storage = new LibSQLStore({
+    /* config */
+  });
+  const favorites = await storage.getStore('favorites');
+
+  await favorites?.favorite({
+    userId: 'user-1',
+    entityType: 'agent',
+    entityId: 'agent-42',
+  });
+  ```
+
+### Patch Changes
+
+- Fixed a workspace PATCH bug: omitted config fields in a PATCH no longer overwrite previously-persisted values with `undefined`. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+- Bumped `@mastra/core` peer dependency floor to `>=1.34.0-0` so the new `@mastra/core/storage/domains/favorites` subpath is available. Older `@mastra/core` versions don't ship the `FavoritesStorage` base class these adapters now extend. ([#16580](https://github.com/mastra-ai/mastra/pull/16580))
+
+- Updated dependencies [[`816b974`](https://github.com/mastra-ai/mastra/commit/816b974b424e4a1bfae3af30cc41263b6f1c0344), [`816b974`](https://github.com/mastra-ai/mastra/commit/816b974b424e4a1bfae3af30cc41263b6f1c0344), [`b32ba5f`](https://github.com/mastra-ai/mastra/commit/b32ba5fde524b46a4ff1bdf38e30d62a2bb29b04)]:
+  - @mastra/core@1.35.0-alpha.2
+
 ## 1.10.1
 
 ### Patch Changes

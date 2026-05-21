@@ -148,6 +148,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/atomic-chat',
+          label: 'Atomic Chat',
+        },
+        {
+          type: 'doc',
           id: 'providers/auriko',
           label: 'Auriko',
         },
@@ -265,11 +270,6 @@ const sidebars = {
           type: 'doc',
           id: 'providers/friendli',
           label: 'Friendli',
-        },
-        {
-          type: 'doc',
-          id: 'providers/frogbot',
-          label: 'FrogBot',
         },
         {
           type: 'doc',
@@ -530,6 +530,11 @@ const sidebars = {
           type: 'doc',
           id: 'providers/requesty',
           label: 'Requesty',
+        },
+        {
+          type: 'doc',
+          id: 'providers/routing-run',
+          label: 'routing.run',
         },
         {
           type: 'doc',
