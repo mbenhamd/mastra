@@ -304,6 +304,7 @@ function realpathIfExists(value: string | null): string | null {
   try {
     return fs.realpathSync.native(value);
   } catch {
+    // Missing or inaccessible paths fall back to lexical containment checks above.
     return null;
   }
 }
