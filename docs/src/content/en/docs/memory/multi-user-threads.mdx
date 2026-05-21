@@ -45,10 +45,7 @@ function escapeAttr(value: string) {
 }
 
 function escapeText(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 export function asUserTurn(speaker: Speaker, text: string) {
