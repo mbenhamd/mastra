@@ -14,7 +14,7 @@ permissions: {}
 jobs:
   changes:
     name: Detect code changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ github.repository == 'mastra-ai/mastra' && 'starsling-ubuntu-24.04' || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
