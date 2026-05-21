@@ -1538,6 +1538,7 @@ export class Session {
   private async _mcpListTools(
     key: string,
     abortSignal: AbortSignal = new AbortController().signal,
+    opts: { resolveWorkspace?: boolean } = {},
   ): Promise<HarnessMcpToolDescriptor[] | undefined> {
     const server = this._harness._getMcpServer(key);
     if (!server) return undefined;
@@ -1545,6 +1546,7 @@ export class Session {
       modeId: this._record.modeId,
       modelId: this._record.modelId,
       abortSignal,
+      resolveWorkspace: opts.resolveWorkspace,
     });
     const toolList = await server.getToolListInfo(requestContext);
     const convertedTools = server.tools();
@@ -1804,13 +1806,23 @@ export class Session {
     };
   }
 
-  private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor): string {
+  private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor, workspaceId: string): string {
     return [
       server.key,
       this._record.modeId,
       this._record.modelId ?? '',
-      this._workspace?.id ?? '',
+      workspaceId,
     ].join('\0');
+  }
+
+  private _getCachedMcpActionCatalogEntries(cacheKey: string): HarnessActionCatalogEntry[] | undefined {
+    const cached = this._actionsMcpEntriesCacheByServer.get(cacheKey);
+    if (!cached) return undefined;
+    if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
+      return cached.entries;
+    }
+    this._actionsMcpEntriesCacheByServer.delete(cacheKey);
+    return undefined;
   }
 
   private async _resolveMcpActionCatalogEntries(): Promise<HarnessActionCatalogEntry[]> {
@@ -1825,7 +1837,7 @@ export class Session {
     cacheKey: string,
   ): Promise<HarnessActionCatalogEntry[]> {
     const pending = withActionCatalogMcpListTimeout(async abortSignal => {
-      const tools = await this._mcpListTools(server.key, abortSignal);
+      const tools = await this._mcpListTools(server.key, abortSignal, { resolveWorkspace: false });
       return (tools ?? []).map(tool => this._projectMcpToolActionCatalogEntry(server, tool));
     });
     pending.catch(() => {
@@ -1853,14 +1865,9 @@ export class Session {
   private async _resolveMcpActionCatalogEntriesForServer(
     server: HarnessMcpServerDescriptor,
   ): Promise<HarnessActionCatalogEntry[]> {
-    const cacheKey = this._actionMcpCatalogCacheKey(server);
-    const cached = this._actionsMcpEntriesCacheByServer.get(cacheKey);
-    if (cached) {
-      if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
-        return cached.entries;
-      }
-      this._actionsMcpEntriesCacheByServer.delete(cacheKey);
-    }
+    const cacheKey = this._actionMcpCatalogCacheKey(server, this._workspace?.id ?? '');
+    const cached = this._getCachedMcpActionCatalogEntries(cacheKey);
+    if (cached) return cached;
 
     const pending =
       this._actionsMcpEntriesResolvingByServer.get(cacheKey) ??
@@ -7519,6 +7526,7 @@ export class Session {
     modelId: string;
     abortSignal: AbortSignal;
     persistedRequestContext?: PersistedRequestContextInput;
+    resolveWorkspace?: boolean;
   }): Promise<RequestContext> {
     const session = this;
     const stateSnapshot = (this._record.state ?? {}) as unknown;
@@ -7526,15 +7534,19 @@ export class Session {
       ? clonePersistedRequestContext(turn.persistedRequestContext)
       : undefined;
     // Resolve the workspace eagerly so tools see a populated `ctx.workspace`
-    // without each tool re-awaiting. Errors here surface as the turn's
-    // failure; workspace_error is still emitted via the registry.
+    // without each tool re-awaiting. Catalog-only callers can opt out to avoid
+    // provisioning a workspace for read-only inventory.
     let workspace: Workspace | undefined;
-    try {
-      workspace = await this._getWorkspaceUnchecked();
-    } catch {
-      // Leave undefined — tools that need a workspace will get a null slot.
-      // The registry has already emitted workspace_error so subscribers know.
-      workspace = undefined;
+    if (turn.resolveWorkspace === false) {
+      workspace = this._workspace;
+    } else {
+      try {
+        workspace = await this._getWorkspaceUnchecked();
+      } catch {
+        // Leave undefined — tools that need a workspace will get a null slot.
+        // The registry has already emitted workspace_error so subscribers know.
+        workspace = undefined;
+      }
     }
     const harnessSlot: HarnessRequestContext<unknown> = {
       harnessId: this._harness.ownerId,

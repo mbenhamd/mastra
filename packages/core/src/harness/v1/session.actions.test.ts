@@ -127,6 +127,33 @@ class FlakyMcpServer extends MockMcpServer {
   }
 }
 
+class GatedMcpServer extends MockMcpServer {
+  private releaseGate?: () => void;
+
+  async getToolListInfo(requestContext?: RequestContext) {
+    this.toolListCallCount++;
+    this.lastToolListRequestContext = requestContext;
+    await new Promise<void>(resolve => {
+      this.releaseGate = resolve;
+    });
+    return {
+      tools: Object.entries(this.convertedTools).map(([name, tool]) => ({
+        name,
+        description: tool.description,
+        inputSchema: tool.parameters,
+        outputSchema: tool.outputSchema,
+        toolType: tool.mcp?.toolType,
+        _meta: tool.mcp?._meta,
+      })),
+    };
+  }
+
+  release(): void {
+    this.releaseGate?.();
+    this.releaseGate = undefined;
+  }
+}
+
 class FakeWorkspaceSkills {
   public getCallCount = 0;
   public listCallCount = 0;
@@ -283,6 +310,27 @@ async function makeSession() {
 }
 
 function makeHarnessWithWorkspaceSkills(skills: FakeWorkspaceSkills): Harness {
+  const provider = makeWorkspaceSkillsProvider(skills);
+  return new Harness({
+    agents: { default: makeAgent() } as any,
+    modes: [{ id: 'default', agentId: 'default' }],
+    defaultModeId: 'default',
+    sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    workspace: { kind: 'per-session', provider },
+  });
+}
+
+function makeRegisteredHarnessWithWorkspaceSkills(skills: FakeWorkspaceSkills): Harness {
+  const provider = makeWorkspaceSkillsProvider(skills);
+  return new Harness({
+    modes: [{ id: 'default', agentId: 'default' }],
+    defaultModeId: 'default',
+    sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    workspace: { kind: 'per-session', provider },
+  });
+}
+
+function makeWorkspaceSkillsProvider(skills: FakeWorkspaceSkills): WorkspaceProvider {
   const workspace: Workspace = {
     id: 'workspace-actions',
     name: 'workspace-actions',
@@ -299,13 +347,7 @@ function makeHarnessWithWorkspaceSkills(skills: FakeWorkspaceSkills): Harness {
     create: async () => workspace,
     resume: async () => workspace,
   };
-  return new Harness({
-    agents: { default: makeAgent() } as any,
-    modes: [{ id: 'default', agentId: 'default' }],
-    defaultModeId: 'default',
-    sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
-    workspace: { kind: 'per-session', provider },
-  });
+  return provider;
 }
 
 describe('Session action catalog (PF-576)', () => {
@@ -454,6 +496,111 @@ describe('Session action catalog (PF-576)', () => {
     ]);
     expect(healthy.toolListCallCount).toBe(1);
     expect(failing.toolListCallCount).toBe(1);
+  });
+
+  it('uses the resolved workspace identity for MCP action cache keys when available', async () => {
+    const skills = new FakeWorkspaceSkills([]);
+    const server = new MockMcpServer({
+      id: 'workspace-mcp',
+      name: 'Workspace MCP',
+      version: '1.0.0',
+      tools: { search_files: makeTool() },
+    });
+    const harness = makeRegisteredHarnessWithWorkspaceSkills(skills);
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      mcpServers: { workspace: server },
+      harness,
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.getWorkspace();
+    await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+      { id: 'mcp-tool:workspace:search_files' },
+    ]);
+    await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+      { id: 'mcp-tool:workspace:search_files' },
+    ]);
+    expect(server.toolListCallCount).toBe(1);
+  });
+
+  it('does not provision or block behind a slow workspace provider for MCP action discovery', async () => {
+    const server = new MockMcpServer({
+      id: 'slow-workspace-mcp',
+      name: 'Slow Workspace MCP',
+      version: '1.0.0',
+      tools: { search_files: makeTool() },
+    });
+    const provider: WorkspaceProvider = {
+      providerId: 'slow-workspace-actions',
+      resumable: true,
+      create: async () => new Promise<Workspace>(() => {}),
+      resume: async () => new Promise<Workspace>(() => {}),
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      workspace: { kind: 'per-session', provider },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      mcpServers: { workspace: server },
+      harness,
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const startedAt = Date.now();
+    await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+      { id: 'mcp-tool:workspace:search_files' },
+    ]);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(server.toolListCallCount).toBe(1);
+
+    const cachedStartedAt = Date.now();
+    await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+      { id: 'mcp-tool:workspace:search_files' },
+    ]);
+    expect(Date.now() - cachedStartedAt).toBeLessThan(500);
+    expect(server.toolListCallCount).toBe(1);
+  });
+
+  it('does not repopulate MCP action caches from discovery cleared by refresh', async () => {
+    const server = new GatedMcpServer({
+      id: 'gated-mcp',
+      name: 'Gated MCP',
+      version: '1.0.0',
+      tools: { search_files: makeTool() },
+    });
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      mcpServers: { gated: server },
+      harness,
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const first = session.actions.list({ source: 'mcp-tool' });
+    while (server.toolListCallCount === 0) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await session.actions.refresh();
+    server.release();
+    await expect(first).resolves.toMatchObject([{ id: 'mcp-tool:gated:search_files' }]);
+
+    const second = session.actions.list({ source: 'mcp-tool' });
+    while (server.toolListCallCount === 1) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    server.release();
+    await expect(second).resolves.toMatchObject([{ id: 'mcp-tool:gated:search_files' }]);
+    expect(server.toolListCallCount).toBe(2);
   });
 
   it('recovers MCP action entries after a transient tool-list failure', async () => {
