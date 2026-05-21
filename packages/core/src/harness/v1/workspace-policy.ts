@@ -9,6 +9,9 @@ export interface WorkspaceRootDescriptor {
   id: string;
   path: string;
   label?: string;
+  /**
+   * When omitted, the root is treated as writable. Set to false to deny mutating file operations before rules run.
+   */
   writable?: boolean;
   metadata?: Readonly<Record<string, unknown>>;
 }
@@ -348,6 +351,7 @@ function matchesFileRootSelector(rule: WorkspacePolicyRule, rootIds: readonly (s
   const actualRootIds = rootIds.filter((rootId): rootId is string => rootId !== undefined);
   if (actualRootIds.length === 0) return false;
 
+  // Allow rules must approve every involved root, while deny/ask rules block when any involved root matches.
   if (rule.decision === 'allow') {
     return actualRootIds.every(rootId => matchesValue(rule.rootId, rootId));
   }

@@ -21,10 +21,38 @@ describe('workspace policy evaluator', () => {
     });
   });
 
+  it('resolves Windows-style absolute paths against workspace roots', () => {
+    const windowsRoots = [
+      { id: 'project', path: 'C:\\workspace\\project', writable: true },
+    ] satisfies WorkspacePolicy['roots'];
+
+    expect(resolveWorkspacePath(windowsRoots, 'C:\\workspace\\project\\src\\index.ts')).toMatchObject({
+      root: { id: 'project', path: 'C:\\workspace\\project' },
+      normalizedPath: 'C:\\workspace\\project\\src\\index.ts',
+      relativePath: 'src\\index.ts',
+    });
+  });
+
   it('denies traversal outside an explicit workspace root', () => {
     const evaluation = evaluateWorkspacePolicy(
       { roots, defaultDecision: 'allow' },
       { kind: 'file', operation: 'read', path: '../secret.txt', rootId: 'project' },
+    );
+
+    expect(evaluation).toMatchObject({
+      decision: 'deny',
+      reasons: ['workspace.path_outside_roots'],
+    });
+  });
+
+  it('denies Windows-style traversal outside an explicit workspace root', () => {
+    const windowsRoots = [
+      { id: 'project', path: 'C:\\workspace\\project', writable: true },
+    ] satisfies WorkspacePolicy['roots'];
+
+    const evaluation = evaluateWorkspacePolicy(
+      { roots: windowsRoots, defaultDecision: 'allow' },
+      { kind: 'file', operation: 'read', path: '..\\secret.txt', rootId: 'project' },
     );
 
     expect(evaluation).toMatchObject({
@@ -78,6 +106,39 @@ describe('workspace policy evaluator', () => {
       decision: 'deny',
       reasons: ['workspace.root_readonly:readonly'],
       path: { root: { id: 'readonly' }, normalizedPath: '/workspace/docs/notes.md' },
+    });
+  });
+
+  it('treats roots as writable when writable is omitted', () => {
+    const implicitWritableRoots = [
+      { id: 'project', path: '/workspace/project' },
+      { id: 'scratch', path: '/workspace/scratch' },
+    ] satisfies WorkspacePolicy['roots'];
+
+    const writeEvaluation = evaluateWorkspacePolicy(
+      { roots: implicitWritableRoots, defaultDecision: 'allow' },
+      { kind: 'file', operation: 'write', path: 'src/index.ts', rootId: 'project' },
+    );
+    const renameEvaluation = evaluateWorkspacePolicy(
+      { roots: implicitWritableRoots, defaultDecision: 'allow' },
+      {
+        kind: 'file',
+        operation: 'rename',
+        path: '/workspace/project/src/index.ts',
+        toPath: '/workspace/scratch/index.ts',
+      },
+    );
+
+    expect(writeEvaluation).toMatchObject({
+      decision: 'allow',
+      reasons: ['workspace.default_allow'],
+      path: { root: { id: 'project' } },
+    });
+    expect(renameEvaluation).toMatchObject({
+      decision: 'allow',
+      reasons: ['workspace.default_allow'],
+      path: { root: { id: 'project' } },
+      toPath: { root: { id: 'scratch' } },
     });
   });
 

@@ -2,9 +2,12 @@
 '@mastra/core': patch
 ---
 
-Added Harness desktop workspace policy evaluation for desktop hosts and other constrained executors.
+Added workspace policy evaluation for desktop hosts and other constrained runtimes.
 
-Apps can now enforce file, command, network, and MCP access rules before starting work. The evaluator resolves file paths and command working directories against declared workspace roots, rejects path traversal and read-only root writes, applies deterministic `deny > ask > allow` precedence, and returns the matched rules and resolved paths for audit or approval UI.
+**What changed**
+- Added pre-run checks for file, command, network, and Model Context Protocol (MCP) access.
+- Added consistent decision order: `deny` before `ask`, and `ask` before `allow`.
+- Added resolved paths and matched rules in results for approval screens and audit logs.
 
 ```ts
 import { evaluateWorkspacePolicy } from '@mastra/core/harness/v1';
@@ -18,7 +21,9 @@ const result = evaluateWorkspacePolicy(
   { kind: 'file', operation: 'write', path: 'src/index.ts', rootId: 'project' },
 );
 
-if (result.decision === 'deny') {
-  throw new Error(result.reasons.join(', '));
+if (result.decision !== 'allow') {
+  throw new Error(
+    result.decision === 'ask' ? `Approval required: ${result.reasons.join(', ')}` : result.reasons.join(', '),
+  );
 }
 ```
