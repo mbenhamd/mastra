@@ -18,6 +18,18 @@ import type { InternalCoreTool, MCPToolType } from '../../tools';
 import { HarnessValidationError } from './errors';
 import { Harness } from './harness';
 
+type MockToolListInfo = {
+  tools: Array<{
+    id?: string;
+    name: string;
+    description?: string;
+    inputSchema: unknown;
+    outputSchema?: unknown;
+    toolType?: MCPToolType;
+    _meta?: Record<string, unknown>;
+  }>;
+};
+
 class MockMcpServer extends MCPServerBase {
   constructor(config: MCPServerConfig) {
     super(config);
@@ -58,7 +70,7 @@ class MockMcpServer extends MCPServerBase {
     };
   }
 
-  getToolListInfo() {
+  getToolListInfo(): MockToolListInfo | Promise<MockToolListInfo> {
     return {
       tools: Object.entries(this.convertedTools).map(([name, tool]) => ({
         name,
@@ -72,7 +84,16 @@ class MockMcpServer extends MCPServerBase {
   }
 
   getToolInfo(toolId: string) {
-    return this.getToolListInfo().tools.find(tool => tool.name === toolId);
+    const tool = this.convertedTools[toolId];
+    if (!tool) return undefined;
+    return {
+      name: toolId,
+      description: tool.description,
+      inputSchema: tool.parameters,
+      outputSchema: tool.outputSchema,
+      toolType: tool.mcp?.toolType,
+      _meta: tool.mcp?._meta,
+    };
   }
 
   async executeTool(): Promise<unknown> {
@@ -85,6 +106,19 @@ class MockMcpServer extends MCPServerBase {
 
   async listResources(): Promise<{ resources: Array<{ uri: string; name: string }> }> {
     return { resources: [] };
+  }
+}
+
+class LazyMockMcpServer extends MockMcpServer {
+  private readonly lazyTools: MockToolListInfo;
+
+  constructor(config: Omit<MCPServerConfig, 'tools'>, tools: MockToolListInfo['tools']) {
+    super({ ...config, tools: {} });
+    this.lazyTools = { tools };
+  }
+
+  getToolListInfo(): MockToolListInfo | Promise<MockToolListInfo> {
+    return Promise.resolve(this.lazyTools);
   }
 }
 
@@ -178,10 +212,10 @@ describe('Session MCP catalog (PF-562)', () => {
     expect(session.mcp.getServer('missing')).toBeUndefined();
   });
 
-  it('lists registered MCP tool descriptors without applying execution auth filtering', async () => {
+  it('lists registered MCP tool descriptors through the server tool-list contract', async () => {
     const { session } = await makeSession();
 
-    expect(session.mcp.listTools('files')).toEqual([
+    await expect(session.mcp.listTools('files')).resolves.toEqual([
       {
         serverKey: 'files',
         name: 'read_file',
@@ -199,13 +233,74 @@ describe('Session MCP catalog (PF-562)', () => {
         strict: true,
       },
     ]);
-    expect(session.mcp.listTools('missing')).toBeUndefined();
+    await expect(session.mcp.listTools('missing')).resolves.toBeUndefined();
+  });
+
+  it('lists lazy MCP client proxy tools through the server tool-list contract', async () => {
+    const server = new LazyMockMcpServer(
+      {
+        id: 'remote',
+        name: 'Remote',
+        version: '1.0.0',
+        description: 'Remote tools',
+      },
+      [
+        {
+          id: 'remote_search',
+          name: 'Remote Search',
+          description: 'Search remote data',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string' },
+            },
+          },
+          outputSchema: {
+            type: 'object',
+            properties: {
+              result: { type: 'string' },
+            },
+          },
+          toolType: 'tool' as MCPToolType,
+          _meta: { ui: { resourceUri: 'ui://remote/search' } },
+        },
+      ],
+    );
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      mcpServers: { remote: server },
+      harness,
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.mcp.listTools('remote')).resolves.toEqual([
+      {
+        serverKey: 'remote',
+        name: 'remote_search',
+        description: 'Search remote data',
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+        },
+        outputSchema: {
+          type: 'object',
+          properties: { result: { type: 'string' } },
+        },
+        toolType: 'tool',
+        meta: { ui: { resourceUri: 'ui://remote/search' } },
+      },
+    ]);
   });
 
   it('returns clone-safe MCP server and tool snapshots', async () => {
     const { session, server } = await makeSession();
     const firstServer = session.mcp.getServer('files')!;
-    const firstTool = session.mcp.listTools('files')![0]!;
+    const firstTool = (await session.mcp.listTools('files'))![0]!;
 
     (firstServer.repository as Record<string, unknown>).url = 'mutated';
     (firstServer.packages![0] as Record<string, unknown>).name = 'mutated';
@@ -214,10 +309,10 @@ describe('Session MCP catalog (PF-562)', () => {
 
     expect(session.mcp.getServer('files')!.repository).toEqual({ url: 'https://example.test/repo', source: 'github' });
     expect(session.mcp.getServer('files')!.packages![0]).toMatchObject({ name: '@example/filesystem-mcp' });
-    expect((session.mcp.listTools('files')![0]!.inputSchema as Record<string, any>).properties.path.type).toBe(
+    expect(((await session.mcp.listTools('files'))![0]!.inputSchema as Record<string, any>).properties.path.type).toBe(
       'string',
     );
-    expect((session.mcp.listTools('files')![0]!.meta!.ui as Record<string, unknown>).resourceUri).toBe(
+    expect(((await session.mcp.listTools('files'))![0]!.meta!.ui as Record<string, unknown>).resourceUri).toBe(
       'ui://files/read',
     );
     expect(server.repository).toEqual({ url: 'https://example.test/repo', source: 'github' });
@@ -230,5 +325,7 @@ describe('Session MCP catalog (PF-562)', () => {
     expect(() => session.mcp.listTools('')).toThrow(HarnessValidationError);
     expect(() => session.mcp.getServer('__proto__')).toThrow(HarnessValidationError);
     expect(() => session.mcp.listTools('constructor')).toThrow(HarnessValidationError);
+    expect(() => session.mcp.getServer('toString')).toThrow(HarnessValidationError);
+    expect(() => session.mcp.listTools('hasOwnProperty')).toThrow(HarnessValidationError);
   });
 });

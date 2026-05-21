@@ -22,7 +22,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
-import type { MCPServerBase } from '../../mcp';
+import { MCPServerBase } from '../../mcp';
 import type {
   PermissionRules,
   SessionGrants,
@@ -1305,7 +1305,8 @@ export class Harness {
 
   /** @internal — Session resolves one registered MCP server by Mastra registration key. */
   _getMcpServer(key: string): MCPServerBase | undefined {
-    return this.mastra.getMCPServer(key as never) as MCPServerBase | undefined;
+    const server = this.mastra.getMCPServer(key as never) as unknown;
+    return server instanceof MCPServerBase ? server : undefined;
   }
 
   /** @internal — Session enforces the subagent depth cap inside the spawn tool. */

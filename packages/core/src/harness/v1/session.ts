@@ -185,7 +185,7 @@ const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
   'items',
   'additionalProperties',
 ]);
-const RESERVED_MCP_SERVER_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const RESERVED_MCP_SERVER_KEYS = new Set([...Object.getOwnPropertyNames(Object.prototype), '__proto__']);
 
 function cloneMcpCatalogValue(value: unknown): unknown | undefined {
   if (value === undefined) return undefined;
@@ -1354,10 +1354,10 @@ export class Session {
   // MCP catalog — PF-562 / PF-552 desktop integration inventory.
   //
   // This is an inventory snapshot over MCP servers registered on the Harness
-  // Mastra instance. It deliberately does not call `getToolListInfo()` because
-  // that method may apply execution/auth filtering and return an empty list
-  // without a request context. Execution permission remains enforced by the
-  // MCP tool runtime; this catalog only lets desktop hosts render integrations.
+  // Mastra instance. Tool descriptors use MCPServerBase.getToolListInfo() so
+  // lazy MCP client proxies can populate remote tool catalogs on demand.
+  // Execution permission remains enforced by the MCP tool runtime; this
+  // catalog only lets desktop hosts render integrations.
   // -------------------------------------------------------------------------
 
   readonly mcp = Object.freeze({
@@ -1366,7 +1366,11 @@ export class Session {
     /** Look up one MCP server by Mastra registration key. */
     getServer: (key: string): HarnessMcpServerDescriptor | undefined => this._mcpGetServer(key),
     /** List MCP tool descriptors for one registered server key. */
-    listTools: (key: string): HarnessMcpToolDescriptor[] | undefined => this._mcpListTools(key),
+    listTools: (key: string): Promise<HarnessMcpToolDescriptor[] | undefined> => {
+      this._assertLive('mcp.listTools()');
+      this._assertMcpServerKey('mcp.listTools()', key);
+      return this._mcpListTools(key);
+    },
   });
 
   private _mcpListServers(): HarnessMcpServerDescriptor[] {
@@ -1381,24 +1385,28 @@ export class Session {
     return server ? this._projectMcpServer(key, server) : undefined;
   }
 
-  private _mcpListTools(key: string): HarnessMcpToolDescriptor[] | undefined {
-    this._assertLive('mcp.listTools()');
-    this._assertMcpServerKey('mcp.listTools()', key);
+  private async _mcpListTools(key: string): Promise<HarnessMcpToolDescriptor[] | undefined> {
     const server = this._harness._getMcpServer(key);
     if (!server) return undefined;
-    return Object.entries(server.tools()).map(([toolName, tool]) => {
-      const inputSchema = cloneMcpSchemaLike(tool.parameters);
-      const outputSchema = cloneMcpSchemaLike(tool.outputSchema);
-      const meta = cloneMcpCatalogRecord(tool.mcp?._meta);
+    const convertedTools = server.tools();
+    const toolList = await server.getToolListInfo();
+    return toolList.tools.map(toolInfo => {
+      const infoWithId = toolInfo as typeof toolInfo & { id?: unknown };
+      const toolName = typeof infoWithId.id === 'string' && infoWithId.id.length > 0 ? infoWithId.id : toolInfo.name;
+      const convertedTool = convertedTools[toolName];
+      const inputSchema = cloneMcpSchemaLike(toolInfo.inputSchema ?? convertedTool?.parameters);
+      const outputSchema = cloneMcpSchemaLike(toolInfo.outputSchema ?? convertedTool?.outputSchema);
+      const meta = cloneMcpCatalogRecord(toolInfo._meta ?? convertedTool?.mcp?._meta);
+      const toolType = toolInfo.toolType ?? convertedTool?.mcp?.toolType;
       return {
         serverKey: key,
         name: toolName,
-        ...(tool.description ? { description: tool.description } : {}),
+        ...(toolInfo.description ? { description: toolInfo.description } : {}),
         ...(inputSchema !== undefined ? { inputSchema } : {}),
         ...(outputSchema !== undefined ? { outputSchema } : {}),
-        ...(tool.mcp?.toolType ? { toolType: tool.mcp.toolType } : {}),
+        ...(toolType ? { toolType } : {}),
         ...(meta ? { meta } : {}),
-        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+        ...(convertedTool?.strict !== undefined ? { strict: convertedTool.strict } : {}),
       };
     });
   }
