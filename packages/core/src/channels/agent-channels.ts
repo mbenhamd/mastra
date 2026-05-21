@@ -715,7 +715,7 @@ export class AgentChannels {
             durationMs?: number,
           ) => Promise<Response>;
 
-          this.startGatewayLoop(name, startGateway);
+          this.startGatewayLoop(name, startGateway, generation);
         }
       }
     })();
@@ -1550,12 +1550,13 @@ export class AgentChannels {
   private startGatewayLoop(
     name: string,
     startGateway: (options: { waitUntil: (p: Promise<unknown>) => void }, durationMs?: number) => Promise<Response>,
+    generation: number,
   ): void {
     const DURATION = 24 * 60 * 60 * 1000;
     const RETRY_DELAY = 5000;
 
     const reconnect = async () => {
-      while (true) {
+      while (generation === this.lifecycleGeneration) {
         try {
           let resolve: () => void;
           let reject: (err: unknown) => void;
@@ -1575,8 +1576,14 @@ export class AgentChannels {
             DURATION,
           );
           await done;
+          if (generation !== this.lifecycleGeneration) {
+            break;
+          }
           this.log('info', `[${name}] Gateway session ended, reconnecting...`);
         } catch (err) {
+          if (generation !== this.lifecycleGeneration) {
+            break;
+          }
           this.log('error', `[${name}] Gateway error, retrying in ${RETRY_DELAY / 1000}s`, err);
           await new Promise(r => setTimeout(r, RETRY_DELAY));
         }

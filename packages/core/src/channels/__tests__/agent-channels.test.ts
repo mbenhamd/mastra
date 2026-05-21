@@ -80,6 +80,30 @@ describe('AgentChannels', () => {
       expect((agentChannels as any).lifecycleGeneration).toBe(generation + 1);
     });
 
+    it('stops gateway reconnect loops after close', async () => {
+      let finishGateway!: () => void;
+      const gatewayDone = new Promise<void>(resolve => {
+        finishGateway = resolve;
+      });
+      const startGateway = vi.fn(async ({ waitUntil }: { waitUntil: (p: Promise<unknown>) => void }) => {
+        waitUntil(gatewayDone);
+        return new Response('ok');
+      });
+      const generation = (agentChannels as any).lifecycleGeneration;
+
+      (agentChannels as any).startGatewayLoop('mock', startGateway, generation);
+      await Promise.resolve();
+
+      expect(startGateway).toHaveBeenCalledTimes(1);
+
+      agentChannels.close();
+      finishGateway();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(startGateway).toHaveBeenCalledTimes(1);
+    });
+
     it('returns a specific adapter by key', () => {
       const adapter = agentChannels.adapters['discord'];
       expect(adapter).toBeDefined();
