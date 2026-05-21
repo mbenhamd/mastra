@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Harness v1 channel wakeups now record `channel_binding_closed` and stop instead of running with stale or mismatched channel binding context.
+Fixed channel wakeups with stale or mismatched bindings: they now stop before admission and are marked as `channel_binding_closed`.
