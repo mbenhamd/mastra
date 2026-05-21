@@ -125,7 +125,7 @@ export function TracesListView({
         <TracesDataList.TopCell>Status</TracesDataList.TopCell>
       </TracesDataList.Top>
 
-      {items.length === 0 ? (
+      {traces.length === 0 ? (
         <TracesDataList.NoMatch
           message={filtersApplied ? 'No traces found for applied filters' : 'No traces found yet'}
         />
