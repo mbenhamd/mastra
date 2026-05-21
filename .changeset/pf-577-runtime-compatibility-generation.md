@@ -2,7 +2,7 @@
 "@mastra/core": patch
 ---
 
-Added runtime compatibility protection for Harness recovery. When you update agent implementations, prompts, tools, model bindings, MCP bindings, or other runtime dependencies, queued or suspended work from an older generation will be rejected during recovery instead of running against mismatched runtime state.
+Added runtime compatibility protection for Harness recovery. When you update agent code, prompts, tools, model settings, protocol bindings, or other runtime dependencies, queued or suspended work from an older generation will be rejected during recovery instead of running against mismatched runtime state.
 
 ```ts
 const harness = new Harness({
