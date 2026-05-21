@@ -128,8 +128,13 @@ export const useChat = ({
 
   type SignalContentPart =
     | { type: 'text'; text: string }
-    | { type: 'file'; data: string; mediaType: string; filename?: string };
-  type UserMessageSignalContents = string | SignalContentPart[];
+    | { type: 'file'; data: string; mimeType: string; filename?: string }
+    | { type: 'image'; image: string; mimeType?: string };
+  type SerializableCoreUserMessage = {
+    role: 'user';
+    content: string | SignalContentPart[];
+  };
+  type UserMessageSignalContents = string | SerializableCoreUserMessage | SerializableCoreUserMessage[];
 
   const normalizeSignalFileData = (data: string | URL | ArrayBuffer | Uint8Array) => {
     if (data instanceof URL) return data.toString();
@@ -137,35 +142,40 @@ export const useChat = ({
   };
 
   const getSignalContents = (coreUserMessages: CoreUserMessage[]): UserMessageSignalContents => {
-    const parts = coreUserMessages.reduce<SignalContentPart[]>((allParts, message) => {
+    if (coreUserMessages.length === 1 && typeof coreUserMessages[0]?.content === 'string') {
+      return coreUserMessages[0].content;
+    }
+
+    const messages = coreUserMessages.map<SerializableCoreUserMessage>(message => {
       if (typeof message.content === 'string') {
-        allParts.push({ type: 'text', text: message.content });
-        return allParts;
+        return { role: 'user', content: message.content };
       }
 
-      for (const part of message.content) {
+      const parts = message.content.reduce<SignalContentPart[]>((allParts, part) => {
         if (part.type === 'text') {
           allParts.push({ type: 'text', text: part.text });
         } else if (part.type === 'file') {
           allParts.push({
             type: 'file',
             data: normalizeSignalFileData(part.data),
-            mediaType: part.mimeType,
+            mimeType: part.mimeType,
             ...(part.filename ? { filename: part.filename } : {}),
           });
         } else if (part.type === 'image') {
           allParts.push({
-            type: 'file',
-            data: normalizeSignalFileData(part.image),
-            mediaType: part.mimeType ?? 'image/png',
+            type: 'image',
+            image: normalizeSignalFileData(part.image),
+            ...(part.mimeType ? { mimeType: part.mimeType } : {}),
           });
         }
-      }
 
-      return allParts;
-    }, []);
+        return allParts;
+      }, []);
 
-    return parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
+      return { role: 'user', content: parts };
+    });
+
+    return messages.length === 1 ? messages[0]! : messages;
   };
 
   const markThreadSignalsUnsupported = useCallback(() => {

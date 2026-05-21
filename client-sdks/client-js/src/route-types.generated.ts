@@ -5568,56 +5568,51 @@ type PostAgentsAgentIdSignals_Body_Auxiliary_2 =
 
 export type PostAgentsAgentIdSignals_Body =
   | {
-      signal: {
-        id?: string | undefined;
-        createdAt?: (string | Date) | undefined;
-        metadata?:
-          | {
-              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-            }
-          | undefined;
-        attributes?:
-          | {
-              [key: string]: string | number | boolean | null | undefined;
-            }
-          | undefined;
-        type: string;
-        contents:
-          | string
-          | (
+      signal:
+        | {
+            id?: string | undefined;
+            createdAt?: (string | Date) | undefined;
+            metadata?:
               | {
-                  type: 'text';
-                  text: string;
-                  providerOptions?:
-                    | {
-                        [key: string]: {
-                          [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-                        };
-                      }
-                    | undefined;
+                  [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
                 }
+              | undefined;
+            attributes?:
               | {
-                  type: 'file';
-                  data: string;
-                  mediaType: string;
-                  filename?: string | undefined;
-                  providerOptions?:
-                    | {
-                        [key: string]: {
-                          [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-                        };
-                      }
-                    | undefined;
+                  [key: string]: string | number | boolean | null | undefined;
                 }
-            )[];
-        providerOptions?:
-          | {
-              [key: string]: {
-                [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-              };
-            }
-          | undefined;
-      };
+              | undefined;
+            type: 'user-message';
+            contents:
+              | string
+              | {
+                  role: string;
+                  [x: string]: unknown;
+                }
+              | (
+                  | string
+                  | {
+                      role: string;
+                      [x: string]: unknown;
+                    }
+                )[];
+          }
+        | {
+            id?: string | undefined;
+            createdAt?: (string | Date) | undefined;
+            metadata?:
+              | {
+                  [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
+                }
+              | undefined;
+            attributes?:
+              | {
+                  [key: string]: string | number | boolean | null | undefined;
+                }
+              | undefined;
+            type: string;
+            contents: string;
+          };
       ifActive?:
         | {
             behavior?: ('deliver' | 'persist' | 'discard') | undefined;
@@ -5629,56 +5624,51 @@ export type PostAgentsAgentIdSignals_Body =
       ifIdle?: undefined | undefined;
     }
   | {
-      signal: {
-        id?: string | undefined;
-        createdAt?: (string | Date) | undefined;
-        metadata?:
-          | {
-              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-            }
-          | undefined;
-        attributes?:
-          | {
-              [key: string]: string | number | boolean | null | undefined;
-            }
-          | undefined;
-        type: string;
-        contents:
-          | string
-          | (
+      signal:
+        | {
+            id?: string | undefined;
+            createdAt?: (string | Date) | undefined;
+            metadata?:
               | {
-                  type: 'text';
-                  text: string;
-                  providerOptions?:
-                    | {
-                        [key: string]: {
-                          [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-                        };
-                      }
-                    | undefined;
+                  [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
                 }
+              | undefined;
+            attributes?:
               | {
-                  type: 'file';
-                  data: string;
-                  mediaType: string;
-                  filename?: string | undefined;
-                  providerOptions?:
-                    | {
-                        [key: string]: {
-                          [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-                        };
-                      }
-                    | undefined;
+                  [key: string]: string | number | boolean | null | undefined;
                 }
-            )[];
-        providerOptions?:
-          | {
-              [key: string]: {
-                [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
-              };
-            }
-          | undefined;
-      };
+              | undefined;
+            type: 'user-message';
+            contents:
+              | string
+              | {
+                  role: string;
+                  [x: string]: unknown;
+                }
+              | (
+                  | string
+                  | {
+                      role: string;
+                      [x: string]: unknown;
+                    }
+                )[];
+          }
+        | {
+            id?: string | undefined;
+            createdAt?: (string | Date) | undefined;
+            metadata?:
+              | {
+                  [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_2;
+                }
+              | undefined;
+            attributes?:
+              | {
+                  [key: string]: string | number | boolean | null | undefined;
+                }
+              | undefined;
+            type: string;
+            contents: string;
+          };
       ifActive?:
         | {
             behavior?: ('deliver' | 'persist' | 'discard') | undefined;

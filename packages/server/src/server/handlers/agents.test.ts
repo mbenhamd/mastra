@@ -1148,14 +1148,19 @@ describe('Agent Routes Authorization', () => {
   });
 
   describe('SIGNAL_ROUTES', () => {
-    it('should validate typed user-message signal contents and attributes', () => {
+    it('should validate user-message BaseMessageListInput contents and attributes', () => {
       const body = {
         signal: {
           type: 'user-message',
           contents: [
-            { type: 'text', text: 'describe these files' },
-            { type: 'file', data: 'data:image/png;base64,image-data', mediaType: 'image/png' },
-            { type: 'file', data: 'file-data', mediaType: 'application/pdf', filename: 'brief.pdf' },
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'describe these files' },
+                { type: 'file', data: 'data:image/png;base64,image-data', mimeType: 'image/png' },
+                { type: 'file', data: 'file-data', mimeType: 'application/pdf', filename: 'brief.pdf' },
+              ],
+            },
           ],
           attributes: { intent: 'follow-up', count: 1, urgent: false, empty: null },
           metadata: { source: 'studio' },
@@ -1167,7 +1172,7 @@ describe('Agent Routes Authorization', () => {
       expect(sendAgentSignalBodySchema.safeParse(body).success).toBe(true);
     });
 
-    it('should validate string user-message signal contents and reject legacy array wrappers', () => {
+    it('should validate string user-message signal contents and message array wrappers', () => {
       expect(
         sendAgentSignalBodySchema.safeParse({
           signal: { type: 'user-message', contents: 'hello' },
@@ -1178,14 +1183,14 @@ describe('Agent Routes Authorization', () => {
 
       expect(
         sendAgentSignalBodySchema.safeParse({
-          signal: { type: 'user-message', contents: ['hello', 'again'] },
+          signal: { type: 'user-message', contents: ['hello', { role: 'user', content: 'again' }] },
           resourceId: 'user-a',
           threadId: 'thread-a',
         }).success,
-      ).toBe(false);
+      ).toBe(true);
     });
 
-    it('should reject Mastra DB message shaped user-message signal contents', () => {
+    it('should accept Mastra DB message shaped user-message signal contents', () => {
       expect(
         sendAgentSignalBodySchema.safeParse({
           signal: {
@@ -1209,15 +1214,18 @@ describe('Agent Routes Authorization', () => {
           resourceId: 'user-a',
           threadId: 'thread-a',
         }).success,
-      ).toBe(false);
+      ).toBe(true);
     });
 
-    it('should reject malformed user-message content parts', () => {
+    it('should reject raw user-message content part arrays without message roles', () => {
       expect(
         sendAgentSignalBodySchema.safeParse({
           signal: {
             type: 'user-message',
-            contents: { role: 'user', content: [{ type: 'image' }] },
+            contents: [
+              { type: 'text', text: 'missing role wrapper' },
+              { type: 'file', data: 'file-data', mimeType: 'application/pdf' },
+            ],
           },
           resourceId: 'user-a',
           threadId: 'thread-a',
