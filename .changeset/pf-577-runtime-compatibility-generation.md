@@ -11,4 +11,4 @@ const harness = new Harness({
 });
 ```
 
-Change the `runtimeCompatibilityGeneration` value whenever existing non-terminal queued or suspended work should not resume on the new runtime surface.
+Change the `runtimeCompatibilityGeneration` value whenever in-progress queued or suspended work should not resume on the updated runtime.
