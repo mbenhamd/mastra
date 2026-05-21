@@ -11,7 +11,14 @@ import type { ZodError } from 'zod/v4';
 import { z } from 'zod/v4';
 
 import type { InMemoryTaskStore } from '../a2a/store';
-import { coreAuthMiddleware } from '../auth/helpers';
+import {
+  allowsHarnessSseSubscriptionToken,
+  coreAuthMiddleware,
+  findBearerEquivalentHarnessQueryParam,
+  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM,
+  hasHarnessSseSubscriptionToken,
+  isHarnessClientRoute,
+} from '../auth/helpers';
 import {
   MASTRA_CLIENT_TYPE_HEADER,
   MASTRA_IS_STUDIO_KEY,
@@ -36,20 +43,6 @@ export {
 } from '../constants';
 
 export { WorkflowRegistry, normalizeRoutePath } from '../utils';
-
-function isProtectedFGARoute(route: Pick<ServerRoute, 'requiresAuth'>): boolean {
-  return route.requiresAuth !== false;
-}
-
-function getRoutePermissions(route: ServerRoute): MastraFGAPermissionInput[] {
-  const permission = getEffectivePermission(route);
-  if (!permission) return [];
-  return (Array.isArray(permission) ? permission : [permission]) as MastraFGAPermissionInput[];
-}
-
-function formatRoute(route: ServerRoute): string {
-  return `${route.method} ${route.path}`;
-}
 
 export interface OpenAPIConfig {
   title?: string;
@@ -114,6 +107,59 @@ export interface ParsedRequestParams {
   bodyParseError?: {
     message: string;
   };
+}
+
+const SENSITIVE_QUERY_PARAMS = new Set([
+  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM.toLowerCase(),
+  'access_token',
+  'accesstoken',
+  'apikey',
+  'authorization',
+  'authtoken',
+  'bearer',
+  'token',
+]);
+
+function normalizeSensitiveQueryParamKey(key: string): string {
+  return key.toLowerCase().split('[')[0]?.split('.')[0] ?? key.toLowerCase();
+}
+
+export function redactSensitiveQueryParams<T extends Record<string, unknown>>(queryParams: T): T {
+  const redacted: Record<string, unknown> = { ...queryParams };
+
+  for (const key of Object.keys(redacted)) {
+    const normalizedKey = key.toLowerCase();
+    const baseKey = normalizeSensitiveQueryParamKey(key);
+    if (SENSITIVE_QUERY_PARAMS.has(normalizedKey) || SENSITIVE_QUERY_PARAMS.has(baseKey)) {
+      redacted[key] = '[REDACTED]';
+    }
+  }
+
+  return redacted as T;
+}
+
+function isAbortSignalError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+
+  const { code, name } = error as { code?: string; name?: string };
+  return name === 'AbortError' || code === 'ABORT_ERR';
+}
+
+function isExpectedResponseCloseError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+
+  const { code } = error as { code?: string };
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ERR_STREAM_DESTROYED' ||
+    code === 'ERR_STREAM_WRITE_AFTER_END' ||
+    code === 'ERR_STREAM_PREMATURE_CLOSE'
+  );
+}
+
+function isResponseClosed(response: { writableEnded?: boolean; destroyed?: boolean }): boolean {
+  return Boolean(response.writableEnded || response.destroyed);
 }
 
 function isProtectedFGARoute(route: Pick<ServerRoute, 'requiresAuth'>): boolean {
@@ -842,7 +888,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
         });
     }
 
-    const init: RequestInit = { method, headers: fetchHeaders };
+    const init: RequestInit = { method, headers: fetchHeaders, signal };
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && body !== undefined) {
       if (body instanceof ArrayBuffer || body instanceof Uint8Array || body instanceof ReadableStream) {
         init.body = body as any;

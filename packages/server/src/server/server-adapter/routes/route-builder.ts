@@ -181,6 +181,7 @@ interface RouteConfig<
    * If set, the user must have the specified permission on the resource.
    */
   fga?: FGARouteConfig;
+  harnessAuth?: HarnessRouteAuthConfig;
   onValidationError?: ValidationErrorHook;
 }
 

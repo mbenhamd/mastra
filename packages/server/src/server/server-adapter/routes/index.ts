@@ -17,6 +17,7 @@ import { CHANNELS_ROUTES } from './channels';
 import { CONVERSATIONS_ROUTES } from './conversations';
 import { DATASETS_ROUTES } from './datasets';
 import { EDITOR_BUILDER_ROUTES } from './editor-builder';
+import { HARNESS_ROUTES } from './harness';
 import { LEGACY_ROUTES } from './legacy';
 import { LOGS_ROUTES } from './logs';
 import { MCP_ROUTES } from './mcp';
@@ -159,6 +160,7 @@ export type ServerRoute<
    * fga: { resourceType: 'agent', resourceIdParam: 'agentId', permission: MastraFGAPermissions.AGENTS_EXECUTE }
    */
   fga?: FGARouteConfig;
+  harnessAuth?: HarnessRouteAuthConfig;
   onValidationError?: ValidationErrorHook;
   /** @internal Phantom type — not present at runtime. Used for type-level schema inference. */
   readonly __schemas?: TSchemas;
@@ -181,6 +183,7 @@ export const SERVER_ROUTES: readonly ServerRoute[] = [
   ...WORKSPACE_ROUTES,
   ...LEGACY_ROUTES,
   ...MCP_ROUTES,
+  ...HARNESS_ROUTES,
   ...STORED_AGENTS_ROUTES,
   ...STORED_MCP_CLIENTS_ROUTES,
   ...STORED_PROMPT_BLOCKS_ROUTES,
