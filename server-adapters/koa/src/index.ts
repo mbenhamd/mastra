@@ -462,6 +462,9 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       taskStore: ctx.state.taskStore,
       abortSignal: ctx.state.abortSignal,
       routePrefix: prefix,
+      getHeader: (name: string) => ctx.get(name),
+      requestBody: params.body,
+      requestPathParams: params.urlParams,
     };
 
     // Check route permission requirement (EE feature)
@@ -940,10 +943,11 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         ctx.headers as Record<string, string | string[] | undefined>,
         ctx.request.body,
         ctx.state.requestContext,
+        ctx.state.abortSignal,
       );
       if (!response) return next();
       ctx.respond = false;
-      await server.writeCustomRouteResponse(response, ctx.res);
+      await server.writeCustomRouteResponse(response, ctx.res, ctx.state.abortSignal);
     });
   }
 
@@ -986,7 +990,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       };
 
       if (server.httpLoggingConfig?.includeQueryParams) {
-        logData.query = ctx.query;
+        logData.query = redactSensitiveQueryParams(ctx.query);
       }
 
       if (server.httpLoggingConfig?.includeHeaders) {

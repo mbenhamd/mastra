@@ -84,10 +84,14 @@ describe('RouteHandlerService', () => {
       body: {
         requestContext: 'spoofed',
         routePrefix: '/spoofed',
+        requestBody: 'spoofed',
+        requestPathParams: 'spoofed',
+        getHeader: 'spoofed',
         custom: 'ok',
       },
       requestContext,
       abortSignal,
+      getHeader: (name: string) => (name.toLowerCase() === 'if-match' ? '"v1"' : undefined),
     });
 
     const handlerParams = await route.handler.mock.results[0]?.value;
@@ -100,5 +104,15 @@ describe('RouteHandlerService', () => {
     expect(handlerParams.requestContext).toBe(requestContext);
     expect(handlerParams.abortSignal).toBe(abortSignal);
     expect(handlerParams.routePrefix).toBe('/api');
+    expect(handlerParams.requestBody).toEqual({
+      requestContext: 'spoofed',
+      routePrefix: '/spoofed',
+      requestBody: 'spoofed',
+      requestPathParams: 'spoofed',
+      getHeader: 'spoofed',
+      custom: 'ok',
+    });
+    expect(handlerParams.requestPathParams).toEqual({ id: '123' });
+    expect(handlerParams.getHeader('if-match')).toBe('"v1"');
   });
 });

@@ -27,11 +27,11 @@ async function collectFiles(rootDir: string, patterns: string[]): Promise<string
 
 /**
  * Finds the workspace root by walking up directories looking for a lockfile.
- * Returns null if no workspace root is found (i.e., lockfile is in projectDir or no lockfile found).
+ * Returns null if no workspace root is found.
  */
 async function findWorkspaceRoot(projectDir: string): Promise<string | null> {
-  let currentDir = dirname(projectDir);
-  let previousDir = projectDir;
+  let currentDir = projectDir;
+  let previousDir = '';
 
   // Walk up until we hit the filesystem root (when dirname returns the same path)
   while (currentDir !== previousDir) {
@@ -58,7 +58,7 @@ async function findWorkspaceRoot(projectDir: string): Promise<string | null> {
 async function getWorkspaceRootLockfiles(projectDir: string): Promise<string[]> {
   const workspaceRoot = await findWorkspaceRoot(projectDir);
 
-  if (!workspaceRoot) {
+  if (!workspaceRoot || workspaceRoot === projectDir) {
     return [];
   }
 
@@ -94,6 +94,10 @@ async function getWorkspaceRootSourceFiles(projectDir: string): Promise<string[]
     `!packages/*/src/${TEST_FILE_GLOB}`,
     '!packages/*/src/**/__tests__/**',
   ]);
+
+  if (workspaceRoot === projectDir) {
+    return files;
+  }
 
   return files.filter(filePath => {
     const relToProject = relative(projectDir, filePath);

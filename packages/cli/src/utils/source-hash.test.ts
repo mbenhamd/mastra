@@ -173,6 +173,32 @@ describe('source-hash', () => {
 
       await rm(workspaceRoot, { recursive: true, force: true });
     });
+
+    it('should include workspace package source files when the project is the workspace root', async () => {
+      const workspaceRoot = join(
+        TEST_TMP_ROOT,
+        `workspace-root-source-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      );
+      const rootMastraDir = join(workspaceRoot, 'src', 'mastra');
+      const sharedPackageDir = join(workspaceRoot, 'packages', 'shared');
+
+      await mkdir(rootMastraDir, { recursive: true });
+      await writeFileSynced(join(workspaceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 1');
+      await writeFileSynced(join(rootMastraDir, 'index.ts'), "import '@repo/shared'; export const mastra = {}");
+      await writeFileSynced(join(workspaceRoot, 'package.json'), '{"name": "root-app"}');
+      await writeFileSynced(join(sharedPackageDir, 'package.json'), '{"name": "@repo/shared"}');
+      await writeFileSynced(join(sharedPackageDir, 'src', 'index.ts'), 'export const value = 1');
+
+      const hash1 = await computeSourceHash(workspaceRoot, rootMastraDir);
+
+      await writeFileSynced(join(sharedPackageDir, 'src', 'index.ts'), 'export const value = 2');
+
+      const hash2 = await computeSourceHash(workspaceRoot, rootMastraDir);
+
+      expect(hash1).not.toBe(hash2);
+
+      await rm(workspaceRoot, { recursive: true, force: true });
+    });
   });
 
   describe('writeBuildManifest / readBuildManifest', () => {
