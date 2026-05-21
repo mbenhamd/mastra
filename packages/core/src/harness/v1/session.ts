@@ -105,6 +105,8 @@ import type {
   AgentStream,
   AttachmentRef,
   GoalOptions,
+  HarnessMcpServerDescriptor,
+  HarnessMcpToolDescriptor,
   HarnessMode,
   InboxResponseOptions,
   InboxResponseResult,
@@ -183,6 +185,40 @@ const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
   'items',
   'additionalProperties',
 ]);
+
+function cloneMcpCatalogValue(value: unknown): unknown | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return structuredClone(value);
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(value)) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function cloneMcpCatalogRecord(value: unknown): Record<string, unknown> | undefined {
+  const cloned = cloneMcpCatalogValue(value);
+  if (!cloned || typeof cloned !== 'object' || Array.isArray(cloned)) return undefined;
+  return cloned as Record<string, unknown>;
+}
+
+function cloneMcpCatalogRecordArray(value: unknown): readonly Record<string, unknown>[] | undefined {
+  const cloned = cloneMcpCatalogValue(value);
+  if (!Array.isArray(cloned) || cloned.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+    return undefined;
+  }
+  return cloned as Record<string, unknown>[];
+}
+
+function cloneMcpSchemaLike(value: unknown): unknown | undefined {
+  if (value && typeof value === 'object' && 'jsonSchema' in value) {
+    return cloneMcpCatalogValue((value as { jsonSchema?: unknown }).jsonSchema);
+  }
+  return cloneMcpCatalogValue(value);
+}
 
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
@@ -1306,6 +1342,88 @@ export class Session {
      */
     use: (ref: string, opts?: UseSkillOptions): Promise<AgentResult> => this._skillsUse(ref, opts),
   });
+
+  // -------------------------------------------------------------------------
+  // MCP catalog — PF-562 / PF-552 desktop integration inventory.
+  //
+  // This is an inventory snapshot over MCP servers registered on the Harness
+  // Mastra instance. It deliberately does not call `getToolListInfo()` because
+  // that method may apply execution/auth filtering and return an empty list
+  // without a request context. Execution permission remains enforced by the
+  // MCP tool runtime; this catalog only lets desktop hosts render integrations.
+  // -------------------------------------------------------------------------
+
+  readonly mcp = Object.freeze({
+    /** List MCP servers registered on the Harness Mastra instance. */
+    listServers: (): HarnessMcpServerDescriptor[] => this._mcpListServers(),
+    /** Look up one MCP server by Mastra registration key. */
+    getServer: (key: string): HarnessMcpServerDescriptor | undefined => this._mcpGetServer(key),
+    /** List MCP tool descriptors for one registered server key. */
+    listTools: (key: string): HarnessMcpToolDescriptor[] | undefined => this._mcpListTools(key),
+  });
+
+  private _mcpListServers(): HarnessMcpServerDescriptor[] {
+    this._assertLive('mcp.listServers()');
+    return this._harness._listMcpServers().map(([key, server]) => this._projectMcpServer(key, server));
+  }
+
+  private _mcpGetServer(key: string): HarnessMcpServerDescriptor | undefined {
+    this._assertLive('mcp.getServer()');
+    this._assertMcpServerKey('mcp.getServer()', key);
+    const server = this._harness._getMcpServer(key);
+    return server ? this._projectMcpServer(key, server) : undefined;
+  }
+
+  private _mcpListTools(key: string): HarnessMcpToolDescriptor[] | undefined {
+    this._assertLive('mcp.listTools()');
+    this._assertMcpServerKey('mcp.listTools()', key);
+    const server = this._harness._getMcpServer(key);
+    if (!server) return undefined;
+    return Object.entries(server.tools()).map(([toolName, tool]) => {
+      const inputSchema = cloneMcpSchemaLike(tool.parameters);
+      const outputSchema = cloneMcpSchemaLike(tool.outputSchema);
+      const meta = cloneMcpCatalogRecord(tool.mcp?._meta);
+      return {
+        serverKey: key,
+        name: toolName,
+        ...(tool.description ? { description: tool.description } : {}),
+        ...(inputSchema !== undefined ? { inputSchema } : {}),
+        ...(outputSchema !== undefined ? { outputSchema } : {}),
+        ...(tool.mcp?.toolType ? { toolType: tool.mcp.toolType } : {}),
+        ...(meta ? { meta } : {}),
+        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+      };
+    });
+  }
+
+  private _assertMcpServerKey(method: string, key: unknown): asserts key is string {
+    if (typeof key !== 'string' || key.length === 0) {
+      throw new HarnessValidationError(method, 'key must be a non-empty string');
+    }
+  }
+
+  private _projectMcpServer(
+    key: string,
+    server: NonNullable<ReturnType<Harness['_getMcpServer']>>,
+  ): HarnessMcpServerDescriptor {
+    const repository = cloneMcpCatalogRecord(server.repository);
+    const packages = cloneMcpCatalogRecordArray(server.packages);
+    const remotes = cloneMcpCatalogRecordArray(server.remotes);
+    return {
+      key,
+      id: server.id,
+      name: server.name,
+      version: server.version,
+      ...(server.description ? { description: server.description } : {}),
+      ...(server.instructions ? { instructions: server.instructions } : {}),
+      releaseDate: server.releaseDate,
+      isLatest: server.isLatest,
+      ...(repository ? { repository } : {}),
+      ...(server.packageCanonical ? { packageCanonical: server.packageCanonical } : {}),
+      ...(packages ? { packages } : {}),
+      ...(remotes ? { remotes } : {}),
+    };
+  }
 
   private async _skillsList(): Promise<HarnessSkill[]> {
     this._assertLive('skills.list()');

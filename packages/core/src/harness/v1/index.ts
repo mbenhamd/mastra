@@ -121,6 +121,8 @@ export type {
   HarnessChannelRouteContext,
   HarnessChannelTransportRequest,
   HarnessConfig,
+  HarnessMcpServerDescriptor,
+  HarnessMcpToolDescriptor,
   HarnessMode,
   HarnessSkill,
   InboxResponseOptions,
