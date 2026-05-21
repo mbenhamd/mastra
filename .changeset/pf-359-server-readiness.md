@@ -2,7 +2,7 @@
 '@mastra/server': patch
 ---
 
-Updated `MastraServer.init()` to call `Mastra.init()` before route registration, delaying server request handling until Harness readiness completes.
+Server routes now wait for Harness and channel readiness before accepting traffic.
 
 ```ts
 const server = new MastraServer({ app, mastra });

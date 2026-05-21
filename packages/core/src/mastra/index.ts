@@ -1337,12 +1337,7 @@ export class Mastra<
       this.#ensureScheduler();
     }
 
-    // Initialize channels asynchronously (auto-provision apps, etc.).
-    // Harness-enabled servers await this promise in init() so channel-bound
-    // harnesses cannot accept traffic before channel providers are ready.
-    if (this.#channels) {
-      this.#startChannelInitialization();
-    }
+    // Channel initialization is deferred to init() so readiness owns startup side effects.
   }
 
   #startChannelInitialization(): void {
@@ -2074,7 +2069,9 @@ export class Mastra<
         };
       }
       this.#agentChannelInstances.set(String(agentKey), agentChannelsInstance);
-      this.#startAgentChannelInitialization(String(agentKey), agentChannelsInstance);
+      if (this.#lifecycleState === 'ready') {
+        this.#startAgentChannelInitialization(String(agentKey), agentChannelsInstance);
+      }
     }
   }
 
@@ -4294,6 +4291,10 @@ export class Mastra<
    * user-defined event listeners.
    */
   public async startWorkers(name?: string): Promise<void> {
+    if (this.#lifecycleState === 'constructed' || this.#lifecycleState === 'starting') {
+      await this.init();
+    }
+
     if (
       this.#shutdownStarted ||
       this.#lifecycleState === 'failed' ||

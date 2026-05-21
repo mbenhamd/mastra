@@ -120,6 +120,7 @@ describe('Mastra Channel Integration', () => {
         storage: new InMemoryStore(),
       });
 
+      expect(initialize).not.toHaveBeenCalled();
       await expect(mastra.init()).rejects.toThrow('agent channel readiness failed');
       await mastra.init();
 

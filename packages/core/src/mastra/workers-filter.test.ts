@@ -1339,6 +1339,44 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
     await expect(mastra.startWorkers()).rejects.toThrow('Mastra workers cannot be started after shutdown has started');
   });
 
+  it('waits for Harness readiness when workers are started before Mastra init completes', async () => {
+    const harness = new Harness({
+      modes: [],
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    });
+    let resolveHarnessInit!: () => void;
+    const harnessInit = vi.spyOn(harness, 'init').mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveHarnessInit = resolve;
+        }),
+    );
+    const worker = new ControllableWorker();
+    const mastra = new Mastra({
+      harness,
+      workers: [worker],
+      logger: false,
+    });
+
+    const starting = mastra.startWorkers();
+    await vi.waitFor(() => {
+      expect(harnessInit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(mastra.getLifecycleStatus()).toBe('starting');
+    expect(worker.initCalls).toBe(0);
+    expect(worker.startCalls).toBe(0);
+
+    resolveHarnessInit();
+    await starting;
+
+    expect(mastra.getLifecycleStatus()).toBe('ready');
+    expect(worker.initCalls).toBe(1);
+    expect(worker.startCalls).toBe(1);
+
+    await mastra.shutdown();
+  });
+
   it('keeps shutdown as a terminal lifecycle boundary when shutdown fails', async () => {
     const harness = new Harness({
       modes: [],
@@ -1500,6 +1538,7 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
       logger: false,
     });
 
+    expect(channel.initialize).not.toHaveBeenCalled();
     await expect(mastra.init()).rejects.toThrow('channel init failed');
     expect(mastra.getLifecycleStatus()).toBe('failed');
     expect(mastra.isHarnessReady()).toBe(false);
@@ -1522,6 +1561,7 @@ describe('Mastra workers filter (MASTRA_WORKERS env)', () => {
       logger: false,
     });
 
+    expect(initialize).not.toHaveBeenCalled();
     await expect(mastra.init()).rejects.toThrow('channel not ready');
     expect(mastra.getLifecycleStatus()).toBe('failed');
 
