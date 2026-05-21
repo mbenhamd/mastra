@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 import type { PermissionPolicy } from './types';
@@ -183,6 +184,10 @@ function resolveWorkspaceFileAction(
     return { status: 'denied', reason: 'workspace.path_outside_roots' };
   }
 
+  if (action.operation === 'rename' && action.toPath === undefined) {
+    return { status: 'denied', reason: 'workspace.target_path_required' };
+  }
+
   if (action.toPath === undefined) {
     return { status: 'allowed', path: resolvedPath };
   }
@@ -203,7 +208,18 @@ function resolveWorkspaceActionPath(
   const requestedPath = resolveWorkspacePath(roots, inputPath, rootId);
   if (!requestedPath) return null;
 
-  return resolveWorkspacePath(roots, requestedPath.normalizedPath) ?? requestedPath;
+  const canonicalPath = resolveWorkspacePath(roots, requestedPath.normalizedPath);
+  if (!canonicalPath) return requestedPath;
+
+  if (
+    rootId !== undefined &&
+    canonicalPath.root.id !== requestedPath.root.id &&
+    canonicalPath.root.path === requestedPath.root.path
+  ) {
+    return requestedPath;
+  }
+
+  return canonicalPath;
 }
 
 function resolveWorkspaceCommandRoot(
@@ -251,6 +267,7 @@ function resolveAgainstRoot(root: WorkspaceRootDescriptor, inputPath: string): W
     return { root: { ...root, path: normalizedRoot }, normalizedPath, relativePath: '.' };
   }
   if (isOutsideRelativePath(relativePath, pathApi)) return null;
+  if (escapesRootByRealpath(normalizedRoot, normalizedPath, pathApi)) return null;
 
   return { root: { ...root, path: normalizedRoot }, normalizedPath, relativePath };
 }
@@ -263,6 +280,43 @@ function normalizeAbsolutePath(value: string, pathApi: typeof path.posix | typeo
 
 function isOutsideRelativePath(relativePath: string, pathApi: typeof path.posix | typeof path.win32): boolean {
   return relativePath === '..' || relativePath.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(relativePath);
+}
+
+function escapesRootByRealpath(
+  normalizedRoot: string,
+  normalizedPath: string,
+  pathApi: typeof path.posix | typeof path.win32,
+): boolean {
+  const realRoot = realpathIfExists(normalizedRoot);
+  if (!realRoot) return false;
+
+  const nearestRealPath =
+    realpathIfExists(normalizedPath) ?? realpathIfExists(nearestExistingPath(normalizedPath, pathApi));
+  if (!nearestRealPath) return false;
+
+  const relativeRealPath = pathApi.relative(realRoot, nearestRealPath);
+  return isOutsideRelativePath(relativeRealPath, pathApi);
+}
+
+function realpathIfExists(value: string | null): string | null {
+  if (!value) return null;
+
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return null;
+  }
+}
+
+function nearestExistingPath(inputPath: string, pathApi: typeof path.posix | typeof path.win32): string | null {
+  let current = inputPath;
+
+  while (current !== pathApi.dirname(current)) {
+    if (fs.existsSync(current)) return current;
+    current = pathApi.dirname(current);
+  }
+
+  return fs.existsSync(current) ? current : null;
 }
 
 function pathFlavorFor(...values: string[]): 'posix' | 'win32' {
@@ -311,9 +365,9 @@ function ruleMatches(
 
   if (action.kind === 'network') {
     return (
-      matchesValue(rule.networkHost, action.host) &&
+      matchesNetworkHost(rule.networkHost, action.host) &&
       matchesValue(rule.networkPort, action.port) &&
-      matchesValue(rule.networkProtocol, action.protocol) &&
+      matchesNetworkProtocol(rule.networkProtocol, action.protocol) &&
       rule.command === undefined &&
       rule.mcpServerId === undefined &&
       rule.mcpToolName === undefined
@@ -344,6 +398,37 @@ function matchesAnyValue<T extends string>(
 ): boolean {
   if (expected === undefined) return true;
   return actualValues.some(actual => matchesValue(expected, actual));
+}
+
+function matchesNetworkHost(expected: string | readonly string[] | undefined, actual: string | undefined): boolean {
+  return matchesValue(normalizeExpectedStringSelector(expected, normalizeNetworkHost), normalizeNetworkHost(actual));
+}
+
+function matchesNetworkProtocol(expected: string | readonly string[] | undefined, actual: string | undefined): boolean {
+  return matchesValue(
+    normalizeExpectedStringSelector(expected, normalizeNetworkProtocol),
+    normalizeNetworkProtocol(actual),
+  );
+}
+
+function normalizeExpectedStringSelector(
+  expected: string | readonly string[] | undefined,
+  normalize: (value: string | undefined) => string | undefined,
+): string | readonly string[] | undefined {
+  if (expected === undefined) return undefined;
+  if (Array.isArray(expected)) {
+    return expected.map(value => normalize(value) ?? value);
+  }
+  if (typeof expected !== 'string') return expected;
+  return normalize(expected) ?? expected;
+}
+
+function normalizeNetworkHost(value: string | undefined): string | undefined {
+  return value?.toLowerCase();
+}
+
+function normalizeNetworkProtocol(value: string | undefined): string | undefined {
+  return value?.replace(/:$/, '').toLowerCase();
 }
 
 function matchesFileRootSelector(rule: WorkspacePolicyRule, rootIds: readonly (string | undefined)[]): boolean {

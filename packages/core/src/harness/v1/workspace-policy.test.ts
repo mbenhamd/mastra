@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { evaluateWorkspacePolicy, resolveWorkspacePath } from './workspace-policy';
@@ -102,6 +106,18 @@ describe('workspace policy evaluator', () => {
     });
   });
 
+  it('denies rename actions that omit the target path', () => {
+    const evaluation = evaluateWorkspacePolicy(
+      { roots, defaultDecision: 'allow' },
+      { kind: 'file', operation: 'rename', path: 'src/index.ts', rootId: 'project' },
+    );
+
+    expect(evaluation).toMatchObject({
+      decision: 'deny',
+      reasons: ['workspace.target_path_required'],
+    });
+  });
+
   it('denies mutating operations inside read-only roots before rules are applied', () => {
     const evaluation = evaluateWorkspacePolicy(
       {
@@ -149,6 +165,24 @@ describe('workspace policy evaluator', () => {
       reasons: ['workspace.default_allow'],
       path: { root: { id: 'project' } },
       toPath: { root: { id: 'scratch' } },
+    });
+  });
+
+  it('preserves an explicitly selected root id when another root shares the same path', () => {
+    const duplicatePathRoots = [
+      { id: 'writable', path: '/workspace/project', writable: true },
+      { id: 'readonly', path: '/workspace/project', writable: false },
+    ] satisfies WorkspacePolicy['roots'];
+
+    const evaluation = evaluateWorkspacePolicy(
+      { roots: duplicatePathRoots, defaultDecision: 'allow' },
+      { kind: 'file', operation: 'write', path: 'notes.md', rootId: 'readonly' },
+    );
+
+    expect(evaluation).toMatchObject({
+      decision: 'deny',
+      reasons: ['workspace.root_readonly:readonly'],
+      path: { root: { id: 'readonly' } },
     });
   });
 
@@ -294,7 +328,7 @@ describe('workspace policy evaluator', () => {
       matchedRules: [{ id: 'pnpm' }],
     });
     expect(
-      evaluateWorkspacePolicy(policy, { kind: 'network', host: 'api.example.test', port: 443, protocol: 'https' }),
+      evaluateWorkspacePolicy(policy, { kind: 'network', host: 'API.EXAMPLE.TEST', port: 443, protocol: 'https:' }),
     ).toMatchObject({
       decision: 'ask',
       matchedRules: [{ id: 'api' }],
@@ -317,6 +351,30 @@ describe('workspace policy evaluator', () => {
       decision: 'deny',
       matchedRules: [],
     });
+  });
+
+  it('denies paths that escape a workspace root through an existing symlink', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mastra-workspace-policy-'));
+    const rootDir = path.join(tempDir, 'root');
+    const outsideDir = path.join(tempDir, 'outside');
+
+    try {
+      fs.mkdirSync(rootDir);
+      fs.mkdirSync(outsideDir);
+      fs.symlinkSync(outsideDir, path.join(rootDir, 'linked-outside'), 'dir');
+
+      const evaluation = evaluateWorkspacePolicy(
+        { roots: [{ id: 'project', path: rootDir, writable: true }], defaultDecision: 'allow' },
+        { kind: 'file', operation: 'write', path: 'linked-outside/created.txt', rootId: 'project' },
+      );
+
+      expect(evaluation).toMatchObject({
+        decision: 'deny',
+        reasons: ['workspace.path_outside_roots'],
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('contains command cwd and lets command rules target the cwd root', () => {
