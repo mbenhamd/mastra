@@ -228,5 +228,7 @@ describe('Session MCP catalog (PF-562)', () => {
 
     expect(() => session.mcp.getServer('')).toThrow(HarnessValidationError);
     expect(() => session.mcp.listTools('')).toThrow(HarnessValidationError);
+    expect(() => session.mcp.getServer('__proto__')).toThrow(HarnessValidationError);
+    expect(() => session.mcp.listTools('constructor')).toThrow(HarnessValidationError);
   });
 });

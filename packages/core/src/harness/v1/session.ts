@@ -185,6 +185,7 @@ const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
   'items',
   'additionalProperties',
 ]);
+const RESERVED_MCP_SERVER_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function cloneMcpCatalogValue(value: unknown): unknown | undefined {
   if (value === undefined) return undefined;
@@ -1405,6 +1406,9 @@ export class Session {
   private _assertMcpServerKey(method: string, key: unknown): asserts key is string {
     if (typeof key !== 'string' || key.length === 0) {
       throw new HarnessValidationError(method, 'key must be a non-empty string');
+    }
+    if (RESERVED_MCP_SERVER_KEYS.has(key)) {
+      throw new HarnessValidationError(method, 'key must not be a reserved object property name');
     }
   }
 
