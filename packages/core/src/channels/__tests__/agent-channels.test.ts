@@ -64,6 +64,20 @@ describe('AgentChannels', () => {
       expect(Object.keys(agentChannels.adapters)).toEqual(['discord', 'slack']);
     });
 
+    it('exposes the original channel config for provider rebuilds', () => {
+      expect(agentChannels.channelConfig.adapters).toBeDefined();
+      expect(Object.keys(agentChannels.channelConfig.adapters)).toEqual(['discord', 'slack']);
+    });
+
+    it('allows providers to close before replacing the instance', () => {
+      (agentChannels as any).chat = { webhooks: {} };
+      (agentChannels as any).initPromise = Promise.resolve();
+
+      expect(() => agentChannels.close()).not.toThrow();
+      expect(agentChannels.sdk).toBeNull();
+      expect((agentChannels as any).initPromise).toBeNull();
+    });
+
     it('returns a specific adapter by key', () => {
       const adapter = agentChannels.adapters['discord'];
       expect(adapter).toBeDefined();

@@ -346,6 +346,11 @@ async function headContentType(url: string, logger?: IMastraLogger): Promise<str
  */
 export class AgentChannels {
   readonly adapters: Record<string, Adapter>;
+  /**
+   * The original channel configuration. Channel providers use this to rebuild
+   * an AgentChannels instance without dropping author-configured adapters.
+   */
+  public readonly channelConfig: ChannelConfig;
   private chat: Chat | null = null;
   /** Stored initialization promise so webhook handlers can await readiness on serverless cold starts. */
   private initPromise: Promise<void> | null = null;
@@ -399,6 +404,7 @@ export class AgentChannels {
     this.shouldInline = buildInlineMediaCheck(config.inlineMedia);
     this.inlineLinkRules = normalizeInlineLinks(config.inlineLinks);
     this.toolsEnabled = config.tools !== false;
+    this.channelConfig = config;
     this.channelToolNames = new Set(Object.keys(this.getTools()));
   }
 
@@ -844,6 +850,16 @@ export class AgentChannels {
   getTools(): Record<string, unknown> {
     if (!this.toolsEnabled) return {};
     return this.makeChannelTools();
+  }
+
+  /**
+   * Close resources owned by AgentChannels. The fork's channel runtime does not
+   * currently hold long-lived subscriptions here, but providers still call this
+   * before replacing an instance.
+   */
+  close(): void {
+    this.initPromise = null;
+    this.chat = null;
   }
 
   // ---------------------------------------------------------------------------

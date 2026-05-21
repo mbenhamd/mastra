@@ -10,6 +10,8 @@ export interface BuildManifest {
 
 const MANIFEST_FILENAME = 'build-manifest.json';
 const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock'] as const;
+const SOURCE_FILE_GLOB = '**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}';
+const TEST_FILE_GLOB = '**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs,cts,cjs}';
 
 /**
  * Recursively collects all files matching the given patterns.
@@ -20,7 +22,7 @@ async function collectFiles(rootDir: string, patterns: string[]): Promise<string
     absolute: true,
     expandDirectories: false,
   });
-  return files.sort(); // Deterministic order
+  return Array.from(new Set(files)).sort(); // Deterministic order
 }
 
 /**
@@ -75,6 +77,31 @@ async function getWorkspaceRootLockfiles(projectDir: string): Promise<string[]> 
 }
 
 /**
+ * Gets workspace package sources that can be bundled through local workspace
+ * imports. This intentionally stays scoped to conventional package source
+ * roots rather than hashing the entire monorepo.
+ */
+async function getWorkspaceRootSourceFiles(projectDir: string): Promise<string[]> {
+  const workspaceRoot = await findWorkspaceRoot(projectDir);
+
+  if (!workspaceRoot) {
+    return [];
+  }
+
+  const files = await collectFiles(workspaceRoot, [
+    `packages/*/src/${SOURCE_FILE_GLOB}`,
+    'packages/*/package.json',
+    `!packages/*/src/${TEST_FILE_GLOB}`,
+    '!packages/*/src/**/__tests__/**',
+  ]);
+
+  return files.filter(filePath => {
+    const relToProject = relative(projectDir, filePath);
+    return relToProject.startsWith('..') || relToProject === '' || relToProject.startsWith('/');
+  });
+}
+
+/**
  * Computes a SHA-256 hash of a file's contents.
  */
 async function hashFile(filePath: string): Promise<string> {
@@ -99,10 +126,14 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
 
   // Patterns for source files to hash
   const patterns = [
-    // All TypeScript/JavaScript files in the mastra directory
-    posix.join(normalizedMastraDir, '**/*.{ts,js,mts,mjs,cts,cjs}'),
+    // Project source files that can be imported by the Mastra entrypoint.
+    `src/${SOURCE_FILE_GLOB}`,
+    // The Mastra directory may be customized outside the conventional src tree.
+    posix.join(normalizedMastraDir, SOURCE_FILE_GLOB),
     // Exclude test files
-    `!${posix.join(normalizedMastraDir, '**/*.{test,spec}.{ts,js,mts,mjs}')}`,
+    `!src/${TEST_FILE_GLOB}`,
+    '!src/**/__tests__/**',
+    `!${posix.join(normalizedMastraDir, TEST_FILE_GLOB)}`,
     `!${posix.join(normalizedMastraDir, '**/__tests__/**')}`,
     // Package files that affect the build
     'package.json',
@@ -116,7 +147,9 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
   const files = await collectFiles(rootDir, patterns);
 
   // Also check for workspace root lockfiles (monorepo support)
+  const workspaceRoot = await findWorkspaceRoot(rootDir);
   const workspaceRootLockfiles = await getWorkspaceRootLockfiles(rootDir);
+  const workspaceRootSourceFiles = await getWorkspaceRootSourceFiles(rootDir);
 
   // Create a hash of all file hashes combined with their paths
   const masterHash = createHash('sha256');
@@ -135,6 +168,15 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
     // Use just the lockfile name to ensure determinism across machines
     const lockfileName = lockfilePath.split(/[/\\]/).pop()!;
     masterHash.update(`[workspace-root]${lockfileName}:${fileHash}\n`);
+  }
+
+  // Hash workspace package sources that may be bundled via local imports.
+  for (const filePath of workspaceRootSourceFiles) {
+    const fileHash = await hashFile(filePath);
+    const relPath = workspaceRoot
+      ? relative(workspaceRoot, filePath).split('\\').join('/')
+      : relative(rootDir, filePath);
+    masterHash.update(`[workspace-root]${relPath}:${fileHash}\n`);
   }
 
   return `sha256:${masterHash.digest('hex')}`;
