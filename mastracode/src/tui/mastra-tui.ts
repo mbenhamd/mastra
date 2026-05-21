@@ -544,7 +544,9 @@ export class MastraTUI {
       await this.showOnboarding();
     }
 
-    await this.showQuietModePreferencePromptIfNeeded();
+    if (process.stdin.isTTY && !this.state.options.initialMessage) {
+      await this.showQuietModePreferencePromptIfNeeded();
+    }
 
     // Check for updates after first render so network latency never blocks startup.
     void this.checkForUpdate().catch(() => {});

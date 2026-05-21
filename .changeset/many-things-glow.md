@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed trajectory scorers so tool calls stored only in V2 content.parts are included in extracted eval steps.
+Fixed agent evaluation to correctly include all tool calls when extracting evaluation steps. Previously, some tool calls were missing from trajectory analysis, which could skew evaluation results.

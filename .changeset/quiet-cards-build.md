@@ -2,4 +2,4 @@
 '@internal/playground': patch
 ---
 
-Fixed Studio typecheck compatibility for sidebar links and dataset comparison selects.
+Fixed TypeScript errors in Studio sidebar links and dataset comparison dropdowns.

@@ -251,7 +251,13 @@ export class MastraStorageExporter extends BaseExporter {
       ...(error === undefined ? {} : { error: this.sanitizeDropError(error) }),
     };
 
-    this.#emitDropEvent?.(dropEvent);
+    try {
+      this.#emitDropEvent?.(dropEvent);
+    } catch (error) {
+      this.logger.warn('emitDropEvent callback failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
