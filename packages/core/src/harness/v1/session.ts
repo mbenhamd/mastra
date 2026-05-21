@@ -199,15 +199,21 @@ function cloneMcpCatalogValue(value: unknown): unknown | undefined {
   }
 }
 
+function isPlainMcpCatalogObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (Object.prototype.toString.call(value) !== '[object Object]') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 function cloneMcpCatalogRecord(value: unknown): Record<string, unknown> | undefined {
   const cloned = cloneMcpCatalogValue(value);
-  if (!cloned || typeof cloned !== 'object' || Array.isArray(cloned)) return undefined;
-  return cloned as Record<string, unknown>;
+  return isPlainMcpCatalogObject(cloned) ? cloned : undefined;
 }
 
 function cloneMcpCatalogRecordArray(value: unknown): readonly Record<string, unknown>[] | undefined {
   const cloned = cloneMcpCatalogValue(value);
-  if (!Array.isArray(cloned) || cloned.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+  if (!Array.isArray(cloned) || cloned.some(item => !isPlainMcpCatalogObject(item))) {
     return undefined;
   }
   return cloned as Record<string, unknown>[];
