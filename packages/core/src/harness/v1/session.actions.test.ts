@@ -591,11 +591,19 @@ describe('Session action catalog (PF-576)', () => {
       version: '1.0.0',
       tools: { search_files: makeTool() },
     });
+    let createCalls = 0;
+    let resumeCalls = 0;
     const provider: WorkspaceProvider = {
       providerId: 'slow-workspace-actions',
       resumable: true,
-      create: async () => new Promise<Workspace>(() => {}),
-      resume: async () => new Promise<Workspace>(() => {}),
+      create: async () => {
+        createCalls++;
+        return new Promise<Workspace>(() => {});
+      },
+      resume: async () => {
+        resumeCalls++;
+        return new Promise<Workspace>(() => {});
+      },
     };
     const harness = new Harness({
       modes: [{ id: 'default', agentId: 'default' }],
@@ -611,19 +619,19 @@ describe('Session action catalog (PF-576)', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    const startedAt = Date.now();
     await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
       { id: 'mcp-tool:workspace:search_files' },
     ]);
-    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(server.toolListCallCount).toBe(1);
+    expect(createCalls).toBe(0);
+    expect(resumeCalls).toBe(0);
 
-    const cachedStartedAt = Date.now();
     await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
       { id: 'mcp-tool:workspace:search_files' },
     ]);
-    expect(Date.now() - cachedStartedAt).toBeLessThan(500);
     expect(server.toolListCallCount).toBe(1);
+    expect(createCalls).toBe(0);
+    expect(resumeCalls).toBe(0);
   });
 
   it('does not repopulate MCP action caches from discovery cleared by refresh', async () => {
