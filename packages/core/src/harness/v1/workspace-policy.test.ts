@@ -61,6 +61,16 @@ describe('workspace policy evaluator', () => {
     });
   });
 
+  it('keeps backslashes as literal path characters for POSIX roots', () => {
+    const resolved = resolveWorkspacePath(roots, '..\\secret.txt', 'project');
+
+    expect(resolved).toMatchObject({
+      root: { id: 'project' },
+      normalizedPath: '/workspace/project/..\\secret.txt',
+      relativePath: '..\\secret.txt',
+    });
+  });
+
   it('keeps lexical path containment segment-aware', () => {
     const resolved = resolveWorkspacePath(
       [{ id: 'project', path: '/workspace/project' }],
