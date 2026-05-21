@@ -7,6 +7,10 @@ export interface SeededDataset {
   itemIds: string[];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 /**
  * Creates a dataset with items via the Studio API.
  * Returns dataset ID, name, and item IDs.
@@ -25,7 +29,11 @@ export const seedDatasetWithItems = async (
     throw new Error(`Failed to create dataset: ${datasetRes.status} ${datasetRes.statusText}`);
   }
 
-  const dataset = (await datasetRes.json()) as { id: string };
+  const datasetBody: unknown = await datasetRes.json();
+  if (!isRecord(datasetBody) || typeof datasetBody.id !== 'string') {
+    throw new Error('Dataset response missing id field');
+  }
+  const dataset = { id: datasetBody.id };
 
   const items = Array.from({ length: itemCount }, (_, i) => ({
     input: `Test input ${i + 1}`,
@@ -42,7 +50,15 @@ export const seedDatasetWithItems = async (
     throw new Error(`Failed to add items: ${itemsRes.status} ${itemsRes.statusText}`);
   }
 
-  const itemsData = (await itemsRes.json()) as { items: { id: string }[] };
+  const itemsBody: unknown = await itemsRes.json();
+  if (
+    !isRecord(itemsBody) ||
+    !Array.isArray(itemsBody.items) ||
+    !itemsBody.items.every(item => isRecord(item) && typeof item.id === 'string')
+  ) {
+    throw new Error('Items response missing items array with id fields');
+  }
+  const itemsData = { items: itemsBody.items };
 
   return {
     id: dataset.id,
