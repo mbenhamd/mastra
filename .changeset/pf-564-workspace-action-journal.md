@@ -23,4 +23,4 @@ await storage.appendWorkspaceActionJournalEntry({
 });
 ```
 
-LibSQL and Postgres adapters can now return ordered journal pages for reconnectable desktop audit views.
+Improved: LibSQL and Postgres adapters now return ordered journal pages for reconnectable desktop audit views.
