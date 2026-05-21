@@ -354,6 +354,8 @@ export class AgentChannels {
   private chat: Chat | null = null;
   /** Stored initialization promise so webhook handlers can await readiness on serverless cold starts. */
   private initPromise: Promise<void> | null = null;
+  /** Incremented when the lifecycle is closed so stale async initialization cannot resurrect chat. */
+  private lifecycleGeneration = 0;
   private agent!: Agent<any, any, any, any>;
   private logger?: IMastraLogger;
   private customState: StateAdapter | undefined;
@@ -483,6 +485,7 @@ export class AgentChannels {
       return this.initPromise;
     }
 
+    const generation = this.lifecycleGeneration;
     this.initPromise = (async () => {
       // Resolve state adapter: custom > Mastra storage > in-memory fallback
       if (this.customState) {
@@ -696,6 +699,9 @@ export class AgentChannels {
         }
       });
       await chat.initialize();
+      if (generation !== this.lifecycleGeneration) {
+        return;
+      }
       this.chat = chat;
 
       // Start gateway listeners for adapters that support it (e.g. Discord)
@@ -717,7 +723,9 @@ export class AgentChannels {
     try {
       await this.initPromise;
     } catch (error) {
-      this.initPromise = null;
+      if (generation === this.lifecycleGeneration) {
+        this.initPromise = null;
+      }
       throw error;
     }
   }
@@ -858,6 +866,7 @@ export class AgentChannels {
    * before replacing an instance.
    */
   close(): void {
+    this.lifecycleGeneration += 1;
     this.initPromise = null;
     this.chat = null;
   }

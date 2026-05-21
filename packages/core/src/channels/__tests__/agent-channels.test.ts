@@ -72,10 +72,12 @@ describe('AgentChannels', () => {
     it('allows providers to close before replacing the instance', () => {
       (agentChannels as any).chat = { webhooks: {} };
       (agentChannels as any).initPromise = Promise.resolve();
+      const generation = (agentChannels as any).lifecycleGeneration;
 
       expect(() => agentChannels.close()).not.toThrow();
       expect(agentChannels.sdk).toBeNull();
       expect((agentChannels as any).initPromise).toBeNull();
+      expect((agentChannels as any).lifecycleGeneration).toBe(generation + 1);
     });
 
     it('returns a specific adapter by key', () => {
