@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, unlink, utimes, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -184,6 +184,46 @@ describe('UnixSocketPubSub', () => {
     const cb = vi.fn();
     await pubsub.subscribe('topic-a', cb);
     await pubsub.publish('topic-a', makeEvent({ type: 'reclaimed' }));
+
+    expect(pubsub.isBroker).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries broker election after removing a stale election lock', async () => {
+    const path = await socketPath();
+    const lockPath = `${path}.elect`;
+    await writeFile(path, 'stale');
+    await writeFile(lockPath, 'stale-lock');
+    const oldDate = new Date(Date.now() - 3000);
+    await utimes(lockPath, oldDate, oldDate);
+
+    const pubsub = new UnixSocketPubSub(path);
+    pubsubs.push(pubsub);
+    const cb = vi.fn();
+
+    await pubsub.subscribe('topic-a', cb);
+    await pubsub.publish('topic-a', makeEvent({ type: 'after-stale-lock' }));
+
+    expect(pubsub.isBroker).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for an active election lock instead of surfacing startup contention', async () => {
+    const path = await socketPath();
+    const lockPath = `${path}.elect`;
+    await writeFile(path, 'stale');
+    await writeFile(lockPath, 'active-lock');
+
+    const pubsub = new UnixSocketPubSub(path);
+    pubsubs.push(pubsub);
+    const cb = vi.fn();
+    const subscribePromise = pubsub.subscribe('topic-a', cb);
+
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await unlink(lockPath);
+
+    await subscribePromise;
+    await pubsub.publish('topic-a', makeEvent({ type: 'after-active-lock' }));
 
     expect(pubsub.isBroker).toBe(true);
     expect(cb).toHaveBeenCalledTimes(1);

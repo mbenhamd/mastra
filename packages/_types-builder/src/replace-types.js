@@ -39,6 +39,13 @@ function matchesBundledPackage(moduleSpecifier, bundledPackage) {
   return packageName === bundledPackage || getTypesPackageName(packageName) === bundledPackage;
 }
 
+function declarationPathToRuntimeSpecifier(declarationPath) {
+  return declarationPath
+    .replace(/\.d\.mts$/, '.mjs')
+    .replace(/\.d\.cts$/, '.cjs')
+    .replace(/\.d\.ts$/, '.js');
+}
+
 async function getPackageRootPath(packageName, parentPath) {
   let rootPath;
 
@@ -242,7 +249,7 @@ async function replaceBundledReferences(file, rootDir, bundledPackages, visited,
 
     await copyDeclarationGraph(sourceTypesPath, sourcePkgRootPath, destTypesRoot, rootDir, bundledPackages, visited);
 
-    let relativeImport = relative(fileDirname, destTypesPath);
+    let relativeImport = relative(fileDirname, declarationPathToRuntimeSpecifier(destTypesPath));
     if (!relativeImport.startsWith('.')) {
       relativeImport = './' + relativeImport;
     }

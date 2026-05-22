@@ -339,46 +339,65 @@ export class UnixSocketPubSub extends PubSub {
    */
   async #electBroker(): Promise<void> {
     const lockPath = this.socketPath + '.elect';
-    let lockFd: FileHandle | undefined;
-    try {
-      lockFd = await open(lockPath, 'wx');
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-        if (await this.#isElectionLockStale(lockPath)) {
-          await unlink(lockPath).catch(() => {});
-          throw new Error('Stale broker election lock removed');
+    while (!this.#closed) {
+      let lockFd: FileHandle | undefined;
+      try {
+        lockFd = await open(lockPath, 'wx');
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+          if (await this.#isElectionLockStale(lockPath)) {
+            try {
+              await unlink(lockPath);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
+              }
+            }
+            continue;
+          }
+          await new Promise(resolve => setTimeout(resolve, 150));
+          try {
+            await this.#connectClient();
+            this.#throwIfClosed();
+            return;
+          } catch (error) {
+            if (!this.#isBrokerConnectRetryable(error)) {
+              throw error;
+            }
+            continue;
+          }
         }
-        await new Promise(resolve => setTimeout(resolve, 150));
+        throw e;
+      }
+
+      try {
+        // Re-check: a previous election round may have installed a broker
+        // between our initial connectClient() and acquiring this lock.
         try {
           await this.#connectClient();
           this.#throwIfClosed();
           return;
         } catch {
-          throw new Error('Broker election in progress by another process');
+          // Still no live broker — proceed with election.
         }
+        await unlink(this.socketPath).catch(() => {});
+        this.#throwIfClosed();
+        await this.#listen();
+        this.#throwIfClosed();
+        this.#isBroker = true;
+        return;
+      } finally {
+        await lockFd.close().catch(() => {});
+        await unlink(lockPath).catch(() => {});
       }
-      throw e;
     }
 
-    try {
-      // Re-check: a previous election round may have installed a broker
-      // between our initial connectClient() and acquiring this lock.
-      try {
-        await this.#connectClient();
-        this.#throwIfClosed();
-        return;
-      } catch {
-        // Still no live broker — proceed with election.
-      }
-      await unlink(this.socketPath).catch(() => {});
-      this.#throwIfClosed();
-      await this.#listen();
-      this.#throwIfClosed();
-      this.#isBroker = true;
-    } finally {
-      await lockFd.close().catch(() => {});
-      await unlink(lockPath).catch(() => {});
-    }
+    throw new Error('UnixSocketPubSub is closed');
+  }
+
+  #isBrokerConnectRetryable(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ECONNREFUSED' || code === 'ENOENT' || code === 'ENOTSOCK';
   }
 
   async #isElectionLockStale(lockPath: string): Promise<boolean> {
