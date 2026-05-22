@@ -1727,7 +1727,14 @@ export class Session {
     const build = async (): Promise<HarnessActionCatalogEntry[]> => {
       const codeSkills = this._harness._listCodeSkills();
       const entries: ActionCatalogSkillDescriptor[] = [...codeSkills];
-      const workspace = await this.getWorkspace();
+      let workspace: Workspace | undefined;
+      try {
+        workspace = await this.getWorkspace();
+      } catch (error) {
+        if (!(error instanceof HarnessWorkspaceLostError)) {
+          throw error;
+        }
+      }
       const workspaceSkills = workspace?.skills;
       if (workspaceSkills) {
         const workspaceEntries = await workspaceSkills.list();

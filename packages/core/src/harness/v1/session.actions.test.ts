@@ -19,7 +19,7 @@ import { InMemoryStore } from '../../storage/mock';
 import type { InternalCoreTool, MCPToolType } from '../../tools';
 import type { Workspace } from '../../workspace';
 
-import { HarnessSessionClosedError, HarnessValidationError } from './errors';
+import { HarnessSessionClosedError, HarnessValidationError, HarnessWorkspaceLostError } from './errors';
 import { Harness } from './harness';
 import type { WorkspaceProvider } from './workspace-provider';
 
@@ -528,6 +528,34 @@ describe('Session action catalog (PF-576)', () => {
       { name: 'new-workspace-action' },
     ]);
     expect(skills.refreshCallCount).toBe(1);
+  });
+
+  it('keeps code-registered actions listable when a per-session workspace is lost', async () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      workspace: { kind: 'per-session', provider: makeWorkspaceSkillsProvider(new FakeWorkspaceSkills([])) },
+      skills: [
+        {
+          name: 'code-action',
+          description: 'Code action',
+          instructions: 'Run code action.',
+          action: { displayName: 'Code action' },
+        },
+      ],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    session._markWorkspaceLost();
+
+    await expect(session.getWorkspace()).rejects.toBeInstanceOf(HarnessWorkspaceLostError);
+    await expect(session.actions.list({ source: 'skill' })).resolves.toMatchObject([
+      {
+        id: 'skill:code-action',
+        source: { kind: 'skill', skillName: 'code-action' },
+        label: 'Code action',
+      },
+    ]);
   });
 
   it('caches successful MCP action entries and negative-caches failing MCP servers', async () => {
