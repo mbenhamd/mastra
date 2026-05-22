@@ -6,7 +6,7 @@
  * or manage MCP lifecycle/auth.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
@@ -124,6 +124,14 @@ class FlakyMcpServer extends MockMcpServer {
       throw new Error('temporary mcp unavailable');
     }
     return super.getToolListInfo(requestContext);
+  }
+}
+
+class HangingMcpServer extends MockMcpServer {
+  getToolListInfo(requestContext?: RequestContext) {
+    this.toolListCallCount++;
+    this.lastToolListRequestContext = requestContext;
+    return new Promise<ReturnType<MockMcpServer['getToolListInfo']>>(() => {});
   }
 }
 
@@ -555,6 +563,45 @@ describe('Session action catalog (PF-576)', () => {
     ]);
     expect(healthy.toolListCallCount).toBe(1);
     expect(failing.toolListCallCount).toBe(1);
+  });
+
+  it('times out hung MCP action discovery and rechecks after the failure cache expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const hanging = new HangingMcpServer({
+        id: 'hanging',
+        name: 'Hanging',
+        version: '1.0.0',
+        tools: { search_files: makeTool() },
+      });
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        mcpServers: { hanging },
+        harness,
+      });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      const first = session.actions.list({ source: 'mcp-tool' });
+      await vi.waitFor(() => expect(hanging.toolListCallCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(first).resolves.toEqual([]);
+
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toEqual([]);
+      expect(hanging.toolListCallCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      const afterTtl = session.actions.list({ source: 'mcp-tool' });
+      await vi.waitFor(() => expect(hanging.toolListCallCount).toBe(2));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(afterTtl).resolves.toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('uses the resolved workspace identity for MCP action cache keys when available', async () => {

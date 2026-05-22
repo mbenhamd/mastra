@@ -4,7 +4,7 @@
 
 Added: Harness sessions now expose a read-only `actions` catalog that aggregates skill action metadata and MCP tool descriptors for desktop command palettes without adding execution or lifecycle controls.
 
-MCP action discovery uses workspace-scoped cache keys when a workspace is already available, and MCP action reads do not provision a workspace just to build the catalog.
+MCP action discovery uses workspace-scoped cache keys when a workspace is already available, and MCP-only action reads do not provision a workspace just to build the catalog.
 
 ```ts
 const actions = await session.actions.list({ query: 'ticket', limit: 20 });
