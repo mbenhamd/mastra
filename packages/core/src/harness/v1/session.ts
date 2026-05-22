@@ -336,13 +336,20 @@ function cloneActionMetadataLike(value: unknown): HarnessSkillActionMetadata | u
   };
 }
 
+class ActionCatalogMcpListTimeoutError extends Error {
+  constructor() {
+    super(`MCP tool catalog did not resolve within ${ACTION_CATALOG_MCP_LIST_TIMEOUT_MS}ms`);
+    this.name = 'ActionCatalogMcpListTimeoutError';
+  }
+}
+
 function withActionCatalogMcpListTimeout<T>(run: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutError = new Error(`MCP tool catalog did not resolve within ${ACTION_CATALOG_MCP_LIST_TIMEOUT_MS}ms`);
   const work = run(controller.signal);
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      const timeoutError = new ActionCatalogMcpListTimeoutError();
       controller.abort(timeoutError);
       reject(timeoutError);
     }, ACTION_CATALOG_MCP_LIST_TIMEOUT_MS);
@@ -1883,12 +1890,14 @@ export class Session {
       this._startMcpActionCatalogEntriesForServer(server, cacheKey);
     try {
       return await pending;
-    } catch {
+    } catch (error) {
       const entries: HarnessActionCatalogEntry[] = [];
       if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
         this._actionsMcpEntriesCacheByServer.set(cacheKey, {
           entries,
-          expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+          ...(error instanceof ActionCatalogMcpListTimeoutError
+            ? {}
+            : { expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS }),
         });
         this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
       }

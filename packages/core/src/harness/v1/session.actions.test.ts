@@ -593,7 +593,7 @@ describe('Session action catalog (PF-576)', () => {
     expect(failing.toolListCallCount).toBe(1);
   });
 
-  it('times out hung MCP action discovery and rechecks after the failure cache expires', async () => {
+  it('times out hung MCP action discovery and requires refresh before retrying', async () => {
     vi.useFakeTimers();
     try {
       const hanging = new HangingMcpServer({
@@ -623,10 +623,14 @@ describe('Session action catalog (PF-576)', () => {
       expect(hanging.toolListCallCount).toBe(1);
 
       await vi.advanceTimersByTimeAsync(5_001);
-      const afterTtl = session.actions.list({ source: 'mcp-tool' });
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toEqual([]);
+      expect(hanging.toolListCallCount).toBe(1);
+
+      await session.actions.refresh();
+      const afterRefresh = session.actions.list({ source: 'mcp-tool' });
       await vi.waitFor(() => expect(hanging.toolListCallCount).toBe(2));
       await vi.advanceTimersByTimeAsync(2_000);
-      await expect(afterTtl).resolves.toEqual([]);
+      await expect(afterRefresh).resolves.toEqual([]);
     } finally {
       vi.useRealTimers();
     }
