@@ -74116,7 +74116,6 @@ export type PatchStoredWorkspacesStoredWorkspaceId_PathParams = {
 };
 
 export type PatchStoredWorkspacesStoredWorkspaceId_Body = {
-  authorId?: (string | undefined) | undefined;
   metadata?:
     | (
         | {
