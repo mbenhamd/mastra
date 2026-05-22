@@ -84,6 +84,32 @@ describe('source-hash', () => {
       expect(hash1).not.toBe(hash2);
     });
 
+    it('should include TSX and JSX source files under the mastra directory', async () => {
+      await writeFileSynced(join(mastraDir, 'index.ts'), 'export const mastra = {}');
+      await writeFileSynced(join(testDir, 'package.json'), '{"name": "test"}');
+
+      const hash1 = await computeSourceHash(testDir, mastraDir);
+
+      await writeFileSynced(join(mastraDir, 'component.tsx'), 'export const Component = () => null');
+      await writeFileSynced(join(mastraDir, 'view.jsx'), 'export const View = () => null');
+
+      const hash2 = await computeSourceHash(testDir, mastraDir);
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it('should include source files outside the mastra directory', async () => {
+      await writeFileSynced(join(mastraDir, 'index.ts'), 'export const mastra = {}');
+      await writeFileSynced(join(testDir, 'src', 'shared.ts'), 'export const shared = 1');
+      await writeFileSynced(join(testDir, 'package.json'), '{"name": "test"}');
+
+      const hash1 = await computeSourceHash(testDir, mastraDir);
+
+      await writeFileSynced(join(testDir, 'src', 'shared.ts'), 'export const shared = 2');
+
+      const hash2 = await computeSourceHash(testDir, mastraDir);
+      expect(hash1).not.toBe(hash2);
+    });
+
     it('should exclude test files from hash', async () => {
       await writeFileSynced(join(mastraDir, 'index.ts'), 'export const mastra = {}');
       await writeFileSynced(join(testDir, 'package.json'), '{"name": "test"}');
@@ -116,6 +142,29 @@ describe('source-hash', () => {
       const hash2 = await computeSourceHash(projectDir, projectMastraDir);
 
       expect(hash1).not.toBe(hash2);
+
+      await rm(workspaceRoot, { recursive: true, force: true });
+    });
+
+    it('should skip parent workspace lockfiles when the project has its own lockfile', async () => {
+      const workspaceRoot = await mkdtemp(join(TEST_TMP_ROOT, 'workspace-root-test-'));
+      const projectDir = join(workspaceRoot, 'packages', 'my-app');
+      const projectMastraDir = join(projectDir, 'src', 'mastra');
+
+      await mkdir(projectMastraDir, { recursive: true });
+
+      await writeFileSynced(join(workspaceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 1');
+      await writeFileSynced(join(projectDir, 'pnpm-lock.yaml'), 'lockfileVersion: local');
+      await writeFileSynced(join(projectMastraDir, 'index.ts'), 'export const mastra = {}');
+      await writeFileSynced(join(projectDir, 'package.json'), '{"name": "my-app"}');
+
+      const hash1 = await computeSourceHash(projectDir, projectMastraDir);
+
+      await writeFileSynced(join(workspaceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 2');
+
+      const hash2 = await computeSourceHash(projectDir, projectMastraDir);
+
+      expect(hash1).toBe(hash2);
 
       await rm(workspaceRoot, { recursive: true, force: true });
     });

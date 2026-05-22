@@ -10,6 +10,7 @@ export interface BuildManifest {
 
 const MANIFEST_FILENAME = 'build-manifest.json';
 const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock'] as const;
+const SOURCE_EXTENSIONS = 'ts,tsx,js,jsx,mts,mjs,cts,cjs';
 
 /**
  * Recursively collects all files matching the given patterns.
@@ -20,7 +21,19 @@ async function collectFiles(rootDir: string, patterns: string[]): Promise<string
     absolute: true,
     expandDirectories: false,
   });
-  return files.sort(); // Deterministic order
+  return [...new Set(files)].sort(); // Deterministic order
+}
+
+async function hasLockfile(directory: string): Promise<boolean> {
+  for (const lockfile of LOCKFILES) {
+    try {
+      await stat(join(directory, lockfile));
+      return true;
+    } catch {
+      // Continue searching
+    }
+  }
+  return false;
 }
 
 /**
@@ -28,6 +41,10 @@ async function collectFiles(rootDir: string, patterns: string[]): Promise<string
  * Returns null if no workspace root is found (i.e., lockfile is in projectDir or no lockfile found).
  */
 async function findWorkspaceRoot(projectDir: string): Promise<string | null> {
+  if (await hasLockfile(projectDir)) {
+    return null;
+  }
+
   let currentDir = dirname(projectDir);
   let previousDir = projectDir;
 
@@ -99,11 +116,12 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
 
   // Patterns for source files to hash
   const patterns = [
-    // All TypeScript/JavaScript files in the mastra directory
-    posix.join(normalizedMastraDir, '**/*.{ts,js,mts,mjs,cts,cjs}'),
+    // All TypeScript/JavaScript files that can affect the Mastra build
+    posix.join(normalizedMastraDir, `**/*.{${SOURCE_EXTENSIONS}}`),
+    `src/**/*.{${SOURCE_EXTENSIONS}}`,
     // Exclude test files
-    `!${posix.join(normalizedMastraDir, '**/*.{test,spec}.{ts,js,mts,mjs}')}`,
-    `!${posix.join(normalizedMastraDir, '**/__tests__/**')}`,
+    `!**/*.{test,spec}.{${SOURCE_EXTENSIONS}}`,
+    '!**/__tests__/**',
     // Package files that affect the build
     'package.json',
     'pnpm-lock.yaml',

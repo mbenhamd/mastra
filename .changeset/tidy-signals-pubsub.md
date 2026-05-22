@@ -2,4 +2,4 @@
 'mastracode': patch
 ---
 
-Improved thread-isolated signal delivery so concurrent runs avoid cross-thread message mix-ups while socket initialization remains guarded.
+Fixed signal delivery errors when using long thread IDs in MastraCode so concurrent agent runs remain isolated.
