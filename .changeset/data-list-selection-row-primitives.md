@@ -2,21 +2,7 @@
 '@mastra/playground-ui': patch
 ---
 
-Added `DataList` primitives for building selection-aware, condensed lists with inline checkboxes, range-select via shift, consistent ID/date/time formatting, and flushable layouts that match the Traces/Logs visual style.
-
-You can now compose range-selectable rows with `SelectCell`, use consistent `IdCell`, `MonoCell`, `DateCell`, and `TimeCell` formatting across list views, and align checkbox columns with `flushLeft`/`colStart` row layouts.
-
-**Example** — selection row with a checkbox in column 1 and an interactive button spanning the rest:
-
-```tsx
-<DataList.Row>
-  <DataList.SelectCell checked={isSelected} onToggle={shiftKey => toggle(id, shiftKey)} />
-  <DataList.RowButton flushLeft colStart={2} featured={isFeatured} onClick={onRowClick}>
-    <DataList.IdCell id={item.id} />
-    <DataList.MonoCell>{item.input}</DataList.MonoCell>
-  </DataList.RowButton>
-</DataList.Row>
-```
+Added `DataList` primitives and props for building selection-aware, condensed list rows that match the Traces/Logs visual style.
 
 **New cells** on `DataList`:
 
@@ -38,5 +24,17 @@ You can now compose range-selectable rows with `SelectCell`, use consistent `IdC
 
 - `as` on `DataList.Cell` and `DataList.TopCell` — render the cell as any HTML element (e.g. `<label>` so the whole cell is clickable).
 - `hasLeadingCell` on `DataList.Top` — drops default gap and left padding so a leading cell sits flush, mirroring how `Row` + `RowButton` compose.
+
+**Example** — selection row with a checkbox in column 1 and an interactive button spanning the rest:
+
+```tsx
+<DataList.Row>
+  <DataList.SelectCell checked={isSelected} onToggle={shiftKey => toggle(id, shiftKey)} />
+  <DataList.RowButton flushLeft colStart={2} featured={isFeatured} onClick={onRowClick}>
+    <DataList.IdCell id={item.id} />
+    <DataList.MonoCell>{item.input}</DataList.MonoCell>
+  </DataList.RowButton>
+</DataList.Row>
+```
 
 Internally the Traces and Logs list views now use the shared primitives — no behavior change for those consumers.
