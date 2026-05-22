@@ -42,7 +42,7 @@ export interface ClientObservabilityProxyLimits {
   maxSpans: number;
   /** Maximum number of log records accepted per receive call. */
   maxLogs: number;
-  /** Maximum total payload size in bytes (JSON.stringify length). */
+  /** Maximum total payload size in UTF-8 bytes after JSON serialization. */
   maxPayloadBytes: number;
 }
 
@@ -92,9 +92,11 @@ class ClientObservabilityProxyImpl implements ClientObservabilityProxy {
     }
 
     // Size cap before decoding so a hostile payload can't OOM us.
+    let payloadJson: string;
     let payloadBytes = 0;
     try {
-      payloadBytes = JSON.stringify(payload).length;
+      payloadJson = JSON.stringify(payload);
+      payloadBytes = Buffer.byteLength(payloadJson, 'utf8');
     } catch {
       this.#warn('Client observability payload is not JSON-serializable; dropping.');
       return;

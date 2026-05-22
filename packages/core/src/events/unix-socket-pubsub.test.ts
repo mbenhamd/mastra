@@ -1,4 +1,4 @@
-import { mkdtemp, rm, unlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -224,6 +224,49 @@ describe('UnixSocketPubSub', () => {
 
     await subscribePromise;
     await pubsub.publish('topic-a', makeEvent({ type: 'after-active-lock' }));
+
+    expect(pubsub.isBroker).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reclaim an old election lock owned by a live process', async () => {
+    const path = await socketPath();
+    const lockPath = `${path}.elect`;
+    await writeFile(path, 'stale');
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 3000 }));
+    const oldDate = new Date(Date.now() - 3000);
+    await utimes(lockPath, oldDate, oldDate);
+
+    const pubsub = new UnixSocketPubSub(path);
+    pubsubs.push(pubsub);
+    const cb = vi.fn();
+    const subscribePromise = pubsub.subscribe('topic-a', cb);
+
+    await new Promise(resolve => setTimeout(resolve, 250));
+    await expect(stat(lockPath)).resolves.toBeDefined();
+
+    await unlink(lockPath);
+    await subscribePromise;
+    await pubsub.publish('topic-a', makeEvent({ type: 'after-live-lock' }));
+
+    expect(pubsub.isBroker).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('eventually reclaims an ancient election lock even if its pid is live', async () => {
+    const path = await socketPath();
+    const lockPath = `${path}.elect`;
+    await writeFile(path, 'stale');
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 31_000 }));
+    const oldDate = new Date(Date.now() - 31_000);
+    await utimes(lockPath, oldDate, oldDate);
+
+    const pubsub = new UnixSocketPubSub(path);
+    pubsubs.push(pubsub);
+    const cb = vi.fn();
+
+    await pubsub.subscribe('topic-a', cb);
+    await pubsub.publish('topic-a', makeEvent({ type: 'after-ancient-live-lock' }));
 
     expect(pubsub.isBroker).toBe(true);
     expect(cb).toHaveBeenCalledTimes(1);

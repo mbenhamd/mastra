@@ -133,6 +133,21 @@ describe('ingest validation', () => {
     expect(bus.events).toHaveLength(0);
   });
 
+  it('counts payload limits using UTF-8 bytes instead of UTF-16 string length', () => {
+    const { instance, bus } = createFakeInstance();
+    const payload = { executionDurationMs: 1, toolName: 'é'.repeat(20) };
+    const serialized = JSON.stringify(payload);
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(serialized.length);
+    const proxy = createClientObservabilityProxy({
+      resolveInstance: () => instance,
+      limits: { maxPayloadBytes: serialized.length + 1 },
+    });
+
+    proxy.receive(payload, carrier());
+
+    expect(bus.events).toHaveLength(0);
+  });
+
   it('drops payloads when no instance is registered', () => {
     const proxy = createClientObservabilityProxy({ resolveInstance: () => undefined });
     // Should not throw.

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, stat, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname } from 'node:path';
@@ -26,6 +26,14 @@ type SubscribeWaiter = {
   resolve: () => void;
   reject: (error: Error) => void;
 };
+
+type ElectionLockRecord = {
+  pid?: number;
+  startedAt?: number;
+};
+
+const ELECTION_LOCK_STALE_MS = 2000;
+const ELECTION_LOCK_LIVE_PROCESS_STALE_MS = 30_000;
 
 function writeFrame(socket: net.Socket, frame: ClientFrame | ServerFrame): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -371,6 +379,9 @@ export class UnixSocketPubSub extends PubSub {
       }
 
       try {
+        await lockFd.writeFile(
+          JSON.stringify({ pid: process.pid, startedAt: Date.now() } satisfies ElectionLockRecord),
+        );
         // Re-check: a previous election round may have installed a broker
         // between our initial connectClient() and acquiring this lock.
         try {
@@ -403,9 +414,31 @@ export class UnixSocketPubSub extends PubSub {
   async #isElectionLockStale(lockPath: string): Promise<boolean> {
     try {
       const lockStat = await stat(lockPath);
-      return Date.now() - lockStat.mtimeMs > 2000;
+      const ageMs = Date.now() - lockStat.mtimeMs;
+      const lockRecord = await this.#readElectionLockRecord(lockPath);
+      if (lockRecord?.pid && Number.isInteger(lockRecord.pid) && lockRecord.pid > 0) {
+        return !this.#isProcessAlive(lockRecord.pid) || ageMs > ELECTION_LOCK_LIVE_PROCESS_STALE_MS;
+      }
+      return ageMs > ELECTION_LOCK_STALE_MS;
     } catch {
       return true;
+    }
+  }
+
+  async #readElectionLockRecord(lockPath: string): Promise<ElectionLockRecord | undefined> {
+    try {
+      return JSON.parse(await readFile(lockPath, 'utf8')) as ElectionLockRecord;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
     }
   }
 
