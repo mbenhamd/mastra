@@ -174,6 +174,12 @@ type ActionCatalogSkillDescriptor = Pick<
 type ActionCatalogMcpCacheEntry = {
   entries: HarnessActionCatalogEntry[];
   expiresAt?: number;
+  successful?: boolean;
+};
+type ActionCatalogMcpTimedOutWork = {
+  work: Promise<HarnessActionCatalogEntry[]>;
+  retryAfter: number;
+  retryCount: number;
 };
 
 /**
@@ -192,7 +198,9 @@ const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
 const ACTION_CATALOG_DEFAULT_LIMIT = 100;
 const ACTION_CATALOG_MAX_LIMIT = 500;
 const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
+const ACTION_CATALOG_MCP_SUCCESS_CACHE_MS = 5_000;
 const ACTION_CATALOG_MCP_FAILURE_CACHE_MS = 5_000;
+const ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES = 1;
 const ACTION_CATALOG_SOURCE_KINDS: readonly HarnessActionCatalogSourceKind[] = ['skill', 'mcp-tool'];
 const ACTION_CATALOG_SOURCE_ORDER: Record<HarnessActionCatalogSourceKind, number> = {
   skill: 0,
@@ -259,7 +267,14 @@ function compareActionCatalogIds(a: string, b: string): number {
 }
 
 function cloneActionCatalogEntry(entry: HarnessActionCatalogEntry): HarnessActionCatalogEntry {
-  return cloneMcpCatalogValue(entry) as HarnessActionCatalogEntry;
+  const cloned = cloneMcpCatalogValue(entry);
+  if (cloned === undefined) {
+    throw new HarnessValidationError(
+      'actions.list()',
+      `could not clone action catalog entry ${JSON.stringify(entry.id)}`,
+    );
+  }
+  return cloned as HarnessActionCatalogEntry;
 }
 
 function cloneActionCatalogStringArray(value: unknown): readonly string[] | undefined {
@@ -343,7 +358,10 @@ class ActionCatalogMcpListTimeoutError extends Error {
   }
 }
 
-function startActionCatalogMcpListWithTimeout<T>(run: (abortSignal: AbortSignal) => Promise<T>): {
+function startActionCatalogMcpListWithTimeout<T>(
+  run: (abortSignal: AbortSignal) => Promise<T>,
+  onTimeout?: (work: Promise<T>) => void,
+): {
   pending: Promise<T>;
   work: Promise<T>;
   didTimeout: () => boolean;
@@ -356,6 +374,7 @@ function startActionCatalogMcpListWithTimeout<T>(run: (abortSignal: AbortSignal)
     timer = setTimeout(() => {
       const timeoutError = new ActionCatalogMcpListTimeoutError();
       timedOut = true;
+      onTimeout?.(work);
       controller.abort(timeoutError);
       reject(timeoutError);
     }, ACTION_CATALOG_MCP_LIST_TIMEOUT_MS);
@@ -712,6 +731,8 @@ export class Session {
   private _actionsSkillEntriesResolving?: Promise<HarnessActionCatalogEntry[]>;
   private _actionsMcpEntriesCacheByServer = new Map<string, ActionCatalogMcpCacheEntry>();
   private _actionsMcpEntriesResolvingByServer = new Map<string, Promise<HarnessActionCatalogEntry[]>>();
+  private _actionsMcpTimedOutWorkByServer = new Map<string, ActionCatalogMcpTimedOutWork>();
+  private _actionsMcpCatalogGeneration = 0;
 
   // -------------------------------------------------------------------------
   // Thread subscription — §4.2 signal routing.
@@ -1667,6 +1688,8 @@ export class Session {
     this._actionsSkillEntriesResolving = undefined;
     this._actionsMcpEntriesCacheByServer.clear();
     this._actionsMcpEntriesResolvingByServer.clear();
+    this._actionsMcpTimedOutWorkByServer.clear();
+    this._actionsMcpCatalogGeneration++;
   }
 
   private _normalizeActionCatalogOptions(options?: HarnessActionCatalogListOptions): {
@@ -1757,9 +1780,11 @@ export class Session {
       const workspaceSkills = workspace?.skills;
       if (workspaceSkills) {
         const workspaceEntries = await workspaceSkills.list();
-        const codeNames = new Set(codeSkills.map(skill => skill.name));
+        const codeActionNames = new Set(
+          codeSkills.filter(skill => this._projectSkillActionCatalogEntry(skill).length > 0).map(skill => skill.name),
+        );
         for (const meta of workspaceEntries) {
-          if (codeNames.has(meta.name)) continue;
+          if (codeActionNames.has(meta.name) && !meta.path) continue;
           entries.push({
             name: meta.name,
             description: meta.description,
@@ -1795,6 +1820,7 @@ export class Session {
         id: `skill:${encodeActionCatalogIdPart(idSource)}`,
         source: {
           kind: 'skill',
+          ref: skill.filePath ?? skill.name,
           skillName: skill.name,
           ...(skill.filePath ? { filePath: skill.filePath } : {}),
         },
@@ -1843,6 +1869,12 @@ export class Session {
     return [server.key, this._record.modeId, this._record.modelId ?? '', workspaceId].join('\0');
   }
 
+  private _currentMcpActionCatalogWorkspaceId(): string {
+    // MCP catalog reads pass `resolveWorkspace: false`; key only by a workspace
+    // that was already materialized so catalog reads never provision one.
+    return this._workspace?.id ?? '';
+  }
+
   private _getCachedMcpActionCatalogEntries(cacheKey: string): HarnessActionCatalogEntry[] | undefined {
     const cached = this._actionsMcpEntriesCacheByServer.get(cacheKey);
     if (!cached) return undefined;
@@ -1863,11 +1895,27 @@ export class Session {
   private _startMcpActionCatalogEntriesForServer(
     server: HarnessMcpServerDescriptor,
     cacheKey: string,
+    retryCount = 0,
   ): Promise<HarnessActionCatalogEntry[]> {
-    const { pending, work, didTimeout } = startActionCatalogMcpListWithTimeout(async abortSignal => {
-      const tools = await this._mcpListTools(server.key, abortSignal, { resolveWorkspace: false });
-      return (tools ?? []).map(tool => this._projectMcpToolActionCatalogEntry(server, tool));
-    });
+    const catalogGeneration = this._actionsMcpCatalogGeneration;
+    let pending: Promise<HarnessActionCatalogEntry[]>;
+    const started = startActionCatalogMcpListWithTimeout(
+      async abortSignal => {
+        const tools = await this._mcpListTools(server.key, abortSignal, { resolveWorkspace: false });
+        return (tools ?? []).map(tool => this._projectMcpToolActionCatalogEntry(server, tool));
+      },
+      work => {
+        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+          this._actionsMcpTimedOutWorkByServer.set(cacheKey, {
+            work,
+            retryAfter: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+            retryCount,
+          });
+        }
+      },
+    );
+    pending = started.pending;
+    const { work, didTimeout } = started;
     pending.catch(() => {
       // `pending` is observed below for cache/single-flight cleanup; attach
       // this noop handler immediately so timeout rejection is never unhandled.
@@ -1877,24 +1925,45 @@ export class Session {
     pending
       .then(entries => {
         if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, { entries });
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
+            entries,
+            expiresAt: Date.now() + ACTION_CATALOG_MCP_SUCCESS_CACHE_MS,
+            successful: true,
+          });
           this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
         }
+      })
+      .catch(error => {
+        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) !== pending) return;
+        const timeoutWorkStillTracked =
+          error instanceof ActionCatalogMcpListTimeoutError &&
+          this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work;
+        const existingCache = this._actionsMcpEntriesCacheByServer.get(cacheKey);
+        const hasSuccessfulTimedOutResult = existingCache?.successful === true;
+        if (
+          (!(error instanceof ActionCatalogMcpListTimeoutError) || timeoutWorkStillTracked) &&
+          !hasSuccessfulTimedOutResult
+        ) {
+          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
+            entries: [],
+            expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+          });
+        }
+        this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
       });
 
     work
       .then(entries => {
-        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, { entries });
+        if (didTimeout() && this._actionsMcpCatalogGeneration === catalogGeneration) {
+          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
+            entries,
+            expiresAt: Date.now() + ACTION_CATALOG_MCP_SUCCESS_CACHE_MS,
+            successful: true,
+          });
         }
       })
       .catch(() => {
-        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+        if (didTimeout() && this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work) {
           this._actionsMcpEntriesCacheByServer.set(cacheKey, {
             entries: [],
             expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
@@ -1902,8 +1971,8 @@ export class Session {
         }
       })
       .finally(() => {
-        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-          this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
+        if (didTimeout() && this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work) {
+          this._actionsMcpTimedOutWorkByServer.delete(cacheKey);
         }
       });
 
@@ -1913,27 +1982,36 @@ export class Session {
   private async _resolveMcpActionCatalogEntriesForServer(
     server: HarnessMcpServerDescriptor,
   ): Promise<HarnessActionCatalogEntry[]> {
-    const cacheKey = this._actionMcpCatalogCacheKey(server, this._workspace?.id ?? '');
+    const cacheKey = this._actionMcpCatalogCacheKey(server, this._currentMcpActionCatalogWorkspaceId());
     const cached = this._getCachedMcpActionCatalogEntries(cacheKey);
     if (cached) return cached;
 
+    const timedOutWork = this._actionsMcpTimedOutWorkByServer.get(cacheKey);
+    if (
+      timedOutWork &&
+      (timedOutWork.retryAfter > Date.now() || timedOutWork.retryCount >= ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES)
+    ) {
+      const entries: HarnessActionCatalogEntry[] = [];
+      this._actionsMcpEntriesCacheByServer.set(cacheKey, {
+        entries,
+        expiresAt:
+          timedOutWork.retryAfter > Date.now()
+            ? timedOutWork.retryAfter
+            : Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+      });
+      return entries;
+    }
+    if (timedOutWork) {
+      this._actionsMcpTimedOutWorkByServer.delete(cacheKey);
+    }
+
     const pending =
       this._actionsMcpEntriesResolvingByServer.get(cacheKey) ??
-      this._startMcpActionCatalogEntriesForServer(server, cacheKey);
+      this._startMcpActionCatalogEntriesForServer(server, cacheKey, (timedOutWork?.retryCount ?? -1) + 1);
     try {
       return await pending;
-    } catch (error) {
-      const entries: HarnessActionCatalogEntry[] = [];
-      if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-        this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-          entries,
-          expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
-        });
-        if (!(error instanceof ActionCatalogMcpListTimeoutError)) {
-          this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
-        }
-      }
-      return entries;
+    } catch {
+      return [];
     }
   }
 

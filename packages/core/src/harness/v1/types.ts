@@ -659,7 +659,9 @@ export type HarnessActionCatalogSourceKind = 'skill' | 'mcp-tool';
 
 export interface HarnessActionCatalogSkillSource {
   kind: 'skill';
-  /** Skill name usable with `session.skills.use(name, ...)`. */
+  /** Canonical ref usable with `session.skills.use(ref, ...)`. */
+  ref: string;
+  /** Skill name, useful for display and grouping. */
   skillName: string;
   /** Workspace path when the descriptor came from workspace discovery. */
   filePath?: string;

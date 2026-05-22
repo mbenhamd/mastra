@@ -136,13 +136,13 @@ class HangingMcpServer extends MockMcpServer {
 }
 
 class GatedMcpServer extends MockMcpServer {
-  private releaseGate?: () => void;
+  private releaseGates: Array<() => void> = [];
 
   async getToolListInfo(requestContext?: RequestContext) {
     this.toolListCallCount++;
     this.lastToolListRequestContext = requestContext;
     await new Promise<void>(resolve => {
-      this.releaseGate = resolve;
+      this.releaseGates.push(resolve);
     });
     return {
       tools: Object.entries(this.convertedTools).map(([name, tool]) => ({
@@ -156,9 +156,9 @@ class GatedMcpServer extends MockMcpServer {
     };
   }
 
-  release(): void {
-    this.releaseGate?.();
-    this.releaseGate = undefined;
+  release(index = 0): void {
+    const [release] = this.releaseGates.splice(index, 1);
+    release?.();
   }
 }
 
@@ -380,7 +380,7 @@ describe('Session action catalog (PF-576)', () => {
     await expect(session.actions.list()).resolves.toEqual([
       {
         id: 'skill:open-ticket',
-        source: { kind: 'skill', skillName: 'open-ticket' },
+        source: { kind: 'skill', ref: 'open-ticket', skillName: 'open-ticket' },
         status: 'available',
         label: 'Open ticket',
         description: 'Open a ticket',
@@ -469,6 +469,7 @@ describe('Session action catalog (PF-576)', () => {
         id: 'skill:skills%2Fworkspace-action%2FSKILL.md',
         source: {
           kind: 'skill',
+          ref: 'skills/workspace-action/SKILL.md',
           skillName: 'workspace-action',
           filePath: 'skills/workspace-action/SKILL.md',
         },
@@ -484,6 +485,104 @@ describe('Session action catalog (PF-576)', () => {
     await session.skills.refresh();
     await session.actions.list({ source: 'skill' });
     expect(skills.listCallCount).toBe(2);
+  });
+
+  it('keeps same-name workspace actions when the code skill has no action metadata', async () => {
+    const skills = new FakeWorkspaceSkills([
+      {
+        name: 'shared-name',
+        description: 'Workspace action',
+        path: 'skills/shared-name/SKILL.md',
+        metadata: {
+          action: {
+            displayName: 'Workspace shared action',
+          },
+        },
+      },
+    ]);
+    const provider = makeWorkspaceSkillsProvider(skills);
+    const harness = new Harness({
+      agents: { default: makeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      workspace: { kind: 'per-session', provider },
+      skills: [
+        {
+          name: 'shared-name',
+          description: 'Code skill without palette metadata',
+          instructions: 'Run shared code skill.',
+        },
+      ],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.actions.list({ source: 'skill' })).resolves.toMatchObject([
+      {
+        id: 'skill:skills%2Fshared-name%2FSKILL.md',
+        source: {
+          kind: 'skill',
+          ref: 'skills/shared-name/SKILL.md',
+          skillName: 'shared-name',
+          filePath: 'skills/shared-name/SKILL.md',
+        },
+        label: 'Workspace shared action',
+      },
+    ]);
+  });
+
+  it('keeps path-addressable same-name workspace actions when the code skill also has action metadata', async () => {
+    const skills = new FakeWorkspaceSkills([
+      {
+        name: 'shared-name',
+        description: 'Workspace action',
+        path: 'skills/shared-name/SKILL.md',
+        metadata: {
+          action: {
+            displayName: 'Workspace shared action',
+          },
+        },
+      },
+    ]);
+    const provider = makeWorkspaceSkillsProvider(skills);
+    const harness = new Harness({
+      agents: { default: makeAgent() } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      workspace: { kind: 'per-session', provider },
+      skills: [
+        {
+          name: 'shared-name',
+          description: 'Code skill with palette metadata',
+          instructions: 'Run shared code skill.',
+          action: {
+            displayName: 'Code shared action',
+          },
+        },
+      ],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.actions.list({ source: 'skill' })).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'skill:shared-name',
+          source: { kind: 'skill', ref: 'shared-name', skillName: 'shared-name' },
+          label: 'Code shared action',
+        }),
+        expect.objectContaining({
+          id: 'skill:skills%2Fshared-name%2FSKILL.md',
+          source: {
+            kind: 'skill',
+            ref: 'skills/shared-name/SKILL.md',
+            skillName: 'shared-name',
+            filePath: 'skills/shared-name/SKILL.md',
+          },
+          label: 'Workspace shared action',
+        }),
+      ]),
+    );
   });
 
   it('refreshes an already-materialized workspace skill source before rebuilding skill actions', async () => {
@@ -593,7 +692,46 @@ describe('Session action catalog (PF-576)', () => {
     expect(failing.toolListCallCount).toBe(1);
   });
 
-  it('times out hung MCP action discovery and requires refresh before retrying', async () => {
+  it('expires successful MCP action cache entries so context-filtered catalogs refresh', async () => {
+    vi.useFakeTimers();
+    try {
+      const server = new MockMcpServer({
+        id: 'ttl',
+        name: 'TTL',
+        version: '1.0.0',
+        tools: { search_files: makeTool() },
+      });
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        mcpServers: { ttl: server },
+        harness,
+      });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+        { id: 'mcp-tool:ttl:search_files' },
+      ]);
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+        { id: 'mcp-tool:ttl:search_files' },
+      ]);
+      expect(server.toolListCallCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+        { id: 'mcp-tool:ttl:search_files' },
+      ]);
+      expect(server.toolListCallCount).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out hung MCP action discovery and bounds automatic retries', async () => {
     vi.useFakeTimers();
     try {
       const hanging = new HangingMcpServer({
@@ -623,14 +761,14 @@ describe('Session action catalog (PF-576)', () => {
       expect(hanging.toolListCallCount).toBe(1);
 
       await vi.advanceTimersByTimeAsync(5_001);
-      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toEqual([]);
-      expect(hanging.toolListCallCount).toBe(1);
-
-      await session.actions.refresh();
-      const afterRefresh = session.actions.list({ source: 'mcp-tool' });
+      const afterBackoff = session.actions.list({ source: 'mcp-tool' });
       await vi.waitFor(() => expect(hanging.toolListCallCount).toBe(2));
       await vi.advanceTimersByTimeAsync(2_000);
-      await expect(afterRefresh).resolves.toEqual([]);
+      await expect(afterBackoff).resolves.toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toEqual([]);
+      expect(hanging.toolListCallCount).toBe(2);
     } finally {
       vi.useRealTimers();
     }
@@ -672,6 +810,55 @@ describe('Session action catalog (PF-576)', () => {
         ]);
       });
       expect(slow.toolListCallCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a late successful timed-out MCP discovery after a retry starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const slow = new GatedMcpServer({
+        id: 'late-success',
+        name: 'Late success',
+        version: '1.0.0',
+        tools: { search_files: makeTool() },
+      });
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        mcpServers: { late: slow },
+        harness,
+      });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      const first = session.actions.list({ source: 'mcp-tool' });
+      await vi.waitFor(() => expect(slow.toolListCallCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(first).resolves.toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      const retry = session.actions.list({ source: 'mcp-tool' });
+      await vi.waitFor(() => expect(slow.toolListCallCount).toBe(2));
+
+      slow.release(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(async () => {
+        await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+          { id: 'mcp-tool:late:search_files' },
+        ]);
+      });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(retry).resolves.toEqual([]);
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+        { id: 'mcp-tool:late:search_files' },
+      ]);
+      expect(slow.toolListCallCount).toBe(2);
     } finally {
       vi.useRealTimers();
     }

@@ -104,7 +104,7 @@ const actions = await session.actions.list({ query: 'ticket', limit: 20 })
 const mcpActions = await session.actions.search('workspace', { source: 'mcp-tool' })
 ```
 
-Use the returned `source` field to route execution through the owning surface, such as `session.skills.use()` for skill entries. Call `session.actions.refresh()` after the host changes available skills or MCP tools and needs a fresh catalog.
+Use the returned `source` field to route execution through the owning surface, such as `session.skills.use(action.source.ref)` for skill entries. Call `session.actions.refresh()` after the host changes available skills or MCP tools and needs a fresh catalog.
 
 ## Constructor parameters
 
