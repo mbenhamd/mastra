@@ -1652,20 +1652,21 @@ export class Session {
 
   private async _actionsRefresh(): Promise<void> {
     this._assertLive('actions.refresh()');
-    const clearActionAndSkillCatalogCaches = () => {
-      this._skillsCache = undefined;
-      this._skillsResolving = undefined;
-      this._actionsSkillEntriesCache = undefined;
-      this._actionsSkillEntriesResolving = undefined;
-      this._actionsMcpEntriesCacheByServer.clear();
-      this._actionsMcpEntriesResolvingByServer.clear();
-    };
-    clearActionAndSkillCatalogCaches();
+    this._clearSkillAndActionCatalogCaches();
     try {
       await this._workspace?.skills?.refresh();
     } finally {
-      clearActionAndSkillCatalogCaches();
+      this._clearSkillAndActionCatalogCaches();
     }
+  }
+
+  private _clearSkillAndActionCatalogCaches(): void {
+    this._skillsCache = undefined;
+    this._skillsResolving = undefined;
+    this._actionsSkillEntriesCache = undefined;
+    this._actionsSkillEntriesResolving = undefined;
+    this._actionsMcpEntriesCacheByServer.clear();
+    this._actionsMcpEntriesResolvingByServer.clear();
   }
 
   private _normalizeActionCatalogOptions(options?: HarnessActionCatalogListOptions): {
@@ -1926,9 +1927,7 @@ export class Session {
       if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
         this._actionsMcpEntriesCacheByServer.set(cacheKey, {
           entries,
-          ...(error instanceof ActionCatalogMcpListTimeoutError
-            ? {}
-            : { expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS }),
+          expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
         });
         if (!(error instanceof ActionCatalogMcpListTimeoutError)) {
           this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
@@ -1956,17 +1955,12 @@ export class Session {
 
   private async _skillsRefresh(): Promise<void> {
     this._assertLive('skills.refresh()');
-    // Drop cached generation. Any in-flight discovery promise is allowed to
-    // run to completion (its result will not repopulate the cache because
-    // `_resolveSkills` always writes through `_skillsCache` after the
-    // promise it awaits, and the next caller is guaranteed to enter the
-    // `_skillsResolving === undefined` branch and start a fresh build).
-    this._skillsCache = undefined;
-    this._skillsResolving = undefined;
-    this._actionsSkillEntriesCache = undefined;
-    this._actionsSkillEntriesResolving = undefined;
-    this._actionsMcpEntriesCacheByServer.clear();
-    this._actionsMcpEntriesResolvingByServer.clear();
+    this._clearSkillAndActionCatalogCaches();
+    try {
+      await this._workspace?.skills?.refresh();
+    } finally {
+      this._clearSkillAndActionCatalogCaches();
+    }
   }
 
   /**
