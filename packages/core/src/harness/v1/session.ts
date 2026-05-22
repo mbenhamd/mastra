@@ -343,20 +343,31 @@ class ActionCatalogMcpListTimeoutError extends Error {
   }
 }
 
-function withActionCatalogMcpListTimeout<T>(run: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
+function startActionCatalogMcpListWithTimeout<T>(run: (abortSignal: AbortSignal) => Promise<T>): {
+  pending: Promise<T>;
+  work: Promise<T>;
+  didTimeout: () => boolean;
+} {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const work = run(controller.signal);
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const timeoutError = new ActionCatalogMcpListTimeoutError();
+      timedOut = true;
       controller.abort(timeoutError);
       reject(timeoutError);
     }, ACTION_CATALOG_MCP_LIST_TIMEOUT_MS);
   });
-  return Promise.race([work, timeout]).finally(() => {
+  const pending = Promise.race([work, timeout]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });
+  return {
+    pending,
+    work,
+    didTimeout: () => timedOut,
+  };
 }
 
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
@@ -1852,7 +1863,7 @@ export class Session {
     server: HarnessMcpServerDescriptor,
     cacheKey: string,
   ): Promise<HarnessActionCatalogEntry[]> {
-    const pending = withActionCatalogMcpListTimeout(async abortSignal => {
+    const { pending, work, didTimeout } = startActionCatalogMcpListWithTimeout(async abortSignal => {
       const tools = await this._mcpListTools(server.key, abortSignal, { resolveWorkspace: false });
       return (tools ?? []).map(tool => this._projectMcpToolActionCatalogEntry(server, tool));
     });
@@ -1870,7 +1881,27 @@ export class Session {
       })
       .catch(() => {})
       .finally(() => {
-        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+        if (!didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+          this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
+        }
+      });
+
+    work
+      .then(entries => {
+        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+          this._actionsMcpEntriesCacheByServer.set(cacheKey, { entries });
+        }
+      })
+      .catch(() => {
+        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
+          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
+            entries: [],
+            expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+          });
+        }
+      })
+      .finally(() => {
+        if (didTimeout() && this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
           this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
         }
       });
@@ -1899,7 +1930,9 @@ export class Session {
             ? {}
             : { expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS }),
         });
-        this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
+        if (!(error instanceof ActionCatalogMcpListTimeoutError)) {
+          this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
+        }
       }
       return entries;
     }

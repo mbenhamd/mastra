@@ -636,6 +636,47 @@ describe('Session action catalog (PF-576)', () => {
     }
   });
 
+  it('updates a timed-out MCP action cache when the original discovery eventually resolves', async () => {
+    vi.useFakeTimers();
+    try {
+      const slow = new GatedMcpServer({
+        id: 'slow',
+        name: 'Slow',
+        version: '1.0.0',
+        tools: { search_files: makeTool() },
+      });
+      const harness = new Harness({
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      new Mastra({
+        agents: { default: makeAgent() },
+        storage: new InMemoryStore(),
+        mcpServers: { slow },
+        harness,
+      });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      const first = session.actions.list({ source: 'mcp-tool' });
+      await vi.waitFor(() => expect(slow.toolListCallCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(first).resolves.toEqual([]);
+
+      await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toEqual([]);
+      expect(slow.toolListCallCount).toBe(1);
+
+      slow.release();
+      await vi.waitFor(async () => {
+        await expect(session.actions.list({ source: 'mcp-tool' })).resolves.toMatchObject([
+          { id: 'mcp-tool:slow:search_files' },
+        ]);
+      });
+      expect(slow.toolListCallCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('uses the resolved workspace identity for MCP action cache keys when available', async () => {
     const skills = new FakeWorkspaceSkills([]);
     const server = new MockMcpServer({
