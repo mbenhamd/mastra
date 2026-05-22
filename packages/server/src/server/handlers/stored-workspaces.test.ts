@@ -31,13 +31,14 @@ interface MockWorkspacesStore {
   create: ReturnType<typeof vi.fn>;
   getById: ReturnType<typeof vi.fn>;
   getByIdResolved: ReturnType<typeof vi.fn>;
+  list: ReturnType<typeof vi.fn>;
   listResolved: ReturnType<typeof vi.fn>;
   update: ReturnType<typeof vi.fn>;
   delete: ReturnType<typeof vi.fn>;
 }
 
 function createMockWorkspacesStore(data: Map<string, MockStoredWorkspace> = new Map()): MockWorkspacesStore {
-  return {
+  const store: MockWorkspacesStore = {
     create: vi.fn().mockImplementation(async ({ workspace }: { workspace: MockStoredWorkspace }) => {
       if (data.has(workspace.id)) {
         throw new Error('Workspace already exists');
@@ -47,24 +48,29 @@ function createMockWorkspacesStore(data: Map<string, MockStoredWorkspace> = new 
     }),
     getById: vi.fn().mockImplementation(async (id: string) => data.get(id) ?? null),
     getByIdResolved: vi.fn().mockImplementation(async (id: string) => data.get(id) ?? null),
-    listResolved: vi.fn().mockImplementation(
+    list: vi.fn().mockImplementation(
       async ({
-        page = 1,
+        page = 0,
         perPage = 20,
         authorId,
+        authorIds,
       }: {
         page?: number;
-        perPage?: number;
+        perPage?: number | false;
         authorId?: string;
+        authorIds?: Array<string | null>;
       } = {}) => {
         let workspaces = Array.from(data.values());
 
-        if (authorId) {
+        if (authorIds !== undefined) {
+          const authorSet = new Set(authorIds);
+          workspaces = workspaces.filter(w => authorSet.has(w.authorId ?? null));
+        } else if (authorId !== undefined) {
           workspaces = workspaces.filter(w => w.authorId === authorId);
         }
 
-        const start = (page - 1) * perPage;
-        const end = start + perPage;
+        const start = perPage === false ? 0 : page * perPage;
+        const end = perPage === false ? workspaces.length : start + perPage;
         const paginatedWorkspaces = workspaces.slice(start, end);
 
         return {
@@ -72,9 +78,19 @@ function createMockWorkspacesStore(data: Map<string, MockStoredWorkspace> = new 
           total: workspaces.length,
           page,
           perPage,
-          hasMore: end < workspaces.length,
+          hasMore: perPage !== false && end < workspaces.length,
         };
       },
+    ),
+    listResolved: vi.fn().mockImplementation(
+      async (
+        args: {
+          page?: number;
+          perPage?: number | false;
+          authorId?: string;
+          authorIds?: Array<string | null>;
+        } = {},
+      ) => store.list(args),
     ),
     update: vi.fn().mockImplementation(async (updates: Partial<MockStoredWorkspace> & { id: string }) => {
       const existing = data.get(updates.id);
@@ -92,6 +108,7 @@ function createMockWorkspacesStore(data: Map<string, MockStoredWorkspace> = new 
     }),
     delete: vi.fn().mockImplementation(async (id: string) => data.delete(id)),
   };
+  return store;
 }
 
 interface MockStorage {
@@ -165,13 +182,13 @@ describe('Stored Workspaces Handlers', () => {
     it('returns an empty list when no workspaces exist', async () => {
       const result = await LIST_STORED_WORKSPACES_ROUTE.handler({
         ...createTestContext(mockMastra),
-        page: 1,
+        page: 0,
       });
 
       expect(result).toMatchObject({
         workspaces: [],
         total: 0,
-        page: 1,
+        page: 0,
       });
     });
 
@@ -182,13 +199,31 @@ describe('Stored Workspaces Handlers', () => {
 
       const result = await LIST_STORED_WORKSPACES_ROUTE.handler({
         ...createAuthenticatedContext(mockMastra, 'user-a'),
-        page: 1,
+        page: 0,
       });
 
       const ids = result.workspaces.map(w => w.id);
       expect(ids).toContain('mine');
       expect(ids).toContain('unowned');
       expect(ids).not.toContain('other-private');
+      expect(result.total).toBe(2);
+    });
+
+    it('paginates after ownership filtering so hidden rows do not create sparse pages', async () => {
+      mockData.set('hidden-1', { id: 'hidden-1', name: 'Hidden 1', authorId: 'user-b' });
+      mockData.set('hidden-2', { id: 'hidden-2', name: 'Hidden 2', authorId: 'user-b' });
+      mockData.set('mine-1', { id: 'mine-1', name: 'Mine 1', authorId: 'user-a' });
+      mockData.set('mine-2', { id: 'mine-2', name: 'Mine 2', authorId: 'user-a' });
+
+      const result = await LIST_STORED_WORKSPACES_ROUTE.handler({
+        ...createAuthenticatedContext(mockMastra, 'user-a'),
+        page: 0,
+        perPage: 1,
+      });
+
+      expect(result.workspaces.map(w => w.id)).toEqual(['mine-1']);
+      expect(result.total).toBe(2);
+      expect(result.hasMore).toBe(true);
     });
 
     it('returns all workspaces for an admin caller', async () => {
@@ -197,7 +232,7 @@ describe('Stored Workspaces Handlers', () => {
 
       const result = await LIST_STORED_WORKSPACES_ROUTE.handler({
         ...createAuthenticatedContext(mockMastra, 'user-a', ['*']),
-        page: 1,
+        page: 0,
       });
 
       const ids = result.workspaces.map(w => w.id);
@@ -210,11 +245,12 @@ describe('Stored Workspaces Handlers', () => {
 
       const result = await LIST_STORED_WORKSPACES_ROUTE.handler({
         ...createAuthenticatedContext(mockMastra, 'user-a'),
-        page: 1,
+        page: 0,
         authorId: 'user-b',
       });
 
       expect(result.workspaces).toEqual([]);
+      expect(result.total).toBe(0);
     });
 
     it('throws when storage is not configured', async () => {
@@ -223,7 +259,7 @@ describe('Stored Workspaces Handlers', () => {
       await expect(
         LIST_STORED_WORKSPACES_ROUTE.handler({
           ...createTestContext(mastraNoStorage),
-          page: 1,
+          page: 0,
         }),
       ).rejects.toThrow(HTTPException);
     });

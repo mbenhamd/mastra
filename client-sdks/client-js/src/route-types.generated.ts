@@ -73855,8 +73855,6 @@ export interface GetStoredWorkspacesStoredWorkspaceId_RouteContract {
 export type PostStoredWorkspaces_Body = {
   /** Unique identifier. If not provided, derived from name. */
   id?: string | undefined;
-  /** Author identifier for multi-tenant filtering */
-  authorId?: string | undefined;
   /** Additional metadata for the workspace */
   metadata?:
     | {

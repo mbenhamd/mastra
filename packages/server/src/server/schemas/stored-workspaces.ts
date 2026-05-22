@@ -87,7 +87,6 @@ const snapshotConfigSchema = z.object({
 export const createStoredWorkspaceBodySchema = z
   .object({
     id: z.string().optional().describe('Unique identifier. If not provided, derived from name.'),
-    authorId: z.string().optional().describe('Author identifier for multi-tenant filtering'),
     metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata for the workspace'),
   })
   .merge(snapshotConfigSchema);

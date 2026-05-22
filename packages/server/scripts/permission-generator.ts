@@ -69,7 +69,7 @@ const RESOURCE_DESCRIPTIONS: Record<string, string> = {
 /**
  * Compound permission patterns supported by the RBAC matcher.
  */
-const ADDITIONAL_PERMISSION_PATTERNS = [
+const ADDITIONAL_PERMISSION_PATTERNS: string[] = [
   // Reserved for matcher patterns that are not represented by concrete permissions.
 ];
 

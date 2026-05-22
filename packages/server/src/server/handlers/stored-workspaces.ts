@@ -13,13 +13,7 @@ import {
 import { createRoute } from '../server-adapter/routes/route-builder';
 import { assertStoredResourceScope, getStoredResourceScope, scopeStoredResourceMetadata, toSlug } from '../utils';
 
-import {
-  assertReadAccess,
-  assertWriteAccess,
-  getCallerAuthorId,
-  matchesAuthorFilter,
-  resolveAuthorFilter,
-} from './authorship';
+import { assertReadAccess, assertWriteAccess, getCallerAuthorId, resolveAuthorFilter } from './authorship';
 import { handleError } from './error';
 
 // ============================================================================
@@ -62,24 +56,33 @@ export const LIST_STORED_WORKSPACES_ROUTE = createRoute({
         queryAuthorId: authorId,
       });
 
+      if (filter.kind === 'ownedOrPublicOthers') {
+        const effectivePage = page ?? 0;
+        const effectivePerPage = perPage ?? 100;
+        return { workspaces: [], total: 0, page: effectivePage, perPage: effectivePerPage, hasMore: false };
+      }
+
       const scope = await getStoredResourceScope(mastra, requestContext);
+      const scopedMetadata = scopeStoredResourceMetadata(metadata, scope);
+      const authorIds =
+        filter.kind === 'ownedOrPublic'
+          ? [filter.callerAuthorId, null]
+          : filter.kind === 'publicOnly'
+            ? [null]
+            : undefined;
+
       const result = await workspaceStore.listResolved({
         page,
         perPage,
         orderBy,
         authorId: filter.kind === 'exact' ? filter.authorId : undefined,
-        metadata: scopeStoredResourceMetadata(metadata, scope),
+        authorIds,
+        metadata: scopedMetadata,
       });
-
-      // Post-filter to enforce ownership rules across all backends. Storage
-      // adapters can only do an equality filter on authorId, so we apply the
-      // ownedOrPublic / ownedOrPublicOthers logic here. `total` is left as the
-      // storage-reported count to keep pagination math working.
-      const visibleWorkspaces = result.workspaces.filter(record => matchesAuthorFilter(record, filter));
 
       // Annotate each workspace with whether it's registered at runtime
       const runtimeWorkspaces = mastra.listWorkspaces();
-      const workspaces = visibleWorkspaces.map(ws => ({
+      const workspaces = result.workspaces.map(ws => ({
         ...ws,
         runtimeRegistered: ws.id in runtimeWorkspaces,
       }));

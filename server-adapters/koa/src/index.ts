@@ -947,7 +947,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       );
       if (!response) return next();
       ctx.respond = false;
-      await server.writeCustomRouteResponse(response, ctx.res);
+      await server.writeCustomRouteResponse(response, ctx.res, ctx.state.abortSignal);
     });
   }
 

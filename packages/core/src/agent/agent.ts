@@ -6587,8 +6587,6 @@ export class Agent<
       structuredOutput?: PublicStructuredOutputOptions<any>;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<FullOutput<OUTPUT>> {
-    this.#extractClientObservability(messages);
-
     const requestContextToUse = options?.requestContext;
     if (requestContextToUse) {
       await this.#assertAgentExecutionPreflight(requestContextToUse, { authorize: false });
@@ -6608,6 +6606,7 @@ export class Agent<
     }
 
     await this.#requireAgentExecutionFGA(mergedOptions);
+    this.#extractClientObservability(messages);
 
     const llm = await this.getLLM({
       requestContext: mergedOptions.requestContext,
@@ -6869,8 +6868,6 @@ export class Agent<
       structuredOutput?: PublicStructuredOutputOptions<any>;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<MastraModelOutput<OUTPUT>> {
-    this.#extractClientObservability(messages);
-
     const pubsub =
       ((streamOptions as any)?._pubsub as PubSub | undefined) ?? this.getPubSub() ?? defaultAgentThreadPubSub;
     const streamOptionsBase = { ...(streamOptions ?? {}) };
@@ -7047,6 +7044,8 @@ export class Agent<
           };
         }
       }
+
+      this.#extractClientObservability(messages);
 
       const llm = await this.getLLM({
         requestContext: mergedOptions.requestContext,
