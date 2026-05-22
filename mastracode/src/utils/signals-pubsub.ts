@@ -1,8 +1,17 @@
+import { createHash } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { PubSub, UnixSocketPubSub } from '@mastra/core/events';
 import type { PubSubDeliveryMode, Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
+
+function safeSocketPathComponent(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!safe) return '_';
+  if (safe.length <= 40) return safe;
+  const digest = createHash('sha1').update(value).digest('hex').slice(0, 16);
+  return `${safe.slice(0, 23)}-${digest}`;
+}
 
 /**
  * A PubSub that manages one Unix socket per thread for cross-process signal
@@ -89,8 +98,8 @@ class SignalsPubSub extends PubSub {
   async #socketPath(topic: string): Promise<string> {
     // Extract threadId from the topic. Topics follow the format:
     // agent.thread-stream.<encoded key> where key = resourceId\0threadId
-    const threadId = this.#extractThreadId(topic);
-    const dir = join('/tmp/mc', this.#resourceId);
+    const threadId = safeSocketPathComponent(this.#extractThreadId(topic));
+    const dir = join('/tmp/mc', safeSocketPathComponent(this.#resourceId));
     await mkdir(dir, { recursive: true });
     return join(dir, `${threadId}.sock`);
   }
@@ -111,7 +120,7 @@ class SignalsPubSub extends PubSub {
       }
     }
     // Fallback: use the topic directly (sanitized for filesystem)
-    return topic.replace(/[^a-zA-Z0-9_-]/g, '_');
+    return topic;
   }
 }
 

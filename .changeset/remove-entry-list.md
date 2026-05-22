@@ -1,5 +1,5 @@
 ---
-'@mastra/playground-ui': patch
+'@mastra/playground-ui': major
 ---
 
 Removed `EntryList` and its sub-components (`EntryList.Header`, `EntryList.Entries`, `EntryList.Entry`, `EntryList.EntryText`, `EntryList.Pagination`, `EntryList.NoMatch`, `EntryListSkeleton`, etc.) from the public API. All in-repo list views have migrated to `DataList`, which is the recommended replacement.

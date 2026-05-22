@@ -28,12 +28,14 @@ export default function remarkModelTokens() {
       if (
         (node.type === 'code' || node.type === 'inlineCode' || node.type === 'text') &&
         'value' in node &&
-        typeof node.value === 'string' &&
-        TOKEN_RE.test(node.value)
+        typeof node.value === 'string'
       ) {
         // Reset the regex lastIndex since we use the `g` flag for test()
         TOKEN_RE.lastIndex = 0
-        node.value = replaceTokens(node.value)
+        if (TOKEN_RE.test(node.value)) {
+          TOKEN_RE.lastIndex = 0
+          node.value = replaceTokens(node.value)
+        }
       }
     })
   }

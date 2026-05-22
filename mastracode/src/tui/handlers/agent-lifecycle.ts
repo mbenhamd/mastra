@@ -19,12 +19,16 @@ export function handleAgentStart(ctx: EventHandlerContext): void {
   state.goalManager.startActiveTimer();
 
   // Refresh git branch async to avoid blocking the event loop
-  getCurrentGitBranchAsync(state.projectInfo.rootPath).then(freshBranch => {
-    if (freshBranch) {
-      state.projectInfo.gitBranch = freshBranch;
-      ctx.updateStatusLine();
-    }
-  });
+  getCurrentGitBranchAsync(state.projectInfo.rootPath)
+    .then(freshBranch => {
+      if (freshBranch) {
+        state.projectInfo.gitBranch = freshBranch;
+        ctx.updateStatusLine();
+      }
+    })
+    .catch(() => {
+      // Best-effort status line refresh; keep lifecycle transitions moving.
+    });
 
   if (!state.gradientAnimator) {
     state.gradientAnimator = new GradientAnimator(() => {
@@ -41,12 +45,16 @@ export function handleAgentEnd(ctx: EventHandlerContext): void {
   }
 
   // Refresh git branch async — tool calls during this turn may have switched branches
-  getCurrentGitBranchAsync(state.projectInfo.rootPath).then(freshBranch => {
-    if (freshBranch) {
-      state.projectInfo.gitBranch = freshBranch;
-      ctx.updateStatusLine();
-    }
-  });
+  getCurrentGitBranchAsync(state.projectInfo.rootPath)
+    .then(freshBranch => {
+      if (freshBranch) {
+        state.projectInfo.gitBranch = freshBranch;
+        ctx.updateStatusLine();
+      }
+    })
+    .catch(() => {
+      // Best-effort status line refresh; keep lifecycle transitions moving.
+    });
 
   if (state.streamingComponent) {
     state.streamingComponent = undefined;

@@ -2,4 +2,4 @@
 'mastracode': patch
 ---
 
-Route Unix socket signal PubSub traffic through per-thread socket paths under `/tmp/mc/<resourceId>/<threadId>.sock` and guard concurrent socket initialization.
+Improved thread-isolated signal delivery so concurrent runs avoid cross-thread message mix-ups while socket initialization remains guarded.

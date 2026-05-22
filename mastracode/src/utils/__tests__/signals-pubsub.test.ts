@@ -101,6 +101,22 @@ describe('SignalsPubSub', () => {
     expect(mocks.instances[0]?.socketPath).toBe(`/tmp/mc/${resourceId}/agent_thread-stream__E0_A4_A.sock`);
   });
 
+  it('keeps socket paths short for long resource and thread ids', async () => {
+    const { createSignalsPubSub } = await import('../signals-pubsub.js');
+    const resourceId = `resource-${'a'.repeat(120)}`;
+    const threadId = `thread-${'b'.repeat(120)}`;
+    const topic = threadTopic(resourceId, threadId);
+
+    const pubsub = createSignalsPubSub(resourceId);
+    await pubsub.publish(topic, event);
+
+    expect(mocks.instances).toHaveLength(1);
+    expect(mocks.instances[0]?.socketPath.length).toBeLessThan(100);
+    expect(mocks.instances[0]?.socketPath).toMatch(
+      /^\/tmp\/mc\/resource-a+-[a-f0-9]{16}\/thread-b+-[a-f0-9]{16}\.sock$/,
+    );
+  });
+
   it('deduplicates concurrent first-time access for the same topic', async () => {
     const mkdir = deferred();
     mocks.setMkdirImpl(() => mkdir.promise);

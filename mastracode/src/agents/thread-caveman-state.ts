@@ -59,10 +59,12 @@ async function restoreSettingsForThread(harness: Harness<Record<string, unknown>
   }
 
   if (Object.keys(updates).length > 0) {
+    if (harness.getCurrentThreadId() !== threadId) return;
     await harness.setState(updates);
   }
 
   for (const setting of settingsToSeed) {
+    if (harness.getCurrentThreadId() !== threadId) return;
     await harness.setThreadSetting(setting);
   }
 }

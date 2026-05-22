@@ -687,7 +687,6 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     resolveModel,
     storageWarning,
     observabilityWarning,
-    signalsPubSub,
     builtinPacks,
     builtinOmPacks,
     effectiveDefaults,

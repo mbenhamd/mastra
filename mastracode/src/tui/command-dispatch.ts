@@ -330,6 +330,7 @@ async function handleCustomSlashCommand(
   ctx: SlashCommandContext,
   displayText: string,
 ): Promise<void> {
+  const commandLabel = displayText.split(/\s+/, 1)[0] || `//${command.name}`;
   try {
     // Process the command template
     const processedContent = await processSlashCommand(command as any, args, process.cwd());
@@ -348,9 +349,9 @@ async function handleCustomSlashCommand(
       const wrapped = `<slash-command name="${command.name}">\n${processedContent.trim()}\n</slash-command>`;
       await sendSlashCommandMessage(commandCtx, displayText, wrapped, { renderIdleUserMessage: false });
     } else {
-      showInfo(state, `Executed //${command.name} (no output)`);
+      showInfo(state, `Executed ${commandLabel} (no output)`);
     }
   } catch (error) {
-    showError(state, `Error executing //${command.name}: ${error instanceof Error ? error.message : String(error)}`);
+    showError(state, `Error executing ${commandLabel}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

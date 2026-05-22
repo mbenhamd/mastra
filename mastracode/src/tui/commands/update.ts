@@ -7,7 +7,7 @@ import {
   isNewerVersion,
   runUpdate,
 } from '../../utils/update-check.js';
-import { askModalQuestion } from '../modal-question.js';
+import { AskQuestionInlineComponent } from '../components/ask-question-inline.js';
 import type { SlashCommandContext } from './types.js';
 
 export async function handleUpdateCommand(ctx: SlashCommandContext): Promise<void> {

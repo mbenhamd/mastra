@@ -6,6 +6,10 @@ on:
       head_sha:
         required: true
         type: string
+      run_vectorize_tests:
+        required: false
+        type: boolean
+        default: false
     secrets:
       TURBO_TOKEN:
         required: false
@@ -34,7 +38,7 @@ jobs:
     outputs:
       stores: ${{ steps.set-stores.outputs.stores }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           ref: ${{ inputs.head_sha }}
           persist-credentials: false
@@ -49,20 +53,10 @@ jobs:
             exit 1
           fi
 
-          # Check if we should include vectorize tests
-          # Only run vectorize tests for dane-ai-mastra bot's version packages PRs
-          PR_DATA=$(gh api "/repos/${{ github.repository }}/commits/${{ inputs.head_sha }}/pulls" --jq '.[0] | {user: .user.login, title: .title}' 2>/dev/null || echo '{}')
-          PR_USER=$(echo "$PR_DATA" | jq -r '.user // ""')
-          PR_TITLE=$(echo "$PR_DATA" | jq -r '.title // ""')
-          IS_VERSIONING_PR=false
-          if [[ "$PR_USER" == "dane-ai-mastra" ]] && [[ "$PR_TITLE" == "chore: version packages" || "$PR_TITLE" == "chore: version packages (alpha)" ]]; then
-            IS_VERSIONING_PR=true
-          fi
-
-          if [[ "$IS_VERSIONING_PR" == "true" ]]; then
-            echo "✓ This is a version packages PR from dane-ai-mastra bot - vectorize tests will run"
+          if [[ "${{ inputs.run_vectorize_tests }}" == "true" ]]; then
+            echo "✓ run_vectorize_tests enabled - vectorize tests will run"
           else
-            echo "✗ Not a version packages PR from dane-ai-mastra bot - filtering out vectorize tests"
+            echo "✗ run_vectorize_tests disabled - filtering out vectorize tests"
             STORES=$(echo "$STORES" | jq -c '[.[] | select(. != "vectorize")]')
           fi
 
@@ -85,7 +79,7 @@ jobs:
       TURBO_CACHE: remote:r
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           ref: ${{ inputs.head_sha }}
           persist-credentials: false
