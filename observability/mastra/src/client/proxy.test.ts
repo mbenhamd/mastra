@@ -88,6 +88,26 @@ describe('ingest validation', () => {
     expect(bus.events).toHaveLength(0);
   });
 
+  it('rejects logs attached to unknown spanIds', () => {
+    const { instance, bus } = createFakeInstance();
+    const proxy = createClientObservabilityProxy({ resolveInstance: () => instance });
+    proxy.receive(
+      {
+        logs: logsPayload([
+          {
+            traceId: TRACE_ID,
+            spanId: 'deadbeefdeadbeef',
+            timeUnixNano: '0',
+            severityText: 'INFO',
+            body: { stringValue: 'hello' },
+          },
+        ]),
+      },
+      carrier(),
+    );
+    expect(bus.events).toHaveLength(0);
+  });
+
   it('rejects payloads exceeding span count limit', () => {
     const { instance, bus } = createFakeInstance();
     const proxy = createClientObservabilityProxy({
@@ -239,6 +259,28 @@ describe('ingest happy path', () => {
     );
     expect(bus.events).toHaveLength(1);
     expect(bus.events[0]).toMatchObject({ type: 'log' });
+  });
+
+  it('forwards logs attached to spans present in the same payload', () => {
+    const { instance, bus } = createFakeInstance();
+    const proxy = createClientObservabilityProxy({ resolveInstance: () => instance });
+    proxy.receive(
+      {
+        spans: spansPayload([makeSpan()]),
+        logs: logsPayload([
+          {
+            traceId: TRACE_ID,
+            spanId: CHILD_SPAN_ID,
+            timeUnixNano: '0',
+            severityText: 'INFO',
+            body: { stringValue: 'hello' },
+          },
+        ]),
+      },
+      carrier(),
+    );
+    expect(bus.events).toHaveLength(3);
+    expect(bus.events[2]).toMatchObject({ type: 'log' });
   });
 
   it('logs warnings via the provided logger when validation fails', () => {

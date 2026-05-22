@@ -77,6 +77,9 @@ export class MastraController {
       pathParams,
       queryParams,
       body,
+      getHeader: name => req.get(name),
+      requestBody: body,
+      requestPathParams: pathParams,
       requestContext: this.requestContext.requestContext,
       abortSignal: this.requestContext.abortSignal,
     });

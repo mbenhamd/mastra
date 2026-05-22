@@ -32,6 +32,12 @@ export interface RouteHandlerParams {
   queryParams: Record<string, unknown>;
   /** Request body (for POST/PUT/PATCH) */
   body: unknown;
+  /** Header lookup helper */
+  getHeader?: (name: string) => string | undefined;
+  /** Unflattened request body */
+  requestBody?: unknown;
+  /** Unflattened URL path parameters */
+  requestPathParams?: Record<string, unknown>;
   /** Request context (user, session, etc.) */
   requestContext: RequestContext;
   /** Abort signal for request cancellation */
@@ -62,6 +68,9 @@ export class RouteHandlerService {
     'taskStore',
     'abortSignal',
     'routePrefix',
+    'getHeader',
+    'requestBody',
+    'requestPathParams',
   ]);
 
   constructor(
@@ -223,6 +232,9 @@ export class RouteHandlerService {
       ...this.omitReservedKeys(validatedPathParams),
       ...this.omitReservedKeys(validatedQueryParams),
       ...(typeof validatedBody === 'object' && validatedBody !== null ? this.omitReservedKeys(validatedBody) : {}),
+      getHeader: params.getHeader ?? (() => undefined),
+      requestBody: validatedBody,
+      requestPathParams: validatedPathParams,
       ...context,
     };
 

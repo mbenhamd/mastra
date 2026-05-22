@@ -181,14 +181,29 @@ class ObservabilityCollectorImpl implements ObservabilityCollector {
     spanStack.push(spanId);
     let statusCode = 1;
     let statusMessage: string | undefined;
+    let result: Promise<T> | T | undefined;
+    let syncError: unknown;
+    let didSyncThrow = false;
     try {
-      return await fn();
+      result = fn();
+    } catch (err) {
+      statusCode = 2;
+      statusMessage = err instanceof Error ? err.message : String(err);
+      syncError = err;
+      didSyncThrow = true;
+    } finally {
+      spanStack.pop();
+    }
+    try {
+      if (didSyncThrow) {
+        throw syncError;
+      }
+      return await (result as Promise<T> | T);
     } catch (err) {
       statusCode = 2;
       statusMessage = err instanceof Error ? err.message : String(err);
       throw err;
     } finally {
-      spanStack.pop();
       this.#spans.push({
         spanId,
         parentSpanId,
@@ -306,10 +321,17 @@ export const createObservabilityCollector: ObservabilityCollectorFactory = paren
  * scope (e.g. when running outside a client tool, or when the user has
  * not opted into the `@mastra/client-js/observability` subpath).
  *
- * This accessor is browser-safe and best-effort. Prefer the `observe`
- * object passed to `clientTool.execute(args, { observe })`; it is
- * scoped to the current tool invocation and does not rely on ambient
- * async context.
+ * This accessor is browser-safe and best-effort. It returns `undefined`
+ * when multiple collector contexts overlap because browsers do not expose
+ * reliable async-local storage. Prefer the `observe` object passed to
+ * `clientTool.execute(args, { observe })`; it is scoped to the current tool
+ * invocation and does not rely on ambient async context.
+ *
+ * The default browser collector preserves synchronous span nesting. After
+ * an awaited boundary inside `span()`, later ambient logs or child spans can
+ * no longer be attributed to that parent without an async-local context, so
+ * they fall back to the carrier span instead of risking cross-invocation
+ * misattribution.
  *
  * ```ts
  * import { getCurrentObservabilityCollector } from '@mastra/client-js/observability';
@@ -322,5 +344,11 @@ export const createObservabilityCollector: ObservabilityCollectorFactory = paren
  * ```
  */
 export function getCurrentObservabilityCollector(): ObservabilityCollector | undefined {
+  // Browsers do not expose a reliable async-local context primitive. When
+  // executions overlap, returning the top of the process-global stack can leak
+  // another tool invocation's collector, so degrade instead of misattributing.
+  if (activeCollectorStack.length !== 1) {
+    return undefined;
+  }
   return activeCollectorStack[activeCollectorStack.length - 1];
 }

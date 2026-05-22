@@ -75,6 +75,63 @@ describe('ObservabilityCollector', () => {
     expect(inner.parentSpanId).toBe(outer.spanId);
   });
 
+  it('parents parallel sibling spans under the carrier instead of another in-flight span', async () => {
+    const collector = createObservabilityCollector(makeCarrier());
+    let releaseFirst!: () => void;
+    await collector.withContext(async () => {
+      const first = collector.span('first', async () => {
+        await new Promise<void>(resolve => {
+          releaseFirst = resolve;
+        });
+      });
+      const second = collector.span('second', async () => 'ok');
+
+      await second;
+      releaseFirst();
+      await first;
+    });
+
+    const spans = flushSpans(collector.flush());
+    const first = spans.find(s => s.name === 'first')!;
+    const second = spans.find(s => s.name === 'second')!;
+    expect(first.parentSpanId).toBe(PARENT_SPAN_ID);
+    expect(second.parentSpanId).toBe(PARENT_SPAN_ID);
+  });
+
+  it('records synchronously-thrown spans before rethrowing', async () => {
+    const collector = createObservabilityCollector(makeCarrier());
+    await collector.withContext(async () => {
+      await expect(
+        collector.span('sync failure', () => {
+          throw new Error('sync boom');
+        }),
+      ).rejects.toThrow('sync boom');
+    });
+
+    const spans = flushSpans(collector.flush());
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.name).toBe('sync failure');
+    expect(spans[0]!.status.code).toBe(2);
+    expect(spans[0]!.status.message).toBe('sync boom');
+  });
+
+  it('rethrows falsy synchronous errors', async () => {
+    const collector = createObservabilityCollector(makeCarrier());
+    await collector.withContext(async () => {
+      await expect(
+        collector.span('falsy failure', () => {
+          throw 0;
+        }),
+      ).rejects.toBe(0);
+    });
+
+    const spans = flushSpans(collector.flush());
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.name).toBe('falsy failure');
+    expect(spans[0]!.status.code).toBe(2);
+    expect(spans[0]!.status.message).toBe('0');
+  });
+
   it('records error status when the wrapped function throws', async () => {
     const collector = createObservabilityCollector(makeCarrier());
     await collector.withContext(async () => {
@@ -126,6 +183,26 @@ describe('ObservabilityCollector', () => {
     expect(logs[1]!.severityText).toBe('WARN');
     // The inner log should be parented under the work span, not the carrier.
     expect(logs[1]!.spanId).not.toBe(PARENT_SPAN_ID);
+  });
+
+  it('falls back to the carrier for child work after an awaited span boundary', async () => {
+    const collector = createObservabilityCollector(makeCarrier());
+    await collector.withContext(async () => {
+      await collector.span('parent', async () => {
+        await Promise.resolve();
+        collector.log('info', 'after await');
+        await collector.span('child after await', async () => 'ok');
+      });
+    });
+
+    const payload = collector.flush();
+    const logs = flushLogs(payload);
+    const spans = flushSpans(payload);
+    const child = spans.find(s => s.name === 'child after await')!;
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]!.spanId).toBe(PARENT_SPAN_ID);
+    expect(child.parentSpanId).toBe(PARENT_SPAN_ID);
   });
 
   it('measures wall-clock execution duration in withContext', async () => {
@@ -183,10 +260,33 @@ describe('ObservabilityCollector', () => {
       await outer.withContext(async () => {
         expect(getCurrentObservabilityCollector()).toBe(outer);
         await inner.withContext(async () => {
-          expect(getCurrentObservabilityCollector()).toBe(inner);
+          expect(getCurrentObservabilityCollector()).toBeUndefined();
         });
         expect(getCurrentObservabilityCollector()).toBe(outer);
       });
+      expect(getCurrentObservabilityCollector()).toBeUndefined();
+    });
+
+    it('does not expose an ambient collector while contexts overlap', async () => {
+      const first = createObservabilityCollector(makeCarrier());
+      const second = createObservabilityCollector(makeCarrier());
+      let releaseFirst!: () => void;
+      let observedDuringOverlap: ReturnType<typeof getCurrentObservabilityCollector> = first;
+
+      const firstRun = first.withContext(async () => {
+        await new Promise<void>(resolve => {
+          releaseFirst = resolve;
+        });
+      });
+
+      await second.withContext(async () => {
+        observedDuringOverlap = getCurrentObservabilityCollector();
+      });
+
+      releaseFirst();
+      await firstRun;
+
+      expect(observedDuringOverlap).toBeUndefined();
       expect(getCurrentObservabilityCollector()).toBeUndefined();
     });
 

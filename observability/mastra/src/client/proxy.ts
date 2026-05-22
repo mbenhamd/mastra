@@ -154,6 +154,10 @@ class ClientObservabilityProxyImpl implements ClientObservabilityProxy {
       this.#warn('Client observability payload contains spans with orphan parents; dropping.');
       return;
     }
+    if (!validateLogLinks(decodedLogs, decodedSpans, parent.spanId)) {
+      this.#warn('Client observability payload contains logs with orphan spanIds; dropping.');
+      return;
+    }
 
     // All validation passed; emit through the bus.
     for (const decoded of decodedSpans) {
@@ -222,6 +226,18 @@ function validateParentLinks(spans: DecodedOtlpSpan[], rootParent: string): bool
       return false;
     }
     if (!known.has(s.parentSpanId)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateLogLinks(logs: DecodedOtlpLog[], spans: DecodedOtlpSpan[], rootParent: string): boolean {
+  if (logs.length === 0) return true;
+  const known = new Set<string>([rootParent]);
+  for (const s of spans) known.add(s.spanId);
+  for (const log of logs) {
+    if (log.spanId && !known.has(log.spanId)) {
       return false;
     }
   }
