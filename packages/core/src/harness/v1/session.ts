@@ -1712,10 +1712,7 @@ export class Session {
   private async _buildActionCatalogEntries(
     source?: HarnessActionCatalogSourceKind,
   ): Promise<HarnessActionCatalogEntry[]> {
-    const skillEntries =
-      source === 'mcp-tool'
-        ? []
-        : await this._resolveSkillActionCatalogEntries();
+    const skillEntries = source === 'mcp-tool' ? [] : await this._resolveSkillActionCatalogEntries();
     const mcpEntries: HarnessActionCatalogEntry[] = [];
     if (source !== 'skill') {
       mcpEntries.push(...(await this._resolveMcpActionCatalogEntries()));
@@ -1817,12 +1814,7 @@ export class Session {
   }
 
   private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor, workspaceId: string): string {
-    return [
-      server.key,
-      this._record.modeId,
-      this._record.modelId ?? '',
-      workspaceId,
-    ].join('\0');
+    return [server.key, this._record.modeId, this._record.modelId ?? '', workspaceId].join('\0');
   }
 
   private _getCachedMcpActionCatalogEntries(cacheKey: string): HarnessActionCatalogEntry[] | undefined {
