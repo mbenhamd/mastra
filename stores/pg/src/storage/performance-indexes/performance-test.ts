@@ -68,7 +68,11 @@ export class PostgresPerformanceTest {
   /** Initialize the store and memory domain used by the benchmark operations. */
   async init(): Promise<void> {
     await this.store.init();
-    this.memory = (await this.store.getStore('memory'))!;
+    const memory = await this.store.getStore('memory');
+    if (!memory) {
+      throw new Error('Memory store is unavailable after PostgresStore initialization');
+    }
+    this.memory = memory;
   }
 
   /** Remove synthetic benchmark rows and refresh planner statistics for touched tables. */
