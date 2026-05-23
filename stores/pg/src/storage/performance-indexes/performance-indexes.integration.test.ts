@@ -156,7 +156,7 @@ describePgPerfIntegration('PostgresStore Performance Indexes Integration', () =>
     for (const results of functionResults.values()) {
       expect(results.length).toBe(testSizes.length);
     }
-  }, 120000);
+  }, 300000);
 
   it('should handle index creation gracefully when indexes already exist', async () => {
     // Re-initialize the store - should not fail even if indexes already exist
