@@ -4,9 +4,9 @@
 '@mastra/client-js': minor
 ---
 
-Harness v1 remote sessions now let developers reliably inspect remote session state through a versioned `displayState` snapshot (`version: 1`).
+Added a versioned `displayState` snapshot (`version: 1`) for Harness v1 remote sessions through `session.getDisplayState()`.
 
-The snapshot includes active tools, tool input buffers, active subagents, token usage, pending operations, queue state, and goal metadata without requiring local runtime objects.
+Improved remote session inspection by exposing active tools, tool input buffers, active subagents, token usage, pending operations, queue state, and goal metadata without requiring local runtime objects.
 
 ```ts
 const session = await client.getHarness('default').getSession('session-id');
