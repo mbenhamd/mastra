@@ -173,7 +173,7 @@ describe('PostgresStore Performance Indexes Integration', () => {
     // Ensure we have some test data
     await db.none(`
       INSERT INTO ${TABLE_THREADS} (id, "resourceId", title, metadata, "createdAt", "updatedAt")
-      VALUES ('test-thread', 'test-resource', 'Test Thread', '{}', NOW(), NOW())
+      VALUES ('thread_query_plan', 'test-resource', 'perf_test_query_plan_thread', '{}', NOW(), NOW())
       ON CONFLICT (id) DO NOTHING
     `);
 

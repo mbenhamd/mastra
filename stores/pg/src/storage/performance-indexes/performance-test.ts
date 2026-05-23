@@ -560,7 +560,7 @@ export class PostgresPerformanceTest {
       SELECT schemaname, tablename, indexname, indexdef
       FROM pg_indexes
       WHERE indexname LIKE '%mastra_%_idx'
-        OR indexname LIKE 'idx_harness_%'
+        OR indexname LIKE '%idx_harness_%'
       ORDER BY tablename, indexname
     `);
 
