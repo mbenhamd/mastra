@@ -1732,13 +1732,7 @@ export class Session {
     entry: HarnessActionCatalogEntry,
     options: { query: string; source?: HarnessActionCatalogSourceKind; limit: number; offset: number },
   ): boolean {
-    if (
-      options.source !== undefined &&
-      entry.source.kind !== options.source &&
-      !(options.source === 'mcp-tool' && entry.source.kind === 'mcp-server')
-    ) {
-      return false;
-    }
+    if (options.source !== undefined && entry.source.kind !== options.source) return false;
     if (options.query.length === 0) return true;
     const haystack = this._actionCatalogSearchText(entry).toLowerCase();
     return haystack.includes(options.query);
@@ -1972,17 +1966,15 @@ export class Session {
       })
       .catch(error => {
         if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) !== pending) return;
-        const timeoutWorkStillTracked =
-          error instanceof ActionCatalogMcpListTimeoutError &&
-          this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work;
+        const timeoutWorkStillTracked = this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work;
+        const didCatalogTimeout =
+          error instanceof ActionCatalogMcpListTimeoutError || (didTimeout() && timeoutWorkStillTracked);
         const existingCache = this._actionsMcpEntriesCacheByServer.get(cacheKey);
         const hasSuccessfulTimedOutResult = existingCache?.successful === true;
-        if (
-          (!(error instanceof ActionCatalogMcpListTimeoutError) || timeoutWorkStillTracked) &&
-          !hasSuccessfulTimedOutResult
-        ) {
-          const reason: HarnessActionCatalogUnavailableReason =
-            error instanceof ActionCatalogMcpListTimeoutError ? 'mcp_tool_catalog_timeout' : 'mcp_tool_catalog_failed';
+        if ((!didCatalogTimeout || timeoutWorkStillTracked) && !hasSuccessfulTimedOutResult) {
+          const reason: HarnessActionCatalogUnavailableReason = didCatalogTimeout
+            ? 'mcp_tool_catalog_timeout'
+            : 'mcp_tool_catalog_failed';
           this._actionsMcpEntriesCacheByServer.set(cacheKey, {
             entries: [this._projectUnavailableMcpActionCatalogEntry(server, reason)],
             expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
