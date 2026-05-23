@@ -1077,10 +1077,15 @@ export class InMemoryHarness extends HarnessStorage {
     operation,
     policyDecision,
     requestId,
+    traceId,
+    spanId,
     affectedPath,
     after,
     limit,
   }: ListWorkspaceActionJournalInput): Promise<WorkspaceActionJournalEntry[]> {
+    if (spanId !== undefined && traceId === undefined) {
+      throw new Error('Workspace action journal spanId filter requires traceId');
+    }
     if (limit <= 0) return [];
     const namespace = resolveHarnessName(harnessName, this.harnessName);
     const rows = Array.from(this.db.harnessWorkspaceActionJournal.values()).filter(entry => {
@@ -1091,6 +1096,8 @@ export class InMemoryHarness extends HarnessStorage {
       if (operation !== undefined && entry.operation !== operation) return false;
       if (policyDecision !== undefined && entry.policyDecision !== policyDecision) return false;
       if (requestId !== undefined && entry.requestId !== requestId) return false;
+      if (traceId !== undefined && entry.traceId !== traceId) return false;
+      if (spanId !== undefined && entry.spanId !== spanId) return false;
       if (affectedPath !== undefined && !workspaceActionJournalEntryMatchesPath(entry, affectedPath)) return false;
       if (after !== undefined && compareWorkspaceActionJournalCursor(entry, after) <= 0) return false;
       return true;
