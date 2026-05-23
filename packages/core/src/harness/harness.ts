@@ -150,7 +150,11 @@ function toSystemReminderContent(
     type: 'system_reminder',
     message,
     reminderType:
-      getStringValue(payload.reminderType) ?? getStringValue(attributes?.type) ?? getStringValue(payload.type),
+      getStringValue(payload.reminderType) ??
+      getStringValue(attributes?.reminderType) ??
+      getStringValue(attributes?.type) ??
+      getStringValue(metadata?.reminderType) ??
+      getStringValue(payload.type),
     path: getStringValue(payload.path) ?? getStringValue(attributes?.path),
     precedesMessageId: getStringValue(payload.precedesMessageId) ?? getStringValue(attributes?.precedesMessageId),
     gapText: getStringValue(payload.gapText) ?? getStringValue(attributes?.gapText),
@@ -2009,14 +2013,13 @@ export class Harness<TState = {}> {
       });
       if (reminder) {
         content.push(reminder);
+        return {
+          id: msg.id,
+          role: 'user',
+          content,
+          createdAt: msg.createdAt,
+        };
       }
-
-      return {
-        id: msg.id,
-        role: 'user',
-        content,
-        createdAt: msg.createdAt,
-      };
     }
 
     if (msg.role === 'signal') {
@@ -2070,7 +2073,7 @@ export class Harness<TState = {}> {
           if (part.toolInvocation) {
             const inv = part.toolInvocation;
             content.push({ type: 'tool_call', id: inv.toolCallId, name: inv.toolName, args: inv.args });
-            if (inv.state === 'result' && inv.result !== undefined) {
+            if (inv.state === 'result') {
               const partProviderMetadata = part.providerMetadata as Record<string, unknown> | undefined;
               content.push({
                 type: 'tool_result',
