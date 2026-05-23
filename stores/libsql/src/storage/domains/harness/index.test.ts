@@ -733,9 +733,17 @@ describe('HarnessLibSQL active session admission', () => {
         sessionId: 'session-1',
         resourceId: 'resource-1',
         spanId: 'span-2',
-        limit: 0,
+        limit: 10,
       }),
     ).rejects.toThrow('spanId filter requires traceId');
+    await expect(
+      storage.appendWorkspaceActionJournalEntry(
+        sampleWorkspaceActionJournalEntry({
+          id: 'invalid-span',
+          spanId: 'span-without-trace',
+        }),
+      ),
+    ).rejects.toThrow('spanId requires traceId');
   });
 
   it('widens existing workspace action journal tables with observability columns', async () => {

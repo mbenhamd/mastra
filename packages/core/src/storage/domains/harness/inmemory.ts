@@ -1054,6 +1054,7 @@ export class InMemoryHarness extends HarnessStorage {
   async appendWorkspaceActionJournalEntry(
     record: WorkspaceActionJournalEntry,
   ): Promise<AppendWorkspaceActionJournalEntryResult> {
+    assertWorkspaceActionTraceScope(record);
     assertWorkspaceActionKindMatches(record);
     const namespaced = { ...record, harnessName: resolveHarnessName(record.harnessName, this.harnessName) };
     const session = this.db.harnessSessions.get(sessionKey(namespaced.harnessName, namespaced.sessionId));
@@ -3532,6 +3533,12 @@ function assertWorkspaceActionKindMatches(record: WorkspaceActionJournalEntry): 
     if (actionKind !== undefined && actionKind !== record.actionKind) {
       throw new Error(`Workspace action journal kind mismatch: ${String(actionKind)} != ${record.actionKind}`);
     }
+  }
+}
+
+function assertWorkspaceActionTraceScope(record: WorkspaceActionJournalEntry): void {
+  if (record.spanId !== undefined && record.traceId === undefined) {
+    throw new Error('Workspace action journal spanId requires traceId');
   }
 }
 
