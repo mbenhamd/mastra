@@ -476,7 +476,7 @@ export class PostgresPerformanceTest {
       const threadPlan = await db.manyOrNone(`
         EXPLAIN (ANALYZE false, FORMAT TEXT)
         SELECT id, "resourceId", title, metadata, "createdAt", "updatedAt"
-        FROM mastra_threads
+        FROM ${TABLE_THREADS}
         WHERE "resourceId" = 'resource_0'
         ORDER BY "createdAt" DESC
       `);
@@ -487,7 +487,7 @@ export class PostgresPerformanceTest {
       const messagePlan = await db.manyOrNone(`
         EXPLAIN (ANALYZE false, FORMAT TEXT)
         SELECT id, content, role, type, "createdAt", thread_id AS "threadId", "resourceId"
-        FROM mastra_messages
+        FROM ${TABLE_MESSAGES}
         WHERE thread_id = 'thread_0'
         ORDER BY "createdAt" DESC
       `);
@@ -545,6 +545,7 @@ export class PostgresPerformanceTest {
       SELECT schemaname, tablename, indexname, indexdef
       FROM pg_indexes
       WHERE indexname LIKE '%mastra_%_idx'
+        OR indexname LIKE 'idx_harness_%'
       ORDER BY tablename, indexname
     `);
 
