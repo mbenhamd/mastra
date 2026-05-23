@@ -2,7 +2,8 @@
 '@mastra/posthog': minor
 ---
 
-Export Mastra operational logs to PostHog for unified observability. Log export is disabled by default so existing tracing setups do not start sending new events unless users opt in.
+Added optional PostHog export for Mastra operational logs.
+Log export is off by default, so existing tracing setups do not send new events until you opt in.
 
 Enable log export with defaults:
 
@@ -28,4 +29,6 @@ new PosthogExporter({
 });
 ```
 
-Log events include trace/span correlation, user/session identifiers, structured log data, and optional Error Tracking fanout for error and fatal logs. Privacy mode redacts freeform log fields while preserving structural correlation properties.
+Added `mastra_log` events with trace and span links, user and session identifiers, and structured log fields.
+Use `eventName`, `minLevel`, `distinctId`, `captureExceptions`, and `dedupe` to customize export behavior.
+Privacy mode redacts message and custom payload fields while preserving correlation fields.
