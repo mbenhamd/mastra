@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import type { MastraDBMessage } from '../../agent/types';
 import { signalToMastraDBMessage } from '../../agent/signals';
 import { convertStoredMessageToHarnessMessage } from './message-conversion';
 import type { StoredMessageRow } from './message-conversion';
 
-function convert(message: MastraDBMessage) {
-  return convertStoredMessageToHarnessMessage(message as unknown as StoredMessageRow);
+function convert(message: StoredMessageRow) {
+  return convertStoredMessageToHarnessMessage(message);
 }
 
 describe('convertStoredMessageToHarnessMessage', () => {

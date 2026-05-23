@@ -7,9 +7,9 @@
  *
  * No `this`-coupling, no harness state — pure function over an input row.
  */
-import type { HarnessMessage, HarnessMessageContent } from '../types';
 import { mastraDBMessageToSignal } from '../../agent/signals';
 import type { MastraDBMessage } from '../../agent/types';
+import type { HarnessMessage, HarnessMessageContent } from '../types';
 
 /**
  * Memory-storage row shape that both runtimes feed in. We type the parts
@@ -205,6 +205,9 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
     }
 
     if (signal.type === 'system-reminder') {
+      // `msg.role === 'signal'` rows parsed through `mastraDBMessageToSignal`
+      // must not fall through to the parts loop; return a user message even
+      // when `toSystemReminderContent` cannot build a reminder payload.
       const reminder = toSystemReminderContent({
         type: signal.type,
         contents: signal.contents,
