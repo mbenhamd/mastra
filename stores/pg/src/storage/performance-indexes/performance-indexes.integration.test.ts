@@ -51,8 +51,7 @@ describePgPerfIntegration('PostgresStore Performance Indexes Integration', () =>
     expect(indexNames.some(name => name.includes('harness_session_events_replay'))).toBe(true);
   });
 
-  // Keep the expensive multi-size benchmark opt-in so package verification remains pipeline-friendly.
-  it.skip('should demonstrate performance scaling with indexes across dataset sizes', async () => {
+  it('should demonstrate performance scaling with indexes across dataset sizes', async () => {
     const testSizes = [
       { name: 'XSmall', size: 100 },
       { name: 'Small', size: 500 },
