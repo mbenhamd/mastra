@@ -59,6 +59,12 @@ export interface HarnessDisplayStateSnapshotV1 {
   goal?: HarnessDisplayJsonValue;
 }
 
+/**
+ * Converts unknown display-state payloads into JSON-safe values. Dates become
+ * ISO strings, bigints become strings, non-finite numbers/cycles/errors become
+ * null, and undefined/function/symbol object fields are omitted. Own
+ * `__proto__` keys are preserved as data properties to avoid prototype writes.
+ */
 function toHarnessDisplayJsonValue(value: unknown, seen = new WeakSet<object>()): HarnessDisplayJsonValue {
   if (value === null) return null;
 
