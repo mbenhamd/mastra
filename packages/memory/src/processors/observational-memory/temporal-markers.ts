@@ -67,7 +67,7 @@ function isTemporalGapMarkerForMessage(message: MastraDBMessage, targetMessageId
 export async function insertTemporalGapMarkers({
   messageList,
   sendSignal,
-}: Pick<ProcessInputStepArgs, 'messageList' | 'sendSignal'>): Promise<void> {
+}: Pick<ProcessInputStepArgs, 'messageList'> & { sendSignal?: ProcessInputStepArgs['sendSignal'] }): Promise<void> {
   const inputMessages = messageList.get.input.db().filter((message): message is MastraDBMessage => Boolean(message));
   const latestInputMessage = inputMessages.at(-1);
 

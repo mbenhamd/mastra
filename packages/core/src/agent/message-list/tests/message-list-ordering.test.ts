@@ -474,6 +474,22 @@ describe('Message ordering with identical timestamps (Issue #10683)', () => {
       });
     });
 
+    it('should give split prompt messages stable unique IDs when projecting signals', () => {
+      const list = new MessageList();
+      const signal = createSignal({
+        id: 'split-signal',
+        type: 'user-message',
+        contents: [
+          { role: 'user' as const, content: 'First signal prompt message' },
+          { role: 'user' as const, content: 'Second signal prompt message' },
+        ],
+      });
+
+      const promptMessages = (list as any).convertSignalForModelPrompt(signal.toDBMessage()) as MastraDBMessage[];
+      expect(promptMessages).toHaveLength(2);
+      expect(promptMessages.map(message => message.id)).toEqual(['split-signal', 'split-signal:prompt:1']);
+    });
+
     it('should normalize regular input signals using transcript timestamps', () => {
       const baseTime = Date.now() + 60_000;
       const responseTime = new Date(baseTime);
