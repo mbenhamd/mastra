@@ -1,4 +1,3 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_SESSIONS,
@@ -9,6 +8,7 @@ import {
   TABLE_SPANS,
   TABLE_THREADS,
 } from '@mastra/core/storage';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { HarnessPG } from '../domains/harness';
 import { MemoryPG } from '../domains/memory';
 import { ObservabilityPG } from '../domains/observability';

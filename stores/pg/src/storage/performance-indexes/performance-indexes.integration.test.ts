@@ -1,3 +1,4 @@
+import { TABLE_THREADS } from '@mastra/core/storage';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { PgDB } from '../db';
 import { PostgresStore } from '../index';
@@ -171,7 +172,7 @@ describe('PostgresStore Performance Indexes Integration', () => {
 
     // Ensure we have some test data
     await db.none(`
-      INSERT INTO mastra_threads (id, "resourceId", title, metadata, "createdAt", "updatedAt") 
+      INSERT INTO ${TABLE_THREADS} (id, "resourceId", title, metadata, "createdAt", "updatedAt")
       VALUES ('test-thread', 'test-resource', 'Test Thread', '{}', NOW(), NOW())
       ON CONFLICT (id) DO NOTHING
     `);
@@ -179,9 +180,9 @@ describe('PostgresStore Performance Indexes Integration', () => {
     // Get query plan for indexed query
     const plan = await db.manyOrNone(`
       EXPLAIN (FORMAT TEXT)
-      SELECT id, "resourceId", title, metadata, "createdAt", "updatedAt" 
-      FROM mastra_threads 
-      WHERE "resourceId" = 'test-resource' 
+      SELECT id, "resourceId", title, metadata, "createdAt", "updatedAt"
+      FROM ${TABLE_THREADS}
+      WHERE "resourceId" = 'test-resource'
       ORDER BY "createdAt" DESC
     `);
 

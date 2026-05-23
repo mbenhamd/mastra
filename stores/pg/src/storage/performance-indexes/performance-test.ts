@@ -43,10 +43,12 @@ type DefaultIndexCreator = {
   createDefaultIndexes(): Promise<void>;
 };
 
+/** Returns true when a storage domain exposes the default-index hook used by this perf helper. */
 function hasDefaultIndexCreator(domain: unknown): domain is DefaultIndexCreator {
   return typeof (domain as Partial<DefaultIndexCreator> | undefined)?.createDefaultIndexes === 'function';
 }
 
+/** Runs the Postgres storage performance-index smoke and comparison suite against a configured database. */
 export class PostgresPerformanceTest {
   private store: PostgresStore;
   private memory!: MemoryStorage;
@@ -63,11 +65,13 @@ export class PostgresPerformanceTest {
     this.dbOps = new PgDB({ client: this.store.db });
   }
 
+  /** Initialize the store and memory domain used by the benchmark operations. */
   async init(): Promise<void> {
     await this.store.init();
     this.memory = (await this.store.getStore('memory'))!;
   }
 
+  /** Remove synthetic benchmark rows and refresh planner statistics for touched tables. */
   async cleanup(): Promise<void> {
     // Clean up test data more aggressively
     const db = this.store.db;
@@ -105,6 +109,7 @@ export class PostgresPerformanceTest {
     console.info('📊 Updated PostgreSQL statistics after cleanup');
   }
 
+  /** Truncate benchmark tables when a run needs a fully clean database. */
   async resetDatabase(): Promise<void> {
     // Nuclear option: completely reset all tables
     const db = this.store.db;
@@ -122,6 +127,7 @@ export class PostgresPerformanceTest {
     }
   }
 
+  /** Drop the performance indexes measured by the benchmark's before/after comparison. */
   async dropPerformanceIndexes(): Promise<void> {
     console.info('Dropping performance indexes...');
     // Get schema name for index naming
@@ -157,6 +163,7 @@ export class PostgresPerformanceTest {
     }
   }
 
+  /** Ask each initialized storage domain to create its default indexes. */
   async createDefaultIndexes(): Promise<void> {
     console.info('Creating indexes...');
     for (const domain of Object.values(this.store.stores)) {
@@ -166,6 +173,7 @@ export class PostgresPerformanceTest {
     }
   }
 
+  /** Seed synthetic threads, messages, and spans at the configured benchmark scale. */
   async seedTestData(): Promise<void> {
     console.info(`Seeding ${this.config.testDataSize} test records...`);
 
@@ -367,6 +375,7 @@ export class PostgresPerformanceTest {
     console.info('Test data seeding completed');
   }
 
+  /** Measure one benchmark operation across the configured number of iterations. */
   async measureOperation(
     name: string,
     operation: () => Promise<any>,
@@ -400,6 +409,7 @@ export class PostgresPerformanceTest {
     };
   }
 
+  /** Run the benchmark operations for one index scenario. */
   async runPerformanceTests(scenario: 'without_indexes' | 'with_indexes'): Promise<PerformanceResult[]> {
     const results: PerformanceResult[] = [];
 
@@ -431,6 +441,7 @@ export class PostgresPerformanceTest {
     return results;
   }
 
+  /** Compare benchmark operation timings before and after default index creation. */
   async runComparisonTest(): Promise<PerformanceComparison[]> {
     console.info('\n=== Running Performance Comparison Test ===');
 
@@ -467,6 +478,7 @@ export class PostgresPerformanceTest {
     return comparisons;
   }
 
+  /** Print planner output for the benchmark's representative memory queries. */
   async analyzeCurrentQueries(): Promise<void> {
     const db = this.store.db;
     console.info('\n=== Query Execution Plans ===');
@@ -498,6 +510,7 @@ export class PostgresPerformanceTest {
     }
   }
 
+  /** Print before/after comparison rows for benchmark output. */
   printComparison(comparisons: PerformanceComparison[]): void {
     console.info('\n=== Performance Comparison Results ===');
     console.info('Operation                 | Without (ms) | With (ms) | Improvement | % Faster');
@@ -522,6 +535,7 @@ export class PostgresPerformanceTest {
     console.info(`Best improvement: ${maxOp?.operation} - ${maxImprovement.toFixed(2)}x faster`);
   }
 
+  /** Print raw benchmark result rows for one scenario. */
   printResults(results: PerformanceResult[]): void {
     console.info('\n=== Performance Test Results ===');
     console.info('Operation                 | Scenario         | Avg (ms) | Min (ms) | Max (ms) | Iterations');
@@ -539,6 +553,7 @@ export class PostgresPerformanceTest {
     }
   }
 
+  /** Print the performance indexes currently visible in the connected database. */
   async checkIndexes(): Promise<void> {
     const db = this.store.db;
     const indexes = await db.manyOrNone(`
