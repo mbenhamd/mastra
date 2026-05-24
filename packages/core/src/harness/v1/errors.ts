@@ -78,6 +78,22 @@ export class HarnessSessionClosingError extends Error {
   }
 }
 
+/**
+ * Raised when a queued turn or pending resume is rejected because the session
+ * or a specific queue item was cancelled before the work completed.
+ */
+export class HarnessSessionCancelledError extends Error {
+  readonly name = 'HarnessSessionCancelledError';
+  readonly code = 'harness.session_cancelled';
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly reason?: string,
+  ) {
+    super(reason ? `Session "${sessionId}" cancelled: ${reason}` : `Session "${sessionId}" cancelled`);
+  }
+}
+
 export class HarnessSessionDeleteBlockedError extends Error {
   readonly name = 'HarnessSessionDeleteBlockedError';
   constructor(

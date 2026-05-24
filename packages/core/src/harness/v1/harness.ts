@@ -3901,6 +3901,11 @@ export class Harness {
     return `thread-${randomUUID()}`;
   }
 
+  /** @internal — used by Session.cancel(...) to walk the live subagent tree. */
+  _internalGetLiveSession(sessionId: string): Session | undefined {
+    return this._liveSessions.get(sessionId);
+  }
+
   /** @internal — exposed for inspection in tests. */
   _internalLiveSessionCount(): number {
     return this._liveSessions.size;

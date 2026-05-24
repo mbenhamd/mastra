@@ -343,6 +343,18 @@ export interface SessionRecord {
   ownerId?: string;
   /** Epoch ms — when the current lease TTLs out. */
   leaseExpiresAt?: number;
+  /**
+   * Durable marker set when `Session.cancel(...)` runs. Once present, pending
+   * resume attempts fail closed instead of resurrecting cancelled work after a
+   * restart or race. First writer wins; later cancel attempts preserve the
+   * original requestedAt/reason/requestedBy tuple.
+   */
+  cancelRequest?: {
+    requestedAt: number;
+    reason?: string;
+    /** Free-form actor label, for example an A2A task id or route id. */
+    requestedBy?: string;
+  };
 }
 
 /**
