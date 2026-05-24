@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Added type-safe Harness v1 work-unit contracts under `@mastra/core/harness/v1`.
+Added type-safe Harness v1 work-unit types under `@mastra/core/harness/v1`.
 
 Developers can now use shared types for tasks, runs, evidence, and pending interactions when building Harness integrations. This release adds types only; it does not change runtime behavior.
 
