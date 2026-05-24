@@ -1077,6 +1077,9 @@ export class Session {
    */
   private _beginTurn(callerSignal: AbortSignal | undefined): AbortController {
     const controller = new AbortController();
+    this._currentTurnAbortController = controller;
+    this._resetTurnTracking();
+    controller.signal.addEventListener('abort', () => this._scheduleActiveTurnAbort(controller), { once: true });
     if (callerSignal) {
       if (callerSignal.aborted) {
         controller.abort((callerSignal as { reason?: unknown }).reason);
@@ -1086,8 +1089,6 @@ export class Session {
         });
       }
     }
-    this._currentTurnAbortController = controller;
-    this._resetTurnTracking();
     return controller;
   }
 
@@ -1150,6 +1151,23 @@ export class Session {
     for (const waiter of waiters) {
       waiter.reject(reason);
     }
+  }
+
+  private _scheduleActiveTurnAbort(controller: AbortController): void {
+    const reason = (controller.signal as { reason?: unknown }).reason;
+    const message = typeof reason === 'string' && reason.length > 0 ? reason : 'session_aborted';
+    const err = reason instanceof Error ? reason : new HarnessSessionCancelledError(this.id, message);
+    setTimeout(() => {
+      if (this._currentTurnAbortController !== controller || !controller.signal.aborted) return;
+      this._rejectActiveTurnWaiters(err);
+    }, 0);
+  }
+
+  private _agentEndReasonForFullOutput(full: FullOutput<unknown>): 'complete' | 'aborted' | 'error' | 'suspended' {
+    if (full.finishReason === 'suspended') return 'suspended';
+    if (full.finishReason === 'aborted') return 'aborted';
+    if (full.finishReason === 'error') return 'error';
+    return 'complete';
   }
 
   private _raceActiveTurnWaiter<T>(promise: Promise<T>, activeTurnWaiter?: Promise<never>): Promise<T> {
@@ -3741,6 +3759,7 @@ export class Session {
 
     // Structured + sync path: agent.generate with structuredOutput.
     if (opts.output !== undefined && opts.sync === true) {
+      let agentEndEmitted = false;
       try {
         const result = await Promise.race([
           agent.generate(opts.content, {
@@ -3766,11 +3785,20 @@ export class Session {
         }
         this._emitTurnEvent({
           type: 'agent_end',
-          reason: full.finishReason === 'suspended' ? 'suspended' : 'complete',
+          reason: this._agentEndReasonForFullOutput(full),
           runId: full.runId,
         });
+        agentEndEmitted = true;
         await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
         return full.object;
+      } catch (err) {
+        if (!agentEndEmitted) {
+          this._emitTurnEvent({
+            type: 'agent_end',
+            reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+          });
+        }
+        throw err;
       } finally {
         finishOwnedMessageTurn();
       }
@@ -4036,6 +4064,7 @@ export class Session {
         throw err;
       }
       let streamCompletedEvidenceWriteFailed = false;
+      let streamAgentEndEmitted = false;
       const streamBookkeeping = Promise.race([completion, activeTurnWaiter.promise])
         .then(async full => {
           try {
@@ -4082,9 +4111,10 @@ export class Session {
         .then(async full => {
           this._emitTurnEvent({
             type: 'agent_end',
-            reason: full.finishReason === 'suspended' ? 'suspended' : 'complete',
+            reason: this._agentEndReasonForFullOutput(full),
             runId: full.runId,
           });
+          streamAgentEndEmitted = true;
           await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
         })
         .catch(err => {
@@ -4107,6 +4137,13 @@ export class Session {
               { compatibleAdmissionHashes },
             ).catch(() => {});
           }
+          if (!streamAgentEndEmitted) {
+            this._emitTurnEvent({
+              type: 'agent_end',
+              reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+              runId: signal.runId,
+            });
+          }
           // The caller owns the visible stream; swallow drain-side errors.
         })
         .finally(() => {
@@ -4122,6 +4159,7 @@ export class Session {
     // deliver this run's bundled `FullOutput`, then run post-turn bookkeeping.
     let streamStarted = signal.output === undefined;
     let completedEvidenceWriteFailed = false;
+    let agentEndEmitted = false;
     try {
       // The pre-dispatch reservation is the durable admission barrier here.
       // Keep the post-dispatch pending refresh best-effort so completion
@@ -4174,9 +4212,10 @@ export class Session {
       }
       this._emitTurnEvent({
         type: 'agent_end',
-        reason: full.finishReason === 'suspended' ? 'suspended' : 'complete',
+        reason: this._agentEndReasonForFullOutput(full),
         runId: full.runId,
       });
+      agentEndEmitted = true;
       await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
       return full;
     } catch (err) {
@@ -4208,6 +4247,13 @@ export class Session {
           ).catch(() => {}),
           activeTurnWaiter.promise,
         ]);
+      }
+      if (!agentEndEmitted) {
+        this._emitTurnEvent({
+          type: 'agent_end',
+          reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+          runId: signal.runId,
+        });
       }
       throw err;
     } finally {
@@ -4837,6 +4883,7 @@ export class Session {
       // Register the completion waiter before any terminal chunks land.
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
+      let agentEndEmitted = false;
 
       // Background continuation runs the post-turn bookkeeping so the
       // caller's `result` promise resolves with the final AgentResult.
@@ -4867,11 +4914,22 @@ export class Session {
             }
             this._emitTurnEvent({
               type: 'agent_end',
-              reason: full.finishReason === 'suspended' ? 'suspended' : 'complete',
+              reason: this._agentEndReasonForFullOutput(full),
               runId: full.runId,
             });
+            agentEndEmitted = true;
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
             return full as AgentResult;
+          })
+          .catch(err => {
+            if (!agentEndEmitted) {
+              this._emitTurnEvent({
+                type: 'agent_end',
+                reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+                runId: dispatched.runId,
+              });
+            }
+            throw err;
           })
           .finally(() => {
             finishOwnedSignalTurn();
@@ -5017,6 +5075,7 @@ export class Session {
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
+      let agentEndEmitted = false;
       const result = this._trackBackgroundTurnCompletion(
         completionOrDelete
           .then(async full => {
@@ -5044,10 +5103,21 @@ export class Session {
             }
             this._emitTurnEvent({
               type: 'agent_end',
-              reason: full.finishReason === 'suspended' ? 'suspended' : 'complete',
+              reason: this._agentEndReasonForFullOutput(full),
               runId: full.runId,
             });
+            agentEndEmitted = true;
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
+          })
+          .catch(err => {
+            if (!agentEndEmitted) {
+              this._emitTurnEvent({
+                type: 'agent_end',
+                reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+                runId: dispatched.runId,
+              });
+            }
+            throw err;
           })
           .finally(() => {
             finishOwnedReminderTurn();
@@ -5125,11 +5195,7 @@ export class Session {
     const pending = this._pendingResumeFromSuspendedOutput(full, payload, queuedItemId, modeId, modelId);
     if (pending === undefined) return;
     const existing = this._record.pendingResume;
-    if (
-      existing &&
-      existing.runId === full.runId &&
-      existing.toolCallId === payload.toolCallId
-    ) {
+    if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
       await this._flushUpdate(prev => prev, { tokenUsageDelta: opts.tokenUsageDelta });
       this._clearPendingDurableTurnFlushErrorIfRepaired(full);
       return;
@@ -6763,7 +6829,7 @@ export class Session {
       if (full.finishReason !== 'suspended') {
         this._emitTurnEvent({
           type: 'agent_end',
-          reason: full.finishReason === 'error' ? 'error' : 'complete',
+          reason: this._agentEndReasonForFullOutput(full),
           runId: full.runId,
         });
 
@@ -8141,6 +8207,8 @@ export class Session {
         throw new HarnessSessionDeletedError(this.id);
       }
     };
+    let agentStarted = false;
+    let agentEndEmitted = false;
 
     try {
       const requestContext = await Promise.race([
@@ -8162,6 +8230,7 @@ export class Session {
       };
 
       this._emitTurnEvent({ type: 'agent_start' });
+      agentStarted = true;
 
       await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
       assertQueuedTurnNotDeleted();
@@ -8193,6 +8262,7 @@ export class Session {
         signalIdentity.signalId,
         effectiveModeId,
         activeTurnWaiter.promise,
+        { onAgentEnd: () => (agentEndEmitted = true) },
       );
       void completion.catch(() => {});
       if (signalIdentity !== identity) {
@@ -8217,7 +8287,19 @@ export class Session {
         })).catch(() => {}),
         activeTurnWaiter.promise,
       ]);
-      return await Promise.race([completion, activeTurnWaiter.promise]);
+      const full = await Promise.race([completion, activeTurnWaiter.promise]);
+      agentEndEmitted = true;
+      return full;
+    } catch (err) {
+      if (agentStarted && !agentEndEmitted) {
+        this._emitTurnEvent({
+          type: 'agent_end',
+          reason: turnAbortController.signal.aborted ? 'aborted' : 'error',
+          runId: identity.runId,
+          queuedItemId: item.id,
+        });
+      }
+      throw err;
     } finally {
       finishQueuedTurn();
     }
@@ -8312,6 +8394,7 @@ export class Session {
     signalId: string,
     modeId: string,
     activeTurnWaiter?: Promise<never>,
+    opts: { onAgentEnd?: () => void } = {},
   ): Promise<FullOutput<unknown>> {
     let full: FullOutput<unknown>;
     try {
@@ -8347,7 +8430,7 @@ export class Session {
         activeTurnWaiter,
       );
     } else {
-      await this._finalizeQueuedRunCompletion(item, full, modeId, activeTurnWaiter);
+      await this._finalizeQueuedRunCompletion(item, full, modeId, activeTurnWaiter, opts);
     }
     return full;
   }
@@ -8405,10 +8488,7 @@ export class Session {
             item,
             full,
             modeId,
-            new QueuePostRunFinalizationPendingError(
-              Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS,
-              completionErr,
-            ),
+            new QueuePostRunFinalizationPendingError(Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS, completionErr),
           );
           return;
         }
@@ -8484,7 +8564,7 @@ export class Session {
     full: FullOutput<unknown>,
     modeId?: string,
     activeTurnWaiter?: Promise<never>,
-    opts: { skipTokenAccounting?: boolean } = {},
+    opts: { skipTokenAccounting?: boolean; onAgentEnd?: () => void } = {},
   ): Promise<FullOutput<unknown>> {
     const tokenUsageDelta = opts.skipTokenAccounting
       ? undefined
@@ -8502,9 +8582,10 @@ export class Session {
     }
     this._emitTurnEvent({
       type: 'agent_end',
-      reason: full.finishReason === 'suspended' ? 'suspended' : full.finishReason === 'error' ? 'error' : 'complete',
+      reason: this._agentEndReasonForFullOutput(full),
       runId: full.runId,
     });
+    opts.onAgentEnd?.();
     await this._raceActiveTurnWaiter(this._runGoalJudge(full, (item.source ?? 'user') === 'goal'), activeTurnWaiter);
     return full;
   }

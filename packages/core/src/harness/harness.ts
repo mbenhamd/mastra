@@ -232,6 +232,8 @@ export class Harness<TState = {}> {
   private displayStateSchedulers = new Set<DisplayStateScheduler>();
   private abortController: AbortController | null = null;
   private abortRequested: boolean = false;
+  private abortGeneration = 0;
+  private abortWaiters = new Set<() => void>();
   private currentRunId: string | null = null;
   private currentTraceId: string | null = null;
   private currentOperationId: number = 0;
@@ -1622,6 +1624,33 @@ export class Harness<TState = {}> {
     return this.agentThreadSubscription === subscription;
   }
 
+  private createAbortWaiter(generation: number): { promise: Promise<void>; cleanup: () => void } {
+    let waiter: (() => void) | undefined;
+    const promise = new Promise<void>(resolve => {
+      if (this.abortGeneration !== generation) {
+        resolve();
+        return;
+      }
+      waiter = resolve;
+      this.abortWaiters.add(waiter);
+    });
+    return {
+      promise,
+      cleanup: () => {
+        if (waiter) this.abortWaiters.delete(waiter);
+      },
+    };
+  }
+
+  private notifyAbortWaiters(): void {
+    if (this.abortWaiters.size === 0) return;
+    const waiters = Array.from(this.abortWaiters);
+    this.abortWaiters.clear();
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
   private async finishSubscribedStreamRun({
     suspended,
     error,
@@ -1689,6 +1718,10 @@ export class Harness<TState = {}> {
 
         try {
           const streamResult = await this.processStreamChunk(currentRun, chunk, requestContext);
+          if (!this.isActiveAgentThreadSubscription(subscription)) {
+            subscription.unsubscribe();
+            break;
+          }
           if (
             streamResult ||
             chunk.type === 'finish' ||
@@ -1709,6 +1742,10 @@ export class Harness<TState = {}> {
             currentRun = undefined;
           }
         } catch (error) {
+          if (!this.isActiveAgentThreadSubscription(subscription)) {
+            subscription.unsubscribe();
+            break;
+          }
           await this.handleSubscribedStreamError(error);
           currentRun = undefined;
         }
@@ -1735,6 +1772,13 @@ export class Harness<TState = {}> {
   ): { id: string; type: AgentSignalInput['type']; accepted: Promise<{ accepted: true; runId: string }> } {
     const { tracingContext, tracingOptions, requestContext: requestContextInput } = 'content' in input ? input : {};
     const signal = createSignal('content' in input ? { type: 'user-message', contents: input.content } : input);
+    const abortGeneration = this.abortGeneration;
+    const throwIfAdmissionAborted = () => {
+      if (this.abortGeneration === abortGeneration) return;
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      throw err;
+    };
     const accepted = Promise.resolve().then(async () => {
       if (!this.currentThreadId) {
         const thread = await this.createThread();
@@ -1743,6 +1787,7 @@ export class Harness<TState = {}> {
 
       const agent = this.getCurrentAgent();
       await this.ensureAgentThreadSubscription(agent, this.currentThreadId);
+      throwIfAdmissionAborted();
 
       if (this.agentThreadSubscription?.activeRunId()) {
         const result = agent.sendSignal(signal, {
@@ -1768,6 +1813,7 @@ export class Harness<TState = {}> {
         ...(tracingOptions && { tracingOptions }),
       };
       streamOptions.toolsets = await this.buildToolsets(requestContext);
+      throwIfAdmissionAborted();
 
       const result = agent.sendSignal(signal, {
         resourceId: this.resourceId,
@@ -1834,20 +1880,32 @@ export class Harness<TState = {}> {
       : this.subscribe(event => {
           if (event.type === 'agent_end') emittedAgentEnd = true;
         });
+    const abortWaiter = this.createAbortWaiter(this.abortGeneration);
     const signal = this.sendSignal({
       content: messageInput,
       tracingContext,
       tracingOptions,
       requestContext: requestContextInput,
     });
-    await signal.accepted;
-    if (!wasActive) {
-      await new Promise(resolve => setTimeout(resolve, 0));
-      await this.waitForCurrentThreadStreamIdle();
-      unsubscribeAgentEnd?.();
-      if (!emittedAgentEnd && !this.pendingSuspensionRunId) {
-        this.emit({ type: 'agent_end', reason: 'complete' });
+    try {
+      await Promise.race([
+        signal.accepted,
+        abortWaiter.promise.then(() => {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          throw err;
+        }),
+      ]);
+      if (!wasActive) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await this.waitForCurrentThreadStreamIdle();
+        if (!emittedAgentEnd && !this.pendingSuspensionRunId) {
+          this.emit({ type: 'agent_end', reason: 'complete' });
+        }
       }
+    } finally {
+      abortWaiter.cleanup();
+      unsubscribeAgentEnd?.();
     }
     return;
   }
@@ -2539,15 +2597,32 @@ export class Harness<TState = {}> {
    * Abort the current operation.
    */
   abort(): void {
+    this.abortGeneration++;
+    this.notifyAbortWaiters();
+    const activeSubscription = this.agentThreadSubscription;
+    const wasThreadStreamActive = this.isCurrentThreadStreamActive() || this.currentRunId !== null;
     this.abortRequested = true;
     try {
-      this.agentThreadSubscription?.abort();
+      activeSubscription?.abort();
     } catch {}
     if (this.abortController) {
       try {
         this.abortController.abort();
       } catch {}
       this.abortController = null;
+    }
+    if (wasThreadStreamActive) {
+      try {
+        activeSubscription?.unsubscribe();
+      } catch {}
+      if (this.agentThreadSubscription === activeSubscription) {
+        this.agentThreadSubscription = null;
+        this.agentThreadSubscriptionKey = null;
+      }
+      this.currentRunId = null;
+      this.currentTraceId = null;
+      this.abortRequested = false;
+      this.emit({ type: 'agent_end', reason: 'aborted' });
     }
   }
 
