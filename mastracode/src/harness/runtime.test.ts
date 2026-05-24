@@ -2,7 +2,7 @@ import { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
-import { MASTRACODE_HARNESS_NAME } from './config.js';
+import { MASTRACODE_HARNESS_NAME, toHarnessV1Agents, toHarnessV1Modes } from './config.js';
 import { MastraCodeHarnessRuntime } from './runtime.js';
 
 function createRuntime(
@@ -500,6 +500,35 @@ describe('MastraCodeHarnessRuntime', () => {
     });
 
     expect(runtime.getMastra().getAgent('mode-review-agent' as never)).toBe(reviewAgent);
+  });
+
+  it('binds function-backed custom modes to their resolved Harness v1 agent', () => {
+    const codeAgent = new Agent({
+      id: 'code-agent',
+      name: 'Code Agent',
+      instructions: 'test',
+      model: 'openai/gpt-4o-mini' as any,
+    });
+    const reviewAgent = new Agent({
+      id: 'review-agent',
+      name: 'Review Agent',
+      instructions: 'review',
+      model: 'openai/gpt-4o-mini' as any,
+    });
+    const modes = [
+      { id: 'build', name: 'Build', default: true, agent: codeAgent },
+      {
+        id: 'review',
+        name: 'Review',
+        agent: (state: { selected: string }) => (state.selected === 'review' ? reviewAgent : codeAgent),
+      },
+    ];
+
+    const agents = toHarnessV1Agents({ 'code-agent': codeAgent }, modes, { selected: 'review' });
+    const harnessModes = toHarnessV1Modes(modes, agents, 'build');
+
+    expect(agents['mode-review-agent']).toBe(reviewAgent);
+    expect(harnessModes.find(mode => mode.id === 'review')?.agentId).toBe('mode-review-agent');
   });
 
   it('registers native Harness v1 spawn_subagent types for MastraCode subagent agents', () => {

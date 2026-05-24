@@ -79,10 +79,14 @@ export function subagentModeId(subagentId: string): string {
 export function toHarnessV1Agents<TState>(
   baseAgents: Record<string, Agent>,
   modes: LegacyHarnessMode<TState>[],
+  initialState: TState,
 ): Record<string, Agent> {
   const agents = { ...baseAgents };
   for (const mode of modes) {
-    if (typeof mode.agent === 'function') continue;
+    if (typeof mode.agent === 'function') {
+      agents[modeAgentId(mode.id)] = mode.agent(initialState);
+      continue;
+    }
     if (Object.values(agents).includes(mode.agent)) continue;
     agents[modeAgentId(mode.id)] = mode.agent;
   }
@@ -100,7 +104,7 @@ export function toHarnessV1Modes<TState>(
     ...modes.map(mode => ({
       id: mode.id,
       agentId:
-        typeof mode.agent === 'function' ? 'code-agent' : (agentIdsByInstance.get(mode.agent) ?? modeAgentId(mode.id)),
+        typeof mode.agent === 'function' ? modeAgentId(mode.id) : (agentIdsByInstance.get(mode.agent) ?? modeAgentId(mode.id)),
       description: mode.name,
       transitionsTo: mode.id === 'plan' && defaultModeId !== 'plan' ? defaultModeId : undefined,
       metadata: {

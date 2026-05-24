@@ -248,6 +248,39 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
     expect((session.getRecord().pendingQueue ?? []).map(i => i.id)).toEqual(['q-future']);
   });
 
+  it('does not expire completed receipts waiting for post-run finalization', async () => {
+    const { session } = await setup();
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => events.push(e));
+    const past = Date.now() - 1000;
+    await (session as any)._flushUpdate((prev: any) => ({
+      ...prev,
+      pendingQueue: [
+        { id: 'q-completed', admissionId: 'a1', enqueuedAt: 1, content: 'done', attachments: [], deadline: past },
+      ],
+      queueAdmissionReceipts: {
+        'q-completed': {
+          admissionId: 'a1',
+          admissionHash: 'h1',
+          queuedItemId: 'q-completed',
+          status: 'completed',
+          attempts: 1,
+          enqueuedAt: 1,
+          updatedAt: 2,
+          completedAt: 2,
+          runId: 'run-completed',
+          result: { text: 'done', finishReason: 'stop' },
+        },
+      },
+    }));
+
+    await (session as any)._scheduleNextQueueHead();
+
+    expect((session.getRecord().pendingQueue ?? []).map(i => i.id)).toEqual(['q-completed']);
+    expect(session.getRecord().queueAdmissionReceipts?.['q-completed']?.status).toBe('completed');
+    expect(events.some(e => e.type === 'queue_item_expired')).toBe(false);
+  });
+
   it('no-op when the queue is empty', async () => {
     const { session } = await setup();
     const before = session.getRecord().pendingQueue;
