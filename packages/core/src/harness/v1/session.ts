@@ -7248,10 +7248,19 @@ export class Session {
 
     const queued = createDeferred<AgentResult>();
     const promise = queued.promise;
-    const currentReceipt = this._record.queueAdmissionReceipts?.[admission.queuedItemId];
-    if (currentReceipt?.status === 'failed' && currentReceipt.error?.code === 'harness.queue_full_dropped') {
-      queued.reject(new HarnessQueueFullDroppedError(admission.queuedItemId));
+    const latestReceipt = this._record.queueAdmissionReceipts?.[admission.queuedItemId];
+    const terminalAdmissionError = this._queueReceiptTerminalFailureErrorFromReceipt(latestReceipt);
+    if (terminalAdmissionError) {
+      queued.reject(
+        latestReceipt?.status === 'failed' && latestReceipt.error?.code === 'harness.queue_full_dropped'
+          ? new HarnessQueueFullDroppedError(admission.queuedItemId)
+          : terminalAdmissionError,
+      );
       void promise.catch(() => {});
+      return promise;
+    }
+    if (latestReceipt?.status === 'completed') {
+      queued.resolve(latestReceipt.result as AgentResult);
       return promise;
     }
 
@@ -7634,6 +7643,12 @@ export class Session {
       if (value !== undefined && (!Number.isFinite(value) || Object.is(value, -0))) {
         throw new HarnessValidationError(`${methodName}.${field}`, 'must be a finite JSON number other than -0');
       }
+    }
+    if (opts.notBefore !== undefined && opts.deadline !== undefined && opts.notBefore > opts.deadline) {
+      throw new HarnessValidationError(
+        `${methodName}.notBefore`,
+        '`notBefore` must be less than or equal to `deadline`',
+      );
     }
   }
 

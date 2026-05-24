@@ -140,10 +140,6 @@ vi.mock('./agents/memory.js', () => ({
   getDynamicMemory: getDynamicMemoryMock,
 }));
 
-vi.mock('../agents/memory.js', () => ({
-  getDynamicMemory: getDynamicMemoryMock,
-}));
-
 vi.mock('./agents/model.js', () => ({
   getDynamicModel: vi.fn(),
   resolveModel: vi.fn(),

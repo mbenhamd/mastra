@@ -185,6 +185,14 @@ describe('Session.queue() — admission', () => {
         deadline: Number.POSITIVE_INFINITY,
       } as any),
     ).rejects.toBeInstanceOf(HarnessValidationError);
+    await expect(
+      session.admitQueue({
+        content: 'bad window',
+        admissionId: 'queue-bad-window',
+        notBefore: Date.now() + 10_000,
+        deadline: Date.now(),
+      }),
+    ).rejects.toThrow('`notBefore` must be less than or equal to `deadline`');
     await session.close();
   });
 
@@ -287,6 +295,37 @@ describe('Session.queue() — admission', () => {
     });
 
     await expect(session.queue({ content: 'first' })).rejects.toBeInstanceOf(HarnessQueueFullDroppedError);
+    await session.close();
+  });
+
+  it('rejects queue() if the receipt fails before the local resolver is registered', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const admitQueue = (session as any)._admitQueue.bind(session);
+    vi.spyOn(session as any, '_admitQueue').mockImplementation(async (...args: any[]) => {
+      const admission = await admitQueue(...args);
+      const now = Date.now();
+      await (session as any)._flushUpdate((prev: any) => ({
+        ...prev,
+        pendingQueue: (prev.pendingQueue ?? []).filter((item: { id: string }) => item.id !== admission.queuedItemId),
+        queueAdmissionReceipts: {
+          ...(prev.queueAdmissionReceipts ?? {}),
+          [admission.queuedItemId]: {
+            ...prev.queueAdmissionReceipts[admission.queuedItemId],
+            status: 'failed',
+            error: {
+              code: 'harness.queue_failed',
+              message: 'queued turn failed before resolver registration',
+            },
+            failedAt: now,
+            updatedAt: now,
+          },
+        },
+      }));
+      return admission;
+    });
+
+    await expect(session.queue({ content: 'first' })).rejects.toMatchObject({ code: 'harness.queue_failed' });
     await session.close();
   });
 

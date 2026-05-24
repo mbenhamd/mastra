@@ -2,6 +2,6 @@
 'mastracode': patch
 ---
 
-Moved MastraCode onto the Harness v1 runtime while preserving its existing CLI and TUI behavior.
+MastraCode now runs on Harness v1 while keeping the same CLI and TUI entry points. Users should see more reliable task handling, thread recovery, permissions, and display updates because those flows now use the shared Harness v1 runtime.
 
-This is a backward-compatible runtime migration: existing MastraCode callers keep using the same entry points, while threads, signals, permissions, tasks, and display events now flow through Harness v1.
+This is backward-compatible, but users may notice steadier recovery after interrupted sessions and more consistent live task/status updates.
