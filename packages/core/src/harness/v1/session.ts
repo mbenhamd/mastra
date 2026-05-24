@@ -5127,7 +5127,6 @@ export class Session {
     const existing = this._record.pendingResume;
     if (
       existing &&
-      existing.kind === pending.kind &&
       existing.runId === full.runId &&
       existing.toolCallId === payload.toolCallId
     ) {
@@ -9180,6 +9179,7 @@ export class Session {
       threadId: this.threadId,
       resourceId: this.resourceId,
       modeId: turn.modeId,
+      modelId: turn.modelId,
       ...(persistedRequestContext?.metadata ? { app: persistedRequestContext.metadata } : {}),
       ...(persistedRequestContext?.channel ? { channel: persistedRequestContext.channel } : {}),
       state: stateSnapshot,
