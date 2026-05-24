@@ -190,7 +190,7 @@ export async function handleSandboxAccessRequest(
         approved,
       });
     } else {
-      state.harness.respondToQuestion({ questionId, answer });
+      await Promise.resolve(state.harness.respondToQuestion({ questionId, answer }));
     }
   };
   return new Promise(resolve => {

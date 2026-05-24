@@ -205,19 +205,19 @@ function resolveExitCode(reason?: string): number {
   return reason === 'error' || reason === 'aborted' ? 1 : 0;
 }
 
-function autoResolve<TState extends Record<string, unknown>>(
+async function autoResolve<TState extends Record<string, unknown>>(
   harness: Harness<TState>,
   event: HarnessEvent,
-): { resolved: true; label: string; json: Record<string, unknown> } | { resolved: false } {
+): Promise<{ resolved: true; label: string; json: Record<string, unknown> } | { resolved: false }> {
   switch (event.type) {
     case 'sandbox_access_request': {
       if ((event as { responseKind?: string }).responseKind === 'sandbox-access') {
-        void (harness as HarnessV1ResponseSurface<TState>).respondToSandboxAccess({
+        await (harness as HarnessV1ResponseSurface<TState>).respondToSandboxAccess({
           questionId: event.questionId,
           approved: true,
         });
       } else {
-        harness.respondToQuestion({ questionId: event.questionId, answer: 'Yes' });
+        await Promise.resolve(harness.respondToQuestion({ questionId: event.questionId, answer: 'Yes' }));
       }
       return { resolved: true, label: `[auto-approved sandbox] ${event.path}`, json: { ...event, autoApproved: true } };
     }
@@ -229,17 +229,17 @@ function autoResolve<TState extends Record<string, unknown>>(
       return { resolved: true, label: `[auto-approved] ${event.toolName}`, json: { ...event, autoApproved: true } };
     }
     case 'tool_suspended': {
-      void (harness as HarnessV1ResponseSurface<TState>).respondToToolSuspension({
+      await (harness as HarnessV1ResponseSurface<TState>).respondToToolSuspension({
         toolCallId: event.toolCallId,
         resumeData: {},
       });
       return { resolved: true, label: `[auto-resumed] ${event.toolName}`, json: { ...event, autoResumed: true } };
     }
     case 'ask_question': {
-      harness.respondToQuestion({
+      await Promise.resolve(harness.respondToQuestion({
         questionId: event.questionId,
         answer: 'Proceed with your best judgment. Do not ask further questions.',
-      });
+      }));
       return {
         resolved: true,
         label: `[auto-answered] ${truncate(event.question, 100)}`,
@@ -247,7 +247,7 @@ function autoResolve<TState extends Record<string, unknown>>(
       };
     }
     case 'plan_approval_required': {
-      void harness.respondToPlanApproval({ planId: event.planId, response: { action: 'approved' } });
+      await Promise.resolve(harness.respondToPlanApproval({ planId: event.planId, response: { action: 'approved' } }));
       return { resolved: true, label: `[auto-approved plan] ${event.title}`, json: { ...event, autoApproved: true } };
     }
     default:
@@ -481,38 +481,45 @@ export async function runHeadless<TState extends Record<string, unknown>>(
 
   const done = new Promise<number>(resolve => {
     harness.subscribe(event => {
-      const result = autoResolve(harness, event);
-      if (result.resolved) {
-        if (emit) emit(result.json);
-        else if (!outputFormat) process.stderr.write(result.label + '\n');
-        return;
-      }
-
-      // Aggregate into accumulators for text / json modes
-      if (summary) aggregateIntoSummary(event, summary);
-      if (textBuffer !== null && event.type === 'message_end' && event.message.role === 'assistant') {
-        textBuffer += extractAssistantText(event.message);
-      }
-
-      if (event.type === 'agent_end') {
-        if (summary) {
-          finalizeSummary(summary, event, harness);
-          process.stdout.write(JSON.stringify(summary) + '\n');
-        } else if (textBuffer !== null) {
-          process.stdout.write(textBuffer);
-          if (!textBuffer.endsWith('\n')) process.stdout.write('\n');
-        } else if (emit) {
-          emit({ ...event });
+      void (async () => {
+        const result = await autoResolve(harness, event);
+        if (result.resolved) {
+          if (emit) emit(result.json);
+          else if (!outputFormat) process.stderr.write(result.label + '\n');
+          return;
         }
-        resolve(resolveExitCode(event.reason));
-        return;
-      }
 
-      if (emit) {
-        emit({ ...event });
-      } else if (!outputFormat) {
-        formatDefault(event, streamCtx);
-      }
+        // Aggregate into accumulators for text / json modes
+        if (summary) aggregateIntoSummary(event, summary);
+        if (textBuffer !== null && event.type === 'message_end' && event.message.role === 'assistant') {
+          textBuffer += extractAssistantText(event.message);
+        }
+
+        if (event.type === 'agent_end') {
+          if (summary) {
+            finalizeSummary(summary, event, harness);
+            process.stdout.write(JSON.stringify(summary) + '\n');
+          } else if (textBuffer !== null) {
+            process.stdout.write(textBuffer);
+            if (!textBuffer.endsWith('\n')) process.stdout.write('\n');
+          } else if (emit) {
+            emit({ ...event });
+          }
+          resolve(resolveExitCode(event.reason));
+          return;
+        }
+
+        if (emit) {
+          emit({ ...event });
+        } else if (!outputFormat) {
+          formatDefault(event, streamCtx);
+        }
+      })().catch(error => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (emit) emit({ type: 'error', error: { message } });
+        else process.stderr.write(`Error: ${message}\n`);
+        resolve(1);
+      });
     });
   });
 
