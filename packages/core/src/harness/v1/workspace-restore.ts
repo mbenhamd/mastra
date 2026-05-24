@@ -91,6 +91,7 @@ export interface CreateWorkspaceRestorePlanOptions {
 
 const DEFAULT_RESTORE_PLAN_LIMIT = 500;
 const FILE_MUTATION_OPERATIONS = new Set(['write', 'delete', 'rename', 'patch']);
+const FILE_NON_MUTATION_OPERATIONS = new Set(['read', 'readFile', 'listFiles', 'grep', 'stat', 'lspInspect']);
 
 /** Builds an ordered restore plan from already-scoped workspace action journal entries. */
 export function createWorkspaceRestorePlan({
@@ -132,6 +133,7 @@ export function workspaceRestoreEntryMatchesScope(
   );
 }
 
+/** Projects one journal row into host-executable restore work or a review-only step. */
 function projectWorkspaceRestoreStep(entry: WorkspaceActionJournalEntry): WorkspaceRestorePlanStep {
   if (entry.policyDecision === 'deny') {
     return {
@@ -144,11 +146,20 @@ function projectWorkspaceRestoreStep(entry: WorkspaceActionJournalEntry): Worksp
     return blockedStep(entry, 'manual_review', 'unsupported_operation', 'Only file journal entries can be restored');
   }
 
-  if (!entry.operation || !FILE_MUTATION_OPERATIONS.has(entry.operation)) {
+  if (!entry.operation || FILE_NON_MUTATION_OPERATIONS.has(entry.operation)) {
     return {
       ...baseStep(entry, 'skip', 'skipped'),
       conflict: { status: 'no_effect', message: 'Non-mutating file action does not require restore work' },
     };
+  }
+
+  if (!FILE_MUTATION_OPERATIONS.has(entry.operation)) {
+    return blockedStep(
+      entry,
+      'manual_review',
+      'unsupported_operation',
+      'Unsupported file operation requires manual restore review',
+    );
   }
 
   if (entry.operation === 'rename') {
@@ -230,11 +241,13 @@ function projectWorkspaceRestoreStep(entry: WorkspaceActionJournalEntry): Worksp
   };
 }
 
+/** Maps file mutation operations to the restore action kind a host should perform. */
 function restoreKindForOperation(operation: string): WorkspaceRestoreStepKind {
   if (operation === 'patch') return 'reverse_patch';
   return 'restore_file';
 }
 
+/** Copies common journal metadata into a detached restore step shell. */
 function baseStep(
   entry: WorkspaceActionJournalEntry,
   kind: WorkspaceRestoreStepKind,
@@ -252,6 +265,7 @@ function baseStep(
   };
 }
 
+/** Builds a blocked restore step with a typed conflict reason. */
 function blockedStep(
   entry: WorkspaceActionJournalEntry,
   kind: WorkspaceRestoreStepKind,
@@ -264,6 +278,7 @@ function blockedStep(
   };
 }
 
+/** Summarizes distinct source and destination paths touched by selected journal rows. */
 function collectAffectedPaths(entries: readonly WorkspaceActionJournalEntry[]): WorkspaceRestoreAffectedPath[] {
   const byPath = new Map<string, WorkspaceRestoreAffectedPath>();
   for (const entry of entries) {
@@ -280,6 +295,7 @@ function collectAffectedPaths(entries: readonly WorkspaceActionJournalEntry[]): 
   );
 }
 
+/** Applies the journal affected-path selector contract to one resolved workspace path. */
 function workspaceActionPathMatches(
   path: WorkspaceActionJournalPath | undefined,
   filter: WorkspaceActionJournalPathFilter,
@@ -291,32 +307,39 @@ function workspaceActionPathMatches(
   return true;
 }
 
+/** Returns true when a path filter contains at least one concrete selector. */
 function workspaceActionPathFilterHasSelector(filter: WorkspaceActionJournalPathFilter): boolean {
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
 }
 
+/** Builds a deterministic path identity key for de-duplicating affected paths. */
 function workspaceActionPathKey(path: WorkspaceActionJournalPath): string {
   return `${path.rootId}\0${path.path}\0${path.relativePath}`;
 }
 
+/** Orders journal rows the same way storage pagination orders them. */
 function compareWorkspaceRestoreEntries(left: WorkspaceActionJournalEntry, right: WorkspaceActionJournalEntry): number {
   return left.createdAt - right.createdAt || compareWorkspaceActionJournalId(left.id, right.id);
 }
 
+/** Compares journal ids without locale-dependent collation. */
 function compareWorkspaceActionJournalId(left: string, right: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
 }
 
+/** Reads restore evidence from result records while preserving explicit null values. */
 function getResultSnapshot(result: JsonValue | undefined, key: 'before' | 'toBefore'): JsonValue | undefined {
   if (!isJsonRecord(result) || !(key in result)) return undefined;
   return result[key];
 }
 
+/** Narrows JSON values to plain object records. */
 function isJsonRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Validates and returns the maximum number of journal rows to project. */
 function boundRestorePlanLimit(limit: number): number {
   if (!Number.isSafeInteger(limit) || limit <= 0) {
     throw new HarnessValidationError('limit', 'Workspace restore plan limit must be a positive safe integer');
@@ -324,6 +347,7 @@ function boundRestorePlanLimit(limit: number): number {
   return limit;
 }
 
+/** Produces detached JSON-safe output objects for the public plan DTO. */
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }

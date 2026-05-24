@@ -78,6 +78,31 @@ describe('workspace restore planner', () => {
           operation: 'read',
           action: { kind: 'file', operation: 'read', path: 'notes.md' },
         }),
+        journalEntry({
+          id: 'stat-file',
+          operation: 'stat',
+          action: { kind: 'file', operation: 'stat', path: 'notes.md' },
+        }),
+        journalEntry({
+          id: 'readfile-file',
+          operation: 'readFile',
+          action: { kind: 'file', operation: 'readFile', path: 'notes.md' },
+        }),
+        journalEntry({
+          id: 'listfiles-file',
+          operation: 'listFiles',
+          action: { kind: 'file', operation: 'listFiles', path: 'src' },
+        }),
+        journalEntry({
+          id: 'grep-file',
+          operation: 'grep',
+          action: { kind: 'file', operation: 'grep', path: 'src' },
+        }),
+        journalEntry({
+          id: 'lspinspect-file',
+          operation: 'lspInspect',
+          action: { kind: 'file', operation: 'lspInspect', path: 'src/index.ts' },
+        }),
         journalEntry({ id: 'denied-write', policyDecision: 'deny', result: { before: 'old' } }),
         journalEntry({
           id: 'missing-before',
@@ -96,10 +121,36 @@ describe('workspace restore planner', () => {
     });
 
     expect(plan.steps.map(step => [step.journalEntryId, step.status, step.conflict.status])).toEqual([
+      ['stat-file', 'skipped', 'no_effect'],
+      ['readfile-file', 'skipped', 'no_effect'],
       ['read-file', 'skipped', 'no_effect'],
       ['missing-before', 'blocked', 'missing_before_snapshot'],
+      ['lspinspect-file', 'skipped', 'no_effect'],
+      ['listfiles-file', 'skipped', 'no_effect'],
+      ['grep-file', 'skipped', 'no_effect'],
       ['denied-write', 'skipped', 'no_effect'],
       ['command-run', 'blocked', 'unsupported_operation'],
+    ]);
+  });
+
+  it('blocks unhandled file mutation audit operations for manual review', () => {
+    const plan = createWorkspaceRestorePlan({
+      scope: { kind: 'session' },
+      entries: ['mkdir', 'rmdir', 'copy', 'move'].map((operation, index) =>
+        journalEntry({
+          id: `unsupported-${operation}`,
+          createdAt: 1000 + index,
+          operation,
+          action: { kind: 'file', operation, path: 'notes.md' },
+        }),
+      ),
+    });
+
+    expect(plan.steps.map(step => [step.journalEntryId, step.kind, step.status, step.conflict.status])).toEqual([
+      ['unsupported-move', 'manual_review', 'blocked', 'unsupported_operation'],
+      ['unsupported-copy', 'manual_review', 'blocked', 'unsupported_operation'],
+      ['unsupported-rmdir', 'manual_review', 'blocked', 'unsupported_operation'],
+      ['unsupported-mkdir', 'manual_review', 'blocked', 'unsupported_operation'],
     ]);
   });
 
