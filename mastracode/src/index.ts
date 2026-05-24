@@ -556,6 +556,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       globalInitialState[`subagentModelId_${key}`] = modelId;
     }
   }
+  const loadCurrentSettings = () => loadSettings(config?.settingsPath);
   const modelAuthChecker = (provider: string) => {
     // Gateway key only authorizes providers that the Mastra gateway actually serves
     const gatewayKey = authStorage.getStoredApiKey(MEMORY_GATEWAY_PROVIDER) ?? process.env['MASTRA_GATEWAY_API_KEY'];
@@ -585,7 +586,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       }
     }
 
-    const customProvider = globalSettings.customProviders.find(entry => {
+    const customProvider = loadCurrentSettings().customProviders.find(entry => {
       return provider === getCustomProviderId(entry.name);
     });
     if (customProvider) {
@@ -596,7 +597,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
 
   const customModelCatalogProvider = async () => {
     const customModels: CustomAvailableModel[] = [];
-    for (const provider of globalSettings.customProviders) {
+    for (const provider of loadCurrentSettings().customProviders) {
       const providerId = getCustomProviderId(provider.name);
       for (const modelName of provider.models) {
         customModels.push({

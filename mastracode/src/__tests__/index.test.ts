@@ -170,6 +170,15 @@ vi.mock('./auth/storage.js', () => ({
     get() {
       return undefined;
     }
+    getStoredApiKey() {
+      return undefined;
+    }
+    hasStoredApiKey() {
+      return false;
+    }
+    isLoggedIn() {
+      return false;
+    }
     loadStoredApiKeysIntoEnv() {}
   },
 }));
@@ -405,6 +414,25 @@ describe('createMastraCode', () => {
     expect(harnessSubscribeMock).toHaveBeenCalled();
     expect(harnessListThreadsMock).toHaveBeenCalledWith({ allResources: true });
     expect(harnessSetStateMock).toHaveBeenCalledWith({ observeAttachments: 'auto' });
+  });
+
+  it('checks custom provider auth against current settings', async () => {
+    const settingsModule = await import('../onboarding/settings.js');
+    vi.mocked(settingsModule.getCustomProviderId).mockImplementation(name => `custom-${name.toLowerCase()}`);
+    const initialSettings = createMockSettings();
+    const refreshedSettings = {
+      ...createMockSettings(),
+      customProviders: [{ name: 'Acme', url: 'https://llm.acme.test/v1', models: ['acme-large'] }],
+    };
+    loadSettingsMock.mockReturnValueOnce(initialSettings);
+    loadSettingsMock.mockReturnValue(refreshedSettings);
+    const { createMastraCode } = await import('../index.js');
+
+    await createMastraCode({ settingsPath: '/tmp/settings.json' });
+    const runtimeConfig = harnessConstructorMock.mock.calls[0]![0] as { modelAuthChecker: (provider: string) => unknown };
+
+    expect(runtimeConfig.modelAuthChecker('custom-acme')).toBe(true);
+    expect(loadSettingsMock).toHaveBeenLastCalledWith('/tmp/settings.json');
   });
 
   it('enables OpenAI Responses stream error retries by default', async () => {
