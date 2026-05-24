@@ -258,7 +258,7 @@ describe('workspace restore planner', () => {
     ).toBe(false);
   });
 
-  it('uses the same same-timestamp journal id ordering as storage', () => {
+  it('uses stable journal id ordering for same-timestamp entries', () => {
     const plan = createWorkspaceRestorePlan({
       scope: { kind: 'session' },
       entries: [
