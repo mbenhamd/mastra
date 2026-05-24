@@ -72,6 +72,7 @@ export {
   HarnessAdmissionConflictError,
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
+  HarnessQueueItemExpiredError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessRuntimeDependencyDriftError,

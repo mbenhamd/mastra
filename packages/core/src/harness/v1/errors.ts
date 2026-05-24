@@ -160,6 +160,19 @@ export class HarnessQueueFullError extends Error {
   }
 }
 
+export class HarnessQueueItemExpiredError extends Error {
+  readonly name = 'HarnessQueueItemExpiredError';
+  readonly code = 'harness.queue_item_expired';
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly queuedItemId: string,
+    public readonly deadline: number,
+  ) {
+    super(`Queued item "${queuedItemId}" for session "${sessionId}" expired at ${new Date(deadline).toISOString()}`);
+  }
+}
+
 export class HarnessAdmissionConflictError extends Error {
   readonly name = 'HarnessAdmissionConflictError';
   constructor(

@@ -18,6 +18,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { buildFakeOutput } from './__test-utils__/fake-output';
 
+import { HarnessQueueItemExpiredError } from './errors';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 
@@ -195,6 +196,11 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
     const events: HarnessEvent[] = [];
     session.subscribe(e => events.push(e));
     const past = Date.now() - 1000;
+    let rejectExpired!: (err: unknown) => void;
+    const expiredRejection = new Promise<never>((_resolve, reject) => {
+      rejectExpired = reject;
+    });
+    void expiredRejection.catch(() => undefined);
     await (session as any)._flushUpdate((prev: any) => ({
       ...prev,
       pendingQueue: [
@@ -213,7 +219,10 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
         },
       },
     }));
+    (session as any)._queueResolvers.set('q-expired', { resolve: vi.fn(), reject: rejectExpired });
+
     await (session as any)._scheduleNextQueueHead();
+
     const queue = session.getRecord().pendingQueue ?? [];
     expect(queue.map(i => i.id)).toEqual(['q-alive']);
     const expiredEvent = events.find(e => e.type === 'queue_item_expired') as any;
@@ -222,6 +231,8 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
     expect(expiredEvent.deadline).toBe(past);
     const receipt = (session.getRecord().queueAdmissionReceipts ?? {})['q-expired'];
     expect(receipt?.status).toBe('failed');
+    expect(receipt?.error?.code).toBe('harness.queue_item_expired');
+    await expect(expiredRejection).rejects.toBeInstanceOf(HarnessQueueItemExpiredError);
   });
 
   it('keeps items whose deadline is in the future', async () => {

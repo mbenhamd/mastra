@@ -93,7 +93,7 @@ export const requestSandboxAccessTool = createTool({
       const questionId = `sandbox_${++requestCounter}_${Date.now()}`;
       let answer: HarnessQuestionAnswer | unknown = resumeData;
 
-      if (answer === undefined && toolContext?.agent?.suspend) {
+      if (answer === undefined && toolContext?.agent?.suspend && !harnessCtx.emitEvent) {
         // Harness v1 path: park the tool through the durable question suspension surface.
         const harnessV1Ctx = harnessCtx as unknown as HarnessV1QuestionContext;
         await harnessV1Ctx.registerQuestion({
