@@ -38,6 +38,10 @@ function parseResumeData(answer: string): unknown {
   }
 }
 
+function showPromptResponseError(ctx: EventHandlerContext, action: string, error: unknown): void {
+  ctx.showError(`${action} failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
 /**
  * Handle an ask_question event from the ask_user tool.
  * Shows a dialog overlay and resolves the tool's pending promise.
@@ -178,10 +182,10 @@ export async function handleSandboxAccessRequest(
   responseKind?: 'question' | 'sandbox-access',
 ): Promise<void> {
   const { state } = ctx;
-  const respond = (answer: string) => {
+  const respond = async (answer: string) => {
     if (responseKind === 'sandbox-access') {
       const approved = answer.toLowerCase().startsWith('y') || answer.toLowerCase() === 'approve';
-      void (state.harness as typeof state.harness & HarnessV1PromptResponseSurface).respondToSandboxAccess({
+      await (state.harness as typeof state.harness & HarnessV1PromptResponseSurface).respondToSandboxAccess({
         questionId,
         approved,
       });
@@ -200,15 +204,21 @@ export async function handleSandboxAccessRequest(
           ],
           onSubmit: answer => {
             state.activeInlineQuestion = undefined;
-            respond(answer);
-            resolve();
-            processNextInlineQuestion(state);
+            void respond(answer)
+              .catch(error => showPromptResponseError(ctx, 'Sandbox access response', error))
+              .finally(() => {
+                resolve();
+                processNextInlineQuestion(state);
+              });
           },
           onCancel: () => {
             state.activeInlineQuestion = undefined;
-            respond('No');
-            resolve();
-            processNextInlineQuestion(state);
+            void respond('No')
+              .catch(error => showPromptResponseError(ctx, 'Sandbox access response', error))
+              .finally(() => {
+                resolve();
+                processNextInlineQuestion(state);
+              });
           },
           formatResult: answer => {
             const approved = answer.toLowerCase().startsWith('y');
@@ -260,21 +270,29 @@ export async function handleToolSuspension(
           multiline: true,
           onSubmit: answer => {
             state.activeInlineQuestion = undefined;
-            (state.harness as typeof state.harness & HarnessV1PromptResponseSurface).respondToToolSuspension({
-              toolCallId,
-              resumeData: parseResumeData(answer),
-            });
-            resolve();
-            processNextInlineQuestion(state);
+            void (state.harness as typeof state.harness & HarnessV1PromptResponseSurface)
+              .respondToToolSuspension({
+                toolCallId,
+                resumeData: parseResumeData(answer),
+              })
+              .catch(error => showPromptResponseError(ctx, 'Tool suspension response', error))
+              .finally(() => {
+                resolve();
+                processNextInlineQuestion(state);
+              });
           },
           onCancel: () => {
             state.activeInlineQuestion = undefined;
-            (state.harness as typeof state.harness & HarnessV1PromptResponseSurface).respondToToolSuspension({
-              toolCallId,
-              resumeData: {},
-            });
-            resolve();
-            processNextInlineQuestion(state);
+            void (state.harness as typeof state.harness & HarnessV1PromptResponseSurface)
+              .respondToToolSuspension({
+                toolCallId,
+                resumeData: {},
+              })
+              .catch(error => showPromptResponseError(ctx, 'Tool suspension response', error))
+              .finally(() => {
+                resolve();
+                processNextInlineQuestion(state);
+              });
           },
         },
         state.ui,

@@ -885,6 +885,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'tool_end',
   'suspension_required',
   'suspension_resolved',
+  'sandbox_access_requested',
   'task_cancellation_requested',
   'queue_item_started',
   'queue_item_replayed',

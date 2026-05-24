@@ -77,6 +77,7 @@ import {
   HarnessOverrideConflictError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
+  HarnessQueueItemExpiredError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
   HarnessSessionClosingError,
@@ -7874,7 +7875,6 @@ export class Session {
   private async _scheduleNextQueueHead(): Promise<boolean> {
     const now = Date.now();
     const expired: { queuedItemId: string; admissionId?: string; deadline: number }[] = [];
-    const cancelErrorForReceipt = new HarnessSessionCancelledError(this.id, 'queue_item_expired');
     let didCommit = false;
     let hasRunnableHead = false;
 
@@ -7892,10 +7892,11 @@ export class Session {
           expired.push({ queuedItemId: item.id, admissionId: item.admissionId, deadline: item.deadline });
           const receipt = existingReceipts[item.id];
           if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+            const expiryError = new HarnessQueueItemExpiredError(this.id, item.id, item.deadline);
             nextReceipts[item.id] = {
               ...receipt,
               status: 'failed',
-              error: projectHarnessPublicError(cancelErrorForReceipt),
+              error: projectHarnessPublicError(expiryError),
               failedAt: receipt.failedAt ?? now,
               updatedAt: now,
             };
@@ -7960,7 +7961,7 @@ export class Session {
       const resolver = this._queueResolvers.get(dropped.queuedItemId);
       if (resolver) {
         this._queueResolvers.delete(dropped.queuedItemId);
-        resolver.reject(new HarnessSessionCancelledError(this.id, 'queue_item_expired'));
+        resolver.reject(new HarnessQueueItemExpiredError(this.id, dropped.queuedItemId, dropped.deadline));
       }
     }
     return hasRunnableHead;
