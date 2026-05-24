@@ -39,7 +39,9 @@ export type {
   PermissionGrantedEvent,
   PermissionPolicyChangedEvent,
   PermissionRevokedEvent,
+  QueueFullDroppedEvent,
   QueueItemCancelledEvent,
+  SandboxAccessRequestedEvent,
   SessionClosedEvent,
   SessionClosingEvent,
   SessionCreatedEvent,
@@ -61,6 +63,7 @@ export type {
 } from './events';
 
 export { HARNESS_EVENT_ID_PREFIX, formatHarnessEventId, parseHarnessEventId } from './events';
+export { getHarnessWorkspaceActionPathInput, isHarnessWorkspaceFileMutationTool } from './workspace-actions';
 
 export {
   HarnessAttachmentInUseError,
@@ -69,6 +72,7 @@ export {
   HarnessAdmissionConflictError,
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
+  HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessRuntimeDependencyDriftError,
   HarnessSessionCancelledError,
@@ -142,7 +146,11 @@ export type {
  * underlying definitions used by the legacy `Harness`, so renderers can
  * import from either entry point and consume the same shape.
  */
-export type { HarnessMessage, HarnessMessageContent } from '../types';
+export type {
+  HarnessMessage,
+  HarnessMessageContent,
+  HarnessMessageContent as HarnessMessageContentPart,
+} from '../types';
 
 /**
  * Goal-loop primitive types (§4.7). `GoalState` lives in `SessionRecord.goal`
@@ -187,6 +195,7 @@ export type {
   HarnessMcpServerDescriptor,
   HarnessMcpToolDescriptor,
   HarnessMode,
+  HarnessQueueBackpressurePolicy,
   HarnessSkill,
   HarnessSkillActionMetadata,
   HarnessSkillActionPermissionHints,

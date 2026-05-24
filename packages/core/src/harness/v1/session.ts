@@ -75,6 +75,7 @@ import {
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
   HarnessOverrideConflictError,
+  HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
@@ -395,6 +396,16 @@ function startActionCatalogMcpListWithTimeout<T>(
 
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
+interface QueueBackpressureDrop {
+  queuedItemId: string;
+  admissionId?: string;
+  replacementQueuedItemId?: string;
+  replacementAdmissionId?: string;
+  maxQueueDepth: number;
+  source: 'queue' | 'goal';
+  goalId?: string;
+}
+
 /**
  * System prompt for the goal judge. Lifted verbatim from
  * mastracode/src/tui/goal-manager.ts so the harness-native judge produces
@@ -670,6 +681,8 @@ export class Session {
   private readonly _liveAdmittedQueuedItemIds = new Set<string>();
   /** True while `_maybeDrainQueue` is running so re-entrant kicks are no-ops. */
   private _draining = false;
+  private _queueWakeTimer?: ReturnType<typeof setTimeout>;
+  private _queueWakeAt?: number;
   private _queuedResumeRecoveryTimer?: ReturnType<typeof setTimeout>;
   /**
    * Tracks the AbortController for the currently-running turn (message or
@@ -1268,7 +1281,9 @@ export class Session {
   private _recordTokenUsageMatchesLive(opts: { tolerateInvalidZero?: boolean } = {}): boolean {
     const stored = this._record.tokenUsage;
     const liveIsZero =
-      this._tokenUsage.promptTokens === 0 && this._tokenUsage.completionTokens === 0 && this._tokenUsage.totalTokens === 0;
+      this._tokenUsage.promptTokens === 0 &&
+      this._tokenUsage.completionTokens === 0 &&
+      this._tokenUsage.totalTokens === 0;
     if (
       stored === undefined ||
       !this._isValidTokenCount(stored.promptTokens) ||
@@ -1497,7 +1512,10 @@ export class Session {
       if (backgroundTurnCompletions.length > 0) {
         const completed = await waitUntilDeadline(Promise.allSettled(backgroundTurnCompletions));
         if (!completed) {
-          throw new HarnessValidationError('shutdown()', 'Session background work did not flush before shutdown deadline');
+          throw new HarnessValidationError(
+            'shutdown()',
+            'Session background work did not flush before shutdown deadline',
+          );
         }
       }
       const chain = this._flushChain;
@@ -1967,6 +1985,11 @@ export class Session {
     if (resolver) {
       this._queueResolvers.delete(removed.queuedItemId);
       resolver.reject(new HarnessSessionCancelledError(this.id, reason));
+    }
+    if ((this._record.pendingQueue?.length ?? 0) > 0) {
+      this._scheduleQueueWakeupForPendingQueue();
+    } else {
+      this._clearQueueWakeTimer();
     }
     this._notifyMaybeIdle();
   }
@@ -5599,11 +5622,6 @@ export class Session {
   private async _enqueueGoalContinuation(goal: GoalState, content: string): Promise<void> {
     if (this._currentCancelRequest() !== undefined) return;
     const cap = this._harness._internalMaxQueueDepth;
-    if ((this._record.pendingQueue?.length ?? 0) >= cap) {
-      // Drop continuation silently — user activity has filled the queue,
-      // we'll re-judge after they drain. Better than failing the judge call.
-      return;
-    }
     const item: QueuedItem = {
       id: `q-${randomUUID()}`,
       enqueuedAt: Date.now(),
@@ -5613,13 +5631,35 @@ export class Session {
       source: 'goal',
       goalId: goal.id,
     };
+    const droppedItems: QueueBackpressureDrop[] = [];
+    let admitted = false;
     await this._flushUpdate(prev => {
       if (prev.cancelRequest !== undefined) return prev;
-      return {
-        ...prev,
-        pendingQueue: [...(prev.pendingQueue ?? []), item],
-      };
+      return this._applyQueueBackpressureForAppend(prev, {
+        item,
+        receipt: undefined,
+        maxQueueDepth: cap,
+        source: 'goal',
+        goalId: goal.id,
+        droppedItems,
+        onRejected: () => {
+          admitted = false;
+        },
+        onAdmitted: () => {
+          admitted = true;
+        },
+      });
     });
+    this._emitQueueBackpressureDrops(droppedItems);
+    if (!admitted) {
+      this._emitQueueFullRejected({
+        source: 'goal',
+        policy: this._harness._internalQueueBackpressure,
+        maxQueueDepth: cap,
+        goalId: goal.id,
+      });
+      return;
+    }
     void this._maybeDrainQueue();
   }
 
@@ -5964,6 +6004,28 @@ export class Session {
     opts: { answer: unknown } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
     return this._resume('question', { answer: opts.answer }, opts);
+  }
+
+  async respondToSandboxAccess(
+    opts: { approved: boolean; reason?: string } & InboxReceiptResponseOptions,
+  ): Promise<InboxResponseResult>;
+  async respondToSandboxAccess(
+    opts: { approved: boolean; reason?: string } & LegacyInboxResponseOptions,
+  ): Promise<AgentResult>;
+  async respondToSandboxAccess(
+    opts: { approved: boolean; reason?: string } & InboxResponseOptions,
+  ): Promise<AgentResult | InboxResponseResult>;
+  async respondToSandboxAccess(
+    opts: { approved: boolean; reason?: string } & InboxResponseOptions,
+  ): Promise<AgentResult | InboxResponseResult> {
+    return this._resume(
+      'sandbox-access',
+      compactJsonObject({
+        approved: opts.approved,
+        reason: opts.reason,
+      }),
+      opts,
+    );
   }
 
   /**
@@ -6413,8 +6475,7 @@ export class Session {
     let cancelledBeforeResume: { reason?: string } | undefined;
     await this._flushUpdate(prev => {
       if (prev.cancelRequest !== undefined && prev.pendingResume?.resumedAt === undefined) {
-        cancelledBeforeResume =
-          prev.cancelRequest.reason !== undefined ? { reason: prev.cancelRequest.reason } : {};
+        cancelledBeforeResume = prev.cancelRequest.reason !== undefined ? { reason: prev.cancelRequest.reason } : {};
         return prev;
       }
 
@@ -7187,6 +7248,13 @@ export class Session {
 
     const queued = createDeferred<AgentResult>();
     const promise = queued.promise;
+    const currentReceipt = this._record.queueAdmissionReceipts?.[admission.queuedItemId];
+    if (currentReceipt?.status === 'failed' && currentReceipt.error?.code === 'harness.queue_full_dropped') {
+      queued.reject(new HarnessQueueFullDroppedError(admission.queuedItemId));
+      void promise.catch(() => {});
+      return promise;
+    }
+
     this._queueResolvers.set(admission.queuedItemId, { promise, resolve: queued.resolve, reject: queued.reject });
     // Kick the drain — fire-and-forget. Drain handles its own errors and
     // settles the resolver via `_completeQueuedTurn` / `_failQueuedTurn`.
@@ -7237,6 +7305,7 @@ export class Session {
     if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
       throw new HarnessValidationError(`${methodName}.admissionId`, 'admissionId must be a non-empty string');
     }
+    this._validateQueueSchedulingOptions(opts, methodName);
 
     const attachments =
       internal?.persistedAttachments ??
@@ -7263,7 +7332,8 @@ export class Session {
     }
 
     const cap = this._harness._internalMaxQueueDepth;
-    if ((this._record.pendingQueue?.length ?? 0) >= cap) {
+    const queueBackpressure = this._harness._internalQueueBackpressure;
+    if (queueBackpressure === 'reject' && (this._record.pendingQueue?.length ?? 0) >= cap) {
       throw new HarnessQueueFullError(this.id, cap);
     }
     const queuedItemId = this._queueAdmissionQueuedItemId(admissionId);
@@ -7280,6 +7350,9 @@ export class Session {
       ...(opts.model !== undefined ? { model: opts.model } : {}),
       mode: effectiveModeId,
       ...(opts.yolo !== undefined ? { yolo: opts.yolo } : {}),
+      ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
+      ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}),
+      ...(opts.notBefore !== undefined ? { notBefore: opts.notBefore } : {}),
     };
     const attachmentReferences = attachments
       .filter((attachment): attachment is Extract<PersistedAttachment, { kind: 'ref' }> => attachment.kind === 'ref')
@@ -7291,6 +7364,7 @@ export class Session {
         sourceId: item.id,
       }));
     let admittedReceipt: QueueAdmissionReceipt | undefined;
+    const droppedItems: QueueBackpressureDrop[] = [];
     const receipt: QueueAdmissionReceipt = {
       admissionId,
       admissionHash,
@@ -7327,17 +7401,16 @@ export class Session {
           if (prev.cancelRequest !== undefined) {
             throw new HarnessSessionCancelledError(this.id, prev.cancelRequest.reason);
           }
-          if ((prev.pendingQueue?.length ?? 0) >= cap) {
+          if (queueBackpressure === 'reject' && (prev.pendingQueue?.length ?? 0) >= cap) {
             throw new HarnessQueueFullError(this.id, cap);
           }
-          return {
-            ...prev,
-            pendingQueue: [...(prev.pendingQueue ?? []), item],
-            queueAdmissionReceipts: {
-              ...(prev.queueAdmissionReceipts ?? {}),
-              [item.id]: receipt,
-            },
-          };
+          return this._applyQueueBackpressureForAppend(prev, {
+            item,
+            receipt,
+            maxQueueDepth: cap,
+            source: 'queue',
+            droppedItems,
+          });
         },
         { attachmentReferences },
       );
@@ -7353,6 +7426,7 @@ export class Session {
       return { queuedItemId: admittedReceipt.queuedItemId, evidence: admittedReceipt, duplicate: true };
     }
 
+    this._emitQueueBackpressureDrops(droppedItems);
     return { queuedItemId: item.id, evidence: receipt, duplicate: false };
   }
 
@@ -7525,6 +7599,9 @@ export class Session {
       ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
       ...(opts.yolo === true ? { yolo: true } : {}),
+      ...(opts.priority !== undefined && opts.priority !== 0 ? { priority: opts.priority } : {}),
+      ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}),
+      ...(opts.notBefore !== undefined ? { notBefore: opts.notBefore } : {}),
       attachments: attachments.map(attachment => ({
         kind: attachment.kind,
         name: attachment.name,
@@ -7549,6 +7626,151 @@ export class Session {
       })),
       ...(requestContext ? { requestContext: clonePersistedRequestContext(requestContext) } : {}),
     });
+  }
+
+  private _validateQueueSchedulingOptions(opts: QueueOptions, methodName: 'queue()' | 'admitQueue()'): void {
+    for (const field of ['priority', 'deadline', 'notBefore'] as const) {
+      const value = opts[field];
+      if (value !== undefined && (!Number.isFinite(value) || Object.is(value, -0))) {
+        throw new HarnessValidationError(`${methodName}.${field}`, 'must be a finite JSON number other than -0');
+      }
+    }
+  }
+
+  private _applyQueueBackpressureForAppend(
+    prev: SessionRecord,
+    opts: {
+      item: QueuedItem;
+      receipt?: QueueAdmissionReceipt;
+      maxQueueDepth: number;
+      source: 'queue' | 'goal';
+      goalId?: string;
+      droppedItems: QueueBackpressureDrop[];
+      onRejected?: () => void;
+      onAdmitted?: () => void;
+    },
+  ): SessionRecord {
+    const policy = this._harness._internalQueueBackpressure;
+    const activeId = this._currentQueuedItemId ?? prev.pendingResume?.queuedItemId;
+    const queue = [...(prev.pendingQueue ?? [])];
+    const existingReceipts = prev.queueAdmissionReceipts ?? {};
+    let nextReceipts: Record<string, QueueAdmissionReceipt> | undefined;
+    const now = opts.item.enqueuedAt;
+
+    while (queue.length >= opts.maxQueueDepth) {
+      if (policy === 'reject') {
+        opts.onRejected?.();
+        return prev;
+      }
+
+      let dropIdx = -1;
+      let dropEnqueuedAt = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < queue.length; i += 1) {
+        const candidate = queue[i]!;
+        if (activeId !== undefined && candidate.id === activeId) continue;
+        const receipt = existingReceipts[candidate.id];
+        if (receipt !== undefined && receipt.status !== 'queued') continue;
+        if (candidate.enqueuedAt < dropEnqueuedAt) {
+          dropIdx = i;
+          dropEnqueuedAt = candidate.enqueuedAt;
+        }
+      }
+      if (dropIdx < 0) {
+        if (opts.source === 'goal') {
+          opts.onRejected?.();
+          return prev;
+        }
+        throw new HarnessQueueFullError(this.id, opts.maxQueueDepth);
+      }
+
+      const [dropped] = queue.splice(dropIdx, 1);
+      if (!dropped) continue;
+      opts.droppedItems.push({
+        queuedItemId: dropped.id,
+        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
+        replacementQueuedItemId: opts.item.id,
+        ...(opts.item.admissionId !== undefined ? { replacementAdmissionId: opts.item.admissionId } : {}),
+        maxQueueDepth: opts.maxQueueDepth,
+        source: opts.source,
+        ...(opts.goalId !== undefined ? { goalId: opts.goalId } : {}),
+      });
+
+      const receipt = existingReceipts[dropped.id];
+      if (receipt && !this._isTerminalQueueReceipt(receipt)) {
+        nextReceipts ??= { ...existingReceipts };
+        const dropError = new HarnessQueueFullDroppedError(dropped.id);
+        nextReceipts[dropped.id] = {
+          ...receipt,
+          status: 'failed',
+          error: projectHarnessPublicError(dropError),
+          failedAt: receipt.failedAt ?? now,
+          updatedAt: now,
+        };
+      }
+    }
+
+    opts.onAdmitted?.();
+    const next: SessionRecord = {
+      ...prev,
+      pendingQueue: [...queue, opts.item],
+    };
+    if (opts.receipt !== undefined) {
+      next.queueAdmissionReceipts = {
+        ...(nextReceipts ?? existingReceipts),
+        [opts.item.id]: opts.receipt,
+      };
+    } else if (nextReceipts !== undefined) {
+      next.queueAdmissionReceipts = nextReceipts;
+    }
+    return next;
+  }
+
+  private _emitQueueBackpressureDrops(droppedItems: QueueBackpressureDrop[]): void {
+    for (const dropped of droppedItems) {
+      this._emitter.emit({
+        type: 'queue_full_dropped',
+        source: dropped.source,
+        policy: 'drop-oldest',
+        maxQueueDepth: dropped.maxQueueDepth,
+        queuedItemId: dropped.queuedItemId,
+        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
+        ...(dropped.replacementQueuedItemId !== undefined
+          ? { replacementQueuedItemId: dropped.replacementQueuedItemId }
+          : {}),
+        ...(dropped.replacementAdmissionId !== undefined
+          ? { replacementAdmissionId: dropped.replacementAdmissionId }
+          : {}),
+        ...(dropped.goalId !== undefined ? { goalId: dropped.goalId } : {}),
+      } as EmitInput);
+      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(dropped.queuedItemId);
+        resolver.reject(new HarnessQueueFullDroppedError(dropped.queuedItemId));
+      }
+    }
+  }
+
+  private _emitQueueFullRejected(opts: {
+    source: 'queue' | 'goal';
+    policy?: 'reject' | 'drop-oldest';
+    maxQueueDepth: number;
+    goalId?: string;
+    queuedItemId?: string;
+    admissionId?: string;
+  }): void {
+    this._emitter.emit({
+      type: 'queue_full_dropped',
+      source: opts.source,
+      policy: opts.policy ?? 'reject',
+      maxQueueDepth: opts.maxQueueDepth,
+      ...(opts.queuedItemId !== undefined ? { queuedItemId: opts.queuedItemId } : {}),
+      ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
+      ...(opts.goalId !== undefined ? { goalId: opts.goalId } : {}),
+    } as EmitInput);
+  }
+
+  private _isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {
+    return receipt.status === 'completed' || receipt.status === 'failed' || receipt.status === 'dead';
   }
 
   private async _updateQueueAdmissionReceipt(
@@ -7623,6 +7845,113 @@ export class Session {
   }
 
   /**
+   * Scheduler step. Inside a single `_flushUpdate` CAS:
+   *   - drop any items whose `deadline` has passed; emit
+   *     `queue_item_expired` per drop, mark each item's receipt
+   *     `failed`, and reject the resolver after the commit;
+   *   - select the next item to run by `(priority desc, enqueuedAt
+   *     asc)` from those that have no `notBefore` block; rotate it
+   *     to position 0 so the existing drain + recovery logic can keep
+   *     its `pendingQueue[0]` invariant.
+   *
+   * No-op when the queue is empty or no item is currently eligible.
+   */
+  private async _scheduleNextQueueHead(): Promise<boolean> {
+    const now = Date.now();
+    const expired: { queuedItemId: string; admissionId?: string; deadline: number }[] = [];
+    const cancelErrorForReceipt = new HarnessSessionCancelledError(this.id, 'queue_item_expired');
+    let didCommit = false;
+    let hasRunnableHead = false;
+
+    await this._flushUpdate(prev => {
+      const queue = prev.pendingQueue ?? [];
+      if (queue.length === 0) return prev;
+
+      const survivors: QueuedItem[] = [];
+      const existingReceipts = prev.queueAdmissionReceipts ?? {};
+      const nextReceipts: Record<string, QueueAdmissionReceipt> = { ...existingReceipts };
+      let receiptsChanged = false;
+
+      for (const item of queue) {
+        if (item.deadline !== undefined && item.deadline <= now) {
+          expired.push({ queuedItemId: item.id, admissionId: item.admissionId, deadline: item.deadline });
+          const receipt = existingReceipts[item.id];
+          if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+            nextReceipts[item.id] = {
+              ...receipt,
+              status: 'failed',
+              error: projectHarnessPublicError(cancelErrorForReceipt),
+              failedAt: receipt.failedAt ?? now,
+              updatedAt: now,
+            };
+            receiptsChanged = true;
+          }
+          continue;
+        }
+        survivors.push(item);
+      }
+
+      // Pick the next runnable item: highest priority, FIFO tie-break.
+      // The currently-running item (if any) stays first — it's already
+      // executing and the drain only consults position 0 mid-loop when
+      // no turn is in flight.
+      let head: QueuedItem | undefined;
+      let headIdx = -1;
+      for (let i = 0; i < survivors.length; i++) {
+        const candidate = survivors[i]!;
+        if (candidate.notBefore !== undefined && candidate.notBefore > now) continue;
+        const cp = candidate.priority ?? 0;
+        const hp = head?.priority ?? 0;
+        if (head === undefined || cp > hp || (cp === hp && candidate.enqueuedAt < head.enqueuedAt)) {
+          head = candidate;
+          headIdx = i;
+        }
+      }
+      hasRunnableHead = head !== undefined;
+
+      const rotated = head !== undefined && headIdx > 0;
+      const didExpire = expired.length > 0;
+      // No-op short-circuit: nothing expired, no rotation needed, no
+      // receipts to update. `survivors` is always a fresh array, so an
+      // identity check vs `queue` would never short-circuit — we have
+      // to derive "nothing changed" from the flags instead.
+      if (!didExpire && !rotated && !receiptsChanged) return prev;
+
+      const nextQueue = rotated
+        ? // Rotate selected item to position 0 so the existing
+          // recovery + drain code can keep its `pendingQueue[0]`
+          // assumption while still running the highest-priority
+          // work first.
+          [head!, ...survivors.slice(0, headIdx), ...survivors.slice(headIdx + 1)]
+        : survivors;
+
+      didCommit = true;
+      const next: SessionRecord = { ...prev, pendingQueue: nextQueue };
+      if (receiptsChanged) {
+        next.queueAdmissionReceipts = nextReceipts;
+      }
+      return next;
+    });
+
+    if (!didCommit) return hasRunnableHead;
+
+    for (const dropped of expired) {
+      this._emitter.emit({
+        type: 'queue_item_expired',
+        queuedItemId: dropped.queuedItemId,
+        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
+        deadline: dropped.deadline,
+      } as EmitInput);
+      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(dropped.queuedItemId);
+        resolver.reject(new HarnessSessionCancelledError(this.id, 'queue_item_expired'));
+      }
+    }
+    return hasRunnableHead;
+  }
+
+  /**
    * Drain pending queue items head-of-line. No-op while another drain is
    * running, the session is suspended (`pendingResume` set), or the queue
    * is empty. Each item runs as a fresh turn; if the turn suspends, drain
@@ -7648,6 +7977,16 @@ export class Session {
         // Bail if a previous iteration left the session suspended.
         if (this._record.pendingResume !== undefined) return;
 
+        // Scheduler step: expire any items past their deadline, then
+        // rotate the highest-priority item to the head. Done in a
+        // single CAS so the rest of the drain logic (recovery,
+        // post-run finalize) can keep its `pendingQueue[0]` assumption.
+        const hasRunnableHead = await this._scheduleNextQueueHead();
+        if (!hasRunnableHead) {
+          this._scheduleQueueWakeupForPendingQueue();
+          return;
+        }
+        this._clearQueueWakeTimer();
         const head = this._record.pendingQueue?.[0];
         if (!head) return;
         this._currentQueuedItemId = head.id;
@@ -8533,7 +8872,7 @@ export class Session {
     if (err instanceof QueueRecoveryPendingError) {
       const delayMs = Math.max(0, err.retryAt - Date.now());
       const timer = setTimeout(() => void this._maybeDrainQueue(), delayMs);
-      timer.unref?.();
+      this._unrefQueueTimerIfBackgroundOnly(timer);
       return;
     }
     const resolver = this._queueResolvers.get(itemId);
@@ -8562,7 +8901,52 @@ export class Session {
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => void this._maybeDrainQueue(), delayMs);
-    timer.unref?.();
+    this._unrefQueueTimerIfBackgroundOnly(timer);
+  }
+
+  private _scheduleQueueWakeupForPendingQueue(): void {
+    const now = Date.now();
+    let wakeAt: number | undefined;
+    for (const item of this._record.pendingQueue ?? []) {
+      const candidates = [item.notBefore, item.deadline].filter(
+        (value): value is number => value !== undefined && value > now,
+      );
+      for (const candidate of candidates) {
+        if (wakeAt === undefined || candidate < wakeAt) wakeAt = candidate;
+      }
+    }
+    if (wakeAt === undefined) {
+      this._clearQueueWakeTimer();
+      if ((this._record.pendingQueue?.length ?? 0) > 0) {
+        const timer = setTimeout(() => void this._maybeDrainQueue(), 0);
+        this._unrefQueueTimerIfBackgroundOnly(timer);
+      }
+      return;
+    }
+    if (this._queueWakeAt !== undefined && this._queueWakeAt <= wakeAt) return;
+    this._clearQueueWakeTimer();
+    this._queueWakeAt = wakeAt;
+    const delayMs = Math.min(Math.max(0, wakeAt - now), 2_147_483_647);
+    this._queueWakeTimer = setTimeout(() => {
+      this._queueWakeTimer = undefined;
+      this._queueWakeAt = undefined;
+      void this._maybeDrainQueue();
+    }, delayMs);
+    this._unrefQueueTimerIfBackgroundOnly(this._queueWakeTimer);
+  }
+
+  private _clearQueueWakeTimer(): void {
+    if (this._queueWakeTimer !== undefined) {
+      clearTimeout(this._queueWakeTimer);
+      this._queueWakeTimer = undefined;
+    }
+    this._queueWakeAt = undefined;
+  }
+
+  private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
+    if (this._queueResolvers.size === 0) {
+      timer.unref?.();
+    }
   }
 
   /** @internal — used by the Harness on hydration to start replay drain. */
@@ -8889,6 +9273,7 @@ export class Session {
    * harness's job. Idempotent.
    */
   _markClosed(updatedRecord: SessionRecord): void {
+    this._clearQueueWakeTimer();
     this._record = updatedRecord;
     this._state = 'closed';
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
@@ -8910,6 +9295,7 @@ export class Session {
       clearTimeout(this._queuedResumeRecoveryTimer);
       this._queuedResumeRecoveryTimer = undefined;
     }
+    this._clearQueueWakeTimer();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const [queuedItemId, resolver] of this._queueResolvers) {
@@ -8935,10 +9321,34 @@ export class Session {
    * the session can be re-hydrated. Currently unused; lands with eviction.
    */
   _markEvicted(updatedRecord: SessionRecord): void {
+    const err = new HarnessValidationError('session.evict()', 'Session evicted');
     this._record = updatedRecord;
     this._state = 'evicted';
-    this._tearDownThreadSubscription(new HarnessValidationError('session.evict()', 'Session evicted'));
+    this._tearDownThreadSubscription(err);
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
+    this._rejectActiveTurnWaiters(err);
+    const activeTurn = this._currentTurnAbortController;
+    if (activeTurn) {
+      activeTurn.abort('session_evicted');
+      this._endTurn(activeTurn);
+    }
+    if (this._queuedResumeRecoveryTimer !== undefined) {
+      clearTimeout(this._queuedResumeRecoveryTimer);
+      this._queuedResumeRecoveryTimer = undefined;
+    }
+    this._clearQueueWakeTimer();
+    this._currentQueuedItemId = undefined;
+    this._currentQueuedItemSource = undefined;
+    for (const [queuedItemId, resolver] of this._queueResolvers) {
+      this._queueResolvers.delete(queuedItemId);
+      resolver.reject(err);
+    }
+  }
+
+  /** @internal — update local lease metadata after the owning Harness renews storage. */
+  _markLeaseRenewed(expiresAt: number): void {
+    if (this._state !== 'live' && this._state !== 'closing') return;
+    this._record = { ...this._record, leaseExpiresAt: expiresAt };
   }
 
   /**

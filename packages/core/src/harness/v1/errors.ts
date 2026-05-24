@@ -453,3 +453,15 @@ export class HarnessWorkspaceInUseError extends Error {
     super(`Workspace for resource "${resourceId}" is in use (refCount: ${refCount})`);
   }
 }
+
+export class HarnessQueueFullDroppedError extends Error {
+  readonly name = 'HarnessQueueFullDroppedError';
+  readonly code = 'harness.queue_full_dropped';
+  constructor(public readonly queuedItemId?: string) {
+    super(
+      queuedItemId
+        ? `Queued item "${queuedItemId}" was dropped because the session queue was full`
+        : 'Queued work was dropped because the session queue was full',
+    );
+  }
+}
