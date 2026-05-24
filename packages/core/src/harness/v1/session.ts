@@ -8053,20 +8053,21 @@ export class Session {
    * stays in place (suspended) or is removed (complete / error).
    */
   private async _runQueuedTurn(item: QueuedItem): Promise<FullOutput<unknown>> {
-    this._assertOpenForTurn('queue drain');
-    await this._validateQueuedAttachmentRefs(item);
     const currentReceipt = this._record.queueAdmissionReceipts?.[item.id];
     const effectiveModeId = currentReceipt?.modeId ?? item.mode ?? this._record.modeId;
+    if (currentReceipt?.status === 'completed') {
+      const full = currentReceipt.result as FullOutput<unknown>;
+      if (currentReceipt.postRunFinalizedAt === undefined) {
+        await this._finalizeCompletedQueuedTurn(item, full, effectiveModeId);
+      }
+      return full;
+    }
+
+    this._assertOpenForTurn('queue drain');
+    await this._validateQueuedAttachmentRefs(item);
     const identity = this._queueSignalIdentity(item);
     let shouldMarkAdmitting = true;
     if (currentReceipt) {
-      if (currentReceipt.status === 'completed') {
-        const full = currentReceipt.result as FullOutput<unknown>;
-        if (currentReceipt.postRunFinalizedAt === undefined) {
-          await this._finalizeCompletedQueuedTurn(item, full, effectiveModeId);
-        }
-        return full;
-      }
       if (currentReceipt.status === 'failed' || currentReceipt.status === 'admission_failed') {
         throw publicErrorProjectionToError(
           currentReceipt.error ?? { code: 'harness.queue_failed', message: 'queued turn failed' },
@@ -8385,19 +8386,37 @@ export class Session {
   ): Promise<void> {
     try {
       await this._finalizeCompletedQueuedTurn(item, full, modeId);
+      await this._completeQueuedTurn(item.id, full as AgentResult);
     } catch (err) {
+      if (err instanceof HarnessSessionDeletedError) throw err;
       const receipt = this._record.queueAdmissionReceipts?.[item.id];
       if (receipt?.postRunFinalizedAt !== undefined) {
-        await this._completeQueuedTurn(item.id, full as AgentResult);
-        return;
+        try {
+          await this._completeQueuedTurn(item.id, full as AgentResult);
+          return;
+        } catch (completionErr) {
+          if (completionErr instanceof HarnessSessionDeletedError) throw completionErr;
+          this._deferCompletedQueuedItemFinalizationAfterCancellation(
+            item,
+            full,
+            modeId,
+            new QueuePostRunFinalizationPendingError(
+              Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS,
+              completionErr,
+            ),
+          );
+          return;
+        }
       }
-      if (err instanceof QueuePostRunFinalizationPendingError) {
-        this._deferCompletedQueuedItemFinalizationAfterCancellation(item, full, modeId, err);
-        return;
-      }
-      throw err;
+      this._deferCompletedQueuedItemFinalizationAfterCancellation(
+        item,
+        full,
+        modeId,
+        err instanceof QueuePostRunFinalizationPendingError
+          ? err
+          : new QueuePostRunFinalizationPendingError(Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS, err),
+      );
     }
-    await this._completeQueuedTurn(item.id, full as AgentResult);
   }
 
   private _deferCompletedQueuedItemFinalizationAfterCancellation(
@@ -9005,10 +9024,17 @@ export class Session {
   }
 
   private _canDrainQueue(): boolean {
-    if (this._record.cancelRequest !== undefined) return false;
+    if (this._record.cancelRequest !== undefined) return this._hasCompletedQueuedItemsAfterCancellation();
     if (this._state === 'live') return true;
     if (!this.isClosing) return false;
     return this._record.closeDeadlineAt === undefined || Date.now() < this._record.closeDeadlineAt;
+  }
+
+  private _hasCompletedQueuedItemsAfterCancellation(): boolean {
+    return (this._record.pendingQueue ?? []).some(item => {
+      const receipt = this._record.queueAdmissionReceipts?.[item.id];
+      return receipt?.status === 'completed';
+    });
   }
 
   /**

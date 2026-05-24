@@ -222,6 +222,56 @@ describe('Session.cancel()', () => {
     await expect(queued.promise).resolves.toBe(result);
   });
 
+  it('drains restored completed queued heads after cancellation', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const now = Date.now();
+    const result = {
+      text: 'done',
+      finishReason: 'stop',
+      runId: 'run-completed-after-cancel',
+      steps: [],
+    };
+    await (session as any)._flushUpdate((prev: any) => ({
+      ...prev,
+      cancelRequest: {
+        requestedAt: now,
+        reason: 'cancel-before-restore',
+      },
+      pendingQueue: [
+        {
+          id: 'completed-after-cancel',
+          admissionId: 'admission-completed-after-cancel',
+          enqueuedAt: now,
+          content: 'done',
+          attachments: [],
+        },
+      ],
+      queueAdmissionReceipts: {
+        'completed-after-cancel': {
+          admissionId: 'admission-completed-after-cancel',
+          admissionHash: 'hash-completed-after-cancel',
+          queuedItemId: 'completed-after-cancel',
+          status: 'completed',
+          attempts: 1,
+          enqueuedAt: now,
+          updatedAt: now,
+          result,
+        },
+      },
+    }));
+    const queued = deferred();
+    (session as any)._queueResolvers.set('completed-after-cancel', queued);
+
+    await (session as any)._kickQueueDrain();
+
+    expect(session.getRecord().pendingQueue).toEqual([]);
+    expect(session.getRecord().queueAdmissionReceipts?.['completed-after-cancel']?.postRunFinalizedAt).toEqual(
+      expect.any(Number),
+    );
+    await expect(queued.promise).resolves.toBe(result);
+  });
+
   it('retries completed queued head finalization after cancellation', async () => {
     vi.useFakeTimers();
     try {
@@ -262,7 +312,7 @@ describe('Session.cancel()', () => {
       let attempts = 0;
       (session as any)._markQueuedPostRunFinalized = async (...args: unknown[]) => {
         attempts += 1;
-        if (attempts === 1) throw new Error('transient finalization write failure');
+        if (attempts <= 2) throw new Error('transient finalization write failure');
         return originalMarkPostRunFinalized(...args);
       };
       const queued = deferred();
@@ -272,12 +322,107 @@ describe('Session.cancel()', () => {
 
       expect(session.getRecord().pendingQueue.map(item => item.id)).toEqual(['completed-retry']);
       await vi.advanceTimersByTimeAsync(1_000);
+      expect(session.getRecord().pendingQueue.map(item => item.id)).toEqual(['completed-retry']);
+      await vi.advanceTimersByTimeAsync(1_000);
 
       expect(session.getRecord().pendingQueue).toEqual([]);
       expect(session.getRecord().queueAdmissionReceipts?.['completed-retry']?.postRunFinalizedAt).toEqual(
         expect.any(Number),
       );
       await expect(queued.promise).resolves.toBe(result);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('continues settling completed queued heads after one finalization failure', async () => {
+    vi.useFakeTimers();
+    try {
+      const { harness } = setupHarness();
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      const now = Date.now();
+      const firstResult = {
+        text: 'first done',
+        finishReason: 'stop',
+        runId: 'run-completed-first',
+        steps: [],
+      };
+      const secondResult = {
+        text: 'second done',
+        finishReason: 'stop',
+        runId: 'run-completed-second',
+        steps: [],
+      };
+      await (session as any)._flushUpdate((prev: any) => ({
+        ...prev,
+        pendingQueue: [
+          {
+            id: 'completed-first',
+            admissionId: 'admission-completed-first',
+            enqueuedAt: now,
+            content: 'first',
+            attachments: [],
+          },
+          {
+            id: 'completed-second',
+            admissionId: 'admission-completed-second',
+            enqueuedAt: now + 1,
+            content: 'second',
+            attachments: [],
+          },
+        ],
+        queueAdmissionReceipts: {
+          'completed-first': {
+            admissionId: 'admission-completed-first',
+            admissionHash: 'hash-completed-first',
+            queuedItemId: 'completed-first',
+            status: 'completed',
+            attempts: 1,
+            enqueuedAt: now,
+            updatedAt: now,
+            result: firstResult,
+          },
+          'completed-second': {
+            admissionId: 'admission-completed-second',
+            admissionHash: 'hash-completed-second',
+            queuedItemId: 'completed-second',
+            status: 'completed',
+            attempts: 1,
+            enqueuedAt: now + 1,
+            updatedAt: now + 1,
+            result: secondResult,
+          },
+        },
+      }));
+      const originalMarkPostRunFinalized = (session as any)._markQueuedPostRunFinalized.bind(session);
+      const seen = new Set<string>();
+      (session as any)._markQueuedPostRunFinalized = async (queuedItemId: string, ...args: unknown[]) => {
+        if (queuedItemId === 'completed-first' && !seen.has(queuedItemId)) {
+          seen.add(queuedItemId);
+          throw new Error('transient first finalization write failure');
+        }
+        return originalMarkPostRunFinalized(queuedItemId, ...args);
+      };
+      const first = deferred();
+      const second = deferred();
+      (session as any)._queueResolvers.set('completed-first', first);
+      (session as any)._queueResolvers.set('completed-second', second);
+
+      await session.cancel({ reason: 'cancel-two-completed' });
+
+      expect(session.getRecord().pendingQueue.map(item => item.id)).toEqual(['completed-first']);
+      expect(session.getRecord().queueAdmissionReceipts?.['completed-second']?.postRunFinalizedAt).toEqual(
+        expect.any(Number),
+      );
+      await expect(second.promise).resolves.toBe(secondResult);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(session.getRecord().pendingQueue).toEqual([]);
+      expect(session.getRecord().queueAdmissionReceipts?.['completed-first']?.postRunFinalizedAt).toEqual(
+        expect.any(Number),
+      );
+      await expect(first.promise).resolves.toBe(firstResult);
     } finally {
       vi.useRealTimers();
     }
