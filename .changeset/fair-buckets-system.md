@@ -4,4 +4,4 @@
 
 Fixed observability capability reporting for custom storage classes.
 
-Studio can now show storage-backed observability features accurately when a storage adapter extends another implementation.
+Studio now correctly shows storage-backed observability features for custom storage classes.
