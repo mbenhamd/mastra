@@ -1856,6 +1856,7 @@ export class Session {
     if (!attemptedWrite) return;
     if (committedCancel.requestedAt !== requestedAt) return;
     const durableReason = committedCancel.reason;
+    this._clearQueueWakeTimer();
 
     this._emitter.emit({
       type: 'task_cancellation_requested',
@@ -7888,10 +7889,14 @@ export class Session {
       let receiptsChanged = false;
 
       for (const item of queue) {
+        const receipt = existingReceipts[item.id];
+        if (receipt?.status === 'completed') {
+          survivors.push(item);
+          continue;
+        }
         if (item.deadline !== undefined && item.deadline <= now) {
           expired.push({ queuedItemId: item.id, admissionId: item.admissionId, deadline: item.deadline });
-          const receipt = existingReceipts[item.id];
-          if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+          if (receipt && receipt.status !== 'failed' && receipt.status !== 'dead') {
             const expiryError = new HarnessQueueItemExpiredError(this.id, item.id, item.deadline);
             nextReceipts[item.id] = {
               ...receipt,

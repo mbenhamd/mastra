@@ -289,7 +289,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     this.currentModeId = this.defaultModeId;
     this.state = { ...config.initialState };
     this.currentDisplayTasks = cloneTasks(this.state.tasks);
-    const harnessV1Agents = toHarnessV1Agents(config.agents, config.modes);
+    const harnessV1Agents = toHarnessV1Agents(config.agents, config.modes, this.state);
     const exposedSubagents = this.shouldExposeSubagentTool() ? config.subagents : [];
     const harnessV1Subagents =
       exposedSubagents.length > 0 ? { types: toHarnessV1Subagents(exposedSubagents) } : undefined;

@@ -98,6 +98,40 @@ describe('Session.cancel()', () => {
     await expect(second.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
   });
 
+  it('clears delayed queue wake timers when cancellation drops queued items', async () => {
+    vi.useFakeTimers();
+    try {
+      const { harness } = setupHarness();
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      const now = Date.now();
+      const queued = deferred();
+      await (session as any)._flushUpdate((prev: any) => ({
+        ...prev,
+        pendingQueue: [
+          {
+            id: 'delayed',
+            admissionId: 'admission-delayed',
+            enqueuedAt: now,
+            content: 'later',
+            attachments: [],
+            notBefore: now + 60_000,
+          },
+        ],
+      }));
+      (session as any)._queueResolvers.set('delayed', queued);
+      (session as any)._scheduleQueueWakeupForPendingQueue();
+      expect((session as any)._queueWakeTimer).toBeDefined();
+
+      await session.cancel({ reason: 'stop-delayed' });
+
+      expect((session as any)._queueWakeTimer).toBeUndefined();
+      expect((session as any)._queueWakeAt).toBeUndefined();
+      await expect(queued.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('durably fails an active queued head and aborts the running turn', async () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
