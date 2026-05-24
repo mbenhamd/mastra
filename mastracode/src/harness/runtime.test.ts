@@ -755,6 +755,51 @@ describe('MastraCodeHarnessRuntime', () => {
     await runtime.destroy();
   });
 
+  it('replaces modified-file snapshots from workspace journal refreshes', async () => {
+    const storage = new InMemoryStore({ id: `mc-runtime-journal-refresh-${Date.now()}-${Math.random()}` });
+    const runtime = createRuntime({ storage });
+    await runtime.init();
+    const session = (runtime as any).session;
+    const harnessStorage = (await storage.getStore('harness')) as any;
+    runtime.getDisplayState().modifiedFiles.set('src/stale.ts', {
+      operations: ['write_file'],
+      firstModified: new Date(1_000),
+    });
+
+    await harnessStorage.appendWorkspaceActionJournalEntry({
+      id: 'workspace-action-real',
+      harnessName: MASTRACODE_HARNESS_NAME,
+      sessionId: session.id,
+      resourceId: runtime.getResourceId(),
+      threadId: session.threadId,
+      actionKind: 'file',
+      operation: 'write_file',
+      action: { kind: 'file', operation: 'write_file', path: 'src/real.ts' },
+      policyDecision: 'allow',
+      policyReasons: [],
+      matchedRules: [],
+      path: {
+        rootId: 'project',
+        rootPath: '/tmp/mastracode-runtime-test',
+        path: '/tmp/mastracode-runtime-test/src/real.ts',
+        relativePath: 'src/real.ts',
+      },
+      actor: { type: 'user', id: 'user-1' },
+      requestId: 'request-real',
+      result: { status: 'ok' },
+      createdAt: 2_000,
+    });
+
+    await (runtime as any).refreshModifiedFilesFromWorkspaceJournal();
+
+    expect(runtime.getDisplayState().modifiedFiles.has('src/stale.ts')).toBe(false);
+    expect(runtime.getDisplayState().modifiedFiles.get('src/real.ts')).toMatchObject({
+      operations: ['write_file'],
+      firstModified: new Date(2_000),
+    });
+    await runtime.destroy();
+  });
+
   it('does not track errored or non-mutating tools as modified files', async () => {
     const runtime = createRuntime();
 

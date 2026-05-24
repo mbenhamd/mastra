@@ -466,6 +466,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
       this.mergeModifiedFileJournalEntry(next, entry.path, entry.operation, entry.createdAt);
       this.mergeModifiedFileJournalEntry(next, entry.toPath, entry.operation, entry.createdAt);
     }
+    this.modifiedFiles.clear();
     for (const [path, value] of next) {
       this.modifiedFiles.set(path, value);
     }
