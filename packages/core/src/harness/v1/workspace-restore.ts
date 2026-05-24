@@ -6,6 +6,7 @@ import type {
 } from '../../storage/domains/harness';
 import { HarnessValidationError } from './errors';
 
+/** Selects which workspace journal entries should be projected into a restore plan. */
 export type WorkspaceRestoreScope =
   | { kind: 'session' }
   | { kind: 'turn'; requestId: string }
@@ -16,6 +17,7 @@ export type WorkspaceRestoreScope =
    */
   | { kind: 'file'; affectedPath: WorkspaceActionJournalPathFilter };
 
+/** Operation the host should perform, or inspect, to reverse a journal entry. */
 export type WorkspaceRestoreStepKind =
   | 'restore_file'
   | 'delete_file'
@@ -24,8 +26,10 @@ export type WorkspaceRestoreStepKind =
   | 'skip'
   | 'manual_review';
 
+/** Whether a restore step is actionable, needs review, or has no effect. */
 export type WorkspaceRestoreStepStatus = 'planned' | 'blocked' | 'skipped';
 
+/** Conflict classification for a projected restore step. */
 export type WorkspaceRestoreConflictStatus =
   | 'unknown'
   | 'clean'
@@ -34,11 +38,13 @@ export type WorkspaceRestoreConflictStatus =
   | 'unsupported_operation'
   | 'no_effect';
 
+/** Human-readable conflict information for a restore step. */
 export interface WorkspaceRestoreConflict {
   status: WorkspaceRestoreConflictStatus;
   message?: string;
 }
 
+/** Planned restore work derived from one workspace action journal entry. */
 export interface WorkspaceRestorePlanStep {
   id: string;
   journalEntryId: string;
@@ -52,11 +58,13 @@ export interface WorkspaceRestorePlanStep {
   snapshot?: JsonValue;
 }
 
+/** A workspace path touched by the selected journal entries. */
 export interface WorkspaceRestoreAffectedPath {
   path: WorkspaceActionJournalPath;
   lastJournalEntryId: string;
 }
 
+/** Ordered restore plan for the selected workspace journal scope. */
 export interface WorkspaceRestorePlan {
   scope: WorkspaceRestoreScope;
   steps: WorkspaceRestorePlanStep[];
@@ -64,6 +72,7 @@ export interface WorkspaceRestorePlan {
   truncated: boolean;
 }
 
+/** Inputs for pure workspace restore planning. */
 export interface CreateWorkspaceRestorePlanOptions {
   scope: WorkspaceRestoreScope;
   /**
@@ -83,6 +92,7 @@ export interface CreateWorkspaceRestorePlanOptions {
 const DEFAULT_RESTORE_PLAN_LIMIT = 500;
 const FILE_MUTATION_OPERATIONS = new Set(['write', 'delete', 'rename', 'patch']);
 
+/** Builds an ordered restore plan from already-scoped workspace action journal entries. */
 export function createWorkspaceRestorePlan({
   scope,
   entries,
@@ -109,6 +119,7 @@ export function createWorkspaceRestorePlan({
   };
 }
 
+/** Returns true when a workspace action journal entry belongs to the requested restore scope. */
 export function workspaceRestoreEntryMatchesScope(
   entry: WorkspaceActionJournalEntry,
   scope: WorkspaceRestoreScope,
