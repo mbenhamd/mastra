@@ -88,6 +88,12 @@ export function createWorkspaceRestorePlan({
   entries,
   limit = DEFAULT_RESTORE_PLAN_LIMIT,
 }: CreateWorkspaceRestorePlanOptions): WorkspaceRestorePlan {
+  if (scope.kind === 'file' && !workspaceActionPathFilterHasSelector(scope.affectedPath)) {
+    throw new HarnessValidationError(
+      'scope.affectedPath',
+      'File restore scope requires at least one affected path selector',
+    );
+  }
   const planLimit = boundRestorePlanLimit(limit);
   const matchingEntries = [...entries]
     .filter(entry => workspaceRestoreEntryMatchesScope(entry, scope))
@@ -97,7 +103,7 @@ export function createWorkspaceRestorePlan({
 
   return {
     scope: cloneJson(scope),
-    steps: steps.map(step => cloneJson(step)),
+    steps,
     affectedPaths: collectAffectedPaths(selectedEntries),
     truncated: matchingEntries.length > selectedEntries.length,
   };

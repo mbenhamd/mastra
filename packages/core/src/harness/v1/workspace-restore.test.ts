@@ -269,6 +269,15 @@ describe('workspace restore planner', () => {
     ).toThrow(HarnessValidationError);
   });
 
+  it('rejects file scopes without an affected path selector', () => {
+    expect(() =>
+      createWorkspaceRestorePlan({
+        scope: { kind: 'file', affectedPath: {} },
+        entries: [journalEntry()],
+      }),
+    ).toThrow(HarnessValidationError);
+  });
+
   it('returns cloned plan data', () => {
     const plan = createWorkspaceRestorePlan({
       scope: { kind: 'session' },
