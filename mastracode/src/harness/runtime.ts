@@ -185,6 +185,10 @@ function isValidModelId(value: unknown): value is string {
   return typeof value === 'string';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function sanitizeMastraCodeOMStatePatch<T extends Record<string, unknown>>(patch: T): T {
   const sanitized = { ...patch };
   for (const key of ['observerModelId', 'reflectorModelId', 'subagentModelId']) {
@@ -482,7 +486,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     this.activeToolCalls.delete(endedToolCallId);
     if (!tool || isError || !isHarnessWorkspaceFileMutationTool(tool.name)) return;
 
-    const filePath = getHarnessWorkspaceActionPathInput(tool.name, tool.args as Record<string, unknown>);
+    const filePath = getHarnessWorkspaceActionPathInput(tool.name, isRecord(tool.args) ? tool.args : {});
     if (!filePath) return;
 
     const existing = this.modifiedFiles.get(filePath);

@@ -1062,6 +1062,18 @@ describe('MastraCodeHarnessRuntime', () => {
       result: 'ok',
       isError: false,
     });
+    await (runtime as any).handleCoreEvent({
+      type: 'subagent_tool_start',
+      innerToolCallId: 'sub-tool-1',
+      toolName: 'write_file',
+    });
+    await (runtime as any).handleCoreEvent({
+      type: 'subagent_tool_end',
+      innerToolCallId: 'sub-tool-1',
+      toolName: 'write_file',
+      output: 'ok',
+      isError: false,
+    });
 
     expect(runtime.getDisplayState().modifiedFiles.size).toBe(0);
     await runtime.destroy();
