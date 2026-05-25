@@ -28,7 +28,7 @@
   },
   "license": "Apache-2.0",
   "dependencies": {
-    "files-sdk": "^1.5.0"
+    "files-sdk": "^1.6.0"
   },
   "devDependencies": {
     "@internal/lint": "workspace:*",

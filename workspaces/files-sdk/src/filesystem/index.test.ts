@@ -12,7 +12,22 @@
  * All tests mock the FilesSDK Files instance.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdir, mkdtemp, stat, writeFile as writeLocalFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+import {
+  DirectoryNotEmptyError,
+  DirectoryNotFoundError,
+  FileExistsError,
+  FileNotFoundError,
+  IsDirectoryError,
+  NotDirectoryError,
+  StaleFileError,
+  WorkspaceReadOnlyError,
+} from '@mastra/core/workspace';
+import { describe, it, expect, vi } from 'vitest';
 
 import { FilesSDKFilesystem } from './index';
 import type { FilesSDKFilesystemOptions } from './index';
@@ -51,7 +66,8 @@ function createMockFiles() {
     url: vi.fn(),
     signedUploadUrl: vi.fn(),
     file: vi.fn(),
-    adapter: { name: 'mock' },
+    adapter: { name: 'mock', url: vi.fn() },
+    raw: {},
   };
 }
 
@@ -161,6 +177,15 @@ describe('FilesSDKFilesystem', () => {
       expect(mockFiles.download).toHaveBeenCalledWith('test.txt');
     });
 
+    it('normalizes dot, duplicate separator, and parent segments', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.download.mockResolvedValueOnce(createMockStoredFile('dir/file.txt', 'data'));
+
+      await fs.readFile('./dir//nested/../file.txt');
+
+      expect(mockFiles.download).toHaveBeenCalledWith('dir/file.txt');
+    });
+
     it('throws FileNotFoundError on NotFound', async () => {
       const { fs, mockFiles } = createFs();
       const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
@@ -183,7 +208,11 @@ describe('FilesSDKFilesystem', () => {
 
       await fs.writeFile('/test.txt', 'hello world');
 
-      expect(mockFiles.upload).toHaveBeenCalledWith('test.txt', expect.anything(), expect.objectContaining({ contentType: 'text/plain' }));
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'test.txt',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'text/plain' }),
+      );
     });
 
     it('calls upload with Buffer content', async () => {
@@ -191,18 +220,30 @@ describe('FilesSDKFilesystem', () => {
 
       await fs.writeFile('/data.bin', Buffer.from([1, 2, 3]));
 
-      expect(mockFiles.upload).toHaveBeenCalledWith('data.bin', expect.any(Uint8Array), expect.objectContaining({ contentType: 'application/octet-stream' }));
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'data.bin',
+        expect.any(Uint8Array),
+        expect.objectContaining({ contentType: 'application/octet-stream' }),
+      );
     });
 
     it('detects MIME type from extension', async () => {
       const { fs, mockFiles } = createFs();
 
       await fs.writeFile('/page.html', '<html>');
-      expect(mockFiles.upload).toHaveBeenCalledWith('page.html', expect.anything(), expect.objectContaining({ contentType: 'text/html' }));
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'page.html',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'text/html' }),
+      );
 
       mockFiles.upload.mockClear();
       await fs.writeFile('/data.json', '{}');
-      expect(mockFiles.upload).toHaveBeenCalledWith('data.json', expect.anything(), expect.objectContaining({ contentType: 'application/json' }));
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'data.json',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'application/json' }),
+      );
     });
 
     it('respects mimeType option override', async () => {
@@ -210,7 +251,11 @@ describe('FilesSDKFilesystem', () => {
 
       await fs.writeFile('/file.txt', 'data', { mimeType: 'text/csv' });
 
-      expect(mockFiles.upload).toHaveBeenCalledWith('file.txt', expect.anything(), expect.objectContaining({ contentType: 'text/csv' }));
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'file.txt',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'text/csv' }),
+      );
     });
 
     it('checks overwrite=false and throws FileExistsError', async () => {
@@ -227,6 +272,84 @@ describe('FilesSDKFilesystem', () => {
       await fs.writeFile('/new.txt', 'data', { overwrite: false });
 
       expect(mockFiles.upload).toHaveBeenCalled();
+    });
+
+    it('throws StaleFileError when expectedMtime does not match', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head
+        .mockResolvedValueOnce(createMockStoredFile('test.txt', 'old'))
+        .mockResolvedValueOnce(createMockStoredFile('test.txt', 'old'));
+
+      await expect(
+        fs.writeFile('/test.txt', 'new', { expectedMtime: new Date('2025-06-02T00:00:00Z') }),
+      ).rejects.toThrow(StaleFileError);
+      expect(mockFiles.upload).not.toHaveBeenCalled();
+    });
+
+    it('writes when expectedMtime matches', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head
+        .mockResolvedValueOnce(createMockStoredFile('test.txt', 'old'))
+        .mockResolvedValueOnce(createMockStoredFile('test.txt', 'old'));
+
+      await fs.writeFile('/test.txt', 'new', { expectedMtime: new Date('2025-06-01T00:00:00Z') });
+
+      expect(mockFiles.upload).toHaveBeenCalled();
+    });
+
+    it('throws IsDirectoryError when target is a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'dir/child.txt' }], cursor: undefined });
+
+      await expect(fs.writeFile('/dir', 'data')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.upload).not.toHaveBeenCalled();
+    });
+
+    it('writes exact object keys even when the same key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'old'));
+
+      await fs.writeFile('/dir', 'new');
+
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'dir',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'application/octet-stream' }),
+      );
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('treats nested FilesSDK NotFound errors as missing exact files', async () => {
+      const { fs, mockFiles } = createFs();
+      const notFound = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      const wrapped = Object.assign(new Error('Provider'), { code: 'Provider', cause: notFound });
+      mockFiles.head.mockRejectedValueOnce(wrapped);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+
+      await fs.writeFile('/new.txt', 'data');
+
+      expect(mockFiles.upload).toHaveBeenCalledWith(
+        'new.txt',
+        expect.anything(),
+        expect.objectContaining({ contentType: 'text/plain' }),
+      );
+    });
+
+    it('throws IsDirectoryError when target is an empty directory on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'empty');
+      await mkdir(emptyPath);
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.url.mockResolvedValue(pathToFileURL(emptyPath).href);
+
+      await expect(fs.writeFile('/empty', 'data')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.upload).not.toHaveBeenCalled();
     });
   });
 
@@ -281,15 +404,35 @@ describe('FilesSDKFilesystem', () => {
       expect(mockFiles.delete).toHaveBeenCalledWith(['dir/file.txt']);
     });
 
-    it('swallows errors with force=true', async () => {
+    it('swallows NotFound errors with force=true', async () => {
       const { fs, mockFiles } = createFs();
       // isDirectory check
       mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
       // delete throws
-      mockFiles.delete.mockRejectedValueOnce(new Error('fail'));
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.delete.mockRejectedValueOnce(error);
 
       // Should not throw
       await fs.deleteFile('/gone.txt', { force: true });
+    });
+
+    it('throws FileNotFoundError for NotFound errors with force=false', async () => {
+      const { fs, mockFiles } = createFs();
+      // isDirectory check
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.delete.mockRejectedValueOnce(error);
+
+      await expect(fs.deleteFile('/gone.txt')).rejects.toThrow(FileNotFoundError);
+    });
+
+    it('re-throws non-NotFound errors with force=true', async () => {
+      const { fs, mockFiles } = createFs();
+      // isDirectory check
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.delete.mockRejectedValueOnce(new Error('fail'));
+
+      await expect(fs.deleteFile('/test.txt', { force: true })).rejects.toThrow('fail');
     });
   });
 
@@ -309,24 +452,138 @@ describe('FilesSDKFilesystem', () => {
 
       await expect(fs.copyFile('/missing.txt', '/dest.txt')).rejects.toThrow(/missing\.txt/);
     });
+
+    it('throws FileExistsError when overwrite=false and destination exists', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+
+      await expect(fs.copyFile('/src.txt', '/dest.txt', { overwrite: false })).rejects.toThrow(FileExistsError);
+      expect(mockFiles.copy).not.toHaveBeenCalled();
+    });
+
+    it('copies exact source objects even when the same key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'exact'));
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+
+      await fs.copyFile('/dir', '/dest.txt');
+
+      expect(mockFiles.copy).toHaveBeenCalledWith('dir', 'dest.txt');
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('throws IsDirectoryError when source is only a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'src/child.txt' }], cursor: undefined });
+
+      await expect(fs.copyFile('/src', '/dest.txt')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.copy).not.toHaveBeenCalled();
+    });
+
+    it('throws IsDirectoryError when destination is a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error).mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'dest/child.txt' }], cursor: undefined });
+
+      await expect(fs.copyFile('/src.txt', '/dest')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.copy).not.toHaveBeenCalled();
+    });
+
+    it('copies to exact destination objects even when the destination key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head
+        .mockResolvedValueOnce(createMockStoredFile('src.txt', 'source'))
+        .mockResolvedValueOnce(createMockStoredFile('dest', 'old'));
+
+      await fs.copyFile('/src.txt', '/dest');
+
+      expect(mockFiles.copy).toHaveBeenCalledWith('src.txt', 'dest');
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
   });
 
   describe('moveFile()', () => {
-    it('copies then deletes source', async () => {
+    it('moves with normalized keys', async () => {
       const { fs, mockFiles } = createFs();
 
       await fs.moveFile('/src.txt', '/dest.txt');
 
-      expect(mockFiles.copy).toHaveBeenCalledWith('src.txt', 'dest.txt');
-      expect(mockFiles.delete).toHaveBeenCalledWith('src.txt');
+      expect(mockFiles.move).toHaveBeenCalledWith('src.txt', 'dest.txt');
+      expect(mockFiles.copy).not.toHaveBeenCalled();
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('delegates same-key moves to FilesSDK', async () => {
+      const { fs, mockFiles } = createFs();
+
+      await fs.moveFile('/a/../file.txt', '/file.txt');
+
+      expect(mockFiles.move).toHaveBeenCalledWith('file.txt', 'file.txt');
+      expect(mockFiles.copy).not.toHaveBeenCalled();
+      expect(mockFiles.delete).not.toHaveBeenCalled();
     });
 
     it('throws FileNotFoundError on NotFound', async () => {
       const { fs, mockFiles } = createFs();
       const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
-      mockFiles.copy.mockRejectedValueOnce(error);
+      mockFiles.move.mockRejectedValueOnce(error);
 
       await expect(fs.moveFile('/missing.txt', '/dest.txt')).rejects.toThrow(/missing\.txt/);
+    });
+
+    it('throws FileExistsError when overwrite=false and destination exists', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+
+      await expect(fs.moveFile('/src.txt', '/dest.txt', { overwrite: false })).rejects.toThrow(FileExistsError);
+      expect(mockFiles.move).not.toHaveBeenCalled();
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('moves exact source objects even when the same key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'exact'));
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+
+      await fs.moveFile('/dir', '/dest.txt');
+
+      expect(mockFiles.move).toHaveBeenCalledWith('dir', 'dest.txt');
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('throws IsDirectoryError when move source is only a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'src/child.txt' }], cursor: undefined });
+
+      await expect(fs.moveFile('/src', '/dest.txt')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.move).not.toHaveBeenCalled();
+    });
+
+    it('throws IsDirectoryError when destination is a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error).mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'dest/child.txt' }], cursor: undefined });
+
+      await expect(fs.moveFile('/src.txt', '/dest')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.move).not.toHaveBeenCalled();
+    });
+
+    it('moves to exact destination objects even when the destination key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head
+        .mockResolvedValueOnce(createMockStoredFile('src.txt', 'source'))
+        .mockResolvedValueOnce(createMockStoredFile('dest', 'old'));
+
+      await fs.moveFile('/src.txt', '/dest');
+
+      expect(mockFiles.move).toHaveBeenCalledWith('src.txt', 'dest');
+      expect(mockFiles.list).not.toHaveBeenCalled();
     });
   });
 
@@ -339,6 +596,12 @@ describe('FilesSDKFilesystem', () => {
       // Should not call any file operations
       expect(mockFiles.upload).not.toHaveBeenCalled();
       expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('throws on read-only filesystems', async () => {
+      const { fs } = createFs({ readOnly: true });
+
+      await expect(fs.mkdir('/newdir')).rejects.toThrow(WorkspaceReadOnlyError);
     });
   });
 
@@ -359,6 +622,33 @@ describe('FilesSDKFilesystem', () => {
         { name: 'file1.txt', type: 'file', size: 100 },
         { name: 'file2.json', type: 'file', size: 200 },
       ]);
+    });
+
+    it('normalizes trailing slashes before listing directories', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/file.txt', size: 100, type: 'text/plain' }],
+        cursor: undefined,
+      });
+
+      const entries = await fs.readdir('/dir/');
+
+      expect(mockFiles.list).toHaveBeenCalledWith({ prefix: 'dir/', cursor: undefined, limit: 1000 });
+      expect(entries).toEqual([{ name: 'file.txt', type: 'file', size: 100 }]);
+    });
+
+    it('lists directories even when the adapter reports the directory key exists', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/file.txt', size: 100, type: 'text/plain' }],
+        cursor: undefined,
+      });
+
+      const entries = await fs.readdir('/dir');
+
+      expect(mockFiles.exists).not.toHaveBeenCalled();
+      expect(entries).toEqual([{ name: 'file.txt', type: 'file', size: 100 }]);
     });
 
     it('synthesizes directory entries for nested keys', async () => {
@@ -417,6 +707,55 @@ describe('FilesSDKFilesystem', () => {
       ]);
     });
 
+    it('returns an empty list when extension filters exclude all files in an existing directory', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(false);
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/a.json', size: 1 }],
+        cursor: undefined,
+      });
+
+      await expect(fs.readdir('/dir', { extension: '.txt' })).resolves.toEqual([]);
+    });
+
+    it('returns an empty list for marker-only directories', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/', size: 0 }],
+        cursor: undefined,
+      });
+
+      await expect(fs.readdir('/dir')).resolves.toEqual([]);
+      expect(mockFiles.exists).not.toHaveBeenCalled();
+    });
+
+    it('returns an empty list for empty directories on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'empty');
+      await mkdir(emptyPath);
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.url.mockResolvedValueOnce(pathToFileURL(emptyPath).href);
+
+      await expect(fs.readdir('/empty')).resolves.toEqual([]);
+      expect(mockFiles.url).toHaveBeenCalledWith('empty');
+    });
+
+    it('keeps file paths as NotDirectoryError on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const filePath = join(tempRoot, 'file.txt');
+      await writeLocalFile(filePath, 'data');
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.url.mockResolvedValueOnce(pathToFileURL(filePath).href);
+
+      await expect(fs.readdir('/file.txt')).rejects.toThrow(NotDirectoryError);
+    });
+
     it('paginates across multiple pages', async () => {
       const { fs, mockFiles } = createFs();
       mockFiles.list
@@ -434,6 +773,22 @@ describe('FilesSDKFilesystem', () => {
       expect(entries).toHaveLength(2);
       expect(mockFiles.list).toHaveBeenCalledTimes(2);
     });
+
+    it('throws DirectoryNotFoundError for missing directories', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(false);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+
+      await expect(fs.readdir('/missing')).rejects.toThrow(DirectoryNotFoundError);
+    });
+
+    it('throws NotDirectoryError for file paths', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+
+      await expect(fs.readdir('/file.txt')).rejects.toThrow(NotDirectoryError);
+      expect(mockFiles.list).toHaveBeenCalledWith({ prefix: 'file.txt/', cursor: undefined, limit: 1000 });
+    });
   });
 
   describe('rmdir()', () => {
@@ -444,32 +799,191 @@ describe('FilesSDKFilesystem', () => {
         cursor: undefined,
       });
 
-      await expect(fs.rmdir('/dir')).rejects.toThrow();
+      await expect(fs.rmdir('/dir')).rejects.toThrow(DirectoryNotEmptyError);
     });
 
     it('batch-deletes all keys for recursive rmdir', async () => {
       const { fs, mockFiles } = createFs();
       mockFiles.list.mockResolvedValueOnce({
-        items: [
-          { key: 'dir/a.txt' },
-          { key: 'dir/b.txt' },
-          { key: 'dir/sub/c.txt' },
-        ],
+        items: [{ key: 'dir/a.txt' }, { key: 'dir/b.txt' }, { key: 'dir/sub/c.txt' }],
         cursor: undefined,
       });
+      mockFiles.delete.mockResolvedValueOnce({ deleted: ['dir/a.txt', 'dir/b.txt', 'dir/sub/c.txt'] });
 
       await fs.rmdir('/dir', { recursive: true });
 
       expect(mockFiles.delete).toHaveBeenCalledWith(['dir/a.txt', 'dir/b.txt', 'dir/sub/c.txt']);
     });
 
-    it('no-ops if directory is already empty', async () => {
+    it('removes directories even when the adapter reports the directory key exists', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/a.txt' }],
+        cursor: undefined,
+      });
+      mockFiles.delete.mockResolvedValueOnce({ deleted: ['dir/a.txt'] });
+
+      await fs.rmdir('/dir', { recursive: true });
+
+      expect(mockFiles.exists).not.toHaveBeenCalled();
+      expect(mockFiles.delete).toHaveBeenCalledWith(['dir/a.txt']);
+    });
+
+    it('removes backing local directories after recursive delete on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const dirPath = join(tempRoot, 'dir');
+      const filePath = join(dirPath, 'file.txt');
+      await mkdir(dirPath, { recursive: true });
+      await writeLocalFile(filePath, 'data');
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/file.txt' }],
+        cursor: undefined,
+      });
+      mockFiles.delete.mockResolvedValueOnce({ deleted: ['dir/file.txt'] });
+      mockFiles.url.mockResolvedValueOnce(pathToFileURL(dirPath).href);
+
+      await fs.rmdir('/dir', { recursive: true });
+
+      await expect(stat(dirPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(mockFiles.delete).toHaveBeenCalledWith(['dir/file.txt']);
+    });
+
+    it('throws when recursive bulk delete reports errors', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/a.txt' }],
+        cursor: undefined,
+      });
+      mockFiles.delete.mockResolvedValueOnce({
+        deleted: [],
+        errors: [{ key: 'dir/a.txt', error: new Error('delete failed') }],
+      });
+
+      await expect(fs.rmdir('/dir', { recursive: true })).rejects.toThrow(/Failed to delete 1 object/);
+    });
+
+    it('no-ops with force=true if directory is missing', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.exists.mockResolvedValueOnce(false);
+
+      await fs.rmdir('/empty', { recursive: true, force: true });
+
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('removes marker-only directories without requiring recursive', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/' }],
+        cursor: undefined,
+      });
+      mockFiles.delete.mockResolvedValueOnce({ deleted: ['dir/'] });
+
+      await fs.rmdir('/dir');
+
+      expect(mockFiles.delete).toHaveBeenCalledWith(['dir/']);
+    });
+
+    it('throws when marker-only directory delete reports errors', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.list.mockResolvedValueOnce({
+        items: [{ key: 'dir/' }],
+        cursor: undefined,
+      });
+      mockFiles.delete.mockResolvedValueOnce({
+        deleted: [],
+        errors: [{ key: 'dir/', error: new Error('delete failed') }],
+      });
+
+      await expect(fs.rmdir('/dir')).rejects.toThrow(/Failed to delete 1 object/);
+    });
+
+    it('removes empty directories on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'empty');
+      await mkdir(emptyPath);
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.url.mockResolvedValueOnce(pathToFileURL(emptyPath).href);
+
+      await fs.rmdir('/empty');
+
+      await expect(stat(emptyPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('removes empty directories on the FilesSDK fs adapter when urlBaseUrl is configured', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'empty');
+      await mkdir(emptyPath);
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.raw = { root: tempRoot };
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.url
+        .mockResolvedValueOnce('http://localhost/static/empty')
+        .mockResolvedValueOnce('http://localhost/static/__mastra_files_sdk_prefix_probe__');
+      mockFiles.adapter.url.mockResolvedValueOnce('http://localhost/static/__mastra_files_sdk_prefix_probe__');
+
+      await fs.rmdir('/empty');
+
+      await expect(stat(emptyPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('removes empty directories on prefixed FilesSDK fs adapters with urlBaseUrl', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'workspace', 'empty');
+      await mkdir(emptyPath, { recursive: true });
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.raw = { root: tempRoot };
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+      mockFiles.url
+        .mockResolvedValueOnce('http://localhost/static/workspace/empty')
+        .mockResolvedValueOnce('http://localhost/static/workspace/__mastra_files_sdk_prefix_probe__');
+      mockFiles.adapter.url.mockResolvedValueOnce('http://localhost/static/__mastra_files_sdk_prefix_probe__');
+
+      await fs.rmdir('/empty');
+
+      await expect(stat(emptyPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(join(tempRoot, 'empty'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(mockFiles.delete).not.toHaveBeenCalled();
+    });
+
+    it('throws DirectoryNotFoundError for missing directories without force', async () => {
       const { fs, mockFiles } = createFs();
       mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
 
-      await fs.rmdir('/empty', { recursive: true });
+      await expect(fs.rmdir('/missing', { recursive: true })).rejects.toThrow(DirectoryNotFoundError);
+    });
 
-      expect(mockFiles.delete).not.toHaveBeenCalled();
+    it('throws NotDirectoryError for file paths', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+
+      await expect(fs.rmdir('/file.txt', { recursive: true })).rejects.toThrow(NotDirectoryError);
+      expect(mockFiles.list).toHaveBeenCalledWith({ prefix: 'file.txt/', cursor: undefined, limit: 1000 });
+    });
+
+    it('throws NotDirectoryError for file paths even with force=true', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.exists.mockResolvedValueOnce(true);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
+
+      await expect(fs.rmdir('/file.txt', { recursive: true, force: true })).rejects.toThrow(NotDirectoryError);
     });
   });
 
@@ -518,9 +1032,7 @@ describe('FilesSDKFilesystem', () => {
 
     it('returns file stat from head()', async () => {
       const { fs, mockFiles } = createFs();
-      mockFiles.head.mockResolvedValueOnce(
-        createMockStoredFile('test.txt', 'hello'),
-      );
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('test.txt', 'hello'));
 
       const st = await fs.stat('/test.txt');
 
@@ -540,6 +1052,33 @@ describe('FilesSDKFilesystem', () => {
 
       expect(st.type).toBe('directory');
       expect(st.name).toBe('dir');
+    });
+
+    it('preserves exact object keys over synthetic directories for stat', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'hello'));
+
+      const st = await fs.stat('/dir');
+
+      expect(st.type).toBe('file');
+      expect(st.name).toBe('dir');
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('returns directory stat for empty directories on the FilesSDK fs adapter', async () => {
+      const { fs, mockFiles } = createFs();
+      const tempRoot = await mkdtemp(join(tmpdir(), 'files-sdk-filesystem-'));
+      const emptyPath = join(tempRoot, 'empty');
+      await mkdir(emptyPath);
+
+      mockFiles.adapter.name = 'fs';
+      mockFiles.url.mockResolvedValueOnce(pathToFileURL(emptyPath).href);
+
+      const st = await fs.stat('/empty');
+
+      expect(st).toMatchObject({ name: 'empty', path: '/empty', type: 'directory', size: 0 });
+      expect(mockFiles.list).not.toHaveBeenCalled();
+      expect(mockFiles.head).not.toHaveBeenCalled();
     });
 
     it('throws FileNotFoundError when nothing matches', async () => {
@@ -593,37 +1132,37 @@ describe('FilesSDKFilesystem', () => {
     it('throws on writeFile', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.writeFile('/test.txt', 'data')).rejects.toThrow();
+      await expect(fs.writeFile('/test.txt', 'data')).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('throws on deleteFile', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.deleteFile('/test.txt')).rejects.toThrow();
+      await expect(fs.deleteFile('/test.txt')).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('throws on appendFile', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.appendFile('/test.txt', 'data')).rejects.toThrow();
+      await expect(fs.appendFile('/test.txt', 'data')).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('throws on copyFile', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.copyFile('/a.txt', '/b.txt')).rejects.toThrow();
+      await expect(fs.copyFile('/a.txt', '/b.txt')).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('throws on moveFile', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.moveFile('/a.txt', '/b.txt')).rejects.toThrow();
+      await expect(fs.moveFile('/a.txt', '/b.txt')).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('throws on rmdir', async () => {
       const { fs } = createFs({ readOnly: true });
 
-      await expect(fs.rmdir('/dir', { recursive: true })).rejects.toThrow();
+      await expect(fs.rmdir('/dir', { recursive: true })).rejects.toThrow(WorkspaceReadOnlyError);
     });
 
     it('allows readFile', async () => {

@@ -1,4 +1,6 @@
-import type { Files, StoredFile as SDKStoredFile } from 'files-sdk';
+import { rm, rmdir as removeDirectory, stat as statPath } from 'node:fs/promises';
+import { join as pathJoin, posix as pathPosix, resolve as pathResolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type {
   FileContent,
@@ -18,9 +20,14 @@ import {
   MastraFilesystem,
   FileNotFoundError,
   FileExistsError,
+  DirectoryNotFoundError,
+  IsDirectoryError,
+  NotDirectoryError,
   DirectoryNotEmptyError,
+  StaleFileError,
   WorkspaceReadOnlyError,
 } from '@mastra/core/workspace';
+import type { Files, StoredFile as SDKStoredFile } from 'files-sdk';
 
 // ---------------------------------------------------------------------------
 // Options
@@ -50,11 +57,8 @@ export interface FilesSDKFilesystemOptions extends MastraFilesystemOptions {
  * Strips leading slashes, resolves `.`/`./` to empty string.
  */
 function toKey(path: string): string {
-  let key = path.replace(/^\/+/, '');
-  if (key === '.' || key === './') return '';
-  // Remove trailing slash (keys don't end with /)
-  key = key.replace(/\/+$/, '');
-  return key;
+  const normalized = pathPosix.normalize(`/${path}`).slice(1);
+  return normalized === '.' ? '' : normalized.replace(/\/+$/, '');
 }
 
 /**
@@ -65,22 +69,41 @@ function basename(key: string): string {
   return idx === -1 ? key : key.slice(idx + 1);
 }
 
+function getFilesystemErrorCodes(err: unknown, depth = 0): unknown[] {
+  if (!err || typeof err !== 'object' || depth > 4) return [];
+
+  const error = err as { code?: unknown; cause?: unknown; info?: unknown };
+  return [
+    error.code,
+    ...getFilesystemErrorCodes(error.cause, depth + 1),
+    ...getFilesystemErrorCodes(error.info, depth + 1),
+  ].filter(code => code !== undefined);
+}
+
+function hasFilesystemErrorCode(err: unknown, code: string): boolean {
+  return getFilesystemErrorCodes(err).includes(code);
+}
+
 function isNotFoundError(err: unknown): boolean {
-  if (err && typeof err === 'object' && 'code' in err) {
-    return (err as { code: string }).code === 'NotFound';
-  }
-  return false;
+  return hasFilesystemErrorCode(err, 'NotFound');
 }
 
 function isUnauthorizedError(err: unknown): boolean {
-  if (err && typeof err === 'object' && 'code' in err) {
-    return (err as { code: string }).code === 'Unauthorized';
-  }
-  return false;
+  return hasFilesystemErrorCode(err, 'Unauthorized');
+}
+
+function getFilesystemErrorCode(err: unknown): unknown {
+  const codes = getFilesystemErrorCodes(err);
+  return codes.find(code => code !== 'Provider') ?? codes[0];
 }
 
 function generateId(): string {
   return `files-sdk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function toDate(value: number | Date | undefined): Date | undefined {
+  if (value === undefined) return undefined;
+  return value instanceof Date ? value : new Date(value);
 }
 
 /**
@@ -180,6 +203,102 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     return this._files;
   }
 
+  private async isExistingLocalDirectoryKey(key: string): Promise<boolean> {
+    if (this._files.adapter?.name !== 'fs') return false;
+
+    const localPath = await this.getLocalFsPath(key);
+    if (!localPath) return false;
+
+    try {
+      const stats = await statPath(localPath);
+      return stats.isDirectory();
+    } catch (err) {
+      const code = getFilesystemErrorCode(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+      throw err;
+    }
+  }
+
+  private async isExactFileKey(key: string): Promise<boolean> {
+    if (!key) return false;
+
+    if (await this.isExistingLocalDirectoryKey(key)) return false;
+
+    try {
+      await this._files.head(key);
+      return true;
+    } catch (err) {
+      if (isNotFoundError(err)) return false;
+      throw err;
+    }
+  }
+
+  private async removeExistingLocalDirectoryKey(key: string, path: string, options?: RemoveOptions): Promise<boolean> {
+    if (this._files.adapter?.name !== 'fs') return false;
+
+    const localPath = await this.getLocalFsPath(key);
+    if (!localPath) return false;
+
+    try {
+      const stats = await statPath(localPath);
+      if (!stats.isDirectory()) return false;
+
+      if (options?.recursive) {
+        await rm(localPath, { recursive: true, force: false });
+      } else {
+        await removeDirectory(localPath);
+      }
+      return true;
+    } catch (err) {
+      const code = getFilesystemErrorCode(err);
+      if (code === 'ENOENT') throw new DirectoryNotFoundError(path);
+      if (code === 'ENOTEMPTY' || code === 'EEXIST') throw new DirectoryNotEmptyError(path);
+      if (code === 'ENOTDIR') throw new NotDirectoryError(path);
+      throw err;
+    }
+  }
+
+  private async getLocalFsPath(key: string): Promise<string | undefined> {
+    const url = await this._files.url(key);
+    if (typeof url === 'string' && url.startsWith('file:')) return fileURLToPath(url);
+
+    const raw = this._files.raw as { root?: unknown } | undefined;
+    if (typeof raw?.root !== 'string') return undefined;
+
+    const scopedKey = await this.getScopedLocalFsKey(key);
+    if (!scopedKey) return undefined;
+    return pathJoin(pathResolve(raw.root), ...scopedKey.split('/'));
+  }
+
+  private async getScopedLocalFsKey(key: string): Promise<string | undefined> {
+    const probe = '__mastra_files_sdk_prefix_probe__';
+
+    try {
+      const scopedProbeUrl = await this._files.url(probe);
+      const adapterProbeUrl = await this._files.adapter.url(probe);
+      const scopedProbePath = new URL(scopedProbeUrl).pathname;
+      const adapterProbePath = new URL(adapterProbeUrl).pathname;
+      const probeSuffix = `/${probe}`;
+
+      if (!scopedProbePath.endsWith(probeSuffix) || !adapterProbePath.endsWith(probeSuffix)) return undefined;
+
+      const scopedBasePath = scopedProbePath.slice(0, -probe.length);
+      const adapterBasePath = adapterProbePath.slice(0, -probe.length);
+      if (!scopedBasePath.startsWith(adapterBasePath)) return undefined;
+
+      const prefixPath = scopedBasePath.slice(adapterBasePath.length);
+      const prefix = prefixPath
+        .split('/')
+        .filter(Boolean)
+        .map(segment => decodeURIComponent(segment))
+        .join('/');
+
+      return prefix ? `${prefix}/${key}` : key;
+    } catch {
+      return undefined;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -245,6 +364,23 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     this.assertWritable('writeFile');
     const key = toKey(path);
 
+    if (!(await this.isExactFileKey(key)) && (await this.isDirectory(key))) {
+      throw new IsDirectoryError(path);
+    }
+
+    if (options?.expectedMtime) {
+      try {
+        const current = await this._files.head(key);
+        const actualMtime = toDate(current.lastModified);
+        if (!actualMtime || actualMtime.getTime() !== options.expectedMtime.getTime()) {
+          throw new StaleFileError(path, options.expectedMtime, actualMtime ?? new Date(0));
+        }
+      } catch (err) {
+        if (err instanceof StaleFileError) throw err;
+        if (!isNotFoundError(err)) throw err;
+      }
+    }
+
     // Respect overwrite option (default: true)
     if (options?.overwrite === false) {
       const fileExists = await this._files.exists(key);
@@ -294,16 +430,31 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     try {
       await this._files.delete(key);
     } catch (err) {
-      if (options?.force) return;
+      if (isNotFoundError(err)) {
+        if (options?.force) return;
+        throw new FileNotFoundError(path);
+      }
       throw err;
     }
   }
 
-  async copyFile(src: string, dest: string, _options?: CopyOptions): Promise<void> {
+  async copyFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
     await this.ensureReady();
     this.assertWritable('copyFile');
     const fromKey = toKey(src);
     const toKey_ = toKey(dest);
+
+    if (!(await this.isExactFileKey(fromKey)) && (await this.isDirectory(fromKey))) {
+      throw new IsDirectoryError(src);
+    }
+
+    if (!(await this.isExactFileKey(toKey_)) && (await this.isDirectory(toKey_))) {
+      throw new IsDirectoryError(dest);
+    }
+
+    if (options?.overwrite === false && (await this._files.exists(toKey_))) {
+      throw new FileExistsError(dest);
+    }
 
     try {
       await this._files.copy(fromKey, toKey_);
@@ -313,15 +464,26 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     }
   }
 
-  async moveFile(src: string, dest: string, _options?: CopyOptions): Promise<void> {
+  async moveFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
     await this.ensureReady();
     this.assertWritable('moveFile');
     const fromKey = toKey(src);
     const toKey_ = toKey(dest);
 
+    if (!(await this.isExactFileKey(fromKey)) && (await this.isDirectory(fromKey))) {
+      throw new IsDirectoryError(src);
+    }
+
+    if (!(await this.isExactFileKey(toKey_)) && (await this.isDirectory(toKey_))) {
+      throw new IsDirectoryError(dest);
+    }
+
+    if (options?.overwrite === false && (await this._files.exists(toKey_))) {
+      throw new FileExistsError(dest);
+    }
+
     try {
-      await this._files.copy(fromKey, toKey_);
-      await this._files.delete(fromKey);
+      await this._files.move(fromKey, toKey_);
     } catch (err) {
       if (isNotFoundError(err)) throw new FileNotFoundError(src);
       throw err;
@@ -334,6 +496,7 @@ export class FilesSDKFilesystem extends MastraFilesystem {
 
   async mkdir(_path: string, _options?: { recursive?: boolean }): Promise<void> {
     await this.ensureReady();
+    this.assertWritable('mkdir');
     // No-op: object storage creates "directories" implicitly on file write.
   }
 
@@ -355,7 +518,19 @@ export class FilesSDKFilesystem extends MastraFilesystem {
       cursor = result.cursor;
     } while (cursor);
 
-    if (allKeys.length === 0) return;
+    if (allKeys.length === 0) {
+      if (key && (await this._files.exists(key))) {
+        if (await this.removeExistingLocalDirectoryKey(key, path, options)) return;
+        throw new NotDirectoryError(path);
+      }
+      if (options?.force) return;
+      throw new DirectoryNotFoundError(path);
+    }
+
+    if (key && allKeys.length === 1 && allKeys[0] === prefix) {
+      await this.deleteKeysOrThrow(allKeys, path);
+      return;
+    }
 
     // Non-recursive: fail if directory is not empty
     if (!options?.recursive) {
@@ -363,7 +538,14 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     }
 
     // Batch delete all keys
-    await this._files.delete(allKeys);
+    await this.deleteKeysOrThrow(allKeys, path);
+    if (key) {
+      try {
+        await this.removeExistingLocalDirectoryKey(key, path, { ...options, recursive: true });
+      } catch (err) {
+        if (!(err instanceof DirectoryNotFoundError)) throw err;
+      }
+    }
   }
 
   async readdir(path: string, options?: ListOptions): Promise<FileEntry[]> {
@@ -377,6 +559,7 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     let cursor: string | undefined;
     const maxDepth = options?.maxDepth;
     const recursive = options?.recursive ?? false;
+    let sawAnyEntry = false;
     const extensions = options?.extension
       ? Array.isArray(options.extension)
         ? options.extension
@@ -390,6 +573,7 @@ export class FilesSDKFilesystem extends MastraFilesystem {
         // item.key is relative to the Files instance's prefix.
         // We need to get the portion after our directory prefix.
         const relativePath = prefix ? item.key.slice(prefix.length) : item.key;
+        sawAnyEntry = true;
         if (!relativePath) continue;
 
         const segments = relativePath.split('/');
@@ -444,6 +628,14 @@ export class FilesSDKFilesystem extends MastraFilesystem {
       cursor = result.cursor;
     } while (cursor);
 
+    if (key && !sawAnyEntry) {
+      if (await this._files.exists(key)) {
+        if (await this.isExistingLocalDirectoryKey(key)) return [];
+        throw new NotDirectoryError(path);
+      }
+      throw new DirectoryNotFoundError(path);
+    }
+
     return entries;
   }
 
@@ -483,7 +675,20 @@ export class FilesSDKFilesystem extends MastraFilesystem {
       };
     }
 
-    // Try as file first
+    // Try local fs directories first, since FilesSDK's fs adapter can `head()` directories.
+    if (this._files.adapter?.name === 'fs' && (await this.isDirectory(key))) {
+      const now = new Date();
+      return {
+        name: basename(key),
+        path,
+        type: 'directory',
+        size: 0,
+        createdAt: now,
+        modifiedAt: now,
+      };
+    }
+
+    // Try as file
     try {
       const file = await this._files.head(key);
       return this.storedFileToStat(file, path);
@@ -491,7 +696,7 @@ export class FilesSDKFilesystem extends MastraFilesystem {
       if (!isNotFoundError(err)) throw err;
     }
 
-    // Try as directory
+    // Try as synthetic object-store directory after preserving exact object keys.
     if (await this.isDirectory(key)) {
       const now = new Date();
       return {
@@ -517,12 +722,24 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     }
   }
 
+  private async deleteKeysOrThrow(keys: string[], path: string): Promise<void> {
+    const deleteResult = await this._files.delete(keys);
+    const errors = deleteResult?.errors ?? [];
+    if (errors.length) {
+      throw new Error(`Failed to delete ${errors.length} object(s) in ${path}`);
+    }
+  }
+
   /** Check if a key prefix has any children (i.e. acts like a directory). */
   private async isDirectory(key: string): Promise<boolean> {
     if (!key) return true; // root
+    if (this._files.adapter?.name === 'fs') {
+      return this.isExistingLocalDirectoryKey(key);
+    }
     const prefix = `${key}/`;
     const result = await this._files.list({ prefix, limit: 1 });
-    return result.items.length > 0;
+    if (result.items.length > 0) return true;
+    return false;
   }
 
   /** Convert a FilesSDK StoredFile to a Mastra FileStat. */
