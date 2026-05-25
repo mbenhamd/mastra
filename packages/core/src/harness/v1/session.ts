@@ -8314,7 +8314,7 @@ export class Session {
       agentEndEmitted = true;
       return full;
     } catch (err) {
-      if (agentStarted && !agentEndEmitted) {
+      if (agentStarted && !agentEndEmitted && !(err instanceof QueuePostRunFinalizationPendingError)) {
         this._emitTurnEvent({
           type: 'agent_end',
           reason: turnAbortController.signal.aborted ? 'aborted' : 'error',
