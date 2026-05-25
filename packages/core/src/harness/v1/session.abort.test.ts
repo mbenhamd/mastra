@@ -123,10 +123,13 @@ describe('Session.abort()', () => {
     await inflight;
     expect(abortReason).toBe('user-cancelled');
     expect(session.isRunning()).toBe(false);
-    expect(events.find(event => (event as { type?: string }).type === 'agent_end')).toMatchObject({
-      type: 'agent_end',
-      reason: 'aborted',
-    });
+    const agentEnds = events.filter(event => (event as { type?: string }).type === 'agent_end');
+    expect(agentEnds).toEqual([
+      expect.objectContaining({
+        type: 'agent_end',
+        reason: 'aborted',
+      }),
+    ]);
 
     // Per-turn signal handed to the agent must have aborted with the same
     // reason that `session.abort()` supplied.
@@ -177,6 +180,29 @@ describe('Session.abort()', () => {
     const turnSignal = agent.streamCalls[0]!.options.abortSignal as AbortSignal;
     expect(turnSignal.aborted).toBe(true);
     expect((turnSignal as { reason?: unknown }).reason).toBe('session_aborted');
+  });
+
+  it('does not let a completed caller abort signal cancel a later turn', async () => {
+    const { harness, agent } = setupHarness();
+    const oldCallerAbort = new AbortController();
+    agent.enqueueRun({ finishReason: 'stop', text: 'first' });
+
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'first', abortSignal: oldCallerAbort.signal });
+    expect(session.isRunning()).toBe(false);
+
+    const hold = deferred();
+    agent.enqueueRun({ finishReason: 'stop', text: 'second', holdUntil: hold.promise });
+    const second = session.message({ content: 'second' });
+
+    await waitFor(() => session.isRunning());
+    oldCallerAbort.abort('late-old-caller');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(session.isRunning()).toBe(true);
+
+    hold.resolve();
+    await expect(second).resolves.toBeDefined();
+    expect(session.isRunning()).toBe(false);
   });
 
   it('cancels an in-flight queued turn', async () => {

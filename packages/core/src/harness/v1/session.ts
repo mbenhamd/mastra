@@ -569,6 +569,7 @@ interface IdleWaiter {
 
 interface ActiveTurnWaiter {
   promise: Promise<never>;
+  controller?: AbortController;
   reject: (err: unknown) => void;
   cleanup: () => void;
 }
@@ -702,6 +703,7 @@ export class Session {
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
+  private readonly _turnAbortSignalCleanups = new WeakMap<AbortController, () => void>();
   private readonly _operationEvidenceSignalIds = new Set<string>();
   private readonly _activeTools = new Map<string, ActiveToolState>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
@@ -1084,9 +1086,9 @@ export class Session {
       if (callerSignal.aborted) {
         controller.abort((callerSignal as { reason?: unknown }).reason);
       } else {
-        callerSignal.addEventListener('abort', () => controller.abort((callerSignal as { reason?: unknown }).reason), {
-          once: true,
-        });
+        const forwardAbort = () => controller.abort((callerSignal as { reason?: unknown }).reason);
+        callerSignal.addEventListener('abort', forwardAbort, { once: true });
+        this._turnAbortSignalCleanups.set(controller, () => callerSignal.removeEventListener('abort', forwardAbort));
       }
     }
     return controller;
@@ -1114,6 +1116,8 @@ export class Session {
    * idle state. Cumulative aggregates (`_tokenUsage`) are preserved.
    */
   private _endTurn(controller: AbortController): void {
+    this._turnAbortSignalCleanups.get(controller)?.();
+    this._turnAbortSignalCleanups.delete(controller);
     if (this._currentTurnAbortController === controller) {
       this._currentTurnAbortController = undefined;
       this._currentRunId = undefined;
@@ -1127,10 +1131,12 @@ export class Session {
 
   private _createActiveTurnWaiter(): ActiveTurnWaiter {
     let reject!: (err: unknown) => void;
+    const activeTurn = this._currentTurnAbortController;
     const waiter: ActiveTurnWaiter = {
       promise: new Promise<never>((_, rej) => {
         reject = rej;
       }),
+      controller: activeTurn,
       reject: err => reject(err),
       cleanup: () => {
         this._activeTurnWaiters.delete(waiter);
@@ -1141,25 +1147,40 @@ export class Session {
       this._activeTurnWaiters.delete(waiter);
       waiter.reject(new HarnessSessionDeletedError(this.id));
     }
+    if (activeTurn?.signal.aborted) {
+      this._activeTurnWaiters.delete(waiter);
+      waiter.reject(this._activeTurnAbortError(activeTurn));
+    }
     return waiter;
   }
 
-  private _rejectActiveTurnWaiters(reason: unknown): void {
-    if (this._activeTurnWaiters.size === 0) return;
-    const waiters = Array.from(this._activeTurnWaiters);
-    this._activeTurnWaiters.clear();
-    for (const waiter of waiters) {
+  private _rejectActiveTurnWaiters(reason: unknown, waiters?: ActiveTurnWaiter[]): void {
+    const selectedWaiters = waiters ?? Array.from(this._activeTurnWaiters);
+    if (selectedWaiters.length === 0) return;
+    if (waiters) {
+      for (const waiter of selectedWaiters) {
+        this._activeTurnWaiters.delete(waiter);
+      }
+    } else {
+      this._activeTurnWaiters.clear();
+    }
+    for (const waiter of selectedWaiters) {
       waiter.reject(reason);
     }
   }
 
-  private _scheduleActiveTurnAbort(controller: AbortController): void {
+  private _activeTurnAbortError(controller: AbortController): Error {
     const reason = (controller.signal as { reason?: unknown }).reason;
     const message = typeof reason === 'string' && reason.length > 0 ? reason : 'session_aborted';
-    const err = reason instanceof Error ? reason : new HarnessSessionCancelledError(this.id, message);
+    return reason instanceof Error ? reason : new HarnessSessionCancelledError(this.id, message);
+  }
+
+  private _scheduleActiveTurnAbort(controller: AbortController): void {
+    const err = this._activeTurnAbortError(controller);
+    const waiters = Array.from(this._activeTurnWaiters).filter(waiter => waiter.controller === controller);
     setTimeout(() => {
-      if (this._currentTurnAbortController !== controller || !controller.signal.aborted) return;
-      this._rejectActiveTurnWaiters(err);
+      if (!controller.signal.aborted) return;
+      this._rejectActiveTurnWaiters(err, waiters);
     }, 0);
   }
 
@@ -8209,6 +8230,7 @@ export class Session {
     };
     let agentStarted = false;
     let agentEndEmitted = false;
+    let fallbackRunId = identity.runId;
 
     try {
       const requestContext = await Promise.race([
@@ -8256,6 +8278,7 @@ export class Session {
         signal.runId === identity.runId && signal.signal.id === identity.signalId
           ? identity
           : { runId: signal.runId, signalId: signal.signal.id };
+      fallbackRunId = signalIdentity.runId;
       const completion = this._awaitQueuedRunCompletion(
         item,
         signalIdentity.runId,
@@ -8295,7 +8318,7 @@ export class Session {
         this._emitTurnEvent({
           type: 'agent_end',
           reason: turnAbortController.signal.aborted ? 'aborted' : 'error',
-          runId: identity.runId,
+          runId: fallbackRunId,
           queuedItemId: item.id,
         });
       }
@@ -8419,7 +8442,7 @@ export class Session {
 
     if (full.finishReason !== 'suspended') {
       await this._raceActiveTurnWaiter(this._markQueuedTurnCompleted(item.id, full), activeTurnWaiter);
-      await this._finalizeCompletedQueuedTurn(item, full, modeId, activeTurnWaiter);
+      await this._finalizeCompletedQueuedTurn(item, full, modeId, activeTurnWaiter, opts);
       await this._raceActiveTurnWaiter(
         this._writeQueueSignalResultEvidence({
           status: 'completed',
@@ -8440,6 +8463,7 @@ export class Session {
     full: FullOutput<unknown>,
     modeId: string,
     activeTurnWaiter?: Promise<never>,
+    opts: { onAgentEnd?: () => void } = {},
   ): Promise<void> {
     let alreadyAccounted = false;
     if (this._record.queueAdmissionReceipts?.[item.id]?.postRunFinalizedAt === undefined) {
@@ -8464,6 +8488,7 @@ export class Session {
     }
     await this._finalizeQueuedRunCompletion(item, full, modeId, activeTurnWaiter, {
       skipTokenAccounting: alreadyAccounted,
+      onAgentEnd: opts.onAgentEnd,
     });
   }
 

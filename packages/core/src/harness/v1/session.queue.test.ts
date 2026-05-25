@@ -1419,7 +1419,8 @@ describe('Session.queue() — suspension', () => {
 
     expect(result.text).toBe('resumed done');
     expect(events.find(e => e.type === 'suspension_resolved')).toMatchObject({ queuedItemId });
-    expect(events.find(e => e.type === 'agent_end')).toMatchObject({ queuedItemId });
+    const agentEnds = events.filter(e => e.type === 'agent_end');
+    expect(agentEnds).toEqual([expect.objectContaining({ queuedItemId })]);
     expect(events.findIndex(e => e.type === 'agent_end')).toBeGreaterThan(
       events.findIndex(e => e.type === 'suspension_resolved'),
     );
