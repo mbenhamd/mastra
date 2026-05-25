@@ -171,7 +171,7 @@ const codeAgent = new AcpAgent({
 });
 
 const models = await codeAgent.getAvailableModels();
-// [{ modelId: 'claude-sonnet-4-20250514', name: 'Claude Sonnet' }, ...]
+// [{ modelId: 'agent-reported-model-id', name: 'Agent Reported Model' }, ...]
 ```
 
 ### Set the model
@@ -186,20 +186,20 @@ const codeAgent = new AcpAgent({
   description: 'An ACP-compatible coding agent',
   command: 'claude',
   args: ['--acp'],
-  model: 'claude-sonnet-4-20250514',
+  model: 'agent-reported-model-id',
 });
 ```
 
 You can also change the model at runtime with `setModel()`:
 
 ```typescript
-await codeAgent.setModel('claude-sonnet-4-20250514');
+await codeAgent.setModel('agent-reported-model-id');
 ```
 
 If the ACP agent advertises available models and your model ID doesn't match any of them, Mastra throws an error listing the valid options:
 
 ```text
-Model "bad-model-id" is not available. Available models: claude-sonnet-4-20250514, claude-haiku-4-20250514
+Model "bad-model-id" is not available. Available models: agent-reported-model-id, another-model-id
 ```
 
 If the agent doesn't advertise a model list, the value is passed through without validation.

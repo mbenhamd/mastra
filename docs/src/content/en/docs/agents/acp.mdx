@@ -151,7 +151,7 @@ const codeAgent = new AcpAgent({
 })
 
 const models = await codeAgent.getAvailableModels()
-// [{ modelId: 'claude-sonnet-4-20250514', name: 'Claude Sonnet' }, ...]
+// [{ modelId: '__AI_SDK_ANTHROPIC_MODEL_SONNET__', name: 'Claude Sonnet' }, ...]
 ```
 
 ### Set the model
@@ -179,7 +179,7 @@ await codeAgent.setModel('__AI_SDK_ANTHROPIC_MODEL_SONNET__')
 If the ACP agent advertises available models and your model ID doesn't match any of them, Mastra throws an error listing the valid options:
 
 ```text
-Model "bad-model-id" is not available. Available models: claude-sonnet-4-20250514, claude-haiku-4-20250514
+Model "bad-model-id" is not available. Available models: __AI_SDK_ANTHROPIC_MODEL_SONNET__, __AI_SDK_ANTHROPIC_MODEL_HAIKU__
 ```
 
 If the agent doesn't advertise a model list, the value is passed through without validation.

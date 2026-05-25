@@ -49,6 +49,9 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+const TEST_MODEL_ID = 'test-model-alpha';
+const TEST_SECONDARY_MODEL_ID = 'test-model-beta';
+
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal<object>();
   return {
@@ -307,7 +310,7 @@ describe('ACPConnection', () => {
       description: 'Build anything with Claude Code',
       command: 'claude',
       args: ['--acp'],
-      model: 'claude-sonnet-4-20250514',
+      model: TEST_MODEL_ID,
       persistSession: true,
     });
 
@@ -316,7 +319,7 @@ describe('ACPConnection', () => {
 
     expect(acpConnection?.unstable_setSessionModel).toHaveBeenCalledWith({
       sessionId: 'session-1',
-      modelId: 'claude-sonnet-4-20250514',
+      modelId: TEST_MODEL_ID,
     });
   });
 
@@ -339,13 +342,13 @@ describe('ACPConnection', () => {
   it('returns available models from the session response', async () => {
     const { ACPConnection } = await import('../connection');
     const availableModels = [
-      { modelId: 'claude-sonnet-4-20250514', name: 'Claude Sonnet' },
-      { modelId: 'claude-haiku-4-20250514', name: 'Claude Haiku' },
+      { modelId: TEST_MODEL_ID, name: 'Test Model Alpha' },
+      { modelId: TEST_SECONDARY_MODEL_ID, name: 'Test Model Beta' },
     ];
 
     mocks.sessionResponse = {
       sessionId: 'session-1',
-      models: { availableModels, currentModelId: 'claude-sonnet-4-20250514' },
+      models: { availableModels, currentModelId: TEST_MODEL_ID },
     };
 
     const connection = new ACPConnection({
@@ -380,10 +383,10 @@ describe('ACPConnection', () => {
       sessionId: 'session-1',
       models: {
         availableModels: [
-          { modelId: 'claude-sonnet-4-20250514', name: 'Claude Sonnet' },
-          { modelId: 'claude-haiku-4-20250514', name: 'Claude Haiku' },
+          { modelId: TEST_MODEL_ID, name: 'Test Model Alpha' },
+          { modelId: TEST_SECONDARY_MODEL_ID, name: 'Test Model Beta' },
         ],
-        currentModelId: 'claude-sonnet-4-20250514',
+        currentModelId: TEST_MODEL_ID,
       },
     };
 
@@ -396,7 +399,7 @@ describe('ACPConnection', () => {
     });
 
     await expect(connection.prompt('implement feature')).rejects.toThrow(
-      'Model "nonexistent-model" is not available. Available models: claude-sonnet-4-20250514, claude-haiku-4-20250514',
+      `Model "nonexistent-model" is not available. Available models: ${TEST_MODEL_ID}, ${TEST_SECONDARY_MODEL_ID}`,
     );
   });
 
@@ -430,12 +433,12 @@ describe('ACPConnection', () => {
       persistSession: true,
     });
 
-    await connection.setModel('claude-sonnet-4-20250514');
+    await connection.setModel(TEST_MODEL_ID);
     const acpConnection = mocks.connectionInstances[0];
 
     expect(acpConnection?.unstable_setSessionModel).toHaveBeenCalledWith({
       sessionId: 'session-1',
-      modelId: 'claude-sonnet-4-20250514',
+      modelId: TEST_MODEL_ID,
     });
   });
 
@@ -445,8 +448,8 @@ describe('ACPConnection', () => {
     mocks.sessionResponse = {
       sessionId: 'session-1',
       models: {
-        availableModels: [{ modelId: 'claude-sonnet-4-20250514', name: 'Claude Sonnet' }],
-        currentModelId: 'claude-sonnet-4-20250514',
+        availableModels: [{ modelId: TEST_MODEL_ID, name: 'Test Model Alpha' }],
+        currentModelId: TEST_MODEL_ID,
       },
     };
 
@@ -458,7 +461,7 @@ describe('ACPConnection', () => {
     });
 
     await expect(connection.setModel('nonexistent')).rejects.toThrow(
-      'Model "nonexistent" is not available. Available models: claude-sonnet-4-20250514',
+      `Model "nonexistent" is not available. Available models: ${TEST_MODEL_ID}`,
     );
   });
 

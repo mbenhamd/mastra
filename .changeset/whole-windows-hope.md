@@ -12,7 +12,7 @@ const codeAgent = new AcpAgent({
   description: 'ACP-compatible coding agent',
   command: 'claude',
   args: ['--acp'],
-  model: 'claude-sonnet-4-20250514',
+  model: '__AI_SDK_ANTHROPIC_MODEL_SONNET__',
 });
 ```
 
