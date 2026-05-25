@@ -266,7 +266,8 @@ describe('request_access', () => {
         toolCallId: 'tool-1',
       }),
     );
-    expect(suspend).toHaveBeenCalledWith({});
+    expect(suspend).toHaveBeenCalled();
+    expect(suspend.mock.calls[0]?.[0]).toEqual({});
   });
 
   it('does not require the legacy question registrar for native Harness v1 sandbox-access requests', async () => {
