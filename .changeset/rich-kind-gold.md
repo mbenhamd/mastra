@@ -2,7 +2,7 @@
 '@mastra/files-sdk': minor
 ---
 
-Added @mastra/files-sdk workspace filesystem provider — a unified storage adapter backed by [FilesSDK](https://files-sdk.dev). Supports any FilesSDK adapter (S3, R2, GCS, Azure Blob, Vercel Blob, local filesystem, and more) through a single `FilesSDKFilesystem` class.
+Connect your Mastra workspace to any storage backend — S3, R2, GCS, Azure Blob, Vercel Blob, local filesystem, and more — using a single unified interface. Swap storage providers without changing your workspace code through the new `@mastra/files-sdk` package and `FilesSDKFilesystem` class.
 
 **Usage**
 

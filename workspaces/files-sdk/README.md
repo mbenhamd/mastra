@@ -49,7 +49,7 @@ const workspace = new Workspace({
 
 const agent = new Agent({
   name: 'my-agent',
-  model: '__GATEWAY_ANTHROPIC_MODEL_OPUS__',
+  model: 'YOUR_MODEL_NAME',
   workspace,
 });
 ```

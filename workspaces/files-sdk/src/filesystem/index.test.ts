@@ -371,27 +371,54 @@ describe('FilesSDKFilesystem', () => {
     it('creates file if it does not exist', async () => {
       const { fs, mockFiles } = createFs();
       const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
       mockFiles.download.mockRejectedValueOnce(error);
 
       await fs.appendFile('/new.txt', 'content');
 
       expect(mockFiles.upload).toHaveBeenCalledTimes(1);
     });
+
+    it('throws IsDirectoryError when target is only a synthetic directory', async () => {
+      const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
+      mockFiles.list.mockResolvedValueOnce({ items: [{ key: 'dir/child.txt' }], cursor: undefined });
+
+      await expect(fs.appendFile('/dir', 'content')).rejects.toThrow(IsDirectoryError);
+      expect(mockFiles.download).not.toHaveBeenCalled();
+      expect(mockFiles.upload).not.toHaveBeenCalled();
+    });
+
+    it('appends exact object keys even when the same key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'hello '));
+      mockFiles.download.mockResolvedValueOnce(createMockStoredFile('dir', 'hello '));
+
+      await fs.appendFile('/dir', 'world');
+
+      expect(mockFiles.list).not.toHaveBeenCalled();
+      const uploadCall = mockFiles.upload.mock.calls[0]!;
+      const written = Buffer.from(uploadCall[1] as Uint8Array);
+      expect(written.toString()).toBe('hello world');
+    });
   });
 
   describe('deleteFile()', () => {
     it('calls delete for files', async () => {
       const { fs, mockFiles } = createFs();
-      // isDirectory check returns empty (not a directory)
-      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
 
       await fs.deleteFile('/test.txt');
 
       expect(mockFiles.delete).toHaveBeenCalledWith('test.txt');
+      expect(mockFiles.list).not.toHaveBeenCalled();
     });
 
     it('delegates to rmdir for directories', async () => {
       const { fs, mockFiles } = createFs();
+      const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
+      mockFiles.head.mockRejectedValueOnce(error);
       // isDirectory check returns items (is a directory)
       mockFiles.list
         .mockResolvedValueOnce({ items: [{ key: 'dir/file.txt' }], cursor: undefined })
@@ -404,10 +431,18 @@ describe('FilesSDKFilesystem', () => {
       expect(mockFiles.delete).toHaveBeenCalledWith(['dir/file.txt']);
     });
 
+    it('deletes exact object keys even when the same key has synthetic children', async () => {
+      const { fs, mockFiles } = createFs();
+      mockFiles.head.mockResolvedValueOnce(createMockStoredFile('dir', 'exact'));
+
+      await fs.deleteFile('/dir', { recursive: true });
+
+      expect(mockFiles.delete).toHaveBeenCalledWith('dir');
+      expect(mockFiles.list).not.toHaveBeenCalled();
+    });
+
     it('swallows NotFound errors with force=true', async () => {
       const { fs, mockFiles } = createFs();
-      // isDirectory check
-      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
       // delete throws
       const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
       mockFiles.delete.mockRejectedValueOnce(error);
@@ -418,8 +453,6 @@ describe('FilesSDKFilesystem', () => {
 
     it('throws FileNotFoundError for NotFound errors with force=false', async () => {
       const { fs, mockFiles } = createFs();
-      // isDirectory check
-      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
       const error = Object.assign(new Error('NotFound'), { code: 'NotFound' });
       mockFiles.delete.mockRejectedValueOnce(error);
 
@@ -428,8 +461,6 @@ describe('FilesSDKFilesystem', () => {
 
     it('re-throws non-NotFound errors with force=true', async () => {
       const { fs, mockFiles } = createFs();
-      // isDirectory check
-      mockFiles.list.mockResolvedValueOnce({ items: [], cursor: undefined });
       mockFiles.delete.mockRejectedValueOnce(new Error('fail'));
 
       await expect(fs.deleteFile('/test.txt', { force: true })).rejects.toThrow('fail');

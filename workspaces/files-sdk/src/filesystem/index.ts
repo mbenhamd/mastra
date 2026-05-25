@@ -398,6 +398,10 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     this.assertWritable('appendFile');
     const key = toKey(path);
 
+    if (!(await this.isExactFileKey(key)) && (await this.isDirectory(key))) {
+      throw new IsDirectoryError(path);
+    }
+
     // Read-modify-write (object storage has no native append)
     let existing = Buffer.alloc(0);
     try {
@@ -421,8 +425,7 @@ export class FilesSDKFilesystem extends MastraFilesystem {
     this.assertWritable('deleteFile');
     const key = toKey(path);
 
-    // Check if path is a directory (has children)
-    if (await this.isDirectory(key)) {
+    if (!(await this.isExactFileKey(key)) && (await this.isDirectory(key))) {
       await this.rmdir(path, options);
       return;
     }
