@@ -97,7 +97,7 @@ describe('request_access', () => {
       requestContext: {
         get: (key: string) => (key === 'harness' ? mockHarnessCtx : undefined),
       },
-      workspace: {},
+      workspace: { path: '/mock/project' },
     };
 
     const result = await (requestSandboxAccessTool as any).execute(
@@ -127,6 +127,7 @@ describe('request_access', () => {
         get: (key: string) => (key === 'harness' ? mockHarnessCtx : undefined),
       },
       workspace: {
+        path: '/mock/project',
         filesystem: fs,
       },
     };
@@ -165,6 +166,7 @@ describe('request_access', () => {
         get: (key: string) => (key === 'harness' ? mockHarnessCtx : undefined),
       },
       workspace: {
+        path: '/mock/project',
         filesystem: {}, // no setAllowedPaths
       },
     };
@@ -200,7 +202,7 @@ describe('request_access', () => {
               }
             : undefined,
       },
-      workspace: {},
+      workspace: { path: '/mock/project' },
     };
 
     await expect(
@@ -246,7 +248,7 @@ describe('request_access', () => {
               }
             : undefined,
       },
-      workspace: {},
+      workspace: { path: '/mock/project' },
     };
 
     await expect(
@@ -292,7 +294,7 @@ describe('request_access', () => {
               }
             : undefined,
       },
-      workspace: {},
+      workspace: { path: '/mock/project' },
     };
 
     await expect(
@@ -341,7 +343,7 @@ describe('request_access', () => {
               }
             : undefined,
       },
-      workspace: {},
+      workspace: { path: '/mock/project' },
     };
 
     const result = await (requestSandboxAccessTool as any).execute(
@@ -386,6 +388,7 @@ describe('request_access', () => {
             : undefined,
       },
       workspace: {
+        path: '/mock/project',
         filesystem: fs,
       },
     };
@@ -420,6 +423,7 @@ describe('request_access', () => {
             : undefined,
       },
       workspace: {
+        path: '/mock/project',
         filesystem: fs,
       },
     };
