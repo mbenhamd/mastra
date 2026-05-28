@@ -83,6 +83,7 @@ import type { MastraVoice } from '../voice';
 import { DefaultVoice } from '../voice';
 import type { Step } from '../workflows/step';
 import type { OutputWriter, WorkflowResult } from '../workflows/types';
+import { waitForSuspendedSnapshot } from '../workflows/utils';
 import type { AnyWorkflow } from '../workflows/workflow';
 import { createWorkflow, createStep, isProcessor } from '../workflows/workflow';
 import type { AnyWorkspace } from '../workspace';
@@ -5601,11 +5602,7 @@ export class Agent<
     const workflowRunSnapshot =
       workflowRun?.snapshot && typeof workflowRun.snapshot === 'object' ? workflowRun.snapshot : undefined;
     const existingSnapshot =
-      workflowRunSnapshot ??
-      (await workflowsStore?.loadWorkflowSnapshot({
-        workflowName,
-        runId,
-      }));
+      workflowRunSnapshot ?? (await waitForSuspendedSnapshot(workflowsStore, workflowName, runId));
 
     if (!existingSnapshot) {
       const hasStorage = !!workflowsStore;

@@ -11,7 +11,7 @@ import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcesso
 import type { PubSub } from '../events/pubsub';
 import type { RequestContext } from '../request-context';
 import type { ToolPayloadTransformPolicy } from '../tools';
-import type { OutputWriter } from '../workflows/types';
+import type { OutputWriter, WorkflowRunState } from '../workflows/types';
 import type { MessageListInput } from './message-list';
 import type { CreatedAgentSignal } from './signals';
 import type {
@@ -145,6 +145,14 @@ export interface DelegationCompleteContext {
     text: string;
     subAgentThreadId?: string;
     subAgentResourceId?: string;
+    /** Aggregate token usage from the sub-agent's execution */
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      reasoningTokens?: number;
+      cachedInputTokens?: number;
+    };
   };
   /** Duration of the delegation in milliseconds */
   duration: number;
@@ -668,7 +676,7 @@ export type InnerAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptions
   /** Internal: Whether the execution is a resume */
   resumeContext?: {
     resumeData: any;
-    snapshot: any;
+    snapshot: WorkflowRunState;
   };
   /** Internal: PubSub captured by the public execution path for this run */
   _pubsub?: PubSub;

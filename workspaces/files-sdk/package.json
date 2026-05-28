@@ -1,6 +1,6 @@
 {
   "name": "@mastra/files-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FilesSDK filesystem provider for Mastra workspaces — unified storage across S3, R2, GCS, Azure, Vercel Blob, and more",
   "type": "module",
   "main": "dist/index.js",
@@ -22,13 +22,14 @@
     "build": "tsup --silent --config tsup.config.ts",
     "build:lib": "pnpm build",
     "build:watch": "pnpm build --watch",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --exclude '**/*.integration.test.ts'",
+    "test:cloud": "vitest run ./src/**/*.integration.test.ts",
     "test:watch": "vitest watch",
     "lint": "eslint ."
   },
   "license": "Apache-2.0",
   "dependencies": {
-    "files-sdk": "^1.6.0"
+    "files-sdk": "^1.5.0"
   },
   "devDependencies": {
     "@internal/lint": "workspace:*",

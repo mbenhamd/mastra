@@ -41,6 +41,7 @@ import { createDynamicTools } from './agents/tools.js';
 
 import { getDynamicWorkspace } from './agents/workspace.js';
 import { AuthStorage } from './auth/storage.js';
+import { DEFAULT_CONFIG_DIR, validateConfigDirName } from './constants.js';
 import { createOutcomeScorer, createEfficiencyScorer } from './evals/scorers/index.js';
 import { createHarnessV1SubagentAgents, MastraCodeHarnessRuntime } from './harness/index.js';
 import { HookManager } from './hooks/index.js';
@@ -114,6 +115,8 @@ export interface MastraCodeConfig {
   heartbeatHandlers?: HeartbeatHandler[];
   /** Override the workspace. Default: local filesystem + local sandbox based on detected project */
   workspace?: HarnessConfig['workspace'];
+  /** Override the config directory name. Default: '.mastracode'. Replaces '.mastracode' in project-level and global config paths. */
+  configDir?: string;
   /** Programmatic MCP server configurations, merged with (and overriding) file-based configs. */
   mcpServers?: Record<string, McpServerConfig>;
   /** Disable MCP server discovery. Default: false */
@@ -182,6 +185,10 @@ function resolveCloudObservabilityConfig(
 
 export async function createMastraCode(config?: MastraCodeConfig) {
   const cwd = config?.cwd ?? process.cwd();
+  const configDir = config?.configDir ?? DEFAULT_CONFIG_DIR;
+  if (configDir !== DEFAULT_CONFIG_DIR) {
+    validateConfigDirName(configDir);
+  }
 
   // Load .env file from cwd if present (for observability API keys, etc.)
   try {
@@ -236,7 +243,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   // Project detection
   const project = detectProject(cwd);
 
-  const resourceIdOverride = getResourceIdOverride(project.rootPath);
+  const resourceIdOverride = getResourceIdOverride(project.rootPath, configDir);
   if (resourceIdOverride) {
     project.resourceId = resourceIdOverride;
     project.resourceIdOverride = true;
@@ -252,7 +259,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   }
 
   // Storage
-  const storageConfig = config?.storage ?? getStorageConfig(project.rootPath, globalSettings.storage);
+  const storageConfig = config?.storage ?? getStorageConfig(project.rootPath, globalSettings.storage, configDir);
   const storageResult = await createStorage(storageConfig);
   const storageWarning = storageResult.warning;
 
@@ -349,10 +356,10 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   const memory = config?.memory ?? getDynamicMemory(storage, vectorStore);
 
   // MCP
-  const mcpManager = config?.disableMcp ? undefined : createMcpManager(project.rootPath, config?.mcpServers);
+  const mcpManager = config?.disableMcp ? undefined : createMcpManager(project.rootPath, configDir, config?.mcpServers);
 
   // Hooks
-  const hookManager = config?.disableHooks ? undefined : new HookManager(project.rootPath, 'session-init');
+  const hookManager = config?.disableHooks ? undefined : new HookManager(project.rootPath, 'session-init', configDir);
 
   // Scorers (live evaluation with sampling)
   const outcomeScorer = createOutcomeScorer();
@@ -650,6 +657,9 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       yolo: true,
       ...globalInitialState,
       ...config?.initialState,
+      // configDir must win over initialState so prompts/workspace paths stay
+      // aligned with MCP, hooks, storage, and resource override resolution.
+      configDir,
     },
     workspace: (config?.workspace as never) ?? getDynamicWorkspace,
     modes,

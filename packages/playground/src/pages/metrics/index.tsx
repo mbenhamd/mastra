@@ -52,6 +52,7 @@ const ANALYTICS_OBSERVABILITY_TYPES = new Set([
   'ObservabilityStorageClickhouseVNext',
   'ObservabilityStorageDuckDB',
   'ObservabilityInMemory',
+  'ObservabilitySpanner',
 ]);
 
 type MetricsStorageCapabilities = {

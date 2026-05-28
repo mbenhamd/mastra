@@ -101,6 +101,7 @@ export default defineConfig({
         '@internal/ai-v6',
         '@internal/external-types',
         '@internal/core',
+        '@internal/voice',
       ]),
     );
 
