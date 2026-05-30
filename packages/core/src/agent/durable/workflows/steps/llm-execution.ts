@@ -1,6 +1,7 @@
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import type { ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod';
+import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import type { PubSub } from '../../../../events/pubsub';
 import { mergeProviderOptions } from '../../../../llm/model/provider-options';
 import type { SharedProviderOptions } from '../../../../llm/model/shared.types';
@@ -277,6 +278,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               currentMessageId = processInputStepResult.messageId ?? currentMessageId;
               currentModel = (processInputStepResult.model ?? currentModel) as typeof currentModel;
               currentTools = (processInputStepResult.tools ?? currentTools) as ToolSet;
+              // §14.7 INC-1b: re-enforce the channel tool fence after a processor may have
+              // re-introduced a reserved channel tool name (no-op unless this is a
+              // channel-bound turn that stamped a reserved set onto the requestContext).
+              const channelToolFence = readChannelToolFence(requestContext);
+              if (channelToolFence) {
+                enforceChannelToolFence(currentTools as unknown as Record<string, unknown>, channelToolFence);
+              }
               currentToolChoice = processInputStepResult.toolChoice as ToolChoice<ToolSet> | undefined;
               currentProviderOptions = processInputStepResult.providerOptions ?? currentProviderOptions;
               currentActiveTools = processInputStepResult.activeTools;

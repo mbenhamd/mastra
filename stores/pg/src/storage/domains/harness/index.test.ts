@@ -4,11 +4,12 @@ import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
   HarnessStorageAttachmentInUseError,
   HarnessStorageAttachmentUnavailableError,
+  HarnessStorageChannelBindingConflictError,
   HarnessStorageThreadDeleteFenceConflictError,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
 } from '@mastra/core/storage';
-import type { WorkspaceActionJournalEntry } from '@mastra/core/storage';
+import type { ChannelBinding, WorkspaceActionJournalEntry } from '@mastra/core/storage';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 
 import { exportSchemas, HarnessPG, PostgresStore } from '../..';
@@ -42,6 +43,10 @@ describe('HarnessPG', () => {
     expect(ddl).toContain(TABLE_HARNESS_SESSION_EVENTS);
     expect(ddl).toContain(TABLE_HARNESS_WORKSPACE_ACTIONS);
     expect(ddl).toContain('idx_harness_sessions_active_key');
+    expect(ddl).toContain('idx_harness_sessions_parent');
+    expect(ddl).toContain('idx_harness_message_results_lookup');
+    expect(ddl).toContain('idx_harness_message_results_admission');
+    expect(ddl).toContain('idx_harness_tombstones_lookup');
     expect(ddl).toContain('idx_harness_session_events_replay');
     expect(ddl).toContain('idx_harness_workspace_actions_page');
     expect(ddl).toContain('idx_harness_workspace_actions_session');
@@ -959,6 +964,303 @@ describe('HarnessPG', () => {
         limit: 0,
       }),
     ).resolves.toEqual({ inbox: [], actionTokens: [], actionReceipts: [], outbox: [] });
+  });
+});
+
+function sampleChannelBinding(overrides: Partial<ChannelBinding> = {}): ChannelBinding {
+  return {
+    id: 'binding-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    status: 'active',
+    platform: 'slack',
+    externalTenantId: 'T1',
+    externalChannelId: 'C1',
+    externalThreadId: 'th-1',
+    resourceId: 'resource-1',
+    threadId: 'thread-1',
+    sessionId: 'session-1',
+    mode: 'per-user-resource',
+    generation: 1,
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('HarnessPG channel binding ledger (§5.1h / §14.1 / PF-824)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-channel-binding-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  it('saves a binding and loads it back by external tuple', async () => {
+    const harness = store.stores.harness!;
+    const binding = sampleChannelBinding();
+    await harness.saveChannelBinding(binding);
+
+    const byId = await harness.loadChannelBinding({ bindingId: binding.id });
+    expect(byId).toEqual(binding);
+
+    const byExternal = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toEqual(binding);
+  });
+
+  it('excludes non-active rows from the external lookup', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'fenced', status: 'replaced' }));
+
+    const byExternal = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toBeNull();
+
+    // The fenced row is still addressable by id.
+    const byId = await harness.loadChannelBinding({ bindingId: 'fenced' });
+    expect(byId?.status).toBe('replaced');
+  });
+
+  it('rejects a second active binding for the same tuple (§5.2h)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'first' }));
+
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'second' })),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+
+    // The conflict names the holder of the active row.
+    await harness
+      .saveChannelBinding(sampleChannelBinding({ id: 'third' }))
+      .catch((err: HarnessStorageChannelBindingConflictError) => {
+        expect(err).toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+        expect(err.heldBy).toBe('first');
+      });
+
+    // Re-saving the SAME id (an in-place update) is always allowed.
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'first', lastInboundAt: 5000 })),
+    ).resolves.toBeUndefined();
+    const reloaded = await harness.loadChannelBinding({ bindingId: 'first' });
+    expect(reloaded?.lastInboundAt).toBe(5000);
+  });
+
+  it('treats a missing optional external id as a sentinel match (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // Persist a binding with no tenant/channel id, then look it up with the same
+    // omitted ids — the sentinel makes them collide, not SQL NULL semantics.
+    const binding = sampleChannelBinding({
+      id: 'no-optional',
+      externalTenantId: undefined,
+      externalChannelId: undefined,
+    });
+    await harness.saveChannelBinding(binding);
+
+    const matched = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(matched).toEqual(binding);
+
+    // A second active binding with the same omitted optional ids still conflicts.
+    await expect(
+      harness.saveChannelBinding(
+        sampleChannelBinding({ id: 'no-optional-2', externalTenantId: undefined, externalChannelId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+
+    // Supplying a real tenant id is a DIFFERENT tuple, so it does not match/conflict.
+    const distinct = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalThreadId: 'th-1',
+    });
+    expect(distinct).toBeNull();
+  });
+
+  it('keeps an empty-string optional external id distinct from undefined (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // The space sentinel (not '') means an EXPLICIT empty-string tenant id round-trips
+    // faithfully and addresses a different tuple than an omitted tenant id.
+    const empty = sampleChannelBinding({ id: 'empty-tenant', externalTenantId: '', externalChannelId: '' });
+    await harness.saveChannelBinding(empty);
+
+    const reloaded = await harness.loadChannelBinding({ bindingId: 'empty-tenant' });
+    expect(reloaded?.externalTenantId).toBe('');
+    expect(reloaded?.externalChannelId).toBe('');
+
+    // The empty-string tuple matches an empty-string lookup ...
+    const matched = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: '',
+      externalChannelId: '',
+      externalThreadId: 'th-1',
+    });
+    expect(matched?.id).toBe('empty-tenant');
+
+    // ... but an OMITTED optional id is a distinct tuple and must not collide.
+    const omitted = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(omitted).toBeNull();
+  });
+
+  it('advances inbound activity forward-only (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ updatedAt: 1000 }));
+
+    const forward = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 5000 });
+    expect(forward?.lastInboundAt).toBe(5000);
+    expect(forward?.updatedAt).toBe(5000);
+
+    // An older ingress must NOT regress the marker.
+    const backward = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 2000 });
+    expect(backward?.lastInboundAt).toBe(5000);
+    expect(backward?.updatedAt).toBe(5000);
+
+    // A newer ingress advances it again.
+    const newer = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 9000 });
+    expect(newer?.lastInboundAt).toBe(9000);
+
+    // Touching an unknown binding returns null.
+    expect(await harness.touchChannelBindingInbound({ bindingId: 'missing', at: 1 })).toBeNull();
+  });
+
+  it('resolves idempotently and fences the prior active binding on replacement (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    const first = await harness.resolveChannelBinding({ candidate: sampleChannelBinding({ id: 'gen-1' }) });
+    expect(first).toEqual({ binding: expect.objectContaining({ id: 'gen-1', generation: 1 }), created: true });
+
+    // No replacement: the existing active binding wins (idempotent), generation stays.
+    const again = await harness.resolveChannelBinding({ candidate: sampleChannelBinding({ id: 'gen-1-dup' }) });
+    expect(again.created).toBe(false);
+    expect(again.binding.id).toBe('gen-1');
+
+    // Replacement fences the prior active binding and bumps the generation.
+    const replaced = await harness.resolveChannelBinding({
+      candidate: sampleChannelBinding({ id: 'gen-2', updatedAt: 2000 }),
+      replaceBindingId: 'gen-1',
+    });
+    expect(replaced.created).toBe(true);
+    expect(replaced.binding.generation).toBe(2);
+    expect(replaced.replacedBindingId).toBe('gen-1');
+
+    const fenced = await harness.loadChannelBinding({ bindingId: 'gen-1' });
+    expect(fenced?.status).toBe('replaced');
+    expect(fenced?.replacedByBindingId).toBe('gen-2');
+
+    // Exactly one active binding remains for the tuple.
+    const active = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(active?.id).toBe('gen-2');
+  });
+
+  it('lists active bindings for a scope ordered by activity then id, with cursor paging (§14.8)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(
+      sampleChannelBinding({ id: 'a', externalThreadId: 'th-a', lastOutboundAt: 100 }),
+    );
+    await harness.saveChannelBinding(
+      sampleChannelBinding({ id: 'b', externalThreadId: 'th-b', lastOutboundAt: 300 }),
+    );
+    await harness.saveChannelBinding(
+      sampleChannelBinding({ id: 'c', externalThreadId: 'th-c', lastInboundAt: 200 }),
+    );
+
+    const page1 = await harness.listActiveChannelBindingsForScope({ harnessName: 'default', limit: 2 });
+    expect(page1.bindings.map(b => b.id)).toEqual(['b', 'c']);
+    expect(page1.nextCursor).toBe('c');
+
+    const page2 = await harness.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      limit: 2,
+      cursor: page1.nextCursor,
+    });
+    expect(page2.bindings.map(b => b.id)).toEqual(['a']);
+    expect(page2.nextCursor).toBeUndefined();
+
+    // An unknown cursor pages to the end of the set rather than restarting.
+    const stale = await harness.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      limit: 2,
+      cursor: 'ghost',
+    });
+    expect(stale.bindings).toEqual([]);
+  });
+
+  it('removes the binding on deleteSessions and frees the tuple for rebind', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id: 'session-1' }), { ownerId: 'h-1', ifVersion: 0 });
+    const seeded = await harness.loadSession({ sessionId: 'session-1' });
+    if (!seeded) throw new Error('expected seeded session');
+    await harness.saveChannelBinding(sampleChannelBinding({ sessionId: 'session-1' }));
+
+    await harness.deleteSessions({
+      sessions: [
+        {
+          sessionId: 'session-1',
+          ifVersion: seeded.version,
+          expectedResourceId: seeded.resourceId,
+          expectedThreadId: seeded.threadId,
+          expectedCreatedAt: seeded.createdAt,
+        },
+      ],
+    });
+
+    // The session-scoped binding is gone.
+    expect(await harness.loadChannelBinding({ bindingId: 'binding-1' })).toBeNull();
+    expect(await harness.listChannelBindingsForSession({ sessionId: 'session-1' })).toEqual([]);
+
+    // The conversation tuple is free, so a replacement session can rebind it.
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'rebind', sessionId: 'session-2' })),
+    ).resolves.toBeUndefined();
+    const rebound = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(rebound?.id).toBe('rebind');
   });
 });
 

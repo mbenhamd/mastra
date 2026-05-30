@@ -104,7 +104,7 @@ describe('Session._registerSandboxAccess', () => {
     });
   });
 
-  it('emits sandbox_access_requested and suspension_required after registration', async () => {
+  it('projects sandbox-access registration to a question_pending event (§10.2)', async () => {
     const { session } = await setup();
     (session as any)._currentRunId = 'run-1';
     const events: HarnessEvent[] = [];
@@ -117,18 +117,15 @@ describe('Session._registerSandboxAccess', () => {
       payload: { host: 'registry.npmjs.org', port: 443 },
     });
 
-    expect(events.find(e => e.type === 'sandbox_access_requested')).toMatchObject({
-      type: 'sandbox_access_requested',
-      requestId: 'sa-2',
+    // §10.2 defines no sandbox_access_* event — sandbox/path-access prompts
+    // surface as question_pending carrying the access reason.
+    const types = events.map(e => (e as { type: string }).type);
+    expect(types).not.toContain('sandbox_access_requested');
+    expect(types).not.toContain('suspension_required');
+    expect(events.find(e => e.type === 'question_pending')).toMatchObject({
+      type: 'question_pending',
       toolCallId: 'sa-2',
-      semanticType: 'network',
-      reason: 'outbound HTTPS to dependency mirror',
-      payload: { host: 'registry.npmjs.org', port: 443 },
-    });
-    expect(events.find(e => e.type === 'suspension_required')).toMatchObject({
-      type: 'suspension_required',
-      kind: 'sandbox-access',
-      toolCallId: 'sa-2',
+      question: 'outbound HTTPS to dependency mirror',
     });
   });
 
@@ -183,7 +180,7 @@ describe('Session._registerSandboxAccess', () => {
       semanticType: 'mcp',
     });
 
-    expect(events.filter(e => e.type === 'sandbox_access_requested')).toHaveLength(0);
+    expect(events.filter(e => e.type === 'question_pending')).toHaveLength(0);
   });
 
   it('rejects duplicate request ids with different payloads', async () => {
@@ -231,7 +228,7 @@ describe('Session._registerSandboxAccess', () => {
 });
 
 describe('Session.respondToSandboxAccess', () => {
-  it('emits sandbox_access_resolved for approval responses', async () => {
+  it('clears the pending on approval (no sandbox_access_resolved event, §10.2)', async () => {
     const { session } = await setup();
     (session as any)._currentRunId = 'run-1';
     await (session as any)._registerSandboxAccess({
@@ -244,17 +241,13 @@ describe('Session.respondToSandboxAccess', () => {
 
     await session.respondToSandboxAccess({ approved: true });
 
-    expect(events.find(e => e.type === 'sandbox_access_resolved')).toMatchObject({
-      type: 'sandbox_access_resolved',
-      requestId: 'sa-7',
-      toolCallId: 'sa-7',
-      semanticType: 'file',
-      approved: true,
-    });
+    // §10.2 defines no sandbox_access_resolved event — resolution is observed
+    // via the cleared pending state.
+    expect(events.filter(e => (e as { type: string }).type === 'sandbox_access_resolved')).toHaveLength(0);
     expect(session.getRecord().pendingResume).toBeUndefined();
   });
 
-  it('records denial verdicts on sandbox_access_resolved', async () => {
+  it('clears the pending on denial (no sandbox_access_resolved event, §10.2)', async () => {
     const { session } = await setup();
     (session as any)._currentRunId = 'run-1';
     await (session as any)._registerSandboxAccess({
@@ -266,12 +259,7 @@ describe('Session.respondToSandboxAccess', () => {
 
     await session.respondToSandboxAccess({ approved: false });
 
-    expect(events.find(e => e.type === 'sandbox_access_resolved')).toMatchObject({
-      type: 'sandbox_access_resolved',
-      requestId: 'sa-8',
-      semanticType: 'command',
-      approved: false,
-    });
+    expect(events.filter(e => (e as { type: string }).type === 'sandbox_access_resolved')).toHaveLength(0);
     expect(session.getRecord().pendingResume).toBeUndefined();
   });
 

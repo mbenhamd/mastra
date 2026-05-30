@@ -1478,7 +1478,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
       it('writes, loads, conflicts, and deletes operation tombstones', async () => {
         if (!harness) return;
         const tombstone = {
-          kind: 'message' as const,
+          kind: 'signal' as const,
           harnessName: 'default',
           sessionId: 'session-1',
           resourceId: 'resource-1',
@@ -1508,7 +1508,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
             sessionId: 'session-1',
             resourceId: 'resource-1',
             threadId: 'thread-1',
-            kind: 'message',
+            kind: 'signal',
             admissionId: 'admission-1',
             attemptedAdmissionHash: 'hash-1',
           }),
@@ -1561,7 +1561,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
             sessionId: 'session-1',
             resourceId: 'resource-1',
             threadId: 'thread-1',
-            kind: 'message',
+            kind: 'signal',
             admissionId: 'admission-1',
             attemptedAdmissionHash: 'hash-1',
           }),
@@ -1571,7 +1571,7 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
             sessionId: 'session-1',
             resourceId: 'resource-1',
             threadId: 'thread-1',
-            kind: 'message',
+            kind: 'signal',
             admissionId: 'admission-1',
             attemptedAdmissionHash: 'different-hash',
           }),
@@ -1598,13 +1598,13 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
         const compacted = await harness.compactOperationResultEvidence({
           sessionId: 'session-1',
           resourceId: 'resource-1',
-          kind: 'message',
+          kind: 'signal',
           signalId: 'signal-1',
           now: 3000,
         });
 
         expect(compacted).toMatchObject({
-          kind: 'message',
+          kind: 'signal',
           admissionId: 'admission-1',
           admissionHash: 'hash-1',
           signalId: 'signal-1',

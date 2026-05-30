@@ -80,7 +80,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup() {
+function setup(opts?: { persistTransientStreamingEvents?: boolean }) {
   const agent = new FakeAgent('default');
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
   const harness = new Harness({
@@ -90,7 +90,12 @@ function setup() {
       { id: 'other', agentId: 'default' },
     ],
     defaultModeId: 'default',
-    sessions: { storage },
+    sessions: {
+      storage,
+      ...(opts?.persistTransientStreamingEvents !== undefined
+        ? { persistTransientStreamingEvents: opts.persistTransientStreamingEvents }
+        : {}),
+    },
   });
   return { harness, agent, storage };
 }
@@ -126,6 +131,76 @@ describe('Session.subscribe()', () => {
     await session.message({ content: 'hi' });
 
     expect(events).toEqual([]);
+  });
+
+  it('emits state_changed with full state + changedKeys on setState, and skips no-op writes (§10.2)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      if (e.type === 'state_changed') events.push(e);
+    });
+
+    await session.setState({ a: 1, b: 2 });
+    await session.setState({ b: 2 }); // b unchanged → no key changes → no event
+    await session.setState({ a: 1, c: 3 }); // only c changes
+
+    expect(events).toHaveLength(2);
+    const first = events[0] as { state: Record<string, unknown>; changedKeys: string[] };
+    expect(first.state).toEqual({ a: 1, b: 2 });
+    expect(first.changedKeys.sort()).toEqual(['a', 'b']);
+    const second = events[1] as { state: Record<string, unknown>; changedKeys: string[] };
+    expect(second.state).toEqual({ a: 1, b: 2, c: 3 });
+    expect(second.changedKeys).toEqual(['c']);
+  });
+
+  it('emits state_changed with the "$" root sentinel for scalar/array root changes (§10.2)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: Array<{ state: unknown; changedKeys: string[] }> = [];
+    session.subscribe(e => {
+      if (e.type === 'state_changed') events.push(e as { state: unknown; changedKeys: string[] });
+    });
+
+    // Scalar root transition 1 -> 2: collapses to no top-level keys, but the
+    // root value genuinely changed, so it must still emit under the '$' sentinel.
+    await session.setState<number>(() => 1);
+    await session.setState<number>(() => 1); // no-op, same scalar → suppressed
+    await session.setState<number>(() => 2);
+    // Array root transition ['a'] -> ['b']: same — sentinel-keyed.
+    await session.setState<string[]>(() => ['a']);
+    await session.setState<string[]>(() => ['a']); // no-op, equal array → suppressed
+    await session.setState<string[]>(() => ['b']);
+
+    expect(events.map(e => ({ state: e.state, changedKeys: e.changedKeys }))).toEqual([
+      { state: 1, changedKeys: ['$'] },
+      { state: 2, changedKeys: ['$'] },
+      { state: ['a'], changedKeys: ['$'] },
+      { state: ['b'], changedKeys: ['$'] },
+    ]);
+  });
+
+  it('keeps object-root diffs unchanged when transitioning from a scalar root (§10.2)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: Array<{ state: unknown; changedKeys: string[] }> = [];
+    session.subscribe(e => {
+      if (e.type === 'state_changed') events.push(e as { state: unknown; changedKeys: string[] });
+    });
+
+    // scalar -> object root: not both plain objects → '$' sentinel.
+    await session.setState<unknown>(() => 5);
+    await session.setState<unknown>(() => ({ a: 1 }));
+    // object -> object: per-key diff (unchanged behavior).
+    await session.setState<{ a: number; b?: number }>(prev => ({ ...prev, b: 2 }));
+
+    expect(events).toHaveLength(3);
+    expect(events[0]).toMatchObject({ state: 5, changedKeys: ['$'] });
+    expect(events[1]).toMatchObject({ state: { a: 1 }, changedKeys: ['$'] });
+    expect(events[2]).toMatchObject({ state: { a: 1, b: 2 }, changedKeys: ['b'] });
   });
 
   it('isolates a throwing subscriber from other subscribers', async () => {
@@ -244,7 +319,7 @@ describe('Session.subscribe()', () => {
 });
 
 describe('Session events — fullStream drain', () => {
-  it('emits message_start / message_update / message_end around a text stream', async () => {
+  it('emits text_delta for each streamed text chunk (§10.2 — no message-boundary events)', async () => {
     const { harness, agent } = setup();
     agent.chunks = [
       { type: 'text-start', payload: { id: 'msg-1' }, runId: 'fake-run' },
@@ -260,18 +335,174 @@ describe('Session events — fullStream drain', () => {
     });
     await session.message({ content: 'hi' });
 
-    const messageEvents = events.filter(
-      e => e.type === 'message_start' || e.type === 'message_update' || e.type === 'message_end',
-    );
-    expect(messageEvents.map(e => e.type)).toEqual([
-      'message_start',
-      'message_update',
-      'message_update',
-      'message_end',
-    ]);
-    expect((messageEvents[0] as any).messageId).toBe('msg-1');
-    expect(messageEvents.slice(1, 3).map((e: any) => e.delta)).toEqual(['hel', 'lo']);
-    expect((messageEvents[3] as any).messageId).toBe('msg-1');
+    // §10.2 TurnEvent has only `text_delta` (no message_start/update/end).
+    const types = events.map(e => e.type);
+    expect(types).not.toContain('message_start');
+    expect(types).not.toContain('message_update');
+    expect(types).not.toContain('message_end');
+    const textDeltas = events.filter(e => e.type === 'text_delta') as Array<
+      Extract<HarnessEvent, { type: 'text_delta' }>
+    >;
+    expect(textDeltas.map(e => e.delta)).toEqual(['hel', 'lo']);
+    expect(textDeltas.every(e => e.runId === 'fake-run')).toBe(true);
+  });
+
+  const streamChunks = [
+    { type: 'text-start', payload: { id: 'm' }, runId: 'fake-run' },
+    { type: 'text-delta', payload: { id: 'm', text: 'hi' }, runId: 'fake-run' },
+    { type: 'text-end', payload: { id: 'm' }, runId: 'fake-run' },
+  ];
+  async function persistedEventTypes(
+    storage: InMemoryHarness,
+    session: { id: string; resourceId: string; threadId: string },
+  ): Promise<string[]> {
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    if (!state) return [];
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      epoch: state.epoch,
+      afterSequence: 0,
+      limit: 1000,
+    });
+    return rows.map(row => (row.event as { type: string }).type);
+  }
+
+  it('persists text_delta to the durable event log by default (§10.5)', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = streamChunks;
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    await session._flushEventPersistence();
+    expect(await persistedEventTypes(storage, session)).toContain('text_delta');
+  });
+
+  it('skips persisting text_delta when persistTransientStreamingEvents=false, keeping live delivery + durable events (§10.5)', async () => {
+    const { harness, agent, storage } = setup({ persistTransientStreamingEvents: false });
+    agent.chunks = streamChunks;
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveDeltas: string[] = [];
+    session.subscribe(e => {
+      if (e.type === 'text_delta') liveDeltas.push((e as Extract<HarnessEvent, { type: 'text_delta' }>).delta);
+    });
+    await session.message({ content: 'go' });
+    await session._flushEventPersistence();
+
+    // Live subscribers still receive the delta in real time...
+    expect(liveDeltas).toContain('hi');
+    const persisted = await persistedEventTypes(storage, session);
+    // ...but it is NOT written to the durable event log (no per-token write amplification)...
+    expect(persisted).not.toContain('text_delta');
+    // ...while durable lifecycle events still persist.
+    expect(persisted).toContain('agent_end');
+  });
+
+  it('mints a FRESH event epoch on rehydrate when transient deltas are not persisted (no seq reuse, §10.5)', async () => {
+    // Codex-found edge: a skipped tail delta advances the live seq but not the persisted
+    // newest, so reusing `newestSequence + 1` on rehydrate would reuse a seq the client
+    // already saw. With persistence off, rehydrate must NOT reuse the cursor — a fresh
+    // epoch means a prior-epoch Last-Event-ID gets a 412 stale_epoch + snapshot recovery.
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const make = () => {
+      const agent = new FakeAgent('default');
+      agent.chunks = streamChunks;
+      return new Harness({
+        agents: { default: agent } as any,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+        sessions: { storage, persistTransientStreamingEvents: false },
+      });
+    };
+
+    const h1 = make();
+    const s1 = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    let epoch1: string | undefined;
+    s1.subscribe(e => {
+      if (e.type === 'agent_end') epoch1 = parseHarnessEventId(e.id).epoch;
+    });
+    await s1.message({ content: 'first' });
+    await s1._flushEventPersistence();
+    await h1.shutdown();
+
+    // Rehydrate in a fresh harness (new owner) over the same storage.
+    const h2 = make();
+    const s2 = await h2.session({ sessionId: s1.id });
+    let epoch2: string | undefined;
+    s2.subscribe(e => {
+      if (e.type === 'agent_end') epoch2 = parseHarnessEventId(e.id).epoch;
+    });
+    await s2.message({ content: 'second' });
+    await h2.shutdown();
+
+    expect(epoch1).toBeDefined();
+    expect(epoch2).toBeDefined();
+    expect(epoch2).not.toBe(epoch1);
+  });
+
+  it('attributes text_delta/tool_start/tool_end to the active run when chunks omit runId (§10.2)', async () => {
+    // Real AI SDK stream parts surfaced by the long-lived thread subscription
+    // do NOT carry their own runId. agent_start stamps `_currentRunId`, so
+    // `_emitForChunk` attributes these chunks to the active run rather than
+    // silently dropping them (regression guard — these previously vanished
+    // unless the test manually included runId).
+    const { harness, agent } = setup();
+    agent.chunks = [
+      { type: 'text-start', payload: { id: 'm' } },
+      { type: 'text-delta', payload: { id: 'm', text: 'no-run-id' } },
+      { type: 'tool-call', payload: { toolCallId: 'tc9', toolName: 'lookup', args: { q: 'x' } } },
+      { type: 'tool-result', payload: { toolCallId: 'tc9', result: { ok: true } } },
+      { type: 'text-end', payload: { id: 'm' } },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => events.push(e));
+    await session.message({ content: 'hi' });
+
+    const textDelta = events.find(e => e.type === 'text_delta') as
+      | Extract<HarnessEvent, { type: 'text_delta' }>
+      | undefined;
+    expect(textDelta?.delta).toBe('no-run-id');
+    expect(typeof textDelta?.runId).toBe('string');
+    expect((textDelta?.runId ?? '').length).toBeGreaterThan(0);
+
+    expect(events.find(e => e.type === 'tool_start')).toMatchObject({
+      type: 'tool_start',
+      toolCallId: 'tc9',
+      toolName: 'lookup',
+      input: { q: 'x' },
+    });
+    expect(events.find(e => e.type === 'tool_end')).toMatchObject({
+      type: 'tool_end',
+      toolCallId: 'tc9',
+      output: { ok: true },
+    });
+  });
+
+  it('emits token_usage_changed with the cumulative session total after a turn (§10.2)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+    await session.message({ content: 'hi' });
+
+    const usageEvents = events.filter(e => e.type === 'token_usage_changed') as Array<
+      Extract<HarnessEvent, { type: 'token_usage_changed' }>
+    >;
+    expect(usageEvents.length).toBeGreaterThan(0);
+    // §10.2 StateEvent — `usage` is the running cumulative total, matching the
+    // session's own accounting.
+    const last = usageEvents[usageEvents.length - 1]!;
+    expect(last.usage.totalTokens).toBeGreaterThan(0);
+    expect(last.usage.totalTokens).toBe(session.getTokenUsage().totalTokens);
   });
 
   it('emits tool_start and tool_end around a tool-call/tool-result pair', async () => {
@@ -298,8 +529,23 @@ describe('Session events — fullStream drain', () => {
 
     const start = events.find(e => e.type === 'tool_start');
     const end = events.find(e => e.type === 'tool_end');
-    expect(start).toMatchObject({ type: 'tool_start', toolCallId: 'tc1', toolName: 'lookup' });
-    expect(end).toMatchObject({ type: 'tool_end', toolCallId: 'tc1', isError: false });
+    // §10.2 ToolEvent: tool_start carries runId + input; tool_end carries
+    // runId + toolName + output.
+    expect(start).toMatchObject({
+      type: 'tool_start',
+      runId: 'fake-run',
+      toolCallId: 'tc1',
+      toolName: 'lookup',
+      input: { q: 'mastra' },
+    });
+    expect(end).toMatchObject({
+      type: 'tool_end',
+      runId: 'fake-run',
+      toolCallId: 'tc1',
+      toolName: 'lookup',
+      isError: false,
+      output: { hits: 3 },
+    });
   });
 
   it('persists tool error events without poisoning event replay', async () => {
@@ -338,8 +584,9 @@ describe('Session events — fullStream drain', () => {
     expect(rows.map(row => row.event).find((event: any) => event.type === 'tool_end')).toMatchObject({
       type: 'tool_end',
       toolCallId: 'tc1',
+      toolName: 'lookup',
       isError: true,
-      result: { name: 'Error', code: 'Error', message: 'lookup failed' },
+      output: { name: 'Error', code: 'Error', message: 'lookup failed' },
     });
   });
 
@@ -394,20 +641,20 @@ describe('Session events — fullStream drain', () => {
       type: 'tool_end',
       toolCallId: 'tc1',
       isError: false,
-      result: {
+      output: {
         first: { ok: true },
         second: { ok: true },
         at: '2026-05-19T00:00:00.000Z',
         boxed: { value: 'ok' },
       },
     });
-    expect(toolEnd.result).not.toHaveProperty('omitted');
+    expect(toolEnd.output).not.toHaveProperty('omitted');
   });
 
-  it('bridges a data-task-updated writer chunk into a task_updated event', async () => {
-    // Round-trips the taskWrite tool's emission path: tools publish via
-    // `ctx.writer?.custom({ type: 'data-task-updated', data: { tasks } })`
-    // and the harness translates that into a typed `task_updated` event.
+  it('does not synthesize a built-in event from a data-task-updated chunk (§10.2/§10.3)', async () => {
+    // §10.2 has no `task_updated` built-in. Tools surface task lists via §10.3
+    // custom (dotted) events; the harness no longer bridges `data-*` writer
+    // chunks into harness-owned built-in events.
     const { harness, agent } = setup();
     const tasks = [
       { content: 'A', activeForm: 'Doing A', status: 'pending' as const },
@@ -416,40 +663,18 @@ describe('Session events — fullStream drain', () => {
     agent.chunks = [{ type: 'data-task-updated', data: { tasks }, runId: 'fake-run' }];
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    const events: HarnessEvent[] = [];
-    session.subscribe(e => {
-      events.push(e);
-    });
+    const types: string[] = [];
+    session.subscribe(e => types.push((e as { type: string }).type));
     await session.message({ content: 'do it' });
 
-    const updated = events.find(e => e.type === 'task_updated');
-    expect(updated).toBeDefined();
-    expect(updated).toMatchObject({ type: 'task_updated', tasks });
-    expect((updated as any).sessionId).toBe(session.id);
-  });
-
-  it('ignores a data-task-updated chunk whose payload is missing a tasks array', async () => {
-    // The bridge only fires for well-formed payloads — malformed `data-*`
-    // chunks pass silently rather than emitting a half-typed event.
-    const { harness, agent } = setup();
-    agent.chunks = [
-      { type: 'data-task-updated', data: { tasks: 'not-an-array' }, runId: 'fake-run' },
-      { type: 'data-task-updated', data: undefined, runId: 'fake-run' },
-    ];
-    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-
-    const events: HarnessEvent[] = [];
-    session.subscribe(e => {
-      events.push(e);
-    });
-    await session.message({ content: 'hi' });
-
-    expect(events.find(e => e.type === 'task_updated')).toBeUndefined();
+    expect(types).not.toContain('task_updated');
+    expect(types).not.toContain('tool_update');
+    expect(types).not.toContain('shell_output');
   });
 });
 
 describe('Session events — suspension round-trip', () => {
-  it('emits suspension_required on capture and suspension_resolved on resume', async () => {
+  it('emits tool_approval_required on capture; resume clears the pending (no suspension_resolved event, §10.2)', async () => {
     const { harness, agent } = setup();
     agent.fullOutput = {
       ...agent.fullOutput,
@@ -468,13 +693,17 @@ describe('Session events — suspension round-trip', () => {
     });
 
     await session.message({ content: 'do it' });
-    expect(events.some(e => e.type === 'suspension_required')).toBe(true);
+    // §10.2: a tool-approval suspend surfaces as `tool_approval_required`.
+    expect(events.some(e => e.type === 'tool_approval_required')).toBe(true);
 
     // Flip the agent so the resumed run completes.
     agent.fullOutput = { ...agent.fullOutput, finishReason: 'stop', suspendPayload: undefined };
 
     await session.respondToToolApproval({ approved: true });
-    expect(events.some(e => e.type === 'suspension_resolved')).toBe(true);
+    // §10.2 defines NO suspension_resolved event — resolution is observed via
+    // the cleared pending state (+ the resumed run's agent_end), not an event.
+    expect(events.some(e => (e as { type: string }).type === 'suspension_resolved')).toBe(false);
+    expect(session.getRecord().pendingResume).toBeUndefined();
   });
 });
 

@@ -12,6 +12,8 @@ import {
   HarnessStorageChannelOutboxClaimConflictError,
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
+  HarnessStorageLeaseConflictError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
@@ -1124,7 +1126,7 @@ describe('InMemoryHarness admission storage contract', () => {
         sessionId: 'session-1',
         resourceId: 'resource-1',
         threadId: 'thread-2',
-        kind: 'message',
+        kind: 'signal',
         admissionId: 'admission-1',
         attemptedAdmissionHash: 'hash-2',
       }),
@@ -1574,6 +1576,60 @@ describe('InMemoryHarness channel inbox ledger', () => {
         { claimId: 'claim-1' },
       ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+
+  it('preserves a renewed claim expiry across a status update (heartbeat is not rolled back)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const now = Date.now();
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5_000 }, // stale expiry: now+5_000
+    });
+    // Heartbeat extends the claim far into the future (now+61_000).
+    const renewed = await storage.renewChannelInboxClaim({
+      inboxItemId: 'inbox-1',
+      claimId: 'claim-1',
+      now: now + 1_000,
+      claimTtlMs: 60_000,
+    });
+    expect(renewed.claimExpiresAt).toBe(now + 61_000);
+
+    // A KEEP-claim status update (record still carries claimId) whose record has
+    // the STALE original claimExpiresAt must NOT roll the renewal back.
+    await storage.updateChannelInboxItem(
+      sampleChannelInbox({
+        status: 'admitted',
+        delivery: 'queue',
+        admittedAt: now + 50,
+        claimId: 'claim-1',
+        claimExpiresAt: now + 5_000,
+      }),
+      { claimId: 'claim-1' },
+    );
+
+    // Past the STALE 5s expiry but before the renewed 61s expiry: still claimed →
+    // empty result. A rollback to now+5_000 would have made it claimable here.
+    const tooEarly = await storage.claimChannelInboxItems({
+      harnessName: 'default',
+      channelId: 'support',
+      statuses: ['admitted'],
+      claimId: 'too-early',
+      limit: 1,
+      now: now + 10_000,
+      claimTtlMs: 1_000,
+    });
+    expect(tooEarly).toHaveLength(0);
+
+    // Past the renewed expiry: now reclaimable (confirms the row + renewed expiry).
+    const afterRenewed = await storage.claimChannelInboxItems({
+      harnessName: 'default',
+      channelId: 'support',
+      statuses: ['admitted'],
+      claimId: 'reader',
+      limit: 1,
+      now: now + 62_000,
+      claimTtlMs: 1_000,
+    });
+    expect(afterRenewed.map(r => r.id)).toEqual(['inbox-1']);
   });
 });
 
@@ -2133,6 +2189,44 @@ describe('InMemoryHarness channel action ledger', () => {
     }
   });
 
+  it('does not let a stale KEEP-claim update roll back a renewed action receipt claim', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt(), {
+        initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
+      });
+      // A heartbeat extends the storage-owned claim to now + 5100.
+      await expect(
+        storage.renewChannelActionReceiptClaim({ receiptId: 'receipt-1', claimId: 'claim-1', now: now + 100, claimTtlMs: 5000 }),
+      ).resolves.toEqual({ claimExpiresAt: now + 5100, storageNow: now + 100 });
+
+      // A worker holding the PRE-renewal snapshot writes back the stale (smaller)
+      // claimExpiresAt while keeping its claim. The live expiry must not regress.
+      await storage.updateChannelActionReceipt(
+        sampleChannelActionReceipt({
+          status: 'accepted',
+          acceptedAt: now + 200,
+          updatedAt: now + 200,
+          claimId: 'claim-1',
+          claimExpiresAt: now + 5000, // stale: predates the renewal
+        }),
+        { claimId: 'claim-1' },
+      );
+
+      const stored = await storage.loadChannelActionReceiptByTokenId({
+        harnessName: 'default',
+        channelId: 'support',
+        actionTokenId: 'action-token-1',
+      });
+      expect(stored?.status).toBe('accepted'); // the non-claim update still applied
+      expect(stored?.claimExpiresAt).toBe(now + 5100); // claim NOT rolled back
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('validates new action receipt rows before insert and keeps terminal saves idempotent', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await expect(
@@ -2604,6 +2698,110 @@ describe('InMemoryHarness channel diagnostics', () => {
   });
 });
 
+describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
+  async function setupTree() {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const owner = 'owner-A';
+    const ttl = 30_000;
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-2', threadId: 't-c2', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'grandchild', threadId: 't-gc', parentSessionId: 'child-1', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    return { storage, owner, db };
+  }
+
+  it('renews the root and every active descendant to one capped expiry', async () => {
+    const { storage, owner } = await setupTree();
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    expect(result.renewedDescendantCount).toBe(3);
+    const ids = ['root', 'child-1', 'child-2', 'grandchild'];
+    const records = await Promise.all(ids.map(id => storage.loadSession({ sessionId: id })));
+    for (const record of records) {
+      // Every entry shares one expiry (capped at the root's new lease).
+      expect(record?.leaseExpiresAt).toBe(result.expiresAt);
+      expect(record?.ownerId).toBe(owner);
+    }
+  });
+
+  it('skips closed descendants (they hold no live lease)', async () => {
+    const { storage, owner } = await setupTree();
+    const child2 = await storage.loadSession({ sessionId: 'child-2' });
+    await storage.saveSession(
+      { ...child2!, closedAt: Date.now() },
+      { ownerId: owner, ifVersion: child2!.version },
+    );
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    // child-2 is closed → not counted (root + child-1 + grandchild = 2 descendants).
+    expect(result.renewedDescendantCount).toBe(2);
+  });
+
+  it('is all-or-nothing: a descendant owned by another instance fences without renewing the root', async () => {
+    const { storage, owner } = await setupTree();
+    // Re-create grandchild's lease under a different owner to simulate a split.
+    const grandchild = await storage.loadSession({ sessionId: 'grandchild' });
+    await storage.releaseSessionLease({ sessionId: 'grandchild', ownerId: owner });
+    await storage.acquireSessionLease({ sessionId: 'grandchild', ownerId: 'owner-B', ttlMs: 30_000 });
+    const rootBefore = await storage.loadSession({ sessionId: 'root' });
+
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Atomic: the root lease must NOT have advanced.
+    const rootAfter = await storage.loadSession({ sessionId: 'root' });
+    expect(rootAfter?.leaseExpiresAt).toBe(rootBefore?.leaseExpiresAt);
+    expect(grandchild?.ownerId).toBe(owner); // sanity: it was owner's before the split
+  });
+
+  it('re-adopts a same-owner descendant whose mirror lapsed (§5.8 repair, not a fence)', async () => {
+    const { storage, owner, db } = await setupTree();
+    // Simulate a lagging/lapsed mirror: same owner, but its lease already expired.
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith('grandchild'));
+    if (!key) throw new Error('expected grandchild record');
+    const lapsed = db.harnessSessions.get(key)!;
+    db.harnessSessions.set(key, { ...lapsed, leaseExpiresAt: Date.now() - 60_000 });
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    // Lapsed same-owner descendant is extended (re-adopted), not fenced.
+    expect(result.renewedDescendantCount).toBe(3);
+    const grandchild = await storage.loadSession({ sessionId: 'grandchild' });
+    expect(grandchild?.leaseExpiresAt).toBe(result.expiresAt);
+    expect(grandchild?.ownerId).toBe(owner);
+  });
+
+  it('throws not-found for a missing root', async () => {
+    const { storage, owner } = await setupTree();
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'nope', ownerId: owner, ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+  });
+
+  it('throws lease-conflict when the caller is not the root owner', async () => {
+    const { storage } = await setupTree();
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'someone-else', ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+});
+
 function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     harnessName: 'default',
@@ -2816,3 +3014,265 @@ function sampleChannelOutbox(overrides: Partial<ChannelOutboxItem> = {}): Channe
     ...overrides,
   };
 }
+
+describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
+  function makeBinding(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'bind-1',
+      harnessName: 'default',
+      channelId: 'support',
+      providerId: 'slack',
+      status: 'active' as const,
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      resourceId: 'res-1',
+      threadId: 'thread-1',
+      sessionId: 'session-1',
+      mode: 'thread-resource' as const,
+      generation: 1,
+      createdAt: 1000,
+      updatedAt: 1000,
+      ...overrides,
+    };
+  }
+
+  it('saves and loads a binding by id, and looks it up by external tuple', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding());
+    expect(await storage.loadChannelBinding({ bindingId: 'bind-1' })).toMatchObject({ id: 'bind-1', status: 'active' });
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-1' });
+    // Non-active rows are not returned by the external-tuple lookup.
+    await storage.saveChannelBinding(makeBinding({ status: 'closed' }));
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toBeNull();
+  });
+
+  it('hard-deletes session-scoped bindings on session deletion, freeing the conversation to rebind', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.saveChannelBinding(makeBinding());
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-1' });
+
+    const active = await storage.loadSession({ sessionId: 'session-1' });
+    if (!active) throw new Error('expected session');
+    await storage.saveSession(
+      { ...active, closedAt: 2000, lastActivityAt: 2000 },
+      { ownerId: 'h-1', ifVersion: active.version },
+    );
+    const closed = await storage.loadSession({ sessionId: 'session-1' });
+    if (!closed) throw new Error('expected session');
+    await storage.deleteSession({
+      sessionId: 'session-1',
+      ifVersion: closed.version,
+      expectedResourceId: closed.resourceId,
+      expectedThreadId: closed.threadId,
+      expectedParentSessionId: closed.parentSessionId ?? null,
+      expectedCreatedAt: closed.createdAt,
+      requireClosed: true,
+    });
+
+    // The session-scoped binding is gone — no orphan blocks the conversation.
+    expect(await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).toEqual([]);
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toBeNull();
+    // A replacement session can claim the same tuple without a §5.2h conflict
+    // (before the cleanup, the stale active binding would have rejected this).
+    await expect(
+      storage.saveChannelBinding(makeBinding({ id: 'bind-2', sessionId: 'session-2' })),
+    ).resolves.toBeUndefined();
+  });
+
+  it('matches the external tuple with the missing-optional-id sentinel', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding({ id: 'bind-dm', externalTenantId: undefined, externalChannelId: undefined }));
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-dm' });
+  });
+
+  it('resolveChannelBinding is idempotent for the same tuple (created once)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const first = await storage.resolveChannelBinding({ candidate: makeBinding() });
+    expect(first).toMatchObject({ created: true });
+    const second = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'bind-2' }) });
+    expect(second.created).toBe(false);
+    expect(second.binding.id).toBe('bind-1'); // existing active binding wins
+  });
+
+  it('resolveChannelBinding replacement fences the prior binding and bumps generation', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.resolveChannelBinding({ candidate: makeBinding() });
+    const replaced = await storage.resolveChannelBinding({
+      candidate: makeBinding({ id: 'bind-2', threadId: 'thread-2', sessionId: 'session-2' }),
+      replaceBindingId: 'bind-1',
+    });
+    expect(replaced).toMatchObject({ created: true, replacedBindingId: 'bind-1' });
+    expect(replaced.binding.generation).toBe(2);
+    const prior = await storage.loadChannelBinding({ bindingId: 'bind-1' });
+    expect(prior).toMatchObject({ status: 'replaced', replacedByBindingId: 'bind-2' });
+    // Exactly one active binding for the tuple after replacement.
+    const active = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+    });
+    expect(active?.id).toBe('bind-2');
+  });
+
+  it('lists bindings for a session and paginates active bindings for a scope, then deletes', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding({ id: 'b-a', externalThreadId: 'A', lastOutboundAt: 30 }));
+    await storage.saveChannelBinding(makeBinding({ id: 'b-b', externalThreadId: 'B', lastOutboundAt: 20 }));
+    await storage.saveChannelBinding(makeBinding({ id: 'b-c', externalThreadId: 'C', lastOutboundAt: 10, sessionId: 'session-other' }));
+
+    expect((await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).map(b => b.id)).toEqual(['b-a', 'b-b']);
+
+    const page1 = await storage.listActiveChannelBindingsForScope({ harnessName: 'default', channelId: 'support', limit: 2 });
+    expect(page1.bindings.map(b => b.id)).toEqual(['b-a', 'b-b']); // lastOutboundAt DESC
+    expect(page1.nextCursor).toBe('b-b');
+    const page2 = await storage.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      channelId: 'support',
+      limit: 2,
+      cursor: 'b-b',
+    });
+    expect(page2.bindings.map(b => b.id)).toEqual(['b-c']);
+    expect(page2.nextCursor).toBeUndefined();
+
+    await storage.deleteChannelBinding({ bindingId: 'b-a' });
+    expect(await storage.loadChannelBinding({ bindingId: 'b-a' })).toBeNull();
+  });
+
+  it('replacement keeps one-active-per-tuple even with a stale replaceBindingId (§14.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    // Two distinct active conversations (same tenant/channel, different thread).
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'A', externalThreadId: 'TS-A' }) });
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'B', externalThreadId: 'TS-B' }) });
+    // Replace B's conversation with a fresh binding, but pass A's id (stale/wrong).
+    const res = await storage.resolveChannelBinding({
+      candidate: makeBinding({ id: 'B2', externalThreadId: 'TS-B', sessionId: 'session-B2' }),
+      replaceBindingId: 'A',
+    });
+    // The tuple's active (B) is replaced — NOT the unrelated A named by the stale id.
+    expect(res).toMatchObject({ created: true, replacedBindingId: 'B' });
+    expect(res.binding.generation).toBe(2);
+    expect((await storage.loadChannelBinding({ bindingId: 'A' }))?.status).toBe('active');
+    expect((await storage.loadChannelBinding({ bindingId: 'B' }))?.status).toBe('replaced');
+    const activeB = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS-B',
+    });
+    expect(activeB?.id).toBe('B2');
+  });
+
+  it('accepts the binding-local closedReason values (§5.1h / §13.3f.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding({ status: 'closed', closedReason: 'platform_unlinked', closedAt: 5 }));
+    expect(await storage.loadChannelBinding({ bindingId: 'bind-1' })).toMatchObject({
+      status: 'closed',
+      closedReason: 'platform_unlinked',
+    });
+  });
+
+  it('saveChannelBinding rejects a second active binding for the same tuple (§5.2h)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { HarnessStorageChannelBindingConflictError } = await import('./base');
+    await storage.saveChannelBinding(makeBinding({ id: 'b1' }));
+    // Same id update is allowed.
+    await expect(storage.saveChannelBinding(makeBinding({ id: 'b1', lastInboundAt: 99 }))).resolves.toBeUndefined();
+    // A non-active row for the tuple is allowed.
+    await expect(storage.saveChannelBinding(makeBinding({ id: 'b1-old', status: 'replaced' }))).resolves.toBeUndefined();
+    // A second ACTIVE row for the same tuple is rejected.
+    await expect(storage.saveChannelBinding(makeBinding({ id: 'b2' }))).rejects.toBeInstanceOf(
+      HarnessStorageChannelBindingConflictError,
+    );
+  });
+
+  it('generation is monotonic per tuple across replacement (§14.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const r1 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g1', generation: 1 }) });
+    expect(r1.binding.generation).toBe(1);
+    const r2 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g2' }), replaceBindingId: 'g1' });
+    expect(r2.binding.generation).toBe(2);
+    // A fresh resolve after the prior is replaced does not regress generation.
+    const r3 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g3' }), replaceBindingId: 'g2' });
+    expect(r3.binding.generation).toBe(3);
+  });
+
+  it('touchChannelBindingInbound advances the activity marker forward only and never regresses it (§14.1 / PF-813)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'b1', createdAt: 1000, updatedAt: 1000 }) });
+
+    // First inbound advances both markers forward.
+    const t1 = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 2000 });
+    expect(t1).toMatchObject({ id: 'b1', lastInboundAt: 2000, updatedAt: 2000 });
+
+    // A delayed/out-of-order OLDER ingress must NOT regress the marker (the core
+    // PF-813 guarantee: a stale read-modify-write would have clobbered 2000 → 1500).
+    const stale = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 1500 });
+    expect(stale).toMatchObject({ lastInboundAt: 2000, updatedAt: 2000 });
+    expect(await storage.loadChannelBinding({ bindingId: 'b1' })).toMatchObject({ lastInboundAt: 2000 });
+
+    // A newer ingress advances again.
+    const t2 = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 3000 });
+    expect(t2).toMatchObject({ lastInboundAt: 3000, updatedAt: 3000 });
+  });
+
+  it('touchChannelBindingInbound returns null for an unknown binding', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    expect(await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'missing', at: 1 })).toBeNull();
+  });
+
+  it('throws unsupported from the base default (channel bindings opt-in per adapter)', async () => {
+    const { HarnessStorageChannelBindingUnsupportedError } = await import('./base');
+    expect(HarnessStorageChannelBindingUnsupportedError).toBeDefined();
+  });
+});

@@ -54,6 +54,7 @@ export const TABLE_HARNESS_OPERATION_TOMBSTONES = 'mastra_harness_operation_tomb
 export const TABLE_HARNESS_SESSION_EVENTS = 'mastra_harness_session_events';
 export const TABLE_HARNESS_THREAD_DELETE_FENCES = 'mastra_harness_thread_delete_fences';
 export const TABLE_HARNESS_CHANNEL_INBOX = 'mastra_harness_channel_inbox';
+export const TABLE_HARNESS_CHANNEL_BINDINGS = 'mastra_harness_channel_bindings';
 export const TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS = 'mastra_harness_provider_callback_bindings';
 export const TABLE_HARNESS_CHANNEL_ACTION_TOKENS = 'mastra_harness_channel_action_tokens';
 export const TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS = 'mastra_harness_channel_action_receipts';
@@ -104,6 +105,7 @@ export type TABLE_NAMES =
   | typeof TABLE_HARNESS_SESSION_EVENTS
   | typeof TABLE_HARNESS_THREAD_DELETE_FENCES
   | typeof TABLE_HARNESS_CHANNEL_INBOX
+  | typeof TABLE_HARNESS_CHANNEL_BINDINGS
   | typeof TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS
   | typeof TABLE_HARNESS_CHANNEL_ACTION_TOKENS
   | typeof TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS
@@ -826,6 +828,32 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     attachments: { type: 'jsonb', nullable: false },
     last_error: { type: 'jsonb', nullable: true },
   },
+  [TABLE_HARNESS_CHANNEL_BINDINGS]: {
+    id: { type: 'text', nullable: false, primaryKey: true },
+    harness_name: { type: 'text', nullable: false },
+    channel_id: { type: 'text', nullable: false },
+    provider_id: { type: 'text', nullable: false },
+    status: { type: 'text', nullable: false },
+    platform: { type: 'text', nullable: false },
+    // §14.1: missing optional external IDs are persisted as a non-null sentinel so
+    // the partial-unique ACTIVE-binding index never relies on SQL NULL uniqueness.
+    external_tenant_id: { type: 'text', nullable: false },
+    external_channel_id: { type: 'text', nullable: false },
+    external_thread_id: { type: 'text', nullable: false },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    mode: { type: 'text', nullable: false },
+    generation: { type: 'integer', nullable: false },
+    created_at: { type: 'bigint', nullable: false },
+    updated_at: { type: 'bigint', nullable: false },
+    last_inbound_at: { type: 'bigint', nullable: true },
+    last_outbound_at: { type: 'bigint', nullable: true },
+    closed_at: { type: 'bigint', nullable: true },
+    closed_reason: { type: 'text', nullable: true },
+    replaced_by_binding_id: { type: 'text', nullable: true },
+    undeliverable_reason: { type: 'text', nullable: true },
+  },
   [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: {
     id: { type: 'text', nullable: false, primaryKey: true },
     provider_id: { type: 'text', nullable: false },
@@ -1028,6 +1056,9 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
   },
   [TABLE_HARNESS_CHANNEL_INBOX]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_INBOX],
+  },
+  [TABLE_HARNESS_CHANNEL_BINDINGS]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_BINDINGS],
   },
   [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS],

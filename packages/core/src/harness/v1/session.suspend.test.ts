@@ -182,6 +182,105 @@ describe('Session — suspend capture on message()', () => {
     expect(session.getDisplayState().pending?.kind).toBe('tool-approval');
   });
 
+  it('signal(): a suspended owned turn is parked, not settled — no signal_completed, evidence stays pending (§4.2f/§10.2)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-S',
+      suspendPayload: { toolCallId: 'tc-s', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+
+    const handle = await session.signal({ content: 'do it' });
+    const result = await handle.result;
+    expect(result.finishReason).toBe('suspended');
+
+    // §10.2 — a parked turn is not answered, so the operation does not settle.
+    expect(events.some(e => e.type === 'signal_completed')).toBe(false);
+    expect(events.some(e => e.type === 'signal_failed')).toBe(false);
+
+    // §4.2f — durable per-signalId evidence stays `pending` until resume
+    // terminalizes (the accept-time pending write is the durable barrier).
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('pending');
+  });
+
+  it('signal(): terminal resume of a suspended owned turn settles signal_completed + durable evidence (§4.2f/§10.2)', async () => {
+    const { harness, agent } = setup();
+    // 1) initial owned turn suspends
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-RS',
+      suspendPayload: { toolCallId: 'tc-rs', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    // 2) resume terminalizes (no further suspend)
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-RS', text: 'done' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const handle = await session.signal({ content: 'do it' });
+    const suspended = await handle.result;
+    expect(suspended.finishReason).toBe('suspended');
+
+    // Evidence is parked while suspended (companion to the test above).
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+    expect((session.getRecord().pendingResume as { originSignalId?: string }).originSignalId).toBe(handle.id);
+
+    // Now approve the tool → resume runs to a terminal (non-suspended) finish.
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+    await session.respondToToolApproval({ approved: true });
+
+    // §4.2f — the terminal resume IS this signal's answer: it settles the
+    // durable per-signalId evidence and projects signal_completed (not just
+    // agent_end), so a suspended owned signal does not stay pending forever.
+    await waitFor(
+      () => events.some(e => e.type === 'signal_completed'),
+      'signal_completed after terminal resume',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+    expect(session.getRecord().pendingResume).toBeUndefined();
+  });
+
+  it('signal(): failed resume of a suspended owned turn settles signal_failed (§4.2f)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-RF',
+      suspendPayload: { toolCallId: 'tc-rf', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const handle = await session.signal({ content: 'do it' });
+    await handle.result;
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+
+    // No further run enqueued → resumeStream throws → terminal failure.
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+
+    await waitFor(
+      () => events.some(e => e.type === 'signal_failed'),
+      'signal_failed after failed resume',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('failed');
+  });
+
   it('classifies as "tool-suspension" when the chunk carries a suspendPayload field', async () => {
     const { harness, agent } = setup();
     agent.enqueueRun({
@@ -589,12 +688,12 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ sessionId });
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toMatchObject({ code: 'harness.runtime_dependency_drifted' });
+    ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       status: 'failed',
-      error: { code: 'harness.runtime_dependency_drifted' },
+      error: { code: 'harness.runtime_drift' },
     });
     expect(session.getRecord().pendingResume).toMatchObject({ runId: 'run-Q' });
     expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
@@ -657,14 +756,14 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ sessionId });
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q-generation', responseId: 'answer-generation', answer: 'red' }),
-    ).rejects.toMatchObject({ code: 'harness.runtime_dependency_drifted' });
+    ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
     expect(session.getRecord().inboxResponseReceipts?.['answer-generation']).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
-        message: expect.stringContaining('runtime_compatibility_generation "generation-a"'),
+        code: 'harness.runtime_drift',
+        message: expect.stringContaining('recorded generation "generation-a"'),
       },
     });
     expect(session.getRecord().pendingResume).toMatchObject({ runId: 'run-Q-generation' });

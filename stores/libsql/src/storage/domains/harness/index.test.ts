@@ -12,6 +12,7 @@ import {
   TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
+  TABLE_HARNESS_OPERATION_TOMBSTONES,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
@@ -21,12 +22,15 @@ import {
   HarnessStorageAttachmentUnavailableError,
   HarnessStorageChannelActionClaimConflictError,
   HarnessStorageChannelActionReceiptTransitionError,
+  HarnessStorageChannelBindingConflictError,
   HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelInboxTransitionError,
   HarnessStorageChannelOutboxClaimConflictError,
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
+  HarnessStorageLeaseConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
@@ -35,6 +39,7 @@ import {
 import type {
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
   HarnessProviderCallbackBinding,
@@ -356,6 +361,28 @@ describe('HarnessLibSQL legacy Harness table migrations', () => {
       'Cannot create Harness active-session uniqueness index while duplicate active rows exist',
     );
     await expect(primaryKeyColumns(client, TABLE_HARNESS_SESSIONS)).resolves.toEqual(['id']);
+  });
+
+  it('creates the parent_session_id index for subtree-lease renewal + child listing (PF-825)', async () => {
+    const client = createClient({ url: ':memory:' });
+    const storage = new HarnessLibSQL({ client });
+    await storage.init();
+    await expect(indexNames(client, TABLE_HARNESS_SESSIONS)).resolves.toContain('idx_harness_sessions_parent');
+  });
+
+  it('creates the admission-evidence lookup indexes (message_results + operation_tombstones) (PF-825)', async () => {
+    const client = createClient({ url: ':memory:' });
+    const storage = new HarnessLibSQL({ client });
+    await storage.init();
+    // operation_tombstones is created in init().
+    await expect(indexNames(client, TABLE_HARNESS_OPERATION_TOMBSTONES)).resolves.toContain(
+      'idx_harness_tombstones_lookup',
+    );
+    // message_results is lazily ensured — trigger it via a lookup, then assert its indexes.
+    await storage.loadMessageResultEvidence({ sessionId: 's', resourceId: 'r', threadId: 't', signalId: 'sig' });
+    const messageResultIndexes = await indexNames(client, TABLE_HARNESS_MESSAGE_RESULTS);
+    expect(messageResultIndexes).toContain('idx_harness_message_results_lookup');
+    expect(messageResultIndexes).toContain('idx_harness_message_results_admission');
   });
 });
 
@@ -1179,7 +1206,7 @@ describe('HarnessLibSQL message result evidence', () => {
         sessionId: 'session-1',
         resourceId: 'resource-1',
         threadId: 'thread-1',
-        kind: 'message',
+        kind: 'signal',
         admissionId: 'admission-1',
         attemptedAdmissionHash: 'hash-1',
       }),
@@ -1189,7 +1216,7 @@ describe('HarnessLibSQL message result evidence', () => {
         sessionId: 'session-1',
         resourceId: 'resource-1',
         threadId: 'thread-1',
-        kind: 'message',
+        kind: 'signal',
         admissionId: 'admission-1',
         attemptedAdmissionHash: 'different-hash',
       }),
@@ -1265,13 +1292,13 @@ describe('HarnessLibSQL message result evidence', () => {
     const compacted = await storage.compactOperationResultEvidence({
       sessionId: 'session-1',
       resourceId: 'resource-1',
-      kind: 'message',
+      kind: 'signal',
       signalId: 'signal-1',
       now: 3000,
     });
 
     expect(compacted).toMatchObject({
-      kind: 'message',
+      kind: 'signal',
       admissionId: 'admission-1',
       admissionHash: 'hash-1',
       signalId: 'signal-1',
@@ -3312,6 +3339,256 @@ describe('HarnessLibSQL channel diagnostics', () => {
         limit: 0,
       }),
     ).resolves.toEqual({ inbox: [], actionTokens: [], actionReceipts: [], outbox: [] });
+  });
+});
+
+describe('HarnessLibSQL renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
+  let storage: HarnessLibSQL;
+
+  beforeEach(async () => {
+    storage = new HarnessLibSQL({ client: createHarnessTestClient() });
+    await storage.init();
+  });
+
+  async function seedOwned(id: string, ownerId: string, parentSessionId?: string, overrides: Partial<SessionRecord> = {}) {
+    await storage.saveSession(sampleSession({ id, threadId: `t-${id}`, parentSessionId, ...overrides }), {
+      ownerId,
+      ifVersion: 0,
+    });
+    await storage.acquireSessionLease({ sessionId: id, ownerId, ttlMs: 60_000 });
+  }
+
+  it('atomically renews the root and every active descendant to one capped expiry', async () => {
+    await seedOwned('root', 'h-1');
+    await seedOwned('child', 'h-1', 'root');
+    await seedOwned('grandchild', 'h-1', 'child');
+
+    const before = Date.now();
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    expect(result.renewedDescendantCount).toBe(2);
+
+    for (const id of ['root', 'child', 'grandchild']) {
+      const rec = await storage.loadSession({ sessionId: id });
+      expect(rec?.leaseExpiresAt).toBeGreaterThanOrEqual(before + 120_000 - 5_000);
+    }
+  });
+
+  it('skips closed descendants (no live lease) but still renews active ones', async () => {
+    await seedOwned('root', 'h-1');
+    await seedOwned('open-child', 'h-1', 'root');
+    // A closed descendant holds no live lease and must not be counted/renewed.
+    await storage.saveSession(
+      sampleSession({ id: 'closed-child', threadId: 't-closed', parentSessionId: 'root', closedAt: 5000, lastActivityAt: 5000 }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    expect(result.renewedDescendantCount).toBe(1);
+  });
+
+  it('fences and renews NOTHING when an active descendant is owned by another instance (§5.8 all-or-nothing)', async () => {
+    await seedOwned('root', 'h-1');
+    await seedOwned('foreign-child', 'h-2', 'root'); // split subtree
+
+    const rootBefore = await storage.loadSession({ sessionId: 'root' });
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Root lease must be untouched — no parent-only partial commit.
+    const rootAfter = await storage.loadSession({ sessionId: 'root' });
+    expect(rootAfter?.leaseExpiresAt).toBe(rootBefore?.leaseExpiresAt);
+  });
+
+  it('throws SessionNotFound for an unknown root and LeaseConflict for a non-owned root', async () => {
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'ghost', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await seedOwned('root', 'h-2'); // owned by someone else
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+});
+
+function sampleChannelBinding(overrides: Partial<ChannelBinding> = {}): ChannelBinding {
+  return {
+    id: 'binding-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    status: 'active',
+    platform: 'slack',
+    externalTenantId: 'T1',
+    externalChannelId: 'C1',
+    externalThreadId: 'th-1',
+    resourceId: 'resource-1',
+    threadId: 'thread-1',
+    sessionId: 'session-1',
+    mode: 'per-user-resource',
+    generation: 1,
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () => {
+  let storage: HarnessLibSQL;
+
+  beforeEach(async () => {
+    const client = createHarnessTestClient();
+    storage = new HarnessLibSQL({ client });
+    await storage.init();
+  });
+
+  it('saves a binding and loads it back by external tuple', async () => {
+    const binding = sampleChannelBinding();
+    await storage.saveChannelBinding(binding);
+
+    const byId = await storage.loadChannelBinding({ bindingId: binding.id });
+    expect(byId).toEqual(binding);
+
+    const byExternal = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toEqual(binding);
+  });
+
+  it('excludes non-active rows from the external lookup', async () => {
+    await storage.saveChannelBinding(sampleChannelBinding({ id: 'fenced', status: 'replaced' }));
+
+    const byExternal = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toBeNull();
+
+    // The fenced row is still addressable by id.
+    const byId = await storage.loadChannelBinding({ bindingId: 'fenced' });
+    expect(byId?.status).toBe('replaced');
+  });
+
+  it('rejects a second active binding for the same tuple (§5.2h)', async () => {
+    await storage.saveChannelBinding(sampleChannelBinding({ id: 'first' }));
+
+    await expect(
+      storage.saveChannelBinding(sampleChannelBinding({ id: 'second' })),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+
+    // The conflict names the holder of the active row.
+    await storage
+      .saveChannelBinding(sampleChannelBinding({ id: 'third' }))
+      .catch((err: HarnessStorageChannelBindingConflictError) => {
+        expect(err).toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+        expect(err.heldBy).toBe('first');
+      });
+
+    // Re-saving the SAME id (an in-place update) is always allowed.
+    await expect(
+      storage.saveChannelBinding(sampleChannelBinding({ id: 'first', lastInboundAt: 5000 })),
+    ).resolves.toBeUndefined();
+    const reloaded = await storage.loadChannelBinding({ bindingId: 'first' });
+    expect(reloaded?.lastInboundAt).toBe(5000);
+  });
+
+  it('treats a missing optional external id as a sentinel match (§14.1)', async () => {
+    // Persist a binding with no tenant/channel id, then look it up with the same
+    // omitted ids — the sentinel makes them collide, not SQL NULL semantics.
+    const binding = sampleChannelBinding({
+      id: 'no-optional',
+      externalTenantId: undefined,
+      externalChannelId: undefined,
+    });
+    await storage.saveChannelBinding(binding);
+
+    const matched = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(matched).toEqual(binding);
+
+    // A second active binding with the same omitted optional ids still conflicts.
+    await expect(
+      storage.saveChannelBinding(
+        sampleChannelBinding({ id: 'no-optional-2', externalTenantId: undefined, externalChannelId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+
+    // Supplying a real tenant id is a DIFFERENT tuple, so it does not match/conflict.
+    const distinct = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalThreadId: 'th-1',
+    });
+    expect(distinct).toBeNull();
+  });
+
+  it('advances inbound activity forward-only (§14.1)', async () => {
+    await storage.saveChannelBinding(sampleChannelBinding({ updatedAt: 1000 }));
+
+    const forward = await storage.touchChannelBindingInbound({ bindingId: 'binding-1', at: 5000 });
+    expect(forward?.lastInboundAt).toBe(5000);
+    expect(forward?.updatedAt).toBe(5000);
+
+    // An older ingress must NOT regress the marker.
+    const backward = await storage.touchChannelBindingInbound({ bindingId: 'binding-1', at: 2000 });
+    expect(backward?.lastInboundAt).toBe(5000);
+    expect(backward?.updatedAt).toBe(5000);
+
+    // A newer ingress advances it again.
+    const newer = await storage.touchChannelBindingInbound({ bindingId: 'binding-1', at: 9000 });
+    expect(newer?.lastInboundAt).toBe(9000);
+
+    // Touching an unknown binding returns null.
+    expect(await storage.touchChannelBindingInbound({ bindingId: 'missing', at: 1 })).toBeNull();
+  });
+
+  it('removes the binding on deleteSessions and frees the tuple for rebind', async () => {
+    await storage.saveSession(sampleSession({ id: 'session-1' }), { ownerId: 'h-1', ifVersion: 0 });
+    const seeded = await storage.loadSession({ sessionId: 'session-1' });
+    if (!seeded) throw new Error('expected seeded session');
+    await storage.saveChannelBinding(sampleChannelBinding({ sessionId: 'session-1' }));
+
+    await storage.deleteSession({
+      sessionId: 'session-1',
+      ifVersion: seeded.version,
+      expectedResourceId: seeded.resourceId,
+      expectedThreadId: seeded.threadId,
+      expectedCreatedAt: seeded.createdAt,
+    });
+
+    // The session-scoped binding is gone.
+    expect(await storage.loadChannelBinding({ bindingId: 'binding-1' })).toBeNull();
+    expect(await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).toEqual([]);
+
+    // The conversation tuple is free, so a replacement session can rebind it.
+    await expect(
+      storage.saveChannelBinding(sampleChannelBinding({ id: 'rebind', sessionId: 'session-2' })),
+    ).resolves.toBeUndefined();
+    const rebound = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(rebound?.id).toBe('rebind');
   });
 });
 

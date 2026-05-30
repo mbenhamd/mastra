@@ -24,13 +24,15 @@ function getHarnessSlot(streamCalls: any[]): HarnessRequestContext {
 }
 
 describe('HarnessRequestContext — identity fields', () => {
-  it('populates harnessId / sessionId / threadId / resourceId / modeId / modelId', async () => {
+  it('populates harnessName / harnessInstanceId / sessionId / threadId / resourceId / modeId / modelId', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true }, modelId: 'model-default' });
     await session.message({ content: 'hi' });
 
     const slot = getHarnessSlot(agent.streamCalls);
-    expect(slot.harnessId).toBe(harness.ownerId);
+    // §6.1: harnessName is the stable namespace; harnessInstanceId is per-process.
+    expect(slot.harnessName).toBe(session.getRecord().harnessName);
+    expect(slot.harnessInstanceId).toBe(harness.ownerId);
     expect(slot.sessionId).toBe(session.id);
     expect(slot.threadId).toBe(session.threadId);
     expect(slot.resourceId).toBe('u1');
@@ -171,7 +173,7 @@ describe('HarnessRequestContext — queued turns', () => {
           platform: 'slack',
           externalThreadId: 'thread-1',
           externalMessageId: 'message-1',
-          actor: { platformUserId: 'user-1', displayName: 'Ada' },
+          actor: { externalUserId: 'user-1', displayName: 'Ada' },
         },
       },
     });
@@ -187,7 +189,7 @@ describe('HarnessRequestContext — queued turns', () => {
       providerId: 'slack',
       externalThreadId: 'thread-1',
       externalMessageId: 'message-1',
-      actor: { platformUserId: 'user-1', displayName: 'Ada' },
+      actor: { externalUserId: 'user-1', displayName: 'Ada' },
     });
     const slot = getHarnessSlot(agent.streamCalls);
     expect(slot.app).toEqual({ appId: 'scheduler' });
@@ -198,7 +200,7 @@ describe('HarnessRequestContext — queued turns', () => {
       providerId: 'slack',
       externalThreadId: 'thread-1',
       externalMessageId: 'message-1',
-      actor: { platformUserId: 'user-1', displayName: 'Ada' },
+      actor: { externalUserId: 'user-1', displayName: 'Ada' },
     });
   });
 
@@ -261,7 +263,7 @@ describe('HarnessRequestContext — §15 pending registration acceptance', () =>
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const eventRecords: Array<Promise<unknown>> = [];
     session.subscribe(event => {
-      if (event.type === 'suspension_required' && event.kind === 'question') {
+      if (event.type === 'question_pending') {
         eventRecords.push(storage.loadSession({ sessionId: session.id }));
       }
     });
@@ -305,7 +307,7 @@ describe('HarnessRequestContext — §15 pending registration acceptance', () =>
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const eventRecords: Array<Promise<unknown>> = [];
     session.subscribe(event => {
-      if (event.type === 'suspension_required' && event.kind === 'plan-approval') {
+      if (event.type === 'plan_approval_required') {
         eventRecords.push(storage.loadSession({ sessionId: session.id }));
       }
     });
@@ -336,5 +338,97 @@ describe('HarnessRequestContext — §15 pending registration acceptance', () =>
         },
       },
     });
+  });
+});
+
+describe('HarnessRequestContext — emitCustomEvent (§6.1/§6.3/§10.2)', () => {
+  // The per-turn tool context only emits while a turn is in flight. Production tools
+  // run mid-turn (the turn controller is set by _beginTurn before generate/stream);
+  // these tests simulate that by stamping the active-turn marker (+ optional runId).
+  function activateTurn(session: unknown, runId?: string): void {
+    (session as { _currentTurnAbortController?: AbortController })._currentTurnAbortController = new AbortController();
+    if (runId !== undefined) (session as { _currentRunId?: string })._currentRunId = runId;
+  }
+
+  it('emits a validated custom event (payload present or omitted) attributed to the active run', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const events: any[] = [];
+    session.subscribe(e => events.push(e));
+    await session.message({ content: 'go' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    activateTurn(session, 'run-emit');
+
+    slot.emitCustomEvent({ type: 'myorg.tool.progress', payload: { pct: 50 } });
+    slot.emitCustomEvent({ type: 'myorg.tool.ping' }); // payload omitted is valid
+
+    const progress = events.find(e => e.type === 'myorg.tool.progress');
+    expect(progress).toMatchObject({
+      type: 'myorg.tool.progress',
+      payload: { pct: 50 },
+      sessionId: session.id,
+      runId: 'run-emit',
+    });
+    expect(typeof progress.id).toBe('string');
+    expect(typeof progress.timestamp).toBe('number');
+    const ping = events.find(e => e.type === 'myorg.tool.ping');
+    expect(ping).toMatchObject({ type: 'myorg.tool.ping', runId: 'run-emit' });
+    expect(ping.payload).toBeUndefined();
+  });
+
+  it('emits during an active turn whose runId is not yet known (structured-sync window)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const events: any[] = [];
+    session.subscribe(e => events.push(e));
+    await session.message({ content: 'go' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    // Active turn (controller set) but no runId yet — mirrors the atomic
+    // agent.generate() window in message({ sync, output }) before agent_start.
+    (session as unknown as { _currentTurnAbortController?: AbortController })._currentTurnAbortController =
+      new AbortController();
+
+    slot.emitCustomEvent({ type: 'myorg.tool.progress', payload: { pct: 10 } });
+
+    const custom = events.find(e => e.type === 'myorg.tool.progress');
+    expect(custom).toMatchObject({ type: 'myorg.tool.progress', payload: { pct: 10 }, sessionId: session.id });
+    expect(custom.runId).toBeUndefined();
+  });
+
+  it('throws when emitted with no active turn (stale/post-turn context)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    // The turn controller is cleared after the turn → emit must reject.
+    expect(() => slot.emitCustomEvent({ type: 'myorg.tool.progress' })).toThrow(HarnessValidationError);
+  });
+
+  it('rejects reserved-prefix (even dotted), non-dotted, and reserved-exact types (§6.3)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    activateTurn(session, 'run-x');
+
+    // Reserved internal-prefix family, even when dotted (the key §6.3 case).
+    expect(() => slot.emitCustomEvent({ type: 'tool_start.progress' })).toThrow(HarnessValidationError);
+    expect(() => slot.emitCustomEvent({ type: 'agent_custom.foo' })).toThrow(HarnessValidationError);
+    // Non-dotted custom type.
+    expect(() => slot.emitCustomEvent({ type: 'notdotted' })).toThrow(HarnessValidationError);
+    // Reserved exact built-in type.
+    expect(() => slot.emitCustomEvent({ type: 'error' })).toThrow(HarnessValidationError);
+  });
+
+  it('rejects a non-JSON-serializable payload and extra top-level fields at call time', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    activateTurn(session, 'run-x');
+
+    expect(() => slot.emitCustomEvent({ type: 'myorg.tool.bad', payload: { fn: () => 1 } as any })).toThrow();
+    // §10.3: only `type` + `payload` are allowed — a forged envelope field is rejected.
+    expect(() => slot.emitCustomEvent({ type: 'myorg.tool.x', id: 'forged' } as any)).toThrow(HarnessValidationError);
   });
 });

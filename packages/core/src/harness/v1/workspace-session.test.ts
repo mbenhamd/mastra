@@ -171,8 +171,8 @@ describe('Subagent workspace inheritance — config validation', () => {
 });
 
 describe('Workspace lifecycle events', () => {
-  it('emits workspace_status_changed transitions for shared lazy resolution', async () => {
-    const events: any[] = [];
+  it('resolves a shared lazy workspace without emitting public workspace events (§2.7/§10.2)', async () => {
+    const eventTypes: string[] = [];
     const harness = new Harness(
       baseConfig({
         workspace: {
@@ -181,15 +181,14 @@ describe('Workspace lifecycle events', () => {
         },
       }),
     );
-    harness.subscribe(ev => {
-      if (ev.type === 'workspace_status_changed') events.push(ev);
-    });
+    harness.subscribe(ev => eventTypes.push((ev as { type: string }).type));
 
     const s = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    await s.getWorkspace();
+    // Behavioral readiness: lazy resolution succeeds and yields a usable workspace.
+    const ws = await s.getWorkspace();
+    expect(ws).toBeDefined();
 
-    const statuses = events.map(e => e.status);
-    expect(statuses).toContain('initializing');
-    expect(statuses).toContain('ready');
+    // §10.2: workspace lifecycle status is not a public HarnessEventV1 event.
+    expect(eventTypes).not.toContain('workspace_status_changed');
   });
 });

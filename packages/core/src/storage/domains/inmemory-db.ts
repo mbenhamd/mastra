@@ -27,6 +27,7 @@ import type {
   AttachmentReference,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
   HarnessProviderCallbackBinding,
@@ -123,6 +124,7 @@ export class InMemoryDB {
   readonly harnessOperationTombstones = new Map<string, OperationAdmissionTombstone>();
   readonly harnessSessionEvents = new Map<string, HarnessSessionEventRecord>();
   readonly harnessWorkspaceActionJournal = new Map<string, WorkspaceActionJournalEntry>();
+  readonly harnessChannelBindings = new Map<string, ChannelBinding>();
   readonly harnessChannelInbox = new Map<string, ChannelInboxItem>();
   readonly harnessProviderCallbackBindings = new Map<string, HarnessProviderCallbackBinding>();
   readonly harnessChannelActionTokens = new Map<string, ChannelActionToken>();
@@ -188,6 +190,7 @@ export class InMemoryDB {
     this.harnessOperationTombstones.clear();
     this.harnessSessionEvents.clear();
     this.harnessWorkspaceActionJournal.clear();
+    this.harnessChannelBindings.clear();
     this.harnessChannelInbox.clear();
     this.harnessProviderCallbackBindings.clear();
     this.harnessChannelActionTokens.clear();

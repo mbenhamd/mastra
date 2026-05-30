@@ -1,11 +1,13 @@
 ### 9.5 Config Validation
 
-Config validation happens during `harness.init()`. `agents` and `modes` must be
-non-empty. Mode IDs must be unique; at most one mode may set `default: true`,
-and if none does, `modes[0]` is the bootstrap default. Every mode's `agentId`
-is required and must reference a key in `agents`; omitted or unknown bindings
-throw `HarnessConfigError`. Multiple modes may intentionally reference the same
-agent.
+Config validation happens during `harness.init()` and finalizes once a Mastra
+binding is resolved. Mode IDs must be unique. `modes` may be empty; when it is,
+`defaultModeId` must be omitted. `defaultModeId` is required whenever `modes` is
+non-empty and must reference one of the mode IDs; it is explicit (rather than an
+implicit `modes[0]`) so reordering `modes` never silently changes the bootstrap
+default. Every mode's `agentId` is required and must reference a key in `agents`;
+omitted or unknown bindings throw `HarnessConfigError`. Multiple modes may
+intentionally reference the same agent.
 
 Mode definitions must use the v1 shape only: each mode names an `agentId` and
 the session-facing `agents` view resolves to the corresponding Mastra-registered

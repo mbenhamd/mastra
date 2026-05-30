@@ -140,7 +140,15 @@ export interface QueuedItem {
  * amount of UX surface so a fresh subscriber can render the prompt without
  * re-fetching the snapshot.
  *
- * See HARNESS_V1_SPEC.md §5.1 ("Persistence shapes — `pendingResume`").
+ * §5.1f models pending interactions as four separate typed fields
+ * (`pendingApproval`/`pendingSuspension`/`pendingQuestion`/`pendingPlan`). This
+ * implementation deliberately uses ONE unified `pendingResume` field
+ * discriminated by `kind` (see §5.1f "Implementation note"): a single field
+ * structurally guarantees the §5.1f one-pending-interaction-per-run slot
+ * invariant (two simultaneous pendings are unrepresentable, not merely
+ * disallowed), and it carries the `sandbox-access` kind that the four-field
+ * shape has no slot for. The four spec interfaces are the per-`kind` payload
+ * contracts surfaced through `payload` / the display projection.
  */
 export interface PendingResume {
   kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
@@ -155,6 +163,14 @@ export interface PendingResume {
   requestedAt: number;
   /** Present when this pending resume belongs to a queued turn. */
   queuedItemId?: string;
+  /**
+   * Present when this pending resume belongs to an owned `signal()` turn whose
+   * durable per-`signalId` result evidence is left `pending` while suspended.
+   * On terminal (non-suspended) resume the harness settles this signal's
+   * evidence and projects `signal_completed`/`signal_failed` (§4.2f) so a
+   * suspended owned signal does not stay pending forever.
+   */
+  originSignalId?: string;
   /** Mode whose backing agent produced this pending resume. */
   modeId?: string;
   /**
@@ -177,6 +193,8 @@ export interface PendingResume {
     // tool-approval
     toolCategory?: string;
     input?: unknown;
+    /** Reasons a conditional approval predicate surfaced (§10.2 `approvalReasons`). */
+    approvalReasons?: string[];
     // tool-suspension
     suspendData?: unknown;
     // question
@@ -336,6 +354,15 @@ export interface SessionRecord {
   // At most one outstanding agent suspension per session (see PendingResume).
   pendingQueue: QueuedItem[];
   pendingResume?: PendingResume;
+  /**
+   * Narrow durable operational projection of the session's currently active or
+   * recently interrupted run (§5.1a.2 / §5.1e). Not an admission ledger, event
+   * log, outbox receipt, or replacement for agent/workflow run storage. Carries
+   * the stable runtime identities used for fail-closed hydration repair after a
+   * restart so a run is never silently resumed against a drifted tool/model/
+   * workspace surface.
+   */
+  currentRun?: HarnessRunOperationalState;
   queueAdmissionReceipts?: Record<string, QueueAdmissionReceipt>;
   inboxResponseReceipts?: Record<string, InboxResponseReceipt>;
 
@@ -382,6 +409,90 @@ export interface SessionRecord {
   };
 }
 
+/** §5.1e — lifecycle status of a `HarnessRunOperationalState`. */
+export type HarnessRunStatus =
+  | 'starting'
+  | 'running'
+  | 'waiting'
+  | 'resuming'
+  | 'completed'
+  | 'failed'
+  | 'interrupted';
+
+/** §5.1e — which entry-point operation a run is executing. */
+export type HarnessRunOperationRef =
+  | { kind: 'signal'; admissionId?: string; admissionHash?: string; signalId?: string; channelInboxItemId?: string }
+  | {
+      kind: 'queue';
+      queuedItemId: string;
+      admissionId?: string;
+      admissionHash?: string;
+      signalId?: string;
+      channelInboxItemId?: string;
+    }
+  | { kind: 'sync-generate'; operationId: string }
+  | { kind: 'use-skill'; skillName: string; admissionId?: string; admissionHash?: string; signalId?: string }
+  | { kind: 'inbox-response'; itemId: string; responseId: string; actionReceiptId?: string; resumeAttemptId: string };
+
+/**
+ * §5.1e — durable operational state for the session's current/most-recent run. Holds the stable
+ * runtime identities (registry/config IDs only — never live closures or client objects) needed to
+ * rehydrate or FAIL CLOSED after restart. Persisted at run-start and on each lifecycle transition.
+ */
+export interface HarnessRunOperationalState {
+  runId: string;
+  /** Mirrors the owning SessionRecord namespace; a mismatch is corrupt state, not a retargeting hint. */
+  harnessName: string;
+  traceId?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  /** Resolved from the effective mode's `HarnessMode.agentId` at run start, persisted with mode/model. */
+  agentId: string;
+  /** Stable tool registry/config IDs only — not names, schemas, toolset objects, or client callbacks. */
+  toolIds?: string[];
+  /** Stable MCP binding/server IDs only — not transport sessions, subscriptions, or callbacks. */
+  mcpBindingIds?: string[];
+  workspaceProviderId?: string;
+  /**
+   * Snapshot of `HarnessConfig.runtimeCompatibilityGeneration` at run start. When present on a
+   * non-terminal `currentRun`, hydration requires the current config's generation to match exactly;
+   * a mismatch means the runtime-dependency surface drifted and the harness fails closed. Absence
+   * falls back to ID-only validation.
+   */
+  runtimeCompatibilityGeneration?: string;
+  /**
+   * `true` when the run admitted a per-run executable tool surface that cannot be reconstructed from
+   * stable persisted tool identities (e.g. `signal({ addTools })` / `useSkill({ addTools })` /
+   * closure-backed extraTools). Those implementations are process-local closures that never persist,
+   * so on hydration the harness fails closed for any non-terminal run carrying this flag (§5.7/§6.2).
+   * Per-run; subagent runs do not inherit a parent's value.
+   */
+  nonRehydratableToolSurface?: boolean;
+  requestContext?: PersistedRequestContextInput;
+  operation: HarnessRunOperationRef;
+  modeId: string;
+  modelId: string;
+  yolo?: boolean;
+  /**
+   * Pending item ids duplicated only for quick inspection after hydration. The authoritative
+   * payloads remain the canonical `pendingResume`/pending fields; hydration rebuilds this array from
+   * those — extra, missing, or wrong-kind entries do not authorize a pending item.
+   */
+  pendingItems?: Array<{
+    itemId: string;
+    kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
+    requestedAt: number;
+  }>;
+  status: HarnessRunStatus;
+  startedAt: number;
+  updatedAt: number;
+  terminalAt?: number;
+  finishReason?: string;
+  error?: { code: HarnessRowErrorCode; message: string };
+}
+
 /**
  * Lightweight projection of `SessionRecord`, used by `listSessions(...)`.
  */
@@ -415,7 +526,11 @@ export interface DeleteSessionOptions {
   requireClosed?: boolean;
 }
 
-export type HarnessOperationKind = 'message' | 'queue';
+// §5.1d / §10-queue-admission-and-tombstones: the durable operation-kind token
+// is `'signal' | 'queue'`. (`'message'` was pre-spec drift.) Durable backends
+// that persist legacy `'message'` rows must normalize them to `'signal'` on
+// read; the in-memory backend creates rows in-process so it has no legacy data.
+export type HarnessOperationKind = 'signal' | 'queue';
 
 export interface HarnessStoredPublicError {
   code: string;
@@ -494,9 +609,10 @@ export interface HarnessRuntimeDependencyRefs {
   modelId?: string;
   /**
    * Provider-backed workspaces persist the configured provider id. Shared
-   * workspaces have no durable provider id, so new work records a process-
-   * scoped shared sentinel and fails closed after restart. Explicitly null
-   * means no workspace was configured at admission. Undefined means legacy
+   * workspaces have no durable provider id, so they record the restart-stable
+   * constant `'shared'` (PF-818) — a workspace-KIND change still drifts, but a
+   * process restart of the same shared runtime does not fail closed. Explicitly
+   * null means no workspace was configured at admission. Undefined means legacy
    * evidence that predates runtime dependency capture.
    */
   workspaceProviderId?: string | null;
@@ -636,31 +752,48 @@ export type HarnessRowErrorCode =
   | 'queue_full'
   | 'override_conflict'
   | 'channel_binding_closed'
+  | 'platform_unlinked'
+  | 'operator_closed'
   | 'channel_payload_conflict'
   | 'delivery_operation_unavailable'
   | 'provider_payload_invalid'
   | 'worker_unavailable'
   | 'unknown';
 
+/**
+ * §14.3 base channel request-context fields. Descriptive metadata copied from the verified ingress
+ * envelope + resolved binding; never overrides Harness identity. Persisted so the §14.1 recovery
+ * worker can reconstruct the `ChannelIngressContext` and re-run `ingress.resolveResource` for a
+ * 'received' row whose original envelope is gone (`conversationKind`/`trigger` are the policy input).
+ */
+interface BaseChannelRequestContext {
+  harnessName: string;
+  channelId: string;
+  providerId: string;
+  platform: string;
+  conversationKind?: 'dm' | 'group-dm' | 'channel' | 'thread';
+  trigger?: 'message' | 'mention' | 'subscribed-message' | 'command';
+  externalTenantId?: string;
+  externalChannelId?: string;
+  externalThreadId: string;
+  replyToMessageId?: string;
+  /** Platform actor; `externalUserId` is the platform id, `linkedResourceId` is set only after app-level identity linking. */
+  actor?: { externalUserId: string; displayName?: string; linkedResourceId?: string };
+  /** Structured delivery capabilities of the channel surface (§14.3). */
+  capabilities?: { markdown?: boolean; buttons?: boolean; files?: boolean; edits?: boolean; reactions?: boolean };
+}
+
+/**
+ * §14.3 channel request context (tool-visible via §6.1). Inbound turns carry a verified
+ * `externalMessageId`; binding-backed (scheduled/proactive) turns carry a required `bindingId` and
+ * no inbound message id.
+ */
+export type ChannelRequestContext =
+  | (BaseChannelRequestContext & { origin: 'inbound'; bindingId?: string; externalMessageId: string })
+  | (BaseChannelRequestContext & { origin: 'scheduled' | 'proactive'; bindingId: string; externalMessageId?: never });
+
 export interface PersistedRequestContextInput {
-  channel?: {
-    origin: 'inbound' | 'binding';
-    harnessName: string;
-    channelId: string;
-    providerId: string;
-    platform: string;
-    externalThreadId: string;
-    externalMessageId?: string;
-    bindingId?: string;
-    externalTenantId?: string;
-    externalChannelId?: string;
-    actor?: {
-      platformUserId: string;
-      displayName?: string;
-      metadata?: Record<string, JsonValue>;
-    };
-    capabilities?: Record<string, JsonValue>;
-  };
+  channel?: ChannelRequestContext;
   metadata?: Record<string, JsonValue>;
 }
 
@@ -687,6 +820,56 @@ export interface ResolveProviderCallbackBindingResult {
   duplicate: boolean;
   conflict: boolean;
   replacedBindingId?: string;
+}
+
+/**
+ * §5.1h durable per-conversation binding between a platform conversation and a
+ * Harness session. Distinct from the in-memory registry `HarnessChannelBinding`
+ * (config-time route identity); this is the durable bridge row that anchors a
+ * binding generation for ingress/outbox work. There is at most one `active`
+ * binding per `(harnessName, channelId, platform, externalTenantId,
+ * externalChannelId, externalThreadId)` tuple; replacements mark the prior row
+ * `replaced` rather than creating two active owners (§14.1).
+ */
+export interface ChannelBinding {
+  id: string;
+  harnessName: string;
+  channelId: string;
+  providerId: string;
+  status: 'active' | 'replaced' | 'closed' | 'undeliverable';
+  platform: string;
+  externalTenantId?: string;
+  externalChannelId?: string;
+  externalThreadId: string;
+  resourceId: string;
+  threadId: string;
+  sessionId: string;
+  // Resource-resolution mode (NOT platform conversation kind). The registry's
+  // 4-value HarnessChannelBinding mode is a separate config concept.
+  mode: 'per-user-resource' | 'thread-resource' | 'shared-resource';
+  generation: number; // starts at 1; increments on replacement
+  createdAt: number;
+  updatedAt: number;
+  lastInboundAt?: number;
+  lastOutboundAt?: number;
+  closedAt?: number;
+  closedReason?: Extract<
+    HarnessRowErrorCode,
+    'session_closed' | 'session_deleted' | 'platform_unlinked' | 'operator_closed'
+  >;
+  replacedByBindingId?: string;
+  undeliverableReason?: string;
+}
+
+export interface ResolveChannelBindingResult {
+  binding: ChannelBinding;
+  created: boolean;
+  replacedBindingId?: string;
+}
+
+export interface ListActiveChannelBindingsResult {
+  bindings: ChannelBinding[];
+  nextCursor?: string;
 }
 
 export interface ChannelInboxItem {
@@ -1166,11 +1349,39 @@ export interface ReleaseSessionLeaseInput {
   ownerId: string;
 }
 
+/**
+ * Renew the parent/root lease AND every active descendant lease entry under it
+ * on a single storage-linearized cycle (§5.8). Subagent/child sessions have no
+ * separately-renewable lease — they share the parent/root owner — so the live
+ * owner extends the whole subtree through this one call, capping each
+ * descendant's expiry at the new parent expiry.
+ */
+export interface RenewSessionLeaseSubtreeInput {
+  harnessName?: string;
+  rootSessionId: string;
+  ownerId: string;
+  ttlMs: number;
+}
+
 export interface SessionLeaseResult {
   /** Record version observed at lease time — caller passes this to `saveSession`. */
   version: number;
   /** Epoch ms when the lease expires if not renewed. */
   expiresAt: number;
+}
+
+export interface SubtreeSessionLeaseResult extends SessionLeaseResult {
+  /**
+   * Number of active descendant lease entries renewed alongside the root in the
+   * same atomic cycle. The renewal is committed in ONE storage-linearized pass,
+   * so it never returns a parent-only partial success (§5.8). If an active
+   * descendant has been claimed by a DIFFERENT instance (ownerId moved), the
+   * subtree was split: the call throws `HarnessStorageLeaseConflictError` and
+   * renews nothing, leaving the owner to fence itself. A same-owner descendant
+   * whose mirror lapsed is re-adopted to the capped expiry — that IS the §5.8
+   * repair (re-running subtree renewal extends a lagging mirror), not a fence.
+   */
+  renewedDescendantCount: number;
 }
 
 export interface SaveAttachmentInput {

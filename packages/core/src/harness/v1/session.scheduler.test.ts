@@ -191,7 +191,7 @@ describe('_scheduleNextQueueHead — priority rotation', () => {
 });
 
 describe('_scheduleNextQueueHead — deadline expiry', () => {
-  it('drops expired items + emits queue_item_expired + marks receipt failed', async () => {
+  it('drops expired items + marks receipt failed (no public event — §10.2)', async () => {
     const { session } = await setup();
     const events: HarnessEvent[] = [];
     session.subscribe(e => events.push(e));
@@ -225,10 +225,8 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
 
     const queue = session.getRecord().pendingQueue ?? [];
     expect(queue.map(i => i.id)).toEqual(['q-alive']);
-    const expiredEvent = events.find(e => e.type === 'queue_item_expired') as any;
-    expect(expiredEvent).toBeDefined();
-    expect(expiredEvent.queuedItemId).toBe('q-expired');
-    expect(expiredEvent.deadline).toBe(past);
+    // §10.2: expiry emits no public event — the dropped item's failed receipt
+    // (stable code) + the rejected operation promise are the observable effects.
     const receipt = (session.getRecord().queueAdmissionReceipts ?? {})['q-expired'];
     expect(receipt?.status).toBe('failed');
     expect(receipt?.error?.code).toBe('harness.queue_item_expired');

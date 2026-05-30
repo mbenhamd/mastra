@@ -4,6 +4,7 @@ import type {
   ActiveToolState,
   SessionDisplayPending,
   SessionDisplayState,
+  SessionRunProjection,
   TokenUsage,
 } from './session';
 
@@ -49,6 +50,8 @@ export interface HarnessDisplayStateSnapshotV1 {
   currentRunId?: string;
   currentMessageId?: string;
   currentTraceId?: string;
+  // §5.1b structured in-flight run projection (JSON-safe; primitive fields only).
+  currentRun?: SessionRunProjection;
   activeTools: Record<string, HarnessDisplayActiveToolSnapshotV1>;
   toolInputBuffers: Record<string, HarnessDisplayToolInputBufferSnapshotV1>;
   activeSubagents: Record<string, HarnessDisplayActiveSubagentSnapshotV1>;
@@ -183,6 +186,8 @@ export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): Har
   if (state.currentMessageId !== undefined) snapshot.currentMessageId = state.currentMessageId;
   if (state.currentTraceId !== undefined) snapshot.currentTraceId = state.currentTraceId;
   if (state.currentQueuedItemId !== undefined) snapshot.currentQueuedItemId = state.currentQueuedItemId;
+  // SessionRunProjection is already JSON-safe (primitive fields only).
+  if (state.currentRun !== undefined) snapshot.currentRun = state.currentRun;
   if (state.goal !== undefined) snapshot.goal = toHarnessDisplayJsonValue(state.goal);
 
   return snapshot;

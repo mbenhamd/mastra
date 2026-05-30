@@ -2,6 +2,7 @@ import type { Chat, Adapter, ChatConfig, Message, StateAdapter, Thread } from 'c
 import { z } from 'zod';
 
 import type { Agent } from '../agent/agent';
+import type { AIV5Type } from '../agent/message-list/types';
 import type { MastraProviderMetadata } from '../agent/message-list/state/types';
 import type { AgentSignalContents } from '../agent/signals';
 import type { AgentThreadSubscription } from '../agent/types';
@@ -904,7 +905,9 @@ export class AgentChannels {
     }
 
     const text = [historyBlock, message.text].filter(Boolean).join('\n\n');
-    const parts: Exclude<AgentSignalContents, string> = [{ type: 'text', text }];
+    // The channel message is built as the content parts of a single user
+    // message (text + inline file parts), not as a list of separate messages.
+    const parts: Exclude<AIV5Type.UserContent, string> = [{ type: 'text', text }];
     const attachments = message.attachments.filter(a => a.url || a.fetchData);
 
     // Route attachments based on `inlineMedia` config (see DEFAULT_INLINE_MEDIA_TYPES).
@@ -1046,16 +1049,24 @@ export class AgentChannels {
     const refreshedThread = memoryStore ? await memoryStore.getThreadById({ threadId: mastraThread.id }) : null;
     const threadForRun = refreshedThread ?? mastraThread;
 
-    // When the message is text-only, pass the bare string to the signal pipeline.
-    // Otherwise pass the parts array directly — both shapes match AgentSignalContents.
-    const signalContents: AgentSignalContents = parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
+    // Wrap the content parts in a single user message. `providerOptions` rides
+    // on the message (not the signal envelope) so it lands on the stored
+    // message's `content.providerMetadata` under `mastra.channels.<platform>`
+    // for UI/query callers — see `buildEventContext` docs. Text-only messages
+    // collapse to a bare string content; file parts stay as an array.
+    const userContent: AIV5Type.UserContent =
+      parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
+    const signalContents: AgentSignalContents = {
+      role: 'user',
+      content: userContent,
+      providerOptions,
+    } satisfies AIV5Type.UserModelMessage;
 
     this.agent.sendSignal(
       {
         type: 'user-message',
         contents: signalContents,
         attributes,
-        providerOptions,
       },
       {
         resourceId: threadResourceId,

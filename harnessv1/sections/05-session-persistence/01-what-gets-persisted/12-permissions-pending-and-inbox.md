@@ -1,5 +1,21 @@
 ### 5.1f Permissions, Pending Items, and Inbox Receipts
 
+**Implementation note (PapersFlow fork — unified `pendingResume`).** The canonical
+shape below models pending interactions as four separate optional fields
+(`pendingApproval`/`pendingSuspension`/`pendingQuestion`/`pendingPlan`) governed by
+the one-pending-interaction-per-run slot invariant. The PapersFlow fork instead
+persists a **single** `pendingResume` field discriminated by `kind`
+(`'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' |
+'sandbox-access'`). This is a deliberate, owner-ratified divergence with two
+concrete advantages: (1) a single field makes the slot invariant *structural* —
+two simultaneous pendings for one run are unrepresentable rather than merely
+forbidden by every read/write path; and (2) it carries the fork's
+`'sandbox-access'` interaction kind (filesystem/sandbox approval), which has no
+slot in the four-field shape. The four interfaces below remain the authoritative
+**per-`kind` payload contracts** (surfaced through `pendingResume.payload` and the
+display projection); only their top-level storage grouping differs. The
+`InboxResponseReceipt` rows and the resume boundary semantics are unchanged.
+
 ```ts
 // Permissions — plain JSON, no functions, no closures. These rows are durable
 // session state: they survive eviction and restart for this active

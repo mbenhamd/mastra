@@ -452,6 +452,15 @@ export interface ToolExecutionContext<
   observe: ToolObserve;
 }
 
+/**
+ * Result of a conditional `requireApproval` predicate. Return a plain boolean for the
+ * historical contract, or `{ required, reason }` to additionally surface WHY the tool
+ * needs approval. A falsy result (`false` / `{ required: false }`) never lowers a static
+ * approval floor (`requireApproval: true` or the agent-level `requireToolApproval`); the
+ * optional `reason` is only meaningful when `required` is true.
+ */
+export type ToolApprovalDecision = boolean | { required: boolean; reason?: string };
+
 export interface ToolAction<
   TSchemaIn,
   TSchemaOut,
@@ -509,14 +518,17 @@ export interface ToolAction<
    * Whether the tool requires explicit user approval before execution.
    * Pass `true` to always require approval, or a function evaluated per-call
    * with the tool input (and optional request context/workspace) to require
-   * approval conditionally.
+   * approval conditionally. The function may return a plain boolean (historical
+   * contract) or a {@link ToolApprovalDecision} object to additionally surface
+   * WHY approval is required — the `reason` is threaded to the harness
+   * `tool_approval_required` event's `approvalReasons`.
    */
   requireApproval?:
     | boolean
     | ((
         input: TSchemaIn,
         ctx?: { requestContext?: Record<string, unknown>; workspace?: Workspace },
-      ) => boolean | Promise<boolean>);
+      ) => ToolApprovalDecision | Promise<ToolApprovalDecision>);
   /**
    * Enables strict tool input generation for providers that support it.
    * When enabled, supported providers will attempt to generate arguments

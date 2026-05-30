@@ -18,6 +18,7 @@ import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { Harness } from './harness';
 import { Session } from './session';
+import { setupHarness } from './__test-utils__/setup';
 
 function makeAgent(name = 'test-agent') {
   return new Agent({
@@ -209,9 +210,15 @@ describe('Session — surface area (M1)', () => {
         'cancel',
         'cancelQueuedItem',
         'close',
+        'delete',
+        'rename',
+        'clone',
         'isRunning',
         'isBusy',
+        'isPinned',
         'getQueueDepth',
+        'getCurrentRunId',
+        'getCurrentTraceId',
         'getTokenUsage',
         'extendLease',
         'withExtendedLease',
@@ -222,12 +229,21 @@ describe('Session — surface area (M1)', () => {
         'signal',
         'injectSystemReminder',
         'getCurrentMode',
+        'getCurrentModeId',
         'switchMode',
         'getEventReplayState',
         'getState',
         'setState',
         'getDisplayState',
+        'subscribeDisplayState',
+        'setThreadSetting',
+        'uploadAttachment',
+        'deleteAttachment',
         'getWorkspace',
+        'hasWorkspace',
+        'isWorkspaceReady',
+        'peekWorkspace',
+        'resolveWorkspace',
         'setGoal',
         'getGoal',
         'pauseGoal',
@@ -248,6 +264,8 @@ describe('Session — surface area (M1)', () => {
         'lifecycleState',
         'isClosed',
         'isClosing',
+        'closingAt',
+        'closeDeadlineAt',
         'getRecord',
       ].sort(),
     );
@@ -279,5 +297,124 @@ describe('Session — surface area (M1)', () => {
     expect(typeof session.skills).toBe('object');
     expect(Object.isFrozen(session.skills)).toBe(true);
     expect(Object.keys(session.skills).sort()).toEqual(['get', 'list', 'refresh', 'use'].sort());
+  });
+});
+
+describe('Session.setState — §5.1 JSON-serializability (F1 HarnessStateSerializationError)', () => {
+  async function freshSession() {
+    const { harness } = setupHarness();
+    return harness.session({ resourceId: 'u', threadId: { fresh: true } });
+  }
+
+  it('commits valid nested JSON state', async () => {
+    const session = await freshSession();
+    await session.setState({ a: 1, b: 'x', c: { d: [true, null, 2] }, e: [] });
+    expect(session.getRecord().state).toEqual({ a: 1, b: 'x', c: { d: [true, null, 2] }, e: [] });
+  });
+
+  it.each([
+    ['a function', { fn: () => {} }, 'fn'],
+    ['a bigint', { big: 1n }, 'big'],
+    ['a non-finite number (NaN)', { n: NaN }, 'n'],
+    ['an Infinity', { inf: Infinity }, 'inf'],
+    ['an explicit undefined', { u: undefined }, 'u'],
+    ['a symbol', { sym: Symbol('x') }, 'sym'],
+    ['a Date (non-plain object)', { when: new Date() }, 'when'],
+    ['a Map (non-plain object)', { m: new Map() }, 'm'],
+    ['a nested invalid value', { a: { b: () => {} } }, 'a.b'],
+    ['an invalid array element', { items: [1, () => {}] }, 'items.1'],
+  ])('rejects %s before commit, reporting the path, and does not corrupt state', async (_label, patch, path) => {
+    const session = await freshSession();
+    await expect(session.setState(patch as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path,
+    });
+    expect(session.getRecord().state).toEqual({}); // nothing committed
+  });
+
+  it('rejects a circular reference', async () => {
+    const session = await freshSession();
+    const node: Record<string, unknown> = {};
+    node.self = node;
+    await expect(session.setState({ node } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'node.self',
+    });
+  });
+
+  it('does not partially apply a multi-key patch when one value is invalid', async () => {
+    const session = await freshSession();
+    await session.setState({ keep: 'ok' });
+    await expect(session.setState({ more: 1, bad: 2n } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+    });
+    // The prior valid state is intact; the rejected patch (incl its valid `more`) is not applied.
+    expect(session.getRecord().state).toEqual({ keep: 'ok' });
+  });
+
+  // Descriptor-strict cases: values JSON would silently DROP or TRANSFORM.
+  it('rejects an array with a non-index extra property (JSON would drop it)', async () => {
+    const session = await freshSession();
+    const arr: number[] = [1, 2];
+    (arr as unknown as Record<string, unknown>).extra = 3;
+    await expect(session.setState({ arr } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'arr',
+    });
+  });
+
+  it('rejects an array with a non-canonical-index own property (e.g. "01", which JSON drops)', async () => {
+    const session = await freshSession();
+    const arr: number[] = [1];
+    (arr as unknown as Record<string, unknown>)['01'] = 9; // coerces to index 1 but is a non-index prop
+    await expect(session.setState({ arr } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'arr',
+    });
+  });
+
+  it('rejects a sparse array hole (JSON would coerce it to null)', async () => {
+    const session = await freshSession();
+    const arr: number[] = [];
+    arr[0] = 1;
+    arr[2] = 3; // index 1 is a hole
+    await expect(session.setState({ arr } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'arr.1',
+    });
+  });
+
+  it('rejects a symbol-keyed property (JSON would drop it)', async () => {
+    const session = await freshSession();
+    const inner: Record<string | symbol, unknown> = { ok: 1 };
+    inner[Symbol('hidden')] = 2;
+    await expect(session.setState({ inner } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'inner',
+    });
+  });
+
+  it('rejects a non-enumerable own property (JSON would drop it)', async () => {
+    const session = await freshSession();
+    const obj: Record<string, unknown> = {};
+    Object.defineProperty(obj, 'hidden', { value: 1, enumerable: false });
+    await expect(session.setState({ obj } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'obj.hidden',
+    });
+  });
+
+  it('rejects an accessor property WITHOUT invoking the (throwing) getter', async () => {
+    const session = await freshSession();
+    const obj = {
+      get danger(): number {
+        throw new Error('getter must not run during validation');
+      },
+    };
+    // Rejected as an accessor — the validation error, not the getter's throw.
+    await expect(session.setState({ obj } as never)).rejects.toMatchObject({
+      name: 'HarnessStateSerializationError',
+      path: 'obj.danger',
+    });
   });
 });

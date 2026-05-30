@@ -23,21 +23,92 @@ export class HarnessConfigError extends Error {
   }
 }
 
-export type HarnessRuntimeDependencyKind = 'mode' | 'agent' | 'workspace_provider' | 'runtime_compatibility_generation';
+/**
+ * Ref kinds that can be missing or drifted at hydration / background-task
+ * execution (spec §4.5b). Generation drift is carried via
+ * `expectedGeneration` / `actualGeneration` on a drifted ref, not as its own
+ * kind.
+ */
+export type HarnessRuntimeDriftRefKind =
+  | 'mode'
+  | 'agent'
+  | 'model'
+  | 'tool'
+  | 'mcp_binding'
+  | 'workspace_provider'
+  | 'executor'
+  | 'completion_policy'
+  | 'sandbox_policy'
+  | 'channel';
 
-export class HarnessRuntimeDependencyDriftError extends Error {
-  readonly name = 'HarnessRuntimeDependencyDriftError';
-  readonly code = 'harness.runtime_dependency_drifted';
+export interface HarnessRuntimeMissingRef {
+  kind: HarnessRuntimeDriftRefKind;
+  ref: string;
+}
 
-  constructor(
-    public readonly dependencyKind: HarnessRuntimeDependencyKind,
-    public readonly dependencyId: string,
-    public readonly reason: string,
-    public readonly context?: string,
-  ) {
-    super(
-      `Runtime dependency drifted${context ? ` during ${context}` : ''}: ${dependencyKind} "${dependencyId}" ${reason}`,
-    );
+export interface HarnessRuntimeDriftedRef {
+  kind: HarnessRuntimeDriftRefKind;
+  ref: string;
+  expectedGeneration?: string;
+  actualGeneration?: string;
+}
+
+export interface HarnessRuntimeDriftDetails {
+  sessionId?: string;
+  runId?: string;
+  backgroundTaskId?: string;
+  missingRefs?: HarnessRuntimeMissingRef[];
+  driftedRefs?: HarnessRuntimeDriftedRef[];
+  /** Human-readable cause used in the Error message only; not a wire field. */
+  context?: string;
+}
+
+/**
+ * Thrown when hydration or background-task execution observes that stored
+ * runtime dependency identifiers (mode, agent, model, tool, mcp binding,
+ * workspace provider, executor, completion policy, sandbox policy, channel)
+ * are missing or have a `runtimeCompatibilityGeneration` mismatch versus the
+ * current runtime configuration. Spec §4.5b.
+ *
+ * Wire projection (§13.3f.1) is `harness.runtime_drift` with
+ * `details.missingRefs` / `details.driftedRefs`. The bare storage-row cause
+ * code is `runtime_dependency_drifted` (`HarnessRowErrorCode`, §4.5d).
+ */
+export class HarnessRuntimeDriftError extends Error {
+  readonly name = 'HarnessRuntimeDriftError';
+  readonly code = 'harness.runtime_drift';
+  readonly sessionId?: string;
+  readonly runId?: string;
+  readonly backgroundTaskId?: string;
+  readonly missingRefs?: HarnessRuntimeMissingRef[];
+  readonly driftedRefs?: HarnessRuntimeDriftedRef[];
+  /** Human-readable cause context; not part of the public wire detail. */
+  readonly context?: string;
+
+  constructor(details: HarnessRuntimeDriftDetails) {
+    super(HarnessRuntimeDriftError._message(details));
+    this.sessionId = details.sessionId;
+    this.runId = details.runId;
+    this.backgroundTaskId = details.backgroundTaskId;
+    this.missingRefs = details.missingRefs;
+    this.driftedRefs = details.driftedRefs;
+    this.context = details.context;
+  }
+
+  private static _message(d: HarnessRuntimeDriftDetails): string {
+    const parts: string[] = [];
+    for (const m of d.missingRefs ?? []) {
+      parts.push(`${m.kind} "${m.ref}" is not registered`);
+    }
+    for (const r of d.driftedRefs ?? []) {
+      const gen =
+        r.expectedGeneration !== undefined || r.actualGeneration !== undefined
+          ? ` (recorded generation "${r.expectedGeneration ?? 'unset'}", current "${r.actualGeneration ?? 'unset'}")`
+          : '';
+      parts.push(`${r.kind} "${r.ref}" drifted${gen}`);
+    }
+    const base = parts.length ? `Runtime dependency drift: ${parts.join('; ')}` : 'Runtime dependency drift';
+    return d.context ? `${base} during ${d.context}` : base;
   }
 }
 
@@ -66,6 +137,23 @@ export class HarnessSessionClosedError extends Error {
 }
 
 /**
+ * Thrown by `harness.session(...)` when hydrating or creating another session
+ * would exceed `sessions.maxLive` and every live session is pinned (parked on a
+ * pending interaction) or otherwise unflushable, so no pressure-eviction victim
+ * is available. Spec §5.4 / §4.5b.
+ */
+export class HarnessLiveSessionLimitError extends Error {
+  readonly name = 'HarnessLiveSessionLimitError';
+  readonly code = 'harness.live_session_limit';
+  constructor(
+    public readonly maxLive: number,
+    public readonly liveCount: number,
+  ) {
+    super(`Live session limit reached (maxLive ${maxLive}, live ${liveCount}); all live sessions are pinned`);
+  }
+}
+
+/**
  * The session has entered the durable closing phase. The record still
  * occupies its active `(harnessName, resourceId, threadId)` key while close
  * aborts/drains live work and cascades through descendants, but callers must
@@ -73,9 +161,46 @@ export class HarnessSessionClosedError extends Error {
  */
 export class HarnessSessionClosingError extends Error {
   readonly name = 'HarnessSessionClosingError';
-  constructor(public readonly sessionId: string) {
-    super(`Session "${sessionId}" is closing`);
+  constructor(
+    public readonly sessionId: string,
+    public readonly closingAt: number,
+    public readonly closeDeadlineAt: number,
+  ) {
+    super(`Session "${sessionId}" is closing (deadline ${new Date(closeDeadlineAt).toISOString()})`);
   }
+}
+
+/**
+ * Build a `HarnessSessionClosingError` (§4.5b) from any source that carries the
+ * closing window — a live `Session`, a stored `SessionRecord`, or an explicit
+ * `{ id, closingAt?, closeDeadlineAt? }`.
+ *
+ * A genuinely-closing *persisted* source has both timestamps. But several
+ * callers throw the moment close *starts* — `Session._beginClosing()` flips the
+ * state and rejects idle waiters before the durable closing marker (which sets
+ * `closingAt`/`closeDeadlineAt`) is committed, and `_assertLive`/the admission
+ * path gate on the in-memory `isClosing` flag for the same reason. At those
+ * points the timestamps are legitimately still `undefined`.
+ *
+ * Fallback semantics (kept explicit on purpose; this is NOT a synthesized
+ * grace window):
+ * - Missing `closingAt` falls back to "now": the session has begun closing as
+ *   of this throw, even though the persisted marker has not landed yet.
+ * - Missing `closeDeadlineAt` falls back to `closingAt`, i.e. an *immediate*
+ *   deadline with zero remaining grace. This is the conservative choice for
+ *   retry clamping / dead-letter decisions — consumers must not assume more
+ *   time than is actually known. It deliberately does not invent a grace
+ *   window (e.g. via a default `closeTimeoutMs`), since the real deadline is
+ *   only knowable once `_flushClosingMarker` persists it.
+ */
+export function harnessSessionClosingError(source: {
+  id: string;
+  closingAt?: number;
+  closeDeadlineAt?: number;
+}): HarnessSessionClosingError {
+  const closingAt = source.closingAt ?? Date.now();
+  const closeDeadlineAt = source.closeDeadlineAt ?? closingAt;
+  return new HarnessSessionClosingError(source.id, closingAt, closeDeadlineAt);
 }
 
 /**
@@ -94,20 +219,165 @@ export class HarnessSessionCancelledError extends Error {
   }
 }
 
+export interface HarnessSessionDeleteBlocker {
+  source:
+    | 'session'
+    | 'child_session'
+    | 'queue'
+    | 'inbox_response'
+    | 'channel_binding'
+    | 'channel_inbox'
+    | 'channel_action'
+    | 'channel_outbox'
+    | 'wakeup'
+    | 'attachment'
+    | 'workspace';
+  id?: string;
+  status?: string;
+}
+
 export class HarnessSessionDeleteBlockedError extends Error {
   readonly name = 'HarnessSessionDeleteBlockedError';
   constructor(
     public readonly sessionId: string,
-    public readonly blockers: ReadonlyArray<string>,
+    public readonly blockers: ReadonlyArray<HarnessSessionDeleteBlocker>,
   ) {
-    super(`Session "${sessionId}" cannot be deleted: ${blockers.join(', ')}`);
+    super(`Session "${sessionId}" cannot be deleted: ${blockers.length} blocker(s)`);
   }
 }
 
 export class HarnessSessionDeletedError extends Error {
   readonly name = 'HarnessSessionDeletedError';
-  constructor(public readonly sessionId: string) {
+  readonly resourceId?: string;
+  readonly threadId?: string;
+  constructor(
+    public readonly sessionId: string,
+    resourceId?: string,
+    threadId?: string,
+  ) {
     super(`Session "${sessionId}" is deleted`);
+    this.resourceId = resourceId;
+    this.threadId = threadId;
+  }
+}
+
+export type HarnessSessionCorruptReason =
+  | 'parse_failed'
+  | 'schema_incompatible'
+  | 'duplicate_session_owner'
+  | 'pending_state_corrupt'
+  | 'tool_surface_unrehydratable';
+
+/**
+ * The harness observed a stored session record that violates a storage
+ * invariant — e.g. a direct-ID record whose `(harnessName, resourceId,
+ * threadId)` now has a *different* current owner (`duplicate_session_owner`),
+ * an unparseable/`schema_incompatible` row, or unrehydratable pending/tool
+ * state. Fails closed before acquiring or stealing a lease. Spec §4.5d / §5.2a.
+ */
+export class HarnessSessionCorruptError extends Error {
+  readonly name = 'HarnessSessionCorruptError';
+  readonly code = 'harness.session_corrupt';
+  readonly reason: HarnessSessionCorruptReason;
+  readonly sessionId?: string;
+  readonly resourceId?: string;
+  readonly threadId?: string;
+  readonly ownerSessionIds?: string[];
+  constructor(details: {
+    reason: HarnessSessionCorruptReason;
+    sessionId?: string;
+    resourceId?: string;
+    threadId?: string;
+    ownerSessionIds?: string[];
+  }) {
+    super(
+      `Session record corrupt (${details.reason})` + (details.sessionId ? ` for session "${details.sessionId}"` : ''),
+    );
+    this.reason = details.reason;
+    this.sessionId = details.sessionId;
+    this.resourceId = details.resourceId;
+    this.threadId = details.threadId;
+    this.ownerSessionIds = details.ownerSessionIds;
+  }
+}
+
+/**
+ * §4.5 / §2.2: thrown when resolving a specific `sessionId` for a
+ * `(harnessName, resourceId, threadId)` pair that already has a DIFFERENT current
+ * owner. Harness v1 permits only one current owner per harness/thread/resource
+ * across Active, Closing, and Closed-reopenable records, so requesting a
+ * superseded session id is an expected CONFLICT (resolve `activeSessionId`
+ * instead) — distinct from `HarnessSessionCorruptError` ('duplicate_session_owner'),
+ * which is reserved for two genuinely-active owners on one thread.
+ */
+export class HarnessSessionConflictError extends Error {
+  readonly name = 'HarnessSessionConflictError';
+  readonly code = 'harness.session_conflict';
+  constructor(
+    public readonly resourceId: string,
+    public readonly threadId: string,
+    public readonly requestedSessionId: string,
+    public readonly activeSessionId: string,
+  ) {
+    super(
+      `Session "${requestedSessionId}" is not the current owner of thread "${threadId}" ` +
+        `(resource "${resourceId}"); the active owner is "${activeSessionId}"`,
+    );
+  }
+}
+
+export type HarnessAbortReason = 'agent_aborted' | 'parent_aborted' | 'session_closed' | 'process_restart';
+
+/**
+ * §4.5c / §6.2: the `reason` carried by a turn's `abortSignal.reason`. The harness
+ * selects the reason from the abort SOURCE (not a caller-supplied string):
+ * `agent_aborted` for ordinary `session.abort()`/cancel, `parent_aborted` when a
+ * parent run's abort propagates into a live subagent turn (carries the
+ * `parentSessionId`), `session_closed` for the close lifecycle, `process_restart`
+ * for live process shutdown/eviction. Tools branch on `reason` to decide rollback
+ * vs best-effort cleanup. Wire code `harness.aborted` (§13.3).
+ */
+export class HarnessAbortedError extends Error {
+  readonly name = 'HarnessAbortedError';
+  readonly code = 'harness.aborted';
+  constructor(
+    public readonly sessionId: string,
+    public readonly reason: HarnessAbortReason,
+    public readonly parentSessionId?: string,
+  ) {
+    super(
+      `Session "${sessionId}" aborted (${reason})` +
+        (parentSessionId !== undefined ? `; parent "${parentSessionId}"` : ''),
+    );
+  }
+}
+
+export type HarnessOutputGenerationReason =
+  | 'structured_output_validation_failed'
+  | 'structured_output_missing_object'
+  | 'tripwire'
+  | 'interactive_tool_required'
+  | 'model_error';
+
+/**
+ * §4.5 / §13.3 (`harness.output_generation_failed`): thrown by the schema-bearing
+ * sync generate form — `message({ output, sync: true })` — after the run starts
+ * when the model/runtime cannot produce a successful public typed value. This is
+ * not an admission-id conflict and does not create retry-safe result evidence in
+ * v1. `tripwire` means an output processor rejected the response; `model_error`
+ * wraps an opaque generation/runtime failure from the agent layer (aborts and
+ * harness-domain errors pass through untouched).
+ */
+export class HarnessOutputGenerationError extends Error {
+  readonly name = 'HarnessOutputGenerationError';
+  readonly code = 'harness.output_generation_failed';
+  constructor(
+    public readonly sessionId: string,
+    public readonly reason: HarnessOutputGenerationReason,
+    public readonly runId?: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`Structured output generation failed for session "${sessionId}" (${reason})`, options);
   }
 }
 
@@ -144,6 +414,31 @@ export class HarnessValidationError extends Error {
   }
 }
 
+export type HarnessBusyReason =
+  | 'in_flight'
+  | 'pending_approval'
+  | 'pending_suspension'
+  | 'pending_question'
+  | 'pending_plan';
+
+/**
+ * Thrown by the fail-fast forms — `message({ sync: true, output })` and
+ * `session.skills.use(...)` — when the session is busy (a run is in flight or a
+ * pending interaction is open). These forms need a clean turn boundary; the
+ * default `message()` / `signal()` / `queue()` paths are busy-independent and
+ * never throw this. Spec §3 / §4.4a.
+ */
+export class HarnessBusyError extends Error {
+  readonly name = 'HarnessBusyError';
+  readonly code = 'harness.busy';
+  constructor(
+    public readonly sessionId: string,
+    public readonly reason: HarnessBusyReason,
+  ) {
+    super(`Session "${sessionId}" is busy (${reason})`);
+  }
+}
+
 /**
  * `session.queue(...)` rejected at admission because `pendingQueue` has
  * already reached `sessions.maxQueueDepth` (default 100). The capacity check
@@ -155,8 +450,9 @@ export class HarnessQueueFullError extends Error {
   constructor(
     public readonly sessionId: string,
     public readonly maxQueueDepth: number,
+    public readonly currentDepth: number,
   ) {
-    super(`Queue for session "${sessionId}" is full (max ${maxQueueDepth})`);
+    super(`Queue for session "${sessionId}" is full (max ${maxQueueDepth}, current ${currentDepth})`);
   }
 }
 
@@ -190,6 +486,8 @@ export class HarnessInboxItemNotFoundError extends Error {
   constructor(
     public readonly sessionId: string,
     public readonly itemId: string,
+    /** The pending kind the caller was responding to, when known (§4.5a). */
+    public readonly kind?: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval',
   ) {
     super(`Inbox item "${itemId}" for session "${sessionId}" was not found`);
   }
@@ -219,6 +517,25 @@ export class HarnessStateConflictError extends Error {
   }
 }
 
+/**
+ * §4.5 / §5.1: thrown BEFORE any durable state commit when a candidate
+ * `session.state` cannot round-trip through `JSON.stringify` / `JSON.parse` as
+ * plain JSON (e.g. a function, symbol, bigint, `undefined`, non-finite number,
+ * circular reference, or a non-plain object like `Date`/`Map`/`Set`/class
+ * instance). This is a non-retryable state-SHAPE failure, not a storage failure
+ * (adapter/save failures after validation surface as `HarnessStorageError`).
+ * `path` is a dotted path into `state` (`$` for the root).
+ */
+export class HarnessStateSerializationError extends Error {
+  readonly name = 'HarnessStateSerializationError';
+  constructor(
+    public readonly sessionId: string,
+    public readonly path: string,
+  ) {
+    super(`State for session "${sessionId}" is not JSON-serializable at path "${path}"`);
+  }
+}
+
 export class HarnessAttachmentInUseError extends Error {
   readonly name = 'HarnessAttachmentInUseError';
   constructor(
@@ -232,14 +549,14 @@ export class HarnessAttachmentInUseError extends Error {
 
 export type HarnessAttachmentUnavailableReason =
   | 'not_found'
-  | 'digest_mismatch'
-  | 'bytes_mismatch'
-  | 'unsupported_url'
-  | 'redirect_limit_exceeded'
-  | 'network_target_blocked'
+  | 'fetch_failed'
   | 'fetch_timeout'
   | 'too_large'
   | 'mime_mismatch'
+  | 'digest_mismatch'
+  | 'unsupported_url'
+  | 'redirect_limit_exceeded'
+  | 'network_target_blocked'
   | 'blocked_by_policy';
 
 export class HarnessAttachmentUnavailableError extends Error {
@@ -262,11 +579,10 @@ export class HarnessAttachmentUnavailableError extends Error {
 export class HarnessSubagentDepthExceededError extends Error {
   readonly name = 'HarnessSubagentDepthExceededError';
   constructor(
-    public readonly sessionId: string,
-    public readonly depth: number,
     public readonly maxDepth: number,
+    public readonly attemptedDepth: number,
   ) {
-    super(`Session "${sessionId}" cannot spawn a subagent: depth ${depth} ≥ maxDepth ${maxDepth}`);
+    super(`Cannot spawn a subagent: attempted depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`);
   }
 }
 
@@ -274,14 +590,81 @@ export class HarnessSubagentDepthExceededError extends Error {
  * Durable write rejected by the storage adapter — exhausted the harness's
  * one transparent retry. `cause` carries the underlying storage error.
  */
+/** Logical storage surfaces a `HarnessStorageError` can name (§4.5d). */
+export type HarnessStorageOperation =
+  | 'session_create'
+  | 'session_load'
+  | 'session_save'
+  | 'session_list'
+  | 'session_close'
+  | 'session_delete'
+  | 'session_delete_cleanup'
+  | 'session_lease_acquire'
+  | 'session_lease_renew'
+  | 'session_lease_release'
+  | 'thread'
+  | 'thread_metadata'
+  | 'message_log'
+  | 'queue'
+  | 'operation_tombstone'
+  | 'inbox_response'
+  | 'channel_binding'
+  | 'provider_callback_binding'
+  | 'channel_inbox'
+  | 'channel_action'
+  | 'channel_outbox'
+  | 'wakeup'
+  | 'attachment'
+  | 'workspace_cleanup';
+
+/** The known, tenant-checked row a storage error is scoped to (§4.5d). */
+export type HarnessStorageSubject =
+  | { kind: 'session'; id: string }
+  | { kind: 'thread'; id: string }
+  | { kind: 'message'; id: string }
+  | { kind: 'queued_item'; id: string }
+  | { kind: 'operation_tombstone'; id: string }
+  | { kind: 'inbox_response'; id: string }
+  | { kind: 'channel_binding'; id: string }
+  | { kind: 'provider_callback_binding'; id: string }
+  | { kind: 'channel_inbox'; id: string }
+  | { kind: 'channel_action'; id: string }
+  | { kind: 'channel_outbox'; id: string }
+  | { kind: 'wakeup'; id: string }
+  | { kind: 'attachment'; id: string };
+
 export class HarnessStorageError extends Error {
   readonly name = 'HarnessStorageError';
-  constructor(
-    public readonly sessionId: string,
-    public readonly operation: 'flush' | 'load' | 'attachment',
-    public readonly cause: unknown,
-  ) {
-    super(`Harness storage ${operation} failed for session "${sessionId}"`);
+  readonly operation: HarnessStorageOperation;
+  readonly cause: unknown;
+  readonly retryable: boolean;
+  readonly sessionId?: string;
+  readonly resourceId?: string;
+  readonly threadId?: string;
+  readonly harnessName?: string;
+  readonly channelId?: string;
+  readonly subject?: HarnessStorageSubject;
+  constructor(opts: {
+    operation: HarnessStorageOperation;
+    cause: unknown;
+    retryable?: boolean;
+    sessionId?: string;
+    resourceId?: string;
+    threadId?: string;
+    harnessName?: string;
+    channelId?: string;
+    subject?: HarnessStorageSubject;
+  }) {
+    super(`Harness storage ${opts.operation} failed${opts.sessionId ? ` for session "${opts.sessionId}"` : ''}`);
+    this.operation = opts.operation;
+    this.cause = opts.cause;
+    this.retryable = opts.retryable ?? true;
+    this.sessionId = opts.sessionId;
+    this.resourceId = opts.resourceId;
+    this.threadId = opts.threadId;
+    this.harnessName = opts.harnessName;
+    this.channelId = opts.channelId;
+    this.subject = opts.subject;
   }
 }
 
@@ -349,14 +732,21 @@ export class HarnessSkillArgsValidationError extends Error {
  * changed mid-flight; silently ignoring the override would be a footgun,
  * so the harness rejects at admission. See spec §4.2.
  */
+export type HarnessOverrideConflictField = 'model' | 'mode' | 'addTools' | 'yolo';
+
 export class HarnessOverrideConflictError extends Error {
   readonly name = 'HarnessOverrideConflictError';
+  readonly code = 'harness.override_conflict';
   constructor(
     public readonly sessionId: string,
-    public readonly field: 'mode' | 'additionalTools' | 'model',
-    public readonly reason: string,
+    public readonly activeRunId: string,
+    public readonly conflictingFields: HarnessOverrideConflictField[],
+    message?: string,
   ) {
-    super(`HarnessOverrideConflictError on session "${sessionId}" for "${field}": ${reason}`);
+    super(
+      message ??
+        `Cannot override ${conflictingFields.join(', ')} on a signal that drains into active run "${activeRunId}" (session "${sessionId}")`,
+    );
   }
 }
 
@@ -407,11 +797,11 @@ export class HarnessWorkspaceProviderMismatchError extends Error {
   readonly name = 'HarnessWorkspaceProviderMismatchError';
   constructor(
     public readonly sessionId: string,
-    public readonly expectedProviderId: string,
+    public readonly configuredProviderId: string,
     public readonly storedProviderId: string,
   ) {
     super(
-      `Workspace provider mismatch for session "${sessionId}": stored "${storedProviderId}", configured "${expectedProviderId}"`,
+      `Workspace provider mismatch for session "${sessionId}": stored "${storedProviderId}", configured "${configuredProviderId}"`,
     );
   }
 }
@@ -422,14 +812,38 @@ export class HarnessWorkspaceProviderMismatchError extends Error {
  * workspace; pending tool calls captured by the previous process are
  * surfaced with this error so callers can decide what to do. See §2.7.
  */
+export type HarnessWorkspaceLostReason =
+  | 'restart'
+  | 'eviction'
+  | 'state_missing'
+  | 'resume_failed'
+  | 'generation_mismatch'
+  | 'provider_unavailable'
+  | 'destroyed';
+
 export class HarnessWorkspaceLostError extends Error {
   readonly name = 'HarnessWorkspaceLostError';
+  readonly reason: HarnessWorkspaceLostReason;
+  readonly providerId?: string;
+  readonly resourceId?: string;
+  readonly generation?: string;
   constructor(
     public readonly sessionId: string,
-    public readonly providerId: string,
-    public readonly reason: 'non-resumable-restart' | 'missing-state' = 'non-resumable-restart',
+    opts?: {
+      reason?: HarnessWorkspaceLostReason;
+      providerId?: string;
+      resourceId?: string;
+      generation?: string;
+    },
   ) {
-    super(`Workspace for session "${sessionId}" (provider "${providerId}") was lost: ${reason}`);
+    super(
+      `Workspace for session "${sessionId}" was lost: ${opts?.reason ?? 'restart'}` +
+        (opts?.providerId ? ` (provider "${opts.providerId}")` : ''),
+    );
+    this.reason = opts?.reason ?? 'restart';
+    this.providerId = opts?.providerId;
+    this.resourceId = opts?.resourceId;
+    this.generation = opts?.generation;
   }
 }
 
@@ -455,15 +869,24 @@ export class HarnessWorkspaceProvisioningError extends Error {
 /**
  * `harness.destroyResourceWorkspace({ resourceId })` was called while sessions
  * still hold the workspace (refcount > 0). Callers are expected to close those
- * sessions first.
+ * sessions first. Spec §4.5d.
+ *
+ * `activeSessionIds` is the spec's optional diagnostic of which sessions still
+ * hold the workspace. The per-resource workspace registry currently tracks
+ * only a refcount, so this is omitted until session-id tracking lands; the
+ * field stays in the public shape so producers can populate it without a
+ * breaking change.
  */
-export class HarnessWorkspaceInUseError extends Error {
-  readonly name = 'HarnessWorkspaceInUseError';
+export class HarnessResourceWorkspaceInUseError extends Error {
+  readonly name = 'HarnessResourceWorkspaceInUseError';
   constructor(
     public readonly resourceId: string,
-    public readonly refCount: number,
+    public readonly activeSessionIds?: string[],
   ) {
-    super(`Workspace for resource "${resourceId}" is in use (refCount: ${refCount})`);
+    super(
+      `Workspace for resource "${resourceId}" is in use` +
+        (activeSessionIds?.length ? ` by ${activeSessionIds.length} session(s)` : ''),
+    );
   }
 }
 

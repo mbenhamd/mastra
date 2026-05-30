@@ -4,6 +4,7 @@ import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
 import type { CallSettings, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
+import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/channel-tool-fence';
 import type { MessageList } from '../../../agent/message-list';
 import type { CreatedAgentSignal } from '../../../agent/signals';
 import { TripWire } from '../../../agent/trip-wire';
@@ -780,6 +781,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 abortSignal: options?.abortSignal,
               });
               Object.assign(currentStep, processInputStepResult);
+              // §14.7 INC-1b: an input processor may have re-introduced a reserved
+              // channel tool name into the tool surface after convertTools fenced it.
+              // Re-enforce the reservation (no-op unless this is a channel-bound turn
+              // that stamped a reserved set onto the per-call requestContext).
+              const channelToolFence = readChannelToolFence(requestContext);
+              if (channelToolFence && currentStep.tools) {
+                enforceChannelToolFence(currentStep.tools as Record<string, unknown>, channelToolFence, logger);
+              }
               executedStepModel =
                 currentStep.model.provider && currentStep.model.modelId
                   ? `${currentStep.model.provider}/${currentStep.model.modelId}`

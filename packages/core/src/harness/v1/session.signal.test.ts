@@ -161,6 +161,29 @@ describe('Session.signal()', () => {
     expect(types).toContain('agent_end');
   });
 
+  it('owned-turn settles by signalId: emits signal_completed and writes durable result evidence (§4.2f/§10.2)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+
+    const handle = await session.signal({ content: 'hi' });
+    await handle.result;
+
+    // §10.2 OperationEvent — settlement is by signalId, not agent_end.
+    const completed = events.find(e => e.type === 'signal_completed');
+    expect(completed).toBeDefined();
+    expect((completed as { signalId: string }).signalId).toBe(handle.id);
+    expect((completed as { runId: string }).runId).toBe(handle.runId);
+
+    // §4.2f durable per-signalId result evidence is queryable after the turn.
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+  });
+
   it('rejects an owned idle-wake result when the live session is marked deleted', async () => {
     const agent = new MockAgent({ id: 'default' });
     let release!: () => void;

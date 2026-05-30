@@ -12,7 +12,7 @@ import { MastraBase } from '../base';
 import type { MastraBrowser } from '../browser/browser';
 import type { BrowserContext } from '../browser/processor';
 import { AgentChannels } from '../channels/agent-channels';
-import type { ChannelConfig } from '../channels/agent-channels';
+import type { ChannelConfig } from '../channels/types';
 import { MastraError, ErrorDomain, ErrorCategory } from '../error';
 import type {
   ScorerRunInputForAgent,
@@ -66,6 +66,12 @@ import { WorkspaceInstructionsProcessor } from '../processors/processors/workspa
 import type { ProcessorState } from '../processors/runner';
 import { ProcessorRunner } from '../processors/runner';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, MASTRA_VERSIONS_KEY } from '../request-context';
+import {
+  enforceChannelToolFence,
+  isHarnessChannelBoundTurn,
+  readChannelToolFence,
+  stampChannelToolFence,
+} from './channel-tool-fence';
 import type { InferStandardSchemaOutput } from '../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
 import { ChunkFrom } from '../stream';
@@ -3578,6 +3584,15 @@ export class Agent<
       }
     }
 
+    // §14.7 INC-1b: an input processor may have re-introduced a reserved channel
+    // tool name into `nextTools` after the assembled surface was already fenced in
+    // convertTools. Re-enforce the reservation (no-op unless this is a channel-bound
+    // turn that stamped a reserved set).
+    const channelToolFence = readChannelToolFence(requestContext);
+    if (channelToolFence) {
+      enforceChannelToolFence(nextTools as Record<string, unknown>, channelToolFence, this.logger);
+    }
+
     return {
       messageList,
       tools: nextTools,
@@ -5310,6 +5325,16 @@ export class Agent<
       backgroundTaskEnabled,
     });
 
+    // §14.7: a turn admitted under an active harness ChannelBinding carries both the
+    // harness slot and a resolved channel request-context. On such turns the legacy
+    // AgentChannels direct-provider tools (e.g. add_reaction) post straight to the
+    // platform, bypassing the harness durable outbox / permission / event-ordering
+    // guarantees, so they MUST NOT reach the model. Omit them, and reserve their names
+    // so NO other tool source (toolset / client / per-turn addTools / skill / …) can
+    // re-expose the same name on this turn and spoof the fenced platform surface.
+    const channelBoundTurn = isHarnessChannelBoundTurn(requestContext);
+    const reservedChannelToolNames = channelBoundTurn ? new Set(Object.keys(channelTools)) : undefined;
+
     const allTools = {
       ...assignedTools,
       ...memoryTools,
@@ -5319,11 +5344,22 @@ export class Agent<
       ...workflowTools,
       ...workspaceTools,
       ...skillTools,
-      ...channelTools,
+      ...(channelBoundTurn ? {} : channelTools),
       ...browserTools,
       ...inputProcessorLoadedTools,
     };
-    return this.formatTools(allTools);
+
+    const formattedTools = this.formatTools(allTools);
+    if (reservedChannelToolNames && reservedChannelToolNames.size > 0) {
+      // Reservation runs on the FINAL normalized surface (post-formatTools), so a tool
+      // whose name normalizes INTO a reserved channel-tool name is caught too. Stamp the
+      // reserved set onto the per-call requestContext so the §14.7 INC-1b re-fence at the
+      // dynamic processor-tool sites (Agent.__runProcessInputStep + the agentic-execution
+      // loop) can catch a processor that re-introduces a reserved name AFTER assembly.
+      stampChannelToolFence(requestContext, reservedChannelToolNames);
+      enforceChannelToolFence(formattedTools, reservedChannelToolNames, logger);
+    }
+    return formattedTools;
   }
 
   /**

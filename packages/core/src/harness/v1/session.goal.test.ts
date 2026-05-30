@@ -181,6 +181,28 @@ describe('Session goal — judge loop', () => {
     expect(session.getGoal()?.turnsUsed).toBe(0);
   });
 
+  it('emits goal_waiting (with judge reason, turnsUsed unchanged) when the judge returns waiting (§10.2)', async () => {
+    const { harness, agent } = setupHarness({ goals: { defaultJudgeModel: 'judge:test' } });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.setGoal({ objective: 'go', kickoff: false });
+    installJudge(session, async () => ({ decision: 'waiting', reason: 'awaiting user checkpoint' }));
+    const events = record(session, ['goal_judged', 'goal_waiting', 'goal_paused', 'goal_done']);
+    agent.enqueueRun({ finishReason: 'stop', text: 'ask user' });
+
+    await session.message({ content: 'do work' });
+    await new Promise(resolve => setImmediate(resolve));
+
+    const waiting = events.find(e => e.type === 'goal_waiting') as
+      | { goalId: string; reason: string; turnsUsed: number }
+      | undefined;
+    expect(waiting).toBeDefined();
+    expect(waiting?.reason).toBe('awaiting user checkpoint');
+    expect(waiting?.turnsUsed).toBe(0);
+    // waiting is a distinct outcome — it must not also pause or complete the goal.
+    expect(events.some(e => e.type === 'goal_paused')).toBe(false);
+    expect(events.some(e => e.type === 'goal_done')).toBe(false);
+  });
+
   it('enqueues a continuation when the judge returns continue and skips re-judging on it', async () => {
     const { harness, agent } = setupHarness({ goals: { defaultJudgeModel: 'judge:test' } });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -307,7 +329,7 @@ describe('Session goal — continuation wording (TUI parity)', () => {
     expect(queued[0]!.source).toBe('goal');
   });
 
-  it('emits queue_full_dropped instead of silently dropping a goal continuation when queue is full', async () => {
+  it('rejects a goal continuation when the queue is full (no public event — §10.2)', async () => {
     const { harness } = setupHarness({
       goals: { defaultJudgeModel: 'judge:test' },
       sessions: { maxQueueDepth: 1 },
@@ -325,14 +347,9 @@ describe('Session goal — continuation wording (TUI parity)', () => {
     expect(session.getRecord().pendingQueue).toEqual([
       expect.objectContaining({ id: existing.queuedItemId, admissionId: 'goal-full-existing' }),
     ]);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      type: 'queue_full_dropped',
-      source: 'goal',
-      policy: 'reject',
-      maxQueueDepth: 1,
-      goalId: goal.id,
-    });
+    // §10.2: queue-full is not a public event — the goal continuation is simply
+    // not admitted (the pre-existing item stays at the head).
+    expect(events).toHaveLength(0);
     await session.cancelQueuedItem({ queuedItemId: existing.queuedItemId, reason: 'test cleanup' });
     await session.close();
   });
@@ -359,15 +376,9 @@ describe('Session goal — continuation wording (TUI parity)', () => {
       status: 'failed',
       error: expect.objectContaining({ code: 'harness.queue_full_dropped' }),
     });
-    expect(events[0]).toMatchObject({
-      type: 'queue_full_dropped',
-      source: 'goal',
-      policy: 'drop-oldest',
-      maxQueueDepth: 1,
-      queuedItemId: existing.queuedItemId,
-      admissionId: 'goal-drop-existing',
-      goalId: goal.id,
-    });
+    // §10.2: backpressure emits no public event — the dropped item's failed
+    // receipt (above) is the durable evidence.
+    expect(events).toHaveLength(0);
     await session.cancelQueuedItem({ queuedItemId: queue[0]!.id, reason: 'test cleanup' });
     await session.close();
   });
@@ -388,16 +399,12 @@ describe('Session goal — continuation wording (TUI parity)', () => {
     await new Promise(resolve => setImmediate(resolve));
     const events = record(session, ['queue_full_dropped']);
 
-    const goal = await session.setGoal({ objective: 'ship the thing' });
+    await session.setGoal({ objective: 'ship the thing' });
 
     expect(session.getRecord().pendingQueue).toEqual([expect.objectContaining({ content: 'active queued work' })]);
-    expect(events[0]).toMatchObject({
-      type: 'queue_full_dropped',
-      source: 'goal',
-      policy: 'drop-oldest',
-      maxQueueDepth: 1,
-      goalId: goal.id,
-    });
+    // §10.2: queue-full/backpressure emits no public event — the goal
+    // continuation is simply not admitted (active head stays).
+    expect(events).toHaveLength(0);
     agent.enqueueRun({ finishReason: 'stop', runId: 'active-goal-head', text: 'done' });
     await session.respondToToolApproval({ approved: true });
     await active;

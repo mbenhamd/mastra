@@ -167,19 +167,19 @@ describe('Session.models.setSubagent / getSubagent', () => {
     expect(session.models.getSubagent({ agentType: 'unset' })).toBeNull();
   });
 
-  it('emits model_override_set with previousModelId', async () => {
+  it('applies subagent model overrides without emitting a public event (§10.2)', async () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const events: HarnessEvent[] = [];
-    session.subscribe(e => {
-      events.push(e);
-    });
+    const eventTypes: string[] = [];
+    session.subscribe(e => eventTypes.push((e as { type: string }).type));
+
     await session.models.setSubagent({ agentType: 'researcher', model: 'v1' });
     await session.models.setSubagent({ agentType: 'researcher', model: 'v2' });
-    const overrideEvents = events.filter(e => e.type === 'model_override_set');
-    expect(overrideEvents).toHaveLength(2);
-    expect(overrideEvents[0]).toMatchObject({ agentType: 'researcher', modelId: 'v1', previousModelId: null });
-    expect(overrideEvents[1]).toMatchObject({ agentType: 'researcher', modelId: 'v2', previousModelId: 'v1' });
+
+    // §10.2 StateEvent has only the session-level `model_changed`; subagent
+    // overrides are reflected in state, not a public event.
+    expect(eventTypes).not.toContain('model_override_set');
+    expect(session.models.getSubagent({ agentType: 'researcher' })).toBe('v2');
   });
 
   it('is a no-op when setting the same agentType to the same model', async () => {

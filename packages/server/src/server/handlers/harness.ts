@@ -10,6 +10,8 @@ import type {
   GoalOptions,
   GoalState,
   HarnessChannelDiagnostics,
+  HarnessChannelInboundResult,
+  HarnessChannelTransportRequest,
   HarnessDisplayStateSnapshotV1,
   HarnessMessage,
   InboxResponseResult,
@@ -31,6 +33,7 @@ import {
   createHarnessSessionResponseSchema,
   harnessChannelDiagnosticsQuerySchema,
   harnessChannelDiagnosticsResponseSchema,
+  harnessChannelInboundPathParams,
   harnessAttachmentPathParams,
   harnessAttachmentUploadBodySchema,
   harnessAttachmentUploadResponseSchema,
@@ -59,7 +62,7 @@ import {
   listHarnessSessionsQuerySchema,
   listHarnessSessionsResponseSchema,
 } from '../schemas/harness';
-import { createRoute } from '../server-adapter/routes/route-builder';
+import { createPublicRoute, createRoute } from '../server-adapter/routes/route-builder';
 
 import { toHarnessDisplayStateSnapshotV1 } from './harness-display-state';
 import { enforceThreadAccess, getEffectiveResourceId } from './utils';
@@ -291,6 +294,11 @@ type HarnessLike = {
     resourceId: string;
     limit?: number;
   }): Promise<HarnessChannelDiagnostics | null>;
+  handleChannelInboundRequest(
+    channelId: string,
+    request: HarnessChannelTransportRequest,
+    opts?: { continueAdmission?: boolean },
+  ): Promise<HarnessChannelInboundResult>;
   closeSession(opts: { sessionId: string; resourceId?: string }): Promise<void>;
   ownerId?: string;
 };
@@ -1445,22 +1453,32 @@ function mapHarnessError(error: unknown): never {
     throwHarnessHttpError(501, 'harness.channel_diagnostics_unsupported', message, undefined, false);
   }
   if (
-    name === 'HarnessRuntimeDependencyDriftError' ||
-    name === 'harness.runtime_dependency_drifted' ||
-    harnessErrorString(error, 'code') === 'harness.runtime_dependency_drifted'
+    name === 'HarnessRuntimeDriftError' ||
+    name === 'harness.runtime_drift' ||
+    harnessErrorString(error, 'code') === 'harness.runtime_drift' ||
+    // Bare storage-row cause code (§4.5d HarnessRowErrorCode) projects to the
+    // same namespaced wire code (§13.3f.1).
+    harnessErrorString(error, 'code') === 'runtime_dependency_drifted'
   ) {
-    const context = harnessErrorProp(error, 'context');
-    throwHarnessHttpError(409, 'harness.runtime_dependency_drifted', message, {
-      dependencyKind: harnessErrorString(error, 'dependencyKind') ?? harnessErrorString(error, 'kind'),
-      dependencyId: harnessErrorString(error, 'dependencyId') ?? harnessErrorString(error, 'id'),
+    throwHarnessHttpError(409, 'harness.runtime_drift', message, {
+      sessionId: harnessErrorString(error, 'sessionId'),
+      runId: harnessErrorString(error, 'runId'),
+      backgroundTaskId: harnessErrorString(error, 'backgroundTaskId'),
+      missingRefs: harnessErrorProp(error, 'missingRefs'),
+      driftedRefs: harnessErrorProp(error, 'driftedRefs'),
+    });
+  }
+  if (name === 'HarnessBusyError') {
+    throwHarnessHttpError(409, 'harness.busy', message, {
+      sessionId: harnessErrorString(error, 'sessionId'),
       reason: harnessErrorString(error, 'reason'),
-      ...(context !== undefined ? { context } : {}),
     });
   }
   if (name === 'HarnessQueueFullError') {
     throwHarnessHttpError(429, 'harness.queue_full', message, {
       sessionId: harnessErrorString(error, 'sessionId'),
       maxQueueDepth: harnessErrorNumber(error, 'maxQueueDepth'),
+      currentDepth: harnessErrorNumber(error, 'currentDepth'),
     });
   }
   if (name === 'HarnessAdmissionConflictError') {
@@ -1541,8 +1559,7 @@ function mapHarnessError(error: unknown): never {
   }
   if (name === 'HarnessSubagentDepthExceededError') {
     throwHarnessHttpError(409, 'harness.subagent_depth_exceeded', message, {
-      sessionId: harnessErrorString(error, 'sessionId'),
-      attemptedDepth: harnessErrorNumber(error, 'depth'),
+      attemptedDepth: harnessErrorNumber(error, 'attemptedDepth'),
       maxDepth: harnessErrorNumber(error, 'maxDepth'),
     });
   }
@@ -1550,7 +1567,7 @@ function mapHarnessError(error: unknown): never {
     throwHarnessHttpError(409, 'harness.workspace_provider_mismatch', message, {
       sessionId: harnessErrorString(error, 'sessionId'),
       storedProviderId: harnessErrorString(error, 'storedProviderId'),
-      configuredProviderId: harnessErrorString(error, 'expectedProviderId'),
+      configuredProviderId: harnessErrorString(error, 'configuredProviderId'),
     });
   }
   if (name === 'HarnessWorkspaceLostError') {
@@ -1981,6 +1998,63 @@ export const GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE = createRoute({
     } catch (error) {
       return mapHarnessError(error);
     }
+  },
+});
+
+export const POST_HARNESS_CHANNEL_INBOUND_ROUTE = createPublicRoute({
+  method: 'POST',
+  path: '/harness/:name/channels/:channelId/inbound',
+  responseType: 'datastream-response',
+  pathParamSchema: harnessChannelInboundPathParams,
+  onValidationError: harnessValidationErrorHook,
+  summary: 'Channel webhook inbound ingress',
+  description:
+    'Transport entrypoint for a registered channel provider webhook. Resolves the channel, runs the adapter ' +
+    'verifyInbound provider-auth boundary, applies the §13.6 worker-readiness gate, and durably records the ' +
+    'inbound (record-only ACK; a recovery worker finishes admission). Public route: the channel adapter owns ' +
+    'the provider signature-auth boundary, not the server auth middleware.',
+  tags: ['Harness'],
+  // Webhook ingress is intentionally NOT app-authenticated: a channel provider
+  // (Slack, etc.) cannot carry a Mastra session token. The adapter's verifyInbound
+  // owns the provider signature-auth boundary (§14.2), which the core bridge runs
+  // before any durable row is created.
+  handler: async ({ mastra, name, channelId, requestBody, getHeader, requestPathParams }) => {
+    const pathName = stringPathParam(requestPathParams, name, 'name');
+    const pathChannelId = stringPathParam(requestPathParams, channelId, 'channelId');
+    const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+    // The route is a thin transport mapper: it forwards a transport-neutral request
+    // to the core ingress bridge, which owns registry resolution, provider
+    // verification, the readiness gate, and durable admission, and returns a
+    // transport-neutral result this handler maps to an HTTP status + §13.3 envelope.
+    // NOTE: the @mastra/server ServerContext exposes per-name header lookup only, so
+    // only content-type is forwarded here; richer provider signature headers require a
+    // ServerContext capable of enumerating headers (tracked separately, not C4c scope).
+    const contentType = getHeader?.('content-type');
+    const transportRequest: HarnessChannelTransportRequest = {
+      method: 'POST',
+      path: `/harness/${pathName}/channels/${pathChannelId}/inbound`,
+      headers: contentType !== undefined ? { 'content-type': contentType } : {},
+      body: requestBody,
+      receivedAt: Date.now(),
+    };
+    const result = await harness.handleChannelInboundRequest(pathChannelId, transportRequest);
+    if (result.kind === 'ok') {
+      return jsonResponse(
+        {
+          inboxItemId: result.inboxItemId,
+          status: result.status,
+          duplicate: result.duplicate,
+          ...(result.binding !== undefined ? { binding: result.binding } : {}),
+          ...(result.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
+          ...(result.queuedItemId !== undefined ? { queuedItemId: result.queuedItemId } : {}),
+        },
+        { status: result.ackStatus },
+      );
+    }
+    return jsonResponse(
+      toHarnessErrorBody(result.error.code, result.error.message, result.error.details, result.error.retryable),
+      { status: result.httpStatus },
+    );
   },
 });
 

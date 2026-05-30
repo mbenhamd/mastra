@@ -73,6 +73,8 @@ export function createSpawnSubagentTool(parent: Session) {
     reason: z.string().optional(),
     message: z.string().optional(),
     depth: z.number().optional(),
+    /** Attempted child depth for a `HarnessSubagentDepthExceededError` result (§4.5b). */
+    attemptedDepth: z.number().optional(),
     maxDepth: z.number().optional(),
   });
 
@@ -101,12 +103,12 @@ export function createSpawnSubagentTool(parent: Session) {
       const childDepth = parentDepth + 1;
       const maxDepth = harness._getSubagentMaxDepth();
       if (childDepth > maxDepth) {
-        const err = new HarnessSubagentDepthExceededError(parent.id, parentDepth, maxDepth);
+        const err = new HarnessSubagentDepthExceededError(maxDepth, childDepth);
         return {
           isError: true,
           errorName: err.name,
           message: err.message,
-          depth: parentDepth,
+          attemptedDepth: childDepth,
           maxDepth,
           subagentSessionId: '',
           result: undefined,
@@ -165,7 +167,7 @@ export function createSpawnSubagentTool(parent: Session) {
               depth: childDepth,
             });
             break;
-          case 'message_update':
+          case 'text_delta':
             if (typeof event.delta === 'string' && event.delta.length > 0) {
               parent._emitSubagentEvent({
                 type: 'subagent_text_delta',
@@ -199,7 +201,7 @@ export function createSpawnSubagentTool(parent: Session) {
               agentType,
               innerToolCallId: event.toolCallId,
               toolName,
-              output: event.result,
+              output: event.output,
               isError: event.isError ?? false,
               depth: childDepth,
             });

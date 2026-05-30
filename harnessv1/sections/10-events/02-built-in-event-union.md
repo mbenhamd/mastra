@@ -82,10 +82,15 @@ type HarnessEventError = HarnessPublicErrorProjection;
 // convenience and do not close the durable session or add lifecycle states
 // beyond §5.5.
 type LifecycleEvent =
-  | { type: 'session_created'; sessionId: string; resourceId: string; threadId: string; parentSessionId?: string }
+  // `modeId`/`modelId` carry the bootstrap mode/model resolved at creation so a
+  // subscriber joining at `session_created` knows the active mode/model without
+  // a follow-up read.
+  | { type: 'session_created'; sessionId: string; resourceId: string; threadId: string; parentSessionId?: string; modeId: string; modelId: string }
   | { type: 'session_closing'; sessionId: string; closingAt: number; closeDeadlineAt: number }
   | { type: 'session_closed';  sessionId: string; reason: 'requested' }
-  | { type: 'session_evicted'; sessionId: string }                  // dropped from live cache; record stays
+  // `reason` is a diagnostic for why the live instance left the cache; the
+  // durable record stays and re-hydrates on next access (`session_hydrated`).
+  | { type: 'session_evicted'; sessionId: string; reason: 'idle' | 'pressure' | 'pinned_timeout' | 'shutdown' | 'lease_lost' }  // dropped from live cache; record stays
   | { type: 'session_hydrated'; sessionId: string }                 // re-loaded from storage on next access
   | { type: 'harness_shutdown' };                                   // process shutdown; sessions persist
 
@@ -93,8 +98,10 @@ type LifecycleEvent =
 type StateEvent =
   // State write committed; changedKeys names top-level added/changed/removed keys.
   | { type: 'state_changed'; state: Record<string, JsonValue>; changedKeys: string[] }
-  | { type: 'mode_changed';  modeId: string }
-  | { type: 'model_changed'; modelId: string }
+  // `previousModeId`/`previousModelId` carry the prior value so display/audit
+  // projections can render the transition without tracking prior state.
+  | { type: 'mode_changed';  modeId: string; previousModeId: string }
+  | { type: 'model_changed'; modelId: string; previousModelId: string }
   | { type: 'token_usage_changed'; usage: TokenUsage }
   // Permission mutations (§4.2e). Emitted only after the owning session's
   // `SessionRecord.permissionRules` / `sessionGrants` transition commits under

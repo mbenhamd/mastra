@@ -23,6 +23,7 @@ import type {
   AttachmentSource,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelDeliverySemantics,
   ChannelInboxItem,
   ChannelOutboxEnqueueOptions,
@@ -39,6 +40,7 @@ import type {
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 import type { Workspace } from '../../workspace';
+import type { RequestContextInput } from './request-context-input';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
 
 // ---------------------------------------------------------------------------
@@ -235,6 +237,34 @@ export interface ChannelIngressContext extends ChannelIngressEnvelope {
   providerId: string;
 }
 
+/**
+ * §13.2/§14.2: transport-neutral result of `harness.handleChannelInboundRequest`.
+ * The core bridge owns registry resolution, provider verification, the §13.6
+ * readiness gate, and durable admission; the @mastra/server route is a thin
+ * transport mapper that turns this into an HTTP response/error envelope.
+ *
+ * On `kind: 'ok'`, `ackStatus` is the success HTTP status — `202` for a record-only
+ * ACK (the durable `received` row exists; a recovery worker finishes admission),
+ * `200` once admission reached `queued`/`accepted` or for an idempotent duplicate.
+ * Failure variants carry the HTTP status and the §13.3 error envelope shape.
+ */
+export type HarnessChannelInboundResult =
+  | {
+      kind: 'ok';
+      ackStatus: 200 | 202;
+      inboxItemId: string;
+      status: ChannelInboxItem['status'];
+      duplicate: boolean;
+      binding?: ChannelBinding;
+      sessionId?: string;
+      queuedItemId?: string;
+    }
+  | {
+      kind: 'not_found' | 'verify_failed' | 'not_ready' | 'conflict';
+      httpStatus: 400 | 401 | 404 | 409 | 503;
+      error: { code: string; message: string; details?: Record<string, unknown>; retryable?: boolean };
+    };
+
 export interface HarnessChannelDeliveryContext extends Omit<HarnessChannelRouteContext, 'route'> {
   binding: HarnessChannelBinding;
 }
@@ -358,7 +388,14 @@ export interface HarnessChannelDiagnosticsOptions {
 }
 
 export interface HarnessChannelDiagnosticError {
-  code: HarnessRowErrorCode;
+  /**
+   * Namespaced `harness.*` wire code (§13.3f.1). The bare `HarnessRowErrorCode`
+   * stored on the row is projected to this public form before it crosses the
+   * wire; `reason` carries the originating bare code when several collapse onto
+   * one envelope.
+   */
+  code: string;
+  reason?: string;
   retryable?: boolean;
 }
 
@@ -771,6 +808,13 @@ export interface UseSkillOptions {
    * exactly as {@link Session.signal}'s `modelOverride`.
    */
   modelOverride?: string;
+
+  /**
+   * Caller-supplied request context for the skill run (§4.4c). Only `app` may
+   * be set (see {@link MessageOverrides.requestContext}); other keys are
+   * rejected before the skill turn starts.
+   */
+  requestContext?: RequestContextInput;
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +901,7 @@ export interface HarnessConfigCommon {
    * change is incompatible with non-terminal persisted work.
    *
    * When set, recoverable work snapshots the token and later fails closed with
-   * `harness.runtime_dependency_drifted` if replay/resume observes a different
+   * `harness.runtime_drift` if replay/resume observes a different
    * current token, including when a previously configured token is later unset.
    * Legacy rows without a snapshot continue ID-only validation.
    */
@@ -915,6 +959,23 @@ export interface HarnessConfigCommon {
     storage?: HarnessStorage;
 
     /**
+     * Persist the high-volume transient streaming events (`text_delta`,
+     * `subagent_text_delta`) to the durable session-event log. Defaults to
+     * `true` (every emitted event is persisted, backing storage-based SSE
+     * `Last-Event-ID` replay). Set `false` to skip persisting these per-token
+     * deltas — a large write reduction for streaming-heavy workloads (a 2000-token
+     * response drops ~2000 `appendSessionEvent` writes). §10.5: durable
+     * `text_delta` replay across restarts is explicitly NOT a goal and the
+     * cold-start snapshot does not synthesize missed deltas, so this is
+     * spec-aligned. With it off, a reconnect whose `Last-Event-ID` precedes a
+     * skipped delta gets a 412 `unreplayable_gap` and recovers via the session
+     * snapshot + message log (the §10.5-sanctioned path); live subscribers still
+     * receive every delta in real time. Recommended `false` when the UI reads
+     * from a separate read-model (e.g. Convex) rather than the harness SSE stream.
+     */
+    persistTransientStreamingEvents?: boolean;
+
+    /**
      * Maximum number of items allowed to wait in `pendingQueue` per session.
      * `session.queue(...)` rejects with `HarnessQueueFullError` when full.
      * Capacity check + durable append are atomic per session. Defaults to 100.
@@ -938,6 +999,44 @@ export interface HarnessConfigCommon {
      * Must be a positive integer. Defaults to 30_000 ms (30s).
      */
     closeTimeoutMs?: number;
+
+    /**
+     * Behavior when `harness.session(...)` needs the write lease but another
+     * owner holds an unexpired lease (§5.8):
+     * - `'fail'` (default): reject immediately with `HarnessSessionLockedError`.
+     * - `'wait'`: block up to `lockWaitMs`, re-acquiring once the held lease
+     *   expires; throw `HarnessSessionLockedError` only if the wait elapses.
+     *   Recommended for SSE/browser-reconnect shapes where the previous lease
+     *   has not yet TTL'd out.
+     * - `'steal'`: reserved for a future operator fence; not yet implemented and
+     *   currently rejected at construction with `HarnessConfigError`.
+     */
+    lockMode?: 'fail' | 'wait';
+
+    /** Session write-lease TTL in ms (§5.8). Defaults to 30_000 (30s). */
+    lockTtlMs?: number;
+
+    /** Keep-alive renewal interval in ms (§5.8). Defaults to 10_000 (10s). */
+    lockRenewMs?: number;
+
+    /** Max ms `lockMode: 'wait'` blocks before failing closed. Defaults to 5_000. */
+    lockWaitMs?: number;
+
+    /**
+     * Cap on hydrated (live) sessions per harness instance (§5.4). Hydrating or
+     * creating another session past the cap pressure-evicts the
+     * least-recently-active unpinned session; if every live session is pinned
+     * (parked on a pending interaction), `harness.session(...)` rejects with
+     * `HarnessLiveSessionLimitError`. Defaults to `Infinity` (no cap).
+     */
+    maxLive?: number;
+
+    /**
+     * Auto-evict a live session after this many ms with no activity (§5.4).
+     * Skipped while a session has a pending approval/suspension/question/plan.
+     * Defaults to 2 hours.
+     */
+    idleTimeoutMs?: number;
   };
 
   /**
@@ -1225,22 +1324,7 @@ export interface SessionResolveByIdScoped extends SessionResolveCommon {
   threadId?: never;
 }
 
-/**
- * Resource-only resolution: hydrate the most-recent active session for
- * `resourceId`, or create a fresh thread + session if none exists. Useful
- * for single-user CLIs that just want "give me a session for this user".
- */
-export interface SessionResolveByResource extends SessionResolveCommon {
-  resourceId: string;
-  threadId?: never;
-  sessionId?: never;
-}
-
-export type SessionResolveOptions =
-  | SessionResolveByThread
-  | SessionResolveById
-  | SessionResolveByIdScoped
-  | SessionResolveByResource;
+export type SessionResolveOptions = SessionResolveByThread | SessionResolveById | SessionResolveByIdScoped;
 
 // ---------------------------------------------------------------------------
 // Sub-namespace option shapes for the Harness class.
@@ -1315,15 +1399,6 @@ export interface ThreadCloneOptions {
   metadata?: Record<string, unknown>;
   /** Forwarded to the storage adapter for message-copy filtering. */
   messageLimit?: number;
-}
-
-export interface ThreadSelectOrCreateOptions {
-  resourceId: string;
-  /** If supplied and owned by `resourceId`, returned as-is. Otherwise create. */
-  threadId?: string;
-  /** Used only when creating. */
-  title?: string;
-  metadata?: Record<string, unknown>;
 }
 
 export interface ThreadDeleteOptions {
@@ -1449,6 +1524,16 @@ export interface MessageOverrides {
    * `HarnessMode.additionalTools` semantics.
    */
   additionalTools?: ToolsInput;
+
+  /**
+   * Caller-supplied request context for this turn (§4.4c). Only `app` — a
+   * canonical-JSON application metadata bag surfaced to tools as
+   * `HarnessRequestContext.app` — may be set; any other top-level key is
+   * rejected with `HarnessValidationError` before admission. Replaced per
+   * turn, never merged. Rejected when the turn would interleave into an
+   * already-active run (it could not become tool-visible there).
+   */
+  requestContext?: RequestContextInput;
 }
 
 /**
@@ -1531,6 +1616,11 @@ export interface QueueAdmissionResult {
 export interface InboxResponseOptions {
   itemId?: string;
   responseId?: string;
+  // NOTE (§4.4c): inbox responses are also a fresh entry point that may carry a
+  // caller `requestContext.app`. Wiring it correctly requires including the
+  // normalized DTO in the response-admission hash (so duplicate `responseId`s
+  // with different `app` do not alias) without plumbing it into the resumed run
+  // — deferred to a dedicated follow-up so it is not left accept-but-ignore here.
 }
 
 export interface InboxResponseResult {
@@ -1570,6 +1660,15 @@ export interface QueueOverrides {
    * item so it survives crash replay.
    */
   yolo?: boolean;
+
+  /**
+   * Caller-supplied request context for this queued turn (§4.4c). Only `app`
+   * may be set (see {@link MessageOverrides.requestContext}); other keys are
+   * rejected before admission. The normalized `app` bag is persisted on the
+   * queued item and rebuilt at drain time, so recovered items use the
+   * persisted value — never a fresh caller value.
+   */
+  requestContext?: RequestContextInput;
 }
 
 /** Options accepted by `Session.queue(...)`. */
@@ -1651,6 +1750,15 @@ export interface SessionSignalOptions {
    * its own abort controller).
    */
   abortSignal?: AbortSignal;
+
+  /**
+   * Caller-supplied request context for the run this signal wakes (§4.4c).
+   * Only `app` may be set (see {@link MessageOverrides.requestContext}); other
+   * keys are rejected before admission. Like `abortSignal`, it applies only
+   * when the signal wakes a fresh idle run; supplying it on an active-delivery
+   * signal is rejected, since it could not reach the in-flight run's tools.
+   */
+  requestContext?: RequestContextInput;
 }
 
 /** Result returned by `Session.signal(...)` (resolved on the first await tick). */
@@ -1769,6 +1877,18 @@ export interface RegisterSandboxAccessParams {
 }
 
 /**
+ * §6.1: tool-authored custom event input for `ctx.emitCustomEvent`. The harness
+ * validates `type` and fills event/session identity (`id`, `sessionId`,
+ * `timestamp`, `runId`) before dispatching the resulting `CustomEvent` (§10.2).
+ * `type` must use a dotted custom prefix (e.g. `myorg.tool.progress`) and must
+ * not collide with a reserved built-in family.
+ */
+export interface HarnessCustomEventInput {
+  type: string;
+  payload?: JsonValue;
+}
+
+/**
  * Harness-specific context surfaced on the agent's `RequestContext` under
  * the `'harness'` key. See spec §6 for the full contract.
  *
@@ -1777,8 +1897,17 @@ export interface RegisterSandboxAccessParams {
  * For a subagent: depth ≥ 1, `source: 'subagent'`, parent linkage populated.
  */
 export interface HarnessRequestContext<TState = unknown> {
-  /** Harness instance id. Useful for log correlation across processes. */
-  harnessId: string;
+  /**
+   * §6.1: stable harness NAMESPACE (the registered harness name) — identical
+   * across processes and sessions for the same logical harness. Use this for
+   * durable identity decisions.
+   */
+  harnessName: string;
+  /**
+   * §6.1: per-PROCESS harness instance id — useful for log correlation across a
+   * single running process. Distinct from {@link harnessName} (the stable namespace).
+   */
+  harnessInstanceId: string;
   /** The session this tool invocation runs against. Stable for the call's lifetime. */
   sessionId: string;
   /** The thread the session is bound to. Stable for the call's lifetime. */
@@ -1814,6 +1943,14 @@ export interface HarnessRequestContext<TState = unknown> {
   /** Register a pending sandbox-access approval. */
   registerSandboxAccess?: (params: RegisterSandboxAccessParams) => Promise<void>;
   /**
+   * §6.1/§6.3/§10.2: emit a tool-authored custom event to this session's
+   * subscribers. The harness validates `type` (dotted custom prefix, not a
+   * reserved built-in family) and the payload (JSON-serializable), then stamps
+   * event + session identity before dispatch. Throws `HarnessValidationError` at
+   * call time on a reserved/invalid type or non-serializable payload.
+   */
+  emitCustomEvent: (event: HarnessCustomEventInput) => void;
+  /**
    * Extend the current session lease before work that may exceed the default
    * lease TTL or block the event loop long enough for the heartbeat to miss.
    */
@@ -1837,9 +1974,31 @@ export interface HarnessRequestContext<TState = unknown> {
   /**
    * Workspace handle (§6.1). Only present when the harness is configured
    * with a workspace and the session has resolved (or can lazily resolve)
-   * one. Tools should null-check before use.
+   * one. Tools should null-check before use. Equivalent to `getWorkspace()`.
    */
   workspace?: Workspace;
+
+  /**
+   * §6.1 workspace access. `getWorkspace()` and `workspace` are NON-materializing
+   * reads (return the cached handle or `undefined`, never a cold start);
+   * `resolveWorkspace()` is the explicit async materialize/resume path. A turn
+   * whose tools never need the filesystem can avoid cloud-sandbox cold starts by
+   * not calling `resolveWorkspace()`. `hasWorkspace()` reports configuration;
+   * `isWorkspaceReady()` reports whether a handle is already warm.
+   */
+  hasWorkspace: () => boolean;
+  isWorkspaceReady: () => boolean;
+  getWorkspace: () => Workspace | undefined;
+  resolveWorkspace: () => Promise<Workspace>;
+
+  /**
+   * §6.1 / §5.6 / §10.6 bounded, redacted activity timeline. DEFERRED: the
+   * underlying activity read-model is not built in this Harness build, so calling
+   * this rejects with a clear error rather than returning partial data. The full
+   * `(opts?: ActivityTimelineOptions) => Promise<SessionActivityTimeline>`
+   * signature lands with the read-model (tracked as a follow-up).
+   */
+  getActivityTimeline: () => Promise<never>;
 
   /**
    * Invoke a skill programmatically from inside a tool. Delegates to

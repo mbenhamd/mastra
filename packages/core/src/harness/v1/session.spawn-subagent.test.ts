@@ -172,7 +172,7 @@ describe('spawn_subagent tool — execution', () => {
 
     expect(result.isError).toBe(true);
     expect(result.errorName).toBe('HarnessSubagentDepthExceededError');
-    expect(result.depth).toBe(1);
+    expect(result.attemptedDepth).toBe(2);
     expect(result.maxDepth).toBe(1);
     expect(parent.subagentDepth).toBe(1);
   });

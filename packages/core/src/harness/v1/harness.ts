@@ -46,9 +46,13 @@ import type {
   OperationAdmissionTombstone,
   QueueAdmissionReceipt,
   HarnessRuntimeDependencyRefs,
+  SubtreeSessionLeaseResult,
+  ChannelBinding,
+  PersistedRequestContextInput,
 } from '../../storage/domains/harness';
 import {
   HarnessStorageAttachmentInUseError,
+  HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelOutboxClaimConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
@@ -68,11 +72,19 @@ import {
   HarnessAttachmentInUseError,
   HarnessAttachmentUnavailableError,
   HarnessConfigError,
+  HarnessLiveSessionLimitError,
   HarnessModelNotFoundError,
-  HarnessRuntimeDependencyDriftError,
+  HarnessOverrideConflictError,
+  HarnessQueueFullError,
+  HarnessRuntimeDriftError,
   HarnessSessionClosedError,
   HarnessSessionClosingError,
+  harnessSessionClosingError,
+  HarnessSessionConflictError,
+  HarnessSessionCorruptError,
   HarnessSessionDeleteBlockedError,
+  type HarnessSessionDeleteBlocker,
+  HarnessSessionDeletedError,
   HarnessSessionLockedError,
   HarnessSessionNotFoundError,
   HarnessStorageError,
@@ -80,7 +92,8 @@ import {
   HarnessValidationError,
   HarnessWorkspaceProviderMismatchError,
 } from './errors';
-import { EventEmitter } from './events';
+import { sha256CanonicalJson } from './canonical-json';
+import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { Session } from './session';
 import type {
@@ -93,6 +106,10 @@ import type {
   HarnessChannelDiagnosticsOptions,
   HarnessChannelBinding,
   HarnessChannelConfig,
+  HarnessChannelRouteContext,
+  HarnessChannelTransportRequest,
+  HarnessChannelInboundResult,
+  ChannelIngressContext,
   HarnessConfig,
   HarnessFileConfig,
   HarnessMode,
@@ -120,16 +137,22 @@ import type {
   ThreadListResult,
   ThreadRecord,
   ThreadRenameOptions,
-  ThreadSelectOrCreateOptions,
   ThreadSetSettingsOptions,
   ToolCategory,
 } from './types';
 import { WorkspaceRegistry } from './workspace-registry';
 
 const DEFAULT_LEASE_TTL_MS = 30_000;
+const DEFAULT_LEASE_RENEW_MS = 10_000;
+const DEFAULT_LOCK_WAIT_MS = 5_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const DEFAULT_MAX_QUEUE_DEPTH = 100;
 const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
 const MAX_CLOSE_TIMEOUT_MS = 2_147_483_647;
+// Bounded best-effort budget for draining a victim's buffered session-record /
+// token-usage flush chain during pressure/idle eviction (§5.4). Caps the hot
+// path so a slow/stuck storage write can never block eviction indefinitely.
+const EVICTION_FLUSH_DRAIN_BUDGET_MS = 5_000;
 const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = 'ask';
@@ -529,9 +552,57 @@ function projectChannelLeaseDiagnostic(row: {
   };
 }
 
-function projectChannelError(error: { code: HarnessRowErrorCode; retryable?: boolean } | undefined) {
+// §13.3f.1: storage rows record BARE `HarnessRowErrorCode` values, but bare
+// codes MUST NOT cross the v1 wire. Every public DTO / event that surfaces a
+// row's cause projects the bare code through this total function into a
+// fully-namespaced `harness.*` wire code (+ `reason` when the spec table
+// collapses several bare codes onto one envelope). Unknown codes fall back to
+// `harness.internal` carrying the bare code as `reason` so the wire never sees
+// a bare literal.
+// Total function over BOTH the impl's `HarnessRowErrorCode` union and the
+// §4.5d bare codes named in the §13.3f.1 table (some of which the impl does not
+// yet store but may flow through a thrown cause). Keyed by `string` so a code
+// outside the impl union still projects deterministically.
+const ROW_ERROR_WIRE_PROJECTION: Record<string, { code: string; reason?: string }> = {
+  // impl `HarnessRowErrorCode` union
+  session_closed: { code: 'harness.session_closed' },
+  session_closing: { code: 'harness.session_closing' },
+  session_deleted: { code: 'harness.session_deleted' },
+  live_session_limit: { code: 'harness.live_session_limit' },
+  session_locked: { code: 'harness.session_locked' },
+  queue_full: { code: 'harness.queue_full' },
+  override_conflict: { code: 'harness.override_conflict' },
+  channel_binding_closed: { code: 'harness.channel_binding_closed' },
+  channel_payload_conflict: { code: 'harness.channel_action_conflict', reason: 'channel_payload_conflict' },
+  delivery_operation_unavailable: {
+    code: 'harness.channel_delivery_unavailable',
+    reason: 'delivery_operation_unavailable',
+  },
+  provider_payload_invalid: { code: 'harness.channel_delivery_unavailable', reason: 'provider_payload_invalid' },
+  worker_unavailable: { code: 'harness.worker_unavailable' },
+  unknown: { code: 'harness.internal', reason: 'unknown' },
+  // §13.3f.1 table bare codes (§4.5d) — collapse onto shared envelopes.
+  platform_unlinked: { code: 'harness.channel_binding_closed', reason: 'platform_unlinked' },
+  operator_closed: { code: 'harness.channel_binding_closed', reason: 'operator_closed' },
+  pending_state_corrupt: { code: 'harness.session_corrupt', reason: 'pending_state_corrupt' },
+  tool_surface_unrehydratable: { code: 'harness.session_corrupt', reason: 'tool_surface_unrehydratable' },
+  runtime_dependency_drifted: { code: 'harness.runtime_drift' },
+};
+
+function projectRowErrorCode(code: string): { code: string; reason?: string } {
+  return ROW_ERROR_WIRE_PROJECTION[code as HarnessRowErrorCode] ?? { code: 'harness.internal', reason: code };
+}
+
+function projectChannelError(
+  error: { code: HarnessRowErrorCode; retryable?: boolean } | undefined,
+): { code: string; reason?: string; retryable?: boolean } | undefined {
   if (!error) return undefined;
-  return { code: error.code, ...(error.retryable !== undefined ? { retryable: error.retryable } : {}) };
+  const projected = projectRowErrorCode(error.code);
+  return {
+    code: projected.code,
+    ...(projected.reason !== undefined ? { reason: projected.reason } : {}),
+    ...(error.retryable !== undefined ? { retryable: error.retryable } : {}),
+  };
 }
 
 function projectChannelInboxDiagnostic(item: ChannelInboxItem): HarnessChannelDiagnostics['inbox'][number] {
@@ -678,10 +749,22 @@ export class Harness {
   private readonly _defaultModeId?: string;
   private readonly _liveSessions = new Map<string, Session>();
   private readonly _leaseTtlMs: number;
+  private readonly _lockMode: 'fail' | 'wait';
+  private readonly _lockWaitMs: number;
+  private readonly _lockRenewMs: number;
+  private readonly _maxLive: number;
+  private readonly _idleTimeoutMs: number;
   private _leaseRenewalTimer?: ReturnType<typeof setInterval>;
   private readonly _leaseRenewingSessionIds = new Set<string>();
+  // §14.2 channel-ingress recovery worker scheduler. Starts when the harness is
+  // bound with at least one channel (so crashed inbox rows recover even with no
+  // live session); stopped on shutdown. Reentrancy-guarded.
+  private _channelInboxRecoveryTimer?: ReturnType<typeof setInterval>;
+  private _channelInboxRecoveryRunning = false;
   private readonly _maxQueueDepth: number;
   private readonly _queueBackpressure: HarnessQueueBackpressurePolicy;
+  /** §10.5: when false, skip persisting transient streaming deltas (text_delta / subagent_text_delta). */
+  private readonly _persistTransientStreamingEvents: boolean;
   private readonly _closeTimeoutMs: number;
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
   private readonly _subagentTypes: ReadonlyMap<string, SubagentDefinition>;
@@ -720,7 +803,36 @@ export class Harness {
       throw new HarnessConfigError('runtimeCompatibilityGeneration', 'must be a non-empty string when provided');
     }
     this._runtimeCompatibilityGeneration = runtimeCompatibilityGeneration?.trim();
-    this._leaseTtlMs = DEFAULT_LEASE_TTL_MS;
+    this._leaseTtlMs = config.sessions?.lockTtlMs ?? DEFAULT_LEASE_TTL_MS;
+    if (!Number.isInteger(this._leaseTtlMs) || this._leaseTtlMs < 1) {
+      throw new HarnessConfigError('sessions.lockTtlMs', 'must be a positive integer');
+    }
+    const lockMode = config.sessions?.lockMode ?? 'fail';
+    if (lockMode !== 'fail' && lockMode !== 'wait') {
+      throw new HarnessConfigError(
+        'sessions.lockMode',
+        'must be "fail" or "wait" ("steal" is reserved and not yet implemented)',
+      );
+    }
+    this._lockMode = lockMode;
+    // §10.5: default true (persist all events — upstream-safe, backs storage SSE replay).
+    this._persistTransientStreamingEvents = config.sessions?.persistTransientStreamingEvents ?? true;
+    this._lockRenewMs = config.sessions?.lockRenewMs ?? DEFAULT_LEASE_RENEW_MS;
+    if (!Number.isInteger(this._lockRenewMs) || this._lockRenewMs < 1 || this._lockRenewMs >= this._leaseTtlMs) {
+      throw new HarnessConfigError('sessions.lockRenewMs', 'must be a positive integer less than lockTtlMs');
+    }
+    this._lockWaitMs = config.sessions?.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
+    if (!Number.isInteger(this._lockWaitMs) || this._lockWaitMs < 0) {
+      throw new HarnessConfigError('sessions.lockWaitMs', 'must be a non-negative integer');
+    }
+    this._maxLive = config.sessions?.maxLive ?? Number.POSITIVE_INFINITY;
+    if (this._maxLive < 1 || (Number.isFinite(this._maxLive) && !Number.isInteger(this._maxLive))) {
+      throw new HarnessConfigError('sessions.maxLive', 'must be a positive integer or Infinity');
+    }
+    this._idleTimeoutMs = config.sessions?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    if (!Number.isInteger(this._idleTimeoutMs) || this._idleTimeoutMs < 1) {
+      throw new HarnessConfigError('sessions.idleTimeoutMs', 'must be a positive integer');
+    }
     this._storageOverride = config.sessions?.storage;
     this._maxQueueDepth = config.sessions?.maxQueueDepth ?? DEFAULT_MAX_QUEUE_DEPTH;
     if (this._maxQueueDepth < 1) {
@@ -914,9 +1026,11 @@ export class Harness {
     // Cross-checks against the subagent registry happen below.
     this._workspaceKind = config.workspace?.kind;
     this._workspaceEager = Boolean(config.workspace?.eager);
+    // §2.7/§10.2: workspace lifecycle/error transitions are NOT public
+    // HarnessEventV1 events. No `onNotice` is wired here, so they stay off the
+    // public `subscribe`/SSE stream; provisioning failures still throw.
     this._workspaceRegistry = new WorkspaceRegistry({
       config: config.workspace,
-      emitter: this._emitter,
     });
 
     // Subagent `workspace: 'fresh'` is only valid under `per-session`. Validate
@@ -1173,6 +1287,10 @@ export class Harness {
     try {
       this._channelRegistry.bind(mastra, this._harnessName);
       this._trackMemoryStorage(mastra.getStorage()?.stores?.memory);
+      // §14.2: start the channel-ingress recovery worker now (not at session
+      // adoption) so durable inbox rows from a prior process are recovered even
+      // before any session goes live. No-op when no channels are configured.
+      this._ensureChannelInboxRecoveryLoop();
     } catch (err) {
       boundHarnesses.delete(this);
       this._mastra = undefined;
@@ -1225,7 +1343,7 @@ export class Harness {
 
   /**
    * Tear down the workspace bound to a given resource. Only valid under
-   * `kind: 'per-resource'`. Throws `HarnessWorkspaceInUseError` if any
+   * `kind: 'per-resource'`. Throws `HarnessResourceWorkspaceInUseError` if any
    * sessions are still holding the workspace; callers are expected to
    * close them first.
    */
@@ -1290,15 +1408,13 @@ export class Harness {
   ): { mode: HarnessMode; agent: Agent } {
     const mode = this._modesById.get(refs.modeId);
     if (!mode) {
-      throw new HarnessRuntimeDependencyDriftError('mode', refs.modeId, 'is not registered on this harness', context);
+      throw new HarnessRuntimeDriftError({ missingRefs: [{ kind: 'mode', ref: refs.modeId }], context });
     }
     if (refs.agentId !== undefined && refs.agentId !== mode.agentId) {
-      throw new HarnessRuntimeDependencyDriftError(
-        'agent',
-        refs.agentId,
-        `was recorded for mode "${refs.modeId}", but the mode now points at agent "${mode.agentId}"`,
-        context,
-      );
+      throw new HarnessRuntimeDriftError({
+        driftedRefs: [{ kind: 'agent', ref: refs.agentId }],
+        context: `${context}: recorded agent "${refs.agentId}" for mode "${refs.modeId}", but the mode now points at agent "${mode.agentId}"`,
+      });
     }
     const agentId = refs.agentId ?? mode.agentId;
     const mastra = this.mastra;
@@ -1309,38 +1425,44 @@ export class Harness {
       agent = undefined;
     }
     if (!agent) {
-      throw new HarnessRuntimeDependencyDriftError(
-        'agent',
-        agentId,
-        'is not registered on this Mastra instance',
-        context,
-      );
+      throw new HarnessRuntimeDriftError({ missingRefs: [{ kind: 'agent', ref: agentId }], context });
     }
     if (
       refs.runtimeCompatibilityGeneration !== undefined &&
       refs.runtimeCompatibilityGeneration !== this._runtimeCompatibilityGeneration
     ) {
-      throw new HarnessRuntimeDependencyDriftError(
-        'runtime_compatibility_generation',
-        refs.runtimeCompatibilityGeneration,
-        `was recorded, but the current generation is "${this._runtimeCompatibilityGeneration ?? 'unconfigured'}"`,
+      throw new HarnessRuntimeDriftError({
+        driftedRefs: [
+          {
+            kind: 'mode',
+            ref: refs.modeId,
+            expectedGeneration: refs.runtimeCompatibilityGeneration,
+            actualGeneration: this._runtimeCompatibilityGeneration,
+          },
+        ],
         context,
-      );
+      });
     }
     if ('workspaceProviderId' in refs && this._workspaceDependencyId() !== refs.workspaceProviderId) {
-      throw new HarnessRuntimeDependencyDriftError(
-        'workspace_provider',
-        refs.workspaceProviderId ?? 'unconfigured',
-        `was recorded, but the current workspace dependency is "${this._workspaceDependencyId() ?? 'unconfigured'}"`,
-        context,
-      );
+      throw new HarnessRuntimeDriftError({
+        driftedRefs: [{ kind: 'workspace_provider', ref: refs.workspaceProviderId ?? 'unconfigured' }],
+        context: `${context}: recorded workspace provider "${refs.workspaceProviderId ?? 'unconfigured'}", but the current workspace dependency is "${this._workspaceDependencyId() ?? 'unconfigured'}"`,
+      });
     }
     return { mode, agent };
   }
 
   private _workspaceDependencyId(): string | null {
     if (this._workspaceKind === undefined) return null;
-    if (this._workspaceKind === 'shared') return `shared:${this.ownerId}`;
+    // §13.3f.1 runtime-drift identity — MUST be restart-stable. A shared workspace
+    // is a single refcounted `workspace` with no provider/providerId (see the
+    // `kind: 'shared'` config variant), so it has no per-owner identity; using the
+    // process-local `ownerId` here produced a spurious `runtime_dependency_drifted`
+    // on every cross-process resume. A constant token is stable AND still detects a
+    // workspace-KIND change (shared → per-resource/per-session yields a providerId
+    // that mismatches `'shared'`); a shared-Workspace-instance swap has no id to
+    // detect either way.
+    if (this._workspaceKind === 'shared') return 'shared';
     return this._workspaceRegistry.providerId ?? null;
   }
 
@@ -1438,6 +1560,883 @@ export class Harness {
   }
 
   /**
+   * @internal §14.1 binding resolution for durable ingress. Applies the channel's
+   * `ChannelIngressPolicy.resolveResource` to map the verified platform tuple to
+   * a Harness `resourceId`/`threadId`/`sessionId`, then commits (or idempotently
+   * reuses) the durable `ChannelBinding` via the storage primitive. Returns the
+   * binding plus the resolved identity for the ingress route to admit a turn
+   * (`harness.session(...)` + `signal`/`queue`). It does NOT create the session
+   * (avoids an orphan session before the binding exists) — the route resolves the
+   * session from the returned identity.
+   */
+  async _resolveChannelBindingForIngress(ctx: ChannelIngressContext): Promise<{
+    binding: ChannelBinding;
+    resolved: {
+      resourceId: string;
+      threadId: string;
+      sessionId: string;
+      mode: ChannelBinding['mode'];
+      admission?: { delivery?: 'message' | 'queue'; mode?: string; model?: string };
+    };
+  }> {
+    const storage = this._requireStorage('channels.resolveBinding()');
+    const config = this._channelRegistry.getConfig(ctx.channelId);
+    if (config === undefined) {
+      throw new HarnessConfigError(`channels["${ctx.channelId}"]`, 'no channel is registered under this id');
+    }
+    const resolved = await config.ingress.resolveResource(ctx);
+    // §14.1: an explicit owning session must come with its own thread — never
+    // pair a caller-supplied sessionId with a freshly derived thread (mispairing
+    // would split the conversation). The policy owns both, or neither.
+    if (resolved.sessionId !== undefined && resolved.threadId === undefined) {
+      throw new HarnessValidationError(
+        `channels["${ctx.channelId}"].ingress.resolveResource`,
+        'must return threadId when sessionId is provided',
+      );
+    }
+    const threadId = resolved.threadId ?? deriveChannelThreadId(ctx, resolved.resourceId);
+    const sessionId = resolved.sessionId ?? deriveChannelSessionId(resolved.resourceId, threadId);
+    // The durable binding mode is the §5.1h 3-value set; a 'custom' policy
+    // resolution records as 'shared-resource' (its broadest logical-resource form).
+    const mode: ChannelBinding['mode'] = resolved.mode === 'custom' ? 'shared-resource' : resolved.mode;
+    const now = ctx.receivedAt;
+    const candidate: ChannelBinding = {
+      id: `binding-${randomUUID()}`,
+      harnessName: this._harnessName,
+      channelId: ctx.channelId,
+      providerId: ctx.providerId,
+      status: 'active',
+      platform: ctx.platform,
+      ...(ctx.externalTenantId !== undefined ? { externalTenantId: ctx.externalTenantId } : {}),
+      ...(ctx.externalChannelId !== undefined ? { externalChannelId: ctx.externalChannelId } : {}),
+      externalThreadId: ctx.externalThreadId,
+      resourceId: resolved.resourceId,
+      threadId,
+      sessionId,
+      mode,
+      generation: 1,
+      createdAt: now,
+      updatedAt: now,
+      lastInboundAt: now,
+    };
+    // Ordinary ingress never replaces — replacement is an explicit, policy-driven
+    // fresh-generation operation, not a retry side effect.
+    const result = await storage.resolveChannelBinding({ candidate });
+    let binding = result.binding;
+    // Idempotent reuse of an existing active binding: advance the activity marker
+    // ONLY forward (a delayed/out-of-order older ingress must not regress it). The
+    // forward-only merge runs atomically in storage against the authoritative
+    // current row — a caller-side read-modify-write here would let a slower older
+    // save clobber a newer concurrent one under same-binding ingress (§14.1).
+    if (!result.created) {
+      const touched = await storage.touchChannelBindingInbound({
+        harnessName: binding.harnessName,
+        bindingId: binding.id,
+        at: now,
+      });
+      if (touched) binding = touched;
+    }
+    return {
+      binding,
+      resolved: {
+        resourceId: binding.resourceId,
+        threadId: binding.threadId,
+        sessionId: binding.sessionId,
+        mode: binding.mode,
+        ...(resolved.admission !== undefined ? { admission: resolved.admission } : {}),
+      },
+    };
+  }
+
+  /**
+   * §13.2/§14.2 channel webhook ingress bridge. The single core entrypoint a
+   * transport route (`POST /harness/:name/channels/:channelId/inbound`) calls: it
+   * resolves the registry route context, runs provider verification through the
+   * channel adapter (`verifyInbound` owns signature auth), applies the §13.6
+   * worker-readiness gate BEFORE any durable row is created, then admits through
+   * {@link admitChannelInbound}. Returns a transport-neutral {@link HarnessChannelInboundResult}
+   * the route maps to an HTTP status + §13.3 error envelope. Defaults to
+   * `continueAdmission: false` (record-only ACK; a recovery worker finishes
+   * admission) per the §14.2 provider-ACK/admission split.
+   */
+  async handleChannelInboundRequest(
+    channelId: string,
+    request: HarnessChannelTransportRequest,
+    opts?: { continueAdmission?: boolean },
+  ): Promise<HarnessChannelInboundResult> {
+    // §13.2: an unregistered (harnessName, channelId) pair fails at the registry
+    // boundary, before adapter verification or body parsing.
+    const resolved = this._resolveChannelRouteContext(channelId, 'inbound');
+    if (!resolved) {
+      return {
+        kind: 'not_found',
+        httpStatus: 404,
+        error: {
+          code: 'harness.not_found',
+          message: `channel "${channelId}" is not registered on harness "${this._harnessName}"`,
+        },
+      };
+    }
+    const { routeContext, adapter } = resolved;
+    if (typeof adapter.verifyInbound !== 'function') {
+      return {
+        kind: 'verify_failed',
+        httpStatus: 400,
+        error: {
+          code: 'harness.bad_request',
+          message: `channel "${channelId}" adapter does not support inbound verification`,
+        },
+      };
+    }
+
+    // Provider signature verification + payload normalization (adapter-owned).
+    let envelope;
+    try {
+      envelope = await adapter.verifyInbound(request, routeContext);
+    } catch (err) {
+      // The adapter owns the provider auth boundary; an unverified/invalid payload
+      // is a permission failure. (400-vs-401 malformed-vs-signature refinement needs
+      // a typed adapter error — deferred.)
+      return {
+        kind: 'verify_failed',
+        httpStatus: 401,
+        error: {
+          code: 'harness.permission_denied',
+          message: err instanceof Error ? err.message : 'channel inbound verification failed',
+        },
+      };
+    }
+
+    // §13.6 worker-readiness gate — before creating/claiming a durable row.
+    const readiness = this.channelWorkerReadiness({ channelId });
+    if (!readiness.ready) {
+      return {
+        kind: 'not_ready',
+        httpStatus: 503,
+        error: {
+          code: 'harness.worker_unavailable',
+          message: `channel "${channelId}" ingress worker is unavailable`,
+          retryable: true,
+          details: {
+            harnessName: this._harnessName,
+            channelId,
+            scope: 'channel_inbox',
+            reason: readiness.reason,
+          },
+        },
+      };
+    }
+
+    const ctx: ChannelIngressContext = {
+      ...envelope,
+      harnessName: this._harnessName,
+      channelId,
+      providerId: routeContext.providerId,
+      // §14.7: the registry route context — not the adapter-returned envelope — is
+      // authoritative for (harnessName, channelId, providerId, platform). Override
+      // platform so a buggy adapter cannot persist a mismatched platform into the
+      // durable binding / requestContext.channel.
+      platform: routeContext.platform,
+    };
+    const result = await this.admitChannelInbound(ctx, {
+      continueAdmission: opts?.continueAdmission ?? false,
+    });
+    if (result.conflict) {
+      // §14.2: same idempotency key, different payload — not an exact-retry duplicate.
+      return {
+        kind: 'conflict',
+        httpStatus: 409,
+        error: {
+          code: 'harness.channel_action_conflict',
+          message: 'channel ingress payload conflict for an existing idempotency key',
+          details: { harnessName: this._harnessName, channelId, inboxItemId: result.inboxItemId },
+        },
+      };
+    }
+    // §14.2: a non-terminal `received`/`admitted` row is an in-progress ACK (202);
+    // a terminal/accepted/queued outcome or an idempotent duplicate is 200.
+    const ackStatus: 200 | 202 = result.status === 'received' || result.status === 'admitted' ? 202 : 200;
+    return {
+      kind: 'ok',
+      ackStatus,
+      inboxItemId: result.inboxItemId,
+      status: result.status,
+      duplicate: result.duplicate,
+      ...(result.binding !== undefined ? { binding: result.binding } : {}),
+      ...(result.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
+      ...(result.queuedItemId !== undefined ? { queuedItemId: result.queuedItemId } : {}),
+    };
+  }
+
+  /**
+   * Resolve the §14.1 channel-level binding + config + provider into the
+   * `HarnessChannelRouteContext` the adapter needs for `verifyInbound`/`verifyAction`.
+   * Returns `undefined` when the `(harnessName, channelId)` pair is not registered
+   * or the provider is unavailable — the caller maps that to a 404 at the registry
+   * boundary (it never reaches adapter verification).
+   */
+  private _resolveChannelRouteContext(
+    channelId: string,
+    route: 'inbound' | 'action',
+  ): { routeContext: HarnessChannelRouteContext; adapter: HarnessChannelConfig['adapter'] } | undefined {
+    const binding = this.getChannelBinding(channelId);
+    const config = this._channelRegistry.getConfig(channelId);
+    if (!binding || !config) return undefined;
+    const provider = this.mastra.getChannelProvider(binding.providerId);
+    if (!provider || provider.id !== binding.platform) return undefined;
+    return {
+      routeContext: {
+        harnessName: this._harnessName,
+        channelId,
+        providerId: binding.providerId,
+        platform: binding.platform,
+        provider,
+        route,
+      },
+      adapter: config.adapter,
+    };
+  }
+
+  /**
+   * §14.2 durable ingress admission core. Idempotently records the inbound as a
+   * durable `ChannelInboxItem`, resolves the §14.1 binding + owning session, and
+   * admits the turn (queue delivery — signal delivery is a follow-up) carrying the
+   * trusted `requestContext.channel` projection. This is the shared admission path
+   * both the auto-mounted ingress route and the recovery worker call (worker-first
+   * design): the route records the row + ACKs; the worker drives this to
+   * completion. Status transitions received → admitted → queued bound the crash
+   * replay window. `admissionId` (the inbox item id) makes provider/worker retries
+   * idempotent.
+   */
+  async admitChannelInbound(
+    ctx: ChannelIngressContext,
+    opts?: { continueAdmission?: boolean },
+  ): Promise<{
+    inboxItemId: string;
+    status: ChannelInboxItem['status'];
+    binding?: ChannelBinding;
+    sessionId?: string;
+    queuedItemId?: string;
+    duplicate: boolean;
+    /**
+     * §14.2: set when the same idempotency key arrived with a DIFFERENT payload —
+     * an admission conflict, NOT an exact-retry duplicate. The transport bridge
+     * maps this to `409 harness.channel_action_conflict`.
+     */
+    conflict?: boolean;
+  }> {
+    const storage = this._requireStorage('channels.admitInbound()');
+    // `receivedAt` is the provider event time (durable record field). Claim TTL
+    // and status-transition timestamps are real processing time — the claim
+    // expiry is validated against the wall clock, not the event time.
+    const receivedAt = ctx.receivedAt;
+    const now = Date.now();
+    // §14.2: idempotency is scoped by the full route + canonical conversation
+    // identity (NOT externalMessageId alone — provider message ids can collide
+    // across tenants/channels); payloadHash distinguishes exact retries from
+    // same-key payload conflicts.
+    const idempotencyKey = sha256CanonicalJson([
+      ctx.harnessName,
+      ctx.channelId,
+      ctx.providerId,
+      ctx.platform,
+      normChannelExternalId(ctx.externalTenantId),
+      normChannelExternalId(ctx.externalChannelId),
+      ctx.externalThreadId,
+      ctx.externalMessageId,
+    ]);
+    // §14.2: the payload hash must distinguish inbound messages that differ only by their
+    // attachments, otherwise two distinct messages collide on the same idempotency key and one is
+    // dropped as a false duplicate. We hash a STABLE identity projection of each provider file
+    // (durable id + digest + name/type, never transient byte/metadata fields) and only widen the
+    // hash when files are present, so the common no-file case stays byte-identical to before.
+    // Full attachment normalization + durable persistence remains the §13.7 follow-up.
+    const payloadHash = sha256CanonicalJson(
+      ctx.files !== undefined && ctx.files.length > 0
+        ? {
+            content: ctx.content,
+            files: ctx.files.map(f => ({
+              attachmentId: f.attachmentId,
+              resourceId: f.resourceId,
+              ...(f.sha256 !== undefined ? { sha256: f.sha256 } : {}),
+              ...(f.name !== undefined ? { name: f.name } : {}),
+              ...(f.mimeType !== undefined ? { mimeType: f.mimeType } : {}),
+            })),
+          }
+        : { content: ctx.content },
+    );
+    const inboxItemId = `inbox-${randomUUID()}`;
+    const claimId = `inbox-claim-${randomUUID()}`;
+    const created = await storage.createOrLoadChannelInboxItem(
+      {
+        id: inboxItemId,
+        harnessName: this._harnessName,
+        channelId: ctx.channelId,
+        providerId: ctx.providerId,
+        idempotencyKey,
+        payloadHash,
+        admissionId: inboxItemId,
+        externalMessageId: ctx.externalMessageId,
+        receivedAt,
+        updatedAt: now,
+        status: 'received',
+        attempts: 0,
+        // Preliminary channel context (no bindingId yet — binding resolves below).
+        requestContext: buildChannelRequestContext(ctx),
+        content: ctx.content,
+        // Payload-hash idempotency now covers file identity (above). Attachment normalisation into
+        // Harness-owned persisted refs remains a §13.7 follow-up; raw provider files are not yet
+        // stored on the durable row.
+        attachments: [],
+      },
+      { initialClaim: { claimId, now, claimTtlMs: DEFAULT_CHANNEL_OUTBOX_CLAIM_TTL_MS } },
+    );
+    const item = created.item;
+    // §14.2: same idempotency key + a DIFFERENT payload is a conflict, not a
+    // duplicate — surface it and do not admit.
+    if (created.conflict) {
+      this._emitter.emit({
+        type: 'channel_ingress_failed',
+        harnessName: this._harnessName,
+        channelId: ctx.channelId,
+        inboxItemId: item.id,
+        externalMessageId: ctx.externalMessageId,
+        error: { code: 'harness.channel_action_conflict', message: 'channel ingress payload conflict' },
+      });
+      return { inboxItemId: item.id, status: item.status, duplicate: true, conflict: true };
+    }
+    // Terminal row (queued/accepted/dead) — idempotent replay returns the prior
+    // outcome without re-admitting or re-claiming. A `dead` row is a terminal
+    // give-up; replaying it must not be mistaken for an in-progress duplicate.
+    if (item.status === 'queued' || item.status === 'accepted' || item.status === 'dead') {
+      return {
+        inboxItemId: item.id,
+        status: item.status,
+        ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
+        ...(item.queuedItemId !== undefined ? { queuedItemId: item.queuedItemId } : {}),
+        duplicate: true,
+      };
+    }
+    // A non-terminal duplicate whose claim we did NOT take is being admitted by
+    // another caller (concurrent provider retry / worker). Don't steal its claim
+    // (that would claim-conflict and emit a false failure) — report in-progress.
+    if (!created.claimed) {
+      return {
+        inboxItemId: item.id,
+        status: item.status,
+        ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
+        duplicate: true,
+      };
+    }
+    if (!created.duplicate) {
+      this._emitter.emit({
+        type: 'channel_ingress_received',
+        harnessName: this._harnessName,
+        channelId: ctx.channelId,
+        inboxItemId: item.id,
+        externalMessageId: ctx.externalMessageId,
+      });
+    }
+    // §14.2 record-only / ACK-after-received: a route may durably record the
+    // 'received' row and acknowledge the provider immediately, leaving binding
+    // resolution + admission to the recovery worker. Release our claim so the
+    // worker can reclaim it on its next tick (the release is CAS-safe —
+    // `updateChannelInboxItem` only honors a write under the matching claimId, so
+    // it can never clear another owner's later claim).
+    if (opts?.continueAdmission === false) {
+      if (created.claimed) {
+        try {
+          await storage.updateChannelInboxItem(
+            { ...item, claimId: undefined, claimExpiresAt: undefined, updatedAt: now },
+            { claimId },
+          );
+        } catch (releaseErr) {
+          if (!(releaseErr instanceof HarnessStorageChannelInboxClaimConflictError)) throw releaseErr;
+        }
+      }
+      return { inboxItemId: item.id, status: item.status, duplicate: created.duplicate };
+    }
+    // The latest row state durably committed under our claim. The catch path
+    // spreads THIS (not the stale pre-admission `item`) so a failure after the
+    // `admitted` write preserves admissionHash / resolved ids / requestContext —
+    // otherwise recovery would lose the persisted admission and wrongly re-run
+    // policy (the row is recovery-complete once `admitted`).
+    let persisted: ChannelInboxItem = item;
+    try {
+      const { binding, resolved } = await this._resolveChannelBindingForIngress(ctx);
+      const session = await this.session({
+        resourceId: resolved.resourceId,
+        threadId: resolved.threadId,
+        sessionId: resolved.sessionId,
+      } as SessionResolveOptions);
+      // §14.3: the trusted channel request-context now carries the resolved
+      // bindingId (built from binding + envelope evidence, never caller input).
+      const requestContext = buildChannelRequestContext(ctx, binding.id);
+      // §14.2 step 7: the policy-selected admission payload (content + persisted
+      // attachments + mode/model + trusted requestContext). Queue delivery only —
+      // signal delivery is a documented follow-up; a policy that selects
+      // `delivery: 'message'` still queues here until the signal path lands.
+      // mode/model are written UNCONDITIONALLY (undefined clears any stale value
+      // from a prior failed attempt) so the persisted payload always matches the
+      // admissionHash, which omits absent fields.
+      const admissionMode = resolved.admission?.mode;
+      const admissionModel = resolved.admission?.model;
+      const admissionHash = session._channelQueueAdmissionHash(
+        { content: ctx.content, mode: admissionMode, model: admissionModel },
+        item.attachments,
+        requestContext,
+      );
+      // Persist the policy-selected fields + admissionHash BEFORE runtime admission
+      // (spec step 7/8) and mark `admitted`, so a crash between admit and durable
+      // acceptance is recoverable: the worker replays the SAME payload (validated
+      // against this admissionHash) and never re-runs policy.
+      const admittedRow: ChannelInboxItem = {
+        ...item,
+        status: 'admitted',
+        bindingId: binding.id,
+        resourceId: resolved.resourceId,
+        threadId: resolved.threadId,
+        sessionId: resolved.sessionId,
+        delivery: 'queue',
+        admissionHash,
+        mode: admissionMode,
+        model: admissionModel,
+        requestContext,
+        admittedAt: now,
+        updatedAt: now,
+        // Clear any failure metadata from a prior failed attempt being retried,
+        // so a successful admission doesn't leave stale failure evidence.
+        failedAt: undefined,
+        deadAt: undefined,
+        nextAttemptAt: undefined,
+        lastError: undefined,
+      };
+      await storage.updateChannelInboxItem(admittedRow, { claimId });
+      persisted = admittedRow;
+      const admit = await session._admitChannelQueueTurn({
+        content: ctx.content,
+        admissionId: item.id,
+        requestContext,
+        attachments: item.attachments,
+        expectedAdmissionHash: admissionHash,
+        mode: admissionMode,
+        model: admissionModel,
+      });
+      const queuedRow: ChannelInboxItem = {
+        ...admittedRow,
+        status: 'queued',
+        queuedItemId: admit.queuedItemId,
+        queuedAt: now,
+        updatedAt: now,
+      };
+      await storage.updateChannelInboxItem(queuedRow, { claimId });
+      persisted = queuedRow;
+      this._emitter.emit({
+        type: 'channel_ingress_admitted',
+        harnessName: this._harnessName,
+        channelId: ctx.channelId,
+        inboxItemId: item.id,
+        bindingId: binding.id,
+        delivery: 'queue',
+        queuedItemId: admit.queuedItemId,
+      });
+      return {
+        inboxItemId: item.id,
+        status: 'queued',
+        binding,
+        sessionId: resolved.sessionId,
+        queuedItemId: admit.queuedItemId,
+        duplicate: created.duplicate,
+      };
+    } catch (err) {
+      const projected = projectHarnessPublicError(err);
+      try {
+        // §5.1: a failed/dead inbox row MUST carry durable failure evidence. The
+        // row stores the bare `HarnessRowErrorCode` (projected to the namespaced
+        // wire code elsewhere); the public channel_ingress_failed event below
+        // already carries the projected code. `retryable: true` lets the recovery
+        // worker re-attempt (a typed retry/dead taxonomy is a follow-up). Spreading
+        // `persisted` preserves the recovery-complete admission (admissionHash,
+        // resolved ids, requestContext) when the failure happened after `admitted`.
+        await storage.updateChannelInboxItem(
+          {
+            ...persisted,
+            status: 'failed',
+            failedAt: now,
+            updatedAt: now,
+            lastError: { code: 'unknown', message: projected.message, retryable: true },
+          },
+          { claimId },
+        );
+      } catch {
+        // Best-effort: the claim may already be lost; the worker reclaims and retries.
+      }
+      this._emitter.emit({
+        type: 'channel_ingress_failed',
+        harnessName: this._harnessName,
+        channelId: ctx.channelId,
+        inboxItemId: item.id,
+        externalMessageId: ctx.externalMessageId,
+        error: projected,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * §9 inbox recovery config for `channelId`, with spec defaults applied. When
+   * `channelId` is omitted (an all-channels sweep) only the defaults apply —
+   * per-channel inbox overrides require a per-channel worker tick (follow-up).
+   */
+  private _resolveInboxRecoveryConfig(channelId?: string): {
+    maxAttempts: number;
+    claimTtlMs: number;
+    claimRenewMs: number;
+    batchSize: number;
+    retryBackoffMs: (attempt: number) => number;
+  } {
+    const inbox = channelId !== undefined ? this._channelRegistry.getConfig(channelId)?.inbox : undefined;
+    const claimTtlMs = inbox?.claimTtlMs ?? 30_000;
+    return {
+      maxAttempts: inbox?.maxAttempts ?? 10,
+      claimTtlMs,
+      claimRenewMs: inbox?.claimRenewMs ?? Math.floor(claimTtlMs / 3),
+      batchSize: inbox?.batchSize ?? 50,
+      retryBackoffMs: inbox?.retryBackoffMs ?? defaultInboxRetryBackoffMs,
+    };
+  }
+
+  /** §14 channel_ingress_admitted emit shared by the route and recovery worker. */
+  private _emitChannelIngressAdmitted(row: ChannelInboxItem, queuedItemId: string, bindingId: string): void {
+    this._emitter.emit({
+      type: 'channel_ingress_admitted',
+      harnessName: this._harnessName,
+      channelId: row.channelId,
+      inboxItemId: row.id,
+      bindingId,
+      delivery: 'queue',
+      queuedItemId,
+    });
+  }
+
+  /**
+   * §13.6 worker-readiness gate for record-only channel ingress. Before a route
+   * durably records a `received` row and ACKs the provider, it must confirm the
+   * recovery worker that will later admit that row is actually running — otherwise
+   * the row would be orphaned. This is a CHEAP synchronous check (no DB probe)
+   * tied to the worker this harness runs:
+   *   - `server_draining`     — the harness is shutting down
+   *   - `storage_unavailable` — no harness storage is configured
+   *   - `channel_not_configured` — no such channel id
+   *   - `channel_not_bound`   — configured but not yet bound to a provider
+   *   - `worker_not_started`  — the recovery loop has not started (e.g. not bound)
+   * Maps to the §13.3f `harness.worker_unavailable` wire error at the route.
+   */
+  channelWorkerReadiness(opts: { channelId: string }): { ready: true } | { ready: false; reason: string } {
+    if (this._shutdown) return { ready: false, reason: 'server_draining' };
+    try {
+      this._requireStorage('channelWorkerReadiness()');
+    } catch {
+      return { ready: false, reason: 'storage_unavailable' };
+    }
+    if (this._channelRegistry.getConfig(opts.channelId) === undefined) {
+      return { ready: false, reason: 'channel_not_configured' };
+    }
+    if (this._channelRegistry.get(opts.channelId) === undefined) {
+      return { ready: false, reason: 'channel_not_bound' };
+    }
+    if (this._channelInboxRecoveryTimer === undefined) {
+      return { ready: false, reason: 'worker_not_started' };
+    }
+    return { ready: true };
+  }
+
+  /**
+   * @internal §14.2 recovery worker — ONE reclaim+resume pass over non-terminal
+   * channel inbox rows. Claims a batch and resumes each row from its first
+   * incomplete step, discriminating by persisted `admissionHash`:
+   *
+   *  - `admissionHash` PRESENT → replay the persisted admission ONLY (policy
+   *    already ran; §14.2 forbids re-running it). Rehydrate the owning session and
+   *    re-admit with the stored payload + `expectedAdmissionHash`; the queue
+   *    boundary de-dupes on `admissionId`, so a crash after queue-append but before
+   *    the `queued` write recovers without a double turn.
+   *  - `admissionHash` ABSENT → resume from binding resolution (policy may run):
+   *    reconstruct the `ChannelIngressContext` from the durable row and run the
+   *    same resolve → admitted → admit → queued sequence as {@link admitChannelInbound}.
+   *    (The sequence is intentionally duplicated rather than extracted: the route
+   *    rethrows on error while the worker applies attempts/backoff/dead-letter, so
+   *    a shared helper would need mode flags. Keep both in lockstep with §14.2.)
+   *
+   * Per-error disposition follows the §14.2 taxonomy (`classifyChannelInboxFailure`):
+   * retryable backpressure → `failed` + backoff → `dead` at `maxAttempts`;
+   * session-closing → deadline-clamped retry then `dead`; closed/deleted/override/
+   * unrecoverable → terminal `dead`. The claim is held across slow work by
+   * `_withChannelInboxClaimHeartbeat` and released on failure so retries honor the
+   * backoff. Rows at/over `maxAttempts` dead-letter for operator repair.
+   */
+  async recoverChannelInboxOnce(opts?: {
+    channelId?: string;
+    now?: number;
+    batchSize?: number;
+  }): Promise<{ claimed: number; queued: number; failed: number; dead: number }> {
+    const storage = this._requireStorage('channels.recoverInbox()');
+    const now = opts?.now ?? Date.now();
+    const cfg = this._resolveInboxRecoveryConfig(opts?.channelId);
+    const claimId = `inbox-worker-${randomUUID()}`;
+    const batch = await storage.claimChannelInboxItems({
+      harnessName: this._harnessName,
+      ...(opts?.channelId !== undefined ? { channelId: opts.channelId } : {}),
+      statuses: ['received', 'admitted', 'failed'],
+      claimId,
+      limit: opts?.batchSize ?? cfg.batchSize,
+      now,
+      claimTtlMs: cfg.claimTtlMs,
+    });
+    let queued = 0;
+    let failed = 0;
+    let dead = 0;
+    for (const row of batch) {
+      const outcome = await this._resumeClaimedChannelInboxRow(storage, row, claimId, now, cfg);
+      if (outcome === 'queued') queued++;
+      else if (outcome === 'failed') failed++;
+      else if (outcome === 'dead') dead++;
+    }
+    return { claimed: batch.length, queued, failed, dead };
+  }
+
+  /** Resume a single claimed inbox row; owns its own failure persistence so the
+   * caller never loses the latest committed admission on a throw. */
+  private async _resumeClaimedChannelInboxRow(
+    storage: HarnessStorage,
+    row: ChannelInboxItem,
+    claimId: string,
+    now: number,
+    cfg: {
+      maxAttempts: number;
+      claimTtlMs: number;
+      claimRenewMs: number;
+      retryBackoffMs: (attempt: number) => number;
+    },
+  ): Promise<'queued' | 'failed' | 'dead'> {
+    // A row already at the attempt ceiling dead-letters without another attempt.
+    if (row.attempts >= cfg.maxAttempts) {
+      return this._failClaimedChannelInboxRow(storage, row, row, claimId, now, cfg, {
+        message: `channel inbox row exceeded maxAttempts (${cfg.maxAttempts})`,
+        forceDead: true,
+      });
+    }
+    // The latest row state committed under our claim — the failure path spreads
+    // THIS so admissionHash/resolved ids survive a post-admitted error (mirrors
+    // admitChannelInbound's `persisted` invariant).
+    let persisted = row;
+    try {
+      // Keep the claim alive across the (possibly slow: binding resolution,
+      // session cold-start, queue admission) work so a long row doesn't lose its
+      // claim mid-flight and false-conflict its own writes (§14.2 claim renewal).
+      return await this._withChannelInboxClaimHeartbeat(
+        storage,
+        row,
+        claimId,
+        cfg.claimTtlMs,
+        cfg.claimRenewMs,
+        async (): Promise<'queued'> => {
+          if (row.admissionHash !== undefined) {
+        // REPLAY-ONLY: never re-run channel policy once admissionHash exists.
+        if (
+          row.resourceId === undefined ||
+          row.threadId === undefined ||
+          row.sessionId === undefined ||
+          row.bindingId === undefined
+        ) {
+          throw new HarnessValidationError(
+            'recoverChannelInboxOnce',
+            'inbox row carries admissionHash but is missing resolved binding/resource/thread/session ids',
+          );
+        }
+        const bindingId = row.bindingId;
+        const session = await this.session({
+          resourceId: row.resourceId,
+          threadId: row.threadId,
+          sessionId: row.sessionId,
+        } as SessionResolveOptions);
+        // The inbox state machine forbids a direct failed → queued transition; a
+        // retried 'failed' row must pass back through 'admitted' first (clearing
+        // its stale failure metadata). An already-'admitted' row goes straight to
+        // 'queued'.
+        let base = row;
+        if (row.status === 'failed') {
+          const readmittedRow: ChannelInboxItem = {
+            ...row,
+            status: 'admitted',
+            admittedAt: row.admittedAt ?? now,
+            updatedAt: now,
+            failedAt: undefined,
+            deadAt: undefined,
+            nextAttemptAt: undefined,
+            lastError: undefined,
+          };
+          await storage.updateChannelInboxItem(readmittedRow, { claimId });
+          persisted = readmittedRow;
+          base = readmittedRow;
+        }
+        const admit = await session._admitChannelQueueTurn({
+          content: row.content,
+          admissionId: row.id,
+          requestContext: row.requestContext,
+          attachments: row.attachments,
+          expectedAdmissionHash: row.admissionHash,
+          ...(row.mode !== undefined ? { mode: row.mode } : {}),
+          ...(row.model !== undefined ? { model: row.model } : {}),
+        });
+        const queuedRow: ChannelInboxItem = {
+          ...base,
+          status: 'queued',
+          queuedItemId: admit.queuedItemId,
+          queuedAt: base.queuedAt ?? now,
+          updatedAt: now,
+          failedAt: undefined,
+          deadAt: undefined,
+          nextAttemptAt: undefined,
+          lastError: undefined,
+        };
+        await storage.updateChannelInboxItem(queuedRow, { claimId });
+        persisted = queuedRow;
+        this._emitChannelIngressAdmitted(row, admit.queuedItemId, bindingId);
+        return 'queued';
+      }
+      // FROM-SCRATCH: no admissionHash → resume from binding resolution. Keep this
+      // sequence in lockstep with admitChannelInbound (§14.2 steps 5-9).
+      const ctx = reconstructChannelIngressContext(row);
+      const { binding, resolved } = await this._resolveChannelBindingForIngress(ctx);
+      const session = await this.session({
+        resourceId: resolved.resourceId,
+        threadId: resolved.threadId,
+        sessionId: resolved.sessionId,
+      } as SessionResolveOptions);
+      const requestContext = buildChannelRequestContext(ctx, binding.id);
+      const admissionMode = resolved.admission?.mode;
+      const admissionModel = resolved.admission?.model;
+      const admissionHash = session._channelQueueAdmissionHash(
+        { content: ctx.content, mode: admissionMode, model: admissionModel },
+        row.attachments,
+        requestContext,
+      );
+      const admittedRow: ChannelInboxItem = {
+        ...row,
+        status: 'admitted',
+        bindingId: binding.id,
+        resourceId: resolved.resourceId,
+        threadId: resolved.threadId,
+        sessionId: resolved.sessionId,
+        delivery: 'queue',
+        admissionHash,
+        mode: admissionMode,
+        model: admissionModel,
+        requestContext,
+        admittedAt: now,
+        updatedAt: now,
+        failedAt: undefined,
+        deadAt: undefined,
+        nextAttemptAt: undefined,
+        lastError: undefined,
+      };
+      await storage.updateChannelInboxItem(admittedRow, { claimId });
+      persisted = admittedRow;
+      const admit = await session._admitChannelQueueTurn({
+        content: ctx.content,
+        admissionId: row.id,
+        requestContext,
+        attachments: row.attachments,
+        expectedAdmissionHash: admissionHash,
+        mode: admissionMode,
+        model: admissionModel,
+      });
+      const queuedRow: ChannelInboxItem = {
+        ...admittedRow,
+        status: 'queued',
+        queuedItemId: admit.queuedItemId,
+        queuedAt: now,
+        updatedAt: now,
+      };
+      await storage.updateChannelInboxItem(queuedRow, { claimId });
+      persisted = queuedRow;
+      this._emitChannelIngressAdmitted(row, admit.queuedItemId, binding.id);
+      return 'queued';
+        },
+      );
+    } catch (err) {
+      return this._failClaimedChannelInboxRow(storage, row, persisted, claimId, now, cfg, { error: err });
+    }
+  }
+
+  /** Persist a recovery failure: bump attempts, schedule the next attempt (or
+   * dead-letter at the cap), preserve the recovery-complete admission, emit. */
+  private async _failClaimedChannelInboxRow(
+    storage: HarnessStorage,
+    originalRow: ChannelInboxItem,
+    persisted: ChannelInboxItem,
+    claimId: string,
+    now: number,
+    cfg: { maxAttempts: number; retryBackoffMs: (attempt: number) => number },
+    failure: { error?: unknown; message?: string; forceDead?: boolean },
+  ): Promise<'failed' | 'dead'> {
+    const projected = failure.error !== undefined ? projectHarnessPublicError(failure.error) : undefined;
+    const message = projected?.message ?? failure.message ?? 'channel inbox recovery failed';
+    const attempts = failure.forceDead ? originalRow.attempts : originalRow.attempts + 1;
+    // §14.2 error taxonomy: classify the thrown error into the durable failure
+    // shape (status / bare lastError.code / retryable / nextAttemptAt). The
+    // entry-level `forceDead` path (maxAttempts exhausted on claim) keeps the row's
+    // own last code rather than reclassifying.
+    const classified = failure.forceDead
+      ? { status: 'dead' as const, code: originalRow.lastError?.code ?? 'unknown', retryable: false, nextAttemptAt: undefined }
+      : classifyChannelInboxFailure(failure.error, {
+          attempts,
+          maxAttempts: cfg.maxAttempts,
+          now,
+          retryBackoffMs: cfg.retryBackoffMs,
+        });
+    const dead = classified.status === 'dead';
+    try {
+      await storage.updateChannelInboxItem(
+        {
+          ...persisted,
+          status: classified.status,
+          attempts,
+          updatedAt: now,
+          // RELEASE the claim on failure so a retryable row reclaims at its
+          // `nextAttemptAt` backoff rather than waiting out the full claim TTL.
+          // (A KEEP write would preserve the live claim and block reclaim until
+          // it expires; `claimId: undefined` is the storage release signal.)
+          claimId: undefined,
+          claimExpiresAt: undefined,
+          ...(dead
+            ? { deadAt: now, nextAttemptAt: undefined }
+            : { failedAt: now, nextAttemptAt: classified.nextAttemptAt }),
+          lastError: { code: classified.code, message, retryable: classified.retryable },
+        },
+        { claimId },
+      );
+    } catch (writeErr) {
+      // A lost/expired claim is expected (another worker took the row, or the TTL
+      // lapsed) — swallow and let the next tick reclaim. Any OTHER error (e.g. an
+      // illegal transition) signals a bug and must surface, not be masked.
+      if (!(writeErr instanceof HarnessStorageChannelInboxClaimConflictError)) {
+        throw writeErr;
+      }
+    }
+    this._emitter.emit({
+      type: 'channel_ingress_failed',
+      harnessName: this._harnessName,
+      channelId: originalRow.channelId,
+      inboxItemId: originalRow.id,
+      externalMessageId: originalRow.externalMessageId,
+      error: projected ?? { code: 'harness.internal', message },
+    });
+    return dead ? 'dead' : 'failed';
+  }
+
+  /**
    * Return read-only, redacted diagnostics for channel ledger rows visible to a
    * session. This method delegates to the storage read-only diagnostics contract
    * and never claims, retries, dispatches, or reconciles work.
@@ -1498,7 +2497,7 @@ export class Harness {
         deliverySemantics: this._resolveChannelDeliverySemantics(opts, config),
       };
       const now = Date.now();
-      return storage.enqueueChannelOutbox({
+      const result = await storage.enqueueChannelOutbox({
         id: `outbox-${randomUUID()}`,
         harnessName: this._harnessName,
         channelId: binding.channelId,
@@ -1523,6 +2522,19 @@ export class Harness {
         createdAt: now,
         updatedAt: now,
       });
+      // §10.2 channel_outbox_enqueued — only for a freshly-created row (idempotent
+      // re-enqueues and payload-hash conflicts are not new outbound work).
+      if (!result.duplicate && !result.conflict) {
+        this._emitter.emit({
+          type: 'channel_outbox_enqueued',
+          harnessName: this._harnessName,
+          channelId: binding.channelId,
+          outboxItemId: result.outboxItemId,
+          bindingId: binding.bindingId,
+          kind: opts.kind,
+        });
+      }
+      return result;
     },
 
     dispatchOutbox: async (opts: ChannelOutboxDispatchOptions = {}): Promise<ChannelOutboxDispatchResult> => {
@@ -1667,6 +2679,26 @@ export class Harness {
           error: { code, message: `${message}; claim was lost before failure could be recorded` },
         };
       }
+      // §10.2 channel_outbox_failed — emitted only after the durable failure
+      // transition commits (not on the claim-conflict path above, where it was
+      // not recorded). `dead` distinguishes terminal from retryable. §13.3f.1:
+      // project the bare row code to its namespaced harness.* wire code — a bare
+      // row code must never cross the public event boundary.
+      const projectedError = projectRowErrorCode(code);
+      this._emitter.emit({
+        type: 'channel_outbox_failed',
+        harnessName: this._harnessName,
+        channelId: item.channelId,
+        outboxItemId: item.id,
+        bindingId: item.bindingId,
+        attempts: item.attempts,
+        dead,
+        error: {
+          code: projectedError.code,
+          ...(projectedError.reason !== undefined ? { reason: projectedError.reason } : {}),
+          message,
+        },
+      });
       return {
         outboxItemId: item.id,
         status: dead ? ('dead' as const) : ('failed' as const),
@@ -1756,6 +2788,16 @@ export class Harness {
         error: { code: 'unknown', message: 'channel outbox claim was lost before sent delivery could be recorded' },
       };
     }
+    // §10.2 channel_outbox_sent — emitted only after the durable sent transition
+    // commits, so clients never observe a false delivery.
+    this._emitter.emit({
+      type: 'channel_outbox_sent',
+      harnessName: this._harnessName,
+      channelId: item.channelId,
+      outboxItemId: item.id,
+      bindingId: item.bindingId,
+      ...(providerMessageId !== undefined ? { providerMessageId } : {}),
+    });
     return {
       outboxItemId: item.id,
       status: 'sent',
@@ -1815,6 +2857,52 @@ export class Harness {
     }
   }
 
+  /**
+   * §14.2 claim renewal for the channel-ingress recovery worker. Keeps the inbox
+   * row's claim alive while a slow admission runs (binding resolution, session
+   * hydration / cold-start, queue admission can each near the claim TTL). Renews
+   * at `claimRenewMs` against a FRESH `Date.now()` (NOT the worker tick's `now`,
+   * which never advances during the row's async work); a renewal failure just
+   * stops the heartbeat.
+   *
+   * Unlike `_withChannelOutboxClaimHeartbeat`, this does NOT throw a post-operation
+   * heartbeat error: every step the wrapped operation performs is a claim-checked
+   * `updateChannelInboxItem` write, so a genuine claim loss makes that write throw
+   * (which the worker's catch already handles). Throwing a late renewal error here
+   * would mis-report a row that actually committed `queued` — once the terminal
+   * write lands, the renewal naturally fails (terminal rows are unclaimable), and
+   * that benign failure must not surface as a `channel_ingress_failed`.
+   */
+  private async _withChannelInboxClaimHeartbeat<T>(
+    storage: HarnessStorage,
+    item: ChannelInboxItem,
+    claimId: string,
+    claimTtlMs: number,
+    claimRenewMs: number,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    let interval: ReturnType<typeof setInterval> | undefined;
+    const renew = async () => {
+      try {
+        await storage.renewChannelInboxClaim({ inboxItemId: item.id, claimId, now: Date.now(), claimTtlMs });
+      } catch {
+        // Stop renewing. A renewal that fails because the row is now terminal
+        // (the operation already committed) is benign; one that fails because the
+        // claim was lost is surfaced by the next claim-checked write throwing.
+        if (interval !== undefined) clearInterval(interval);
+      }
+    };
+    interval = setInterval(() => {
+      void renew();
+    }, claimRenewMs);
+    interval.unref?.();
+    try {
+      return await operation();
+    } finally {
+      if (interval !== undefined) clearInterval(interval);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Permission gate accessors — §4.2e.
   // -------------------------------------------------------------------------
@@ -1856,11 +2944,11 @@ export class Harness {
       return this._resolveByThread(storage, opts);
     }
 
-    // 3) resourceId-only resolution: most-recent active or create.
-    if ('resourceId' in opts && opts.resourceId) {
-      return this._resolveByResource(storage, opts);
-    }
-
+    // §5.3: there is NO resource-only resolver. "Continue latest" is product
+    // selection policy (read listSessions(...) then resolve a concrete
+    // sessionId/threadId), kept out of the core lifecycle API so old
+    // selectOrCreateThread "continue latest" semantics cannot become a hidden
+    // fallback. Bare `{ resourceId }` is therefore invalid resolver options.
     throw new HarnessConfigError('session()', 'invalid resolver options');
   }
 
@@ -1873,7 +2961,7 @@ export class Harness {
         throw new HarnessSessionNotFoundError(sessionId);
       }
       if (live.isClosing) {
-        throw new HarnessSessionClosingError(sessionId);
+        throw harnessSessionClosingError(live);
       }
       return live;
     }
@@ -1884,11 +2972,44 @@ export class Harness {
       // Cross-tenant existence is never leaked.
       throw new HarnessSessionNotFoundError(sessionId);
     }
+    // §5.2a/§5.3: before reopening or leasing a direct-ID record, confirm it is
+    // still the current owner for its (harness, resource, thread). A different
+    // current owner means the store was corrupted or operator-mutated out of
+    // band — fail closed instead of reopening/leasing a superseded record. This
+    // must run BEFORE the closed→reopen branch so reopen cannot resurrect a
+    // superseded record into a second active owner.
+    const currentOwner = await storage.loadSessionByThread({
+      harnessName: this._harnessName,
+      threadId: stored.threadId,
+      resourceId: stored.resourceId,
+    });
+    if (currentOwner && currentOwner.id !== stored.id) {
+      // §2.2/§4.5: one current owner per (harness, resource, thread). If the
+      // REQUESTED record is superseded (closed/closing) while a different session
+      // currently owns the thread, this is an expected CONFLICT — the caller
+      // supplied a stale session id; tell it the active owner instead of reopening
+      // a superseded record into a second active owner. Only when the requested
+      // record is itself still ACTIVE alongside a different active owner is this
+      // genuine duplicate-owner corruption.
+      if (stored.closedAt !== undefined || stored.closingAt !== undefined) {
+        throw new HarnessSessionConflictError(stored.resourceId, stored.threadId, stored.id, currentOwner.id);
+      }
+      throw new HarnessSessionCorruptError({
+        reason: 'duplicate_session_owner',
+        sessionId: stored.id,
+        resourceId: stored.resourceId,
+        threadId: stored.threadId,
+        ownerSessionIds: [currentOwner.id],
+      });
+    }
+
     if (stored.closedAt !== undefined) {
-      throw new HarnessSessionClosedError(sessionId);
+      // §5.3: direct-ID lookup of a Closed (reopenable) record reopens it under
+      // the normal resource/lease checks, then hydrates.
+      return this._reopen(storage, stored);
     }
     if (stored.closingAt !== undefined) {
-      throw new HarnessSessionClosingError(sessionId);
+      throw harnessSessionClosingError(stored);
     }
 
     await this._markExternalSessionStorageOwner(stored.threadId, { requireExisting: false });
@@ -1924,17 +3045,22 @@ export class Harness {
     for (const live of this._liveSessions.values()) {
       if (live.threadId === threadId && live.resourceId === resourceId) {
         if (live.isClosing) {
-          throw new HarnessSessionClosingError(live.id);
+          throw harnessSessionClosingError(live);
         }
         return live;
       }
     }
 
-    // Storage lookup — adapters filter out closed records.
+    // Storage lookup — returns the current owner including Closed/Closing (§5.2a).
     const stored = await storage.loadSessionByThread({ harnessName: this._harnessName, threadId, resourceId });
     if (stored) {
+      if (stored.closedAt !== undefined) {
+        // §5.3/§5.5: reopen the closed owning record instead of ignoring it and
+        // creating a fresh active record on the same thread.
+        return this._reopen(storage, stored);
+      }
       if (stored.closingAt !== undefined) {
-        throw new HarnessSessionClosingError(stored.id);
+        throw harnessSessionClosingError(stored);
       }
       await this._markExternalSessionStorageOwner(stored.threadId, { requireExisting: false });
       return this._hydrate(storage, stored);
@@ -1956,47 +3082,6 @@ export class Harness {
     });
   }
 
-  private async _resolveByResource(
-    storage: HarnessStorage,
-    opts: Extract<SessionResolveOptions, { resourceId: string }>,
-  ): Promise<Session> {
-    const resourceId = opts.resourceId!;
-
-    // Most-recent live session for that resource wins, when present.
-    let liveCandidate: Session | undefined;
-    for (const live of this._liveSessions.values()) {
-      if (live.resourceId !== resourceId) continue;
-      if (live.isClosing) continue;
-      if (!liveCandidate || live.lastActivityAt > liveCandidate.lastActivityAt) {
-        liveCandidate = live;
-      }
-    }
-    if (liveCandidate) return liveCandidate;
-
-    const summaries = await storage.listSessions({ harnessName: this._harnessName, resourceId, includeClosed: false });
-    // listSessions returns newest-first by lastActivityAt. Closing records
-    // still occupy their active thread key, but resource-only resolution can
-    // skip them and create/hydrate another active session for the resource.
-    for (const head of summaries) {
-      const stored = await storage.loadSession({ harnessName: this._harnessName, sessionId: head.id });
-      if (stored && stored.closedAt === undefined && stored.closingAt === undefined) {
-        await this._markExternalSessionStorageOwner(stored.threadId, { requireExisting: false });
-        return this._hydrate(storage, stored);
-      }
-    }
-
-    // Nothing active → fresh thread + session.
-    return this._createFresh(storage, {
-      resourceId,
-      threadId: this._mintThreadId(),
-      ownsThread: true,
-      origin: opts.origin ?? 'top-level',
-      modeId: opts.modeId,
-      modelId: opts.modelId,
-      parentSessionId: opts.parentSessionId,
-      subagentDepth: opts.subagentDepth,
-    });
-  }
 
   // -------------------------------------------------------------------------
   // Session creation / hydration.
@@ -2016,6 +3101,7 @@ export class Harness {
       subagentDepth?: number;
     },
   ): Promise<Session> {
+    await this._enforceMaxLiveCap();
     const sessionId = init.sessionId ?? `sess-${randomUUID()}`;
     const now = Date.now();
 
@@ -2062,8 +3148,11 @@ export class Harness {
         resourceId: init.resourceId,
       });
       if (existing) {
+        if (existing.closedAt !== undefined) {
+          return this._reopen(storage, existing);
+        }
         if (existing.closingAt !== undefined) {
-          throw new HarnessSessionClosingError(existing.id);
+          throw harnessSessionClosingError(existing);
         }
         return this._hydrate(storage, existing);
       }
@@ -2079,7 +3168,12 @@ export class Harness {
       });
     } catch (err) {
       if (err instanceof HarnessStorageParentSessionUnavailableError) {
-        if (err.reason === 'closing') throw new HarnessSessionClosingError(err.parentSessionId);
+        if (err.reason === 'closing')
+          throw harnessSessionClosingError({
+            id: err.parentSessionId,
+            closingAt: err.closingAt,
+            closeDeadlineAt: err.closeDeadlineAt,
+          });
         if (err.reason === 'closed') throw new HarnessSessionClosedError(err.parentSessionId);
         throw new HarnessSessionNotFoundError(err.parentSessionId);
       }
@@ -2088,12 +3182,18 @@ export class Harness {
       if (err instanceof HarnessStorageVersionConflictError) {
         throw new HarnessSessionLockedError(sessionId, 'unknown', 0);
       }
-      throw new HarnessStorageError(sessionId, 'flush', err);
+      throw new HarnessStorageError({ operation: 'session_create', sessionId, cause: err });
     }
 
     if (!admitted.created) {
+      // A current owner already holds this (harness, resource, thread) key.
+      // §5.3/§5.5: reopen a Closed owner, fail a Closing one, hydrate an Active
+      // one — never create a second active owner behind a non-active record.
+      if (admitted.record.closedAt !== undefined) {
+        return this._reopen(storage, admitted.record);
+      }
       if (admitted.record.closingAt !== undefined) {
-        throw new HarnessSessionClosingError(admitted.record.id);
+        throw harnessSessionClosingError(admitted.record);
       }
       return this._hydrate(storage, admitted.record);
     }
@@ -2101,12 +3201,28 @@ export class Harness {
     return this._publish(storage, admitted.record);
   }
 
+  /**
+   * @internal §6.2 strict-lazy + subagent `inherit`. A child inheriting its
+   * parent's workspace requires the parent's per-session registry entry to exist,
+   * but under strict-lazy materialization a parent turn may never have resolved
+   * its workspace. Resolve the (live) parent's workspace first — idempotent if it
+   * was already materialized — so the child's `inheritPerSession` acquire finds it.
+   * No-op when the parent is not live; the registry then surfaces its clear
+   * "no workspace to inherit" error.
+   */
+  async _internalEnsureParentWorkspaceForInherit(parentSessionId: string): Promise<void> {
+    const liveParent = this._liveSessions.get(parentSessionId);
+    if (liveParent && !liveParent.isClosed && !liveParent.isClosing) {
+      await liveParent.getWorkspace();
+    }
+  }
+
   private _getLiveParentAdmissionError(parentSessionId: string | undefined, resourceId: string): Error | undefined {
     if (!parentSessionId) return undefined;
     const liveParent = this._liveSessions.get(parentSessionId);
     if (!liveParent) return undefined;
     if (liveParent.resourceId !== resourceId) return new HarnessSessionNotFoundError(parentSessionId);
-    if (liveParent.isClosing) return new HarnessSessionClosingError(parentSessionId);
+    if (liveParent.isClosing) return harnessSessionClosingError(liveParent);
     if (liveParent.isClosed) return new HarnessSessionClosedError(parentSessionId);
     return undefined;
   }
@@ -2130,6 +3246,7 @@ export class Harness {
   }
 
   private async _hydrate(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
+    await this._enforceMaxLiveCap();
     const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
     const record: SessionRecord = {
       ...stored,
@@ -2137,6 +3254,49 @@ export class Harness {
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
     };
+    const session = this._publish(storage, record, await this._eventReplaySeedFor(storage, record));
+    // §10.2: a session re-loaded from storage into the live cache emits a
+    // (session-scoped, non-terminal) `session_hydrated` observer notification.
+    session._emit({ type: 'session_hydrated' });
+    return session;
+  }
+
+  /**
+   * Reopen a Closed (reopenable) record (§5.3/§5.5): prove ownership via the
+   * lease, then durably clear the closed/closing markers under CAS so the
+   * record returns to its current-owner key as Active. Reuses the same lease +
+   * CAS primitives as hydrate — `saveSession` replaces the record (clearing
+   * `closedAt`) and preserves the lease metadata that `acquireSessionLease`
+   * just set, so no separate atomic reopen storage op is required.
+   */
+  private async _reopen(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
+    await this._enforceMaxLiveCap();
+    const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
+    const reopened: SessionRecord = {
+      ...stored,
+      closedAt: undefined,
+      closingAt: undefined,
+      closeDeadlineAt: undefined,
+      ownerId: this.ownerId,
+      leaseExpiresAt: lease.expiresAt,
+      version: lease.version,
+    };
+    let saved: { version: number };
+    try {
+      saved = await storage.saveSession(reopened, {
+        harnessName: stored.harnessName,
+        ownerId: this.ownerId,
+        ifVersion: lease.version,
+      });
+    } catch (err) {
+      // Lost a race with a concurrent close/delete/reopen on the same record.
+      if (err instanceof HarnessStorageVersionConflictError) {
+        throw new HarnessSessionLockedError(stored.id, 'unknown', 0);
+      }
+      throw new HarnessStorageError({ operation: 'session_save', sessionId: stored.id, cause: err });
+    }
+    const record: SessionRecord = { ...reopened, version: saved.version };
+    await this._markExternalSessionStorageOwner(record.threadId, { requireExisting: false });
     return this._publish(storage, record, await this._eventReplaySeedFor(storage, record));
   }
 
@@ -2181,6 +3341,7 @@ export class Harness {
       record,
       leaseExpiresAt: record.leaseExpiresAt ?? Date.now() + this._leaseTtlMs,
       eventReplaySeed: opts.eventReplaySeed,
+      persistTransientStreamingEvents: this._persistTransientStreamingEvents,
     });
     if (workspaceLost) session._markWorkspaceLost();
     this._hasAdoptedSessions = true;
@@ -2230,7 +3391,7 @@ export class Harness {
   private _ensureLeaseRenewalLoop(): void {
     if (this._shutdown) return;
     if (this._leaseRenewalTimer !== undefined) return;
-    const intervalMs = Math.max(1_000, Math.floor(this._leaseTtlMs / 3));
+    const intervalMs = Math.max(1_000, this._lockRenewMs);
     this._leaseRenewalTimer = setInterval(() => {
       void this._renewLiveSessionLeases();
     }, intervalMs);
@@ -2248,46 +3409,372 @@ export class Harness {
     this._stopLeaseRenewalLoop();
   }
 
+  // ---------------------------------------------------------------------------
+  // §14.2 channel-ingress recovery worker scheduler. Mirrors the lease-renewal
+  // loop, but starts on BIND (not session adoption): crashed/received/failed
+  // inbox rows must be recovered even when no session is live. Idle harnesses
+  // without channels never start the timer. `unref`ed so it never holds the
+  // process open; stopped on shutdown.
+  // ---------------------------------------------------------------------------
+
+  private _ensureChannelInboxRecoveryLoop(): void {
+    if (this._shutdown) return;
+    if (this._channelInboxRecoveryTimer !== undefined) return;
+    if (this._channelRegistry.list().length === 0) return; // no channels → no worker
+    const intervalMs = this._resolveChannelInboxPollIntervalMs();
+    this._channelInboxRecoveryTimer = setInterval(() => {
+      void this._tickChannelInboxRecovery();
+    }, intervalMs);
+    this._channelInboxRecoveryTimer.unref?.();
+  }
+
+  private _stopChannelInboxRecoveryLoop(): void {
+    if (this._channelInboxRecoveryTimer === undefined) return;
+    clearInterval(this._channelInboxRecoveryTimer);
+    this._channelInboxRecoveryTimer = undefined;
+  }
+
+  /** §9 poll cadence: the smallest configured channel `inbox.pollIntervalMs`,
+   * floored at 1s (a single harness-level tick sweeps every channel). */
+  private _resolveChannelInboxPollIntervalMs(): number {
+    let interval = 1_000;
+    let seen = false;
+    for (const binding of this._channelRegistry.list()) {
+      const poll = this._channelRegistry.getConfig(binding.channelId)?.inbox?.pollIntervalMs;
+      if (poll !== undefined && (!seen || poll < interval)) {
+        interval = poll;
+        seen = true;
+      }
+    }
+    return Math.max(1_000, interval);
+  }
+
+  /**
+   * @internal §14.2 recovery worker tick — one `recoverChannelInboxOnce` pass per
+   * configured channel. Reentrancy-guarded so a slow pass never overlaps the next
+   * interval. A per-channel failure is isolated (storage errors surface as a
+   * `storage_error` observer event; others are swallowed and retried next tick) so
+   * one bad channel never starves the others.
+   */
+  async _tickChannelInboxRecovery(): Promise<void> {
+    if (this._shutdown || this._channelInboxRecoveryRunning) return;
+    this._channelInboxRecoveryRunning = true;
+    try {
+      for (const binding of this._channelRegistry.list()) {
+        if (this._shutdown) break;
+        try {
+          await this.recoverChannelInboxOnce({ channelId: binding.channelId });
+        } catch (err) {
+          if (err instanceof HarnessStorageError) this._emitStorageError(err);
+          // else: transient/per-row failure — the next tick reclaims and retries.
+        }
+      }
+    } finally {
+      this._channelInboxRecoveryRunning = false;
+    }
+  }
+
   private async _renewLiveSessionLeases(): Promise<void> {
     if (this._shutdown || this._liveSessions.size === 0) {
       this._stopLeaseRenewalLoopIfIdle();
       return;
     }
     const storage = this._requireStorage('session lease renewal');
-    const sessions = Array.from(this._liveSessions.values());
-    await Promise.all(sessions.map(session => this._renewLiveSessionLease(storage, session)));
+    // §5.8: only roots renew. A root renewal extends the root AND every active
+    // descendant atomically (`renewSessionLeaseSubtree`). Children have no
+    // separately-renewable lease, so they are never renewed independently here.
+    const live = Array.from(this._liveSessions.values());
+    const roots: Session[] = [];
+    const orphans: Session[] = [];
+    for (const session of live) {
+      if (session.parentSessionId === undefined) {
+        roots.push(session);
+      } else if (this._resolveLiveRoot(session) === undefined) {
+        // A live descendant whose ancestry is not fully live (e.g. a child
+        // hydrated by direct id/thread access without its root) can never be
+        // covered by a root subtree renewal — fence it as lease_lost (§5.8).
+        orphans.push(session);
+      }
+    }
+    await Promise.all(roots.map(root => this._renewLiveSessionLeaseSubtree(storage, root)));
+    for (const orphan of orphans) {
+      if (this._liveSessions.get(orphan.id) === orphan) await this._evictLiveSession(orphan, 'lease_lost');
+    }
+    await this._evictIdleSessions();
     this._stopLeaseRenewalLoopIfIdle();
   }
 
-  private async _renewLiveSessionLease(storage: HarnessStorage, session: Session): Promise<void> {
-    if (session.lifecycleState !== 'live' && session.lifecycleState !== 'closing') return;
-    if (this._leaseRenewingSessionIds.has(session.id)) return;
-    this._leaseRenewingSessionIds.add(session.id);
-    try {
-      await session._enqueueLeaseRenewal(async () => {
-        const record = session.getRecord();
-        const effectiveTtl = session._getEffectiveLeaseTtlMs(this._leaseTtlMs);
-        const lease = await storage.renewSessionLease({
-          harnessName: record.harnessName,
-          sessionId: session.id,
-          ownerId: this.ownerId,
-          ttlMs: effectiveTtl,
-        });
-        session._markLeaseRenewed(lease.expiresAt);
-      });
-    } catch (err) {
-      if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionNotFoundError) {
-        await this._evictLiveSession(session, 'lease_lost');
-        return;
+  /**
+   * §5.4 idle eviction: drop live sessions with no activity for `idleTimeoutMs`,
+   * skipping any pinned (subtree-pinned) session. Runs on the keep-alive
+   * cadence; the evicted record stays in storage and rehydrates on next access.
+   */
+  private async _evictIdleSessions(): Promise<void> {
+    if (!Number.isFinite(this._idleTimeoutMs)) return;
+    const cutoff = Date.now() - this._idleTimeoutMs;
+    const idle: Session[] = [];
+    for (const session of this._liveSessions.values()) {
+      if (session.lastActivityAt > cutoff) continue;
+      if (this._isPinnedSubtree(session)) continue;
+      idle.push(session);
+    }
+    for (const session of idle) {
+      if (this._liveSessions.get(session.id) === session) {
+        await this._evictLiveSession(session, 'idle');
       }
-      console.error('[harness/v1] session lease renewal failed:', err);
-    } finally {
-      this._leaseRenewingSessionIds.delete(session.id);
     }
   }
 
-  private async _evictLiveSession(session: Session, reason: 'lease_lost'): Promise<void> {
+  /**
+   * §5.8 background renewal for one live root: extend the root + every active
+   * descendant atomically via `renewSessionLeaseSubtree`, then mark the root and
+   * currently-live descendants to the new expiry. On lease conflict / split or a
+   * missing root, fence the entire live subtree as lease_lost.
+   */
+  private async _renewLiveSessionLeaseSubtree(storage: HarnessStorage, root: Session): Promise<void> {
+    if (root.lifecycleState !== 'live' && root.lifecycleState !== 'closing') return;
+    if (this._leaseRenewingSessionIds.has(root.id)) return;
+    this._leaseRenewingSessionIds.add(root.id);
+    try {
+      await root._enqueueLeaseRenewal(async () => {
+        const effectiveTtl = root._getEffectiveLeaseTtlMs(this._leaseTtlMs);
+        await this._renewSubtreeFromRoot(storage, root, effectiveTtl);
+      });
+    } catch (err) {
+      if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionNotFoundError) {
+        // §5.8: subtree renewal failed (lost ownership or subtree split) — fence
+        // the whole live subtree. Recompute live descendants at failure time so
+        // a descendant created during the renewal is not left under a lost root.
+        const subtree = [root, ...this._liveDescendantsOf(root.id)];
+        for (const session of subtree) {
+          if (this._liveSessions.get(session.id) === session) await this._evictLiveSession(session, 'lease_lost');
+        }
+        return;
+      }
+      // §10.2: a background lease-renewal storage failure never reaches a
+      // caller — surface it as a storage_error observer event.
+      if (err instanceof HarnessStorageError) this._emitStorageError(err);
+      console.error('[harness/v1] session subtree lease renewal failed:', err);
+    } finally {
+      this._leaseRenewingSessionIds.delete(root.id);
+    }
+  }
+
+  /**
+   * §5.8 shared subtree renew+mark. Atomically renews the root + active
+   * descendant lease entries in storage, then advances the in-memory expiry on
+   * the root and every currently-live descendant (recomputed post-call so a
+   * descendant created during the renewal is covered). Caller owns reentrancy,
+   * the renewal chain, and the failure policy (evict vs throw).
+   */
+  private async _renewSubtreeFromRoot(
+    storage: HarnessStorage,
+    root: Session,
+    ttlMs: number,
+  ): Promise<SubtreeSessionLeaseResult> {
+    const record = root.getRecord();
+    const lease = await storage.renewSessionLeaseSubtree({
+      harnessName: record.harnessName,
+      rootSessionId: root.id,
+      ownerId: this.ownerId,
+      ttlMs,
+    });
+    root._markLeaseRenewed(lease.expiresAt);
+    for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
+    return lease;
+  }
+
+  /**
+   * @internal §5.8 — prove + renew the lease subtree that owns `session`, used by
+   * the foreground paths (`extendLease`, CAS write-recovery). Resolves the live
+   * root, renews the whole subtree atomically, and returns the new expiry. When
+   * `propagateRootDeadline` is set (a caller-requested `extendLease`), the root's
+   * effective-TTL deadline is advanced so the next background sweep does not
+   * shorten the extension back to the default TTL. Throws
+   * `HarnessSessionLockedError` if the root cannot be proven live in this process
+   * — a child is never renewed on its own row.
+   */
+  async _internalRenewProveSubtree(
+    session: Session,
+    ttlMs: number,
+    opts?: { propagateRootDeadline?: boolean },
+  ): Promise<number> {
+    const storage = this._requireStorage('session lease renewal');
+    const root = this._resolveLiveRoot(session);
+    if (root === undefined) {
+      // Orphan: a live session whose root ownership cannot be proven here. Fence
+      // it rather than renewing a child on its own row.
+      await this._evictLiveSession(session, 'lease_lost');
+      throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+    }
+    // Serialize on the ROOT's lease-renewal chain — the same chain the
+    // background sweep uses — so a foreground extend / CAS proof can't run
+    // concurrently with a root sweep and let the later write shrink the subtree
+    // lease. The floor below (root effective TTL) is only sufficient under this
+    // serialization. `_enqueueLeaseRenewal` skips when the root is no longer
+    // live, leaving `expiresAt` at the 0 sentinel — treated as ownership lost.
+    let expiresAt = 0;
+    try {
+      await root._enqueueLeaseRenewal(async () => {
+        const effectiveTtl = Math.max(ttlMs, root._getEffectiveLeaseTtlMs(this._leaseTtlMs));
+        const lease = await this._renewSubtreeFromRoot(storage, root, effectiveTtl);
+        if (opts?.propagateRootDeadline === true) root._setLeaseExtensionDeadline(lease.expiresAt);
+        expiresAt = lease.expiresAt;
+      });
+      if (expiresAt === 0) {
+        await this._evictLiveSession(session, 'lease_lost');
+        throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+      }
+      return expiresAt;
+    } catch (err) {
+      if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionNotFoundError) {
+        // Lost ownership or subtree split — fence the whole live subtree.
+        const subtree = [root, ...this._liveDescendantsOf(root.id)];
+        for (const member of subtree) {
+          if (this._liveSessions.get(member.id) === member) await this._evictLiveSession(member, 'lease_lost');
+        }
+        if (err instanceof HarnessStorageSessionNotFoundError) throw new HarnessSessionNotFoundError(session.id);
+        throw new HarnessSessionLockedError(session.id, err.heldBy, err.expiresAt);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * §10.2: project a background/best-effort `HarnessStorageError` (one that does
+   * not reach a caller's awaited promise) into a `storage_error` observer event.
+   * Routed to the owning live session when known (session-scoped, fanned to
+   * `harness.subscribe`), else harness-scoped.
+   */
+  private _emitStorageError(err: HarnessStorageError): void {
+    const payload = {
+      type: 'storage_error' as const,
+      operation: err.operation,
+      retryable: err.retryable,
+      error: { code: 'harness.storage' as const, message: err.message },
+      ...(err.resourceId !== undefined ? { resourceId: err.resourceId } : {}),
+      ...(err.threadId !== undefined ? { threadId: err.threadId } : {}),
+      ...(err.harnessName !== undefined ? { harnessName: err.harnessName } : {}),
+      ...(err.channelId !== undefined ? { channelId: err.channelId } : {}),
+      ...(err.subject !== undefined ? { subject: err.subject } : {}),
+    };
+    const session = err.sessionId ? this._liveSessions.get(err.sessionId) : undefined;
+    if (session) {
+      session._emit(payload);
+    } else {
+      this._emitter.emit({ ...payload, ...(err.sessionId !== undefined ? { sessionId: err.sessionId } : {}) });
+    }
+  }
+
+  /**
+   * §5.4 pressure eviction: before adding a new live session that would exceed
+   * `sessions.maxLive`, evict the least-recently-active unpinned session
+   * (flushing its dirty state first). If every live session is pinned (parked on
+   * a pending interaction), reject with `HarnessLiveSessionLimitError` rather
+   * than dropping a pending prompt. No-op when `maxLive` is `Infinity`.
+   */
+  private async _enforceMaxLiveCap(): Promise<void> {
+    if (!Number.isFinite(this._maxLive)) return;
+    while (this._liveSessions.size >= this._maxLive) {
+      const victim = this._selectPressureEvictionVictim();
+      if (!victim) {
+        throw new HarnessLiveSessionLimitError(this._maxLive, this._liveSessions.size);
+      }
+      await this._evictLiveSession(victim, 'pressure');
+    }
+  }
+
+  /** Least-recently-active unpinned live session, or undefined if all are pinned (§5.4). */
+  private _selectPressureEvictionVictim(): Session | undefined {
+    let victim: Session | undefined;
+    for (const candidate of this._liveSessions.values()) {
+      if (this._isPinnedSubtree(candidate)) continue;
+      if (!victim || candidate.lastActivityAt < victim.lastActivityAt) victim = candidate;
+    }
+    return victim;
+  }
+
+  /**
+   * A session is pinned while it parks on a pending interaction; a live
+   * descendant that is pinned also pins its parent/root owner subtree, because
+   * descendant writes share the parent/root lease (§5.4 / §5.8).
+   */
+  private _isPinnedSubtree(session: Session): boolean {
+    if (session.isPinned()) return true;
+    for (const candidate of this._liveSessions.values()) {
+      if (candidate.parentSessionId === session.id && this._isPinnedSubtree(candidate)) return true;
+    }
+    return false;
+  }
+
+  /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
+  private _liveDescendantsOf(rootId: string): Session[] {
+    const out: Session[] = [];
+    const stack: string[] = [rootId];
+    while (stack.length > 0) {
+      const parentId = stack.pop()!;
+      for (const candidate of this._liveSessions.values()) {
+        if (candidate.parentSessionId === parentId) {
+          out.push(candidate);
+          stack.push(candidate.id);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * §5.8: walk a live session's parent chain to its top-level root via
+   * `_liveSessions`. Returns the session itself when it is already a root, or
+   * `undefined` when any ancestor is not live — i.e. the session is an orphan
+   * whose root ownership cannot be proven in this process.
+   */
+  private _resolveLiveRoot(session: Session): Session | undefined {
+    let current: Session | undefined = session;
+    const seen = new Set<string>();
+    while (current !== undefined && current.parentSessionId !== undefined) {
+      if (seen.has(current.id)) return undefined;
+      seen.add(current.id);
+      current = this._liveSessions.get(current.parentSessionId);
+    }
+    return current;
+  }
+
+  private async _evictLiveSession(session: Session, reason: 'lease_lost' | 'pressure' | 'idle'): Promise<void> {
     if (this._liveSessions.get(session.id) !== session) return;
+    // §5.4 `_enforceMaxLiveCap` flushes the victim first. Previously only event
+    // persistence was drained, leaving the session `_flushChain` (buffered
+    // session-record / token-usage writes) un-drained — `_markEvicted` then flips
+    // the session out of the live/closing state, after which `_persistTokenUsageDelta`
+    // short-circuits and any still-buffered write is dropped. Drain the flush chain
+    // first so those writes settle while the session is still live.
+    //
+    // Scope: ONLY the `pressure`/`idle` evictions, which run from the cap enforcer
+    // and the idle reaper — paths NOT re-entrant to a flush. The `lease_lost`
+    // eviction is reached from INSIDE `_flushUpdate` (a lease conflict fences the
+    // subtree mid-flush), so awaiting the flush chain there would await the very
+    // chain we are a link in → deadlock. Lease-lost writes are also already doomed
+    // (the lease is gone; the flush is failing), so there is nothing useful to drain.
+    //
+    // Best-effort + bounded: wrapped like the event flush below (a victim under
+    // memory pressure may still have a failing/slow write), and capped by a short
+    // deadline so a stuck storage write can never block this hot path. Latched
+    // durability errors surface through `shutdown()`, not eviction.
+    if (reason === 'pressure' || reason === 'idle') {
+      try {
+        await session._internalAwaitFlushChain({ deadlineAt: Date.now() + EVICTION_FLUSH_DRAIN_BUDGET_MS });
+      } catch {
+        // Best-effort: do not block or fail eviction on a drained-but-failed/slow flush.
+      }
+      // Re-check the live-map guard after the drain `await`. The drained flush
+      // chain can hit a lease conflict mid-drain and self-evict this very session
+      // via `_internalEvictSubtreeLeaseLost` -> `_evictLiveSession(this,'lease_lost')`,
+      // which already ran `_markEvicted` + emitted `session_evicted` + deleted the
+      // live entry + tore down the bridge. Bailing here avoids a duplicate
+      // `session_evicted` emit and redundant teardown when this pressure/idle path
+      // resumes after its drain. (The lease_lost path skips this drain entirely.)
+      if (this._liveSessions.get(session.id) !== session) return;
+    }
     const record = session.getRecord() as SessionRecord;
     session._markEvicted(record);
     session._emit({ type: 'session_evicted', reason });
@@ -2319,6 +3806,14 @@ export class Harness {
     storage: HarnessStorage,
     record: SessionRecord,
   ): Promise<{ epoch: string; nextSequence: number } | undefined> {
+    // §10.5: when transient streaming deltas are NOT persisted, the persisted
+    // `newestSequence` undercounts the true emitted seq (skipped deltas advanced
+    // the live counter), so seeding `newestSequence + 1` would REUSE seq numbers a
+    // reconnecting client already saw on the prior epoch → silent event-id collision.
+    // Don't reuse the cursor: each rehydrate mints a fresh epoch, so a reconnect with
+    // a prior-epoch Last-Event-ID gets a 412 `stale_epoch` and recovers via the
+    // snapshot/message path (durable SSE replay across restarts is not a v1 goal).
+    if (!this._persistTransientStreamingEvents) return undefined;
     try {
       const state = await storage.getSessionEventReplayState({
         harnessName: record.harnessName,
@@ -2330,26 +3825,42 @@ export class Harness {
       return { epoch: state.epoch, nextSequence: state.newestSequence + 1 };
     } catch (err) {
       if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return undefined;
-      throw new HarnessStorageError(record.id, 'load', err);
+      throw new HarnessStorageError({ operation: 'session_load', sessionId: record.id, cause: err });
     }
   }
 
   private async _acquireLease(storage: HarnessStorage, harnessName: string, sessionId: string) {
-    try {
-      return await storage.acquireSessionLease({
-        harnessName,
-        sessionId,
-        ownerId: this.ownerId,
-        ttlMs: this._leaseTtlMs,
-      });
-    } catch (err) {
-      if (err instanceof HarnessStorageLeaseConflictError) {
-        throw new HarnessSessionLockedError(sessionId, err.heldBy, err.expiresAt);
+    // §5.8 lock acquisition under contention. `lockMode: 'wait'` blocks up to
+    // `lockWaitMs`, re-acquiring once the held lease expires (never authorizing
+    // from a cached `expiresAt` — always re-attempt). `'fail'` rejects
+    // immediately with the current owner. (`'steal'` is reserved/rejected at
+    // construction until the operator fence is implemented.)
+    const waitDeadline = Date.now() + this._lockWaitMs;
+    for (;;) {
+      try {
+        return await storage.acquireSessionLease({
+          harnessName,
+          sessionId,
+          ownerId: this.ownerId,
+          ttlMs: this._leaseTtlMs,
+        });
+      } catch (err) {
+        if (err instanceof HarnessStorageLeaseConflictError) {
+          const now = Date.now();
+          if (this._lockMode !== 'wait' || now >= waitDeadline) {
+            throw new HarnessSessionLockedError(sessionId, err.heldBy, err.expiresAt);
+          }
+          // Wait until the held lease expires (bounded by the wait deadline),
+          // then re-attempt acquisition against authoritative storage state.
+          const wakeAt = Math.min(err.expiresAt, waitDeadline);
+          await new Promise<void>(resolve => setTimeout(resolve, Math.max(1, wakeAt - now)));
+          continue;
+        }
+        if (err instanceof HarnessStorageSessionNotFoundError) {
+          throw new HarnessSessionNotFoundError(sessionId);
+        }
+        throw new HarnessStorageError({ operation: 'session_lease_acquire', sessionId, cause: err });
       }
-      if (err instanceof HarnessStorageSessionNotFoundError) {
-        throw new HarnessSessionNotFoundError(sessionId);
-      }
-      throw new HarnessStorageError(sessionId, 'load', err);
     }
   }
 
@@ -2408,6 +3919,38 @@ export class Harness {
     }
     if (this._shutdown) return;
     await this._deleteClosedTree(storage, tree);
+  }
+
+  /**
+   * @internal — backs `Session.clone()` (§4.1 / §2.2). Clones the source's
+   * backing thread (copying committed message history + `ThreadCloneMetadata`
+   * provenance), then mints a new session that OWNS the cloned thread. Per §5.2a
+   * the clone copies NO SessionRecord: mode/model reset to the harness default
+   * (legacy mode/model defaults are explicitly NOT copied from the source), with
+   * empty grants/state/pending. Lease, live handles, pending queue/inbox, and
+   * in-flight tool execution are never copied — the clone is a fresh runtime room
+   * over the copied transcript.
+   */
+  async _cloneSession(source: Session, opts?: { title?: string; copyAppMetadata?: boolean }): Promise<Session> {
+    const storage = this._requireStorage('clone()');
+    const clonedThread = await this._threadOps.clone({
+      resourceId: source.resourceId,
+      threadId: source.threadId,
+      ...(opts?.title ? { title: opts.title } : {}),
+    });
+    // §5.2a: the clone copies NO SessionRecord — the new session is a fresh
+    // runtime room (harness-default mode/model, empty grants/state/pending) over
+    // the copied committed history, and owns the cloned thread. `copyAppMetadata`
+    // selects whether app-owned thread metadata carries over; its strict
+    // `metadata.app`-only gating lands with the metadata.app slice (the
+    // underlying memory.cloneThread currently copies thread metadata regardless).
+    void opts?.copyAppMetadata;
+    return this._createFresh(storage, {
+      resourceId: source.resourceId,
+      threadId: clonedThread.id,
+      ownsThread: true,
+      origin: 'top-level',
+    });
   }
 
   /**
@@ -2605,7 +4148,7 @@ export class Harness {
       try {
         record = await node.live._flushClosingMarker({ closeTimeoutMs: this._closeTimeoutMs });
       } catch (err) {
-        throw new HarnessStorageError(node.record.id, 'flush', err);
+        throw new HarnessStorageError({ operation: 'session_close', sessionId: node.record.id, cause: err });
       }
       persistedCloseIds.add(record.id);
       this._emitSessionClosing(node.live, record);
@@ -2626,7 +4169,7 @@ export class Harness {
       });
       next.version = saved.version;
     } catch (err) {
-      throw new HarnessStorageError(next.id, 'flush', err);
+      throw new HarnessStorageError({ operation: 'session_close', sessionId: next.id, cause: err });
     }
 
     persistedCloseIds.add(next.id);
@@ -2660,7 +4203,7 @@ export class Harness {
         try {
           closed = await node.live._flushClosedMarker(closedAt);
         } catch (err) {
-          throw new HarnessStorageError(node.record.id, 'flush', err);
+          throw new HarnessStorageError({ operation: 'session_close', sessionId: node.record.id, cause: err });
         }
       } else {
         closed = {
@@ -2676,7 +4219,7 @@ export class Harness {
           });
           closed.version = saved.version;
         } catch (err) {
-          throw new HarnessStorageError(closed.id, 'flush', err);
+          throw new HarnessStorageError({ operation: 'session_close', sessionId: closed.id, cause: err });
         }
       }
       await this._releaseClosedSessionResources(storage, closed, node.live, closedLiveSessions);
@@ -2778,7 +4321,7 @@ export class Harness {
     this._stopLeaseRenewalLoopIfIdle();
 
     if (eventPersistenceError !== undefined) {
-      throw new HarnessStorageError(record.id, 'flush', eventPersistenceError);
+      throw new HarnessStorageError({ operation: 'session_save', sessionId: record.id, cause: eventPersistenceError });
     }
   }
 
@@ -2838,13 +4381,21 @@ export class Harness {
     return tree;
   }
 
-  private _collectDeleteBlockers(tree: CloseTreeNode[]): string[] {
-    const blockers: string[] = [];
+  private _collectDeleteBlockers(tree: CloseTreeNode[]): HarnessSessionDeleteBlocker[] {
+    const blockers: HarnessSessionDeleteBlocker[] = [];
     for (const node of tree) {
       const record = node.record;
-      if (record.closedAt === undefined) blockers.push(`${record.id}:not_closed`);
-      if ((record.pendingQueue?.length ?? 0) > 0) blockers.push(`${record.id}:pending_queue`);
-      if (record.pendingResume !== undefined) blockers.push(`${record.id}:pending_resume`);
+      // §4.5b structured blockers: the root of the delete tree is the `session`;
+      // descendants are `child_session`. Queue/inbox dependents carry the
+      // owning row id + its status.
+      const sessionSource: HarnessSessionDeleteBlocker['source'] = node.depth === 0 ? 'session' : 'child_session';
+      if (record.closedAt === undefined) blockers.push({ source: sessionSource, id: record.id, status: 'not_closed' });
+      if ((record.pendingQueue?.length ?? 0) > 0) {
+        blockers.push({ source: 'queue', id: record.id, status: 'pending_queue' });
+      }
+      if (record.pendingResume !== undefined) {
+        blockers.push({ source: 'inbox_response', id: record.id, status: 'pending_resume' });
+      }
       for (const receipt of Object.values(record.queueAdmissionReceipts ?? {})) {
         if (
           receipt.status === 'queued' ||
@@ -2852,12 +4403,12 @@ export class Harness {
           receipt.status === 'accepted' ||
           (receipt.status === 'completed' && receipt.postRunFinalizedAt === undefined)
         ) {
-          blockers.push(`${record.id}:queue_receipt:${receipt.queuedItemId}`);
+          blockers.push({ source: 'queue', id: receipt.queuedItemId, status: receipt.status });
         }
       }
       for (const receipt of Object.values(record.inboxResponseReceipts ?? {})) {
         if (receipt.status === 'accepted' || receipt.retryable === true) {
-          blockers.push(`${record.id}:inbox_receipt:${receipt.responseId}`);
+          blockers.push({ source: 'inbox_response', id: receipt.responseId, status: receipt.status });
         }
       }
     }
@@ -3013,6 +4564,7 @@ export class Harness {
     if (this._shutdown) return;
     this._shutdown = true;
     this._stopLeaseRenewalLoop();
+    this._stopChannelInboxRecoveryLoop();
 
     let storage: HarnessStorage;
     try {
@@ -3072,7 +4624,12 @@ export class Harness {
       if (this._liveSessions.size > 0) {
         this._ensureLeaseRenewalLoop();
       }
-      throw new HarnessStorageError(eventPersistenceError.sessionId, 'flush', eventPersistenceError.error);
+      // §14.2: the recovery worker starts on BIND (independent of live sessions),
+      // so a rolled-back shutdown must resume it or channel recovery stays dead
+      // and channelWorkerReadiness() reports worker_not_started. Self-gates on
+      // no-channels / already-running.
+      this._ensureChannelInboxRecoveryLoop();
+      throw new HarnessStorageError({ operation: 'session_save', sessionId: eventPersistenceError.sessionId, cause: eventPersistenceError.error });
     }
 
     for (const session of sessions) {
@@ -3097,7 +4654,12 @@ export class Harness {
       if (this._liveSessions.size > 0) {
         this._ensureLeaseRenewalLoop();
       }
-      throw new HarnessStorageError(eventPersistenceError.sessionId, 'flush', eventPersistenceError.error);
+      // §14.2: the recovery worker starts on BIND (independent of live sessions),
+      // so a rolled-back shutdown must resume it or channel recovery stays dead
+      // and channelWorkerReadiness() reports worker_not_started. Self-gates on
+      // no-channels / already-running.
+      this._ensureChannelInboxRecoveryLoop();
+      throw new HarnessStorageError({ operation: 'session_save', sessionId: eventPersistenceError.sessionId, cause: eventPersistenceError.error });
     }
 
     for (const session of sessions) {
@@ -3125,9 +4687,13 @@ export class Harness {
     try {
       await this._workspaceRegistry.shutdown();
     } catch {
-      // Best-effort: errors surface through the workspace_error event.
+      // Best-effort: workspace teardown errors are swallowed (provider-owned;
+      // §2.7/§10.2 define no public workspace event).
     }
     this._untrackBoundStorage();
+    // §10.2: harness-scoped process-shutdown marker. No sessionId → delivered to
+    // `harness.subscribe(...)` only, never per-session SSE replay. Sessions persist.
+    this._emitter.emit({ type: 'harness_shutdown' });
   }
 
   // -------------------------------------------------------------------------
@@ -3139,8 +4705,14 @@ export class Harness {
   // leases are released and child sessions are torn
   // down before the thread + messages are removed.
   // -------------------------------------------------------------------------
-
-  threads = {
+  // §0/§4.1/§11.6e/§13: thread CRUD is NOT a public app-facing surface — there
+  // is no `harness.threads.*` lifecycle namespace. These operations live behind
+  // an internal/operator boundary: internal callers use them directly, and
+  // server/operator routes reach them through the `@internal`
+  // `createHarnessOperatorThreadController(harness)` factory. Normal product
+  // lifecycle is `Session.close()` / `Session.delete()` / `Session.rename()`.
+  // @internal
+  _threadOps = {
     create: async (opts: ThreadCreateOptions): Promise<ThreadRecord> => {
       const memory = await this._requireMemoryStorage('threads.create()');
       assertNoHarnessInternalThreadMetadata(opts.metadata, 'threads.create().metadata');
@@ -3192,13 +4764,9 @@ export class Harness {
           }
         }
       }
+      // §4.1/§10.2: thread CRUD is an internal/operator op — it emits no
+      // public HarnessEventV1 event (there is no thread_* family in the union).
       const record = toThreadRecord(thread);
-      this._emitter.emit({
-        type: 'thread_created',
-        threadId: record.id,
-        resourceId: record.resourceId,
-        title: record.title,
-      });
       return record;
     },
 
@@ -3237,7 +4805,6 @@ export class Harness {
       if (!existing || existing.resourceId !== opts.resourceId) {
         throw new HarnessThreadNotFoundError(opts.resourceId, opts.threadId);
       }
-      const previousTitle = existing.title;
       const merged: Record<string, unknown> = {
         ...((existing.metadata as Record<string, unknown> | undefined) ?? {}),
         ...((opts.metadata as Record<string, unknown> | undefined) ?? {}),
@@ -3248,13 +4815,6 @@ export class Harness {
         metadata: merged,
       });
       const record = toThreadRecord(updated);
-      this._emitter.emit({
-        type: 'thread_renamed',
-        threadId: record.id,
-        resourceId: record.resourceId,
-        title: opts.title,
-        previousTitle,
-      });
       return record;
     },
 
@@ -3274,37 +4834,7 @@ export class Harness {
         options: opts.messageLimit !== undefined ? { messageLimit: opts.messageLimit } : undefined,
       });
       const record = toThreadRecord(cloned.thread);
-      this._emitter.emit({
-        type: 'thread_cloned',
-        threadId: record.id,
-        resourceId: record.resourceId,
-        sourceThreadId: opts.threadId,
-        title: record.title,
-      });
       return record;
-    },
-
-    selectOrCreate: async (opts: ThreadSelectOrCreateOptions): Promise<ThreadRecord> => {
-      if (opts.threadId) {
-        const existing = await this.threads.get({
-          resourceId: opts.resourceId,
-          threadId: opts.threadId,
-        });
-        if (existing) return existing;
-        // Fall through and create a fresh thread with the requested id so the
-        // caller can pin a stable URL without breaking resource isolation.
-        return this.threads.create({
-          resourceId: opts.resourceId,
-          threadId: opts.threadId,
-          title: opts.title,
-          metadata: opts.metadata,
-        });
-      }
-      return this.threads.create({
-        resourceId: opts.resourceId,
-        title: opts.title,
-        metadata: opts.metadata,
-      });
     },
 
     delete: async (opts: ThreadDeleteOptions): Promise<void> => {
@@ -3347,7 +4877,6 @@ export class Harness {
           'threads.delete() cannot cascade with a separate session storage override because MemoryStorage.deleteThread deletes global thread rows',
         );
       }
-      let cascaded = false;
       let deletedRootThread = false;
       const rootDeleteMarked = await this._setThreadDeleteInProgress(memory, opts.threadId, true, opts.resourceId);
       try {
@@ -3378,7 +4907,6 @@ export class Harness {
                     sessionId: candidate.id,
                   });
                   if (!stored || stored.threadId !== opts.threadId || stored.resourceId !== opts.resourceId) continue;
-                  cascaded = true;
                   const deletedRecords = await this._forceDeleteSessionRecord(storage, stored, () => !this._shutdown, {
                     resourceId: opts.resourceId,
                   });
@@ -3494,14 +5022,6 @@ export class Harness {
         }
       }
       if (!deletedRootThread) return;
-      this._emitter.emit({
-        type: 'thread_deleted',
-        threadId: opts.threadId,
-        resourceId: opts.resourceId,
-        // Historical event field name. For Harness v1 this now means a
-        // session subtree cascade ran; the cascade hard-deletes after close.
-        cascadedSessionClose: cascaded,
-      });
     },
 
     /**
@@ -3564,13 +5084,6 @@ export class Harness {
         },
       });
 
-      this._emitter.emit({
-        type: 'thread_settings_changed',
-        threadId: opts.threadId,
-        resourceId: opts.resourceId,
-        patch: effectivePatch,
-        removedKeys,
-      });
     },
 
     /**
@@ -3595,7 +5108,7 @@ export class Harness {
      * not exist or is owned by a different resource.
      */
     getSetting: async (opts: ThreadGetSettingOptions): Promise<unknown> => {
-      const settings = await this.threads.getSettings({
+      const settings = await this._threadOps.getSettings({
         resourceId: opts.resourceId,
         threadId: opts.threadId,
       });
@@ -3780,6 +5293,15 @@ export class Harness {
       ) {
         throw new HarnessAttachmentUnavailableError(session.id, 'digest_mismatch', attachmentId);
       }
+      // §10.2: session-scoped attachment_uploaded fires only on a fresh save
+      // (the idempotent existing-digest path above does not re-emit).
+      session._emit({
+        type: 'attachment_uploaded',
+        attachmentId: savedRecord.attachmentId,
+        name: savedRecord.name,
+        mimeType: savedRecord.mimeType,
+        bytes: savedRecord.bytes,
+      });
       return {
         attachmentId: savedRecord.attachmentId,
         resourceId: session.resourceId,
@@ -3809,6 +5331,8 @@ export class Harness {
         }
         throw err;
       }
+      // §10.2: session-scoped attachment_deleted after the durable delete commits.
+      session._emit({ type: 'attachment_deleted', attachmentId: opts.attachmentId });
     },
   };
 
@@ -4017,6 +5541,22 @@ export class Harness {
     await this._evictLiveSession(session, 'lease_lost');
   }
 
+  /**
+   * @internal §5.8 — fence the entire live subtree that owns `session` as
+   * lease_lost. A save lease conflict means subtree ownership was lost (root row
+   * conflict) or split (child row conflict), so the root and every live
+   * descendant must be evicted, not just `session`. Resolves the live root to
+   * cover siblings; falls back to `session` + its live descendants when the root
+   * cannot be resolved (orphan).
+   */
+  async _internalEvictSubtreeLeaseLost(session: Session): Promise<void> {
+    const root = this._resolveLiveRoot(session) ?? session;
+    const subtree = [root, ...this._liveDescendantsOf(root.id)];
+    for (const member of subtree) {
+      if (this._liveSessions.get(member.id) === member) await this._evictLiveSession(member, 'lease_lost');
+    }
+  }
+
   /** @internal — exposed for inspection in tests. */
   _internalLiveSessionCount(): number {
     return this._liveSessions.size;
@@ -4085,17 +5625,220 @@ function zeroTokenUsage(): TokenUsage {
   return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 }
 
-function sha256CanonicalJson(value: JsonValue): string {
-  return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
+// §14.1 channel-binding id derivation. Missing optional external IDs normalise to
+// a sentinel (matching the storage tuple key) so derived ids are stable.
+function normChannelExternalId(value: string | undefined): string {
+  return value ?? ' ';
 }
 
-function canonicalJson(value: JsonValue): string {
-  if (value === null) return 'null';
-  if (typeof value === 'number' || typeof value === 'boolean') return JSON.stringify(value);
-  if (typeof value === 'string') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
-    .join(',')}}`;
+/** §14.1: a stable, namespaced threadId from the resolved resourceId + canonical platform tuple. */
+function deriveChannelThreadId(
+  ctx: {
+    harnessName: string;
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  },
+  resourceId: string,
+): string {
+  const canonical = JSON.stringify([
+    ctx.harnessName,
+    ctx.channelId,
+    ctx.platform,
+    normChannelExternalId(ctx.externalTenantId),
+    normChannelExternalId(ctx.externalChannelId),
+    ctx.externalThreadId,
+    resourceId,
+  ]);
+  return `ch:${createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 32)}`;
+}
+
+/** §14.1: derive the owning session id from the resolved (resourceId, threadId). */
+function deriveChannelSessionId(resourceId: string, threadId: string): string {
+  const canonical = JSON.stringify([resourceId, threadId]);
+  return `chs:${createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 32)}`;
+}
+
+/**
+ * §14.3: the trusted `requestContext.channel` projection, built ONLY from
+ * verified envelope + (once resolved) binding evidence — never from caller input.
+ * `bindingId` is absent at inbox-create (binding not yet resolved) and present
+ * once the binding is committed.
+ */
+function buildChannelRequestContext(
+  ctx: ChannelIngressContext,
+  bindingId?: string,
+): PersistedRequestContextInput {
+  return {
+    channel: {
+      origin: 'inbound',
+      harnessName: ctx.harnessName,
+      channelId: ctx.channelId,
+      providerId: ctx.providerId,
+      platform: ctx.platform,
+      conversationKind: ctx.conversationKind,
+      trigger: ctx.trigger,
+      externalThreadId: ctx.externalThreadId,
+      externalMessageId: ctx.externalMessageId,
+      ...(bindingId !== undefined ? { bindingId } : {}),
+      ...(ctx.externalTenantId !== undefined ? { externalTenantId: ctx.externalTenantId } : {}),
+      ...(ctx.externalChannelId !== undefined ? { externalChannelId: ctx.externalChannelId } : {}),
+      // Map the provider-envelope actor (§14 ChannelActorContext: platformUserId) onto the §14.3
+      // request-context actor (externalUserId). `linkedResourceId` is set only after app-level
+      // identity linking, never at ingress; the envelope's `metadata` is not part of §14.3.
+      ...(ctx.actor !== undefined
+        ? {
+            actor: {
+              externalUserId: ctx.actor.platformUserId,
+              ...(ctx.actor.displayName !== undefined ? { displayName: ctx.actor.displayName } : {}),
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+/**
+ * §14.2 recovery: rebuild the `ChannelIngressContext` a recovery worker needs to
+ * re-resolve a binding for a row that never resolved, from the durable inbox row
+ * + its trusted `requestContext.channel`. `files` and `raw` are intentionally NOT
+ * reconstructed — `ingress.resolveResource` must be deterministic from durable
+ * fields (a policy that depends on raw provider bytes is invalid by design).
+ * Throws if the row predates envelope persistence (missing channel context or
+ * conversationKind/trigger) rather than guessing the policy input; the worker
+ * surfaces that as a retryable failure (then dead-letters at maxAttempts, until
+ * the deferred typed-error taxonomy classifies it as immediately terminal).
+ */
+function reconstructChannelIngressContext(row: ChannelInboxItem): ChannelIngressContext {
+  const ch = row.requestContext.channel;
+  if (ch === undefined || ch.conversationKind === undefined || ch.trigger === undefined) {
+    throw new HarnessValidationError(
+      'recoverChannelInboxOnce',
+      'inbox row is missing the persisted channel envelope (conversationKind/trigger) required to re-resolve its binding',
+    );
+  }
+  return {
+    harnessName: ch.harnessName,
+    channelId: ch.channelId,
+    providerId: ch.providerId,
+    platform: ch.platform,
+    conversationKind: ch.conversationKind,
+    trigger: ch.trigger,
+    externalThreadId: ch.externalThreadId,
+    externalMessageId: row.externalMessageId,
+    content: row.content,
+    receivedAt: row.receivedAt,
+    ...(ch.externalTenantId !== undefined ? { externalTenantId: ch.externalTenantId } : {}),
+    ...(ch.externalChannelId !== undefined ? { externalChannelId: ch.externalChannelId } : {}),
+    // Reverse map: §14.3 request-context actor (externalUserId) → provider-envelope actor
+    // (ChannelActorContext: platformUserId) for re-resolving the binding.
+    ...(ch.actor !== undefined
+      ? {
+          actor: {
+            platformUserId: ch.actor.externalUserId,
+            ...(ch.actor.displayName !== undefined ? { displayName: ch.actor.displayName } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/** §9 default inbox retry backoff: exponential (1s→64s) with bounded jitter. */
+function defaultInboxRetryBackoffMs(attempt: number): number {
+  const base = 1_000;
+  const backoff = base * 2 ** Math.min(Math.max(attempt, 1), 6);
+  const jitter = Math.floor(Math.random() * base);
+  return Math.min(120_000, backoff + jitter);
+}
+
+/**
+ * §14.2 channel-ingress recovery error taxonomy. Maps a thrown admission error to
+ * the durable failure shape the worker persists. `attempts` is the already-bumped
+ * attempt count for this row. Returns the target row status, the BARE
+ * `HarnessRowErrorCode` for `lastError.code`, the retryable flag, and (for a
+ * retryable `failed`) the next-attempt time.
+ *
+ * Terminal (operator-repair `dead`, ignore maxAttempts):
+ *   - HarnessSessionClosedError → 'session_closed' (the row's resolved binding/
+ *     session closed; §14.2 exempts only rows that durably resolved a replacement
+ *     BEFORE admission — the worker has no such row, so it is terminal here).
+ *   - HarnessSessionDeletedError → 'session_deleted' (never retarget).
+ *   - HarnessOverrideConflictError → 'override_conflict' (the spec's "switch to
+ *     queue" branch is for SIGNAL admission; this worker is queue-delivery only,
+ *     so there is nothing to switch to → operator repair).
+ * Deadline-bounded:
+ *   - HarnessSessionClosingError → retryable 'session_closing' with nextAttemptAt
+ *     clamped to closeDeadlineAt; once now ≥ closeDeadlineAt (or attempts exhausted)
+ *     it is terminal 'dead'.
+ * Retryable operational backpressure (→ 'dead' only at maxAttempts):
+ *   - HarnessSessionLockedError → 'session_locked'
+ *   - HarnessLiveSessionLimitError → 'live_session_limit'
+ *   - HarnessQueueFullError → 'queue_full' (retryable because this worker forces
+ *     queue delivery; revisit if signal delivery lands).
+ *   - anything else → 'unknown'.
+ */
+function classifyChannelInboxFailure(
+  error: unknown,
+  opts: { attempts: number; maxAttempts: number; now: number; retryBackoffMs: (attempt: number) => number },
+): { status: 'failed' | 'dead'; code: HarnessRowErrorCode; retryable: boolean; nextAttemptAt?: number } {
+  const { attempts, maxAttempts, now, retryBackoffMs } = opts;
+  const backoffRetry = (code: HarnessRowErrorCode): {
+    status: 'failed' | 'dead';
+    code: HarnessRowErrorCode;
+    retryable: boolean;
+    nextAttemptAt?: number;
+  } =>
+    attempts >= maxAttempts
+      ? { status: 'dead', code, retryable: false }
+      : { status: 'failed', code, retryable: true, nextAttemptAt: now + retryBackoffMs(attempts) };
+
+  // Immediately terminal — operator repair, regardless of attempts.
+  if (error instanceof HarnessSessionClosedError) return { status: 'dead', code: 'session_closed', retryable: false };
+  if (error instanceof HarnessSessionDeletedError) return { status: 'dead', code: 'session_deleted', retryable: false };
+  if (error instanceof HarnessOverrideConflictError) {
+    return { status: 'dead', code: 'override_conflict', retryable: false };
+  }
+  // Unrecoverable row-shape problems (a row missing its persisted envelope or
+  // resolved ids, or an ingress policy that returns an invalid resolution) cannot
+  // be fixed by retrying — dead-letter immediately rather than burning attempts.
+  if (error instanceof HarnessValidationError) return { status: 'dead', code: 'unknown', retryable: false };
+
+  // Retryable only until the closing deadline.
+  if (error instanceof HarnessSessionClosingError) {
+    const deadline = error.closeDeadlineAt;
+    if (now >= deadline || attempts >= maxAttempts) {
+      return { status: 'dead', code: 'session_closing', retryable: false };
+    }
+    return {
+      status: 'failed',
+      code: 'session_closing',
+      retryable: true,
+      nextAttemptAt: Math.min(now + retryBackoffMs(attempts), deadline),
+    };
+  }
+
+  if (error instanceof HarnessSessionLockedError) return backoffRetry('session_locked');
+  if (error instanceof HarnessLiveSessionLimitError) return backoffRetry('live_session_limit');
+  if (error instanceof HarnessQueueFullError) return backoffRetry('queue_full');
+  return backoffRetry('unknown');
+}
+
+/**
+ * @internal Operator/server boundary for thread CRUD (§13 auto-mounted routes).
+ *
+ * Thread create/list/get/rename/clone/delete/settings are intentionally NOT a
+ * public app-facing `harness.threads.*` namespace (§0 mental-model, §4.1, §11.6e:
+ * "there is no `harness.threads.*` lifecycle surface"; §13: "no matching
+ * in-process thread method on Harness"). Server routes and operator tooling
+ * reach these operations through this factory; product app code uses `Session`
+ * lifecycle (`close()` / `delete()` / `rename()`) instead. The underlying
+ * `_threadOps` member remains internal-only and is not part of the public type.
+ */
+export type HarnessOperatorThreadController = Harness['_threadOps'];
+
+/** @internal See {@link HarnessOperatorThreadController}. */
+export function createHarnessOperatorThreadController(harness: Harness): HarnessOperatorThreadController {
+  return harness._threadOps;
 }

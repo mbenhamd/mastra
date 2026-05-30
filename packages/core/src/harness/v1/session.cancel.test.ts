@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { QueueAdmissionReceipt } from '../../storage/domains/harness';
 
 import { MockAgent, setupHarness } from './__test-utils__';
-import { HarnessSessionCancelledError, HarnessValidationError } from './errors';
+import { HarnessAbortedError, HarnessSessionCancelledError, HarnessValidationError } from './errors';
 import type { HarnessEvent } from './events';
 
 function deferred<T = unknown>(): {
@@ -30,36 +30,30 @@ function deferred<T = unknown>(): {
 }
 
 describe('Session.cancel()', () => {
-  it('persists the durable cancelRequest and emits one audit event', async () => {
+  it('persists the durable cancelRequest (idempotent, no public event — §10.2)', async () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
-    const events: HarnessEvent[] = [];
-    session.subscribe(event => {
-      events.push(event);
-    });
+    const eventTypes: string[] = [];
+    session.subscribe(event => eventTypes.push((event as { type: string }).type));
 
     await session.cancel({ reason: 'budget-exceeded', requestedBy: 'route:harness.cancel' });
     await session.cancel({ reason: 'second-call' });
 
+    // The durable verdict is the cancelRequest record; the first request wins.
     expect(session.getRecord().cancelRequest).toMatchObject({
       reason: 'budget-exceeded',
       requestedBy: 'route:harness.cancel',
     });
     expect(typeof session.getRecord().cancelRequest?.requestedAt).toBe('number');
-    expect(events.filter(event => event.type === 'task_cancellation_requested')).toHaveLength(1);
-    expect(events.find(event => event.type === 'task_cancellation_requested')).toMatchObject({
-      reason: 'budget-exceeded',
-      requestedBy: 'route:harness.cancel',
-    });
+    // §10.2: cancellation is not a public HarnessEventV1 event.
+    expect(eventTypes).not.toContain('task_cancellation_requested');
   });
 
-  it('drops queued items, fails receipts, emits per-item events, and rejects live resolvers', async () => {
+  it('drops queued items, fails receipts, and rejects live resolvers', async () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
-    const events: HarnessEvent[] = [];
-    session.subscribe(event => {
-      events.push(event);
-    });
+    const eventTypes: string[] = [];
+    session.subscribe(event => eventTypes.push((event as { type: string }).type));
     const now = Date.now();
     const receipt = {
       admissionId: 'admission-1',
@@ -90,10 +84,9 @@ describe('Session.cancel()', () => {
       status: 'failed',
       error: { code: 'harness.session_cancelled' },
     });
-    expect(events.filter(event => event.type === 'queue_item_cancelled').map(event => event.queuedItemId)).toEqual([
-      'queued-1',
-      'queued-2',
-    ]);
+    // §10.2: per-item cancellation emits no public event — the observable
+    // effect is the rejected operation promises below + the cleared queue.
+    expect(eventTypes).not.toContain('queue_item_cancelled');
     await expect(first.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
     await expect(second.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
   });
@@ -548,7 +541,11 @@ describe('Session.cancel()', () => {
     await run;
 
     expect(session.getRecord().cancelRequest?.reason).toBe('operator-stop');
-    expect(abortReason).toBe('operator-stop');
+    // §6.2: the durable cancelRequest.reason keeps the operator string, but the
+    // tool-visible abort reason is a typed HarnessAbortedError. A top-level cancel
+    // (no parent) is ordinary agent-layer cancellation.
+    expect(abortReason).toBeInstanceOf(HarnessAbortedError);
+    expect(abortReason).toMatchObject({ reason: 'agent_aborted', sessionId: session.id });
   });
 
   it('propagates cancellation to live child sessions but not upward', async () => {
@@ -584,6 +581,49 @@ describe('Session.cancel()', () => {
 
     expect(otherChild.getRecord().cancelRequest?.reason).toBe('child-only');
     expect(otherParent.getRecord().cancelRequest).toBeUndefined();
+  });
+
+  it('aborts a live child turn with parent_aborted when cancellation cascades from its parent (§6.2)', async () => {
+    const { harness, agent } = setupHarness();
+    let release!: () => void;
+    const holdUntil = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let childAbortReason: unknown;
+    agent.enqueueRun({ holdUntil, onAbort: reason => (childAbortReason = reason) });
+
+    const parent = await harness.session({ resourceId: 'u-shared', threadId: { fresh: true } });
+    // A subagent runs under the parent's resource.
+    const child = await harness.session({
+      resourceId: 'u-shared',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+    });
+    (parent as any)._activeSubagents.set('tool-call-1', {
+      subagentSessionId: child.id,
+      agentType: 'default',
+      task: 'child task',
+      parentToolCallId: 'tool-call-1',
+      startedAt: Date.now(),
+    });
+
+    const childRun = child.message({ content: 'child work' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(child.isRunning()).toBe(true);
+
+    // Parent cancel cascades to the live child turn. §6.2: the child's tool-visible
+    // abort reason is `parent_aborted` carrying the parent session id, distinct from
+    // an ordinary `agent_aborted`.
+    await parent.cancel({ reason: 'parent-cancel' });
+    release();
+    await childRun.catch(() => undefined);
+
+    expect(childAbortReason).toBeInstanceOf(HarnessAbortedError);
+    expect(childAbortReason).toMatchObject({
+      reason: 'parent_aborted',
+      sessionId: child.id,
+      parentSessionId: parent.id,
+    });
   });
 });
 
@@ -682,7 +722,7 @@ describe('Session.cancelQueuedItem()', () => {
     await session.cancelQueuedItem({ queuedItemId: 'completed', reason: 'single-drop' });
 
     expect(session.getRecord().pendingQueue.map(item => item.id)).toEqual(['completed']);
-    expect(events.filter(event => event.type === 'queue_item_cancelled')).toHaveLength(0);
+    expect(events.map(e => (e as { type: string }).type)).not.toContain('queue_item_cancelled');
   });
 
   it('is a no-op for unknown queuedItemIds and validates empty ids', async () => {
@@ -695,7 +735,7 @@ describe('Session.cancelQueuedItem()', () => {
 
     await session.cancelQueuedItem({ queuedItemId: 'missing' });
 
-    expect(events.filter(event => event.type === 'queue_item_cancelled')).toHaveLength(0);
+    expect(events.map(e => (e as { type: string }).type)).not.toContain('queue_item_cancelled');
     await expect(session.cancelQueuedItem({ queuedItemId: '' })).rejects.toBeInstanceOf(HarnessValidationError);
   });
 });

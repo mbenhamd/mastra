@@ -709,6 +709,8 @@ interface ToolCallApprovalPayload {
   toolName: string;
   args: Record<string, any>;
   resumeSchema: string;
+  /** Reasons a conditional approval predicate surfaced for why the tool needs approval. */
+  approvalReasons?: readonly string[];
 }
 
 interface ToolCallSuspendedPayload {

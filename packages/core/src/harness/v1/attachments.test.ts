@@ -75,6 +75,32 @@ describe('Harness.attachments', () => {
     ).resolves.toBeNull();
   });
 
+  it('emits session-scoped attachment_uploaded and attachment_deleted (§10.2)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const events: Array<{ type: string; attachmentId?: string; name?: string; mimeType?: string; bytes?: number }> = [];
+    session.subscribe(e => events.push(e as never));
+
+    const result = await harness.attachments.upload({
+      sessionId: session.id,
+      data: Buffer.from('hello attachment'),
+      filename: 'note.txt',
+      contentType: 'text/plain',
+    });
+
+    expect(events.find(e => e.type === 'attachment_uploaded')).toMatchObject({
+      attachmentId: result.attachmentId,
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      bytes: result.bytes,
+    });
+
+    await harness.attachments.delete({ attachmentId: result.attachmentId, sessionId: session.id });
+    expect(events.find(e => e.type === 'attachment_deleted')).toMatchObject({
+      attachmentId: result.attachmentId,
+    });
+  });
+
   it('reuses matching internal URL attachment ids without overwriting existing bytes', async () => {
     const { harness, storage } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -398,5 +424,48 @@ describe('Harness.attachments', () => {
     await expect(
       storage.listAttachmentReferences({ sessionId: session.id, attachmentId: second.attachmentId }),
     ).resolves.toEqual([]);
+  });
+});
+
+describe('Session flat attachment accessors (§4.2e)', () => {
+  it('uploadAttachment maps the raw-bytes form onto a file upload, reports progress, returns the id', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const data = Buffer.from('flat upload bytes');
+    let progress: [number, number] | undefined;
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'flat.txt',
+      mimeType: 'text/plain',
+      data,
+      onProgress: (loaded, total) => {
+        progress = [loaded, total];
+      },
+    });
+
+    expect(attachmentId).toBeTruthy();
+    expect(progress).toEqual([data.byteLength, data.byteLength]);
+
+    const record = await storage.getAttachmentRecord({ sessionId: session.id, attachmentId });
+    expect(record).toMatchObject({
+      ownerSessionId: session.id,
+      name: 'flat.txt',
+      mimeType: 'text/plain',
+      bytes: data.length,
+    });
+  });
+
+  it('deleteAttachment removes a session-scoped attachment by id', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'gone.txt',
+      mimeType: 'text/plain',
+      data: Buffer.from('temporary'),
+    });
+    await session.deleteAttachment({ attachmentId });
+
+    await expect(storage.getAttachmentRecord({ sessionId: session.id, attachmentId })).resolves.toBeNull();
   });
 });
