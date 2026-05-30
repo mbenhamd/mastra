@@ -5,11 +5,19 @@ import {
   HarnessStorageAttachmentInUseError,
   HarnessStorageAttachmentUnavailableError,
   HarnessStorageChannelBindingConflictError,
+  HarnessStorageLeaseConflictError,
+  HarnessStorageProviderCallbackBindingTransitionError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
 } from '@mastra/core/storage';
-import type { ChannelBinding, WorkspaceActionJournalEntry } from '@mastra/core/storage';
+import type {
+  ChannelBinding,
+  HarnessProviderCallbackBinding,
+  WorkspaceActionJournalEntry,
+} from '@mastra/core/storage';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 
 import { exportSchemas, HarnessPG, PostgresStore } from '../..';
@@ -1292,3 +1300,393 @@ function sampleWorkspaceActionJournalEntry(
     ...overrides,
   };
 }
+
+function sampleProviderCallbackBinding(
+  overrides: Partial<HarnessProviderCallbackBinding> = {},
+): HarnessProviderCallbackBinding {
+  return {
+    id: 'callback-binding-1',
+    providerId: 'slack',
+    selectorKind: 'installation',
+    selectorValue: 'installation-1',
+    harnessName: 'default',
+    channelId: 'support',
+    origin: { route: 'support-events' },
+    status: 'active',
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('HarnessPG provider callback binding ledger (§5.1i)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-provider-callback-binding-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  it('dedupes exact active selector bindings and creates the active-selector indexes', async () => {
+    const harness = store.stores.harness!;
+
+    await expect(harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding())).resolves.toMatchObject({
+      duplicate: false,
+      conflict: false,
+      binding: { id: 'callback-binding-1', status: 'active' },
+    });
+    await expect(
+      harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding({ id: 'callback-binding-retry' })),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: false,
+      binding: { id: 'callback-binding-1' },
+    });
+
+    const indexes = await store.db.manyOrNone<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND indexname = ANY($1)
+       ORDER BY indexname`,
+      [['idx_harness_provider_callback_active_selector', 'idx_harness_provider_callback_selector_status']],
+    );
+    expect(indexes.map(row => row.indexname)).toEqual([
+      'idx_harness_provider_callback_active_selector',
+      'idx_harness_provider_callback_selector_status',
+    ]);
+    // The active-selector index is a PARTIAL UNIQUE index (WHERE status = 'active').
+    const activeSelectorDef = indexes.find(
+      row => row.indexname === 'idx_harness_provider_callback_active_selector',
+    )?.indexdef;
+    expect(activeSelectorDef).toMatch(/UNIQUE INDEX/i);
+    expect(activeSelectorDef).toMatch(/WHERE.*status.*=.*'active'/i);
+  });
+
+  it('reports same selector with a different target as a conflict without retargeting', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          channelId: 'sales',
+          origin: { route: 'sales-events' },
+        }),
+      ),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: true,
+      binding: { id: 'callback-binding-1', channelId: 'support' },
+    });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', channelId: 'support' });
+  });
+
+  it('replaces active selector bindings and keeps replaced rows terminal', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding(), {
+        replaceBindingId: 'callback-binding-1',
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-disabled',
+          status: 'disabled',
+          harnessName: 'support-disabled',
+          channelId: 'support-disabled',
+          createdAt: 1500,
+          updatedAt: 1500,
+          origin: { route: 'support-events-disabled' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', status: 'active' });
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).resolves.toMatchObject({
+      duplicate: false,
+      conflict: false,
+      replacedBindingId: 'callback-binding-1',
+      binding: { id: 'callback-binding-2', harnessName: 'support-v2', status: 'active' },
+    });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-2' });
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: false,
+      replacedBindingId: 'callback-binding-1',
+      binding: { id: 'callback-binding-2', status: 'active' },
+    });
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+  });
+
+  it('rejects replacement retries when the previous owner was not replaced by the duplicate id', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+    const stalledReplacement = sampleProviderCallbackBinding({
+      id: 'callback-binding-2',
+      status: 'disabled',
+      harnessName: 'support-v2',
+      channelId: 'support-v2',
+      createdAt: 2000,
+      updatedAt: 2000,
+      origin: { route: 'support-events-v2' },
+    });
+    // Seed a disabled row with the would-be replacement id that the replacement target
+    // never transitioned to (replaced_by_binding_id stays NULL), so the unique-conflict
+    // resolver must refuse to treat the retry as an idempotent success.
+    await store.db.none(
+      `INSERT INTO ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+            (id, provider_id, selector_kind, selector_value, harness_name, channel_id, origin, status,
+             created_at, updated_at, replaced_at, replaced_by_binding_id, last_error)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        stalledReplacement.id,
+        stalledReplacement.providerId,
+        stalledReplacement.selectorKind,
+        stalledReplacement.selectorValue,
+        stalledReplacement.harnessName,
+        stalledReplacement.channelId,
+        JSON.stringify(stalledReplacement.origin),
+        stalledReplacement.status,
+        stalledReplacement.createdAt,
+        stalledReplacement.updatedAt,
+        null,
+        null,
+        null,
+      ],
+    );
+
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', status: 'active' });
+  });
+
+  it('round-trips provider binding JSON columns through mark transitions', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+    await harness.markProviderCallbackBindingStatus({
+      bindingId: 'callback-binding-1',
+      status: 'undeliverable',
+      updatedAt: 2000,
+      lastError: { code: 'worker_unavailable', message: 'provider missing', retryable: true },
+    });
+
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).resolves.toMatchObject({
+      id: 'callback-binding-1',
+      origin: { route: 'support-events' },
+      status: 'active',
+      lastError: undefined,
+    });
+  });
+
+  it('allows disabled or undeliverable bindings to reactivate when no active selector owner exists', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.markProviderCallbackBindingStatus({
+        bindingId: 'callback-binding-1',
+        status: 'disabled',
+        updatedAt: 2000,
+        lastError: { code: 'worker_unavailable', message: 'provider disabled', retryable: true },
+      }),
+    ).resolves.toMatchObject({ status: 'disabled', lastError: { code: 'worker_unavailable' } });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).resolves.toMatchObject({ status: 'active', lastError: undefined });
+    await expect(
+      harness.markProviderCallbackBindingStatus({
+        bindingId: 'callback-binding-1',
+        status: 'undeliverable',
+        updatedAt: 4000,
+        lastError: { code: 'worker_unavailable', message: 'provider undeliverable', retryable: true },
+      }),
+    ).resolves.toMatchObject({ status: 'undeliverable', lastError: { code: 'worker_unavailable' } });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 5000 }),
+    ).resolves.toMatchObject({ status: 'active', lastError: undefined });
+  });
+});
+
+describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-renew-subtree-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  async function seedOwned(
+    id: string,
+    ownerId: string,
+    parentSessionId?: string,
+    overrides: Partial<Parameters<typeof createSampleSessionRecord>[0]> = {},
+  ) {
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id, threadId: `t-${id}`, parentSessionId, ...overrides }), {
+      ownerId,
+      ifVersion: 0,
+    });
+    await harness.acquireSessionLease({ sessionId: id, ownerId, ttlMs: 60_000 });
+  }
+
+  it('atomically renews the root and every active descendant (incl. a grandchild) to one capped expiry', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('child', 'h-1', 'root');
+    await seedOwned('grandchild', 'h-1', 'child');
+
+    const before = Date.now();
+    const result = await harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    // child + grandchild — the recursive CTE must descend past the first level.
+    expect(result.renewedDescendantCount).toBe(2);
+
+    for (const id of ['root', 'child', 'grandchild']) {
+      const rec = await harness.loadSession({ sessionId: id });
+      expect(rec?.leaseExpiresAt).toBeGreaterThanOrEqual(before + 120_000 - 5_000);
+    }
+  });
+
+  it('skips closed descendants (no live lease) but still renews active ones', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('open-child', 'h-1', 'root');
+    // A closed descendant holds no live lease and must not be counted/renewed.
+    await harness.saveSession(
+      createSampleSessionRecord({
+        id: 'closed-child',
+        threadId: 't-closed',
+        parentSessionId: 'root',
+        closedAt: 5000,
+        lastActivityAt: 5000,
+      }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    const result = await harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    expect(result.renewedDescendantCount).toBe(1);
+  });
+
+  it('fences and renews NOTHING when an active descendant is owned by another instance (§5.8 all-or-nothing)', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('foreign-child', 'h-2', 'root'); // split subtree
+
+    const rootBefore = await harness.loadSession({ sessionId: 'root' });
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Root lease must be untouched — no parent-only partial commit.
+    const rootAfter = await harness.loadSession({ sessionId: 'root' });
+    expect(rootAfter?.leaseExpiresAt).toBe(rootBefore?.leaseExpiresAt);
+  });
+
+  it('throws SessionNotFound for an unknown root and LeaseConflict for a non-owned root', async () => {
+    const harness = store.stores.harness!;
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'ghost', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await seedOwned('root', 'h-2'); // owned by someone else
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+});
