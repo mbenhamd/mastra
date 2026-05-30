@@ -243,9 +243,21 @@ export interface TurnErrorEvent extends HarnessEventBase {
 // Operation settlement events (§10.2). These — not `agent_end` — are the
 // promise/SDK settlement boundary for admitted work. One run can answer
 // several signals, so `agent_end` alone never identifies which `signal(...)`
-// or `queue(...)` call completed. `result` is scoped to the operation
-// identified by `signalId` / `queuedItemId`, projected from the durable
-// per-signal result evidence (§5.1d), never from the run aggregate.
+// or `queue(...)` call completed; the operation is identified by `signalId` /
+// `queuedItemId` and projected from the durable per-signal result evidence
+// (§5.1d).
+//
+// `result` SCOPE — two cases, by how the operation reached the model:
+//   - Owned (1:1) signals and `queue(...)` items each run as their OWN turn, so
+//     `result` is the distinct per-operation answer (never the aggregate of
+//     other operations).
+//   - INTERLEAVED active-delivery signals (a `signal(...)` drained into an
+//     already-running turn, §4.2f) share that turn's single continuous
+//     response, so each such `signal_completed.result` is the SHARED run
+//     terminal, not a per-segment distinct answer. This is a documented interim
+//     (per-segment attribution is design-gated — see `_settleSignalResult` in
+//     session.ts). Consumers that need to know which operations were
+//     co-answered together group settlement events by their shared `runId`.
 // ---------------------------------------------------------------------------
 
 export interface SignalCompletedEvent extends HarnessEventBase {
@@ -298,7 +310,9 @@ export interface QueueFailedEvent extends HarnessEventBase {
 // `question_pending` (§10.2: no dedicated sandbox event).
 // ---------------------------------------------------------------------------
 
-type SuspensionSource = { source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string };
+type SuspensionSource =
+  | { source: 'parent' }
+  | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string };
 
 export type ToolApprovalRequiredEvent = HarnessEventBase & {
   type: 'tool_approval_required';
