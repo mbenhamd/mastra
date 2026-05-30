@@ -1115,15 +1115,19 @@ export class HarnessLibSQL extends HarnessStorage {
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
               SET lease_expires_at = ?
               WHERE harness_name = ? AND owner_id = ?
-                AND closed_at IS NULL AND closing_at IS NULL
+                AND closed_at IS NULL
                 AND id IN (${allIds.map(() => '?').join(', ')})`,
         args: [expiresAt, namespace, ownerId, ...allIds],
       });
       if (updateResult.rowsAffected !== allIds.length) {
-        // A concurrent ownership change OR a close/closing transition slipped in
-        // between the read and the write — fail closed, renewing NOTHING (the
-        // rollback discards any partial update). Closed/closing rows hold no live
-        // lease (§5.8), so they are excluded from the UPDATE and trip this guard.
+        // A concurrent ownership change OR a hard CLOSE (closed_at written) slipped
+        // in between the read and the write — fail closed, renewing NOTHING (the
+        // rollback discards any partial update). A CLOSED row holds no live lease
+        // (§5.8) so it is excluded here and trips this guard. The guard does NOT
+        // exclude `closing` rows: the close-drain path keeps renewing a CLOSING
+        // ROOT's lease while it waits (harness `_renewLiveSessionLeaseSubtree`
+        // renews `live` OR `closing` roots), and closing DESCENDANTS are already
+        // dropped from `allIds` by the recursive-CTE selector above.
         throw new HarnessStorageLeaseConflictError(rootSessionId, ownerId, expiresAt);
       }
       await tx.commit();
@@ -4935,7 +4939,13 @@ function denormalizeChannelBindingExternalId(value: string): string | undefined 
 /** True when a binding addresses the same platform-conversation tuple (§14.1). */
 function channelBindingTupleMatches(
   a: ChannelBinding,
-  b: { channelId: string; platform: string; externalTenantId?: string; externalChannelId?: string; externalThreadId: string },
+  b: {
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  },
 ): boolean {
   return (
     a.channelId === b.channelId &&

@@ -3350,7 +3350,12 @@ describe('HarnessLibSQL renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
     await storage.init();
   });
 
-  async function seedOwned(id: string, ownerId: string, parentSessionId?: string, overrides: Partial<SessionRecord> = {}) {
+  async function seedOwned(
+    id: string,
+    ownerId: string,
+    parentSessionId?: string,
+    overrides: Partial<SessionRecord> = {},
+  ) {
     await storage.saveSession(sampleSession({ id, threadId: `t-${id}`, parentSessionId, ...overrides }), {
       ownerId,
       ifVersion: 0,
@@ -3378,12 +3383,33 @@ describe('HarnessLibSQL renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
     await seedOwned('open-child', 'h-1', 'root');
     // A closed descendant holds no live lease and must not be counted/renewed.
     await storage.saveSession(
-      sampleSession({ id: 'closed-child', threadId: 't-closed', parentSessionId: 'root', closedAt: 5000, lastActivityAt: 5000 }),
+      sampleSession({
+        id: 'closed-child',
+        threadId: 't-closed',
+        parentSessionId: 'root',
+        closedAt: 5000,
+        lastActivityAt: 5000,
+      }),
       { ownerId: 'h-1', ifVersion: 0 },
     );
 
     const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
     expect(result.renewedDescendantCount).toBe(1);
+  });
+
+  it('renews a CLOSING root and its active descendants (close-drain keeps the root lease alive)', async () => {
+    // §5.8 / lifecycle.md: session.close() keeps renewing the root lease while it
+    // drains, so the harness renews `live` OR `closing` roots. A closing root must
+    // NOT be fenced by the final-UPDATE close guard (closing != closed).
+    await seedOwned('root', 'h-1', undefined, { closingAt: 1000, closeDeadlineAt: 2000 });
+    await seedOwned('child', 'h-1', 'root');
+
+    const before = Date.now();
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    expect(result.renewedDescendantCount).toBe(1);
+    const rootRec = await storage.loadSession({ sessionId: 'root' });
+    expect(rootRec?.leaseExpiresAt).toBeGreaterThanOrEqual(before + 120_000 - 5_000);
+    expect(rootRec?.closingAt).toBe(1000); // renewal does not clear the close marker
   });
 
   it('fences and renews NOTHING when an active descendant is owned by another instance (§5.8 all-or-nothing)', async () => {
@@ -3482,9 +3508,9 @@ describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () =
   it('rejects a second active binding for the same tuple (§5.2h)', async () => {
     await storage.saveChannelBinding(sampleChannelBinding({ id: 'first' }));
 
-    await expect(
-      storage.saveChannelBinding(sampleChannelBinding({ id: 'second' })),
-    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+    await expect(storage.saveChannelBinding(sampleChannelBinding({ id: 'second' }))).rejects.toBeInstanceOf(
+      HarnessStorageChannelBindingConflictError,
+    );
 
     // The conflict names the holder of the active row.
     await storage
