@@ -32,6 +32,12 @@
 
 export { SlackProvider } from './provider';
 export { SlackManifestClient } from './client';
+export {
+  SlackHarnessAdapter,
+  SlackInboundVerificationError,
+  SlackUrlVerificationChallenge,
+  type SlackHarnessAdapterConfig,
+} from './harness-adapter';
 export { verifySlackRequest, parseSlackFormBody } from './crypto';
 export { buildManifest, DEFAULT_BOT_SCOPES, DEFAULT_BOT_EVENTS } from './manifest';
 
