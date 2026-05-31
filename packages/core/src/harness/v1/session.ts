@@ -1627,7 +1627,11 @@ export class Session {
           // output (Date/Map/class/bigint). Project it at emit so the first
           // live subscriber and the durable/replayed row carry the identical
           // value — the same live===replay guarantee as tool_start/tool_end.
-          input: projectToolEventPayloadForJson(p.input, 'tool_approval_required.input'),
+          input: projectToolEventPayloadForJson(
+            p.input,
+            'tool_approval_required.input',
+            this._harness._internalMaxEventPayloadBytes,
+          ),
         } as EmitInput);
         return;
       case 'tool-suspension':
@@ -1637,7 +1641,11 @@ export class Session {
           toolName: pending.toolName ?? '',
           // §10.2: `suspendData` is the tool's raw `suspendPayload` and can hold
           // runtime objects, so project it at emit for live===replay parity.
-          suspendData: projectToolEventPayloadForJson(p.suspendData, 'tool_suspension_required.suspendData'),
+          suspendData: projectToolEventPayloadForJson(
+            p.suspendData,
+            'tool_suspension_required.suspendData',
+            this._harness._internalMaxEventPayloadBytes,
+          ),
         } as EmitInput);
         return;
       case 'question':
@@ -4323,7 +4331,11 @@ export class Session {
             runId,
             toolCallId: payload.toolCallId,
             toolName: payload.toolName,
-            input: projectToolEventPayloadForJson(payload.args, 'tool_start.input'),
+            input: projectToolEventPayloadForJson(
+              payload.args,
+              'tool_start.input',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
           });
         }
         return;
@@ -4346,7 +4358,11 @@ export class Session {
             runId,
             toolCallId: payload.toolCallId,
             toolName,
-            output: projectToolEventPayloadForJson(payload.result, 'tool_end.output'),
+            output: projectToolEventPayloadForJson(
+              payload.result,
+              'tool_end.output',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
             isError: payload.isError ?? false,
           });
         }
@@ -4371,7 +4387,11 @@ export class Session {
             runId,
             toolCallId: payload.toolCallId,
             toolName,
-            output: projectToolEventPayloadForJson(payload.error, 'tool_end.output'),
+            output: projectToolEventPayloadForJson(
+              payload.error,
+              'tool_end.output',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
             isError: true,
           });
         }

@@ -532,6 +532,15 @@ export interface HarnessFileConfig {
   stagedAttachmentRetentionMs?: number;
   allowPrivateNetworkUrls?: boolean;
   allowedUrlMimeTypes?: readonly string[];
+  /**
+   * Maximum JSON-serialized byte size for a single emitted tool-event payload
+   * (`tool_start.input`, `tool_end.output`, approval/suspension data). A payload
+   * exceeding this is replaced AT EMIT by the stable oversized-payload sentinel
+   * so the durable event ledger and the live wire stay bounded while live and
+   * replay remain identical. Defaults high enough that normal model-generated
+   * tool results are untouched. Must be a non-negative integer.
+   */
+  maxEventPayloadBytes?: number;
 }
 
 // ---------------------------------------------------------------------------

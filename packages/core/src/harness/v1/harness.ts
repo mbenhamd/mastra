@@ -5846,6 +5846,17 @@ export class Harness {
   get _internalGoalDefaults(): Readonly<{ defaultJudgeModel?: string; defaultMaxTurns: number }> {
     return this._goalDefaults;
   }
+
+  /**
+   * @internal — opt-in byte cap for an emitted tool-event payload, consumed by
+   * `Session` at emit. Returns `undefined` (NO cap) unless the host explicitly
+   * sets `files.maxEventPayloadBytes`. Defaulting to a cap would silently change
+   * emit/persist behavior for large payloads, so this stays strictly opt-in: an
+   * unconfigured harness is byte-identical to before this feature existed.
+   */
+  get _internalMaxEventPayloadBytes(): number | undefined {
+    return this._fileConfig.maxEventPayloadBytes;
+  }
 }
 
 function toThreadRecord(thread: {

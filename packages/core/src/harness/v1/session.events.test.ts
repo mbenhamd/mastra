@@ -80,7 +80,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup(opts?: { persistTransientStreamingEvents?: boolean }) {
+function setup(opts?: { persistTransientStreamingEvents?: boolean; maxEventPayloadBytes?: number }) {
   const agent = new FakeAgent('default');
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
   const harness = new Harness({
@@ -96,6 +96,7 @@ function setup(opts?: { persistTransientStreamingEvents?: boolean }) {
         ? { persistTransientStreamingEvents: opts.persistTransientStreamingEvents }
         : {}),
     },
+    ...(opts?.maxEventPayloadBytes !== undefined ? { files: { maxEventPayloadBytes: opts.maxEventPayloadBytes } } : {}),
   });
   return { harness, agent, storage };
 }
@@ -936,6 +937,83 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
     });
 
     expect(live.output).toEqual({ __mastraHarness: 'unserializable-tool-payload' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('replaces an output exceeding files.maxEventPayloadBytes with a stable oversized sentinel identically for live and replay', async () => {
+    // Tiny cap so a modest string blows the budget. The serialized output is
+    // well over 64 bytes, so it is replaced by the oversized-payload sentinel.
+    const { harness, agent, storage } = setup({ maxEventPayloadBytes: 64 });
+    const big = 'x'.repeat(2000);
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'fetch', args: { q: 'big' } }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: { blob: big } }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    // Bounded, detectable marker — NOT the raw payload, NOT the unserializable
+    // sentinel — identical on the live wire and the durable replay row.
+    expect(live.output).toEqual({ __mastraHarness: 'oversized-tool-payload' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('passes a payload under files.maxEventPayloadBytes through verbatim identically for live and replay', async () => {
+    const { harness, agent, storage } = setup({ maxEventPayloadBytes: 64 });
+    // Serialized as {"ok":"hi"} — 11 bytes, well under the 64-byte cap.
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'fetch', args: { q: 'small' } }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: { ok: 'hi' } }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    expect(live.output).toEqual({ ok: 'hi' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('applies NO cap when files.maxEventPayloadBytes is unset (opt-in; byte-identical to pre-feature)', async () => {
+    const { harness, agent, storage } = setup();
+    const result = { items: Array.from({ length: 50 }, (_, i) => ({ id: i, label: `row-${i}` })) };
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'list', args: {} }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    // No cap configured => no sentinel substitution at any size; verbatim.
+    expect(live.output).toEqual(result);
     expect(live.output).toEqual(replay.output);
   });
 

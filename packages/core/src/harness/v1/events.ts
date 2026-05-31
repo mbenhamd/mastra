@@ -855,7 +855,24 @@ export const TOOL_PAYLOAD_UNSERIALIZABLE = {
   __mastraHarness: 'unserializable-tool-payload',
 } as const satisfies JsonValue;
 
-export function projectToolEventPayloadForJson(value: unknown, path: string): JsonValue {
+/**
+ * Stable sentinel substituted for a tool-event payload whose JSON-serialized
+ * size exceeds the configured `files.maxEventPayloadBytes` budget. Distinct
+ * discriminator from {@link TOOL_PAYLOAD_UNSERIALIZABLE} so a consumer can tell
+ * "too large" from "could not serialize" from a genuine result.
+ *
+ * Like the unserializable sentinel, the cap is applied AT EMIT (before the
+ * round-trip `JSON.parse`), so the emitted event carries ONLY the sentinel and
+ * the persist-path whole-event snapshot is a structural no-op for the field —
+ * live === replay by construction. A model-generated tool result that blows the
+ * budget must not silently fall out of the durable ledger nor tear down the
+ * stream; it is replaced by this bounded, detectable marker instead.
+ */
+export const TOOL_PAYLOAD_TOO_LARGE = {
+  __mastraHarness: 'oversized-tool-payload',
+} as const satisfies JsonValue;
+
+export function projectToolEventPayloadForJson(value: unknown, path: string, maxBytes?: number): JsonValue {
   try {
     const encoded = JSON.stringify(value, harnessEventJsonReplacer);
     // A top-level `undefined` / function / symbol serializes to nothing. That
@@ -864,6 +881,15 @@ export function projectToolEventPayloadForJson(value: unknown, path: string): Js
     // on both the live and replay paths.
     if (encoded === undefined) {
       return null;
+    }
+    // Size cap is checked on the already-computed serialized string BEFORE the
+    // round-trip `JSON.parse`, so an oversized payload is never re-materialized
+    // and the sentinel is identical on the live and replay paths. Order is
+    // deliberate: undefined ("no result") first, then size, then parse; the
+    // surrounding `try` keeps the unserializable-sentinel path (bigint / cycle /
+    // throwing `toJSON`) at top priority.
+    if (maxBytes !== undefined && Buffer.byteLength(encoded, 'utf8') > maxBytes) {
+      return { ...TOOL_PAYLOAD_TOO_LARGE };
     }
     return JSON.parse(encoded) as JsonValue;
   } catch {
