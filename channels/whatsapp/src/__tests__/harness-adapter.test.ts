@@ -191,19 +191,82 @@ describe('WhatsAppHarnessAdapter.verifyInbound', () => {
       ],
     };
     await expect(adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never)).rejects.toThrow(
-      /no inbound text message/i,
+      /no inbound chat message/i,
     );
   });
 
-  it('throws (no ingress) for a non-text message type (image)', async () => {
+  it('throws (no ingress) for a non-chat message type (image)', async () => {
     const adapter = makeAdapter();
     const payload = textPayload();
     payload.entry[0]!.changes[0]!.value.messages = [
       { from: '14155550000', id: 'wamid.IMG', timestamp: '1700000000', type: 'image' },
     ];
     await expect(adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never)).rejects.toThrow(
-      /no inbound text message/i,
+      /no inbound chat message/i,
     );
+  });
+
+  it('throws (no ingress) for a reaction message type', async () => {
+    const adapter = makeAdapter();
+    const payload = textPayload();
+    payload.entry[0]!.changes[0]!.value.messages = [
+      { from: '14155550000', id: 'wamid.REACT', timestamp: '1700000000', type: 'reaction', reaction: { message_id: 'wamid.X', emoji: '👍' } } as never,
+    ];
+    await expect(adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never)).rejects.toThrow(
+      /no inbound chat message/i,
+    );
+  });
+
+  it('maps an interactive button_reply into a chat envelope (title as content, id in raw)', async () => {
+    const adapter = makeAdapter();
+    const payload = textPayload();
+    payload.entry[0]!.changes[0]!.value.messages = [
+      {
+        from: '14155550000',
+        id: 'wamid.BTN',
+        timestamp: '1700000000',
+        type: 'interactive',
+        interactive: { type: 'button_reply', button_reply: { id: 'opt-yes', title: 'Yes, proceed' } },
+      } as never,
+    ];
+    const envelope = await adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never);
+    expect(envelope).toMatchObject({
+      platform: 'whatsapp',
+      conversationKind: 'dm',
+      trigger: 'message',
+      externalThreadId: '14155550000',
+      externalMessageId: 'wamid.BTN',
+      content: 'Yes, proceed',
+      actor: { platformUserId: '14155550000', displayName: 'Ada Lovelace' },
+    });
+    const raw = (envelope.raw as WhatsAppWebhookPayload).entry[0]!.changes[0]!.value.messages![0]! as never as {
+      interactive: { button_reply: { id: string } };
+    };
+    expect(raw.interactive.button_reply.id).toBe('opt-yes');
+  });
+
+  it('maps an interactive list_reply into a chat envelope (title as content, id+description in raw)', async () => {
+    const adapter = makeAdapter();
+    const payload = textPayload();
+    payload.entry[0]!.changes[0]!.value.messages = [
+      {
+        from: '14155550000',
+        id: 'wamid.LIST',
+        timestamp: '1700000000',
+        type: 'interactive',
+        interactive: { type: 'list_reply', list_reply: { id: 'row-2', title: 'Standard shipping', description: '3-5 days' } },
+      } as never,
+    ];
+    const envelope = await adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never);
+    expect(envelope).toMatchObject({
+      externalMessageId: 'wamid.LIST',
+      content: 'Standard shipping',
+    });
+    const raw = (envelope.raw as WhatsAppWebhookPayload).entry[0]!.changes[0]!.value.messages![0]! as never as {
+      interactive: { list_reply: { id: string; description?: string } };
+    };
+    expect(raw.interactive.list_reply.id).toBe('row-2');
+    expect(raw.interactive.list_reply.description).toBe('3-5 days');
   });
 });
 

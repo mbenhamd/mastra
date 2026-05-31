@@ -53,13 +53,30 @@ export interface WhatsAppAdapterConfig {
 // Inbound webhook payload shapes (the subset we map).
 // ---------------------------------------------------------------------------
 
+/**
+ * A WhatsApp Cloud API interactive reply: the user tapping a quick-reply button
+ * (`button_reply`) or selecting a list row (`list_reply`). Both carry the
+ * developer-supplied `id` (the routing key set when the menu was sent) and the
+ * human-readable `title`; `list_reply` may also carry a `description`. See
+ * https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples#received-callback-from-a-customer-clicking-a-reply-button
+ */
+export interface WhatsAppInteractiveReply {
+  type: 'button_reply' | 'list_reply' | string;
+  button_reply?: { id: string; title: string };
+  list_reply?: { id: string; title: string; description?: string };
+}
+
 export interface WhatsAppTextMessage {
   from: string;
   id: string;
   timestamp: string;
   type: string;
   text?: { body: string };
-  // image/audio/document/etc. carry their own keys; we only read `text` here.
+  // `type:'interactive'` button/list replies (the user tapped a reply button or
+  // picked a list row). These ARE chat-turn ingress, mapped via the reply title.
+  interactive?: WhatsAppInteractiveReply;
+  // image/audio/document/etc. carry their own keys; we only read `text` /
+  // `interactive` here.
   [key: string]: unknown;
 }
 

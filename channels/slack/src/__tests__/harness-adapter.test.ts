@@ -372,4 +372,71 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
     expect(first).toMatchObject({ kind: 'ok', duplicate: false });
     expect(second).toMatchObject({ kind: 'ok', duplicate: true });
   });
+
+  // -------------------------------------------------------------------------
+  // SIGNAL delivery: a real signed Slack webhook STEERS an active run as a
+  // signal (delivery:'signal', signalId persisted) instead of being queued as a
+  // separate turn. The delivery mode is chosen by the ingress POLICY
+  // (resolveResource → admission.delivery), NOT by the adapter — so the same
+  // verified Slack envelope reaches the §14.2 signal admission path.
+  // Mirrors packages/core/src/harness/v1/harness.test.ts:5050-5075.
+  // -------------------------------------------------------------------------
+
+  /** Capture the latest durable inbox row per id (storage exposes no get-by-id). */
+  function setupSignal() {
+    const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, botUserId: BOT_USER_ID });
+    const composite = new InMemoryStore();
+    const storage = composite.stores.harness;
+    const rows = new Map<string, { delivery?: string; runId?: string; signalId?: string; queuedItemId?: string; acceptedAt?: number; status: string }>();
+    const realUpdate = (storage as unknown as { updateChannelInboxItem: (...a: any[]) => Promise<void> }).updateChannelInboxItem.bind(storage);
+    (storage as unknown as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (record: { id: string } & Record<string, unknown>, opts: { claimId: string }) => {
+      await realUpdate(record as any, opts as any);
+      rows.set(record.id, { ...(record as any) });
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage } as any,
+      channels: {
+        support: {
+          providerId: 'slack',
+          platform: 'slack',
+          adapter,
+          ingress: {
+            // The POLICY selects signal delivery (steer an active run), independent of the adapter.
+            resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+          },
+        },
+      },
+    });
+    new Mastra({
+      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as any }) },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    return { harness, rows };
+  }
+
+  it("admits a real signed Slack webhook as a SIGNAL (delivery:'signal', signalId persisted) when the policy selects signal delivery", async () => {
+    const { harness, rows } = setupSignal();
+    const req = signedRequest(messageEventPayload());
+
+    const result = await harness.handleChannelInboundRequest('support', req as any, { continueAdmission: true });
+
+    // A signal admission accepts synchronously (200) with status 'accepted', NOT 'queued'.
+    expect(result).toMatchObject({ kind: 'ok', ackStatus: 200, status: 'accepted', duplicate: false });
+    expect((result as { sessionId?: string }).sessionId).toMatch(/^chs:/);
+    // queue-only field is absent on a signal admission.
+    expect((result as { queuedItemId?: string }).queuedItemId).toBeUndefined();
+
+    const inboxItemId = (result as { inboxItemId: string }).inboxItemId;
+    const row = rows.get(inboxItemId);
+    expect(row?.delivery).toBe('signal');
+    expect(typeof row?.runId).toBe('string');
+    expect(typeof row?.signalId).toBe('string');
+    expect(row?.acceptedAt).toBeDefined();
+    // a signal row never carries a queued item id.
+    expect(row?.queuedItemId).toBeUndefined();
+  });
 });

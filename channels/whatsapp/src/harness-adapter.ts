@@ -17,6 +17,7 @@ import {
   type WhatsAppSendBody,
   type WhatsAppSendResponse,
   type WhatsAppGraphErrorResponse,
+  type WhatsAppTextMessage,
   type WhatsAppWebhookPayload,
 } from './types';
 
@@ -27,7 +28,8 @@ export const WHATSAPP_PLATFORM = 'whatsapp';
  * Harness channel adapter for the WhatsApp Cloud API (Meta Graph API).
  *
  * - Inbound: verifies `X-Hub-Signature-256` over the raw request bytes, then maps
- *   the first inbound text message into a {@link ChannelIngressEnvelope}.
+ *   the first inbound chat message (a `text` body, or an `interactive`
+ *   button/list reply) into a {@link ChannelIngressEnvelope}.
  * - Outbound: POSTs a text message to `/<version>/<phone_number_id>/messages`.
  *
  * The GET webhook-verification handshake is NOT part of the harness POST inbound
@@ -60,8 +62,11 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
    *
    * THROWS on signature mismatch / malformed header / wrong app secret — the
    * harness maps the throw to `verify_failed`/401. THROWS on a payload that
-   * carries no inbound text message (status callbacks, non-text message types,
-   * unrelated change fields) so it is not admitted as a chat turn.
+   * carries no inbound chat message — i.e. status callbacks (`value.statuses[]`)
+   * and truly non-chat message types (image/audio/document/reaction/system/...) —
+   * so they are not admitted as a chat turn. A `text` body and an `interactive`
+   * button/list reply (the user tapping a reply button / picking a list row) ARE
+   * chat-turn ingress and ARE admitted.
    */
   async verifyInbound(
     request: HarnessChannelTransportRequest,
@@ -78,7 +83,7 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
     }
 
     const payload = this.#parsePayload(rawBody, request.body);
-    return this.#projectFirstTextMessage(payload);
+    return this.#projectFirstChatMessage(payload);
   }
 
   /**
@@ -167,7 +172,7 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
     return JSON.parse(text) as WhatsAppWebhookPayload;
   }
 
-  #projectFirstTextMessage(payload: WhatsAppWebhookPayload): ChannelIngressEnvelope {
+  #projectFirstChatMessage(payload: WhatsAppWebhookPayload): ChannelIngressEnvelope {
     if (payload.object !== 'whatsapp_business_account') {
       throw new Error(`WhatsApp inbound: unexpected object '${String(payload.object)}'`);
     }
@@ -177,9 +182,14 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
         if (change.field !== 'messages') continue;
         const value = change.value ?? {};
         const messages = value.messages ?? [];
-        const message = messages.find(m => m.type === 'text' && m.text?.body !== undefined);
+        // A chat turn is either a `text` body or an `interactive` button/list
+        // reply (the user tapped a quick-reply button / picked a list row). Other
+        // message types (image/audio/document/reaction/system/...) are not chat
+        // ingress here.
+        const message = messages.find(m => this.#chatContent(m) !== undefined);
         if (!message) continue;
 
+        const content = this.#chatContent(message)!;
         const from = message.from;
         const contact = value.contacts?.[0];
         const displayName = contact?.profile?.name;
@@ -196,7 +206,9 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
           externalChannelId: value.metadata?.phone_number_id, // business phone-number id
           externalThreadId: from, // per-user conversation == the user's wa_id
           externalMessageId: message.id,
-          content: message.text!.body,
+          // The reply `title` is the user-facing turn content; the developer-set
+          // reply `id` rides along in `raw` (the full payload) for menu routing.
+          content,
           actor: {
             platformUserId: from,
             ...(displayName !== undefined ? { displayName } : {}),
@@ -207,11 +219,32 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
       }
     }
 
-    // No inbound text message: status callbacks (value.statuses[]) and non-text
-    // message types (image/audio/document/...) are NOT chat-turn ingress. We
-    // throw so the harness does not admit a turn. Status callbacks should be
-    // handled by a dedicated delivery-receipt path, not the ingress route.
-    throw new Error('WhatsApp inbound: no inbound text message to admit');
+    // No inbound chat message: status callbacks (value.statuses[]) and truly
+    // non-chat message types (image/audio/document/reaction/system/...) are NOT
+    // chat-turn ingress. We throw so the harness does not admit a turn. Status
+    // callbacks should be handled by a dedicated delivery-receipt path, not the
+    // ingress route.
+    throw new Error('WhatsApp inbound: no inbound chat message to admit');
+  }
+
+  /**
+   * The chat-turn content for an inbound message, or `undefined` if the message
+   * is not a chat turn we admit. A `text` message yields its body; an
+   * `interactive` button/list reply yields the reply `title` (with the
+   * developer-set reply `id` available on the raw payload for menu routing). All
+   * other message types (image/audio/document/reaction/system/...) yield
+   * `undefined`.
+   */
+  #chatContent(message: WhatsAppTextMessage): string | undefined {
+    if (message.type === 'text') {
+      return message.text?.body;
+    }
+    if (message.type === 'interactive') {
+      const interactive = message.interactive;
+      const reply = interactive?.button_reply ?? interactive?.list_reply;
+      return reply?.title;
+    }
+    return undefined;
   }
 
   #extractText(payload: ChannelOutboxItem['payload']): string {
