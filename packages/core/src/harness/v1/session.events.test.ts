@@ -787,3 +787,324 @@ describe('Harness.subscribe()', () => {
     });
   });
 });
+
+describe('Session events — tool payload JSON-safety at emit (live === replay)', () => {
+  // Capture the LIVE-subscriber event and the durable/replayed row for the same
+  // tool call, then assert they are byte-for-byte equal. The previous
+  // regression delivered the RAW runtime object (Date instance, class instance,
+  // present `undefined` prop, shared aliased ref) to live subscribers while only
+  // the persist path normalized through JSON — so live !== replay.
+  async function captureLiveAndReplay(opts: {
+    storage: any;
+    session: any;
+    sendMessage: () => Promise<void>;
+    liveEvents: HarnessEvent[];
+  }): Promise<{ live: any; replay: any }> {
+    await opts.sendMessage();
+    await expect(opts.session._flushEventPersistence()).resolves.toBeUndefined();
+    const state = await opts.storage.getSessionEventReplayState({
+      sessionId: opts.session.id,
+      resourceId: opts.session.resourceId,
+      threadId: opts.session.threadId,
+    });
+    expect(state).not.toBeNull();
+    const rows = await opts.storage.listSessionEvents({
+      sessionId: opts.session.id,
+      resourceId: opts.session.resourceId,
+      threadId: opts.session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    const live = opts.liveEvents.find(e => (e as any).type === 'tool_end') as any;
+    const replay = rows.map((row: any) => row.event).find((event: any) => event.type === 'tool_end') as any;
+    expect(live).toBeDefined();
+    expect(replay).toBeDefined();
+    return { live, replay };
+  }
+
+  it('projects Date/Map/Set/class-instance/undefined/aliased output identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    class Box {
+      constructor(readonly value: string) {}
+    }
+    const shared = { ok: true };
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'mastra' } }, runId: 'fake-run' },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc1',
+          result: {
+            first: shared,
+            second: shared,
+            at: new Date('2026-05-19T00:00:00.000Z'),
+            boxed: new Box('ok'),
+            map: new Map([['a', 1]]),
+            set: new Set([1, 2]),
+            omitted: undefined,
+          },
+        },
+        runId: 'fake-run',
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    // Stable JSON-safe shape: Date->ISO string, Map/Set->{}, class->plain
+    // object, `undefined` prop dropped, aliased ref split into copies.
+    expect(live.output).toEqual({
+      first: { ok: true },
+      second: { ok: true },
+      at: '2026-05-19T00:00:00.000Z',
+      boxed: { value: 'ok' },
+      map: {},
+      set: {},
+    });
+    expect(live.output).not.toHaveProperty('omitted');
+    // The live value is a normalized clone, NOT the raw runtime object.
+    expect(live.output.at).not.toBeInstanceOf(Date);
+    expect(live.output.boxed).not.toBeInstanceOf(Box);
+    expect(live.output.first).not.toBe(live.output.second);
+    // Live === replay by construction.
+    expect(live.output).toEqual(replay.output);
+    expect(live.isError).toBe(false);
+  });
+
+  it('preserves a tool-error name/code/message identically for live and replay (not flattened to harness.internal)', async () => {
+    const { harness, agent, storage } = setup();
+    class LookupError extends Error {
+      readonly code = 'tool.lookup_failed';
+      constructor(message: string) {
+        super(message);
+        this.name = 'LookupError';
+      }
+    }
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'x' } }, runId: 'fake-run' },
+      { type: 'tool-error', payload: { toolCallId: 'tc1', error: new LookupError('boom') }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    // §13.3f.1: the tool's OWN error keeps faithful name/code/message; it is NOT
+    // reduced to the reserved harness.internal public-error shape.
+    expect(live.output).toEqual({ name: 'LookupError', code: 'tool.lookup_failed', message: 'boom' });
+    // Live never receives the raw Error instance (no stack/cause/prototype leak).
+    expect(live.output).not.toBeInstanceOf(Error);
+    expect(live.output).toEqual(replay.output);
+    expect(live.isError).toBe(true);
+  });
+
+  it('replaces a bigint output with a stable sentinel identically for live and replay (no turn crash, no persistence split)', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'calc', args: { n: 1 } }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: { big: 9007199254740993n } }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    expect(live.output).toEqual({ __mastraHarness: 'unserializable-tool-payload' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('replaces a circular output with a stable sentinel identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    const cyclic: any = { name: 'root' };
+    cyclic.self = cyclic;
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'walk', args: {} }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: cyclic }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    expect(live.output).toEqual({ __mastraHarness: 'unserializable-tool-payload' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('drops a function-valued output prop identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'fn', args: {} }, runId: 'fake-run' },
+      {
+        type: 'tool-result',
+        payload: { toolCallId: 'tc1', result: { kept: 'yes', cb: () => 'drop me' } },
+        runId: 'fake-run',
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    expect(live.output).toEqual({ kept: 'yes' });
+    expect(live.output).not.toHaveProperty('cb');
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('projects a top-level-undefined output to null (a valid no-result, NOT the unserializable sentinel) identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    // A void / side-effect tool returns top-level `undefined`. That is a
+    // legitimate "no result", not a serialization failure, so it must NOT
+    // collapse to the unserializable sentinel (which a UI may read as an error
+    // state). It projects to `null`, identically on live and replay.
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'sideEffect', args: {} }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: undefined }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    const { live, replay } = await captureLiveAndReplay({
+      storage,
+      session,
+      liveEvents,
+      sendMessage: () => session.message({ content: 'hi' }),
+    });
+
+    expect(live.output).toBeNull();
+    // Distinct from the bigint/cycle sentinel — a void result is not a failure.
+    expect(live.output).not.toEqual({ __mastraHarness: 'unserializable-tool-payload' });
+    expect(live.output).toEqual(replay.output);
+  });
+
+  it('projects tool_start.input identically for live and replay', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', args: { when: new Date('2026-05-19T00:00:00.000Z') } },
+        runId: 'fake-run',
+      },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: { ok: true } }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    await session.message({ content: 'hi' });
+    await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    const liveStart = liveEvents.find(e => (e as any).type === 'tool_start') as any;
+    const replayStart = rows.map((row: any) => row.event).find((event: any) => event.type === 'tool_start') as any;
+    expect(liveStart.input).toEqual({ when: '2026-05-19T00:00:00.000Z' });
+    expect(liveStart.input.when).not.toBeInstanceOf(Date);
+    expect(liveStart.input).toEqual(replayStart.input);
+  });
+
+  it('projects tool_approval_required.input identically for live and replay (raw suspend args carry a Date)', async () => {
+    const { harness, agent, storage } = setup();
+    // The suspended output hands the harness RAW runtime args. Without projecting
+    // at the emit site, the first live subscriber would see the live `Date`
+    // while the durable/replayed row (snapshot through JSON) would hold the ISO
+    // string — the same live!==replay divergence the tool_start/tool_end fix
+    // closed. `input` is part of the §10.2 public contract (JSON-safe).
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      finishReason: 'suspended',
+      suspendPayload: {
+        toolCallId: 'tc1',
+        toolName: 'do_thing',
+        args: { when: new Date('2026-05-19T00:00:00.000Z'), nested: { ok: true } },
+      },
+    };
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const liveEvents: HarnessEvent[] = [];
+    session.subscribe(e => {
+      liveEvents.push(e);
+    });
+
+    await session.message({ content: 'do it' });
+    await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+    });
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    const live = liveEvents.find(e => (e as any).type === 'tool_approval_required') as any;
+    const replay = rows
+      .map((row: any) => row.event)
+      .find((event: any) => event.type === 'tool_approval_required') as any;
+    expect(live).toBeDefined();
+    expect(replay).toBeDefined();
+    // Date -> ISO string on BOTH paths; the live subscriber never sees a raw Date.
+    expect(live.input).toEqual({ when: '2026-05-19T00:00:00.000Z', nested: { ok: true } });
+    expect(live.input.when).not.toBeInstanceOf(Date);
+    expect(live.input).toEqual(replay.input);
+  });
+});

@@ -811,6 +811,69 @@ export function snapshotHarnessEventForJson(value: unknown, path = 'event'): Jso
 }
 
 /**
+ * Project a single tool-event payload field (`tool_start.input` /
+ * `tool_end.output`) into its JSON-safe replay shape AT EMIT TIME so the live
+ * subscriber and the durable replay row carry the identical value.
+ *
+ * The raw AI-SDK chunk hands us live runtime objects (`Date` instances, `Map`,
+ * `Set`, class instances, the raw thrown `Error` for a failed tool, `undefined`
+ * own-props, shared/aliased references). Persistence already normalizes the
+ * whole event through {@link snapshotHarnessEventForJson} before writing the
+ * durable row, but live listeners previously received the un-normalized raw
+ * object — so `tool_end.output.at` was a `Date` live but the ISO string on
+ * replay, a class instance live but a plain object on replay, etc.
+ *
+ * Running the SAME projector (sharing {@link harnessEventJsonReplacer}, so a
+ * tool's own nested `Error` stays a faithful `{ name, code, message }` and is
+ * NOT flattened into `harness.internal`) at emit makes live === replay by
+ * construction: the field is already JSON-safe by the time the event is
+ * stamped, so the persist-path `snapshotHarnessEventForJson` over the whole
+ * event is a structural no-op for it.
+ *
+ * Failure mode is deterministic and identical for both paths: a payload that
+ * cannot round-trip through JSON (a `bigint`, a true cycle, a value whose
+ * `toJSON` throws) is replaced by the stable {@link TOOL_PAYLOAD_UNSERIALIZABLE}
+ * sentinel rather than thrown. The emitted event then carries ONLY the
+ * sentinel, so the persist-path snapshot of the whole event succeeds and the
+ * durable row matches the live value byte-for-byte. This deliberately does
+ * NOT crash the turn (a single non-serializable tool result must not tear down
+ * the stream) and does NOT silently disable persistence while live delivery
+ * succeeds — the previous split that the live/replay divergence created.
+ *
+ * A value that legitimately serializes to NOTHING — a top-level `undefined`
+ * (the common void/side-effect tool result), a bare function, or a symbol —
+ * is a valid "no result", NOT a serialization failure, so it projects to
+ * `null` rather than the sentinel. The sentinel is reserved for genuine
+ * round-trip failures (bigint / cycle / throwing `toJSON`), so a consumer that
+ * treats the sentinel as an error state never mislabels a void tool result.
+ * This also matches the pre-projection whole-event snapshot, where an
+ * `output: undefined` field was simply dropped (`JSON.stringify` omits
+ * `undefined`-valued keys) and persistence succeeded.
+ */
+export const TOOL_PAYLOAD_UNSERIALIZABLE = {
+  __mastraHarness: 'unserializable-tool-payload',
+} as const satisfies JsonValue;
+
+export function projectToolEventPayloadForJson(value: unknown, path: string): JsonValue {
+  try {
+    const encoded = JSON.stringify(value, harnessEventJsonReplacer);
+    // A top-level `undefined` / function / symbol serializes to nothing. That
+    // is a legitimate "no result" (a void/side-effect tool), not a failure, so
+    // surface it as `null` instead of the unserializable sentinel — identical
+    // on both the live and replay paths.
+    if (encoded === undefined) {
+      return null;
+    }
+    return JSON.parse(encoded) as JsonValue;
+  } catch {
+    // bigint / circular / throwing `toJSON`: keep the wire JSON-safe and
+    // identical on both paths instead of propagating (which would crash the
+    // drain loop) or silently disabling persistence (live/replay split).
+    return { ...TOOL_PAYLOAD_UNSERIALIZABLE };
+  }
+}
+
+/**
  * Generic, caller-safe message for any error that does NOT already carry a
  * namespaced `harness.*` code. §13.3f.1: `harness.internal` is the reserved
  * catch-all for unhandled failures, and the raw `err.message` (driver text,

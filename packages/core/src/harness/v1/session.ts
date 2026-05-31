@@ -118,6 +118,7 @@ import {
   EventEmitter,
   parseHarnessEventId,
   projectHarnessPublicError,
+  projectToolEventPayloadForJson,
   snapshotHarnessEventForJson,
 } from './events';
 import type {
@@ -1618,7 +1619,12 @@ export class Session {
           toolName: pending.toolName ?? '',
           ...(p.toolCategory !== undefined ? { toolCategory: p.toolCategory } : {}),
           approvalReasons: p.approvalReasons ?? [],
-          input: p.input,
+          // §10.2 (events.ts:202 "Public payloads are JSON-safe projections"):
+          // `p.input` is the raw runtime `payload.args` from the suspended
+          // output (Date/Map/class/bigint). Project it at emit so the first
+          // live subscriber and the durable/replayed row carry the identical
+          // value — the same live===replay guarantee as tool_start/tool_end.
+          input: projectToolEventPayloadForJson(p.input, 'tool_approval_required.input'),
         } as EmitInput);
         return;
       case 'tool-suspension':
@@ -1626,7 +1632,9 @@ export class Session {
           type: 'tool_suspension_required',
           ...base,
           toolName: pending.toolName ?? '',
-          suspendData: p.suspendData,
+          // §10.2: `suspendData` is the tool's raw `suspendPayload` and can hold
+          // runtime objects, so project it at emit for live===replay parity.
+          suspendData: projectToolEventPayloadForJson(p.suspendData, 'tool_suspension_required.suspendData'),
         } as EmitInput);
         return;
       case 'question':
@@ -4270,12 +4278,15 @@ export class Session {
         });
         this._toolInputBuffers.delete(payload.toolCallId);
         if (runId !== undefined) {
+          // §10.2: project `input` to its JSON-safe replay shape AT EMIT so the
+          // live subscriber and the durable/replayed row carry the identical
+          // value (the raw `args` may hold Date/Map/Set/class/bigint/cycles).
           this._emitTurnEvent({
             type: 'tool_start',
             runId,
             toolCallId: payload.toolCallId,
             toolName: payload.toolName,
-            input: payload.args,
+            input: projectToolEventPayloadForJson(payload.args, 'tool_start.input'),
           });
         }
         return;
@@ -4285,12 +4296,14 @@ export class Session {
         const toolName = this._activeTools.get(payload.toolCallId)?.toolName ?? '';
         this._activeTools.delete(payload.toolCallId);
         if (runId !== undefined) {
+          // Project `output` at emit so live === replay (§10.2). Shared/aliased
+          // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
           this._emitTurnEvent({
             type: 'tool_end',
             runId,
             toolCallId: payload.toolCallId,
             toolName,
-            output: payload.result,
+            output: projectToolEventPayloadForJson(payload.result, 'tool_end.output'),
             isError: payload.isError ?? false,
           });
         }
@@ -4301,12 +4314,17 @@ export class Session {
         const toolName = this._activeTools.get(payload.toolCallId)?.toolName ?? '';
         this._activeTools.delete(payload.toolCallId);
         if (runId !== undefined) {
+          // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
+          // `harnessEventJsonReplacer` keeps name/code/message — NOT flattened
+          // into `harness.internal`), and projected at emit so the raw thrown
+          // Error (stack/cause/prototype) never reaches a live subscriber while
+          // replay sees only {name,code,message}.
           this._emitTurnEvent({
             type: 'tool_end',
             runId,
             toolCallId: payload.toolCallId,
             toolName,
-            output: payload.error,
+            output: projectToolEventPayloadForJson(payload.error, 'tool_end.output'),
             isError: true,
           });
         }
