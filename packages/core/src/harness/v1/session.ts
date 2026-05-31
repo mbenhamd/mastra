@@ -4570,7 +4570,10 @@ export class Session {
       ]);
     } catch (err) {
       failOwnedMessageTurnBeforeDispatch(err);
-      throw err;
+      // §13.3f.1 — message() is a public §4.2b boundary; _buildRequestContext can
+      // reject with a raw provider/storage/runtime error (workspace materialization,
+      // persistence). Redact before rejecting the caller's promise.
+      throw redactPublicBoundaryRejection(err);
     }
     assertOwnedMessageTurnNotDeleted();
 
@@ -4665,7 +4668,9 @@ export class Session {
       sub = await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
     } catch (err) {
       failOwnedMessageTurnBeforeDispatch(err);
-      throw err;
+      // §13.3f.1 — message() is a public §4.2b boundary; subscribeToThread can
+      // reject with a raw runtime error. Redact before rejecting the caller.
+      throw redactPublicBoundaryRejection(err);
     }
     assertOwnedMessageTurnNotDeleted();
 
@@ -4729,7 +4734,10 @@ export class Session {
         }
       } catch (err) {
         failOwnedMessageTurnBeforeDispatch(err);
-        throw err;
+        // §13.3f.1 — message() is a public §4.2b boundary; the admission
+        // reservation write can reject with a raw storage error. Redact before
+        // rejecting the caller (the conflict/deleted Harness errors pass through).
+        throw redactPublicBoundaryRejection(err);
       }
       assertOwnedMessageTurnNotDeleted();
     }
@@ -4774,7 +4782,10 @@ export class Session {
         }
       }
       failOwnedMessageTurnBeforeDispatch(thrown);
-      throw thrown;
+      // §13.3f.1 — message() is a public §4.2b boundary; agent.sendSignal() can
+      // throw a raw runtime error. Redact before rejecting the caller's promise
+      // (a HarnessSessionDeletedError from the evidence write passes through).
+      throw redactPublicBoundaryRejection(thrown);
     }
 
     // §10.2 agent_start carries the runId — emit it now that the run is
@@ -4881,7 +4892,10 @@ export class Session {
           await awaitPendingMessageEvidence();
         } catch (err) {
           await failDispatchedMessageTurn(err);
-          throw err;
+          // §13.3f.1 — message({ stream: true }) is a public §4.2b boundary; the
+          // pending-evidence wait can reject with a raw storage error. Redact
+          // before rejecting the caller (internal waiters keep the raw err).
+          throw redactPublicBoundaryRejection(err);
         }
         try {
           out = signal.output
@@ -4919,7 +4933,10 @@ export class Session {
           }
           if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
           void this._maybeDrainQueue();
-          throw err;
+          // §13.3f.1 — message({ stream: true }) is a public §4.2b boundary; the
+          // run-output wait can reject with a raw provider/runtime error. Redact
+          // before rejecting the caller (internal waiters keep the raw err).
+          throw redactPublicBoundaryRejection(err);
         }
       }
       if (!out) {
@@ -4927,13 +4944,18 @@ export class Session {
         // Drop the completion waiter so duplicate retries do not treat an
         // unregistered run as live forever.
         await failDispatchedMessageTurn(err);
-        throw err;
+        // §13.3f.1 — public §4.2b boundary. `err` here is a construction-safe
+        // HarnessConfigError, so the wrap is a pass-through; applied for parity
+        // with the other stream-setup throws.
+        throw redactPublicBoundaryRejection(err);
       }
       try {
         await awaitPendingMessageEvidence();
       } catch (err) {
         await failDispatchedMessageTurn(err);
-        throw err;
+        // §13.3f.1 — public §4.2b boundary; the pending-evidence wait can reject
+        // with a raw storage error. Redact before rejecting the caller.
+        throw redactPublicBoundaryRejection(err);
       }
       let streamCompletedEvidenceWriteFailed = false;
       let streamAgentEndEmitted = false;
@@ -5894,7 +5916,14 @@ export class Session {
         );
       } catch (err) {
         finishOwnedSignalTurn();
-        throw err;
+        // §13.3f.1 — signal() is a public §4.2b boundary; the dispatch setup
+        // (_buildRequestContext / _buildSignalContentsWithAttachments /
+        // agent.sendSignal) can reject with a raw provider/storage/runtime error.
+        // Redact before rejecting the caller (Harness-own deleted/closing errors
+        // pass through unchanged). The trusted `internal` channel-ingress hook is
+        // NOT a public §4.2b caller — the recovery worker needs the concrete
+        // error for failure classification / re-dispatch, so it is exempt.
+        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
       }
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
@@ -6076,7 +6105,11 @@ export class Session {
             runId: dispatched.runId,
             error: projectHarnessPublicError(err),
           });
-          throw err;
+          // §13.3f.1 — `handle.result` is a public §4.2b boundary (same as the
+          // idle-wake branch above); redact a raw cause before rejecting it. The
+          // durable `signal_failed` evidence already uses projectHarnessPublicError,
+          // so only the in-process promise rejection changes.
+          throw redactPublicBoundaryRejection(err);
         }),
     );
     void result.catch(() => {});
@@ -7905,21 +7938,30 @@ export class Session {
         `pending ${expectedKind} resume`,
       ).agent;
     } catch (err) {
+      let thrown = err;
       if (responseId !== undefined) {
-        await this._recordInboxResponsePreDispatchFailure(
-          {
-            responseId,
-            responseHash: responseHash!,
-            itemId,
-            queuedItemId: pendingQueuedItemId,
-            kind: expectedKind,
-            pending,
-            response: persistedResponse,
-          },
-          err,
-        );
+        try {
+          await this._recordInboxResponsePreDispatchFailure(
+            {
+              responseId,
+              responseHash: responseHash!,
+              itemId,
+              queuedItemId: pendingQueuedItemId,
+              kind: expectedKind,
+              pending,
+              response: persistedResponse,
+            },
+            err,
+          );
+        } catch (responseErr) {
+          thrown = responseErr;
+        }
       }
-      throw err;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the runtime-drift
+      // resolution throws a construction-safe HarnessRuntimeDriftError
+      // (pass-through), but the pre-dispatch-failure write can surface a raw
+      // storage error. Redact before rejecting the caller.
+      throw redactPublicBoundaryRejection(thrown);
     }
 
     // Mark resumed under the lease BEFORE calling the agent (idempotency
@@ -8049,7 +8091,11 @@ export class Session {
         }
       }
       finishResumedTurn();
-      throw thrown;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the open-for-turn assert
+      // throws construction-safe Harness errors (pass-through), but the
+      // response-failed write can surface a raw storage error. Redact before
+      // rejecting the caller.
+      throw redactPublicBoundaryRejection(thrown);
     }
     let full: FullOutput<unknown>;
     try {
@@ -8110,7 +8156,13 @@ export class Session {
         });
       }
       finishResumedTurn();
-      throw thrown;
+      // §13.3f.1 — respondTo* (this resume) is a public §4.2b boundary; the
+      // resumed agent run (resumeStream / getFullOutput) can reject with a raw
+      // provider/runtime error. Redact before rejecting the caller's promise.
+      // The durable signal_failed evidence already uses projectHarnessPublicError,
+      // and a HarnessSessionDeletedError from the response-failed write passes
+      // through unchanged.
+      throw redactPublicBoundaryRejection(thrown);
     }
 
     // Clear pending + apply any remaining mode flip in a single CAS write. A
@@ -8277,7 +8329,11 @@ export class Session {
       if (err instanceof QueuePostRunFinalizationPendingError && completingQueuedItemId !== undefined) {
         this._deferQueuedTurnRetry(err);
       }
-      throw err;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the post-completion
+      // bookkeeping (_flushUpdate / settle / finalize) can reject with a raw
+      // storage error. Redact before rejecting the caller (the deferred
+      // QueuePostRunFinalizationPendingError and other Harness errors pass through).
+      throw redactPublicBoundaryRejection(err);
     } finally {
       finishResumedTurn();
     }

@@ -811,9 +811,22 @@ describe('Session.message() — default path', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     try {
-      await expect(
-        session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
-      ).rejects.toThrow('post-dispatch pending evidence unavailable');
+      // §13.3f.1: `message({ stream: true })` is a public §4.2b boundary. The
+      // post-dispatch pending-evidence write fails with a RAW storage error;
+      // the in-process rejection is REDACTED to the generic `harness.internal`
+      // shape with the raw original preserved local-only on `.cause`. (The
+      // durable `failed` evidence below still records the projected error.)
+      const streamThrown = await session
+        .message({ content: 'go', admissionId: 'stream-pending-failure', stream: true })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect((streamThrown as Error).name).toBe('HarnessExecutionError');
+      expect((streamThrown as Error).message).toBe('An internal harness error occurred');
+      expect(((streamThrown as { cause?: Error }).cause as Error).message).toBe(
+        'post-dispatch pending evidence unavailable',
+      );
 
       expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
       await nextTick();
@@ -927,7 +940,15 @@ describe('Session.message() — default path', () => {
       expect(outcome).toBeDefined();
       expect(outcome!.ok).toBe(false);
       if (!outcome!.ok) {
-        expect(outcome!.err).toMatchObject({ message: 'post-dispatch pending evidence unavailable' });
+        // §13.3f.1: the public `message({ stream: true })` rejection is REDACTED —
+        // generic `harness.internal` message with the raw original on `.cause`.
+        // The point under test is that this rejection lands BEFORE the failed
+        // evidence write finishes, which the redaction does not change.
+        expect((outcome!.err as Error).name).toBe('HarnessExecutionError');
+        expect((outcome!.err as Error).message).toBe('An internal harness error occurred');
+        expect(((outcome!.err as { cause?: Error }).cause as Error).message).toBe(
+          'post-dispatch pending evidence unavailable',
+        );
       }
       expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
 

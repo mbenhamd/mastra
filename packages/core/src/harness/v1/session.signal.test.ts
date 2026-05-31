@@ -230,6 +230,54 @@ describe('Session.signal()', () => {
     await expect(signal).rejects.toBeInstanceOf(HarnessSessionDeletedError);
   });
 
+  it('§13.3f.1: redacts a raw dispatch failure on the public signal() boundary', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    // The idle-wake dispatch setup (`_buildRequestContext` /
+    // `_buildSignalContentsWithAttachments` / `agent.sendSignal`) rejects with a
+    // RAW provider/runtime error. `signal()` is a public §4.2b boundary, so its
+    // promise rejection must be REDACTED: a generic `harness.internal` message
+    // with the raw original preserved local-only on `.cause`.
+    agent.sendSignal = (() => {
+      throw new Error('provider dispatch exploded: dsn=postgres://secret@db');
+    }) as any;
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const thrown = await session.signal({ content: 'hi' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((thrown as Error).name).toBe('HarnessExecutionError');
+    expect((thrown as Error).message).toBe('An internal harness error occurred');
+    expect(((thrown as { cause?: Error }).cause as Error).message).toBe(
+      'provider dispatch exploded: dsn=postgres://secret@db',
+    );
+  });
+
+  it('§13.3f.1: passes a Harness-own dispatch failure (deleted) through unredacted', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    let started!: () => void;
+    const subscribeStarted = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    agent.subscribeToThread = async () => {
+      started();
+      return new Promise(() => {}) as any;
+    };
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const signal = session.signal({ content: 'hi' });
+    await subscribeStarted;
+    (session as any)._markDeleted();
+
+    // The redaction wrap is a pass-through for construction-safe Harness errors:
+    // the caller still receives the concrete HarnessSessionDeletedError it
+    // branches on, NOT a HarnessExecutionError.
+    await expect(signal).rejects.toBeInstanceOf(HarnessSessionDeletedError);
+  });
+
   it('does not emit agent_start for active-delivery (the live run owns the lifecycle)', async () => {
     const agent = new MockAgent({ id: 'default' });
     let release!: () => void;

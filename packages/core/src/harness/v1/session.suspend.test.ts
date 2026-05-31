@@ -1012,14 +1012,25 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
 
-    await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toThrow('FakeAgent: no run enqueued for resumeStream()');
+    // §13.3f.1: respondTo* is a public §4.2b boundary, so a raw resumeStream
+    // failure is REDACTED on the in-process rejection too — generic
+    // `harness.internal` message, with the raw "FakeAgent: …" text preserved
+    // local-only on `.cause`.
+    const firstThrown = await session
+      .respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect((firstThrown as Error).name).toBe('HarnessExecutionError');
+    expect((firstThrown as Error).message).toBe('An internal harness error occurred');
+    expect(((firstThrown as { cause?: Error }).cause as Error).message).toBe(
+      'FakeAgent: no run enqueued for resumeStream()',
+    );
 
     // §13.3f.1: the durable failure receipt is a public projection surface — a
     // raw (non-namespaced) agent Error redacts to `harness.internal` with a
-    // generic message. The raw "FakeAgent: …" text still surfaces on the LOCAL
-    // thrown rejection above, but must not be persisted onto the receipt.
+    // generic message; the raw text must not be persisted onto the receipt.
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       itemId: 'question:tc-Q',
       status: 'failed',
