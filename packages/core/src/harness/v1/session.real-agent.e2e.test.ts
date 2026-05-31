@@ -701,3 +701,248 @@ describe('Harness v1 real-agent E2E — S6 abort', () => {
     }
   });
 });
+
+// ===========================================================================
+// S7 — REAL parent agent spawns a REAL subagent through the genuine
+//      spawn_subagent → child.message() → ai-sdk loop path, and the CHILD's
+//      streamed events surface on the PARENT's subscriber as `subagent_*`.
+//
+// Every prior subagent test (session.spawn-subagent.test.ts,
+// session.subagent-events.test.ts) drives this surface with a `FakeAgent`
+// (a duck-typed Agent that overrides `stream` to hand back a fabricated
+// `MastraModelOutput`) or by calling `_emitSubagentEvent` directly. NONE of
+// them exercise the real chain:
+//
+//   parent model emits a spawn_subagent tool-call
+//     → the built-in spawn tool runs `child.message({ content: task })`
+//       → the REAL child Agent runs its OWN deterministic-model loop
+//         → the child's real `text-delta` / `tool-call` / `tool-result`
+//           chunks flow through the child session's `_emitForChunk`
+//           → the child session publishes real `agent_start` / `text_delta`
+//             / `tool_start` / `tool_end` harness events
+//             → the spawn tool's `child.subscribe(...)` bridge re-emits them
+//               as `subagent_*` on the PARENT via `_emitSubagentEvent`.
+//
+// Both agents are the real `Agent` class; only their LANGUAGE MODELS are the
+// deterministic `MockLanguageModelV2` provider mock. No `FakeAgent` /
+// `MockAgent` here.
+// ===========================================================================
+
+/**
+ * A raw provider stream that emits a tool-result-bearing turn: a `tool-call`
+ * to `toolName`, then finishes `tool-calls`. (Same shape as `toolCallStream`,
+ * kept distinct for readability in the child's two-call sequence.)
+ */
+function childToolCallStream(toolCallId: string, toolName: string, inputJson: string) {
+  return toolCallStream(toolCallId, toolName, inputJson);
+}
+
+describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
+  it('a REAL parent spawning a REAL subagent surfaces the child’s streamed text + real tool round-trip as subagent_* events with correct attribution', async () => {
+    // --- REAL child tool (runs inside the child agent's real loop) ----------
+    // Returns a non-JSON-native value (Date) to prove the subagent_tool_end
+    // output is projected JSON-safe at the parent event boundary.
+    const childTool = createTool({
+      id: 'lookupFact',
+      description: 'look up a fact for the subagent',
+      inputSchema: z.object({ topic: z.string() }),
+      execute: async input => {
+        return { topic: (input as { topic: string }).topic, value: 42, fetchedAt: new Date(0) };
+      },
+    });
+
+    // --- REAL child agent: model emits a real tool-call, then streamed text --
+    const childDeltas = ['The ', 'answer ', 'is ', '42.'];
+    let childCall = 0;
+    const childModel = new MockLanguageModelV2({
+      doStream: async () => {
+        childCall++;
+        if (childCall === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: childToolCallStream('child-tc-1', 'lookupFact', '{"topic":"the answer"}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(childDeltas),
+        };
+      },
+    });
+    const childAgent = new Agent({
+      id: 'child-agent',
+      name: 'child-agent',
+      instructions: 'use lookupFact then summarize',
+      model: childModel,
+      tools: { lookupFact: childTool },
+    });
+
+    // --- REAL parent agent: model emits a spawn_subagent tool-call, then text -
+    let parentCall = 0;
+    const parentModel = new MockLanguageModelV2({
+      doStream: async () => {
+        parentCall++;
+        if (parentCall === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(
+              'parent-spawn-tc',
+              'spawn_subagent',
+              JSON.stringify({ agentType: 'explore', task: 'Find the answer to the question.' }),
+            ),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['Delegated ', 'and done.']),
+        };
+      },
+    });
+    const parentAgent = new Agent({
+      id: 'parent-agent',
+      name: 'parent-agent',
+      instructions: 'delegate to a subagent',
+      model: parentModel,
+    });
+
+    // --- REAL harness wiring both real agents + a real subagent type --------
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'explore-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      subagents: {
+        maxDepth: 2,
+        types: {
+          explore: {
+            agentId: 'child-agent',
+            modeId: 'explore-mode',
+            description: 'Read-only fact lookup',
+            defaultModelId: 'openai/gpt-4o-mini',
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'u-subagent', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const result = (await session.message({ content: 'answer my question via a subagent' })) as any;
+
+      // The parent's real loop ran the spawn tool and continued to final text.
+      expect(result.text).toBe('Delegated and done.');
+      expect(Array.isArray(result.toolCalls)).toBe(true);
+      expect(result.toolCalls.some((c: any) => (c.toolName ?? c.payload?.toolName) === 'spawn_subagent')).toBe(true);
+
+      // --- subagent_start -----------------------------------------------------
+      const subStart = events.find(e => e.type === 'subagent_start') as
+        | {
+            agentType: string;
+            task: string;
+            parentId: string;
+            depth: number;
+            subagentSessionId: string;
+            toolCallId: string;
+          }
+        | undefined;
+      expect(subStart).toBeDefined();
+      expect(subStart!.agentType).toBe('explore');
+      expect(subStart!.task).toBe('Find the answer to the question.');
+      expect(subStart!.parentId).toBe(session.id);
+      expect(subStart!.depth).toBe(1);
+      expect(typeof subStart!.subagentSessionId).toBe('string');
+      expect(subStart!.subagentSessionId.length).toBeGreaterThan(0);
+      expect(subStart!.subagentSessionId).not.toBe(session.id);
+      // The bridge stamps the PARENT's spawn tool-call id on every child event.
+      expect(subStart!.toolCallId).toBe('parent-spawn-tc');
+
+      const childSessionId = subStart!.subagentSessionId;
+
+      // --- subagent_text_delta (the child's REAL streamed deltas) ------------
+      const subTextDeltas = events.filter(e => e.type === 'subagent_text_delta') as Array<{
+        delta: string;
+        depth: number;
+        parentId: string;
+        subagentSessionId: string;
+      }>;
+      expect(subTextDeltas.length).toBe(childDeltas.length);
+      expect(subTextDeltas.map(e => e.delta)).toEqual(childDeltas);
+      expect(subTextDeltas.map(e => e.delta).join('')).toBe(childDeltas.join(''));
+      // Attribution: all child deltas carry the parent id, child session id, depth 1.
+      expect(subTextDeltas.every(e => e.parentId === session.id)).toBe(true);
+      expect(subTextDeltas.every(e => e.subagentSessionId === childSessionId)).toBe(true);
+      expect(subTextDeltas.every(e => e.depth === 1)).toBe(true);
+
+      // --- subagent_tool_start / subagent_tool_end (child's REAL tool) -------
+      const subToolStart = events.find(e => e.type === 'subagent_tool_start') as
+        | { toolName: string; innerToolCallId: string; parentId: string; depth: number }
+        | undefined;
+      const subToolEnd = events.find(e => e.type === 'subagent_tool_end') as
+        | { toolName: string; innerToolCallId: string; output: any; isError: boolean; parentId: string }
+        | undefined;
+      expect(subToolStart).toBeDefined();
+      expect(subToolStart!.toolName).toBe('lookupFact');
+      expect(subToolStart!.innerToolCallId).toBe('child-tc-1');
+      expect(subToolStart!.parentId).toBe(session.id);
+      expect(subToolStart!.depth).toBe(1);
+
+      expect(subToolEnd).toBeDefined();
+      expect(subToolEnd!.toolName).toBe('lookupFact');
+      expect(subToolEnd!.innerToolCallId).toBe('child-tc-1');
+      expect(subToolEnd!.isError).toBe(false);
+      expect(subToolEnd!.output.topic).toBe('the answer');
+      expect(subToolEnd!.output.value).toBe(42);
+      // JSON-safe projection: the child tool's Date crossed as an ISO string.
+      expect(subToolEnd!.output.fetchedAt).toBe(new Date(0).toISOString());
+      expect(subToolEnd!.output.fetchedAt).not.toBeInstanceOf(Date);
+
+      // --- subagent_end -------------------------------------------------------
+      const subEnd = events.find(e => e.type === 'subagent_end') as
+        | { output: any; isError: boolean; durationMs: number; parentId: string; depth: number }
+        | undefined;
+      expect(subEnd).toBeDefined();
+      expect(subEnd!.isError).toBe(false);
+      expect(typeof subEnd!.durationMs).toBe('number');
+      expect(subEnd!.durationMs).toBeGreaterThanOrEqual(0);
+      expect(subEnd!.parentId).toBe(session.id);
+      expect(subEnd!.depth).toBe(1);
+      // The child's real FullOutput surfaced as the subagent's output; its text
+      // is the concatenation of the child's real streamed deltas.
+      expect((subEnd!.output as { text?: string }).text).toBe(childDeltas.join(''));
+
+      // --- Ordering: start → (child events) → end ----------------------------
+      const subTypes = events.filter(e => e.type.startsWith('subagent_')).map(e => e.type);
+      const startIdx = subTypes.indexOf('subagent_start');
+      const endIdx = subTypes.lastIndexOf('subagent_end');
+      const toolStartIdx = subTypes.indexOf('subagent_tool_start');
+      const toolEndIdx = subTypes.indexOf('subagent_tool_end');
+      const firstTextIdx = subTypes.indexOf('subagent_text_delta');
+      expect(startIdx).toBe(0);
+      expect(endIdx).toBe(subTypes.length - 1);
+      // The child ran its tool BEFORE it streamed its post-tool summary text.
+      expect(toolStartIdx).toBeGreaterThan(startIdx);
+      expect(toolStartIdx).toBeLessThan(toolEndIdx);
+      expect(toolEndIdx).toBeLessThan(firstTextIdx);
+      expect(firstTextIdx).toBeLessThan(endIdx);
+      // Exactly one start and one end for the single spawned child.
+      expect(subTypes.filter(t => t === 'subagent_start')).toHaveLength(1);
+      expect(subTypes.filter(t => t === 'subagent_end')).toHaveLength(1);
+
+      // The child agent's model was actually driven twice (tool round-trip +
+      // summary), proving the REAL child loop ran, not a fabricated output.
+      expect(childCall).toBe(2);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
