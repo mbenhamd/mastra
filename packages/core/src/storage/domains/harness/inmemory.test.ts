@@ -1544,7 +1544,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const terminal = sampleChannelInbox({
       status: 'accepted',
-      delivery: 'message',
+      delivery: 'signal',
       runId: 'run-1',
       signalId: 'signal-1',
       acceptedAt: 0,
@@ -1564,7 +1564,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(
-      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: now + 50 }),
+      sampleChannelInbox({ status: 'admitted', delivery: 'signal', admittedAt: now + 50 }),
       {
         initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
       },
@@ -1572,7 +1572,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
 
     await expect(
       storage.updateChannelInboxItem(
-        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: now + 100, admittedAt: now + 50 }),
+        sampleChannelInbox({ status: 'accepted', delivery: 'signal', acceptedAt: now + 100, admittedAt: now + 50 }),
         { claimId: 'claim-1' },
       ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);

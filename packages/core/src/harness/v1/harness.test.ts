@@ -4641,7 +4641,7 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
   it('worker is a no-op when there are no claimable rows', async () => {
     const { harness } = setup();
     const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
-    expect(res).toEqual({ claimed: 0, queued: 0, failed: 0, dead: 0 });
+    expect(res).toEqual({ claimed: 0, queued: 0, accepted: 0, failed: 0, dead: 0 });
   });
 
   // ——— §14.2 error taxonomy ———
@@ -4945,6 +4945,434 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
   });
 });
 
+describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 / §21 / §13.7)', () => {
+  function makeIngressCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      harnessName: 'primary',
+      channelId: 'support',
+      providerId: 'slack',
+      platform: 'slack',
+      conversationKind: 'channel',
+      trigger: 'message',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      externalMessageId: 'M1',
+      content: 'hello from channel',
+      receivedAt: 1000,
+      ...overrides,
+    } as never;
+  }
+
+  function setup(channelOverrides: Partial<HarnessChannelConfig> = {}) {
+    const agent = new MockAgent({ id: 'default' });
+    const composite = new InMemoryStore();
+    const storage = composite.stores.harness as ReturnType<typeof makeStorage>;
+    // Capture the latest durable inbox row per id (storage exposes no get-by-id),
+    // so tests can assert on persisted delivery/runId/signalId/attachments.
+    const rows = new Map<string, ChannelInboxItem>();
+    const realUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      await realUpdate(record, opts);
+      rows.set(record.id, { ...record });
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeHarnessChannelConfig(channelOverrides) },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    return { harness, storage, agent, rows };
+  }
+
+  type AdmitResult = {
+    inboxItemId: string;
+    status: string;
+    binding?: { id: string };
+    sessionId?: string;
+    queuedItemId?: string;
+    duplicate: boolean;
+  };
+
+  const admit = (harness: Harness) =>
+    (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+
+  it("queue delivery is the default — unchanged when the policy selects no delivery", async () => {
+    const { harness, rows } = setup();
+    const r = await admit(harness)(makeIngressCtx());
+    expect(r.status).toBe('queued');
+    expect(typeof r.queuedItemId).toBe('string');
+    const row = rows.get(r.inboxItemId);
+    expect(row?.delivery).toBe('queue');
+    expect(row?.runId).toBeUndefined();
+    expect(row?.signalId).toBeUndefined();
+  });
+
+  it("signal delivery admits as a SIGNAL: idle-wake → status accepted, runId/signalId persisted, event delivery: 'signal'", async () => {
+    const { harness, rows, agent } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    const events: Array<{ type: string; delivery?: string; runId?: string; signalId?: string }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e as never);
+    });
+
+    const r = await admit(harness)(makeIngressCtx());
+
+    expect(r.status).toBe('accepted');
+    // queue-only field is absent for a signal admission
+    expect(r.queuedItemId).toBeUndefined();
+    const row = rows.get(r.inboxItemId);
+    expect(row?.delivery).toBe('signal');
+    expect(typeof row?.runId).toBe('string');
+    expect(typeof row?.signalId).toBe('string');
+    expect(row?.acceptedAt).toBeDefined();
+    const admitted = events.find(e => e.type === 'channel_ingress_admitted');
+    expect(admitted).toMatchObject({ delivery: 'signal', runId: row?.runId, signalId: row?.signalId });
+    // the idle-wake run actually dispatched to the agent
+    expect(agent.streamCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('worker resumes a SIGNAL row that crashed AFTER dispatch but before the accepted commit WITHOUT firing a second run (post-dispatch idempotency)', async () => {
+    // §14.2 POST-DISPATCH idempotency case: crash the original admission on the
+    // 'accepted' write (after `_admitChannelSignalTurn` already dispatched a run
+    // AND recorded its runId on the reservation), leaving an 'admitted' signal
+    // row that carries the admissionHash + resolved ids. The recovery worker
+    // reclaims it and replays `_admitChannelSignalTurn`, but the durable
+    // per-`admissionId` reservation now carries a real runId, so it
+    // short-circuits to the ORIGINAL run instead of dispatching a SECOND
+    // interleave/wake (no double model turn / double spend). This does NOT cover
+    // the pre-dispatch lost-signal window — see the next test for that.
+    const { harness, storage, agent, rows } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    const wrappedUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      if (record.status === 'accepted') throw new Error('crash before accepted commit');
+      return wrappedUpdate(record, opts);
+    };
+    await expect(admit(harness)(makeIngressCtx())).rejects.toThrow(/crash before accepted commit/);
+    // The first admission already dispatched exactly one run before the crash.
+    expect(agent.streamCalls.length).toBe(1);
+    const firstRunId = agent.streamCalls[0]?.options?.runId as string | undefined;
+
+    // Heal storage so recovery can commit, then run one recovery pass past the
+    // wall-clock admission-claim expiry.
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = wrappedUpdate;
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      accepted: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, accepted: 1 });
+    // The recovery replay did NOT dispatch a second run — still exactly one.
+    // (Before the fix this was 2: the worker re-ran `_admitChannelSignalTurn`,
+    // minting a fresh signal/run for one inbound.)
+    expect(agent.streamCalls.length).toBe(1);
+    const recoveredRow = [...rows.values()].find(r => r.status === 'accepted');
+    expect(recoveredRow?.status).toBe('accepted');
+    // The recovered row reuses the original run, not a freshly minted second one.
+    if (firstRunId !== undefined) expect(recoveredRow?.runId).toBe(firstRunId);
+  });
+
+  it('worker re-delivers a SIGNAL row that crashed AFTER admit but BEFORE dispatch — no lost signal (C2/C7 pre-dispatch window)', async () => {
+    // §14.2 PRE-DISPATCH lost-signal window (C2/C7): the durable 'pending'
+    // reservation is written BEFORE `signal()` dispatches a run. Crash the very
+    // first stream() so the reservation commits with NO runId and NO run is ever
+    // created (streamCalls === 0). Before the fix, recovery saw the still-pending
+    // reservation and short-circuited to a fabricated `runId === signalId`,
+    // permanently losing the signal while marking the row 'accepted'. After the
+    // fix, a 'pending' reservation with no recorded runId is treated as
+    // never-dispatched and the worker RE-DISPATCHES under the SAME deterministic
+    // signalId, delivering exactly one run.
+    const { harness, agent, rows } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    // Crash the FIRST dispatch before any run is created: `signal()` calls
+    // `agent.sendSignal(...)` to wake/interleave a run, so throwing there leaves
+    // the durable reservation committed (written before dispatch) but no run and
+    // no streamCall. Subsequent dispatches (recovery) succeed.
+    const realSendSignal = agent.sendSignal.bind(agent);
+    let crashed = false;
+    (agent as { sendSignal: unknown }).sendSignal = (signal: unknown, target: unknown) => {
+      if (!crashed) {
+        crashed = true;
+        throw new Error('crash before dispatch');
+      }
+      return realSendSignal(signal as never, target as never);
+    };
+
+    await expect(admit(harness)(makeIngressCtx())).rejects.toThrow(/crash before dispatch/);
+    // The pre-dispatch crash means NO run was ever created.
+    expect(agent.streamCalls.length).toBe(0);
+    // The live catch path records the row as 'failed' (spreading the already-
+    // committed 'admitted' state, so admissionHash + resolved ids survive). The
+    // pending signal reservation was written before dispatch but carries no runId.
+    const failedRow = [...rows.values()].find(r => r.status === 'failed');
+    expect(failedRow?.status).toBe('failed');
+    expect(failedRow?.admissionHash).toBeDefined();
+    expect(failedRow?.runId).toBeUndefined();
+
+    // Recovery replays `_admitChannelSignalTurn`; the pending reservation has no
+    // runId, so the worker RE-DISPATCHES instead of fabricating an identity.
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      accepted: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, accepted: 1 });
+    // Exactly one run was dispatched on recovery — the signal was NOT lost.
+    expect(agent.streamCalls.length).toBe(1);
+    expect(extractSignalContents(agent.streamCalls[0]?.messages)).toBe('hello from channel');
+    const recoveredRow = [...rows.values()].find(r => r.status === 'accepted');
+    expect(recoveredRow?.status).toBe('accepted');
+    // The recovered row carries a REAL dispatched runId, never the synthesized
+    // `runId === signalId` fabrication (C7).
+    expect(typeof recoveredRow?.runId).toBe('string');
+    const dispatchedRunId = agent.streamCalls[0]?.options?.runId as string | undefined;
+    if (dispatchedRunId !== undefined) expect(recoveredRow?.runId).toBe(dispatchedRunId);
+    expect(recoveredRow?.runId).not.toBe(recoveredRow?.signalId);
+  });
+
+  it('signal delivery interleaves into an active run and shares its run terminal (§21)', async () => {
+    let releaseFirst!: () => void;
+    const hold = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    const { harness, rows, agent } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    // First inbound wakes a run that holds mid-flight, so the second inbound
+    // arrives while a run is active on the same resolved channel session.
+    agent.enqueueRun({ holdUntil: hold, text: 'first' });
+
+    const first = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-first' }));
+    expect(first.status).toBe('accepted');
+    const firstRow = rows.get(first.inboxItemId);
+
+    // Wait until the held run is the active run on the thread.
+    for (let i = 0; i < 100 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+
+    const second = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-second', content: 'second' }));
+    expect(second.status).toBe('accepted');
+    const secondRow = rows.get(second.inboxItemId);
+
+    // §21: the interleaved signal shares the active run's terminal — same runId.
+    expect(secondRow?.runId).toBe(firstRow?.runId);
+    expect(secondRow?.signalId).not.toBe(firstRow?.signalId);
+    // The first inbound woke the run (its content went to the agent); the second
+    // interleaved into that same run rather than starting a fresh stream.
+    expect(extractSignalContents(agent.streamCalls[0]?.messages)).toBe('hello from channel');
+    expect(agent.streamCalls.length).toBe(1);
+
+    releaseFirst();
+  });
+
+  it("rejects delivery: 'signal' carrying a policy model override (signal has no per-turn model)", async () => {
+    const { harness } = setup({
+      ingress: {
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal', model: 'model-x' },
+        }),
+      },
+    });
+    await expect(admit(harness)(makeIngressCtx())).rejects.toBeInstanceOf(HarnessValidationError);
+  });
+
+  it('record-only recovery replays inbound attachments (C4): raw files survive an ACK-before-admission crash', async () => {
+    // §14.2 record-only durability (C4): a route that records the 'received' row
+    // and ACKs BEFORE admission cannot scope the bytes to a session yet, so the
+    // durable row's `attachments` is []. The RAW provider refs are persisted on
+    // the row (`rawFiles`) so FROM-SCRATCH recovery re-populates the ingress
+    // context and normalizes the SAME attachments the live path would have.
+    // Before the fix, `reconstructChannelIngressContext` dropped the files and
+    // the recovered turn carried ZERO attachments.
+    const { harness, rows, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('attachment-bytes'),
+    });
+
+    const recordOnly = (harness as never as {
+      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+
+    // Record + ACK before admission, carrying the inbound provider file refs.
+    const r = await recordOnly(
+      makeIngressCtx({
+        externalMessageId: 'M-record-only-file',
+        content: 'see attached',
+        files: [{ attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
+      { continueAdmission: false },
+    );
+    expect(r.status).toBe('received');
+    const receivedRow = rows.get(r.inboxItemId) ?? [...rows.values()].find(row => row.status === 'received');
+    // The received row is not session-scoped yet → no normalized attachments, but
+    // the RAW provider refs are persisted for recovery.
+    expect(receivedRow?.attachments).toEqual([]);
+    expect(receivedRow?.rawFiles?.length).toBe(1);
+    expect(receivedRow?.rawFiles?.[0]).toMatchObject({ attachmentId, resourceId });
+
+    // FROM-SCRATCH recovery normalizes the raw refs and dispatches the turn.
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      queued: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, queued: 1 });
+
+    // The recovered row now carries the normalized attachment (not []).
+    const recoveredRow = [...rows.values()].find(row => row.status === 'queued');
+    expect(recoveredRow?.attachments.length).toBe(1);
+    expect(recoveredRow?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt' });
+
+    // The dispatched turn carries the file part — the SAME shape the non-channel
+    // queue/live path forwards (role:'user' with a file content part).
+    for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
+      role?: string;
+      content?: Array<{ type: string; filename?: string }>;
+    };
+    expect(dispatched.role).toBe('user');
+    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+  });
+
+  it('normalizes inbound files into durable row attachments and forwards them to the queued turn', async () => {
+    const { harness, rows, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    // Resolve the binding WITHOUT admitting a turn (no competing queue drain),
+    // materialize that exact channel session via its threadId, then upload an
+    // attachment owned by it and reference it on the single inbound under test.
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('attachment-bytes'),
+    });
+
+    const r = await admit(harness)(
+      makeIngressCtx({
+        externalMessageId: 'M-with-file',
+        content: 'see attached',
+        files: [{ attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
+    );
+    expect(r.status).toBe('queued');
+    const row = rows.get(r.inboxItemId);
+    // Durable row carries the normalized ref (metadata only), not [].
+    expect(row?.attachments.length).toBe(1);
+    expect(row?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt', mimeType: 'text/plain' });
+
+    // The queued turn dispatched a structured user message carrying the file part.
+    for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
+      role?: string;
+      content?: Array<{ type: string; mediaType?: string; filename?: string }>;
+    };
+    expect(dispatched.role).toBe('user');
+    expect(dispatched.content?.some(p => p.type === 'text')).toBe(true);
+    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+  });
+
+  it('the idempotency key distinguishes two inbound messages that differ only by their files', async () => {
+    const { harness, rows } = setup();
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const a = await session.uploadAttachment({ name: 'a.txt', mimeType: 'text/plain', data: new TextEncoder().encode('A') });
+    const b = await session.uploadAttachment({ name: 'b.txt', mimeType: 'text/plain', data: new TextEncoder().encode('B') });
+
+    // Same idempotency identity (same external ids/content) but different files →
+    // a DIFFERENT payloadHash → a payload conflict, not a false duplicate.
+    const withA = await admit(harness)(
+      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: a.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+    );
+    const withB = await admit(harness)(
+      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: b.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+    );
+    expect(withA.inboxItemId).toBe(withB.inboxItemId);
+    expect((withB as { conflict?: boolean }).conflict).toBe(true);
+    const row = rows.get(withA.inboxItemId);
+    // The first (file A) admission stands; the conflicting retry did not overwrite it.
+    expect(row?.attachments[0]).toMatchObject({ attachmentId: a.attachmentId });
+  });
+
+  it('an inbound with no files leaves the dispatched contents a bare string (unchanged)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    const before = agent.streamCalls.length;
+    const r = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-nofiles' }));
+    expect(r.status).toBe('queued');
+    for (let i = 0; i < 100 && agent.streamCalls.length <= before; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages)).toBe('hello from channel');
+  });
+});
+
 describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4c)', () => {
   // Adapter with a verifyInbound that projects the transport body into an ingress
   // envelope; `bad: true` simulates a failed provider signature verification.
@@ -5127,15 +5555,22 @@ describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4
 
   it('409 conflict when only the attachments differ (payload hash covers files)', async () => {
     const { harness } = setup();
+    // Record-only ACK: the payloadHash (which covers `ctx.files`) is computed and
+    // the durable row created at the idempotency-key boundary, BEFORE binding
+    // resolution + attachment normalization. That is the layer this test pins —
+    // a different attachment set under the same key is a conflict, not a false
+    // duplicate. (continueAdmission:true would additionally require the refs to be
+    // uploaded Harness records, which §13.7 normalization now resolves; the
+    // hash-covers-files contract is independent of that.)
     await harness.handleChannelInboundRequest(
       'support',
       inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a1', resourceId: 'r1' }] }),
-      { continueAdmission: true },
+      { continueAdmission: false },
     );
     const differentFiles = await harness.handleChannelInboundRequest(
       'support',
       inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a2', resourceId: 'r1' }] }),
-      { continueAdmission: true },
+      { continueAdmission: false },
     );
     // Same route + externalMessageId (same idempotency key) but a different attachment set must be a
     // conflict, not a false duplicate — otherwise the second message is silently dropped.
@@ -5145,15 +5580,17 @@ describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4
   it('200 duplicate:true when both content and attachments match', async () => {
     const { harness } = setup();
     const files = [{ attachmentId: 'a1', resourceId: 'r1' }];
+    // Record-only ACK pins the payloadHash idempotency layer (see the conflict
+    // test above) independent of attachment normalization.
     const first = await harness.handleChannelInboundRequest(
       'support',
       inboundRequest({ content: 'x', externalMessageId: 'M-dup-files', files }),
-      { continueAdmission: true },
+      { continueAdmission: false },
     );
     const second = await harness.handleChannelInboundRequest(
       'support',
       inboundRequest({ content: 'x', externalMessageId: 'M-dup-files', files }),
-      { continueAdmission: true },
+      { continueAdmission: false },
     );
     expect(first).toMatchObject({ kind: 'ok', duplicate: false });
     expect(second).toMatchObject({ kind: 'ok', duplicate: true });

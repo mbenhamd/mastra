@@ -2140,7 +2140,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
       await storage.updateChannelInboxItem(
         sampleChannelInbox({
           status: 'admitted',
-          delivery: 'message',
+          delivery: 'signal',
           admittedAt: now + 100,
           updatedAt: now + 100,
           claimId: 'claim-1',
@@ -2236,7 +2236,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
   it('keeps identical terminal channel inbox saves idempotent', async () => {
     const terminal = sampleChannelInbox({
       status: 'accepted',
-      delivery: 'message',
+      delivery: 'signal',
       runId: 'run-1',
       signalId: 'signal-1',
       acceptedAt: 0,
@@ -2255,7 +2255,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
   it('rejects illegal accepted transitions without message evidence', async () => {
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(
-      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: now + 50 }),
+      sampleChannelInbox({ status: 'admitted', delivery: 'signal', admittedAt: now + 50 }),
       {
         initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
       },
@@ -2263,7 +2263,7 @@ describe('HarnessLibSQL channel inbox ledger', () => {
 
     await expect(
       storage.updateChannelInboxItem(
-        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: now + 100, admittedAt: now + 50 }),
+        sampleChannelInbox({ status: 'accepted', delivery: 'signal', acceptedAt: now + 100, admittedAt: now + 50 }),
         { claimId: 'claim-1' },
       ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);

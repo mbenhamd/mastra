@@ -33,6 +33,7 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
+import type { AgentSignalContents } from '../../agent/signals';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
@@ -5447,6 +5448,26 @@ export class Session {
     };
   }
 
+  /**
+   * @internal §14.2 deterministic per-`admissionId` signal id for the channel
+   * signal-delivery admission path. Unlike {@link _messageAdmissionIdentity},
+   * only the `signalId` is deterministic — a signal interleaves into whatever
+   * run is active, so its `runId` is not predetermined and is recorded on the
+   * reservation after dispatch. The id is namespaced (`harness-channel-signal-`)
+   * so it never collides with the message/queue admission id spaces.
+   */
+  private _channelSignalAdmissionSignalId(admissionId: string): string {
+    const digest = sha256CanonicalJson({
+      kind: 'channel-signal-admission',
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      admissionId,
+    });
+    return `harness-channel-signal-${digest.slice(0, 32)}`;
+  }
+
   private async _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
@@ -5667,7 +5688,34 @@ export class Session {
   // the in-flight run's surface was committed when it started and cannot
   // be changed mid-flight.
   // -------------------------------------------------------------------------
-  async signal(opts: SessionSignalOptions): Promise<SessionSignalResult> {
+  async signal(
+    opts: SessionSignalOptions,
+    /**
+     * @internal §14.2 channel-ingress trusted hook. The channel bridge supplies
+     * a pre-built trusted `requestContext.channel` projection (NOT caller input —
+     * it bypasses {@link validateCallerRequestContext}) and the already-persisted
+     * inbox attachments. On idle-wake the trusted context rides the fresh run; on
+     * active-delivery (§21 shared terminal) the content interleaves and the
+     * in-flight run's committed context stands — the channel context cannot reach
+     * the in-flight run's already-committed tools, so it is intentionally not
+     * re-applied there. No SDK caller supplies both `opts.requestContext` and
+     * this (channel ingress has no caller app bag).
+     */
+    internal?: {
+      persistedRequestContext?: PersistedRequestContextInput;
+      attachments?: PersistedAttachment[];
+      /**
+       * §14.2 channel-ingress idempotency: the durable per-`admissionId` signal
+       * id minted by {@link _admitChannelSignalTurn}. Stamping the dispatched
+       * signal with this deterministic id (instead of a fresh random one) ties
+       * the in-flight run to the reservation written before dispatch, so a
+       * recovery replay short-circuits to the SAME run instead of firing a
+       * second interleave/wake. No SDK caller supplies this — only channel
+       * ingress.
+       */
+      signalId?: string;
+    },
+  ): Promise<SessionSignalResult> {
     this._assertLive('signal()');
     this._assertOpenForTurn('signal()');
     if (typeof opts.content !== 'string') {
@@ -5675,9 +5723,15 @@ export class Session {
     }
 
     // §4.4c: validate caller request context before the thread subscription
-    // (an observable side effect) and before the routing decision.
+    // (an observable side effect) and before the routing decision. The trusted
+    // channel projection (internal) is a top-level sibling of the caller `app`
+    // bag — combine, never deep-merge (mirrors `_admitQueue`).
     const callerRequestContext = validateCallerRequestContext(opts.requestContext, 'signal()');
-    const persistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+    const callerPersistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+    const persistedRequestContext: PersistedRequestContextInput | undefined =
+      internal?.persistedRequestContext !== undefined || callerPersistedRequestContext !== undefined
+        ? { ...(internal?.persistedRequestContext ?? {}), ...(callerPersistedRequestContext ?? {}) }
+        : undefined;
 
     // Resolve effective mode + backing agent.
     const effectiveModeId = opts.mode ?? this._record.modeId;
@@ -5765,8 +5819,21 @@ export class Session {
         assertOwnedSignalTurnNotDeleted();
         this._assertOpenForTurn('signal()');
 
+        // §13.7/§14.2: attach persisted attachment bytes as model file-parts on
+        // the idle-wake run. No attachments → bare `opts.content` (unchanged).
+        const signalContents = await Promise.race([
+          this._buildSignalContentsWithAttachments(opts.content, internal?.attachments),
+          activeTurnWaiter.promise,
+        ]);
+        assertOwnedSignalTurnNotDeleted();
+        this._assertOpenForTurn('signal()');
+
         dispatched = agent.sendSignal(
-          { type: 'user-message', contents: opts.content as never },
+          {
+            ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+            type: 'user-message',
+            contents: signalContents as never,
+          },
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
@@ -5894,10 +5961,19 @@ export class Session {
 
     // Active-delivery path: signal drains into the existing run. No turn
     // bookkeeping owned here; the in-flight run owns its own completion.
-    // Pass empty streamOptions — the runtime ignores them when active.
+    // Pass empty streamOptions — the runtime ignores them when active. The
+    // interleaved content still carries its attachment file-parts; the §21
+    // shared-terminal run absorbs them mid-flight (the in-flight run's committed
+    // requestContext/surface is unchanged — see the `internal` doc above).
+    this._assertOpenForTurn('signal()');
+    const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
     this._assertOpenForTurn('signal()');
     const dispatched = agent.sendSignal(
-      { type: 'user-message', contents: opts.content as never },
+      {
+        ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+        type: 'user-message',
+        contents: interleavedContents as never,
+      },
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
@@ -8690,6 +8766,230 @@ export class Session {
     return this._computeQueueAdmissionHash(queueOpts, attachments, requestContext);
   }
 
+  /**
+   * @internal §14.2 channel signal-admission duplicate resolution. Decides
+   * whether existing reservation evidence proves a run was already DISPATCHED
+   * (so the caller short-circuits without re-dispatching) or not (so the caller
+   * re-dispatches under the deterministic signalId — closing the pre-dispatch
+   * lost-signal window from C2/C7).
+   *
+   * - `failed`: rethrow the projected error (matches the message/queue
+   *   duplicate-of-failed contract).
+   * - `completed`: the run already answered — short-circuit to its identity.
+   * - `pending` WITH a recorded `runId`: a run was durably dispatched under this
+   *   admissionId — short-circuit to that real run (no double interleave/wake).
+   * - `pending` WITHOUT a `runId`: the reservation committed but the dispatch
+   *   never recorded a run (pre-dispatch crash window). Return `undefined` so the
+   *   caller (re-)dispatches; NEVER fabricate `runId === signalId` (C7).
+   * - tombstone / missing `status`: expired evidence — throw.
+   * - `undefined` input (no evidence): `undefined` (caller proceeds to reserve).
+   */
+  /**
+   * @internal §14.2 idempotency resolver for a replayed channel-signal admission.
+   *
+   * Channel-signal operation-admission evidence is intentionally a pre-dispatch
+   * BARRIER, not the durable answer. `_admitChannelSignalTurn` reserves `pending`
+   * evidence keyed by the deterministic signalId WITH admissionId/admissionHash,
+   * then records the dispatched `runId` on that same `pending` row. The run's
+   * completed/failed terminal settles through `_settleSignalResult`, which writes
+   * evidence WITHOUT admissionId/admissionHash (it is the shared terminal for all
+   * signals, channel or not, and carries no admission identity). Because
+   * `sameMessageEvidenceIdentity` (storage) compares admissionId+admissionHash,
+   * that terminal write is an identity mismatch the best-effort path swallows —
+   * so this evidence row stays `pending` (with a runId) for the lifetime of the
+   * operation. That is by design and matches §14.2 ("answer read-only from a
+   * stored row that is already terminal or accepted/queued"): the DURABLE answer
+   * for an idempotent channel duplicate lives on the channel INBOX row plus the
+   * run terminal, not on this admission record. The `failed` branch below is
+   * therefore defensive — it never fires for channel signals because the failure
+   * terminal never reaches this row — and the `pending + runId` branch is the
+   * live short-circuit that re-resolves a replay to its original run without
+   * re-dispatching.
+   */
+  private _channelSignalDispatchedDuplicate(
+    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | undefined,
+  ): { runId: string; signalId: string; willInterleave: boolean } | undefined {
+    if (evidence === undefined) return undefined;
+    if (!('status' in evidence)) {
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().admissionId',
+        'duplicate channel signal admission evidence has expired',
+      );
+    }
+    if (evidence.status === 'failed') {
+      throw publicErrorProjectionToError(evidence.error);
+    }
+    // A `pending` reservation with no durable `runId` was never delivered to a
+    // run — signal re-dispatch, do not short-circuit to a fabricated identity.
+    if (evidence.status === 'pending' && evidence.runId === undefined) return undefined;
+    return {
+      runId: evidence.runId!,
+      signalId: evidence.signalId,
+      willInterleave: false,
+    };
+  }
+
+  /**
+   * @internal §14.2 channel ingress admission via the SIGNAL path. The
+   * interactive counterpart to {@link _admitChannelQueueTurn}: an inbound that
+   * the channel policy selected `delivery: 'signal'` for interleaves into an
+   * active run (§21 shared terminal) or wakes a fresh idle run, rather than
+   * appending a sequential queue boundary. The trusted `requestContext.channel`
+   * projection and the already-persisted inbox attachments are threaded via the
+   * internal signal hook. `signal()` has no per-turn `model` override, so a
+   * policy `model` is rejected by {@link admitChannelInbound} before reaching
+   * here. Returns the run/signal ids the bridge persists on the inbox row.
+   */
+  async _admitChannelSignalTurn(opts: {
+    content: string;
+    admissionId: string;
+    requestContext: PersistedRequestContextInput;
+    expectedAdmissionHash: string;
+    mode?: string;
+    attachments?: PersistedAttachment[];
+  }): Promise<{ runId: string; signalId: string; willInterleave: boolean }> {
+    if (opts.admissionId.length === 0) {
+      throw new HarnessValidationError('admitChannelSignalTurn().admissionId', 'admissionId must be a non-empty string');
+    }
+    if (opts.expectedAdmissionHash.length === 0) {
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().expectedAdmissionHash',
+        'expectedAdmissionHash must be a non-empty string',
+      );
+    }
+    // §14.2 idempotency barrier (signal analogue of the queue path's
+    // `admissionId`-keyed `queueAdmissionReceipts` de-dup). The deterministic
+    // per-`admissionId` signal id ties the dispatched run to a durable
+    // reservation written BEFORE dispatch. On the admitted→accepted recovery
+    // crash window the worker replays this method against the still-pending
+    // row, but the existing reservation short-circuits to the ORIGINAL run
+    // instead of firing a second interleave/wake (double model turn / spend).
+    const signalId = this._channelSignalAdmissionSignalId(opts.admissionId);
+    const existing = await this._resolveMessageAdmissionDuplicate({
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    const dispatchedDuplicate = this._channelSignalDispatchedDuplicate(existing);
+    if (dispatchedDuplicate !== undefined) return dispatchedDuplicate;
+    // Reserve the admissionId durably BEFORE dispatch. The conflict-detecting
+    // write rejects a payload-mismatched replay and resolves a concurrent winner
+    // to its evidence (returned and short-circuited here, never double-dispatched).
+    const reserved = await this._writeMessageResultEvidence({
+      status: 'pending',
+      signalId,
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    if (!reserved.created) {
+      const reservedDuplicate = this._channelSignalDispatchedDuplicate(reserved.evidence);
+      if (reservedDuplicate !== undefined) return reservedDuplicate;
+      // The reservation already exists but carries NO durable runId: a crash
+      // between reserving and recording the dispatched run (the pre-dispatch
+      // lost-signal window, C2/C7). The signal was never delivered to a run, so
+      // fall through and (re-)dispatch under the SAME deterministic signalId — a
+      // real run is created exactly once on recovery instead of fabricating a
+      // runId for a run that never started. This is safe because channel-ingress
+      // admission for a given admissionId is SERIALIZED by the durable inbox-row
+      // claim (admitChannelInbound's initial claim / recoverChannelInboxOnce's
+      // reclaim), so `_admitChannelSignalTurn` never runs concurrently for the
+      // same admissionId — a pending-without-runId reservation is always the
+      // single claimant's own crashed prior attempt, never a live concurrent run.
+    }
+    const handle = await this.signal(
+      {
+        content: opts.content,
+        ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      },
+      {
+        persistedRequestContext: opts.requestContext,
+        signalId,
+        ...(opts.attachments !== undefined ? { attachments: opts.attachments } : {}),
+      },
+    );
+    // Record the dispatched run on the durable reservation BEFORE returning so the
+    // recovery worker can distinguish "dispatched" (pending + runId) from
+    // "never dispatched" (pending + no runId) and only re-dispatch the latter.
+    // Awaited (not best-effort/background): the reservation's runId is the
+    // recovery discriminator for the lost-signal window, not a convenience field.
+    // The conflicting-write path resolves a concurrent winner to its evidence;
+    // the same-signal runId update never conflicts (runId is not part of the
+    // admission identity), so a duplicate here returns the already-recorded run.
+    const recordedRun = await this._writeMessageResultEvidence({
+      status: 'pending',
+      signalId,
+      runId: handle.runId,
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    if (!recordedRun.created) {
+      const recordedDuplicate = this._channelSignalDispatchedDuplicate(recordedRun.evidence);
+      if (recordedDuplicate !== undefined) return recordedDuplicate;
+    }
+    // The shared run terminal settles `handle.result` in the background (§4.2f /
+    // §21); the bridge persists `runId`/`signalId` synchronously and does not
+    // await the answer here. Swallow so an unawaited rejection is not unhandled.
+    void handle.result.catch(() => {});
+    return { runId: handle.runId, signalId: handle.id, willInterleave: handle.willInterleave };
+  }
+
+  /**
+   * @internal §13.7/§14.2 step 3: resolve inbound channel provider files
+   * (AttachmentRefs the bridge has already uploaded) into Harness-owned persisted
+   * attachment refs scoped to this resolved session. Thin wrapper over the same
+   * `_resolveAttachmentRefs` the queue/message admission paths use — validates
+   * ownership + loads metadata, so the durable inbox row, admissionHash, and the
+   * admitted turn all carry the SAME normalized attachments.
+   */
+  async _resolveChannelInboundAttachments(refs: AttachmentRef[]): Promise<PersistedAttachment[]> {
+    if (refs.length === 0) return [];
+    return this._resolveAttachmentRefs('channel ingress attachments', refs);
+  }
+
+  /**
+   * @internal §14.2 step 7: the SIGNAL admissionHash for a channel turn, computed
+   * over the exact persisted admission payload (content + persisted attachments +
+   * policy-selected mode + trusted requestContext). Discriminated `kind: 'signal'`
+   * (distinct from the queue path's `kind: 'queue'`) so a queue-vs-signal payload
+   * never collides. Persisted on the inbox row BEFORE runtime admission so
+   * recovery replays the SAME payload and never re-runs policy. Hashes the same
+   * `PersistedAttachment` projection as {@link _computeQueueAdmissionHash}. Note:
+   * signal delivery has no `model` field, so model is intentionally absent.
+   */
+  _channelSignalAdmissionHash(
+    opts: { content: string; mode?: string },
+    attachments: PersistedAttachment[],
+    requestContext: PersistedRequestContextInput,
+  ): string {
+    return sha256CanonicalJson({
+      kind: 'signal',
+      content: opts.content,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      attachments: attachments.map(attachment => ({
+        kind: attachment.kind,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        ...(attachment.kind === 'ref'
+          ? {
+              attachmentId: attachment.attachmentId,
+              resourceId: this.resourceId,
+              ownerSessionId: attachment.ownerSessionId,
+              bytes: attachment.bytes,
+              sha256: attachment.sha256,
+              source: attachment.source,
+              attachmentKind: attachment.attachmentKind ?? 'file',
+              ...(attachment.primitiveType ? { primitiveType: attachment.primitiveType } : {}),
+              ...(attachment.elementType ? { elementType: attachment.elementType } : {}),
+              ...(attachment.renderer ? { renderer: attachment.renderer } : {}),
+              ...(attachment.schemaId ? { schemaId: attachment.schemaId } : {}),
+              ...(attachment.metadata ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
+              ...(attachment.object ? { object: attachment.object } : {}),
+            }
+          : { url: attachment.url }),
+      })),
+      requestContext: clonePersistedRequestContext(requestContext),
+    });
+  }
+
   private async _admitQueue(
     opts: QueueOptions,
     methodName: 'queue()' | 'admitQueue()',
@@ -9556,8 +9856,16 @@ export class Session {
         activeTurnWaiter.promise,
       ]);
       assertQueuedTurnNotDeleted();
+      // §13.7/§14.2: forward persisted attachment bytes as model file-parts so a
+      // queued (channel or direct) turn's attachments actually reach the agent,
+      // not just the dedup identity. No attachments → bare `item.content`.
+      const queuedContents = await Promise.race([
+        this._buildSignalContentsWithAttachments(item.content, item.attachments),
+        activeTurnWaiter.promise,
+      ]);
+      assertQueuedTurnNotDeleted();
       const signal = agent.sendSignal(
-        { id: identity.signalId, type: 'user-message', contents: item.content as never },
+        { id: identity.signalId, type: 'user-message', contents: queuedContents as never },
         {
           runId: identity.runId,
           resourceId: this.resourceId,
@@ -10011,6 +10319,61 @@ export class Session {
         );
       }
     }
+  }
+
+  /**
+   * §14.2 / §13.7: build the agent signal contents for a turn, attaching any
+   * persisted attachment bytes as model file/image parts. With no attachments
+   * the contents stay the bare `content` string (byte-identical to the prior
+   * text-only dispatch — no behavior change for the common case). When
+   * attachments are present we load each ref's bytes (already validated by
+   * {@link _validateQueuedAttachmentRefs}) and build a structured user message
+   * mirroring the non-v1 harness file-part pattern, so the agent turn actually
+   * receives the attachment, not just the dedup identity.
+   */
+  private async _buildSignalContentsWithAttachments(
+    content: string,
+    attachments: PersistedAttachment[] | undefined,
+  ): Promise<AgentSignalContents> {
+    if (attachments === undefined || attachments.length === 0) {
+      return content;
+    }
+    const parts: Array<
+      | { type: 'text'; text: string }
+      | { type: 'file'; data: string; mediaType: string; filename?: string }
+    > = [{ type: 'text', text: content }];
+    for (const attachment of attachments) {
+      if (attachment.kind === 'url') {
+        // A URL-only attachment carries no bytes to inline; surface it as a file
+        // reference so the model still sees the link + filename.
+        parts.push({ type: 'file', data: attachment.url, mediaType: attachment.mimeType, filename: attachment.name });
+        continue;
+      }
+      const loaded = await this._storage.loadAttachment({
+        harnessName: this._record.harnessName,
+        sessionId: attachment.ownerSessionId,
+        attachmentId: attachment.attachmentId,
+      });
+      if (!loaded) {
+        throw new HarnessAttachmentUnavailableError(attachment.ownerSessionId, 'not_found', attachment.attachmentId);
+      }
+      const base64 = Buffer.from(loaded.data).toString('base64');
+      // Inline both image and non-image attachment bytes through the AI SDK v5
+      // file-part shape (a `data:<mime>;base64,<bytes>` URL). The v5 image-part
+      // shape keys on `image`/`mediaType`, not `data`/`mimeType`, so a hand-built
+      // `{ type: 'image', data, mimeType }` part silently drops its bytes when
+      // MessageList runs `convertImageFilePart` (it reads `part.image`, which is
+      // undefined). The file shape preserves bytes for image/* mime types too —
+      // `convertToDataContent` decodes the data URL regardless of media type — so
+      // one code path covers every inline attachment.
+      parts.push({
+        type: 'file',
+        data: `data:${attachment.mimeType};base64,${base64}`,
+        mediaType: attachment.mimeType,
+        filename: attachment.name,
+      });
+    }
+    return { role: 'user', content: parts } as AgentSignalContents;
   }
 
   private async _registerQuestion(

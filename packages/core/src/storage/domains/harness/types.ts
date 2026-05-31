@@ -897,7 +897,10 @@ export interface ChannelInboxItem {
   deadAt?: number;
   updatedAt: number;
   status: 'received' | 'admitted' | 'accepted' | 'queued' | 'failed' | 'dead';
-  delivery?: 'message' | 'queue';
+  // §14.2 chosen delivery mode, persisted before runtime admission so recovery
+  // replays the SAME mode. Canonical tokens are `signal` / `queue` (the earlier
+  // `message` spelling is superseded; see ChannelIngressDelivery).
+  delivery?: 'signal' | 'queue';
   mode?: string;
   model?: string;
   attempts: number;
@@ -907,7 +910,47 @@ export interface ChannelInboxItem {
   requestContext: PersistedRequestContextInput;
   content: string;
   attachments: PersistedAttachment[];
+  /**
+   * §14.2 record-only durability: the RAW inbound provider attachment refs as
+   * received at record time, BEFORE the row resolves a session and normalizes
+   * them into Harness-owned {@link PersistedAttachment}s. A route that records the
+   * `received` row and ACKs before admission cannot yet scope the bytes to a
+   * session, so `attachments` is `[]` on that row. Persisting the raw refs lets
+   * FROM-SCRATCH recovery re-populate the ingress context and normalize the SAME
+   * attachments the live path would have — otherwise a record-only crash recovers
+   * with ZERO attachments and a different admissionHash. Cleared once the row is
+   * admitted (`attachments` then carries the durable refs). Structurally the
+   * `ChannelIngressContext.files` (`AttachmentRef`) JSON shape; mirrored here so
+   * the storage domain stays decoupled from `harness/v1`.
+   */
+  rawFiles?: ChannelInboxRawFile[];
   lastError?: { code: HarnessRowErrorCode; message: string; retryable?: boolean };
+}
+
+/**
+ * Raw inbound provider attachment ref persisted on a `received` channel inbox
+ * row for record-only recovery. Mirrors `harness/v1`'s `AttachmentRef` JSON
+ * shape (the storage domain must not import `harness/v1`). Only `attachmentId`
+ * and `resourceId` are guaranteed; the rest are optional provider metadata that
+ * survive a round-trip so recovery normalizes byte-for-byte what the live path
+ * received.
+ */
+export interface ChannelInboxRawFile {
+  attachmentId: string;
+  resourceId: string;
+  ownerSessionId?: string;
+  bytes?: number;
+  sha256?: string;
+  source?: AttachmentSource;
+  kind?: HarnessAttachmentKind;
+  name?: string;
+  mimeType?: string;
+  primitiveType?: HarnessPrimitiveType;
+  elementType?: string;
+  renderer?: AttachmentRendererDescriptor;
+  schemaId?: string;
+  metadata?: Record<string, JsonValue>;
+  object?: AttachmentObjectPointer;
 }
 
 export interface ChannelInboxInitialClaim {

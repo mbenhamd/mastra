@@ -179,7 +179,12 @@ export type ModelAuthStatus = 'authenticated' | 'needs_auth' | 'unknown';
 
 export type ChannelConversationKind = 'dm' | 'group-dm' | 'channel' | 'thread';
 export type ChannelIngressTrigger = 'message' | 'mention' | 'subscribed-message' | 'command';
-export type ChannelIngressDelivery = 'message' | 'queue';
+// §14.2 ingress delivery mode. `signal` interleaves the inbound into an active
+// run (or wakes a fresh one) sharing the run terminal (§21); `queue` appends a
+// sequential durable turn boundary. The canonical token is `signal` — it matches
+// the §14 spec surface (ChannelIngressOptions/Result) and the
+// `channel_ingress_admitted` event — superseding the earlier `message` spelling.
+export type ChannelIngressDelivery = 'signal' | 'queue';
 export type ChannelBindingMode = 'per-user-resource' | 'shared-resource' | 'thread-resource' | 'custom';
 
 export interface HarnessChannelTransportRequest {

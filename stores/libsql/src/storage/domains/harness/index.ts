@@ -5061,6 +5061,7 @@ const CHANNEL_INBOX_COLUMN_NAMES = [
   'request_context',
   'content',
   'attachments',
+  'raw_files',
   'last_error',
 ] as const;
 
@@ -5100,6 +5101,7 @@ function channelInboxColumnValues(record: ChannelInboxItem): { names: string[]; 
     JSON.stringify(record.requestContext),
     record.content,
     JSON.stringify(record.attachments),
+    record.rawFiles ? JSON.stringify(record.rawFiles) : null,
     record.lastError ? JSON.stringify(record.lastError) : null,
   ];
   return { names: [...CHANNEL_INBOX_COLUMN_NAMES], values };
@@ -5141,6 +5143,7 @@ function rowToChannelInboxItem(row: Record<string, unknown>): ChannelInboxItem {
     requestContext: parseJson(row.request_context) ?? {},
     content: String(row.content),
     attachments: parseJson(row.attachments) ?? [],
+    rawFiles: parseJson(row.raw_files) ?? undefined,
     lastError: parseJson(row.last_error) ?? undefined,
   };
 }
@@ -6052,7 +6055,7 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   if (
     record.status === 'admitted' &&
     (record.delivery === undefined ||
-      (record.delivery !== 'message' && record.delivery !== 'queue') ||
+      (record.delivery !== 'signal' && record.delivery !== 'queue') ||
       record.admittedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
@@ -6064,13 +6067,13 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   }
   if (
     record.status === 'accepted' &&
-    (record.delivery !== 'message' || !record.runId || !record.signalId || record.acceptedAt == null)
+    (record.delivery !== 'signal' || !record.runId || !record.signalId || record.acceptedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
       record.id,
       currentStatus,
       record.status,
-      'accepted rows require message delivery, runId, signalId, and acceptedAt',
+      'accepted rows require signal delivery, runId, signalId, and acceptedAt',
     );
   }
   if (record.status === 'queued' && (record.delivery !== 'queue' || !record.queuedItemId || record.queuedAt == null)) {
@@ -6777,6 +6780,7 @@ function channelInboxComparableValues(record: ChannelInboxItem): unknown[] {
     stableJsonString(record.requestContext),
     record.content,
     stableJsonString(record.attachments),
+    record.rawFiles ? stableJsonString(record.rawFiles) : undefined,
     record.lastError ? stableJsonString(record.lastError) : undefined,
   ];
 }

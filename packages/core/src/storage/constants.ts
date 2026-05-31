@@ -826,6 +826,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     request_context: { type: 'jsonb', nullable: false },
     content: { type: 'text', nullable: false },
     attachments: { type: 'jsonb', nullable: false },
+    raw_files: { type: 'jsonb', nullable: true },
     last_error: { type: 'jsonb', nullable: true },
   },
   [TABLE_HARNESS_CHANNEL_BINDINGS]: {

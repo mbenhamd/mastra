@@ -49,6 +49,7 @@ import type {
   SubtreeSessionLeaseResult,
   ChannelBinding,
   PersistedRequestContextInput,
+  PersistedAttachment,
 } from '../../storage/domains/harness';
 import {
   HarnessStorageAttachmentInUseError,
@@ -110,6 +111,7 @@ import type {
   HarnessChannelTransportRequest,
   HarnessChannelInboundResult,
   ChannelIngressContext,
+  ChannelIngressDelivery,
   HarnessConfig,
   HarnessFileConfig,
   HarnessMode,
@@ -1576,7 +1578,7 @@ export class Harness {
       threadId: string;
       sessionId: string;
       mode: ChannelBinding['mode'];
-      admission?: { delivery?: 'message' | 'queue'; mode?: string; model?: string };
+      admission?: { delivery?: ChannelIngressDelivery; mode?: string; model?: string };
     };
   }> {
     const storage = this._requireStorage('channels.resolveBinding()');
@@ -1813,13 +1815,15 @@ export class Harness {
   /**
    * §14.2 durable ingress admission core. Idempotently records the inbound as a
    * durable `ChannelInboxItem`, resolves the §14.1 binding + owning session, and
-   * admits the turn (queue delivery — signal delivery is a follow-up) carrying the
-   * trusted `requestContext.channel` projection. This is the shared admission path
-   * both the auto-mounted ingress route and the recovery worker call (worker-first
-   * design): the route records the row + ACKs; the worker drives this to
-   * completion. Status transitions received → admitted → queued bound the crash
-   * replay window. `admissionId` (the inbox item id) makes provider/worker retries
-   * idempotent.
+   * admits the turn carrying the trusted `requestContext.channel` projection. The
+   * channel policy chooses the delivery mode: `signal` interleaves into an active
+   * run (§21 shared terminal) or wakes a fresh one; `queue` (default) appends a
+   * sequential durable turn boundary. This is the shared admission path both the
+   * auto-mounted ingress route and the recovery worker call (worker-first design):
+   * the route records the row + ACKs; the worker drives this to completion. Status
+   * transitions received → admitted → queued (queue) or received → admitted →
+   * accepted (signal) bound the crash replay window. `admissionId` (the inbox item
+   * id) makes provider/worker retries idempotent.
    */
   async admitChannelInbound(
     ctx: ChannelIngressContext,
@@ -1897,10 +1901,17 @@ export class Harness {
         // Preliminary channel context (no bindingId yet — binding resolves below).
         requestContext: buildChannelRequestContext(ctx),
         content: ctx.content,
-        // Payload-hash idempotency now covers file identity (above). Attachment normalisation into
-        // Harness-owned persisted refs remains a §13.7 follow-up; raw provider files are not yet
-        // stored on the durable row.
+        // The row is not session-scoped yet, so the inbound bytes cannot be
+        // normalized into Harness-owned persisted refs here — `attachments` stays
+        // `[]` until admission scopes them to a session. To keep record-only
+        // recovery faithful (§14.2), persist the RAW inbound provider refs so a
+        // FROM-SCRATCH recovery (ACK-before-admission crash) can re-populate the
+        // ingress context and normalize the SAME attachments the live path would
+        // have — otherwise the recovered turn carries zero files AND computes a
+        // different admissionHash. Payload-hash idempotency already covers file
+        // identity (above).
         attachments: [],
+        ...(ctx.files !== undefined && ctx.files.length > 0 ? { rawFiles: ctx.files } : {}),
       },
       { initialClaim: { claimId, now, claimTtlMs: DEFAULT_CHANNEL_OUTBOX_CLAIM_TTL_MS } },
     );
@@ -1985,18 +1996,108 @@ export class Harness {
       // §14.3: the trusted channel request-context now carries the resolved
       // bindingId (built from binding + envelope evidence, never caller input).
       const requestContext = buildChannelRequestContext(ctx, binding.id);
+      // §13.7/§14.2 step 3: normalize the inbound provider files into Harness-owned
+      // persisted attachment refs scoped to the resolved session, so the durable
+      // row, the admissionHash, and the admitted turn all carry the SAME
+      // attachments (recovery replays them). `ctx.files` are AttachmentRefs (the
+      // bridge has already uploaded the bytes and owns the records); resolving
+      // validates ownership + loads metadata. No files → `[]` (unchanged).
+      const persistedAttachments = await this._normalizeChannelInboundAttachments(session, ctx);
       // §14.2 step 7: the policy-selected admission payload (content + persisted
-      // attachments + mode/model + trusted requestContext). Queue delivery only —
-      // signal delivery is a documented follow-up; a policy that selects
-      // `delivery: 'message'` still queues here until the signal path lands.
-      // mode/model are written UNCONDITIONALLY (undefined clears any stale value
-      // from a prior failed attempt) so the persisted payload always matches the
-      // admissionHash, which omits absent fields.
+      // attachments + mode/model + trusted requestContext). The policy chooses the
+      // delivery mode (`signal` interleaves into an active run per §21; `queue`
+      // appends a sequential durable boundary). mode/model are written
+      // UNCONDITIONALLY (undefined clears any stale value from a prior failed
+      // attempt) so the persisted payload always matches the admissionHash, which
+      // omits absent fields.
+      const admissionDelivery: ChannelIngressDelivery =
+        resolved.admission?.delivery ?? this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ?? 'queue';
       const admissionMode = resolved.admission?.mode;
       const admissionModel = resolved.admission?.model;
+      // signal() has no per-turn `model` override (types.ts SessionSignalOptions),
+      // so a policy `model` is incompatible with signal delivery — reject rather
+      // than silently drop it.
+      if (admissionDelivery === 'signal' && admissionModel !== undefined) {
+        throw new HarnessValidationError(
+          'admitChannelInbound().admission',
+          "delivery: 'signal' cannot carry a policy `model` override — signal turns have no per-turn model; use delivery: 'queue' for a model override",
+        );
+      }
+      if (admissionDelivery === 'signal') {
+        const admissionHash = session._channelSignalAdmissionHash(
+          { content: ctx.content, mode: admissionMode },
+          persistedAttachments,
+          requestContext,
+        );
+        // Persist the policy-selected fields + admissionHash BEFORE runtime
+        // admission (spec step 7/8) and mark `admitted`, so a crash between admit
+        // and durable acceptance is recoverable: the worker replays the SAME
+        // payload and never re-runs policy. `model` is intentionally cleared for a
+        // signal turn (no per-turn model).
+        const admittedRow: ChannelInboxItem = {
+          ...item,
+          status: 'admitted',
+          bindingId: binding.id,
+          resourceId: resolved.resourceId,
+          threadId: resolved.threadId,
+          sessionId: resolved.sessionId,
+          delivery: 'signal',
+          admissionHash,
+          mode: admissionMode,
+          model: undefined,
+          attachments: persistedAttachments,
+          requestContext,
+          admittedAt: now,
+          updatedAt: now,
+          failedAt: undefined,
+          deadAt: undefined,
+          nextAttemptAt: undefined,
+          lastError: undefined,
+        };
+        await storage.updateChannelInboxItem(admittedRow, { claimId });
+        persisted = admittedRow;
+        const admit = await session._admitChannelSignalTurn({
+          content: ctx.content,
+          admissionId: item.id,
+          requestContext,
+          expectedAdmissionHash: admissionHash,
+          attachments: persistedAttachments,
+          mode: admissionMode,
+        });
+        // §14.2 step 9: signal admission is accepted synchronously; persist
+        // runId/signalId and mark `accepted` (the run terminal settles in the
+        // background, shared per §21 when interleaved).
+        const acceptedRow: ChannelInboxItem = {
+          ...admittedRow,
+          status: 'accepted',
+          runId: admit.runId,
+          signalId: admit.signalId,
+          acceptedAt: now,
+          updatedAt: now,
+        };
+        await storage.updateChannelInboxItem(acceptedRow, { claimId });
+        persisted = acceptedRow;
+        this._emitter.emit({
+          type: 'channel_ingress_admitted',
+          harnessName: this._harnessName,
+          channelId: ctx.channelId,
+          inboxItemId: item.id,
+          bindingId: binding.id,
+          delivery: 'signal',
+          runId: admit.runId,
+          signalId: admit.signalId,
+        });
+        return {
+          inboxItemId: item.id,
+          status: 'accepted',
+          binding,
+          sessionId: resolved.sessionId,
+          duplicate: created.duplicate,
+        };
+      }
       const admissionHash = session._channelQueueAdmissionHash(
         { content: ctx.content, mode: admissionMode, model: admissionModel },
-        item.attachments,
+        persistedAttachments,
         requestContext,
       );
       // Persist the policy-selected fields + admissionHash BEFORE runtime admission
@@ -2014,6 +2115,7 @@ export class Harness {
         admissionHash,
         mode: admissionMode,
         model: admissionModel,
+        attachments: persistedAttachments,
         requestContext,
         admittedAt: now,
         updatedAt: now,
@@ -2030,7 +2132,7 @@ export class Harness {
         content: ctx.content,
         admissionId: item.id,
         requestContext,
-        attachments: item.attachments,
+        attachments: persistedAttachments,
         expectedAdmissionHash: admissionHash,
         mode: admissionMode,
         model: admissionModel,
@@ -2119,6 +2221,20 @@ export class Harness {
     };
   }
 
+  /**
+   * §13.7/§14.2 step 3: normalize inbound provider files (`ctx.files`) into
+   * Harness-owned persisted attachment refs scoped to the resolved session. The
+   * refs the bridge supplies already point at uploaded attachment records; this
+   * validates ownership + loads metadata so the durable row, admissionHash, and
+   * the admitted turn all carry the SAME attachments. No files → `[]`.
+   */
+  private async _normalizeChannelInboundAttachments(
+    session: Session,
+    ctx: ChannelIngressContext,
+  ): Promise<PersistedAttachment[]> {
+    return session._resolveChannelInboundAttachments(ctx.files ?? []);
+  }
+
   /** §14 channel_ingress_admitted emit shared by the route and recovery worker. */
   private _emitChannelIngressAdmitted(row: ChannelInboxItem, queuedItemId: string, bindingId: string): void {
     this._emitter.emit({
@@ -2129,6 +2245,26 @@ export class Harness {
       bindingId,
       delivery: 'queue',
       queuedItemId,
+    });
+  }
+
+  /** §14 channel_ingress_admitted (signal delivery) emit shared by the route and
+   * recovery worker. Carries runId/signalId instead of queuedItemId (§14.2 step 9). */
+  private _emitChannelIngressSignalAdmitted(
+    row: ChannelInboxItem,
+    runId: string,
+    signalId: string,
+    bindingId: string,
+  ): void {
+    this._emitter.emit({
+      type: 'channel_ingress_admitted',
+      harnessName: this._harnessName,
+      channelId: row.channelId,
+      inboxItemId: row.id,
+      bindingId,
+      delivery: 'signal',
+      runId,
+      signalId,
     });
   }
 
@@ -2192,7 +2328,7 @@ export class Harness {
     channelId?: string;
     now?: number;
     batchSize?: number;
-  }): Promise<{ claimed: number; queued: number; failed: number; dead: number }> {
+  }): Promise<{ claimed: number; queued: number; accepted: number; failed: number; dead: number }> {
     const storage = this._requireStorage('channels.recoverInbox()');
     const now = opts?.now ?? Date.now();
     const cfg = this._resolveInboxRecoveryConfig(opts?.channelId);
@@ -2207,15 +2343,17 @@ export class Harness {
       claimTtlMs: cfg.claimTtlMs,
     });
     let queued = 0;
+    let accepted = 0;
     let failed = 0;
     let dead = 0;
     for (const row of batch) {
       const outcome = await this._resumeClaimedChannelInboxRow(storage, row, claimId, now, cfg);
       if (outcome === 'queued') queued++;
+      else if (outcome === 'accepted') accepted++;
       else if (outcome === 'failed') failed++;
       else if (outcome === 'dead') dead++;
     }
-    return { claimed: batch.length, queued, failed, dead };
+    return { claimed: batch.length, queued, accepted, failed, dead };
   }
 
   /** Resume a single claimed inbox row; owns its own failure persistence so the
@@ -2231,7 +2369,7 @@ export class Harness {
       claimRenewMs: number;
       retryBackoffMs: (attempt: number) => number;
     },
-  ): Promise<'queued' | 'failed' | 'dead'> {
+  ): Promise<'queued' | 'accepted' | 'failed' | 'dead'> {
     // A row already at the attempt ceiling dead-letters without another attempt.
     if (row.attempts >= cfg.maxAttempts) {
       return this._failClaimedChannelInboxRow(storage, row, row, claimId, now, cfg, {
@@ -2253,7 +2391,7 @@ export class Harness {
         claimId,
         cfg.claimTtlMs,
         cfg.claimRenewMs,
-        async (): Promise<'queued'> => {
+        async (): Promise<'queued' | 'accepted'> => {
           if (row.admissionHash !== undefined) {
         // REPLAY-ONLY: never re-run channel policy once admissionHash exists.
         if (
@@ -2273,10 +2411,9 @@ export class Harness {
           threadId: row.threadId,
           sessionId: row.sessionId,
         } as SessionResolveOptions);
-        // The inbox state machine forbids a direct failed → queued transition; a
+        // The inbox state machine forbids a direct failed → terminal transition; a
         // retried 'failed' row must pass back through 'admitted' first (clearing
-        // its stale failure metadata). An already-'admitted' row goes straight to
-        // 'queued'.
+        // its stale failure metadata). An already-'admitted' row replays directly.
         let base = row;
         if (row.status === 'failed') {
           const readmittedRow: ChannelInboxItem = {
@@ -2292,6 +2429,34 @@ export class Harness {
           await storage.updateChannelInboxItem(readmittedRow, { claimId });
           persisted = readmittedRow;
           base = readmittedRow;
+        }
+        // Replay the persisted delivery mode (NOT a re-run of policy). A row whose
+        // policy selected signal delivery replays as a signal; otherwise queue.
+        if (row.delivery === 'signal') {
+          const admit = await session._admitChannelSignalTurn({
+            content: row.content,
+            admissionId: row.id,
+            requestContext: row.requestContext,
+            expectedAdmissionHash: row.admissionHash,
+            attachments: row.attachments,
+            ...(row.mode !== undefined ? { mode: row.mode } : {}),
+          });
+          const acceptedRow: ChannelInboxItem = {
+            ...base,
+            status: 'accepted',
+            runId: admit.runId,
+            signalId: admit.signalId,
+            acceptedAt: base.acceptedAt ?? now,
+            updatedAt: now,
+            failedAt: undefined,
+            deadAt: undefined,
+            nextAttemptAt: undefined,
+            lastError: undefined,
+          };
+          await storage.updateChannelInboxItem(acceptedRow, { claimId });
+          persisted = acceptedRow;
+          this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, bindingId);
+          return 'accepted';
         }
         const admit = await session._admitChannelQueueTurn({
           content: row.content,
@@ -2328,11 +2493,72 @@ export class Harness {
         sessionId: resolved.sessionId,
       } as SessionResolveOptions);
       const requestContext = buildChannelRequestContext(ctx, binding.id);
+      // Mirror admitChannelInbound: re-normalize attachments against the resolved
+      // session, choose the delivery mode (policy or channel default), and replay
+      // through the matching admit method.
+      const persistedAttachments = await this._normalizeChannelInboundAttachments(session, ctx);
+      const admissionDelivery: ChannelIngressDelivery =
+        resolved.admission?.delivery ?? this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ?? 'queue';
       const admissionMode = resolved.admission?.mode;
       const admissionModel = resolved.admission?.model;
+      if (admissionDelivery === 'signal' && admissionModel !== undefined) {
+        throw new HarnessValidationError(
+          'recoverChannelInboxOnce',
+          "delivery: 'signal' cannot carry a policy `model` override — signal turns have no per-turn model",
+        );
+      }
+      if (admissionDelivery === 'signal') {
+        const admissionHash = session._channelSignalAdmissionHash(
+          { content: ctx.content, mode: admissionMode },
+          persistedAttachments,
+          requestContext,
+        );
+        const admittedRow: ChannelInboxItem = {
+          ...row,
+          status: 'admitted',
+          bindingId: binding.id,
+          resourceId: resolved.resourceId,
+          threadId: resolved.threadId,
+          sessionId: resolved.sessionId,
+          delivery: 'signal',
+          admissionHash,
+          mode: admissionMode,
+          model: undefined,
+          attachments: persistedAttachments,
+          requestContext,
+          admittedAt: now,
+          updatedAt: now,
+          failedAt: undefined,
+          deadAt: undefined,
+          nextAttemptAt: undefined,
+          lastError: undefined,
+        };
+        await storage.updateChannelInboxItem(admittedRow, { claimId });
+        persisted = admittedRow;
+        const admit = await session._admitChannelSignalTurn({
+          content: ctx.content,
+          admissionId: row.id,
+          requestContext,
+          expectedAdmissionHash: admissionHash,
+          attachments: persistedAttachments,
+          mode: admissionMode,
+        });
+        const acceptedRow: ChannelInboxItem = {
+          ...admittedRow,
+          status: 'accepted',
+          runId: admit.runId,
+          signalId: admit.signalId,
+          acceptedAt: now,
+          updatedAt: now,
+        };
+        await storage.updateChannelInboxItem(acceptedRow, { claimId });
+        persisted = acceptedRow;
+        this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, binding.id);
+        return 'accepted';
+      }
       const admissionHash = session._channelQueueAdmissionHash(
         { content: ctx.content, mode: admissionMode, model: admissionModel },
-        row.attachments,
+        persistedAttachments,
         requestContext,
       );
       const admittedRow: ChannelInboxItem = {
@@ -2346,6 +2572,7 @@ export class Harness {
         admissionHash,
         mode: admissionMode,
         model: admissionModel,
+        attachments: persistedAttachments,
         requestContext,
         admittedAt: now,
         updatedAt: now,
@@ -2360,7 +2587,7 @@ export class Harness {
         content: ctx.content,
         admissionId: row.id,
         requestContext,
-        attachments: row.attachments,
+        attachments: persistedAttachments,
         expectedAdmissionHash: admissionHash,
         mode: admissionMode,
         model: admissionModel,
@@ -5767,6 +5994,12 @@ function reconstructChannelIngressContext(row: ChannelInboxItem): ChannelIngress
     externalMessageId: row.externalMessageId,
     content: row.content,
     receivedAt: row.receivedAt,
+    // §14.2 record-only recovery: re-populate the raw inbound provider files the
+    // record-only path persisted before admission so FROM-SCRATCH recovery
+    // normalizes the SAME attachments the live path would have (the durable row's
+    // own `attachments` is `[]` until admission). REPLAY-ONLY recovery never
+    // reaches here — it reads the already-normalized `row.attachments`.
+    ...(row.rawFiles !== undefined && row.rawFiles.length > 0 ? { files: row.rawFiles } : {}),
     ...(ch.externalTenantId !== undefined ? { externalTenantId: ch.externalTenantId } : {}),
     ...(ch.externalChannelId !== undefined ? { externalChannelId: ch.externalChannelId } : {}),
     // Reverse map: §14.3 request-context actor (externalUserId) → provider-envelope actor
