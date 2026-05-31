@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { InMemoryDB } from '../inmemory-db';
 import {
+  CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
   HarnessStorage,
   HarnessStorageAdmissionConflictError,
   HarnessStorageAttachmentInUseError,
@@ -2798,10 +2799,13 @@ function channelBindingKey(_harnessName: string, bindingId: string): string {
   return bindingId;
 }
 
-// §14.1: missing optional external IDs are normalised to a sentinel for tuple
-// uniqueness (storage must not rely on SQL NULL uniqueness semantics).
+// §14.1: missing optional external IDs normalise to the shared
+// CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (defined in ./base) for tuple uniqueness
+// (storage must not rely on SQL NULL uniqueness semantics). Sharing the constant
+// keeps the storage tuple key aligned with the harness-level idempotency/thread-id
+// derivation.
 function normalizeExternalId(value: string | undefined): string {
-  return value ?? ' ';
+  return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
 }
 
 /** True when a binding addresses the same platform-conversation tuple as `b` (§14.1). */

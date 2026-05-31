@@ -3700,6 +3700,38 @@ describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () =
     expect(distinct).toBeNull();
   });
 
+  it('a literal single-space external id does not alias the missing-optional-id sentinel (§14.1)', async () => {
+    // Binding A omits the optional external ids (sentinel-normalised).
+    await storage.saveChannelBinding(
+      sampleChannelBinding({ id: 'missing', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    // Binding B uses real single-space external ids — a DIFFERENT tuple that must
+    // not alias the missing-id sentinel. Both active rows coexist (no conflict).
+    await expect(
+      storage.saveChannelBinding(sampleChannelBinding({ id: 'space', externalTenantId: ' ', externalChannelId: ' ' })),
+    ).resolves.toBeUndefined();
+
+    // The missing-id tuple resolves to the missing-id binding only.
+    const missing = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(missing?.id).toBe('missing');
+
+    // The single-space tuple resolves to the single-space binding only.
+    const space = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: ' ',
+      externalChannelId: ' ',
+      externalThreadId: 'th-1',
+    });
+    expect(space?.id).toBe('space');
+  });
+
   it('advances inbound activity forward-only (§14.1)', async () => {
     await storage.saveChannelBinding(sampleChannelBinding({ updatedAt: 1000 }));
 

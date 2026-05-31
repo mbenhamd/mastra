@@ -80,6 +80,7 @@ import {
   HarnessAttachmentUnavailableError,
   HarnessBusyError,
   HarnessConfigError,
+  HarnessError,
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
@@ -11483,8 +11484,8 @@ function clonePersistedRequestContext(input: PersistedRequestContextInput): Pers
   return JSON.parse(JSON.stringify(input)) as PersistedRequestContextInput;
 }
 
-class QueueRecoveryPendingError extends Error {
-  code = 'harness.queue_recovery_pending';
+class QueueRecoveryPendingError extends HarnessError {
+  readonly code = 'harness.queue_recovery_pending';
   readonly retryAt: number;
 
   constructor(retryAt: number) {
@@ -11494,8 +11495,8 @@ class QueueRecoveryPendingError extends Error {
   }
 }
 
-class QueueRecoveryStaleError extends Error {
-  code = 'harness.queue_recovery_stale';
+class QueueRecoveryStaleError extends HarnessError {
+  readonly code = 'harness.queue_recovery_stale';
 
   constructor() {
     super('queued turn was accepted by the signal runtime but no live run or durable terminal result is available');
@@ -11503,8 +11504,8 @@ class QueueRecoveryStaleError extends Error {
   }
 }
 
-class QueueResumeRecoveryStaleError extends Error {
-  code = 'harness.queue_resume_recovery_stale';
+class QueueResumeRecoveryStaleError extends HarnessError {
+  readonly code = 'harness.queue_resume_recovery_stale';
 
   constructor() {
     super('queued turn resume was marked in flight but no terminal queue result is available');
@@ -11512,8 +11513,8 @@ class QueueResumeRecoveryStaleError extends Error {
   }
 }
 
-class QueuePostRunFinalizationPendingError extends Error {
-  code = 'harness.queue_post_run_finalization_pending';
+class QueuePostRunFinalizationPendingError extends HarnessError {
+  readonly code = 'harness.queue_post_run_finalization_pending';
   readonly retryAt: number;
   readonly cause: unknown;
 

@@ -66,11 +66,47 @@ export interface WriteMessageResultEvidenceResult {
 }
 
 /**
+ * §14.1: missing optional external IDs normalise to this out-of-band sentinel so
+ * the platform-conversation tuple stays unique without relying on SQL NULL
+ * uniqueness semantics. The U+001F (Unit Separator) prefix is a C0 control
+ * character no provider emits in a real external id (including a literal single
+ * space), so an absent external id never collides with a present one in storage
+ * tuple keys, channel idempotency keys, or derived thread ids. NUL (U+0000) is
+ * deliberately avoided: the LibSQL driver rejects NUL bytes in string args.
+ *
+ * Storage adapters and the harness channel id-derivation must share this exact
+ * constant so the storage tuple key and the harness-level idempotency/thread-id
+ * keys agree on the missing-external-id encoding.
+ */
+export const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
+
+/**
+ * Shared base for every storage-domain harness error. Each subclass carries a
+ * fully-namespaced `harness.storage.*` wire `code` and a constructed, safe
+ * message (ids / status names / a harness-built `reason` — never raw driver,
+ * SQL, or filesystem text). Membership is by INSTANCE: the public-error
+ * projection (`projectHarnessPublicError`, §13.3f.1) trusts `err instanceof
+ * HarnessStorageDomainError` to pass `code` + `message` through, so these
+ * adapter-thrown errors surface their specific `harness.storage.*` code instead
+ * of collapsing to the reserved `harness.internal` when they reach a public
+ * boundary directly (e.g. the channel ingress / recovery-worker paths, which do
+ * NOT rewrap into the §4.5d `HarnessStorageError`). A forged `.code` on a raw
+ * `Error` is NOT a `HarnessStorageDomainError` instance, so it stays redacted.
+ *
+ * This is distinct from the §4.5d `HarnessStorageError` (in `harness/v1/errors`),
+ * which is the harness-domain wrapper used on session paths and projects to the
+ * generic `harness.storage` code while keeping its raw `cause` local-only.
+ */
+export abstract class HarnessStorageDomainError extends Error {
+  abstract readonly code: string;
+}
+
+/**
  * Thrown by `saveSession` when `ifVersion` does not match the record's
  * current `version`. The caller should rehydrate and retry once
  * (HARNESS_V1_SPEC.md §5.8).
  */
-export class HarnessStorageVersionConflictError extends Error {
+export class HarnessStorageVersionConflictError extends HarnessStorageDomainError {
   readonly name: string = 'HarnessStorageVersionConflictError';
   readonly code: 'harness.storage.version_conflict' | 'harness.storage.delete_guard_conflict' =
     'harness.storage.version_conflict';
@@ -110,7 +146,7 @@ export class HarnessStorageDeleteGuardConflictError extends HarnessStorageVersio
  * Thrown by `acquireSessionLease` / `renewSessionLease` / `releaseSessionLease`
  * / `saveSession` when another owner currently holds the lease.
  */
-export class HarnessStorageLeaseConflictError extends Error {
+export class HarnessStorageLeaseConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageLeaseConflictError';
   readonly code = 'harness.storage.lease_conflict' as const;
   constructor(
@@ -127,7 +163,7 @@ export class HarnessStorageLeaseConflictError extends Error {
  * the bytes. The harness layer maps this to the public
  * `HarnessAttachmentInUseError`.
  */
-export class HarnessStorageAttachmentInUseError extends Error {
+export class HarnessStorageAttachmentInUseError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAttachmentInUseError';
   readonly code = 'harness.storage.attachment_in_use' as const;
   constructor(
@@ -139,7 +175,7 @@ export class HarnessStorageAttachmentInUseError extends Error {
   }
 }
 
-export class HarnessStorageAttachmentUnavailableError extends Error {
+export class HarnessStorageAttachmentUnavailableError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAttachmentUnavailableError';
   readonly code = 'harness.storage.attachment_unavailable' as const;
   constructor(
@@ -154,7 +190,7 @@ export class HarnessStorageAttachmentUnavailableError extends Error {
  * Thrown by lease/attachment operations when the targeted session record
  * does not exist in storage.
  */
-export class HarnessStorageSessionNotFoundError extends Error {
+export class HarnessStorageSessionNotFoundError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSessionNotFoundError';
   readonly code = 'harness.storage.session_not_found' as const;
   constructor(public readonly sessionId: string) {
@@ -162,7 +198,7 @@ export class HarnessStorageSessionNotFoundError extends Error {
   }
 }
 
-export class HarnessStorageParentSessionUnavailableError extends Error {
+export class HarnessStorageParentSessionUnavailableError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageParentSessionUnavailableError';
   readonly code = 'harness.storage.parent_session_unavailable' as const;
   constructor(
@@ -177,7 +213,7 @@ export class HarnessStorageParentSessionUnavailableError extends Error {
   }
 }
 
-export class HarnessStorageAdmissionConflictError extends Error {
+export class HarnessStorageAdmissionConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAdmissionConflictError';
   readonly code = 'harness.storage.admission_conflict' as const;
   constructor(
@@ -189,7 +225,7 @@ export class HarnessStorageAdmissionConflictError extends Error {
   }
 }
 
-export class HarnessStorageThreadDeleteFenceConflictError extends Error {
+export class HarnessStorageThreadDeleteFenceConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageThreadDeleteFenceConflictError';
   readonly code = 'harness.storage.thread_delete_fence_conflict' as const;
   constructor(
@@ -200,7 +236,7 @@ export class HarnessStorageThreadDeleteFenceConflictError extends Error {
   }
 }
 
-export class HarnessStorageThreadDeleteFenceUnsupportedError extends Error {
+export class HarnessStorageThreadDeleteFenceUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageThreadDeleteFenceUnsupportedError';
   readonly code = 'harness.storage.thread_delete_fence_unsupported' as const;
   constructor() {
@@ -208,7 +244,7 @@ export class HarnessStorageThreadDeleteFenceUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageSessionEventReplayUnsupportedError extends Error {
+export class HarnessStorageSessionEventReplayUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSessionEventReplayUnsupportedError';
   readonly code = 'harness.storage.session_event_replay_unsupported' as const;
   constructor() {
@@ -216,7 +252,7 @@ export class HarnessStorageSessionEventReplayUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageSubtreeLeaseRenewalUnsupportedError extends Error {
+export class HarnessStorageSubtreeLeaseRenewalUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSubtreeLeaseRenewalUnsupportedError';
   readonly code = 'harness.storage.subtree_lease_renewal_unsupported' as const;
   constructor() {
@@ -227,7 +263,7 @@ export class HarnessStorageSubtreeLeaseRenewalUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageWorkspaceActionJournalUnsupportedError extends Error {
+export class HarnessStorageWorkspaceActionJournalUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWorkspaceActionJournalUnsupportedError';
   readonly code = 'harness.storage.workspace_action_journal_unsupported' as const;
   constructor() {
@@ -235,7 +271,7 @@ export class HarnessStorageWorkspaceActionJournalUnsupportedError extends Error 
   }
 }
 
-export class HarnessStorageChannelDiagnosticsUnsupportedError extends Error {
+export class HarnessStorageChannelDiagnosticsUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelDiagnosticsUnsupportedError';
   readonly code = 'harness.storage.channel_diagnostics_unsupported' as const;
   constructor() {
@@ -243,7 +279,7 @@ export class HarnessStorageChannelDiagnosticsUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageChannelBindingUnsupportedError extends Error {
+export class HarnessStorageChannelBindingUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelBindingUnsupportedError';
   readonly code = 'harness.storage.channel_binding_unsupported' as const;
   constructor() {
@@ -256,7 +292,7 @@ export class HarnessStorageChannelBindingUnsupportedError extends Error {
  * conversation tuple (§5.2h: active rows are unique at storage level). Create or
  * replace through `resolveChannelBinding`, which fences the prior active row.
  */
-export class HarnessStorageChannelBindingConflictError extends Error {
+export class HarnessStorageChannelBindingConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelBindingConflictError';
   readonly code = 'harness.storage.channel_binding_conflict' as const;
   constructor(
@@ -270,7 +306,7 @@ export class HarnessStorageChannelBindingConflictError extends Error {
   }
 }
 
-export class HarnessStorageProviderCallbackBindingUnsupportedError extends Error {
+export class HarnessStorageProviderCallbackBindingUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageProviderCallbackBindingUnsupportedError';
   readonly code = 'harness.storage.provider_callback_binding_unsupported' as const;
   constructor() {
@@ -278,7 +314,7 @@ export class HarnessStorageProviderCallbackBindingUnsupportedError extends Error
   }
 }
 
-export class HarnessStorageProviderCallbackBindingTransitionError extends Error {
+export class HarnessStorageProviderCallbackBindingTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageProviderCallbackBindingTransitionError';
   readonly code = 'harness.storage.provider_callback_binding_transition_invalid' as const;
   constructor(
@@ -293,7 +329,7 @@ export class HarnessStorageProviderCallbackBindingTransitionError extends Error 
   }
 }
 
-export class HarnessStorageChannelInboxClaimConflictError extends Error {
+export class HarnessStorageChannelInboxClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelInboxClaimConflictError';
   readonly code = 'harness.storage.channel_inbox_claim_conflict' as const;
   constructor(
@@ -304,7 +340,7 @@ export class HarnessStorageChannelInboxClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelInboxTransitionError extends Error {
+export class HarnessStorageChannelInboxTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelInboxTransitionError';
   readonly code = 'harness.storage.channel_inbox_transition_invalid' as const;
   constructor(
@@ -319,7 +355,7 @@ export class HarnessStorageChannelInboxTransitionError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionClaimConflictError extends Error {
+export class HarnessStorageChannelActionClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionClaimConflictError';
   readonly code = 'harness.storage.channel_action_claim_conflict' as const;
   constructor(
@@ -330,7 +366,7 @@ export class HarnessStorageChannelActionClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionTokenConflictError extends Error {
+export class HarnessStorageChannelActionTokenConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionTokenConflictError';
   readonly code = 'harness.storage.channel_action_token_conflict' as const;
   constructor(
@@ -341,7 +377,7 @@ export class HarnessStorageChannelActionTokenConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionReceiptTransitionError extends Error {
+export class HarnessStorageChannelActionReceiptTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionReceiptTransitionError';
   readonly code = 'harness.storage.channel_action_receipt_transition_invalid' as const;
   constructor(
@@ -356,7 +392,7 @@ export class HarnessStorageChannelActionReceiptTransitionError extends Error {
   }
 }
 
-export class HarnessStorageChannelOutboxClaimConflictError extends Error {
+export class HarnessStorageChannelOutboxClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelOutboxClaimConflictError';
   readonly code = 'harness.storage.channel_outbox_claim_conflict' as const;
   constructor(
@@ -367,7 +403,7 @@ export class HarnessStorageChannelOutboxClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelOutboxTransitionError extends Error {
+export class HarnessStorageChannelOutboxTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelOutboxTransitionError';
   readonly code = 'harness.storage.channel_outbox_transition_invalid' as const;
   constructor(
@@ -382,7 +418,7 @@ export class HarnessStorageChannelOutboxTransitionError extends Error {
   }
 }
 
-export class HarnessStorageWakeupClaimConflictError extends Error {
+export class HarnessStorageWakeupClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWakeupClaimConflictError';
   readonly code = 'harness.storage.wakeup_claim_conflict' as const;
   constructor(
@@ -393,7 +429,7 @@ export class HarnessStorageWakeupClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageWakeupTransitionError extends Error {
+export class HarnessStorageWakeupTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWakeupTransitionError';
   readonly code = 'harness.storage.wakeup_transition_invalid' as const;
   constructor(

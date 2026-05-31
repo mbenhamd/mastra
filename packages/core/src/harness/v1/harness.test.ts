@@ -4254,6 +4254,33 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
     expect(r3.resolved.threadId).not.toBe(r.resolved.threadId);
   });
 
+  it('§14.1: a missing optional external id does NOT collide with a literal single space', async () => {
+    // Residual #3: `normChannelExternalId` must use the same out-of-band sentinel
+    // as the storage tuple key. A provider may legitimately send a single-space
+    // externalChannelId; if `undefined` normalised to `' '` (the old behaviour),
+    // an absent id and a literal space would derive the SAME thread/session id and
+    // collide at the channel level even though storage keeps them distinct.
+    const call = (h: Harness) =>
+      (h as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      })._resolveChannelBindingForIngress.bind(h) as (c: never) => Promise<ResolveResult>;
+
+    const { harness: hMissing } = setup();
+    const missing = await call(hMissing)(makeIngressCtx({ externalChannelId: undefined }));
+
+    const { harness: hSpace } = setup();
+    const space = await call(hSpace)(makeIngressCtx({ externalChannelId: ' ' }));
+
+    // Absent external id and a literal single space derive DISTINCT ids.
+    expect(missing.resolved.threadId).not.toBe(space.resolved.threadId);
+    expect(missing.resolved.sessionId).not.toBe(space.resolved.sessionId);
+
+    // …and each remains stable on its own inputs (no accidental cross-talk).
+    const { harness: hMissing2 } = setup();
+    const missing2 = await call(hMissing2)(makeIngressCtx({ externalChannelId: undefined }));
+    expect(missing2.resolved.threadId).toBe(missing.resolved.threadId);
+  });
+
   it('idempotently reuses the active binding and advances lastInboundAt only forward', async () => {
     const { harness } = setup();
     const call = (harness as never as {

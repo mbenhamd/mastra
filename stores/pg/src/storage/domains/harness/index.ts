@@ -328,10 +328,11 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       columns: ['harness_name', 'channel_id', 'status', 'next_attempt_at', 'claim_expires_at', 'received_at'],
     },
     {
-      // §5.2h / §14.1: at most one ACTIVE binding per platform-conversation tuple. The
-      // external-id columns are stored as non-null sentinels (a single space), so this
-      // partial-unique index enforces the invariant without depending on SQL NULL
-      // uniqueness semantics. Mirrors the LibSQL sibling's active-tuple index.
+      // §5.2h / §14.1: at most one ACTIVE binding per platform-conversation tuple. A
+      // missing optional external id is stored as a non-null out-of-band sentinel
+      // (CHANNEL_BINDING_EXTERNAL_ID_SENTINEL), so this partial-unique index enforces
+      // the invariant without depending on SQL NULL uniqueness semantics. Mirrors the
+      // LibSQL sibling's active-tuple index.
       name: harnessIndexName(schemaPrefix, 'idx_harness_channel_bindings_active_tuple'),
       table: TABLE_HARNESS_CHANNEL_BINDINGS,
       columns: [
@@ -5070,9 +5071,15 @@ const CHANNEL_BINDING_COLUMN_NAMES = [
 
 // §14.1: a missing optional external ID is persisted as this non-null sentinel so
 // the partial-unique ACTIVE-tuple index never depends on SQL NULL uniqueness
-// semantics. Mirrors the in-memory adapter's normalizeExternalId and the LibSQL
-// sibling's CHANNEL_BINDING_EXTERNAL_ID_SENTINEL.
-const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = ' ';
+// semantics. The U+001F (Unit Separator) prefix is a C0 control character no
+// provider emits in a real external id (including a literal single space), so the
+// by-external lookup and active-tuple uniqueness stay correct. NUL (U+0000) is
+// deliberately avoided so the value round-trips through both PG and the LibSQL
+// driver (which rejects NUL bytes in string args). Mirrors the in-memory adapters
+// shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (the single source of truth in
+// @mastra/core) and the LibSQL sibling — keep the value in exact sync so the
+// persisted encoding matches the harness channel id-derivation.
+const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
 
 function normalizeChannelBindingExternalId(value: string | undefined): string {
   return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;

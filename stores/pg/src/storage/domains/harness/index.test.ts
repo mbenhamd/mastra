@@ -1253,8 +1253,9 @@ describe('HarnessPG channel binding ledger (§5.1h / §14.1 / PF-824)', () => {
 
   it('keeps an empty-string optional external id distinct from undefined (§14.1)', async () => {
     const harness = store.stores.harness!;
-    // The space sentinel (not '') means an EXPLICIT empty-string tenant id round-trips
-    // faithfully and addresses a different tuple than an omitted tenant id.
+    // The out-of-band U+001F-prefixed sentinel (not '') means an EXPLICIT empty-string
+    // tenant id round-trips faithfully and addresses a different tuple than an omitted
+    // tenant id.
     const empty = sampleChannelBinding({ id: 'empty-tenant', externalTenantId: '', externalChannelId: '' });
     await harness.saveChannelBinding(empty);
 
@@ -1281,6 +1282,41 @@ describe('HarnessPG channel binding ledger (§5.1h / §14.1 / PF-824)', () => {
       externalThreadId: 'th-1',
     });
     expect(omitted).toBeNull();
+  });
+
+  it('a literal single-space external id does not alias the missing-optional-id sentinel (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // Binding A omits the optional external ids (sentinel-normalised).
+    await harness.saveChannelBinding(
+      sampleChannelBinding({ id: 'missing', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    // Binding B uses real single-space external ids — a DIFFERENT tuple that must
+    // not alias the missing-id sentinel. Both active rows coexist (no conflict).
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'space', externalTenantId: ' ', externalChannelId: ' ' })),
+    ).resolves.toBeUndefined();
+
+    // The single-space tuple round-trips faithfully and resolves to its own binding.
+    const space = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: ' ',
+      externalChannelId: ' ',
+      externalThreadId: 'th-1',
+    });
+    expect(space?.id).toBe('space');
+    expect(space?.externalTenantId).toBe(' ');
+    expect(space?.externalChannelId).toBe(' ');
+
+    // The missing-id tuple resolves to the missing-id binding only — no aliasing.
+    const missing = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(missing?.id).toBe('missing');
   });
 
   it('advances inbound activity forward-only (§14.1)', async () => {

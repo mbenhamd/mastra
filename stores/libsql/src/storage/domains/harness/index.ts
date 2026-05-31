@@ -4923,8 +4923,14 @@ const CHANNEL_BINDING_COLUMN_NAMES = [
 
 // §14.1: a missing optional external ID is persisted as this non-null sentinel so
 // the partial-unique ACTIVE-tuple index never depends on SQL NULL uniqueness
-// semantics. Mirrors the in-memory adapter's normalizeExternalId.
-const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = ' ';
+// semantics. The U+001F (Unit Separator) prefix is a C0 control character no
+// provider emits in a real external id (including a literal single space), so the
+// by-external lookup and active-tuple uniqueness stay correct. NUL (U+0000) is
+// deliberately avoided because the LibSQL driver rejects NUL bytes in string args.
+// Mirrors the in-memory adapters shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (the
+// single source of truth in @mastra/core) and the PG sibling — keep the value in
+// exact sync so the persisted encoding matches the harness channel id-derivation.
+const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
 
 function normalizeChannelBindingExternalId(value: string | undefined): string {
   return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;

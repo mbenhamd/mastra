@@ -3131,6 +3131,40 @@ describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
     ).toMatchObject({ id: 'bind-dm' });
   });
 
+  it('a literal single-space external id does not alias the missing-optional-id sentinel', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    // Binding A omits the optional external ids (sentinel-normalised).
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'bind-missing', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    // Binding B uses a real single-space external id — a distinct tuple that must
+    // NOT alias the missing-id sentinel. Both active rows coexist because they are
+    // different conversations.
+    await storage.saveChannelBinding(makeBinding({ id: 'bind-space', externalTenantId: ' ', externalChannelId: ' ' }));
+
+    // The missing-id tuple resolves to the missing-id binding only.
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-missing' });
+
+    // The single-space tuple resolves to the single-space binding only.
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: ' ',
+        externalChannelId: ' ',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-space' });
+  });
+
   it('resolveChannelBinding is idempotent for the same tuple (created once)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const first = await storage.resolveChannelBinding({ candidate: makeBinding() });

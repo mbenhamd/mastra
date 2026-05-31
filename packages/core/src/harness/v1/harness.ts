@@ -52,6 +52,7 @@ import type {
   PersistedAttachment,
 } from '../../storage/domains/harness';
 import {
+  CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
   HarnessStorageAttachmentInUseError,
   HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelOutboxClaimConflictError,
@@ -5890,9 +5891,12 @@ function zeroTokenUsage(): TokenUsage {
 }
 
 // §14.1 channel-binding id derivation. Missing optional external IDs normalise to
-// a sentinel (matching the storage tuple key) so derived ids are stable.
+// the shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL — the SAME out-of-band sentinel
+// the storage tuple key uses — so an absent external id never collides with a
+// present one (e.g. a literal single space) in channel idempotency keys or derived
+// thread/session ids, and the derived ids stay consistent with storage.
 function normChannelExternalId(value: string | undefined): string {
-  return value ?? ' ';
+  return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
 }
 
 /** §14.1: a stable, namespaced threadId from the resolved resourceId + canonical platform tuple. */

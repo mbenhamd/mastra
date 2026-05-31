@@ -14,6 +14,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  HarnessStorageChannelInboxClaimConflictError,
+  HarnessStorageChannelInboxTransitionError,
+} from '../../storage/domains/harness';
+import {
   HarnessBusyError,
   HarnessStorageError,
   HarnessValidationError,
@@ -51,6 +55,27 @@ describe('projectHarnessPublicError', () => {
     expect(projected.message).toBe('An internal harness error occurred');
   });
 
+  it('does NOT pass through a forged `harness.*` `.code` on a raw (non-Harness) Error', () => {
+    // F2 residual: trust is by INSTANCE, not by the `.code` string. A raw Error
+    // that spoofs a namespaced code must still be redacted — otherwise its raw
+    // driver/SQL/path message would leak across the wire under a trusted code.
+    const forgedStorage = Object.assign(
+      new Error('relation "sessions" does not exist (host db.internal:5432)'),
+      { code: 'harness.storage' },
+    );
+    const projectedStorage = projectHarnessPublicError(forgedStorage);
+    expect(projectedStorage.code).toBe('harness.internal');
+    expect(projectedStorage.message).toBe('An internal harness error occurred');
+    expect(projectedStorage.message).not.toContain('sessions');
+    expect(projectedStorage.message).not.toContain('db.internal');
+
+    const forgedBusy = Object.assign(new Error('leaky message: SELECT secret'), { code: 'harness.busy' });
+    const projectedBusy = projectHarnessPublicError(forgedBusy);
+    expect(projectedBusy.code).toBe('harness.internal');
+    expect(projectedBusy.message).toBe('An internal harness error occurred');
+    expect(projectedBusy.message).not.toContain('secret');
+  });
+
   it('maps a HarnessStorageError to harness.storage with its safe summary message', () => {
     const raw = new HarnessStorageError({
       operation: 'session_save',
@@ -80,6 +105,28 @@ describe('projectHarnessPublicError', () => {
     expect(err.subject).toEqual({ kind: 'workspace', id: 'ws-res-9' });
     const projected = projectHarnessPublicError(err);
     expect(projected.code).toBe('harness.storage');
+  });
+
+  it('surfaces a storage-domain error directly as its harness.storage.* code (not harness.internal)', () => {
+    // Residual #5: the channel ingress / recovery-worker paths project whatever
+    // was thrown WITHOUT rewrapping into the §4.5d HarnessStorageError. The
+    // adapter-thrown HarnessStorage*Error classes carry namespaced
+    // `harness.storage.*` codes and constructed (safe) messages, so they must
+    // surface their specific code instead of collapsing to `harness.internal`.
+    const claim = new HarnessStorageChannelInboxClaimConflictError('inbox-7', 'claim-3');
+    const projectedClaim = projectHarnessPublicError(claim);
+    expect(projectedClaim.code).toBe('harness.storage.channel_inbox_claim_conflict');
+    expect(projectedClaim.message).toBe(claim.message);
+
+    const transition = new HarnessStorageChannelInboxTransitionError(
+      'inbox-7',
+      'received',
+      'admitted',
+      'idempotency key is already owned by another inbox item',
+    );
+    const projectedTransition = projectHarnessPublicError(transition);
+    expect(projectedTransition.code).toBe('harness.storage.channel_inbox_transition_invalid');
+    expect(projectedTransition.message).toBe(transition.message);
   });
 
   it('passes through a namespaced HarnessError code with its constructed (safe) message', () => {

@@ -9,6 +9,26 @@
  */
 
 /**
+ * Shared base for every harness error that carries a public, namespaced
+ * `harness.*` wire `code`. Membership is by INSTANCE: the public-error
+ * projection (`projectHarnessPublicError`, §13.3f.1) trusts `err instanceof
+ * HarnessError` to pass `code` + `message` through unredacted, instead of
+ * trusting an arbitrary `.code` string (which a forged/raw error could spoof to
+ * leak a driver/SQL/path message across the wire).
+ *
+ * Each subclass keeps declaring its own `readonly code = 'harness.xxx'` literal
+ * — the abstract `code` here only forces that declaration to exist; it does not
+ * change any subclass's name, code, message, or fields.
+ *
+ * `HarnessStorageError` deliberately does NOT extend this base: it carries no
+ * `code` field and projects to the fixed `harness.storage` code via its own
+ * branch, keeping its raw `cause` local-only.
+ */
+export abstract class HarnessError extends Error {
+  abstract readonly code: string;
+}
+
+/**
  * Misconfiguration detected at `new Harness(config)`. Examples: a `HarnessMode`
  * references an unknown agent id; both `tools` and `additionalTools` set on
  * the same mode; `defaultModeId` does not match any mode.
@@ -74,7 +94,7 @@ export interface HarnessRuntimeDriftDetails {
  * `details.missingRefs` / `details.driftedRefs`. The bare storage-row cause
  * code is `runtime_dependency_drifted` (`HarnessRowErrorCode`, §4.5d).
  */
-export class HarnessRuntimeDriftError extends Error {
+export class HarnessRuntimeDriftError extends HarnessError {
   readonly name = 'HarnessRuntimeDriftError';
   readonly code = 'harness.runtime_drift';
   readonly sessionId?: string;
@@ -142,7 +162,7 @@ export class HarnessSessionClosedError extends Error {
  * pending interaction) or otherwise unflushable, so no pressure-eviction victim
  * is available. Spec §5.4 / §4.5b.
  */
-export class HarnessLiveSessionLimitError extends Error {
+export class HarnessLiveSessionLimitError extends HarnessError {
   readonly name = 'HarnessLiveSessionLimitError';
   readonly code = 'harness.live_session_limit';
   constructor(
@@ -207,7 +227,7 @@ export function harnessSessionClosingError(source: {
  * Raised when a queued turn or pending resume is rejected because the session
  * or a specific queue item was cancelled before the work completed.
  */
-export class HarnessSessionCancelledError extends Error {
+export class HarnessSessionCancelledError extends HarnessError {
   readonly name = 'HarnessSessionCancelledError';
   readonly code = 'harness.session_cancelled';
 
@@ -275,7 +295,7 @@ export type HarnessSessionCorruptReason =
  * an unparseable/`schema_incompatible` row, or unrehydratable pending/tool
  * state. Fails closed before acquiring or stealing a lease. Spec §4.5d / §5.2a.
  */
-export class HarnessSessionCorruptError extends Error {
+export class HarnessSessionCorruptError extends HarnessError {
   readonly name = 'HarnessSessionCorruptError';
   readonly code = 'harness.session_corrupt';
   readonly reason: HarnessSessionCorruptReason;
@@ -310,7 +330,7 @@ export class HarnessSessionCorruptError extends Error {
  * instead) — distinct from `HarnessSessionCorruptError` ('duplicate_session_owner'),
  * which is reserved for two genuinely-active owners on one thread.
  */
-export class HarnessSessionConflictError extends Error {
+export class HarnessSessionConflictError extends HarnessError {
   readonly name = 'HarnessSessionConflictError';
   readonly code = 'harness.session_conflict';
   constructor(
@@ -337,7 +357,7 @@ export type HarnessAbortReason = 'agent_aborted' | 'parent_aborted' | 'session_c
  * for live process shutdown/eviction. Tools branch on `reason` to decide rollback
  * vs best-effort cleanup. Wire code `harness.aborted` (§13.3).
  */
-export class HarnessAbortedError extends Error {
+export class HarnessAbortedError extends HarnessError {
   readonly name = 'HarnessAbortedError';
   readonly code = 'harness.aborted';
   constructor(
@@ -368,7 +388,7 @@ export type HarnessOutputGenerationReason =
  * wraps an opaque generation/runtime failure from the agent layer (aborts and
  * harness-domain errors pass through untouched).
  */
-export class HarnessOutputGenerationError extends Error {
+export class HarnessOutputGenerationError extends HarnessError {
   readonly name = 'HarnessOutputGenerationError';
   readonly code = 'harness.output_generation_failed';
   constructor(
@@ -428,7 +448,7 @@ export type HarnessBusyReason =
  * default `message()` / `signal()` / `queue()` paths are busy-independent and
  * never throw this. Spec §3 / §4.4a.
  */
-export class HarnessBusyError extends Error {
+export class HarnessBusyError extends HarnessError {
   readonly name = 'HarnessBusyError';
   readonly code = 'harness.busy';
   constructor(
@@ -456,7 +476,7 @@ export class HarnessQueueFullError extends Error {
   }
 }
 
-export class HarnessQueueItemExpiredError extends Error {
+export class HarnessQueueItemExpiredError extends HarnessError {
   readonly name = 'HarnessQueueItemExpiredError';
   readonly code = 'harness.queue_item_expired';
 
@@ -738,7 +758,7 @@ export class HarnessSkillArgsValidationError extends Error {
  */
 export type HarnessOverrideConflictField = 'model' | 'mode' | 'addTools' | 'yolo';
 
-export class HarnessOverrideConflictError extends Error {
+export class HarnessOverrideConflictError extends HarnessError {
   readonly name = 'HarnessOverrideConflictError';
   readonly code = 'harness.override_conflict';
   constructor(
@@ -894,7 +914,7 @@ export class HarnessResourceWorkspaceInUseError extends Error {
   }
 }
 
-export class HarnessQueueFullDroppedError extends Error {
+export class HarnessQueueFullDroppedError extends HarnessError {
   readonly name = 'HarnessQueueFullDroppedError';
   readonly code = 'harness.queue_full_dropped';
   constructor(public readonly queuedItemId?: string) {

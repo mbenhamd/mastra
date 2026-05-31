@@ -17,6 +17,7 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { HarnessStorageDomainError } from '../../storage/domains/harness';
 import type {
   ChannelActionReceipt,
   ChannelOutboxItem,
@@ -26,7 +27,7 @@ import type {
   SessionRecord,
 } from '../../storage/domains/harness';
 
-import { HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
+import { HarnessError, HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
 import type { EventSerializationReason, HarnessStorageOperation, HarnessStorageSubject } from './errors';
 import type { SessionLifecycleState, TokenUsage } from './session';
 import type { PermissionPolicy, ToolCategory } from './types';
@@ -888,25 +889,35 @@ const HARNESS_INTERNAL_REDACTED_MESSAGE = 'An internal harness error occurred';
  * durable receipts and `error` turn events.
  *
  * Per §13.3f.1, every public error surface must expose a fully-namespaced
- * `harness.*` code and must never leak a raw driver/SQL/path message:
- * - A Harness error that already carries a `harness.*` namespaced `code` passes
- *   through with its (constructed, already-safe) message.
+ * `harness.*` code and must never leak a raw driver/SQL/path message. Trust is
+ * by INSTANCE, never by a `.code` string — a forged `code: 'harness.storage'`
+ * on a raw `Error` must NOT pass through, since its message could carry driver
+ * text. Only the harness's own error classes are honored:
+ * - A `HarnessError` (the shared base of every `harness.*`-coded class) passes
+ *   through with its own safe `code` + its (constructed, already-safe) message.
  * - A `HarnessStorageError` maps to `harness.storage` (it has no `.code` field;
  *   its message is the safe "Harness storage <op> failed …" summary, and its
  *   raw `cause` is local-only).
- * - Anything else — a raw `TypeError`/`Error`/`MastraError`, or a non-Error
- *   throw (string/object) — maps to the reserved `harness.internal` code with a
- *   generic redacted message. The raw cause is never surfaced here.
+ * - A `HarnessStorageDomainError` (the shared base of every adapter-thrown
+ *   `harness.storage.*`-coded class) passes through with its specific
+ *   `harness.storage.*` code + its constructed (safe) message. These reach a
+ *   public boundary directly on the channel ingress / recovery-worker paths,
+ *   which do NOT rewrap into the §4.5d `HarnessStorageError`; without this
+ *   branch they would regress to the reserved `harness.internal`.
+ * - Anything else — a raw `TypeError`/`Error`/`MastraError` (even one bearing a
+ *   spoofed `harness.*` code), or a non-Error throw (string/object) — maps to
+ *   the reserved `harness.internal` code with a generic redacted message. The
+ *   raw cause is never surfaced here.
  */
 export function projectHarnessPublicError(err: unknown): { code: string; message: string } {
   if (err instanceof HarnessStorageError) {
     return { code: 'harness.storage', message: err.message };
   }
-  if (err instanceof Error) {
-    const code = (err as { code?: unknown }).code;
-    if (typeof code === 'string' && code.startsWith('harness.')) {
-      return { code, message: err.message };
-    }
+  if (err instanceof HarnessStorageDomainError) {
+    return { code: err.code, message: err.message };
+  }
+  if (err instanceof HarnessError) {
+    return { code: err.code, message: err.message };
   }
   return { code: 'harness.internal', message: HARNESS_INTERNAL_REDACTED_MESSAGE };
 }
