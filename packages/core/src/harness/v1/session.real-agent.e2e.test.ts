@@ -43,6 +43,7 @@ import { z } from 'zod';
 
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent';
+import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 
@@ -941,6 +942,682 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       // The child agent's model was actually driven twice (tool round-trip +
       // summary), proving the REAL child loop ran, not a fabricated output.
       expect(childCall).toBe(2);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S8 — Multi-turn conversation builds REAL thread context.
+//
+// Every prior real-agent scenario opens a fresh thread and sends exactly ONE
+// message(). Nothing asserts that turn N+1's real ai-sdk prompt carries turn
+// N's exchange. `MockLanguageModelV2.doStream` receives the provider call
+// `_options` (incl. `.prompt`, the message array the loop assembled from real
+// thread history), so prompt growth across turns is directly assertable.
+//
+// This drives THREE sequential message() turns on ONE session and proves the
+// real loop threads prior user+assistant content into later prompts — not
+// isolated, stateless model calls.
+//
+// NOTE: conversation history threading is a `Memory` feature, not a bare-agent
+// one. A real Agent with NO `memory` configured logs "No memory is configured
+// but resourceId and threadId were passed" and assembles each turn's prompt
+// from ONLY the system instruction + the new user message (verified at runtime:
+// turn 3's prompt contained neither prior user content nor prior replies). So
+// this scenario wires a real `MockMemory` (the same store the agent memory
+// tests use) onto the agent — the harness passes `memory: { thread, resource }`
+// into every turn's exec options (session.ts), so real history accretes.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S8 multi-turn context threading', () => {
+  it('three sequential message() turns share a thread and later prompts carry earlier turns', async () => {
+    // Capture every provider prompt the real loop assembled, in call order.
+    const prompts: unknown[][] = [];
+    let turn = 0;
+    const replies = ['Noted, Dero.', 'I will remember it.', 'Your name is Dero.'];
+    const model = new MockLanguageModelV2({
+      doStream: async _options => {
+        // `_options.prompt` is the message array the agent loop built from real
+        // thread history + the new user content (title-generation.test.ts reads
+        // `options.prompt` the same way).
+        prompts.push((_options as { prompt: unknown[] }).prompt);
+        const reply = replies[turn] ?? 'ok';
+        turn++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream([reply]),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'remember details',
+      model,
+      memory: new MockMemory(),
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-multi', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const r1 = (await session.message({ content: 'my name is Dero' })) as any;
+      const r2 = (await session.message({ content: 'please remember it' })) as any;
+      const r3 = (await session.message({ content: 'what is my name?' })) as any;
+
+      // (a) each turn resolved with its expected real reply.
+      expect(r1.text).toBe(replies[0]);
+      expect(r2.text).toBe(replies[1]);
+      expect(r3.text).toBe(replies[2]);
+
+      // (b) three real provider calls were made (one per message turn).
+      expect(prompts).toHaveLength(3);
+
+      // (c) prompt for turn 3 carries the prior turns' user content — proving
+      // real thread-history threading, not isolated stateless calls.
+      const turn3Json = JSON.stringify(prompts[2]);
+      expect(turn3Json).toContain('my name is Dero');
+      expect(turn3Json).toContain('please remember it');
+      // turn 3's prompt also carries an earlier assistant reply.
+      expect(turn3Json).toContain(replies[0]);
+
+      // (d) the assembled prompt strictly grows turn over turn (history accretes).
+      expect(prompts[1]!.length).toBeGreaterThan(prompts[0]!.length);
+      expect(prompts[2]!.length).toBeGreaterThan(prompts[1]!.length);
+      // turn 1's prompt has no later turns' content.
+      expect(JSON.stringify(prompts[0])).not.toContain('what is my name?');
+
+      // (e) all three turns ran on the SAME thread with DISTINCT runIds.
+      const ends = events.filter(e => e.type === 'agent_end') as Array<{ runId: string; finishReason: string }>;
+      expect(ends).toHaveLength(3);
+      expect(ends.every(e => e.finishReason === 'complete')).toBe(true);
+      const runIds = ends.map(e => e.runId);
+      expect(new Set(runIds).size).toBe(3);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S9 — A queue of DISTINCT items drains FIFO through the REAL loop.
+//
+// session.queue.test.ts drives FIFO ordering with a MockAgent staging
+// fabricated outputs; the real-agent S4 queue case is a single item. This
+// enqueues THREE distinct items back-to-back on an idle session and asserts
+// they drain in A→B→C order through the genuine loop with distinct results.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S9 queue FIFO drain (real loop)', () => {
+  it('three distinct queued items drain FIFO with distinct results and empty the pendingQueue', async () => {
+    // Stateful model: distinct reply keyed on the user content the loop sent.
+    const model = new MockLanguageModelV2({
+      doStream: async _options => {
+        const promptJson = JSON.stringify((_options as { prompt: unknown[] }).prompt);
+        const which = promptJson.includes('task-C')
+          ? 'reply-C'
+          : promptJson.includes('task-B')
+            ? 'reply-B'
+            : 'reply-A';
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream([which]),
+        };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'reply', model });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-queue-fifo', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      // Fire all three back-to-back without awaiting; the loop drains FIFO.
+      const pA = session.queue({ content: 'task-A' });
+      const pB = session.queue({ content: 'task-B' });
+      const pC = session.queue({ content: 'task-C' });
+      const [rA, rB, rC] = (await Promise.all([pA, pB, pC])) as any[];
+
+      // (a) distinct results, each its own queued item's reply.
+      expect(rA.text).toBe('reply-A');
+      expect(rB.text).toBe('reply-B');
+      expect(rC.text).toBe('reply-C');
+
+      // (b) exactly three queue_completed events, in A,B,C drain order.
+      await waitFor(
+        () => events.filter(e => e.type === 'queue_completed').length === 3,
+        'three queue_completed events',
+      );
+      const completed = events.filter(e => e.type === 'queue_completed') as Array<{
+        queuedItemId: string;
+        signalId: string;
+        runId: string;
+      }>;
+      expect(completed).toHaveLength(3);
+      // (c) distinct queuedItemIds / runIds across the three drained turns.
+      expect(new Set(completed.map(c => c.queuedItemId)).size).toBe(3);
+      expect(new Set(completed.map(c => c.runId)).size).toBe(3);
+      expect(completed.every(c => c.signalId.length > 0)).toBe(true);
+
+      // (d) ordering: each turn's agent_start/agent_end nest in FIFO order.
+      // The three runs ran sequentially, so their agent_end runIds appear in
+      // the SAME order as the queued items drained.
+      const ends = events.filter(e => e.type === 'agent_end') as Array<{ runId: string }>;
+      expect(ends.map(e => e.runId)).toEqual(completed.map(c => c.runId));
+
+      // (e) the pending queue fully drained.
+      expect(session.getRecord().pendingQueue).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S10 — A signal INTERLEAVES a LIVE real run (§21 shared terminal).
+//
+// session.signal.test.ts holds the run open with a MockAgent fabricated
+// output; willInterleave / the shared-terminal settlement are only exercised
+// against a mock. Here a REAL run is genuinely in-flight (a tool blocks on an
+// external barrier), and a signal() fired during that window must report
+// willInterleave:true with the active run's id, then settle off the SHARED
+// run terminal.
+//
+// CHARACTERIZATION: per-segment DISTINCT-answer attribution for the
+// interleaved content is a documented runtime refinement (session.ts shared-
+// terminal comment). This asserts only the GUARANTEED contract — willInterleave
+// + shared runId + override-rejection + shared-terminal settlement — NOT a
+// distinct per-segment answer for the interleaved signal.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S10 signal interleaves a live run', () => {
+  it('a signal fired during a live real run reports willInterleave + shared runId, rejects overrides, and settles off the shared terminal', async () => {
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>(resolve => {
+      releaseBarrier = resolve;
+    });
+    let toolStarted = false;
+    // A real tool that blocks the run open on an external barrier, so a real
+    // run is genuinely in-flight while we fire the interleaving signal.
+    const holdTool = createTool({
+      id: 'holdOpen',
+      description: 'holds the run open until released',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolStarted = true;
+        await barrier;
+        return { held: true };
+      },
+    });
+
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        if (callCount === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('call-hold', 'holdOpen', '{}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['parent done']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use holdOpen',
+      model,
+      tools: { holdOpen: holdTool },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-interleave', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      // Fire the parent run WITHOUT awaiting — it blocks inside holdOpen.
+      const parentPromise = session.message({ content: 'go' }) as Promise<any>;
+      void parentPromise.catch(() => {});
+
+      // Wait until the run is genuinely in-flight (tool executing).
+      await waitFor(() => toolStarted, 'holdOpen tool started');
+      const parentRunId = (events.find(e => e.type === 'agent_start') as { runId: string }).runId;
+
+      // (a) a signal fired NOW interleaves the live run, sharing its runId.
+      const handle = await session.signal({ content: 'steer' });
+      expect(handle.willInterleave).toBe(true);
+      expect(handle.runId).toBe(parentRunId);
+
+      // (b) a per-turn override on an active-delivery signal rejects against the
+      // REAL in-flight run (HarnessOverrideConflictError, session.ts:5858-5862).
+      await expect(session.signal({ content: 'x', mode: 'default' })).rejects.toMatchObject({
+        name: 'HarnessOverrideConflictError',
+      });
+      await expect(
+        session.signal({ content: 'x', additionalTools: { holdOpen: holdTool } as any }),
+      ).rejects.toMatchObject({ name: 'HarnessOverrideConflictError' });
+
+      // Release the barrier — the real run finishes.
+      releaseBarrier();
+      const parentResult = (await parentPromise) as any;
+      expect(parentResult.finishReason).toBe('stop');
+
+      // (c) the interleaved signal settled off the SHARED run terminal: its
+      // result resolves to the same run's AgentResult.
+      const signalResult = (await handle.result) as any;
+      expect(signalResult.finishReason).toBe('stop');
+
+      // (d) a signal_completed for the interleaved signal carries the shared runId.
+      await waitFor(
+        () => events.some(e => e.type === 'signal_completed' && (e as any).runId === parentRunId),
+        'signal_completed on shared runId',
+      );
+
+      // (e) lookup reports the interleaved signal completed.
+      const lookup = await session.lookupMessageResult(handle.id);
+      expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+    } finally {
+      // Ensure the barrier is released so shutdown never hangs.
+      releaseBarrier();
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S11 — Multi-tool turn: TWO tool round-trips in ONE real run.
+//
+// S2 is exactly one tool call. The real loop's ability to run two distinct
+// tool round-trips across loop iterations in a single turn (toolA → toolB →
+// text) is unverified at the harness event boundary. This drives it.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S11 multi-tool single turn', () => {
+  it('two tool round-trips in one real run surface two ordered tool_start/tool_end pairs', async () => {
+    const seenHarnessCtx: unknown[] = [];
+    const toolA = createTool({
+      id: 'stepA',
+      description: 'first step',
+      inputSchema: z.object({ x: z.number() }),
+      execute: async (input, context) => {
+        seenHarnessCtx.push(context?.requestContext?.get('harness'));
+        return { a: (input as { x: number }).x + 1 };
+      },
+    });
+    const toolB = createTool({
+      id: 'stepB',
+      description: 'second step',
+      inputSchema: z.object({ y: z.number() }),
+      execute: async (input, context) => {
+        seenHarnessCtx.push(context?.requestContext?.get('harness'));
+        return { b: (input as { y: number }).y * 2 };
+      },
+    });
+
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        if (callCount === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('tc-a', 'stepA', '{"x":1}'),
+          };
+        }
+        if (callCount === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('tc-b', 'stepB', '{"y":3}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['both ', 'done']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use stepA then stepB',
+      model,
+      tools: { stepA: toolA, stepB: toolB },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-multitool', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const result = (await session.message({ content: 'run both steps' })) as any;
+      expect(result.text).toBe('both done');
+
+      // (a) exactly two tool_start and two tool_end events, in [A,B] order.
+      const toolStarts = events.filter(e => e.type === 'tool_start') as Array<{
+        toolName: string;
+        toolCallId: string;
+      }>;
+      const toolEnds = events.filter(e => e.type === 'tool_end') as Array<{
+        toolName: string;
+        toolCallId: string;
+        isError: boolean;
+        output: any;
+      }>;
+      expect(toolStarts.map(e => e.toolName)).toEqual(['stepA', 'stepB']);
+      expect(toolEnds.map(e => e.toolName)).toEqual(['stepA', 'stepB']);
+      expect(toolEnds.every(e => e.isError === false)).toBe(true);
+      expect(toolEnds[0]!.output).toEqual({ a: 2 });
+      expect(toolEnds[1]!.output).toEqual({ b: 6 });
+
+      // (b) ordering: stepA_end precedes stepB_start precedes final text.
+      const types = events.map(e => e.type);
+      const aEndIdx = events.findIndex(e => e.type === 'tool_end' && (e as any).toolName === 'stepA');
+      const bStartIdx = events.findIndex(e => e.type === 'tool_start' && (e as any).toolName === 'stepB');
+      expect(aEndIdx).toBeGreaterThanOrEqual(0);
+      expect(aEndIdx).toBeLessThan(bStartIdx);
+      expect(bStartIdx).toBeLessThan(types.lastIndexOf('text_delta'));
+
+      // (c) the real FullOutput carries >=2 tool calls/results.
+      expect(result.toolCalls.length).toBeGreaterThanOrEqual(2);
+      expect(result.toolResults.length).toBeGreaterThanOrEqual(2);
+
+      // (d) BOTH tools saw the harness RequestContext for this session.
+      expect(seenHarnessCtx).toHaveLength(2);
+      expect((seenHarnessCtx[0] as { sessionId?: string }).sessionId).toBe(session.id);
+      expect((seenHarnessCtx[1] as { sessionId?: string }).sessionId).toBe(session.id);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S12 — Approval → resume → a SECOND (non-approval) tool → complete.
+//
+// S3's resume turn is text-only. The path where the resumed run calls ANOTHER
+// tool before completing (§10.4 live-drain past a fresh tool) is uncovered.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S12 resume runs a fresh tool', () => {
+  it('after approving the first tool, the resumed run runs a SECOND tool then completes', async () => {
+    const approveTool = createTool({
+      id: 'findUser',
+      description: 'look up a user (needs approval)',
+      inputSchema: z.object({ name: z.string() }),
+      requireApproval: true,
+      execute: async input => ({ name: (input as { name: string }).name, id: 7 }),
+    });
+    const followTool = createTool({
+      id: 'recordResult',
+      description: 'record the looked-up user (no approval)',
+      inputSchema: z.object({ id: z.number() }),
+      execute: async input => ({ recorded: (input as { id: number }).id }),
+    });
+
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        if (callCount === 1) {
+          // suspends on approval
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('tc-approve', 'findUser', '{"name":"Dero"}'),
+          };
+        }
+        if (callCount === 2) {
+          // post-approval continuation calls a fresh, non-approval tool
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('tc-follow', 'recordResult', '{"id":7}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['recorded']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'find then record',
+      model,
+      tools: { findUser: approveTool, recordResult: followTool },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-resume-tool', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const suspended = (await session.message({ content: 'find and record Dero' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(events.some(e => e.type === 'tool_approval_required')).toBe(true);
+      expect(session.getRecord().pendingResume).toBeDefined();
+
+      const eventsAtSuspend = events.length;
+
+      await session.respondToToolApproval({ approved: true });
+      await waitFor(
+        () => events.some(e => e.type === 'agent_end' && (e as any).finishReason === 'complete'),
+        'agent_end:complete after resume + second tool',
+      );
+
+      const postResume = events.slice(eventsAtSuspend);
+      const postTypes = postResume.map(e => e.type);
+
+      // (a) the approved tool (findUser) surfaced its tool_end after resume.
+      const approvedEnd = postResume.find(e => e.type === 'tool_end' && (e as any).toolName === 'findUser') as
+        | { output: any; isError: boolean }
+        | undefined;
+      expect(approvedEnd).toBeDefined();
+      expect(approvedEnd!.isError).toBe(false);
+      expect(approvedEnd!.output).toEqual({ name: 'Dero', id: 7 });
+
+      // (b) the SECOND, fresh tool ran in the continuation: a recordResult
+      // tool_start + tool_end appear AFTER the approved tool's tool_end.
+      const followStartIdx = postResume.findIndex(e => e.type === 'tool_start' && (e as any).toolName === 'recordResult');
+      const followEndIdx = postResume.findIndex(e => e.type === 'tool_end' && (e as any).toolName === 'recordResult');
+      const approvedEndIdx = postResume.findIndex(e => e.type === 'tool_end' && (e as any).toolName === 'findUser');
+      expect(followStartIdx).toBeGreaterThanOrEqual(0);
+      expect(followEndIdx).toBeGreaterThan(followStartIdx);
+      expect(approvedEndIdx).toBeLessThan(followStartIdx);
+      const followEnd = postResume[followEndIdx] as any;
+      expect(followEnd.output).toEqual({ recorded: 7 });
+
+      // (c) the terminal text + complete follow the second tool.
+      const postText = (postResume.filter(e => e.type === 'text_delta') as Array<{ delta: string }>)
+        .map(e => e.delta)
+        .join('');
+      expect(postText).toBe('recorded');
+      expect(followEndIdx).toBeLessThan(postTypes.lastIndexOf('text_delta'));
+      expect(postTypes.lastIndexOf('text_delta')).toBeLessThan(postTypes.lastIndexOf('agent_end'));
+
+      // (d) the pending resume registration cleared.
+      expect(session.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// S13 — Subagent runs a tool, returns, THEN the PARENT runs its OWN tool.
+//
+// S7's parent has no tools — it only spawns then emits text. A parent that
+// consumes the subagent result and then runs its OWN tool (proving the parent
+// resumed its own loop post-delegation) is uncovered.
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — S13 parent runs a tool after the subagent', () => {
+  it('a parent runs its OWN tool after the subagent returns, surfacing a parent-level tool_end (not subagent_*)', async () => {
+    // Child: one tool + text (same shape as S7's child).
+    const childTool = createTool({
+      id: 'lookupFact',
+      description: 'look up a fact',
+      inputSchema: z.object({ topic: z.string() }),
+      execute: async input => ({ topic: (input as { topic: string }).topic, value: 42 }),
+    });
+    const childDeltas = ['answer ', '42'];
+    let childCall = 0;
+    const childModel = new MockLanguageModelV2({
+      doStream: async () => {
+        childCall++;
+        if (childCall === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('child-tc', 'lookupFact', '{"topic":"the answer"}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(childDeltas),
+        };
+      },
+    });
+    const childAgent = new Agent({
+      id: 'child-agent',
+      name: 'child-agent',
+      instructions: 'use lookupFact then summarize',
+      model: childModel,
+      tools: { lookupFact: childTool },
+    });
+
+    // Parent: a REAL tool that records the subagent's returned text.
+    let recordedInput: unknown;
+    const parentTool = createTool({
+      id: 'recordResult',
+      description: 'record the subagent summary',
+      inputSchema: z.object({ summary: z.string() }),
+      execute: async input => {
+        recordedInput = input;
+        return { stored: true };
+      },
+    });
+
+    // Parent model: call-1 spawn_subagent, call-2 a tool-call to recordResult,
+    // call-3 final text.
+    let parentCall = 0;
+    const parentModel = new MockLanguageModelV2({
+      doStream: async () => {
+        parentCall++;
+        if (parentCall === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(
+              'parent-spawn-tc',
+              'spawn_subagent',
+              JSON.stringify({ agentType: 'explore', task: 'Find the answer.' }),
+            ),
+          };
+        }
+        if (parentCall === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('parent-record-tc', 'recordResult', '{"summary":"answer 42"}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['parent done']),
+        };
+      },
+    });
+    const parentAgent = new Agent({
+      id: 'parent-agent',
+      name: 'parent-agent',
+      instructions: 'delegate then record',
+      model: parentModel,
+      tools: { recordResult: parentTool },
+    });
+
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'explore-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      subagents: {
+        maxDepth: 2,
+        types: {
+          explore: {
+            agentId: 'child-agent',
+            modeId: 'explore-mode',
+            description: 'Read-only fact lookup',
+            defaultModelId: 'openai/gpt-4o-mini',
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'u-sub-then-tool', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const result = (await session.message({ content: 'delegate then record' })) as any;
+      expect(result.text).toBe('parent done');
+
+      // (a) the full subagent_* sequence ran (start..end).
+      const subStart = events.find(e => e.type === 'subagent_start');
+      const subEnd = events.find(e => e.type === 'subagent_end');
+      expect(subStart).toBeDefined();
+      expect(subEnd).toBeDefined();
+
+      // (b) AFTER subagent_end, a PARENT-level tool_start/tool_end (NOT
+      // subagent_*) for recordResult — proving the parent resumed its OWN loop
+      // with a fresh tool post-delegation.
+      const subEndIdx = events.findIndex(e => e.type === 'subagent_end');
+      const parentToolStart = events.find(
+        (e, i) => i > subEndIdx && e.type === 'tool_start' && (e as any).toolName === 'recordResult',
+      ) as { toolName: string; toolCallId: string } | undefined;
+      const parentToolEnd = events.find(
+        (e, i) => i > subEndIdx && e.type === 'tool_end' && (e as any).toolName === 'recordResult',
+      ) as { toolName: string; output: any; isError: boolean } | undefined;
+      expect(parentToolStart).toBeDefined();
+      expect(parentToolStart!.toolCallId).toBe('parent-record-tc');
+      expect(parentToolEnd).toBeDefined();
+      expect(parentToolEnd!.isError).toBe(false);
+      expect(parentToolEnd!.output).toEqual({ stored: true });
+
+      // The parent tool is a plain tool_end, not a subagent_tool_end.
+      expect(parentToolEnd!.toolName).toBe('recordResult');
+
+      // (c) the parent tool's input reflects the (model-relayed) subagent summary.
+      expect(recordedInput).toEqual({ summary: 'answer 42' });
+
+      // (d) the child's real loop ran (tool round-trip + summary).
+      expect(childCall).toBe(2);
+
+      // (e) terminal complete after the parent tool.
+      const ends = events.filter(e => e.type === 'agent_end') as Array<{ finishReason: string }>;
+      expect(ends.some(e => e.finishReason === 'complete')).toBe(true);
     } finally {
       await harness.shutdown();
     }
