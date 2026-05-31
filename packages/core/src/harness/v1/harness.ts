@@ -1697,12 +1697,25 @@ export class Harness {
       // The adapter owns the provider auth boundary; an unverified/invalid payload
       // is a permission failure. (400-vs-401 malformed-vs-signature refinement needs
       // a typed adapter error — deferred.)
+      //
+      // §13.3f.1: this route is PUBLIC/unauthenticated, so the raw adapter error
+      // message (signing-secret config errors, expected-vs-actual signature hints,
+      // stack-derived prose) MUST NOT be echoed to the anonymous caller. Surface a
+      // fixed redacted message; the real cause stays local-only (logged here).
+      this._mastra
+        ?.getLogger?.()
+        ?.error?.('[harness/v1] channel inbound verification failed', {
+          harnessName: this._harnessName,
+          channelId,
+          providerId: routeContext.providerId,
+          error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+        });
       return {
         kind: 'verify_failed',
         httpStatus: 401,
         error: {
           code: 'harness.permission_denied',
-          message: err instanceof Error ? err.message : 'channel inbound verification failed',
+          message: 'channel inbound verification failed',
         },
       };
     }

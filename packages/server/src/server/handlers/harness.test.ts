@@ -899,7 +899,13 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
-      makeParams({ mastra, name: 'code', channelId: 'support', requestBody: { content: 'hi' } }),
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
     );
 
     expect(response.status).toBe(200);
@@ -912,7 +918,7 @@ describe('Harness server routes', () => {
     });
   });
 
-  it('forwards an empty headers map when content-type is absent', async () => {
+  it('rejects with 415 when content-type is absent (no allowed webhook type)', async () => {
     const handleChannelInboundRequest = vi.fn(async () => ({
       kind: 'ok' as const,
       ackStatus: 202 as const,
@@ -923,12 +929,116 @@ describe('Harness server routes', () => {
     const harness = { handleChannelInboundRequest };
     const mastra = { getHarness: vi.fn(() => harness) };
 
-    await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
       makeParams({ mastra, name: 'code', channelId: 'support', requestBody: { content: 'hi' } }),
     );
 
+    expect(response.status).toBe(415);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: 'harness.bad_request' });
+  });
+
+  it('rejects with 415 for a disallowed content-type before reaching the bridge', async () => {
+    const handleChannelInboundRequest = vi.fn();
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'text/plain' : undefined),
+      }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+  });
+
+  it('forwards the FULL request header set (lower-cased) and rawBody to the bridge', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-h',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+    const rawBody = new TextEncoder().encode(JSON.stringify({ content: 'hi' }));
+
+    await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+        getHeaders: () => ({
+          'Content-Type': 'application/json',
+          'X-Slack-Signature': 'v0=abc',
+          'X-Slack-Request-Timestamp': '1700000000',
+        }),
+        rawBody,
+      }),
+    );
+
     const [, transportRequest] = handleChannelInboundRequest.mock.calls[0]!;
-    expect((transportRequest as { headers: Record<string, unknown> }).headers).toEqual({});
+    const forwarded = transportRequest as { headers: Record<string, unknown>; rawBody?: unknown };
+    expect(forwarded.headers).toEqual({
+      'content-type': 'application/json',
+      'x-slack-signature': 'v0=abc',
+      'x-slack-request-timestamp': '1700000000',
+    });
+    expect(forwarded.rawBody).toBe(rawBody);
+  });
+
+  it('rejects with 413 when rawBody exceeds the per-route size cap', async () => {
+    const handleChannelInboundRequest = vi.fn();
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+    // 1 byte over the 1 MiB cap.
+    const oversized = new Uint8Array(1024 * 1024 + 1);
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: {},
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+        rawBody: oversized,
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: 'harness.bad_request' });
+  });
+
+  it('falls back to forwarding only content-type when getHeaders is unavailable', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-fb',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+
+    await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
+    );
+
+    const [, transportRequest] = handleChannelInboundRequest.mock.calls[0]!;
+    expect((transportRequest as { headers: Record<string, unknown> }).headers).toEqual({
+      'content-type': 'application/json',
+    });
   });
 
   it.each([
@@ -992,7 +1102,13 @@ describe('Harness server routes', () => {
     const mastra = { getHarness: vi.fn(() => harness) };
 
     const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
-      makeParams({ mastra, name: 'code', channelId: 'support', requestBody: { content: 'hi' } }),
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
     );
 
     expect(response.status).toBe(status);

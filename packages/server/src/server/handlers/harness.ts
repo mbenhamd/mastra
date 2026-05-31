@@ -346,6 +346,34 @@ const DEFAULT_URL_INGESTION_TIMEOUT_MS = 30_000;
 const DEFAULT_URL_INGESTION_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+// §14.2 public channel webhook ingress abuse controls. The route is
+// createPublicRoute (no app auth); the adapter's verifyInbound owns provider
+// signature auth, but the transport layer still pre-gates body size and
+// content-type BEFORE handing bytes to the core bridge / adapter.
+//
+// A tighter-than-default raw-body cap (the generic adapter bodyLimit default is
+// ~4.5MB). The adapter's bodyLimit middleware rejects oversized bodies with 413
+// before the handler runs; this in-handler guard is a defense-in-depth check for
+// adapters/tests that supply rawBody without enforcing a transport bodyLimit.
+const CHANNEL_INBOUND_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+// Provider webhooks post JSON or form-encoded payloads. Reject anything else
+// (415) before the body reaches the parser / adapter.
+const CHANNEL_INBOUND_ALLOWED_CONTENT_TYPES = [
+  'application/json',
+  'application/x-www-form-urlencoded',
+  'multipart/form-data',
+];
+
+function rawBodyByteLength(rawBody: Uint8Array | string): number {
+  return typeof rawBody === 'string' ? Buffer.byteLength(rawBody, 'utf8') : rawBody.byteLength;
+}
+
+function isAllowedChannelContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  const base = contentType.split(';', 1)[0]!.trim().toLowerCase();
+  return CHANNEL_INBOUND_ALLOWED_CONTENT_TYPES.includes(base);
+}
+
 function toHarnessErrorBody(
   code: string,
   message: string,
@@ -2014,26 +2042,79 @@ export const POST_HARNESS_CHANNEL_INBOUND_ROUTE = createPublicRoute({
     'inbound (record-only ACK; a recovery worker finishes admission). Public route: the channel adapter owns ' +
     'the provider signature-auth boundary, not the server auth middleware.',
   tags: ['Harness'],
+  // Defense-in-depth body cap for the public webhook (tighter than the generic
+  // adapter default). The adapter bodyLimit middleware rejects oversized bodies
+  // with 413 before the handler runs; the in-handler rawBody guard below is the
+  // fallback for adapters/tests that do not enforce a transport bodyLimit.
+  maxBodySize: CHANNEL_INBOUND_MAX_BODY_BYTES,
+  // The provider signs the EXACT request bytes; a JSON parse + re-serialize would
+  // break HMAC verification, and a signed-but-not-strict-JSON payload carrying
+  // `content-type: application/json` would otherwise be rejected with a 400 before
+  // verifyInbound runs. Capture the raw bytes only and defer parsing/verification to
+  // the adapter on `rawBody`. The adapter still flows `body: requestBody` (undefined
+  // here) to handleChannelInboundRequest, which the bridge tolerates.
+  skipBodyParse: true,
   // Webhook ingress is intentionally NOT app-authenticated: a channel provider
   // (Slack, etc.) cannot carry a Mastra session token. The adapter's verifyInbound
   // owns the provider signature-auth boundary (§14.2), which the core bridge runs
   // before any durable row is created.
-  handler: async ({ mastra, name, channelId, requestBody, getHeader, requestPathParams }) => {
+  handler: async ({ mastra, name, channelId, requestBody, getHeader, getHeaders, rawBody, requestPathParams }) => {
     const pathName = stringPathParam(requestPathParams, name, 'name');
     const pathChannelId = stringPathParam(requestPathParams, channelId, 'channelId');
+    const inboundPath = `/harness/${pathName}/channels/${pathChannelId}/inbound`;
+
+    // Build the lower-cased header set FIRST so the §14.2 gates and the headers
+    // forwarded to verifyInbound read the same canonical content-type (a separate
+    // per-name lookup could diverge from the forwarded map). Forward the FULL
+    // header set + unparsed `rawBody` so the adapter can verify an HMAC over the
+    // exact bytes and read provider signature/timestamp headers (Slack
+    // X-Slack-Signature, etc.). `body` carries the parsed payload for adapters
+    // that don't need raw bytes.
+    const headers: Record<string, string | string[]> = {};
+    const allHeaders = getHeaders?.();
+    if (allHeaders) {
+      for (const [key, value] of Object.entries(allHeaders)) {
+        headers[key.toLowerCase()] = value;
+      }
+    } else {
+      // Fallback: an adapter that only exposes per-name lookup still forwards
+      // content-type so verification can at least branch on it.
+      const contentTypeHeader = getHeader?.('content-type');
+      if (contentTypeHeader !== undefined) {
+        headers['content-type'] = contentTypeHeader;
+      }
+    }
+
+    // §14.2 transport-layer abuse gates, applied BEFORE registry resolution /
+    // adapter verification / any durable work. Content-type allowlist (415) and a
+    // raw-body size cap (413) are transport concerns the route owns; provider
+    // signature + replay-window validation stay in the adapter's verifyInbound.
+    // Read content-type from the canonical headers map (a multi-valued header
+    // collapses to its first value for the allowlist check).
+    const forwardedContentType = headers['content-type'];
+    const contentType = Array.isArray(forwardedContentType) ? forwardedContentType[0] : forwardedContentType;
+    if (!isAllowedChannelContentType(contentType)) {
+      return jsonResponse(
+        toHarnessErrorBody('harness.bad_request', 'unsupported channel webhook content-type'),
+        { status: 415 },
+      );
+    }
+    if (rawBody !== undefined && rawBodyByteLength(rawBody) > CHANNEL_INBOUND_MAX_BODY_BYTES) {
+      return jsonResponse(toHarnessErrorBody('harness.bad_request', 'channel webhook payload too large'), {
+        status: 413,
+      });
+    }
+
     const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
     // The route is a thin transport mapper: it forwards a transport-neutral request
     // to the core ingress bridge, which owns registry resolution, provider
     // verification, the readiness gate, and durable admission, and returns a
     // transport-neutral result this handler maps to an HTTP status + §13.3 envelope.
-    // NOTE: the @mastra/server ServerContext exposes per-name header lookup only, so
-    // only content-type is forwarded here; richer provider signature headers require a
-    // ServerContext capable of enumerating headers (tracked separately, not C4c scope).
-    const contentType = getHeader?.('content-type');
     const transportRequest: HarnessChannelTransportRequest = {
       method: 'POST',
-      path: `/harness/${pathName}/channels/${pathChannelId}/inbound`,
-      headers: contentType !== undefined ? { 'content-type': contentType } : {},
+      path: inboundPath,
+      headers,
+      ...(rawBody !== undefined ? { rawBody } : {}),
       body: requestBody,
       receivedAt: Date.now(),
     };

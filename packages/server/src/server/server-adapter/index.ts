@@ -101,6 +101,12 @@ export interface ParsedRequestParams {
   bodyParseError?: {
     message: string;
   };
+  /**
+   * Unparsed request body bytes/text, captured BEFORE any parse, for handlers
+   * that must verify a provider signature over the exact bytes (e.g. channel
+   * webhooks). Undefined for methods/paths where no body was read.
+   */
+  rawBody?: Uint8Array | string;
 }
 
 function isAbortSignalError(error: unknown): boolean {

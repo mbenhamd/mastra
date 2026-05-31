@@ -5024,6 +5024,29 @@ describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4
     });
   });
 
+  it('redacts the raw verifyInbound error message on the public verify_failed envelope (§13.3f.1)', async () => {
+    // The adapter throws a message that would leak provider-auth internals
+    // (signing-secret/config hints) to an anonymous webhook caller.
+    const { harness } = setup({
+      adapter: {
+        deliver: async () => ({}),
+        verifyInbound: async () => {
+          throw new Error('SLACK_SIGNING_SECRET mismatch: expected v0=deadbeef but got v0=cafe');
+        },
+      } as never,
+    });
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 401,
+      error: { code: 'harness.permission_denied', message: 'channel inbound verification failed' },
+    });
+    // The raw adapter cause must NOT cross the public envelope.
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).not.toContain('SLACK_SIGNING_SECRET');
+    expect(message).not.toContain('v0=deadbeef');
+  });
+
   it('400 verify_failed when the channel adapter has no inbound verification', async () => {
     // Adapter without verifyInbound — cannot project provider transport into an envelope.
     const { harness } = setup({ adapter: { deliver: async () => ({}) } as never });
