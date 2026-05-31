@@ -356,6 +356,12 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // before the handler runs; this in-handler guard is a defense-in-depth check for
 // adapters/tests that supply rawBody without enforcing a transport bodyLimit.
 const CHANNEL_INBOUND_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+
+// SSE keep-alive cadence for the session event stream. Idle harness sessions can
+// stream nothing for long stretches; without a periodic comment frame, intervening
+// proxies (and some clients) silently drop a connection they believe is dead. A `:`
+// comment line is ignored by the EventSource parser yet keeps the socket warm.
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 // Provider webhooks post JSON or form-encoded payloads. Reject anything else
 // (415) before the body reaches the parser / adapter.
 const CHANNEL_INBOUND_ALLOWED_CONTENT_TYPES = [
@@ -421,6 +427,8 @@ function encodeHarnessSseEvent(event: HarnessEvent): Uint8Array {
   const data = JSON.stringify(event, harnessSseJsonReplacer);
   return new TextEncoder().encode(`id: ${event.id}\nevent: ${event.type}\ndata: ${data}\n\n`);
 }
+
+const HARNESS_SSE_HEARTBEAT_FRAME = new TextEncoder().encode(`: keep-alive\n\n`);
 
 function harnessSseJsonReplacer(_key: string, value: unknown): unknown {
   if (value instanceof Error) {
@@ -2317,7 +2325,8 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
   summary: 'Stream Harness session events',
   description: 'Streams typed Harness session events with Last-Event-ID replay and 412 recovery.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, getHeader, abortSignal, requestPathParams }) => {
+  handler: async handlerArgs => {
+    const { mastra, requestContext, name, sessionId, getHeader, abortSignal, requestPathParams } = handlerArgs;
     let unsubscribe: (() => void) | undefined;
     try {
       const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
@@ -2338,9 +2347,17 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
       let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
       let replaying = parsed !== undefined;
       let closed = false;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const heartbeatOverride = (handlerArgs as unknown as { heartbeatIntervalMs?: unknown }).heartbeatIntervalMs;
+      const heartbeatIntervalMs =
+        typeof heartbeatOverride === 'number' ? heartbeatOverride : SSE_HEARTBEAT_INTERVAL_MS;
       const cleanup = () => {
         if (closed) return;
         closed = true;
+        if (heartbeat !== undefined) {
+          clearInterval(heartbeat);
+          heartbeat = undefined;
+        }
         unsubscribe?.();
         unsubscribe = undefined;
       };
@@ -2461,6 +2478,18 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
             for (const event of liveQueue.splice(0)) {
               if (replayedEventIds.has(event.id)) continue;
               streamController.enqueue(encodeHarnessSseEvent(event));
+            }
+            if (!closed && heartbeatIntervalMs > 0) {
+              heartbeat = setInterval(() => {
+                if (closed) return;
+                try {
+                  streamController.enqueue(HARNESS_SSE_HEARTBEAT_FRAME);
+                } catch {
+                  cleanup();
+                }
+              }, heartbeatIntervalMs);
+              // Do not keep the process alive solely for the keep-alive timer.
+              (heartbeat as { unref?: () => void }).unref?.();
             }
           } catch (error) {
             cleanup();

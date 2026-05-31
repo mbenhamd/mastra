@@ -2099,6 +2099,71 @@ describe('Harness server routes', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('emits periodic keep-alive comment frames on an idle live stream', async () => {
+    const session = {
+      subscribe: vi.fn(() => vi.fn()),
+      getEventReplayState: vi.fn(),
+      listEventsAfter: vi.fn(),
+    };
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord()),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await GET_HARNESS_SESSION_EVENTS_ROUTE.handler(
+      // Tiny heartbeat cadence keeps the test deterministic without fake timers.
+      makeParams({ mastra, name: 'code', sessionId: 'session-1', heartbeatIntervalMs: 1 }),
+    );
+
+    const reader = response.body!.getReader();
+    // First read drains any pending frames and lets the ReadableStream `start()`
+    // finish so the heartbeat interval is armed; the next read observes a tick.
+    const chunk = await reader.read();
+    await reader.cancel();
+    const text = new TextDecoder().decode(chunk.value);
+    expect(text).toContain(': keep-alive');
+  });
+
+  it('stops the keep-alive heartbeat and unsubscribes when the request aborts', async () => {
+    const unsubscribe = vi.fn();
+    const session = {
+      subscribe: vi.fn(() => unsubscribe),
+      getEventReplayState: vi.fn(),
+      listEventsAfter: vi.fn(),
+    };
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord()),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+    const controller = new AbortController();
+
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      const response = await GET_HARNESS_SESSION_EVENTS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          abortSignal: controller.signal,
+          heartbeatIntervalMs: 1000,
+        }),
+      );
+
+      const reader = response.body!.getReader();
+      // Let `start()` finish so the heartbeat interval is registered before aborting.
+      await reader.read();
+      controller.abort();
+      await reader.read().catch(() => undefined);
+
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalled();
+    } finally {
+      clearSpy.mockRestore();
+    }
+  });
+
   it('serializes live Harness SSE events with the replay-safe JSON projection', async () => {
     class Box {
       constructor(readonly value: string) {}
