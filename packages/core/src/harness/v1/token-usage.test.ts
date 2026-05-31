@@ -625,9 +625,18 @@ describe('Session token usage — durability', () => {
 
     agent.enqueueRun({ runId: 'foreground-token-persist-failure', finishReason: 'stop' });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
-    await expect(session.message({ content: 'one', admissionId: 'foreground-token-persist-failure' })).rejects.toThrow(
-      'foreground token persist failed',
-    );
+    // §13.3f.1: the raw `saveSession` failure is REDACTED on the public
+    // `message()` rejection (`.message` generic, raw original on `.cause`).
+    // The behavior under test is shutdown-time repair + single lease release.
+    const thrown = await session
+      .message({ content: 'one', admissionId: 'foreground-token-persist-failure' })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect((thrown as Error).name).toBe('HarnessExecutionError');
+    expect((thrown as Error).message).toBe('An internal harness error occurred');
+    expect(((thrown as { cause?: Error }).cause as Error).message).toBe('foreground token persist failed');
     expect(failedTokenSave).toBe(true);
 
     await expect(harness.shutdown()).resolves.toBeUndefined();

@@ -402,6 +402,81 @@ export class HarnessOutputGenerationError extends HarnessError {
 }
 
 /**
+ * Generic, already-redacted wrapper for a raw provider/model/runtime execution
+ * failure that crosses a public §4.2b boundary (e.g. the value REJECTED from
+ * `session.message()` / `session.signal()` / `session.skills.use()`, which
+ * delegate to `message()`). §13.3f.1 forbids raw driver/SQL/path/`err.message`
+ * text from crossing any public Harness boundary, and SDK promise rejections
+ * are explicitly listed among those boundaries (§13.3f).
+ *
+ * Behaves exactly like the {@link HarnessStorageError} both-satisfying shape:
+ * - its public `.message` is a fixed, construction-safe summary (so a naive
+ *   caller that surfaces `.message` — e.g. `spawn-subagent-tool` projecting a
+ *   child failure into its tool result — cannot leak provider detail), and
+ * - the raw original is kept LOCAL-ONLY on `.cause` so the trusted Doxa caller
+ *   retains full fidelity for logging / retry classification.
+ *
+ * It maps to the reserved `harness.internal` wire code via {@link HarnessError},
+ * which is exactly what `projectHarnessPublicError` already produces for an
+ * un-typed raw error — so wire/event/durable surfaces stay byte-identical; only
+ * the in-process promise rejection changes (from raw to redacted). Harness-own
+ * errors (`HarnessError` / `HarnessStorageError`) are construction-safe by
+ * design and are NEVER wrapped — they pass through with their own typed message.
+ */
+export class HarnessExecutionError extends HarnessError {
+  readonly name = 'HarnessExecutionError';
+  readonly code = 'harness.internal';
+  /** The raw underlying provider/model/runtime error. LOCAL-ONLY; never projected to the wire. */
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    // Fixed, redacted message — must match the public `harness.internal`
+    // projection (`HARNESS_INTERNAL_REDACTED_MESSAGE` in events.ts) so a caller
+    // surfacing `.message` sees the same generic text the wire surface carries.
+    super('An internal harness error occurred');
+    this.cause = cause;
+  }
+}
+
+/**
+ * True for a value that is one of the Harness's OWN error classes. Every such
+ * class (see this file) declares a `readonly name = 'Harness…'` and builds its
+ * `.message` from known, non-sensitive fields — so its message is
+ * construction-safe and never carries raw driver/SQL/path text. They do NOT all
+ * share a single base (`HarnessError` is only the wire-`code`-bearing subset;
+ * many extend `Error` directly), so the recognizer is the shared `name`
+ * prefix.
+ *
+ * Why name-prefix (not strict per-class instanceof, unlike the WIRE projection
+ * `projectHarnessPublicError`): this predicate gates the IN-PROCESS promise
+ * rejection consumed by the TRUSTED in-VM caller (Doxa), which branches on the
+ * concrete Harness error TYPE. The wire projection trusts by instance because a
+ * forged `code` string could leak across an UNtrusted boundary; here the
+ * consumer is in-process and the only realistic risk is accidentally redacting
+ * a genuine Harness-typed error (which a raw provider/storage error never
+ * impersonates by setting `name = 'Harness…'`).
+ */
+function isHarnessOwnError(err: unknown): boolean {
+  return (
+    err instanceof Error && typeof (err as { name?: unknown }).name === 'string' && err.name.startsWith('Harness')
+  );
+}
+
+/**
+ * Redact a value about to REJECT a public §4.2b op (`message()` / `signal()` /
+ * `skills.use()`), enforcing §13.3f.1 on the in-process promise-rejection
+ * boundary. A value that is already a construction-safe Harness-own error
+ * (any `Harness…Error`, including `HarnessError` / `HarnessStorageError`)
+ * passes through UNCHANGED — callers rely on its concrete type/message.
+ * Anything else (a raw provider/runtime/storage `Error`, `MastraError`, or
+ * non-Error throw) is wrapped in a {@link HarnessExecutionError} whose
+ * `.message` is redacted and whose `.cause` keeps the raw original local-only.
+ */
+export function redactPublicBoundaryRejection(err: unknown): unknown {
+  if (isHarnessOwnError(err)) return err;
+  return new HarnessExecutionError(err);
+}
+
+/**
  * `harness.session(...)` could not acquire the session's write lease under
  * `lockMode: 'fail'`. Carries the current owner so callers can route the
  * request to the holding instance, and the TTL so callers can decide whether

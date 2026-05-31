@@ -766,9 +766,19 @@ describe('Session.message() — default path', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    await expect(session.message({ content: 'hi', admissionId: 'admission-1' })).rejects.toThrow(
-      'completed evidence unavailable',
+    // §13.3f.1: `message()` is a public §4.2b boundary, so a raw storage
+    // failure is REDACTED on the in-process rejection — `.message` is the
+    // generic `harness.internal` text and the raw original is preserved
+    // local-only on `.cause`. (The behavior under test is that a *completed*
+    // evidence write failure is NOT converted into `failed` evidence; see the
+    // `storage.writes` assertions below.)
+    const thrown = await session.message({ content: 'hi', admissionId: 'admission-1' }).then(
+      () => undefined,
+      (e: unknown) => e,
     );
+    expect((thrown as Error).name).toBe('HarnessExecutionError');
+    expect((thrown as Error).message).toBe('An internal harness error occurred');
+    expect(((thrown as { cause?: Error }).cause as Error).message).toBe('completed evidence unavailable');
 
     expect(storage.writes).toContain('completed');
     expect(storage.writes).not.toContain('failed');

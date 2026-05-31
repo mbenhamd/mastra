@@ -101,6 +101,7 @@ import {
   HarnessSkillNotFoundError,
   HarnessValidationError,
   HarnessWorkspaceLostError,
+  redactPublicBoundaryRejection,
 } from './errors';
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
@@ -4174,6 +4175,40 @@ export class Session {
   }
 
   /**
+   * Drain a RESUME run's own `fullStream` through `_emitForChunk` so the
+   * approved tool's `tool_end` and any post-approval `text_delta` surface LIVE
+   * (§10.4) to subscribers. Unlike the initial run, a resume reuses the
+   * suspended run's `runId` (`pending.runId`), which the long-lived thread
+   * subscription has already recorded in its `seenRunIds`; the subscription
+   * therefore dedups the re-registered resume run and never re-drains it, so
+   * this local drain is the SOLE consumer of the resumed segment's chunks (no
+   * double-emit). This is an independent evented reader over the output's
+   * shared chunk buffer; it does NOT gate completion delivery, which stays on
+   * the `getFullOutput()` / `_waitUntilFinished()` path. `_emitForChunk` never
+   * emits a terminal `agent_end` — the resume's terminal is emitted explicitly
+   * by `respondTo*` after this drain — so a re-suspend or error mid-resume does
+   * not produce a spurious terminal here.
+   */
+  private async _drainResumeStream(out: MastraModelOutput<unknown>): Promise<void> {
+    const stream = (out as { fullStream?: ReadableStream<unknown> }).fullStream;
+    if (!stream) return;
+    // The resume run replays the approved tool's `tool-result` chunk WITHOUT a
+    // preceding `tool-call` chunk in this segment (the `tool-call` landed in the
+    // initial, suspended turn), so `_activeTools` (seeded only by `tool-call`)
+    // does not necessarily hold the resumed tool. `_emitForChunk` now reads the
+    // `toolName` from the chunk payload itself (which always carries it), so the
+    // live `tool_end` surfaces the real name without re-seeding `_activeTools`.
+    for await (const chunk of stream as AsyncIterable<{
+      type: string;
+      payload?: unknown;
+      data?: unknown;
+      runId?: string;
+    }>) {
+      this._emitForChunk(chunk);
+    }
+  }
+
+  /**
    * Settle the outstanding completion waiter for `runId` with the bundled
    * `FullOutput`. Always called from `_watchRunCompletion` with the output
    * reference captured at registration time (runtime cleanup may have
@@ -4294,8 +4329,14 @@ export class Session {
         return;
       }
       case 'tool-result': {
-        const payload = chunk.payload as { toolCallId: string; result: unknown; isError?: boolean };
-        const toolName = this._activeTools.get(payload.toolCallId)?.toolName ?? '';
+        const payload = chunk.payload as { toolCallId: string; toolName?: string; result: unknown; isError?: boolean };
+        // §10.4: the resume segment replays the approved tool's `tool-result`
+        // WITHOUT a preceding `tool-call` in this segment, so `_activeTools` (seeded
+        // only by `tool-call`) misses on resume and `tool_end.toolName` would be ''.
+        // The chunk payload itself carries the required `toolName` (ToolResultPayload,
+        // stream/types.ts) on BOTH the initial and resume paths, so prefer it; fall
+        // back to the `_activeTools` entry for any chunk shape that omits it.
+        const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
         if (runId !== undefined) {
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
@@ -4312,8 +4353,12 @@ export class Session {
         return;
       }
       case 'tool-error': {
-        const payload = chunk.payload as { toolCallId: string; error: unknown };
-        const toolName = this._activeTools.get(payload.toolCallId)?.toolName ?? '';
+        const payload = chunk.payload as { toolCallId: string; toolName?: string; error: unknown };
+        // Same resume gap as `tool-result`: prefer the payload's own `toolName`
+        // (ToolErrorPayload, stream/types.ts) so a resumed/replayed `tool-error`
+        // carries the real name; fall back to `_activeTools` for chunk shapes
+        // that omit it.
+        const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
         if (runId !== undefined) {
           // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
@@ -5076,7 +5121,13 @@ export class Session {
           usage: this._runUsage(),
         });
       }
-      throw err;
+      // §13.3f.1 — `message()` is a public §4.2b boundary; its promise
+      // rejection must not leak raw provider/driver/SQL/path text. Redact a raw
+      // cause into a `HarnessExecutionError` (safe `.message`, raw `.cause`
+      // local-only); Harness-own errors pass through with their typed message.
+      // The wire/event/durable surfaces are unchanged (they already project via
+      // `projectHarnessPublicError`, which maps both shapes to `harness.internal`).
+      throw redactPublicBoundaryRejection(err);
     } finally {
       if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
       finishOwnedMessageTurn();
@@ -5936,7 +5987,12 @@ export class Session {
                 error: projectHarnessPublicError(err),
               });
             }
-            throw err;
+            // §13.3f.1 — `handle.result` is a public §4.2b boundary; redact a raw
+            // cause before rejecting it (safe `.message`, raw `.cause`
+            // local-only). The durable `signal_failed` evidence above is already
+            // projected via `projectHarnessPublicError`, so only the in-process
+            // promise rejection changes.
+            throw redactPublicBoundaryRejection(err);
           })
           .finally(() => {
             finishOwnedSignalTurn();
@@ -8005,9 +8061,28 @@ export class Session {
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
+      // §10.4 — suspension events interleave with text/tool events on the live
+      // subscriber stream and are followed by a `tool_end` after resume. The
+      // resume run REUSES the suspended run's `runId` (`pending.runId`), which is
+      // already in the long-lived thread subscription's `seenRunIds`
+      // (thread-stream-runtime.ts), so that subscription dedups the re-registered
+      // resume run and never re-drains it. Drain the resume run's own
+      // `fullStream` through the same `_emitForChunk` path so the approved tool's
+      // `tool_end` and any post-approval `text_delta` surface LIVE to subscribers
+      // before the terminal `agent_end`. This local drain is the SOLE consumer of
+      // the resumed segment's chunks (no double-emit). Completion delivery stays
+      // on the independent `getFullOutput()` path below — draining is a separate
+      // evented reader over the shared chunk buffer and does not gate settlement.
       const fullOutput = out.getFullOutput() as Promise<FullOutput<unknown>>;
       void fullOutput.catch(() => {});
+      const resumeDrain = this._drainResumeStream(out as MastraModelOutput<unknown>);
+      void resumeDrain.catch(() => {});
       full = await Promise.race([fullOutput, activeTurnWaiter.promise]);
+      // The drain feeds `tool_end`/`text_delta` for the resumed segment; await it
+      // (best-effort) so those live events are emitted before the terminal
+      // `agent_end` below. A drain error must not fail the resume — settlement
+      // already came from `getFullOutput()`.
+      await Promise.race([resumeDrain.catch(() => {}), activeTurnWaiter.promise]);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
