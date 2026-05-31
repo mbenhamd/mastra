@@ -575,6 +575,142 @@ describe('HarnessLibSQL active session admission', () => {
     ).resolves.toBeNull();
   });
 
+  it('replay state reflects single-epoch seq bounds unchanged', async () => {
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-1:1',
+      epoch: 'epoch-1',
+      sequence: 1,
+      event: { type: 'app.event', id: 'harness-v1:epoch-1:1', timestamp: 1000 },
+      emittedAt: 1000,
+      storedAt: 1001,
+    });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-1:2',
+      epoch: 'epoch-1',
+      sequence: 2,
+      event: { type: 'app.event', id: 'harness-v1:epoch-1:2', timestamp: 1002 },
+      emittedAt: 1002,
+      storedAt: 1003,
+    });
+
+    await expect(
+      storage.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toEqual({ epoch: 'epoch-1', oldestSequence: 1, newestSequence: 2 });
+  });
+
+  it('collapses to null on a multi-epoch ledger, matching the authoritative in-memory adapter', async () => {
+    // §10.5: replay state is anchored to the CURRENT in-memory Session
+    // instance's epoch, which storage cannot observe. A multi-epoch ledger is
+    // ambiguous, so storage returns null; the server then 412s the stale cursor
+    // and the client recovers via the snapshot path. The in-memory reference
+    // (packages/core/.../inmemory.ts: `if (epochs.size !== 1) return null;`)
+    // returns null for the identical input, so libsql MUST too.
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:1',
+      epoch: 'epoch-prior',
+      sequence: 1,
+      event: { type: 'agent_start', id: 'harness-v1:epoch-prior:1', timestamp: 1000 },
+      emittedAt: 1000,
+      storedAt: 1000,
+    });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:2',
+      epoch: 'epoch-prior',
+      sequence: 2,
+      event: { type: 'agent_end', id: 'harness-v1:epoch-prior:2', timestamp: 1010 },
+      emittedAt: 1010,
+      storedAt: 1010,
+    });
+    // Fresh, chronologically-newest epoch after a rehydrate.
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:aFresh:0',
+      epoch: 'aFresh',
+      sequence: 0,
+      event: { type: 'agent_start', id: 'harness-v1:aFresh:0', timestamp: 2000 },
+      emittedAt: 2000,
+      storedAt: 2000,
+    });
+
+    await expect(
+      storage.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('still collapses to null when the prior epoch and fresh epoch share a stored_at millisecond', async () => {
+    // Edge case: stored_at is `Date.now()` and same-ms cross-epoch collisions are
+    // routine; a stored_at/sequence tiebreak could otherwise misidentify the
+    // "newest" epoch. Collapsing to null is independent of stored_at ordering,
+    // so the ambiguous ledger stays null regardless of the clock collision.
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:5',
+      epoch: 'epoch-prior',
+      sequence: 5,
+      event: { type: 'agent_end', id: 'harness-v1:epoch-prior:5', timestamp: 1500 },
+      emittedAt: 1500,
+      storedAt: 1500,
+    });
+    // Fresh epoch's seq-0 event lands in the SAME millisecond as the prior
+    // epoch's higher-sequence row.
+    await storage.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:aFresh:0',
+      epoch: 'aFresh',
+      sequence: 0,
+      event: { type: 'agent_start', id: 'harness-v1:aFresh:0', timestamp: 1500 },
+      emittedAt: 1500,
+      storedAt: 1500,
+    });
+
+    await expect(
+      storage.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toBeNull();
+  });
+
   it('appends and pages workspace action journal rows by session/resource', async () => {
     await storage.saveSession(sampleSession(), { ownerId: 'h-1', ifVersion: 0 });
     await storage.saveSession(sampleSession({ id: 'other-session', resourceId: 'other-resource' }), {

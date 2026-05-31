@@ -1253,6 +1253,12 @@ export class Session {
     }
     this._emit({
       type: input.type as `${string}.${string}`,
+      // §10.3: the harness fills the session identity fields. `sessionId` is
+      // stamped by the emitter; `resourceId` / `threadId` are stamped here so a
+      // custom event routes by the same (resourceId, threadId) tuple as built-in
+      // session-scoped events.
+      resourceId: this.resourceId,
+      threadId: this.threadId,
       ...(input.payload !== undefined ? { payload: input.payload } : {}),
       // Attribute to the run when known; the structured-sync window before
       // agent_start has no runId yet, which is acceptable (sessionId still anchors it).
@@ -10847,7 +10853,7 @@ export class Session {
    * @internal — used by the Harness after close starts. New work is rejected
    * immediately while previously admitted flushes serialize before the marker.
    */
-  _flushClosingMarker(params: { closeTimeoutMs: number }): Promise<SessionRecord> {
+  _flushClosingMarker(params: { closeTimeoutMs: number; closeDeadlineAt?: number }): Promise<SessionRecord> {
     if (this.isClosed) {
       return Promise.resolve(this._record);
     }
@@ -10855,7 +10861,14 @@ export class Session {
 
     const run = async (): Promise<SessionRecord> => {
       const closingAt = this._record.closingAt ?? Date.now();
-      const closeDeadlineAt = this._record.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
+      // §5.5: ONE fixed deadline for the whole subtree. The close owner stamps a
+      // single `closeDeadlineAt` at the root and propagates it here, so a
+      // descendant marked mid-walk never resets the clock to its own wall-clock
+      // `now + closeTimeoutMs`. The per-node `closingAt + closeTimeoutMs` is only
+      // a fallback for the root (or a standalone flush where no subtree deadline
+      // is supplied) and is overridden by any deadline already persisted on the
+      // record (resumed close).
+      const closeDeadlineAt = this._record.closeDeadlineAt ?? params.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
       const next: SessionRecord = {
         ...this._record,
         closingAt,

@@ -631,7 +631,11 @@ export type HarnessStorageSubject =
   | { kind: 'channel_action'; id: string }
   | { kind: 'channel_outbox'; id: string }
   | { kind: 'wakeup'; id: string }
-  | { kind: 'attachment'; id: string };
+  | { kind: 'attachment'; id: string }
+  // §4.5d: the per-resource workspace row a `workspace_cleanup` failure is
+  // scoped to. Without this kind a `workspace_cleanup` storage error could not
+  // name its subject, despite the operation being part of HarnessStorageOperation.
+  | { kind: 'workspace'; id: string };
 
 export class HarnessStorageError extends Error {
   readonly name = 'HarnessStorageError';

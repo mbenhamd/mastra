@@ -368,6 +368,10 @@ describe('HarnessRequestContext — emitCustomEvent (§6.1/§6.3/§10.2)', () =>
       payload: { pct: 50 },
       sessionId: session.id,
       runId: 'run-emit',
+      // §10.3: the harness fills the session identity fields, including the
+      // (resourceId, threadId) routing tuple, on every custom event.
+      resourceId: session.resourceId,
+      threadId: session.threadId,
     });
     expect(typeof progress.id).toBe('string');
     expect(typeof progress.timestamp).toBe('number');

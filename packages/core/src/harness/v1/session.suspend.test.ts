@@ -1016,15 +1016,23 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
       session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
     ).rejects.toThrow('FakeAgent: no run enqueued for resumeStream()');
 
+    // §13.3f.1: the durable failure receipt is a public projection surface — a
+    // raw (non-namespaced) agent Error redacts to `harness.internal` with a
+    // generic message. The raw "FakeAgent: …" text still surfaces on the LOCAL
+    // thrown rejection above, but must not be persisted onto the receipt.
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       itemId: 'question:tc-Q',
       status: 'failed',
       retryable: false,
-      error: expect.objectContaining({ message: 'FakeAgent: no run enqueued for resumeStream()' }),
+      error: { code: 'harness.internal', message: 'An internal harness error occurred' },
     });
+    // The idempotent retry replays the stored failure receipt (it does NOT
+    // re-invoke the agent), so it re-throws the receipt's redacted public
+    // projection — the generic `harness.internal` message — not the original
+    // raw agent text. resumeStream is not called a second time.
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toThrow('FakeAgent: no run enqueued for resumeStream()');
+    ).rejects.toThrow('An internal harness error occurred');
     expect(agent.resumeCalls).toHaveLength(1);
   });
 

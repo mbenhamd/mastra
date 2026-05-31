@@ -1591,35 +1591,33 @@ export class HarnessLibSQL extends HarnessStorage {
   }): Promise<HarnessSessionEventReplayState | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureSessionEventsTable();
+    // §10.5 live-replay: the SSE cursor contract is anchored to the CURRENT
+    // in-memory Session instance's epoch, which storage cannot observe. When the
+    // ledger holds more than one epoch (every rehydrate after eviction mints a
+    // fresh epoch and still appends lifecycle events), the replay state is
+    // ambiguous, so we collapse to `null`. The server then returns 412 for the
+    // stale cursor and the client recovers via the §10.5 snapshot path. Durable
+    // SSE replay across restarts/evictions is explicitly NOT a v1 goal, and a
+    // newest-by-`stored_at` projection would (a) diverge from the authoritative
+    // in-memory adapter, which returns `null` for any multi-epoch ledger, and
+    // (b) misidentify the current epoch whenever the prior epoch's last event
+    // and the fresh epoch's seq-0 event share a `stored_at` millisecond.
     const bounds = await this.#client.execute({
       sql: `SELECT
-              oldest.epoch AS oldest_epoch,
-              oldest.sequence AS oldest_sequence,
-              newest.epoch AS newest_epoch,
-              newest.sequence AS newest_sequence
-            FROM (
-              SELECT epoch, sequence
-              FROM ${TABLE_HARNESS_SESSION_EVENTS}
-              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              ORDER BY epoch ASC, sequence ASC
-              LIMIT 1
-            ) AS oldest
-            CROSS JOIN (
-              SELECT epoch, sequence
-              FROM ${TABLE_HARNESS_SESSION_EVENTS}
-              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              ORDER BY epoch DESC, sequence DESC
-              LIMIT 1
-            ) AS newest`,
-      args: [namespace, sessionId, resourceId, threadId, namespace, sessionId, resourceId, threadId],
+              COUNT(DISTINCT epoch) AS epoch_count,
+              MIN(epoch) AS epoch,
+              MIN(sequence) AS oldest_sequence,
+              MAX(sequence) AS newest_sequence
+            FROM ${TABLE_HARNESS_SESSION_EVENTS}
+            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
+      args: [namespace, sessionId, resourceId, threadId],
     });
     const row = bounds.rows[0];
-    if (!row || row.oldest_epoch == null || row.newest_epoch == null) return null;
+    if (!row || row.epoch_count == null || Number(row.epoch_count) !== 1) return null;
     if (row.oldest_sequence == null || row.newest_sequence == null) return null;
-    if (String(row.oldest_epoch) !== String(row.newest_epoch)) return null;
 
     return {
-      epoch: String(row.newest_epoch),
+      epoch: String(row.epoch),
       oldestSequence: Number(row.oldest_sequence),
       newestSequence: Number(row.newest_sequence),
     };

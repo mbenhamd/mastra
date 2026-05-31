@@ -2910,6 +2910,142 @@ describe('Harness v1 — lifecycle', () => {
     expect(closedSessionIds).toEqual([grandchild.id, child.id, parent.id]);
   });
 
+  it('§5.5: stamps ONE fixed close deadline across a 3-level subtree (not depth-multiplied)', async () => {
+    const storage = makeStorage();
+    const closeTimeoutMs = 250;
+    const harness = makeHarness({ sessions: { storage, closeTimeoutMs } });
+    const closingEvents: Array<{ sessionId?: string; closingAt?: number; closeDeadlineAt?: number }> = [];
+    harness.subscribe(event => {
+      if (event.type === 'session_closing') {
+        closingEvents.push({
+          sessionId: event.sessionId,
+          closingAt: event.closingAt,
+          closeDeadlineAt: event.closeDeadlineAt,
+        });
+      }
+    });
+
+    const parent = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    await parent.close();
+
+    // Every node in the subtree shares the SINGLE root deadline. Under the
+    // pre-fix per-node computation each descendant stamped its own (later)
+    // `Date.now() + closeTimeoutMs` during the BFS marking walk, so the child's
+    // and grandchild's deadlines would be strictly greater than the root's.
+    expect(closingEvents).toHaveLength(3);
+    const root = closingEvents.find(e => e.sessionId === parent.id)!;
+    const childEvent = closingEvents.find(e => e.sessionId === child.id)!;
+    const grandchildEvent = closingEvents.find(e => e.sessionId === grandchild.id)!;
+    expect(root.closeDeadlineAt).toBe((root.closingAt ?? 0) + closeTimeoutMs);
+    expect(childEvent.closeDeadlineAt).toBe(root.closeDeadlineAt);
+    expect(grandchildEvent.closeDeadlineAt).toBe(root.closeDeadlineAt);
+
+    // And the durable records carry the same single deadline.
+    for (const id of [parent.id, child.id, grandchild.id]) {
+      const stored = await harness.loadSession({ sessionId: id, includeClosed: true });
+      expect(stored?.closeDeadlineAt).toBe(root.closeDeadlineAt);
+    }
+  });
+
+  it('§5.5: a busy 3-level subtree closes within ~closeTimeoutMs, not depth-multiplied', async () => {
+    const storage = makeStorage();
+    const closeTimeoutMs = 60;
+    const agent = new MockAgent({ id: 'default' });
+    // One held run per subtree level: each session is busy when close drains, so
+    // every node's `_waitForCloseDrain` actually blocks until the deadline. Under
+    // the pre-fix per-node deadline the waits stack (≈ depth × closeTimeoutMs);
+    // with one shared deadline the whole drain is bounded by ~closeTimeoutMs.
+    const hold = deferred();
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'p' });
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'c' });
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'g' });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, closeTimeoutMs },
+    });
+
+    const parent = await harness.session({ threadId: { fresh: true }, resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    const pMsg = parent.message({ content: 'p' });
+    const cMsg = child.message({ content: 'c' });
+    const gMsg = grandchild.message({ content: 'g' });
+    await waitFor(() => agent.streamCalls.length === 3, 'all three turns in flight');
+
+    const startedAt = Date.now();
+    const close = parent.close();
+    await close;
+    const elapsed = Date.now() - startedAt;
+
+    // Bounded by a single deadline (+ scheduling slack), NOT 3× the timeout.
+    expect(elapsed).toBeLessThan(closeTimeoutMs * 2);
+
+    hold.resolve();
+    await Promise.allSettled([pMsg, cMsg, gMsg]);
+
+    for (const id of [parent.id, child.id, grandchild.id]) {
+      const stored = await storage.loadSession({ sessionId: id, harnessName: 'default' });
+      expect(stored?.closedAt).toBeDefined();
+    }
+  });
+
+  it('§5.5: a descendant marked during the close walk inherits the root deadline', async () => {
+    // Build the subtree first, then drive close on the root. Children are
+    // discovered + marked DURING the BFS close walk (after the root deadline is
+    // fixed), so a child/grandchild marked later must still carry the root's
+    // single deadline rather than a fresh `now + closeTimeoutMs`.
+    const storage = makeStorage();
+    const closeTimeoutMs = 1000;
+    const harness = makeHarness({ sessions: { storage, closeTimeoutMs } });
+    const deadlineBySession = new Map<string, number>();
+    harness.subscribe(event => {
+      if (event.type === 'session_closing' && event.sessionId && event.closeDeadlineAt !== undefined) {
+        deadlineBySession.set(event.sessionId, event.closeDeadlineAt);
+      }
+    });
+
+    const parent = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    await parent.close();
+
+    const rootDeadline = deadlineBySession.get(parent.id);
+    expect(rootDeadline).toBeDefined();
+    expect(deadlineBySession.get(child.id)).toBe(rootDeadline);
+    expect(deadlineBySession.get(grandchild.id)).toBe(rootDeadline);
+  });
+
   it('repairs a stored closing marker without resetting the deadline', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage, closeTimeoutMs: 250 } });
@@ -4348,11 +4484,17 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
       harness,
     ) as (c: never) => Promise<AdmitResult>;
 
+    // The local thrown error still carries the raw resolver text (it stays a
+    // local-only cause); only the PUBLIC projection is redacted.
     await expect(call(makeIngressCtx())).rejects.toThrow(/policy boom/);
 
     // received emitted, then failed (not admitted).
     expect(events.map(e => e.type)).toEqual(['channel_ingress_received', 'channel_ingress_failed']);
-    expect(events[1]?.error?.message).toMatch(/policy boom/);
+    // §13.3f.1: a raw (non-namespaced) resolver Error must NOT leak its message
+    // or its `err.name` code onto the public channel_ingress_failed event. It is
+    // redacted to the reserved `harness.internal` catch-all with a generic message.
+    expect(events[1]?.error).toEqual({ code: 'harness.internal', message: 'An internal harness error occurred' });
+    expect(events[1]?.error?.message).not.toMatch(/policy boom/);
     const failedItemId = events[1]?.inboxItemId;
     expect(typeof failedItemId).toBe('string');
 
@@ -4372,8 +4514,12 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
     expect(claimed).toHaveLength(1);
     expect(claimed[0]?.id).toBe(failedItemId);
     expect(claimed[0]?.status).toBe('failed');
+    // The durable row keeps the bare `code: 'unknown'` (row-side readability,
+    // §13.3f.1), but its stored message is the redacted public projection — the
+    // raw resolver text never reaches the durable failure receipt either.
     expect(claimed[0]?.lastError).toMatchObject({ code: 'unknown', retryable: true });
-    expect(claimed[0]?.lastError?.message).toMatch(/policy boom/);
+    expect(claimed[0]?.lastError?.message).toBe('An internal harness error occurred');
+    expect(claimed[0]?.lastError?.message).not.toMatch(/policy boom/);
   });
 
   it('backs off (in-progress duplicate) when the failed row still holds a live claim — does not steal it', async () => {

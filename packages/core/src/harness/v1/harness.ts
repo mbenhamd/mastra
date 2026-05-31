@@ -4026,6 +4026,12 @@ export class Harness {
       }
       tree.push(root);
       tree[0] = await this._markCloseNodeClosing(storage, root, persistedCloseIds);
+      // §5.5: the close deadline is ONE fixed value for the whole subtree. The
+      // root computed/preserved its `closeDeadlineAt` above; capture it once and
+      // propagate that single deadline to every descendant marked during the BFS
+      // walk and to the drain wait, so a fresh descendant never stamps its own
+      // (later) wall-clock `now + closeTimeoutMs` and inflate the total wait.
+      const subtreeCloseDeadlineAt = tree[0]!.record.closeDeadlineAt ?? Date.now() + this._closeTimeoutMs;
 
       for (let index = 0; index < tree.length; index++) {
         const node = tree[index]!;
@@ -4058,11 +4064,16 @@ export class Harness {
           }
           childNode.live?._beginClosing();
           tree.push(childNode);
-          tree[tree.length - 1] = await this._markCloseNodeClosing(storage, childNode, persistedCloseIds);
+          tree[tree.length - 1] = await this._markCloseNodeClosing(
+            storage,
+            childNode,
+            persistedCloseIds,
+            subtreeCloseDeadlineAt,
+          );
         }
       }
 
-      await this._drainCloseTree(tree);
+      await this._drainCloseTree(tree, subtreeCloseDeadlineAt);
       await this._terminalizeCloseTree(storage, tree, closedLiveSessions);
     } catch (err) {
       await this._releaseCloseTreeLeases(storage, tree);
@@ -4140,13 +4151,22 @@ export class Harness {
     storage: HarnessStorage,
     node: CloseTreeNode,
     persistedCloseIds: Set<string>,
+    // §5.5: the ONE fixed deadline for the whole close subtree, stamped once at
+    // the root and propagated to every descendant. `undefined` only for the root
+    // node, which derives its own deadline from `closingAt + closeTimeoutMs` (or
+    // a deadline already persisted on a resumed close).
+    subtreeCloseDeadlineAt?: number,
   ): Promise<CloseTreeNode> {
     const closingAt = node.record.closingAt ?? Date.now();
-    const closeDeadlineAt = node.record.closeDeadlineAt ?? closingAt + this._closeTimeoutMs;
+    const closeDeadlineAt =
+      node.record.closeDeadlineAt ?? subtreeCloseDeadlineAt ?? closingAt + this._closeTimeoutMs;
     if (node.live) {
       let record: SessionRecord;
       try {
-        record = await node.live._flushClosingMarker({ closeTimeoutMs: this._closeTimeoutMs });
+        record = await node.live._flushClosingMarker({
+          closeTimeoutMs: this._closeTimeoutMs,
+          closeDeadlineAt: subtreeCloseDeadlineAt,
+        });
       } catch (err) {
         throw new HarnessStorageError({ operation: 'session_close', sessionId: node.record.id, cause: err });
       }
@@ -4177,11 +4197,15 @@ export class Harness {
     return { ...node, record: next };
   }
 
-  private async _drainCloseTree(tree: CloseTreeNode[]): Promise<void> {
+  private async _drainCloseTree(tree: CloseTreeNode[], subtreeCloseDeadlineAt: number): Promise<void> {
+    // §5.5: every node drains against the SINGLE subtree deadline, not its own
+    // per-node `closeDeadlineAt`. A descendant marked mid-walk carries the same
+    // root deadline, so the total close wait is bounded by `closeTimeoutMs` and
+    // does not grow with subtree depth.
     await Promise.all(
       tree.map(node => {
         if (!node.live) return undefined;
-        return node.live._waitForCloseDrain(node.record.closeDeadlineAt ?? Date.now());
+        return node.live._waitForCloseDrain(subtreeCloseDeadlineAt);
       }),
     );
   }

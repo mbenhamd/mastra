@@ -26,7 +26,7 @@ import type {
   SessionRecord,
 } from '../../storage/domains/harness';
 
-import { HarnessEventSerializationError, HarnessValidationError } from './errors';
+import { HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
 import type { EventSerializationReason, HarnessStorageOperation, HarnessStorageSubject } from './errors';
 import type { SessionLifecycleState, TokenUsage } from './session';
 import type { PermissionPolicy, ToolCategory } from './types';
@@ -553,6 +553,12 @@ export interface StorageErrorEvent extends HarnessEventBase {
 
 export interface CustomEvent extends HarnessEventBase {
   type: `${string}.${string}`;
+  // §10.3: the harness fills the event/session identity fields — `id`,
+  // `sessionId`, `timestamp` (from HarnessEventBase / the emitter) plus
+  // `resourceId` and `threadId`. Subscribers route custom events by the same
+  // (resourceId, threadId) tuple as built-in session-scoped events.
+  resourceId: string;
+  threadId: string;
   payload?: unknown;
 }
 
@@ -804,18 +810,63 @@ export function snapshotHarnessEventForJson(value: unknown, path = 'event'): Jso
   }
 }
 
+/**
+ * Generic, caller-safe message for any error that does NOT already carry a
+ * namespaced `harness.*` code. §13.3f.1: `harness.internal` is the reserved
+ * catch-all for unhandled failures, and the raw `err.message` (driver text,
+ * SQL fragments, filesystem paths, stack-derived prose) MUST NOT cross the
+ * v1 wire. The raw cause stays local-only (logs / `HarnessStorageError.cause`).
+ */
+const HARNESS_INTERNAL_REDACTED_MESSAGE = 'An internal harness error occurred';
+
+/**
+ * Project an arbitrary thrown value into the public `{ code, message }` shape
+ * carried by `channel_ingress_failed` / `signal_failed` / `queue_failed` /
+ * durable receipts and `error` turn events.
+ *
+ * Per §13.3f.1, every public error surface must expose a fully-namespaced
+ * `harness.*` code and must never leak a raw driver/SQL/path message:
+ * - A Harness error that already carries a `harness.*` namespaced `code` passes
+ *   through with its (constructed, already-safe) message.
+ * - A `HarnessStorageError` maps to `harness.storage` (it has no `.code` field;
+ *   its message is the safe "Harness storage <op> failed …" summary, and its
+ *   raw `cause` is local-only).
+ * - Anything else — a raw `TypeError`/`Error`/`MastraError`, or a non-Error
+ *   throw (string/object) — maps to the reserved `harness.internal` code with a
+ *   generic redacted message. The raw cause is never surfaced here.
+ */
 export function projectHarnessPublicError(err: unknown): { code: string; message: string } {
-  if (err instanceof Error) {
-    return { code: (err as { code?: string }).code ?? err.name ?? 'harness.message_failed', message: err.message };
+  if (err instanceof HarnessStorageError) {
+    return { code: 'harness.storage', message: err.message };
   }
-  return { code: 'harness.message_failed', message: String(err) };
+  if (err instanceof Error) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === 'string' && code.startsWith('harness.')) {
+      return { code, message: err.message };
+    }
+  }
+  return { code: 'harness.internal', message: HARNESS_INTERNAL_REDACTED_MESSAGE };
 }
 
+/**
+ * JSON-serializes an arbitrary `Error` nested ANYWHERE inside an event payload
+ * (e.g. a tool's own `error` output projected into `tool_end.output`) so the
+ * event can round-trip through the durable replay ledger.
+ *
+ * This is NOT the public-error projection boundary — that is
+ * `projectHarnessPublicError`, which the operation-settlement / channel paths
+ * call directly to build `error: { code, message }` and which redacts raw
+ * causes per §13.3f.1. Here we faithfully preserve the original error's
+ * `name` / `code` / `message` so a replayed tool error is not flattened into a
+ * generic `harness.internal`; redacting a tool's own diagnostic output would be
+ * lossy and is not what §13.3f.1 governs.
+ */
 function harnessEventJsonReplacer(_key: string, value: unknown): unknown {
   if (value instanceof Error) {
     return {
       name: value.name,
-      ...projectHarnessPublicError(value),
+      code: (value as { code?: string }).code ?? value.name,
+      message: value.message,
     };
   }
   return value;
