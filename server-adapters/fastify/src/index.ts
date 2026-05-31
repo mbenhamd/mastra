@@ -263,9 +263,31 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     const queryParams = normalizeQueryParams((request.query || {}) as Record<string, unknown>);
     let body: unknown;
     let bodyParseError: { message: string } | undefined;
+    let rawBody: Uint8Array | string | undefined;
 
     if (route.method === 'POST' || route.method === 'PUT' || route.method === 'PATCH' || route.method === 'DELETE') {
       const contentType = request.headers['content-type'] || '';
+
+      // Routes that verify a provider signature over the EXACT bytes (e.g. channel
+      // webhooks) opt out of parsing AND need the unparsed body. The JSON content-type
+      // parser (registerContextMiddleware) leaves request.body as the raw Buffer for
+      // these routes; surface it as `rawBody` and leave `body`/`bodyParseError`
+      // undefined so a signed-but-not-strict-JSON payload is not rejected with a 400
+      // before the signature is checked. Mirrors the Hono adapter's getParams.
+      if (route.skipBodyParse) {
+        if (Buffer.isBuffer(request.body)) {
+          rawBody = new Uint8Array(
+            request.body.buffer,
+            request.body.byteOffset,
+            request.body.byteLength,
+          );
+        } else if (typeof request.body === 'string') {
+          rawBody = request.body;
+        } else if (request.body instanceof Uint8Array) {
+          rawBody = request.body;
+        }
+        return { urlParams, queryParams, body, bodyParseError, rawBody };
+      }
 
       if (contentType.includes('multipart/form-data')) {
         try {
@@ -288,7 +310,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       }
     }
 
-    return { urlParams, queryParams, body, bodyParseError };
+    return { urlParams, queryParams, body, bodyParseError, rawBody };
   }
 
   /**
@@ -378,11 +400,34 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     } else if (route.responseType === 'stream') {
       await this.stream(route, reply, result as { fullStream: ReadableStream }, request);
     } else if (route.responseType === 'datastream-response') {
-      // Handle AI SDK Response objects - pipe Response.body to Fastify response
+      // Handle AI SDK / harness Response objects (e.g. the SSE session-events route):
+      // pipe the Web ReadableStream body to the Node response. We write directly to
+      // `reply.raw`, so we must hijack the reply and `writeHead` the status + headers
+      // ourselves — headers set via `reply.header()` are NOT flushed once we bypass
+      // Fastify's send path, which would drop the `text/event-stream` content-type.
+      // This mirrors the `stream()` method above. Preserve headers already set by
+      // hooks/plugins (e.g. @fastify/cors), then merge the Response's own headers.
       const fetchResponse = result as globalThis.Response;
-      fetchResponse.headers.forEach((value, key) => reply.header(key, value));
-      reply.status(fetchResponse.status);
+
+      const rawHeaders = reply.getHeaders();
+      const mergedHeaders: Record<string, string | number | string[]> = {};
+      for (const [key, value] of Object.entries(rawHeaders)) {
+        if (value === undefined) continue;
+        const lowerKey = key.toLowerCase();
+        // Drop framing headers that conflict with chunked streaming.
+        if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding') continue;
+        mergedHeaders[key] = value;
+      }
+      fetchResponse.headers.forEach((value, key) => {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding') return;
+        mergedHeaders[key] = value;
+      });
+
+      reply.hijack();
+
       if (fetchResponse.body) {
+        reply.raw.writeHead(fetchResponse.status, mergedHeaders);
         const reader = fetchResponse.body.getReader();
         let readerCanceled = false;
 
@@ -428,6 +473,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           }
         }
       } else {
+        // No body (e.g. a 204/redirect Response): we already hijacked, so emit the
+        // status + headers and end the raw response ourselves.
+        reply.raw.writeHead(fetchResponse.status, mergedHeaders);
         reply.raw.end();
       }
     } else if (route.responseType === 'mcp-http') {
@@ -633,6 +681,20 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           const value = request.headers[name.toLowerCase()];
           return Array.isArray(value) ? value.join(',') : value;
         },
+        // Full header set for handlers that must read every provider header (e.g. a
+        // channel webhook reading its signature/timestamp headers). Mirrors Hono's
+        // `getHeaders`. Fastify normalizes header names to lower-case already; drop
+        // undefined values so the shape matches the transport-neutral contract.
+        getHeaders: (): Record<string, string | string[]> => {
+          const out: Record<string, string | string[]> = {};
+          for (const [key, value] of Object.entries(request.headers)) {
+            if (value !== undefined) out[key] = value;
+          }
+          return out;
+        },
+        // Unparsed request bytes for skipBodyParse routes (HMAC verification over the
+        // exact bytes). Undefined for normally-parsed routes. Mirrors Hono's `rawBody`.
+        rawBody: params.rawBody,
         requestBody: params.body,
         requestPathParams: params.urlParams,
       };
@@ -696,11 +758,25 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       }
     };
 
-    // Add body limit if configured
-    const shouldApplyBodyLimit = this.bodyLimitOptions && ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
-    const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
+    // Resolve the per-route body size cap. A route-specific cap (`route.maxBodySize`)
+    // takes precedence over the adapter-wide default and is honored INDEPENDENTLY of
+    // `this.bodyLimitOptions`: a route that declares its own cap (e.g. the channel
+    // webhook's 1 MiB) must get a real pre-buffer 413 even when the adapter was
+    // constructed without global bodyLimitOptions (embedders/tests). Fastify's
+    // per-route `bodyLimit` rejects with 413 before buffering the whole body, mirroring
+    // the Hono adapter's per-route `bodyLimit` middleware.
+    //
+    // IMPORTANT: Fastify only enforces a per-route body cap when `bodyLimit` is a
+    // TOP-LEVEL route option (`app.route({ bodyLimit })`); a `bodyLimit` nested under
+    // `config` is silently ignored. `config` is reserved for `skipBodyParse`, which
+    // the JSON content-type parser reads via `request.routeOptions.config` to capture
+    // the raw bytes for this route instead of JSON-parsing them (see
+    // registerContextMiddleware).
+    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
+    const maxSize = isBodyBearingMethod ? (route.maxBodySize ?? this.bodyLimitOptions?.maxSize) : undefined;
 
-    const config = shouldApplyBodyLimit && maxSize ? { bodyLimit: maxSize } : undefined;
+    const config: { skipBodyParse?: boolean } | undefined = route.skipBodyParse ? { skipBodyParse: true } : undefined;
+    const bodyLimit = maxSize || undefined;
 
     // Handle ALL method by registering for each HTTP method
     // Fastify doesn't support 'ALL' method natively like Express
@@ -715,6 +791,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
             url: fastifyPath,
             handler,
             config,
+            ...(bodyLimit !== undefined ? { bodyLimit } : {}),
           });
         } catch (err) {
           // Skip duplicate route errors - can happen if route is registered multiple times
@@ -730,6 +807,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         url: fastifyPath,
         handler,
         config,
+        ...(bodyLimit !== undefined ? { bodyLimit } : {}),
       });
     }
   }
@@ -842,21 +920,43 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
 
   registerContextMiddleware(): void {
     // Override the default JSON parser to allow empty bodies
-    // This matches Express behavior where empty POST requests with Content-Type: application/json are allowed
+    // This matches Express behavior where empty POST requests with Content-Type: application/json are allowed.
+    //
+    // Parse the body as a Buffer (not a string) so a `skipBodyParse` route can keep
+    // the EXACT request bytes: a channel webhook signs the raw bytes, and a JSON
+    // parse + re-serialize would break HMAC verification. The parser runs AFTER
+    // routing, so `request.routeOptions.config.skipBodyParse` (set in registerRoute)
+    // identifies the matched route. For such routes we hand the raw Buffer through
+    // untouched and DO NOT reject on a parse failure — a signed-but-not-strict-JSON
+    // payload carrying `content-type: application/json` must still reach the handler,
+    // which captures it as `rawBody` in getParams() and defers parse/verification to
+    // the route's adapter. This mirrors the Hono adapter, where the global context
+    // middleware skips its JSON pre-parse for skipBodyParse routes and getParams
+    // captures `rawBody` via `arrayBuffer()`.
     this.app.removeContentTypeParser('application/json');
-    this.app.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => {
-      try {
-        // Allow empty body
-        if (!body || (typeof body === 'string' && body.trim() === '')) {
-          done(null, undefined);
+    this.app.addContentTypeParser(
+      'application/json',
+      { parseAs: 'buffer' },
+      (request: FastifyRequest, body: Buffer, done) => {
+        const skipBodyParse = (request.routeOptions?.config as { skipBodyParse?: boolean } | undefined)?.skipBodyParse;
+        if (skipBodyParse) {
+          // Leave the raw bytes unparsed; getParams() reads request.body as the Buffer.
+          done(null, body);
           return;
         }
-        const parsed = JSON.parse(body as string);
-        done(null, parsed);
-      } catch (err) {
-        done(err as Error, undefined);
-      }
-    });
+        try {
+          // Allow empty body
+          if (!body || body.length === 0 || body.toString('utf8').trim() === '') {
+            done(null, undefined);
+            return;
+          }
+          const parsed = JSON.parse(body.toString('utf8'));
+          done(null, parsed);
+        } catch (err) {
+          done(err as Error, undefined);
+        }
+      },
+    );
 
     // Register content type parser for multipart/form-data
     // This allows Fastify to accept multipart requests without parsing them
