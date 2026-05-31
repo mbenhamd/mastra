@@ -255,23 +255,22 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     if (route.method === 'POST' || route.method === 'PUT' || route.method === 'PATCH' || route.method === 'DELETE') {
       const contentType = request.header('content-type') || '';
 
-      // Capture the unparsed bytes BEFORE any parse (JSON or multipart) so a
-      // handler can verify a provider signature over the exact request body.
-      // Cloning first leaves request.raw's stream available for the parse below.
-      try {
-        rawBody = new Uint8Array(await request.raw.clone().arrayBuffer());
-      } catch {
-        // Best-effort: an unreadable/already-consumed stream just leaves rawBody
-        // undefined; signature-verifying handlers treat that as unverifiable.
-        rawBody = undefined;
-      }
-
-      // Routes that verify a provider signature over the exact bytes (e.g. channel
-      // webhooks) opt out of parsing: a signed payload that is not strict JSON would
-      // otherwise be rejected with a 400 (bodyParseError) before the signature is
-      // checked. Leave `body`/`bodyParseError` undefined; the adapter forwards
+      // Routes that verify a provider signature over the EXACT bytes (e.g. channel
+      // webhooks) opt out of parsing AND need the unparsed body. Capture `rawBody`
+      // ONLY for these routes: cloning + buffering the whole body on every write
+      // request would be a needless allocation for normal parsed routes (no other
+      // route consumes `ctx.rawBody`). A signed payload that is not strict JSON
+      // would otherwise be rejected with a 400 (bodyParseError) before the signature
+      // is checked, so leave `body`/`bodyParseError` undefined; the adapter forwards
       // `rawBody` and the handler/adapter parses + verifies from it.
       if (route.skipBodyParse) {
+        try {
+          rawBody = new Uint8Array(await request.raw.clone().arrayBuffer());
+        } catch {
+          // Best-effort: an unreadable/already-consumed stream just leaves rawBody
+          // undefined; signature-verifying handlers treat that as unverifiable.
+          rawBody = undefined;
+        }
         return { urlParams, queryParams, body, bodyParseError, rawBody };
       }
 
