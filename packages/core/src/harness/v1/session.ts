@@ -8156,6 +8156,39 @@ export class Session {
         });
       }
       finishResumedTurn();
+      // §5.4 / §5.7 — `pendingResume.resumedAt` is the at-least-once
+      // idempotency marker, set under the lease BEFORE the agent call so a
+      // CRASH between "marked resumed" and "cleared pending" replays as a
+      // no-op on rehydration (the next caller observes the durable marker and
+      // rejects rather than double-resuming). That crash-recovery contract is
+      // preserved untouched: it only governs markers that SURVIVE a process
+      // death. Here, by contrast, the resume threw IN-PROCESS — no completion,
+      // re-suspension, or settlement occurred (those land in the later try
+      // block, never this catch; the only writes reaching this catch are the
+      // resumeStream/getFullOutput rejection and the queue-completion mark,
+      // and `_markQueuedTurnCompleted` never throws QueuePostRunFinalizationPendingError,
+      // so the deferred-finalization defer is not in play here). We KNOW the
+      // attempt failed, so it is both safe and strictly better than waiting for
+      // QUEUE_ACCEPTED_RECOVERY_STALE_MS to revert the marker back to undefined,
+      // restoring the suspension to its retryable `waiting` state. Without this,
+      // an immediate `respondTo*` retry hits the `resumedAt`-set branch and is
+      // told "awaiting agent confirmation", and `_maybeDrainQueue` parks until
+      // the staleness window elapses — a real liveness gap (F2).
+      //
+      // The revert is CAS-guarded (only clears the marker WE stamped on the
+      // SAME pending identity) and best-effort: if a concurrent caller already
+      // cleared/advanced pending it leaves it alone, and if the session is
+      // CLOSING/CLOSED/DELETED/EVICTED the revert flush rejects — we swallow
+      // that, because (a) `_isShutdownDrainBusy()` already treats a parked
+      // pendingResume as non-busy (a suspension awaiting a user response must
+      // not block shutdown), and (b) a closed/deleted record is being torn down,
+      // so a residual `resumedAt` on it is never observed again. The original
+      // resume error must surface regardless, so the revert never masks it (F4).
+      try {
+        await this._revertFailedResumeMarker(pending, resumedAt);
+      } catch {
+        // best-effort; closing/closed/deleted session — see comment above.
+      }
       // §13.3f.1 — respondTo* (this resume) is a public §4.2b boundary; the
       // resumed agent run (resumeStream / getFullOutput) can reject with a raw
       // provider/runtime error. Redact before rejecting the caller's promise.
@@ -8598,6 +8631,51 @@ export class Session {
     const modeId = this._modeIdForPendingResume(pending);
     const modelId = queuedItem?.model ?? this._record.modelId;
     return pending.runtimeDependencies ?? receipt?.runtimeDependencies ?? { modeId, ...(modelId ? { modelId } : {}) };
+  }
+
+  /**
+   * §5.4 / §5.7 — revert the at-least-once resume marker after an IN-PROCESS
+   * resume failure so the suspension returns to a retryable `waiting` state
+   * instead of looking "resuming" until the staleness window elapses.
+   *
+   * Only the in-process resume catch calls this, where we KNOW the agent call
+   * threw before any settlement/re-suspension (those land in the later try
+   * block, not the resume catch). The crash-recovery contract — a marker that
+   * SURVIVES process death rejects on rehydration — is unaffected, since this
+   * never runs on a rehydrated marker.
+   *
+   * CAS-guarded: clears `resumedAt` only when `pendingResume` is still the same
+   * suspension (same runId/toolCallId/itemId) and still carries exactly the
+   * marker WE stamped (`=== resumedAt`). A concurrent caller that already
+   * cleared or advanced pending is left untouched. After a successful revert we
+   * void-kick `_maybeDrainQueue()` (only while live) so a parked queue self-heals
+   * in-process rather than waiting for an external trigger.
+   *
+   * The flush is allowed to reject on a closing/closed/deleted/evicted session;
+   * the caller swallows that (the record is being torn down and a parked
+   * pendingResume is already non-busy for shutdown — see `_isShutdownDrainBusy`).
+   */
+  private async _revertFailedResumeMarker(pending: PendingResume, resumedAt: number): Promise<void> {
+    let reverted = false;
+    await this._flushUpdate(prev => {
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.resumedAt !== resumedAt ||
+        current.runId !== pending.runId ||
+        current.toolCallId !== pending.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId)
+      ) {
+        return prev;
+      }
+      reverted = true;
+      const restored: PendingResume = { ...current };
+      delete restored.resumedAt;
+      return { ...prev, pendingResume: restored };
+    });
+    if (reverted && this._state === 'live') {
+      void this._maybeDrainQueue();
+    }
   }
 
   private async _maybeRecoverStaleQueuedResume(): Promise<QueueResumeRecoveryResult> {
