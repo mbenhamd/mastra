@@ -20,7 +20,7 @@
  */
 
 import type { LanguageModelV2StreamPart } from '@ai-sdk/provider-v5';
-import { afterEach, bench, describe } from 'vitest';
+import { afterAll, beforeAll, bench, describe } from 'vitest';
 
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent';
@@ -63,28 +63,31 @@ const QUEUE_DEPTH = 200;
 const BOUNDED = { time: 0, iterations: 5, warmupIterations: 1, warmupTime: 0 } as const;
 
 describe('Harness v1 queue drain — _maybeDrainQueue', () => {
-  // A fresh harness per bench so leaked drain timers cannot bleed across runs.
-  let harness: Harness | undefined;
+  // Build the harness ONCE outside the measured callback. Constructing +
+  // shutting down a harness inside the bench fn would dominate the sample with
+  // storage/agent setup + teardown cost rather than the queue-drain work this
+  // bench targets (CodeRabbit finding). A single long-lived harness is shut down
+  // in afterAll; each iteration drains a FRESH session (fresh threadId) so no
+  // drained queue is re-measured and leaked drain timers can't bleed.
+  let harness!: Harness;
 
-  afterEach(async () => {
-    if (harness) {
-      await harness.shutdown();
-      harness = undefined;
-    }
+  beforeAll(() => {
+    harness = buildHarness(QUEUE_DEPTH + 10);
+  });
+
+  afterAll(async () => {
+    await harness.shutdown();
   });
 
   bench(
     `drain ${QUEUE_DEPTH}-item queue (trivial turns)`,
     async () => {
-      harness = buildHarness(QUEUE_DEPTH + 10);
       const session = await harness.session({ resourceId: 'bench-queue', threadId: { fresh: true } });
       const pending: Array<Promise<unknown>> = [];
       for (let i = 0; i < QUEUE_DEPTH; i++) {
         pending.push(session.queue({ content: `q-${i}` }));
       }
       await Promise.all(pending);
-      await harness.shutdown();
-      harness = undefined;
     },
     BOUNDED,
   );
