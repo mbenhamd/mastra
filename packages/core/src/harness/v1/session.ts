@@ -158,7 +158,6 @@ import {
   planTaskReconcileDelegation,
   planTaskReparent,
   planTaskUpdate,
-  computePlanTaskSummary,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
 import { createPlanTaskTools } from './plan-task-tool';
@@ -719,6 +718,14 @@ function buildJudgeContinuation(opts: { turn: number; max: number; objective: st
 }
 
 /**
+ * Defensive cap on `inProgressTaskIds` in the lazily-seeded plan-task summary
+ * (§5.1k / TM-5). The single-in-progress-per-root rule keeps this naturally
+ * small; the cap bounds a degenerate tree from materializing an unbounded id
+ * list into the display snapshot.
+ */
+const PLAN_TASK_SUMMARY_IN_PROGRESS_CAP = 100;
+
+/**
  * Active-tool tracking for `SessionDisplayState.activeTools`. One entry per
  * `tool_start` that has not yet been settled by a matching `tool_end`. Drops
  * out on `tool_end` regardless of `isError`.
@@ -902,6 +909,15 @@ export class Session {
   private readonly _storage: HarnessStorage;
   private readonly _ownerId: string;
   private readonly _emitter: EventEmitter;
+
+  /**
+   * In-process, NON-persisted display-refresh listeners. Distinct from the
+   * `_emitter` event pool: a ping here recomputes the display snapshot for any
+   * `subscribeDisplayState` listener WITHOUT emitting a persisted §10.2 event or
+   * touching SSE/`harness.subscribe` consumers. Used to surface a freshly-seeded
+   * plan-task summary (TM-5) that reflects already-durable state.
+   */
+  private readonly _displayRefreshListeners = new Set<() => void>();
 
   /**
    * Queue resolvers indexed by `queuedItem.id`. Set in `queue()` so the
@@ -6838,6 +6854,7 @@ export class Session {
       }
       pending = undefined;
       unsubscribeRaw?.();
+      this._displayRefreshListeners.delete(onEvent);
     };
 
     const emit = (snap: HarnessDisplayStateSnapshotV1, serialized: string): void => {
@@ -6892,7 +6909,27 @@ export class Session {
     if (initial !== undefined) emit(initial.snap, initial.serialized);
     if (stopped) return stop;
     unsubscribeRaw = this.subscribe(onEvent);
+    // Also wake on in-process display-only refreshes (e.g. the lazy plan-task
+    // summary seed) that carry no persisted event.
+    this._displayRefreshListeners.add(onEvent);
     return stop;
+  }
+
+  /**
+   * Ping `subscribeDisplayState` listeners to recompute their snapshot WITHOUT
+   * emitting a persisted §10.2 event. Used when an in-process, display-only
+   * derived value changes for already-durable state (the TM-5 plan-task summary
+   * seed). The per-subscriber dedupe (`serialized !== lastEmitted`) drops the
+   * ping when nothing actually changed.
+   */
+  private _notifyDisplayRefresh(): void {
+    for (const listener of this._displayRefreshListeners) {
+      try {
+        listener();
+      } catch {
+        // Isolate listener exceptions — they must not disrupt other listeners.
+      }
+    }
   }
 
   getDisplayState(): SessionDisplayState {
@@ -11852,22 +11889,48 @@ export class Session {
   /**
    * §5.1k / TM-5 — lazily seed the bounded plan-task summary ONCE for a hydrated
    * session that may carry pre-existing plan tasks but hasn't mutated yet, so the
-   * first `getDisplayState()` after hydration eventually reflects the tree. A
-   * bounded single-page read (the plan tree is small per §5.1k); idempotent and
-   * fire-and-forget — any mutation recomputes the authoritative summary for free.
-   * Best-effort: a failed read leaves the summary unseeded for a later retry.
+   * first `getDisplayState()` after hydration eventually reflects the tree.
+   *
+   * The counts (`total`/`byStatus`/`rootCount`) come from a cheap EXACT aggregate
+   * (`countPlanTasksByStatus` — a `COUNT(*) GROUP BY status`, never a row load) so
+   * they are correct no matter how large the tree is; a bounded single-page read
+   * would silently undercount a tree larger than the page. `inProgressTaskIds`
+   * is naturally bounded (one explicit per root by §5.1k) and read via a small
+   * status-filtered subtree slice, capped defensively.
+   *
+   * Idempotent and fire-and-forget — any mutation recomputes the authoritative
+   * summary from the post-image for free. Best-effort: a failed read leaves the
+   * summary unseeded for a later retry. When the seed completes and nothing else
+   * populated the summary first, it nudges any display subscriber so the absent
+   * `planTasks` field becomes observable without waiting for an unrelated event.
    */
   private _maybeSeedPlanTaskSummary(): void {
     if (this._planTaskSummarySeeded) return;
     this._planTaskSummarySeeded = true;
-    void this._storage
-      .listPlanTasks({ harnessName: this._record.harnessName, sessionId: this.id, limit: 500 })
-      .then(page => {
+    void Promise.all([
+      this._storage.countPlanTasksByStatus({ harnessName: this._record.harnessName, sessionId: this.id }),
+      // Bounded: in_progress is at most one explicit per root (§5.1k); cap defensively.
+      this._storage.loadPlanTaskSubtree({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        status: 'in_progress',
+        limit: PLAN_TASK_SUMMARY_IN_PROGRESS_CAP,
+      }),
+    ])
+      .then(([counts, inProgress]) => {
         // A concurrent mutation may have set the authoritative summary first; only
         // fill the seed if nothing has populated it yet.
-        if (this._planTaskSummary === undefined) {
-          this._planTaskSummary = computePlanTaskSummary(page.tasks);
-        }
+        if (this._planTaskSummary !== undefined) return;
+        this._planTaskSummary = {
+          total: counts.total,
+          byStatus: counts.byStatus,
+          rootCount: counts.rootCount,
+          inProgressTaskIds: inProgress.tasks.map(t => t.taskId),
+        };
+        // Make the freshly-seeded summary observable: a display-only refresh so a
+        // subscriber sees `planTasks` without waiting for an unrelated §10.2 event.
+        // No persisted event is emitted — the seed reflects already-durable state.
+        this._notifyDisplayRefresh();
       })
       .catch(() => {
         // Allow a later snapshot to retry the seed.

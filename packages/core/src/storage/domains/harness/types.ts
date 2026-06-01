@@ -1674,3 +1674,24 @@ export interface LoadPlanTaskSubtreeResult {
   /** True when the bound (`limit`/`depth`) clipped the subtree. */
   truncated: boolean;
 }
+
+/**
+ * Cheap whole-tree aggregate for the bounded display-state summary (§5.1k /
+ * TM-5). A `COUNT(*) GROUP BY status` over the session's plan tasks — never a
+ * full-row load — so the display summary's `total`/`byStatus`/`rootCount` stay
+ * EXACT regardless of tree size (a bounded single-page read would undercount a
+ * tree larger than the page).
+ */
+export interface CountPlanTasksByStatusInput {
+  harnessName?: string;
+  sessionId: string;
+}
+
+export interface PlanTaskCountSummary {
+  /** Total number of plan-task nodes in the session tree. */
+  total: number;
+  /** Count of nodes in each status (only present statuses appear). */
+  byStatus: Partial<Record<HarnessPlanTaskStatus, number>>;
+  /** Number of root nodes (parent_task_id NULL or not resolvable in the set). */
+  rootCount: number;
+}

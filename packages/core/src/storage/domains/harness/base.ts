@@ -18,6 +18,7 @@ import type {
   HarnessProviderCallbackBinding,
   ChannelInboxInitialClaim,
   ChannelInboxItem,
+  CountPlanTasksByStatusInput,
   CreatePlanTaskInput,
   DeletePlanTaskSubtreeInput,
   DeletePlanTaskSubtreeResult,
@@ -26,6 +27,7 @@ import type {
   ListPlanTasksResult,
   LoadPlanTaskSubtreeInput,
   LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
   MutatePlanTasksForSessionInput,
   UpdatePlanTaskInput,
   UpdatePlanTaskResult,
@@ -1325,6 +1327,17 @@ export abstract class HarnessStorage extends StorageDomain {
    * by `status`. The anti-forgetting "re-orient" read. Read-only.
    */
   async loadPlanTaskSubtree(_opts: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Cheap exact aggregate over the session's plan tasks for the bounded
+   * display-state summary (§5.1k / TM-5): `total`, per-status counts, and the
+   * root count — computed by `COUNT(*) GROUP BY status` (plus a roots count),
+   * NOT by loading rows. Keeps the display summary EXACT even when the tree is
+   * larger than any single read page. Read-only — does not require the lease.
+   */
+  async countPlanTasksByStatus(_opts: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
     throw new HarnessStoragePlanTaskUnsupportedError();
   }
 

@@ -53,14 +53,17 @@ import type {
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
   CreateOrLoadActiveSessionResult,
+  CountPlanTasksByStatusInput,
   CreatePlanTaskInput,
   DeletePlanTaskSubtreeInput,
   DeletePlanTaskSubtreeResult,
   HarnessPlanTask,
+  HarnessPlanTaskStatus,
   ListPlanTasksInput,
   ListPlanTasksResult,
   LoadPlanTaskSubtreeInput,
   LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
   MutatePlanTasksForSessionInput,
   PlanTaskMutationOp,
   PlanTaskSessionFence,
@@ -2958,6 +2961,26 @@ export class InMemoryHarness extends HarnessStorage {
     }
     // Shared walk (§5.1k) keeps depth/status/limit semantics identical across adapters.
     return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
+  }
+
+  async countPlanTasksByStatus({ harnessName, sessionId }: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const ids = new Set<string>();
+    const session: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      ids.add(task.taskId);
+      session.push(task);
+    }
+    const byStatus: Partial<Record<HarnessPlanTaskStatus, number>> = {};
+    let rootCount = 0;
+    for (const task of session) {
+      byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
+      // A root is a node with no parent OR whose parent is not in the set (orphan),
+      // matching `computePlanTaskSummary`'s `indexPlanTasks` root rule exactly.
+      if (task.parentTaskId === undefined || !ids.has(task.parentTaskId)) rootCount += 1;
+    }
+    return { total: session.length, byStatus, rootCount };
   }
 
   // -------------------------------------------------------------------------

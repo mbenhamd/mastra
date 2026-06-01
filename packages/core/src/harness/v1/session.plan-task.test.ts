@@ -176,6 +176,109 @@ describe('plan-task tool execution mid-turn', () => {
     await turn;
   });
 
+  it('task_write back-compat: legacy {tasks:[...]} full-list shape adds + updates by content', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    let release!: () => void;
+    const holdUntil = new Promise<void>(r => (release = r));
+    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
+    const turn = session.message({ content: 'go' });
+    await vitestPoll(() => agent.streamCalls.length > 0);
+
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-legacy', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+
+    // Legacy mastracode contract: pass the FULL list. First call CREATES the tasks.
+    const first = (await tools[TASK_WRITE_TOOL_ID]!.execute!(
+      {
+        tasks: [
+          { content: 'design', status: 'in_progress', activeForm: 'Designing' },
+          { content: 'build', status: 'pending' },
+          { content: 'ship', status: 'pending' },
+        ],
+      } as any,
+      ctx,
+    )) as any;
+    expect(first.isError).toBeFalsy();
+    expect(first.tasks).toHaveLength(3);
+    expect(first.tasks.map((t: any) => t.content)).toEqual(['design', 'build', 'ship']);
+
+    // Second FULL-list call RECONCILES by content: 'design' completed, 'build'
+    // in_progress, 'ship' unchanged. No errors, no duplicate rows.
+    const second = (await tools[TASK_WRITE_TOOL_ID]!.execute!(
+      {
+        tasks: [
+          { content: 'design', status: 'completed' },
+          { content: 'build', status: 'in_progress', activeForm: 'Building' },
+          { content: 'ship', status: 'pending' },
+        ],
+      } as any,
+      ctx,
+    )) as any;
+    expect(second.isError).toBeFalsy();
+    const byContent = new Map(second.tasks.map((t: any) => [t.content, t]));
+    expect((byContent.get('design') as any).status).toBe('completed');
+    expect((byContent.get('build') as any).status).toBe('in_progress');
+
+    // Durable: exactly 3 rows (no duplicates), matched-by-content updates applied.
+    const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 50 });
+    expect(stored.tasks).toHaveLength(3);
+    const storedByContent = new Map(stored.tasks.map(t => [t.content, t]));
+    expect(storedByContent.get('design')!.status).toBe('completed');
+    expect(storedByContent.get('build')!.status).toBe('in_progress');
+
+    release();
+    await turn;
+  });
+
+  it('the lazily-seeded plan-task summary is OBSERVABLE to a display subscriber (Finding 2)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Populate durable plan tasks via a real mid-turn mutation.
+    let release!: () => void;
+    const holdUntil = new Promise<void>(r => (release = r));
+    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
+    const turn = session.message({ content: 'go' });
+    await vitestPoll(() => agent.streamCalls.length > 0);
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-seed-obs', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root' } as any, ctx)) as any;
+    await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'second-root' } as any, ctx);
+    void root;
+    release();
+    await turn;
+
+    // Simulate a freshly-hydrated session that has NOT computed the in-memory
+    // summary yet (the durable tasks exist, but no mutation happened this run).
+    (session as any)._planTaskSummary = undefined;
+    (session as any)._planTaskSummarySeeded = false;
+
+    // A display subscriber should see `planTasks` arrive WITHOUT any further event
+    // — the async seed nudges it. Without the fix the first snapshot has planTasks
+    // absent and nothing re-notifies until an unrelated event fires.
+    const snapshots: Array<unknown> = [];
+    const stop = session.subscribeDisplayState(s => snapshots.push((s as any).planTasks));
+
+    await vitestPoll(() => snapshots.some(p => p !== undefined), 2000);
+    stop();
+
+    const seeded = snapshots.find(p => p !== undefined) as any;
+    expect(seeded).toBeDefined();
+    expect(seeded.total).toBe(2);
+    expect(seeded.rootCount).toBe(2);
+    expect(seeded.byStatus.pending).toBe(2);
+  });
+
   it('a rejected mutation (cycle) returns isError, not a thrown turn abort', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

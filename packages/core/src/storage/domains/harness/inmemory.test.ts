@@ -3628,6 +3628,39 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     expect(limited.truncated).toBe(true);
   });
 
+  it('countPlanTasksByStatus returns exact total/byStatus/rootCount (cheap aggregate)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // 2 roots; root 'r0' has 2 children (one completed); 'r1' standalone in_progress.
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r1', order: 1, status: 'in_progress' }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1, status: 'completed' }) });
+
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts.total).toBe(4);
+    expect(counts.rootCount).toBe(2);
+    expect(counts.byStatus).toEqual({ pending: 2, in_progress: 1, completed: 1 });
+  });
+
+  it('countPlanTasksByStatus counts orphans (unresolvable parent) as roots', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // 'orphan' points at a parent that does not exist in the session set.
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 0 }) });
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts.total).toBe(2);
+    expect(counts.rootCount).toBe(2);
+  });
+
+  it('countPlanTasksByStatus is empty for a session with no plan tasks', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId } = await setupSession(storage);
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts).toEqual({ total: 0, byStatus: {}, rootCount: 0 });
+  });
+
   it('session delete cascades plan tasks (§5.2g)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);

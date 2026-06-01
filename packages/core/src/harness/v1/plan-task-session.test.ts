@@ -18,12 +18,15 @@ import type { JsonValue, SessionRecord } from '../../storage/domains/harness/typ
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { HarnessPlanTaskCycleError, HarnessPlanTaskInProgressConflictError } from './plan-task-hierarchy';
 import {
+  clampPlanTaskCheckLimit,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
   planTaskDecompose,
   planTaskReparent,
   planTaskUpdate,
+  PLAN_TASK_CHECK_DEFAULT_LIMIT,
+  PLAN_TASK_CHECK_MAX_LIMIT,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
 import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
@@ -575,6 +578,103 @@ describe('TM-5 plan-task summary', () => {
     // refresh reuses that post-image, so no SECOND list call is made.
     expect(listCalls).toBe(1);
     expect(summaries).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// countPlanTasksByStatus — exact aggregate for the display-state seed (Finding 1)
+// ---------------------------------------------------------------------------
+
+describe('countPlanTasksByStatus — exact aggregate', () => {
+  it('counts the WHOLE tree exactly even when it exceeds a single list page', async () => {
+    const { storage, port } = await setup();
+    // Build a tree larger than the 500-row seed page so a partial-page count would
+    // undercount. 1 root + 600 children (statuses spread) → 601 nodes, 1 root.
+    const root = await planTaskAdd(port, { content: 'root' });
+    const total = 600;
+    for (let i = 0; i < total; i++) {
+      await planTaskAdd(port, {
+        content: `c${i}`,
+        parentTaskId: root.taskId,
+        // status set explicitly so byStatus is deterministic; avoid a 2nd in_progress
+        // sibling (the single-in-progress rule) by keeping them pending/completed.
+        status: i % 2 === 0 ? 'pending' : 'completed',
+      });
+    }
+
+    const counts = await storage.countPlanTasksByStatus({ sessionId: SESSION_ID });
+    // 601 total: a bounded `listPlanTasks({limit:500})` would have reported <= 500.
+    expect(counts.total).toBe(601);
+    expect(counts.total).toBeGreaterThan(500);
+    // root flips derived; its rolled-up status depends on children, but the count
+    // total is what matters for the LIE this fixes.
+    const sumByStatus = Object.values(counts.byStatus).reduce((a, b) => a + (b ?? 0), 0);
+    expect(sumByStatus).toBe(601);
+    // Exactly one root (the parent); all children resolve their parent.
+    expect(counts.rootCount).toBe(1);
+  });
+
+  it('counts orphan nodes (unresolvable parent) as roots, matching computePlanTaskSummary', async () => {
+    const { storage, port } = await setup();
+    await planTaskAdd(port, { content: 'a' });
+    await planTaskAdd(port, { content: 'b' });
+    const counts = await storage.countPlanTasksByStatus({ sessionId: SESSION_ID });
+    expect(counts.total).toBe(2);
+    expect(counts.rootCount).toBe(2);
+    expect(counts.byStatus.pending).toBe(2);
+  });
+
+  it('returns an empty summary for a session with no plan tasks', async () => {
+    const { storage } = await setup();
+    const counts = await storage.countPlanTasksByStatus({ sessionId: SESSION_ID });
+    expect(counts).toEqual({ total: 0, byStatus: {}, rootCount: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clampPlanTaskCheckLimit — hostile limit cannot pull the whole tree (Finding 3)
+// ---------------------------------------------------------------------------
+
+describe('clampPlanTaskCheckLimit', () => {
+  it('saturates a huge limit at the hard cap', () => {
+    expect(clampPlanTaskCheckLimit(1_000_000)).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
+    expect(clampPlanTaskCheckLimit(Number.MAX_SAFE_INTEGER)).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
+  });
+
+  it('falls back to the default for missing / non-positive / NaN / Infinity', () => {
+    expect(clampPlanTaskCheckLimit(undefined)).toBe(PLAN_TASK_CHECK_DEFAULT_LIMIT);
+    expect(clampPlanTaskCheckLimit(0)).toBe(PLAN_TASK_CHECK_DEFAULT_LIMIT);
+    expect(clampPlanTaskCheckLimit(-50)).toBe(PLAN_TASK_CHECK_DEFAULT_LIMIT);
+    expect(clampPlanTaskCheckLimit(Number.NaN)).toBe(PLAN_TASK_CHECK_DEFAULT_LIMIT);
+    expect(clampPlanTaskCheckLimit(Number.POSITIVE_INFINITY)).toBe(PLAN_TASK_CHECK_DEFAULT_LIMIT);
+  });
+
+  it('floors a fractional limit and passes a sane in-range value through', () => {
+    expect(clampPlanTaskCheckLimit(10.9)).toBe(10);
+    expect(clampPlanTaskCheckLimit(50)).toBe(50);
+  });
+
+  it('planTaskCheck never reads more than the cap even when handed a hostile limit', async () => {
+    const { storage, port } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    // More children than the cap so an unclamped limit would return them all.
+    const n = PLAN_TASK_CHECK_MAX_LIMIT + 50;
+    for (let i = 0; i < n; i++) {
+      await planTaskAdd(port, { content: `c${i}`, parentTaskId: root.taskId });
+    }
+    let lastLimit = -1;
+    const origLoad = storage.loadPlanTaskSubtree.bind(storage);
+    (storage as unknown as { loadPlanTaskSubtree: typeof storage.loadPlanTaskSubtree }).loadPlanTaskSubtree = (
+      args => {
+        lastLimit = args.limit;
+        return origLoad(args);
+      }
+    ) as typeof storage.loadPlanTaskSubtree;
+
+    const res = await planTaskCheck(port, { rootTaskId: root.taskId, limit: 10_000_000 });
+    expect(lastLimit).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
+    expect(res.tasks.length).toBeLessThanOrEqual(PLAN_TASK_CHECK_MAX_LIMIT);
+    expect(res.truncated).toBe(true);
   });
 });
 

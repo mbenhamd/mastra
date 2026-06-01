@@ -70,14 +70,17 @@ import type {
   CreateOrLoadChannelActionTokenResult,
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
+  CountPlanTasksByStatusInput,
   CreatePlanTaskInput,
   DeletePlanTaskSubtreeInput,
   DeletePlanTaskSubtreeResult,
   HarnessPlanTask,
+  HarnessPlanTaskStatus,
   ListPlanTasksInput,
   ListPlanTasksResult,
   LoadPlanTaskSubtreeInput,
   LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
   MutatePlanTasksForSessionInput,
   PlanTaskMutationOp,
   PlanTaskSessionFence,
@@ -2065,6 +2068,42 @@ export class HarnessLibSQL extends HarnessStorage {
     });
     const tasks = result.rows.map(row => rowToPlanTask(row as Record<string, unknown>));
     return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
+  }
+
+  async countPlanTasksByStatus({ harnessName, sessionId }: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    // Exact aggregate, NOT a row load: one COUNT(*) GROUP BY status pass over the
+    // session's tasks. The roots count (parent NULL or unresolvable) comes from a
+    // single anti-join, matching `computePlanTaskSummary`'s root rule.
+    const grouped = await this.#client.execute({
+      sql: `SELECT status, COUNT(*) AS n
+            FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+            GROUP BY status`,
+      args: [namespace, sessionId],
+    });
+    const rootsResult = await this.#client.execute({
+      sql: `SELECT COUNT(*) AS n
+            FROM ${TABLE_HARNESS_PLAN_TASKS} t
+            WHERE t.harness_name = ? AND t.session_id = ?
+              AND (t.parent_task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1 FROM ${TABLE_HARNESS_PLAN_TASKS} p
+                     WHERE p.harness_name = t.harness_name
+                       AND p.session_id = t.session_id
+                       AND p.task_id = t.parent_task_id))`,
+      args: [namespace, sessionId],
+    });
+    const byStatus: Partial<Record<HarnessPlanTaskStatus, number>> = {};
+    let total = 0;
+    for (const row of grouped.rows as Record<string, unknown>[]) {
+      const n = Number(row.n);
+      byStatus[String(row.status) as HarnessPlanTaskStatus] = n;
+      total += n;
+    }
+    const rootCount = Number((rootsResult.rows[0] as Record<string, unknown> | undefined)?.n ?? 0);
+    return { total, byStatus, rootCount };
   }
 
   async resolveOperationAdmissionEvidence({

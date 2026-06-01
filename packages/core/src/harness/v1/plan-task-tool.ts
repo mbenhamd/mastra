@@ -19,6 +19,8 @@ import { z } from 'zod';
 
 import { createTool } from '../../tools/tool';
 import { HarnessValidationError } from './errors';
+import { PLAN_TASK_CHECK_MAX_LIMIT } from './plan-task-session';
+import type { PlanTaskView } from './plan-task-session';
 import type { Session } from './session';
 
 export const TASK_ADD_TOOL_ID = 'task_add';
@@ -222,7 +224,13 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       rootTaskId: z.string().optional().describe('Walk from this task; omit for the plan roots.'),
       depth: z.number().optional().describe('Max depth from the root (0 = just the root level).'),
       status: statusEnum.optional().describe('Only return tasks with this status.'),
-      limit: z.number().optional().describe('Max tasks to return (default 25).'),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(PLAN_TASK_CHECK_MAX_LIMIT)
+        .optional()
+        .describe(`Max tasks to return (default 25, hard cap ${PLAN_TASK_CHECK_MAX_LIMIT}).`),
     }),
     outputSchema: z.object({
       tasks: z.array(z.object(planTaskViewShape)).optional(),
@@ -285,15 +293,31 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           },
         });
 
-  // Back-compat `task_write`: with a `taskId` it updates that task; without one
-  // it adds a new task. Maps onto the same add/update semantics so an agent
-  // trained on the legacy single-tool name keeps working against the tree.
+  // Back-compat `task_write`. Two accepted shapes:
+  //   1. LEGACY mastracode todo-list shape `{ tasks: [{content,status,activeForm}] }` —
+  //      a FULL list pass that replaces the prior list (the original tool's contract:
+  //      "Pass the FULL task list each time"). Reconciled against the existing root
+  //      tasks by `content`: each incoming task updates the matching root's status /
+  //      activeForm, or is added when no root matches. Tasks the model dropped are
+  //      left intact (no destructive delete) — the tree is the durable record.
+  //   2. SINGLE-task shape `{ content?, taskId?, ... }` — with a `taskId` it updates
+  //      that task; without one it adds a new task.
+  // Both map onto the same add/update semantics, so an agent trained on either the
+  // legacy list tool OR the single-task name keeps working against the tree.
+  const legacyTaskItem = z.object({
+    content: z.string(),
+    status: statusEnum.optional(),
+    activeForm: z.string().optional(),
+  });
   const taskWrite = createTool({
     id: TASK_WRITE_TOOL_ID,
     description:
-      'Create or update a single plan task. Provide `taskId` to update an existing task, omit it to add ' +
-      'a new one. Prefer `task_add` / `task_update` for clarity; this exists for back-compat.',
+      'Track plan tasks. Either pass the FULL task list as `tasks: [{content, status, activeForm}]` ' +
+      '(legacy todo-list form — reconciles each task against the plan by content), or write a single ' +
+      'task: provide `taskId` to update an existing one, omit it to add a new one. Prefer ' +
+      '`task_add` / `task_update` for clarity; this exists for back-compat.',
     inputSchema: z.object({
+      tasks: z.array(legacyTaskItem).optional().describe('Legacy full task list (replaces the prior list).'),
       taskId: z.string().optional(),
       content: z.string().optional(),
       parentTaskId: z.string().optional(),
@@ -303,15 +327,47 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       status: statusEnum.optional(),
       blockedBy: z.array(z.string()).optional(),
     }),
-    outputSchema: z.object({ ...planTaskViewShape, ...errorShape }).partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
+    outputSchema: z
+      .object({ ...planTaskViewShape, tasks: z.array(z.object(planTaskViewShape)).optional(), ...errorShape })
+      .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async input => {
       try {
+        // Legacy full-list shape: reconcile each incoming task by content.
+        if (input.tasks !== undefined) {
+          // Existing roots (bounded read; the legacy list is a flat root-level set).
+          const existing = await session._planTaskCheck({ depth: 0, limit: PLAN_TASK_CHECK_MAX_LIMIT });
+          const byContent = new Map<string, string>();
+          for (const t of existing.tasks) {
+            if (!byContent.has(t.content)) byContent.set(t.content, t.taskId);
+          }
+          const out: PlanTaskView[] = [];
+          for (const item of input.tasks) {
+            const existingId = byContent.get(item.content);
+            if (existingId !== undefined) {
+              out.push(
+                await session._planTaskUpdate(existingId, { status: item.status, activeForm: item.activeForm }),
+              );
+            } else {
+              const added = await session._planTaskAdd({
+                content: item.content,
+                status: item.status,
+                activeForm: item.activeForm,
+              });
+              byContent.set(item.content, added.taskId);
+              out.push(added);
+            }
+          }
+          return { tasks: out } as any;
+        }
         if (input.taskId !== undefined) {
           const { taskId, content, status, priority, activeForm, blockedBy } = input;
           return await session._planTaskUpdate(taskId, { content, status, priority, activeForm, blockedBy });
         }
         if (input.content === undefined) {
-          throw new HarnessValidationError('content', 'task_write without a taskId must supply `content` to add a task');
+          throw new HarnessValidationError(
+            'content',
+            'task_write requires either `tasks` (legacy list), a `taskId` to update, or `content` to add a task',
+          );
         }
         return await session._planTaskAdd({
           content: input.content,

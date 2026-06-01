@@ -888,13 +888,33 @@ export interface CheckInput {
   limit?: number;
 }
 
+/** Default page size for the bounded read. */
+export const PLAN_TASK_CHECK_DEFAULT_LIMIT = 25;
+/** Hard cap on the bounded read so a hostile/large `limit` can never pull the
+ * whole tree and defeat the anti-forgetting purpose (§5.1k). */
+export const PLAN_TASK_CHECK_MAX_LIMIT = 200;
+
+/**
+ * Clamp the caller-supplied `limit` to a positive integer in
+ * `[1, PLAN_TASK_CHECK_MAX_LIMIT]`. A missing/NaN/non-positive value falls back
+ * to the default; anything larger saturates at the cap. Centralizes the bound so
+ * the storage read can never be handed an arbitrarily large limit.
+ */
+export function clampPlanTaskCheckLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return PLAN_TASK_CHECK_DEFAULT_LIMIT;
+  const floored = Math.floor(limit);
+  if (floored < 1) return PLAN_TASK_CHECK_DEFAULT_LIMIT;
+  return Math.min(floored, PLAN_TASK_CHECK_MAX_LIMIT);
+}
+
 /** The bounded anti-forgetting read. Default `limit` keeps the model from ever
- * loading the whole tree by accident. */
+ * loading the whole tree by accident; a hostile `limit` is clamped to a hard
+ * cap so the read stays bounded regardless of caller input. */
 export async function planTaskCheck(
   port: PlanTaskSessionPort,
   input: CheckInput,
 ): Promise<{ tasks: PlanTaskView[]; truncated: boolean }> {
-  const limit = input.limit ?? 25;
+  const limit = clampPlanTaskCheckLimit(input.limit);
   const result: LoadPlanTaskSubtreeResult = await port.storage.loadPlanTaskSubtree({
     harnessName: port.harnessName,
     sessionId: port.id,
