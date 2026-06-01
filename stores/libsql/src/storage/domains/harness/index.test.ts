@@ -414,8 +414,38 @@ describe('HarnessLibSQL active session admission', () => {
     ).rejects.toMatchObject({
       name: 'HarnessStorageParentSessionUnavailableError',
       reason: 'closing',
+      // §4.5b: the parent's closing window must travel with the error so the
+      // caller can build a spec-accurate HarnessSessionClosingError instead of
+      // fabricating a `Date.now()` window (parity with InMemory).
+      closingAt: 1000,
+      closeDeadlineAt: 2000,
     } satisfies Partial<HarnessStorageParentSessionUnavailableError>);
     await expect(storage.loadSession({ sessionId: 'child' })).resolves.toBeNull();
+  });
+
+  // §5.2a/§5.3/§5.5 cross-adapter parity (mirrors InMemoryHarness): closing a
+  // session then resolving the SAME (resourceId, threadId) must surface the
+  // CLOSED owner for reopen, not null and not a fresh active row.
+  it('returns the closed current owner by thread for reopen (no fresh active row)', async () => {
+    await storage.saveSession(sampleSession({ id: 'closed-owner', closedAt: 2000, lastActivityAt: 2000 }), {
+      ownerId: 'h-1',
+      ifVersion: 0,
+    });
+
+    await expect(
+      storage.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ id: 'closed-owner', closedAt: 2000 });
+
+    const admitted = await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'would-be-fresh', lastActivityAt: 3000 }),
+      { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+    );
+    expect(admitted).toMatchObject({
+      created: false,
+      leaseAcquired: false,
+      record: expect.objectContaining({ id: 'closed-owner', closedAt: 2000 }),
+    });
+    await expect(storage.loadSession({ sessionId: 'would-be-fresh' })).resolves.toBeNull();
   });
 
   it('returns an existing active child session before re-validating a now-closing parent', async () => {

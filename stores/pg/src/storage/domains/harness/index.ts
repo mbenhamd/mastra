@@ -733,9 +733,14 @@ export class HarnessPG extends HarnessStorage {
     harnessName?: string;
   }): Promise<SessionRecord | null> {
     const namespace = this.#resolveHarnessName(harnessName);
+    // §5.2a/§5.3/§5.5: return the current owner INCLUDING Closed (reopen
+    // candidate) and Closing records. A `closed_at IS NULL` filter here would
+    // hide a closed owner so `harness.session({ threadId, resourceId })` would
+    // mint a second active record on the same thread instead of reopening the
+    // closed one — diverging from InMemory and violating the storage contract.
     const result = await this.#client.execute({
       sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS}
-            WHERE harness_name = ? AND thread_id = ? AND resource_id = ? AND closed_at IS NULL
+            WHERE harness_name = ? AND thread_id = ? AND resource_id = ?
             ORDER BY last_activity_at DESC
             LIMIT 1`,
       args: [namespace, threadId, resourceId],
@@ -1181,9 +1186,15 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessStorageThreadDeleteFenceConflictError(record.threadId);
       }
 
+      // §5.3/§5.5: the current owner for this (harness, resource, thread)
+      // INCLUDES Closed (reopenable) and Closing records — the caller reopens a
+      // closed owner or fails new work on a closing one rather than minting a
+      // second active record behind it. Filtering `closed_at IS NULL` here would
+      // skip a closed owner and INSERT a fresh active row, diverging from
+      // InMemory and orphaning the closed owner.
       const active = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS}
-              WHERE harness_name = ? AND resource_id = ? AND thread_id = ? AND closed_at IS NULL
+              WHERE harness_name = ? AND resource_id = ? AND thread_id = ?
               ORDER BY last_activity_at DESC
               LIMIT 1`,
         args: [harnessName, record.resourceId, record.threadId],
@@ -1204,7 +1215,7 @@ export class HarnessPG extends HarnessStorage {
 
       if (record.parentSessionId !== undefined) {
         const parent = await tx.execute({
-          sql: `SELECT resource_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
+          sql: `SELECT resource_id, closed_at, closing_at, close_deadline_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id = ?
                 LIMIT 1`,
           args: [harnessName, record.parentSessionId],
@@ -1217,7 +1228,15 @@ export class HarnessPG extends HarnessStorage {
           throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closed');
         }
         if (parentRow.closing_at != null) {
-          throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closing');
+          // §4.5b: carry the parent's closing window so the caller can build a
+          // spec-accurate HarnessSessionClosingError instead of fabricating a
+          // `Date.now()` window (InMemory passes these timestamps too).
+          throw new HarnessStorageParentSessionUnavailableError(
+            record.parentSessionId,
+            'closing',
+            parentRow.closing_at != null ? Number(parentRow.closing_at) : undefined,
+            parentRow.close_deadline_at != null ? Number(parentRow.close_deadline_at) : undefined,
+          );
         }
       }
 

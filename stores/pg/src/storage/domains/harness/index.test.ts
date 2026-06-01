@@ -759,6 +759,58 @@ describe('HarnessPG', () => {
     });
   });
 
+  // §5.2a/§5.3/§5.5 cross-adapter parity (mirrors InMemoryHarness): closing a
+  // session then resolving the SAME (resourceId, threadId) must surface the
+  // CLOSED owner for reopen, not null and not a fresh active row.
+  it('returns the closed current owner by thread for reopen (no fresh active row)', async () => {
+    const harness = store.stores.harness;
+    expect(harness).toBeDefined();
+
+    await harness!.saveSession(
+      createSampleSessionRecord({ id: 'closed-owner', closedAt: 2000, lastActivityAt: 2000 }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      harness!.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ id: 'closed-owner', closedAt: 2000 });
+
+    const admitted = await harness!.createOrLoadActiveSession(
+      createSampleSessionRecord({ id: 'would-be-fresh', lastActivityAt: 3000 }),
+      { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+    );
+    expect(admitted).toMatchObject({
+      created: false,
+      leaseAcquired: false,
+      record: expect.objectContaining({ id: 'closed-owner', closedAt: 2000 }),
+    });
+    await expect(harness!.loadSession({ sessionId: 'would-be-fresh' })).resolves.toBeNull();
+  });
+
+  // §4.5b cross-adapter parity (mirrors InMemoryHarness): a child admitted under
+  // a CLOSING parent must surface the parent's closing window.
+  it('carries the parent closing window on parent-unavailable (closing)', async () => {
+    const harness = store.stores.harness;
+    expect(harness).toBeDefined();
+
+    await harness!.saveSession(
+      createSampleSessionRecord({ id: 'closing-parent', closingAt: 5000, closeDeadlineAt: 9000, lastActivityAt: 5000 }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      harness!.createOrLoadActiveSession(
+        createSampleSessionRecord({ id: 'child', threadId: 'child-thread', parentSessionId: 'closing-parent' }),
+        { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+      ),
+    ).rejects.toMatchObject({
+      name: 'HarnessStorageParentSessionUnavailableError',
+      reason: 'closing',
+      closingAt: 5000,
+      closeDeadlineAt: 9000,
+    });
+  });
+
   it('atomically claims channel inbox and wakeup rows with PG claim metadata', async () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();

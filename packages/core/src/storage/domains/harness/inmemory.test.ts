@@ -138,6 +138,64 @@ describe('InMemoryHarness admission storage contract', () => {
     await expect(storage.loadSession({ sessionId: 'active' })).resolves.toMatchObject({ id: 'active' });
   });
 
+  // §5.2a/§5.3/§5.5 cross-adapter parity: closing a session then resolving the
+  // SAME (resourceId, threadId) must surface the CLOSED owner (reopen
+  // candidate), not null and not a second active record. PG/LibSQL assert the
+  // identical behavior in their own suites.
+  it('returns the closed current owner by thread for reopen (no fresh active row)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ id: 'closed-owner', closedAt: 2000, lastActivityAt: 2000 }), {
+      ownerId: 'h-1',
+      ifVersion: 0,
+    });
+
+    // loadSessionByThread must surface the closed owner.
+    await expect(
+      storage.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ id: 'closed-owner', closedAt: 2000 });
+
+    // createOrLoadActiveSession must return the closed owner as created:false
+    // (the harness reopens it) instead of inserting a second active record.
+    const admitted = await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'would-be-fresh', lastActivityAt: 3000 }),
+      { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+    );
+    expect(admitted).toMatchObject({
+      created: false,
+      leaseAcquired: false,
+      record: expect.objectContaining({ id: 'closed-owner', closedAt: 2000 }),
+    });
+    await expect(storage.loadSession({ sessionId: 'would-be-fresh' })).resolves.toBeNull();
+  });
+
+  // §4.5b cross-adapter parity: a child admitted under a CLOSING parent must
+  // surface the parent's closing window (closingAt + closeDeadlineAt) so the
+  // caller can build a spec-accurate HarnessSessionClosingError.
+  it('carries the parent closing window on parent-unavailable (closing)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(
+      sampleSession({
+        id: 'closing-parent',
+        closingAt: 5000,
+        closeDeadlineAt: 9000,
+        lastActivityAt: 5000,
+      }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      storage.createOrLoadActiveSession(
+        sampleSession({ id: 'child', threadId: 'child-thread', parentSessionId: 'closing-parent' }),
+        { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+      ),
+    ).rejects.toMatchObject({
+      name: 'HarnessStorageParentSessionUnavailableError',
+      reason: 'closing',
+      closingAt: 5000,
+      closeDeadlineAt: 9000,
+    });
+  });
+
   it('rejects guarded batch delete without deleting earlier rows', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await storage.saveSession(sampleSession({ id: 'parent', closedAt: 2000, lastActivityAt: 2000 }), {
