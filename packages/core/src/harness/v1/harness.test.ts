@@ -4085,11 +4085,112 @@ describe('Harness v1 — crash recovery (lease TTL)', () => {
 });
 
 describe('Harness v1 — concurrent resolver race', () => {
-  // In-flight dedup of parallel session() calls for the same thread is not
-  // yet implemented — the current resolver lets both calls race to
-  // _createFresh. Track the desired behavior here so it surfaces when the
-  // dedup map lands.
-  it.todo('serialises two parallel session() calls for the same thread to a single record');
+  // §5.3 cold-resolution singleflight. Two CONCURRENT session() calls for the
+  // SAME not-yet-live target (same harness instance) must collapse onto one
+  // hydrate/adopt and receive the SAME Session. Without the singleflight both
+  // calls miss _liveSessions, both cold-hydrate, both acquire the lease under
+  // the same ownerId (CAS does not conflict for the same owner), and the second
+  // _adoptSession overwrites the first's event bridge — leaking a subscription
+  // and leaving two live Session objects for one row with racing flush chains.
+
+  it('collapses two parallel session({ resourceId, threadId }) cold creates to one Session + one bridge', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: 't-race', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race', resourceId: 'r1' }),
+    ]);
+    // Same instance — not just same id (would double-adopt without the fix).
+    expect(a).toBe(b);
+    // Exactly one live session + exactly one event bridge for the row.
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount(a.id)).toBe(1);
+  });
+
+  it('collapses three parallel session({ resourceId, threadId }) cold creates to one Session', async () => {
+    const harness = makeHarness();
+    const [a, b, c] = await Promise.all([
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+    ]);
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount(a.id)).toBe(1);
+  });
+
+  it('collapses two parallel session({ sessionId }) cold hydrates of a stored-but-not-live row to one Session + one bridge', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    // A row owned by THIS harness with a live lease, but never adopted into
+    // _liveSessions — exactly the "not-yet-live" state two cold resolves race on.
+    await storage.saveSession(
+      {
+        id: 'sess-cold',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-cold',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const [a, b] = await Promise.all([
+      harness.session({ sessionId: 'sess-cold' }),
+      harness.session({ sessionId: 'sess-cold' }),
+    ]);
+    expect(a).toBe(b);
+    expect(a.id).toBe('sess-cold');
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount('sess-cold')).toBe(1);
+  });
+
+  it('does not falsely dedupe DISTINCT sessions resolved in parallel', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: 't-distinct-a', resourceId: 'r1' }),
+      harness.session({ threadId: 't-distinct-b', resourceId: 'r1' }),
+    ]);
+    expect(a).not.toBe(b);
+    expect(a.id).not.toBe(b.id);
+    expect(harness._internalLiveSessionCount()).toBe(2);
+  });
+
+  it('does not dedupe { fresh: true } — each fresh call mints its own session', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: { fresh: true }, resourceId: 'r1' }),
+      harness.session({ threadId: { fresh: true }, resourceId: 'r1' }),
+    ]);
+    expect(a).not.toBe(b);
+    expect(a.id).not.toBe(b.id);
+    expect(a.threadId).not.toBe(b.threadId);
+    expect(harness._internalLiveSessionCount()).toBe(2);
+  });
+
+  it('clears the in-flight entry on failure so a retry can proceed', async () => {
+    const harness = makeHarness();
+    // First cold resolve fails (unknown sessionId). The singleflight entry must
+    // be cleared in finally so a subsequent resolve is not served the cached
+    // rejected promise.
+    await expect(harness.session({ sessionId: 'ghost' })).rejects.toThrow(HarnessSessionNotFoundError);
+    await expect(harness.session({ sessionId: 'ghost' })).rejects.toThrow(HarnessSessionNotFoundError);
+  });
 
   it('serialises lease acquisition per session — distinct sessions resolve in parallel', async () => {
     // A single harness owns its leases; parallel resolves for *different*

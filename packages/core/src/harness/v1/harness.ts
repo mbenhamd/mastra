@@ -94,7 +94,7 @@ import {
   HarnessValidationError,
   HarnessWorkspaceProviderMismatchError,
 } from './errors';
-import { sha256CanonicalJson } from './canonical-json';
+import { canonicalJson, sha256CanonicalJson } from './canonical-json';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { Session } from './session';
@@ -783,6 +783,19 @@ export class Harness {
   private readonly _emitter = new EventEmitter();
   /** Per-session unsubscribers so harness-level subscribers see session events too. */
   private readonly _sessionEventBridges = new Map<string, HarnessEventUnsubscribe>();
+  /**
+   * In-flight cold-resolution singleflight (§5.3). Keyed by a stable descriptor
+   * of the resolver INPUT so two concurrent `session(...)` calls for the SAME
+   * not-yet-live target share ONE hydrate/adopt and receive the SAME `Session`.
+   * Without this, both callers miss `_liveSessions`, both cold-hydrate, both
+   * acquire the lease under the same `ownerId` (CAS does not conflict for the
+   * same owner), and the second `_adoptSession` overwrites the first's event
+   * bridge — leaking a subscription and leaving two live `Session` objects for
+   * one row with racing flush chains. Cleared in a `finally` so a failed
+   * resolution does not poison subsequent retries. `{ fresh: true }` never
+   * enters this map: each fresh call must mint its own new session.
+   */
+  private readonly _sessionResolutionsInFlight = new Map<string, Promise<Session>>();
   /** In-process close de-dupe by any session id currently covered by a close tree. */
   private readonly _closePromises = new Map<string, Promise<void>>();
   private readonly _shutdownEvictedSessionIds = new Set<string>();
@@ -3177,12 +3190,45 @@ export class Harness {
 
     // 1) sessionId-only lookups.
     if ('sessionId' in opts && opts.sessionId && !('threadId' in opts && opts.threadId)) {
-      return this._resolveById(storage, opts.sessionId, opts.resourceId);
+      const sessionId = opts.sessionId;
+      const resourceId = opts.resourceId;
+      // Fast-path: an already-live session returns immediately without entering
+      // the singleflight (cheap, and the live record cannot double-adopt).
+      const liveFast = this._liveSessions.get(sessionId);
+      if (liveFast) return this._resolveById(storage, sessionId, resourceId);
+      // Cold resolve — collapse concurrent SAME-key callers onto one promise.
+      // Key includes resourceId so a scoped and an unscoped (or differently
+      // scoped) lookup do not share a resolution and bypass each other's
+      // tenant check inside `_resolveById`.
+      return this._singleflightResolve(
+        // canonicalJson is NUL-/sentinel-safe: every byte (incl.  ) is
+        // JSON-escaped, so distinct (sessionId, resourceId) pairs never collide.
+        canonicalJson(['id', sessionId, resourceId ?? null]),
+        () => this._resolveById(storage, sessionId, resourceId),
+      );
     }
 
     // 2) threadId resolution. May be `{ fresh: true }` to force a new thread.
     if ('threadId' in opts && opts.threadId !== undefined) {
-      return this._resolveByThread(storage, opts);
+      // `{ fresh: true }` always mints a NEW session — never dedupe it.
+      if (typeof opts.threadId !== 'string') {
+        return this._resolveByThread(storage, opts);
+      }
+      const threadId = opts.threadId;
+      const resourceId = opts.resourceId!;
+      // Fast-path: existing live session for (threadId, resourceId) returns
+      // immediately without entering the singleflight.
+      for (const live of this._liveSessions.values()) {
+        if (live.threadId === threadId && live.resourceId === resourceId) {
+          return this._resolveByThread(storage, opts);
+        }
+      }
+      // Cold resolve — two concurrent by-thread callers for the same
+      // (resourceId, threadId) share one resolution.
+      return this._singleflightResolve(
+        canonicalJson(['thread', resourceId, threadId]),
+        () => this._resolveByThread(storage, opts),
+      );
     }
 
     // §5.3: there is NO resource-only resolver. "Continue latest" is product
@@ -3191,6 +3237,30 @@ export class Harness {
     // selectOrCreateThread "continue latest" semantics cannot become a hidden
     // fallback. Bare `{ resourceId }` is therefore invalid resolver options.
     throw new HarnessConfigError('session()', 'invalid resolver options');
+  }
+
+  /**
+   * @internal §5.3 cold-resolution singleflight. On a cache MISS the in-flight
+   * promise is stored BEFORE awaiting so concurrent SAME-key callers await the
+   * same hydrate/adopt and receive the SAME `Session`. The entry is cleared in a
+   * `finally` (success OR failure) so a failed resolution clears for retry. A
+   * by-sessionId and a by-thread call for the SAME row use different keys and
+   * may both resolve cold (an accepted rare case): adopt is idempotent on the id
+   * (second adopt of the same row simply re-publishes), and the common
+   * UI/headless callers resolve a given session consistently by one shape.
+   */
+  private _singleflightResolve(key: string, resolve: () => Promise<Session>): Promise<Session> {
+    const existing = this._sessionResolutionsInFlight.get(key);
+    if (existing) return existing;
+    const inflight = (async () => resolve())().finally(() => {
+      // Only clear OUR entry — a replacement under the same key (after we
+      // settled) must survive.
+      if (this._sessionResolutionsInFlight.get(key) === inflight) {
+        this._sessionResolutionsInFlight.delete(key);
+      }
+    });
+    this._sessionResolutionsInFlight.set(key, inflight);
+    return inflight;
   }
 
   private async _resolveById(storage: HarnessStorage, sessionId: string, resourceId?: string): Promise<Session> {
@@ -5825,6 +5895,11 @@ export class Harness {
   /** @internal — exposed for inspection in tests. */
   _internalLiveSessionCount(): number {
     return this._liveSessions.size;
+  }
+
+  /** @internal — number of harness-level event bridges for a given session id (0 or 1 expected). */
+  _internalSessionEventBridgeCount(sessionId: string): number {
+    return this._sessionEventBridges.has(sessionId) ? 1 : 0;
   }
 
   /** @internal — accessor for `Session.queue()` admission caps. */
