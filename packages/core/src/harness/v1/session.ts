@@ -6090,21 +6090,32 @@ export class Session {
     // interleaved content still carries its attachment file-parts; the §21
     // shared-terminal run absorbs them mid-flight (the in-flight run's committed
     // requestContext/surface is unchanged — see the `internal` doc above).
-    this._assertOpenForTurn('signal()');
-    const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
-    this._assertOpenForTurn('signal()');
-    const dispatched = agent.sendSignal(
-      {
-        ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
-        type: 'user-message',
-        contents: interleavedContents as never,
-      },
-      {
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        ifIdle: { behavior: 'wake', streamOptions: {} as never },
-      },
-    );
+    let dispatched: ReturnType<typeof agent.sendSignal>;
+    try {
+      this._assertOpenForTurn('signal()');
+      const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
+      this._assertOpenForTurn('signal()');
+      dispatched = agent.sendSignal(
+        {
+          ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+          type: 'user-message',
+          contents: interleavedContents as never,
+        },
+        {
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          ifIdle: { behavior: 'wake', streamOptions: {} as never },
+        },
+      );
+    } catch (err) {
+      // §13.3f.1 — active-delivery signal() is ALSO a public §4.2b boundary; its
+      // dispatch setup (_buildSignalContentsWithAttachments / agent.sendSignal)
+      // can reject with a raw provider/storage/runtime error. Redact before
+      // rejecting the caller (Harness-own closing/deleted errors pass through).
+      // The trusted `internal` channel-ingress recovery worker is exempt — it
+      // needs the concrete error for failure classification / re-dispatch.
+      throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+    }
 
     // §4.2f: record durable per-`signalId` pending evidence on acceptance so
     // `lookupMessageResult(signalId)` answers across restarts (not just the
