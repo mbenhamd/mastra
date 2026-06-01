@@ -257,6 +257,22 @@ fails with `HarnessSessionClosedError`, not `HarnessSessionLockedError`.
 `closingAt` and `closedAt`, and asserts cross-harness and cross-tenant safety
 per descendant. Eviction and shutdown only release the lease.
 
+**Plan-task writes** (§5.1k `HarnessPlanTask`) are durable session-owned writes
+and follow this same contract: they go through the live owner, never a second
+writer. The storage mutators (`createPlanTask`, `updatePlanTask`,
+`deletePlanTaskSubtree`, `mutatePlanTasksForSession`) are **session-owner-fenced**
+on `{ harnessName, sessionId, ownerId, ifSessionVersion }` — they verify the
+owning `SessionRecord` still has `ownerId` holding an unexpired lease and a
+`version` matching `ifSessionVersion` before any plan-task row changes, exactly
+as `saveSession` fences. The session is the serialized writer, so the fence is on
+the **session's** lease + version, not bare per-row OCC; the per-row plan-task
+`version` is the field-write OCC token *inside* that fence (catching a stale
+in-memory plan-task read), not an independent cross-process authority. Multi-row
+plan-task operations are transaction-shaped (all-or-nothing under one adapter
+boundary). A stale or stolen owner whose `ifSessionVersion` no longer matches —
+or whose lease has lapsed — cannot mutate the plan tree, the same fail-closed
+behavior as any other durable session write.
+
 **Storage interface.** §5.2 already lists the primitives this contract requires:
 `createOrLoadCurrentSessionOwner`, `acquireSessionLease`, `renewSessionLease`,
 `renewSessionLeaseSubtree`, `releaseSessionLease`, and the `{ ownerId,

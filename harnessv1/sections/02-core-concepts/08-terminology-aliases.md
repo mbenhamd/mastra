@@ -40,3 +40,14 @@ Pairs that look similar but are **not** interchangeable:
   in §5.1d). Every accepted operation went through admission, but admission
   may also reject — and a rejected admission is not "an accepted operation
   that failed later".
+- **`HarnessTask` ≠ `HarnessPlanTask`.** These are two unrelated constructs
+  that both end in `Task`. **`HarnessTask`** (defined in the runtime contracts,
+  not in this spec) is the internal *work-unit* primitive: a single scheduled or
+  in-flight piece of runtime execution. It is unchanged by `HarnessPlanTask` and
+  carries no `parentTaskId`, sibling order, or model-authored plan semantics.
+  **`HarnessPlanTask`** (§4.8, §5.1k) is the durable, arbitrary-depth,
+  *model-authored* agent task/todo **tree** — the persisted plan the agent
+  builds and revises as it decomposes a goal. A `HarnessPlanTask` is a
+  session-owned plan node (adjacency-list `parentTaskId`, sibling `order`,
+  lifecycle `status`); it is never a work-unit and is never scheduled directly.
+  When a section says "plan task" it always means `HarnessPlanTask`.

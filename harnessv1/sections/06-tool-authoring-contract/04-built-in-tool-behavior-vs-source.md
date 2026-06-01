@@ -31,3 +31,12 @@ if `source === 'subagent'`.
 Custom tool authors implementing similar suspension patterns should follow the
 same rule: act on the calling session only, and tag user-facing events with
 `source` for attribution.
+
+> **Plan-task tool surface (stub — TM-3).** The built-in tool that lets the
+> model create, decompose, reorder, reparent, and update the `HarnessPlanTask`
+> tree (§5.1k) is defined by TM-3, not here. That tool is the only model-facing
+> mutation path for plan tasks; it routes every write through the live `Session`
+> under its lease so the storage mutators stay session-owner-fenced (§5.6,
+> §5.8). Its field semantics, decompose/reparent multi-row behavior, and the
+> §5.1k status-rollup interaction (TM-4) are filled in by those lanes. TM-2 ships
+> only the durable storage layer.

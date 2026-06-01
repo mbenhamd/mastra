@@ -18,6 +18,8 @@ import {
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
@@ -26,6 +28,7 @@ import {
   HarnessStorageWakeupTransitionError,
 } from './base';
 import type { WriteMessageResultEvidenceResult } from './base';
+import { applyPlanTaskPatch, comparePlanTaskOrder, walkPlanTaskSubtree } from './plan-task-helpers';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
@@ -50,6 +53,19 @@ import type {
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
   CreateOrLoadActiveSessionResult,
+  CreatePlanTaskInput,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  MutatePlanTasksForSessionInput,
+  PlanTaskMutationOp,
+  PlanTaskSessionFence,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   DeleteSessionOptions,
   HarnessSessionEventRecord,
   HarnessSessionEventReplayState,
@@ -468,6 +484,14 @@ export class InMemoryHarness extends HarnessStorage {
     for (const [key, binding] of this.db.harnessChannelBindings) {
       if (binding.harnessName === namespace && binding.sessionId === sessionId) {
         this.db.harnessChannelBindings.delete(key);
+      }
+    }
+    // §5.2g: the whole plan-task tree owned by this session is cascade-deleted
+    // (every node — listed by session, so descendants are covered regardless of
+    // tree shape). PG/LibSQL mirror this on session delete.
+    for (const [key, task] of this.db.harnessPlanTasks) {
+      if (task.harnessName === namespace && task.sessionId === sessionId) {
+        this.db.harnessPlanTasks.delete(key);
       }
     }
     const refPrefix = `${namespace}\u0000${sessionId}\u0000`;
@@ -2728,6 +2752,215 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   // -------------------------------------------------------------------------
+  // Plan tasks (§5.1k) — durable, arbitrary-depth, model-authored task tree.
+  // All mutators are session-owner-fenced (§5.8): the SESSION is the serialized
+  // writer, so writes fence on the session's lease + version, not bare per-row
+  // OCC. The per-row `version` is the field-write OCC token inside that fence.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verify the session-owner fence: the owning SessionRecord must exist, still be
+   * held by `ownerId` under an unexpired lease, and have `version` matching
+   * `ifSessionVersion`. Returns the resolved namespace.
+   */
+  private assertPlanTaskFence(fence: PlanTaskSessionFence): string {
+    const namespace = resolveHarnessName(fence.harnessName, this.harnessName);
+    const session = this.db.harnessSessions.get(sessionKey(namespace, fence.sessionId));
+    if (!session) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
+    // Lease check first — mirrors saveSession (the lease is the ownership token).
+    assertLeaseHolder(session, fence.ownerId);
+    if (session.version !== fence.ifSessionVersion) {
+      throw new HarnessStorageVersionConflictError(fence.sessionId, fence.ifSessionVersion, session.version);
+    }
+    return namespace;
+  }
+
+  async createPlanTask({ fence, task }: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    const namespace = this.assertPlanTaskFence(fence);
+    // Idempotent retry: an existing task with the same idempotencyKey in this
+    // session returns unchanged (§5.1k).
+    if (task.idempotencyKey !== undefined) {
+      for (const existing of this.db.harnessPlanTasks.values()) {
+        if (
+          existing.harnessName === namespace &&
+          existing.sessionId === fence.sessionId &&
+          existing.idempotencyKey === task.idempotencyKey
+        ) {
+          return clonePlanTask(existing);
+        }
+      }
+    }
+    const now = Date.now();
+    const stored: HarnessPlanTask = normalizePlanTask({
+      ...task,
+      harnessName: namespace,
+      sessionId: fence.sessionId,
+      createdAt: task.createdAt ?? now,
+      updatedAt: now,
+      version: 1,
+    });
+    this.db.harnessPlanTasks.set(planTaskKey(namespace, fence.sessionId, stored.taskId), clonePlanTask(stored));
+    return clonePlanTask(stored);
+  }
+
+  async updatePlanTask({ fence, taskId, ifVersion, patch }: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    const namespace = this.assertPlanTaskFence(fence);
+    const key = planTaskKey(namespace, fence.sessionId, taskId);
+    const existing = this.db.harnessPlanTasks.get(key);
+    if (!existing) throw new HarnessStoragePlanTaskNotFoundError(fence.sessionId, taskId);
+    if (existing.version !== ifVersion) {
+      throw new HarnessStoragePlanTaskVersionConflictError(taskId, ifVersion, existing.version);
+    }
+    const next = applyPlanTaskPatch(existing, patch, ifVersion + 1);
+    this.db.harnessPlanTasks.set(key, clonePlanTask(next));
+    return { version: next.version };
+  }
+
+  async deletePlanTaskSubtree({ fence, rootTaskId }: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    const namespace = this.assertPlanTaskFence(fence);
+    const ids = this.collectPlanTaskSubtreeIds(namespace, fence.sessionId, rootTaskId);
+    let deletedCount = 0;
+    for (const id of ids) {
+      if (this.db.harnessPlanTasks.delete(planTaskKey(namespace, fence.sessionId, id))) deletedCount++;
+    }
+    return { deletedCount };
+  }
+
+  async mutatePlanTasksForSession({ fence, ops }: MutatePlanTasksForSessionInput): Promise<void> {
+    const namespace = this.assertPlanTaskFence(fence);
+    // Transaction-shaped: validate + stage every op against a working copy, then
+    // commit all-or-nothing. A single rejected op throws before any row changes.
+    const working = new Map<string, HarnessPlanTask>();
+    for (const [key, value] of this.db.harnessPlanTasks) {
+      if (value.harnessName === namespace && value.sessionId === fence.sessionId) {
+        working.set(value.taskId, clonePlanTask(value));
+      }
+      void key;
+    }
+    const now = Date.now();
+    for (const op of ops) {
+      this.stagePlanTaskOp(working, namespace, fence.sessionId, op, now);
+    }
+    // Commit: replace this session's rows with the working set.
+    for (const value of [...this.db.harnessPlanTasks.values()]) {
+      if (value.harnessName === namespace && value.sessionId === fence.sessionId) {
+        this.db.harnessPlanTasks.delete(planTaskKey(namespace, fence.sessionId, value.taskId));
+      }
+    }
+    for (const task of working.values()) {
+      this.db.harnessPlanTasks.set(planTaskKey(namespace, fence.sessionId, task.taskId), clonePlanTask(task));
+    }
+  }
+
+  private stagePlanTaskOp(
+    working: Map<string, HarnessPlanTask>,
+    namespace: string,
+    sessionId: string,
+    op: PlanTaskMutationOp,
+    now: number,
+  ): void {
+    if (op.kind === 'create') {
+      if (op.task.idempotencyKey !== undefined) {
+        for (const existing of working.values()) {
+          if (existing.idempotencyKey === op.task.idempotencyKey) return; // idempotent no-op
+        }
+      }
+      const stored = normalizePlanTask({
+        ...op.task,
+        harnessName: namespace,
+        sessionId,
+        createdAt: op.task.createdAt ?? now,
+        updatedAt: now,
+        version: 1,
+      });
+      working.set(stored.taskId, stored);
+      return;
+    }
+    if (op.kind === 'update') {
+      const existing = working.get(op.taskId);
+      if (!existing) throw new HarnessStoragePlanTaskNotFoundError(sessionId, op.taskId);
+      if (existing.version !== op.ifVersion) {
+        throw new HarnessStoragePlanTaskVersionConflictError(op.taskId, op.ifVersion, existing.version);
+      }
+      working.set(op.taskId, applyPlanTaskPatch(existing, op.patch, op.ifVersion + 1));
+      return;
+    }
+    // deleteSubtree
+    const ids = collectSubtreeIdsFromMap(working, op.rootTaskId);
+    for (const id of ids) working.delete(id);
+  }
+
+  /**
+   * BFS the subtree rooted at `rootTaskId` (inclusive) within this session,
+   * walking parentTaskId. A visited set defensively guards a parentTaskId cycle
+   * even though full cycle PREVENTION is TM-4.
+   */
+  private collectPlanTaskSubtreeIds(namespace: string, sessionId: string, rootTaskId: string): string[] {
+    const childrenByParent = new Map<string, string[]>();
+    let rootExists = false;
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      if (task.taskId === rootTaskId) rootExists = true;
+      if (task.parentTaskId !== undefined) {
+        const siblings = childrenByParent.get(task.parentTaskId) ?? [];
+        siblings.push(task.taskId);
+        childrenByParent.set(task.parentTaskId, siblings);
+      }
+    }
+    if (!rootExists) return [];
+    const result: string[] = [];
+    const queue = [rootTaskId];
+    const visited = new Set<string>([rootTaskId]);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      result.push(id);
+      for (const child of childrenByParent.get(id) ?? []) {
+        if (visited.has(child)) continue;
+        visited.add(child);
+        queue.push(child);
+      }
+    }
+    return result;
+  }
+
+  async listPlanTasks({ harnessName, sessionId, limit, cursor }: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    if (limit <= 0) return { tasks: [] };
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const matched: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      matched.push(task);
+    }
+    matched.sort(comparePlanTaskOrder);
+    const start = cursor === undefined ? 0 : matched.findIndex(t => t.taskId === cursor) + 1;
+    const page = matched.slice(start, start + limit);
+    const nextIndex = start + limit;
+    const result: ListPlanTasksResult = { tasks: page.map(clonePlanTask) };
+    if (nextIndex < matched.length && page.length > 0) {
+      result.cursor = page[page.length - 1]!.taskId;
+    }
+    return result;
+  }
+
+  async loadPlanTaskSubtree({
+    harnessName,
+    sessionId,
+    rootTaskId,
+    depth,
+    status,
+    limit,
+  }: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const tasks: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      tasks.push(task);
+    }
+    // Shared walk (§5.1k) keeps depth/status/limit semantics identical across adapters.
+    return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
+  }
+
+  // -------------------------------------------------------------------------
   // Test-only
   // -------------------------------------------------------------------------
 
@@ -2746,6 +2979,7 @@ export class InMemoryHarness extends HarnessStorage {
     this.db.harnessChannelActionReceipts.clear();
     this.db.harnessChannelOutbox.clear();
     this.db.harnessWakeupItems.clear();
+    this.db.harnessPlanTasks.clear();
     this.db.harnessThreadDeleteFences.clear();
   }
 }
@@ -2844,6 +3078,74 @@ function harnessWakeupKey(_harnessName: string, wakeupItemId: string): string {
 
 function resolveHarnessName(input: string | undefined, fallback: string): string {
   return input ?? fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Plan-task helpers (§5.1k)
+// ---------------------------------------------------------------------------
+
+function planTaskKey(harnessName: string, sessionId: string, taskId: string): string {
+  return `${harnessName} ${sessionId} ${taskId}`;
+}
+
+function clonePlanTask(task: HarnessPlanTask): HarnessPlanTask {
+  return cloneJson(task);
+}
+
+/** Drop `undefined` optional fields so stored rows stay shape-stable. */
+function normalizePlanTask(task: HarnessPlanTask): HarnessPlanTask {
+  const next: HarnessPlanTask = {
+    taskId: task.taskId,
+    harnessName: task.harnessName,
+    sessionId: task.sessionId,
+    resourceId: task.resourceId,
+    threadId: task.threadId,
+    order: task.order,
+    status: task.status,
+    statusSource: task.statusSource,
+    content: task.content,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    version: task.version,
+  };
+  if (task.idempotencyKey !== undefined) next.idempotencyKey = task.idempotencyKey;
+  if (task.parentTaskId !== undefined) next.parentTaskId = task.parentTaskId;
+  if (task.activeForm !== undefined) next.activeForm = task.activeForm;
+  if (task.priority !== undefined) next.priority = task.priority;
+  if (task.blockedBy !== undefined) next.blockedBy = [...task.blockedBy];
+  if (task.origin !== undefined) next.origin = task.origin;
+  if (task.delegatedSubagentSessionId !== undefined) {
+    next.delegatedSubagentSessionId = task.delegatedSubagentSessionId;
+  }
+  if (task.metadata !== undefined) next.metadata = cloneJson(task.metadata);
+  if (task.completedAt !== undefined) next.completedAt = task.completedAt;
+  return next;
+}
+
+/** BFS subtree id collection over an in-memory working map (cycle-guarded). */
+function collectSubtreeIdsFromMap(working: Map<string, HarnessPlanTask>, rootTaskId: string): string[] {
+  if (!working.has(rootTaskId)) return [];
+  const childrenByParent = new Map<string, string[]>();
+  for (const task of working.values()) {
+    if (task.parentTaskId !== undefined) {
+      const siblings = childrenByParent.get(task.parentTaskId) ?? [];
+      siblings.push(task.taskId);
+      childrenByParent.set(task.parentTaskId, siblings);
+    }
+  }
+  const result: string[] = [];
+  const queue = [rootTaskId];
+  const visited = new Set<string>([rootTaskId]);
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    result.push(id);
+    for (const child of childrenByParent.get(id) ?? []) {
+      if (visited.has(child)) continue;
+      visited.add(child);
+      queue.push(child);
+    }
+  }
+  return result;
 }
 
 function cloneSessionRecord(record: SessionRecord): SessionRecord {

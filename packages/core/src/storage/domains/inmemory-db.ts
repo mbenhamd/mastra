@@ -30,6 +30,7 @@ import type {
   ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
+  HarnessPlanTask,
   HarnessProviderCallbackBinding,
   HarnessWakeupItem,
   HarnessSessionEventRecord,
@@ -131,6 +132,7 @@ export class InMemoryDB {
   readonly harnessChannelActionReceipts = new Map<string, ChannelActionReceipt>();
   readonly harnessChannelOutbox = new Map<string, ChannelOutboxItem>();
   readonly harnessWakeupItems = new Map<string, HarnessWakeupItem>();
+  readonly harnessPlanTasks = new Map<string, HarnessPlanTask>();
   readonly harnessThreadDeleteFences = new Map<
     string,
     { threadId: string; ownerId: string; leaseId: string; createdAt: number; expiresAt: number }
@@ -197,6 +199,7 @@ export class InMemoryDB {
     this.harnessChannelActionReceipts.clear();
     this.harnessChannelOutbox.clear();
     this.harnessWakeupItems.clear();
+    this.harnessPlanTasks.clear();
     this.harnessThreadDeleteFences.clear();
   }
 }

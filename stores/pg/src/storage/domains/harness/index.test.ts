@@ -6,15 +6,19 @@ import {
   HarnessStorageAttachmentUnavailableError,
   HarnessStorageChannelBindingConflictError,
   HarnessStorageLeaseConflictError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
+  HarnessStorageVersionConflictError,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
 } from '@mastra/core/storage';
 import type {
   ChannelBinding,
+  HarnessPlanTask,
   HarnessProviderCallbackBinding,
   WorkspaceActionJournalEntry,
 } from '@mastra/core/storage';
@@ -1915,5 +1919,246 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
     await expect(
       harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 1000 }),
     ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  describe('plan tasks (§5.1k)', () => {
+    const OWNER = 'plan-owner';
+
+    async function setupSession(
+      sessionId = 'plan-session',
+      overrides: Partial<Parameters<typeof createSampleSessionRecord>[0]> = {},
+    ): Promise<{ sessionId: string; version: number }> {
+      const harness = store.stores.harness!;
+      const record = createSampleSessionRecord({ id: sessionId, ...overrides });
+      const res = await harness.createOrLoadActiveSession(record, {
+        initialLease: { ownerId: OWNER, ttlMs: 30_000 },
+      });
+      return { sessionId, version: res.version };
+    }
+
+    function fence(sessionId: string, ifSessionVersion: number, owner = OWNER) {
+      return { harnessName: 'default', sessionId, ownerId: owner, ifSessionVersion };
+    }
+
+    function sampleTask(sessionId: string, overrides: Partial<HarnessPlanTask> = {}): HarnessPlanTask {
+      return {
+        taskId: 'task-1',
+        harnessName: 'default',
+        sessionId,
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        order: 0,
+        status: 'pending',
+        statusSource: 'explicit',
+        content: 'do the thing',
+        createdAt: 1000,
+        updatedAt: 1000,
+        version: 0,
+        ...overrides,
+      };
+    }
+
+    it('creates a root task and lists it', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const created = await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      expect(created).toMatchObject({ taskId: 'task-1', status: 'pending', version: 1, statusSource: 'explicit' });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks).toHaveLength(1);
+      expect(listed.tasks[0]).toMatchObject({ taskId: 'task-1', content: 'do the thing' });
+    });
+
+    it('createPlanTask is idempotent on idempotencyKey within a session', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const a = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+      });
+      const b = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+      });
+      expect(b.taskId).toBe('t-a');
+      expect(b.content).toBe('first');
+      expect(b.version).toBe(a.version);
+    });
+
+    it('updatePlanTask advances the per-row version and applies the patch', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      const r1 = await harness.updatePlanTask({
+        fence: fence(sessionId, version),
+        taskId: 'task-1',
+        ifVersion: 1,
+        patch: { status: 'in_progress', activeForm: 'doing it', completedAt: 5000, blockedBy: ['x'] },
+      });
+      expect(r1.version).toBe(2);
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks[0]).toMatchObject({
+        status: 'in_progress',
+        activeForm: 'doing it',
+        completedAt: 5000,
+        blockedBy: ['x'],
+        version: 2,
+      });
+    });
+
+    it('updatePlanTask rejects a stale per-row version', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      await expect(
+        harness.updatePlanTask({ fence: fence(sessionId, version), taskId: 'task-1', ifVersion: 99, patch: { status: 'completed' } }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+    });
+
+    it('updatePlanTask throws not-found for an unknown task', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.updatePlanTask({ fence: fence(sessionId, version), taskId: 'nope', ifVersion: 1, patch: {} }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskNotFoundError);
+    });
+
+    it('the session-owner fence rejects a wrong ownerId', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: sampleTask(sessionId) }),
+      ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    });
+
+    it('the session-owner fence rejects a stale session version', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.createPlanTask({ fence: fence(sessionId, version + 5), task: sampleTask(sessionId) }),
+      ).rejects.toBeInstanceOf(HarnessStorageVersionConflictError);
+    });
+
+    it('the session-owner fence throws not-found for an unknown session', async () => {
+      const harness = store.stores.harness!;
+      await expect(
+        harness.createPlanTask({ fence: fence('ghost', 1), task: sampleTask('ghost') }),
+      ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    });
+
+    it('listPlanTasks paginates and orders by (parentTaskId, order)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r1', order: 1 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }) });
+
+      const page1 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+      expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+      expect(page1.cursor).toBeDefined();
+      const page2 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+      expect(page2.tasks.map(t => t.taskId)).toEqual(['c0', 'c1']);
+      expect(page2.cursor).toBeUndefined();
+    });
+
+    it('listPlanTasks isolates by session', async () => {
+      const harness = store.stores.harness!;
+      const a = await setupSession('sess-a', { threadId: 'thread-a' });
+      const b = await setupSession('sess-b', { threadId: 'thread-b' });
+      await harness.createPlanTask({ fence: fence(a.sessionId, a.version), task: sampleTask(a.sessionId, { taskId: 'ta' }) });
+      await harness.createPlanTask({ fence: fence(b.sessionId, b.version), task: sampleTask(b.sessionId, { taskId: 'tb' }) });
+      const listedA = await harness.listPlanTasks({ harnessName: 'default', sessionId: a.sessionId, limit: 10 });
+      expect(listedA.tasks.map(t => t.taskId)).toEqual(['ta']);
+    });
+
+    it('deletePlanTaskSubtree cascades to all descendants (recursive CTE)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'd', order: 9 }) });
+
+      const res = await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'root' });
+      expect(res.deletedCount).toBe(4);
+      const remaining = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(remaining.tasks.map(t => t.taskId)).toEqual(['d']);
+    });
+
+    it('deletePlanTaskSubtree terminates on a parentTaskId cycle (UNION guard)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'x', parentTaskId: 'y' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'y', parentTaskId: 'x' }) });
+      const res = await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'x' });
+      expect(res.deletedCount).toBe(2);
+      const remaining = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(remaining.tasks).toHaveLength(0);
+    });
+
+    it('mutatePlanTasksForSession applies multi-row ops atomically', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'p', order: 0 }) });
+      await harness.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [
+          { kind: 'create', task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'p', order: 0 }) },
+          { kind: 'create', task: sampleTask(sessionId, { taskId: 'c2', parentTaskId: 'p', order: 1 }) },
+          { kind: 'update', taskId: 'p', ifVersion: 1, patch: { status: 'in_progress' } },
+        ],
+      });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks.map(t => t.taskId)).toEqual(['p', 'c1', 'c2']);
+      expect(listed.tasks.find(t => t.taskId === 'p')).toMatchObject({ status: 'in_progress', version: 2 });
+    });
+
+    it('mutatePlanTasksForSession rejects all ops when one op conflicts (transaction rollback)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'p', order: 0 }) });
+      await expect(
+        harness.mutatePlanTasksForSession({
+          fence: fence(sessionId, version),
+          ops: [
+            { kind: 'create', task: sampleTask(sessionId, { taskId: 'new', order: 5 }) },
+            { kind: 'update', taskId: 'p', ifVersion: 99, patch: { status: 'completed' } },
+          ],
+        }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks.map(t => t.taskId)).toEqual(['p']);
+    });
+
+    it('loadPlanTaskSubtree returns a bounded next-N subtree honoring depth + status', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }) });
+
+      const d1 = await harness.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', depth: 1, limit: 10 });
+      expect(d1.tasks.map(t => t.taskId)).toEqual(['root', 'a', 'c']);
+      expect(d1.truncated).toBe(false);
+
+      const completed = await harness.loadPlanTaskSubtree({ harnessName: 'default', sessionId, status: 'completed', limit: 10 });
+      expect(completed.tasks.map(t => t.taskId)).toEqual(['c']);
+
+      const limited = await harness.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', limit: 2 });
+      expect(limited.tasks).toHaveLength(2);
+      expect(limited.truncated).toBe(true);
+    });
+
+    it('session delete cascades plan tasks (§5.2g)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't1' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't2', parentTaskId: 't1' }) });
+      await harness.deleteSession({ harnessName: 'default', sessionId });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks).toHaveLength(0);
+    });
   });
 });

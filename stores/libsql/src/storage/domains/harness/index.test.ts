@@ -29,6 +29,8 @@ import {
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
@@ -42,6 +44,7 @@ import type {
   ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
+  HarnessPlanTask,
   HarnessProviderCallbackBinding,
   HarnessWakeupItem,
   SessionRecord,
@@ -3813,6 +3816,236 @@ describe('HarnessLibSQL channel binding ledger (§5.1h / §14.1 / PF-824)', () =
       externalThreadId: 'th-1',
     });
     expect(rebound?.id).toBe('rebind');
+  });
+});
+
+describe('HarnessLibSQL plan tasks (§5.1k)', () => {
+  let storage: HarnessLibSQL;
+  const OWNER = 'plan-owner';
+
+  beforeEach(async () => {
+    const client = createHarnessTestClient();
+    storage = new HarnessLibSQL({ client });
+    await storage.init();
+  });
+
+  async function setupSession(
+    sessionId = 'plan-session',
+    overrides: Partial<SessionRecord> = {},
+  ): Promise<{ sessionId: string; version: number }> {
+    const res = await storage.createOrLoadActiveSession(sampleSession({ id: sessionId, ...overrides }), {
+      initialLease: { ownerId: OWNER, ttlMs: 30_000 },
+    });
+    return { sessionId, version: res.version };
+  }
+
+  function fence(sessionId: string, ifSessionVersion: number, owner = OWNER) {
+    return { harnessName: 'default', sessionId, ownerId: owner, ifSessionVersion };
+  }
+
+  function planTask(sessionId: string, overrides: Partial<HarnessPlanTask> = {}): HarnessPlanTask {
+    return {
+      taskId: 'task-1',
+      harnessName: 'default',
+      sessionId,
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      order: 0,
+      status: 'pending',
+      statusSource: 'explicit',
+      content: 'do the thing',
+      createdAt: 1000,
+      updatedAt: 1000,
+      version: 0,
+      ...overrides,
+    };
+  }
+
+  it('creates a root task and lists it', async () => {
+    const { sessionId, version } = await setupSession();
+    const created = await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId) });
+    expect(created).toMatchObject({ taskId: 'task-1', status: 'pending', version: 1 });
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks.map(t => t.taskId)).toEqual(['task-1']);
+  });
+
+  it('createPlanTask is idempotent on idempotencyKey within a session', async () => {
+    const { sessionId, version } = await setupSession();
+    const a = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: planTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+    });
+    const b = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: planTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+    });
+    expect(b.taskId).toBe('t-a');
+    expect(b.content).toBe('first');
+    expect(b.version).toBe(a.version);
+  });
+
+  it('updatePlanTask advances the per-row version and applies the patch (incl JSON blockedBy)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId) });
+    const r1 = await storage.updatePlanTask({
+      fence: fence(sessionId, version),
+      taskId: 'task-1',
+      ifVersion: 1,
+      patch: { status: 'in_progress', activeForm: 'doing it', completedAt: 5000, blockedBy: ['x', 'y'], metadata: { a: 1 } },
+    });
+    expect(r1.version).toBe(2);
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks[0]).toMatchObject({
+      status: 'in_progress',
+      activeForm: 'doing it',
+      completedAt: 5000,
+      blockedBy: ['x', 'y'],
+      metadata: { a: 1 },
+      version: 2,
+    });
+  });
+
+  it('updatePlanTask rejects a stale per-row version', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId) });
+    await expect(
+      storage.updatePlanTask({ fence: fence(sessionId, version), taskId: 'task-1', ifVersion: 99, patch: { status: 'completed' } }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+  });
+
+  it('updatePlanTask throws not-found for an unknown task', async () => {
+    const { sessionId, version } = await setupSession();
+    await expect(
+      storage.updatePlanTask({ fence: fence(sessionId, version), taskId: 'nope', ifVersion: 1, patch: {} }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskNotFoundError);
+  });
+
+  it('the session-owner fence rejects a wrong ownerId', async () => {
+    const { sessionId, version } = await setupSession();
+    await expect(
+      storage.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: planTask(sessionId) }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('the session-owner fence rejects a stale session version', async () => {
+    const { sessionId, version } = await setupSession();
+    await expect(
+      storage.createPlanTask({ fence: fence(sessionId, version + 5), task: planTask(sessionId) }),
+    ).rejects.toBeInstanceOf(HarnessStorageVersionConflictError);
+  });
+
+  it('the session-owner fence throws not-found for an unknown session', async () => {
+    await expect(
+      storage.createPlanTask({ fence: fence('ghost', 1), task: planTask('ghost') }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+  });
+
+  it('listPlanTasks paginates and orders by (parentTaskId, order)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'r1', order: 1 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'r0', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }) });
+
+    const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+    expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+    expect(page1.cursor).toBeDefined();
+    const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+    expect(page2.tasks.map(t => t.taskId)).toEqual(['c0', 'c1']);
+    expect(page2.cursor).toBeUndefined();
+  });
+
+  it('listPlanTasks isolates by session', async () => {
+    const a = await setupSession('sess-a', { threadId: 'thread-a' });
+    const b = await setupSession('sess-b', { threadId: 'thread-b' });
+    await storage.createPlanTask({ fence: fence(a.sessionId, a.version), task: planTask(a.sessionId, { taskId: 'ta' }) });
+    await storage.createPlanTask({ fence: fence(b.sessionId, b.version), task: planTask(b.sessionId, { taskId: 'tb' }) });
+    const listedA = await storage.listPlanTasks({ harnessName: 'default', sessionId: a.sessionId, limit: 10 });
+    expect(listedA.tasks.map(t => t.taskId)).toEqual(['ta']);
+  });
+
+  it('deletePlanTaskSubtree cascades to all descendants (recursive CTE)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'root' }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'd', order: 9 }) });
+
+    const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'root' });
+    expect(res.deletedCount).toBe(4);
+    const remaining = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(remaining.tasks.map(t => t.taskId)).toEqual(['d']);
+  });
+
+  it('deletePlanTaskSubtree terminates on a parentTaskId cycle (UNION guard)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'x', parentTaskId: 'y' }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'y', parentTaskId: 'x' }) });
+    const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'x' });
+    expect(res.deletedCount).toBe(2);
+    const remaining = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(remaining.tasks).toHaveLength(0);
+  });
+
+  it('mutatePlanTasksForSession applies multi-row ops atomically', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'p', order: 0 }) });
+    await storage.mutatePlanTasksForSession({
+      fence: fence(sessionId, version),
+      ops: [
+        { kind: 'create', task: planTask(sessionId, { taskId: 'c1', parentTaskId: 'p', order: 0 }) },
+        { kind: 'create', task: planTask(sessionId, { taskId: 'c2', parentTaskId: 'p', order: 1 }) },
+        { kind: 'update', taskId: 'p', ifVersion: 1, patch: { status: 'in_progress' } },
+      ],
+    });
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks.map(t => t.taskId)).toEqual(['p', 'c1', 'c2']);
+    expect(listed.tasks.find(t => t.taskId === 'p')).toMatchObject({ status: 'in_progress', version: 2 });
+  });
+
+  it('mutatePlanTasksForSession rejects all ops when one op conflicts (transaction rollback)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'p', order: 0 }) });
+    await expect(
+      storage.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [
+          { kind: 'create', task: planTask(sessionId, { taskId: 'new', order: 5 }) },
+          { kind: 'update', taskId: 'p', ifVersion: 99, patch: { status: 'completed' } },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks.map(t => t.taskId)).toEqual(['p']);
+  });
+
+  it('loadPlanTaskSubtree returns a bounded next-N subtree honoring depth + status', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'root', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }) });
+
+    const d1 = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', depth: 1, limit: 10 });
+    expect(d1.tasks.map(t => t.taskId)).toEqual(['root', 'a', 'c']);
+    expect(d1.truncated).toBe(false);
+
+    const completed = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, status: 'completed', limit: 10 });
+    expect(completed.tasks.map(t => t.taskId)).toEqual(['c']);
+
+    const limited = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', limit: 2 });
+    expect(limited.tasks).toHaveLength(2);
+    expect(limited.truncated).toBe(true);
+  });
+
+  it('session delete cascades plan tasks (§5.2g)', async () => {
+    const { sessionId, version } = await setupSession();
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 't1' }) });
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: 't2', parentTaskId: 't1' }) });
+    await storage.deleteSession({ harnessName: 'default', sessionId });
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toHaveLength(0);
   });
 });
 

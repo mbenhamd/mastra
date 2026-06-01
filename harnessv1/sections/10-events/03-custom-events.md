@@ -39,3 +39,12 @@ The emitted subscriber event has the `CustomEvent` shape from §10.2, intersecte
 with `HarnessEventBase`. Custom events go through the same ordering and replay
 rules as built-in events. Subscribers should narrow by `type` and tolerate
 unknown types (forward-compatibility).
+
+> **Plan-task event (stub — TM-5).** The `plan_task_*` custom event that
+> projects `HarnessPlanTask` tree changes (create / update / status transition /
+> subtree delete — §5.1k) to subscribers is defined by TM-5, not here. It is a
+> custom event (not part of the closed built-in union in §10.2) emitted by the
+> live owner when the session mutates its plan tree. Its payload shape, ordering
+> guarantees relative to other session events, and the derived-status (TM-4)
+> projection are filled in by that lane. TM-2 ships only the durable storage
+> layer and emits no events.

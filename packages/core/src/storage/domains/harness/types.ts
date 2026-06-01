@@ -1465,3 +1465,212 @@ export interface SaveAttachmentReferenceInput extends AttachmentReference {
   sessionId: string;
   attachmentId: string;
 }
+
+// ---------------------------------------------------------------------------
+// Plan tasks (HARNESS_V1_SPEC.md §5.1k / §4.8f)
+//
+// `HarnessPlanTask` is the durable, arbitrary-depth, MODEL-AUTHORED agent
+// task/todo TREE. It is distinct from the runtime work-unit `HarnessTask` in
+// contracts.ts (which is unrelated and unchanged). Plan tasks are session-owned
+// and isolated by `(harnessName, sessionId)`; every mutation flows through the
+// live `Session` under its lease, so the storage mutators are
+// session-owner-fenced (§5.6 / §5.8). Status ROLLUP, `blockedBy` cycle checks,
+// the plan tool (§6.4), and the `plan_task_*` custom event (§10.3) are DEFERRED
+// to TM-3 / TM-4 / TM-5; TM-2 ships only the durable storage layer.
+// ---------------------------------------------------------------------------
+
+export type HarnessPlanTaskStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'blocked'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+/**
+ * Whether the current `status` was written by an explicit caller/model action
+ * or DERIVED by the harness from child rollup. Rollup is DEFERRED to TM-4 — until
+ * then every write is `'explicit'`.
+ */
+export type HarnessPlanTaskStatusSource = 'explicit' | 'derived';
+
+/**
+ * Durable model-authored plan-tree node (§5.1k). Adjacency-list edge via
+ * `parentTaskId` gives arbitrary depth; `order` sorts siblings. The per-row
+ * `version` is the field-write OCC token, mutated only under the session-owner
+ * fence (§5.8) — NOT an independent cross-process authority.
+ */
+export interface HarnessPlanTask {
+  /** Generated stable id (never the model's free-text title). */
+  taskId: string;
+  /** Optional idempotency key so a retried create resolves to the same row. */
+  idempotencyKey?: string;
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /** Adjacency-list edge to the parent node; absent for roots. */
+  parentTaskId?: string;
+  /** Sibling ordering within one parent (and among roots). */
+  order: number;
+  status: HarnessPlanTaskStatus;
+  statusSource: HarnessPlanTaskStatusSource;
+  /** Imperative task title. */
+  content: string;
+  /** Present-continuous label shown while in progress. */
+  activeForm?: string;
+  priority?: number;
+  /**
+   * Stored as data only in TM-2. Cycle-checking + rollup that consume
+   * `blockedBy` are DEFERRED to TM-4.
+   */
+  blockedBy?: string[];
+  origin?: string;
+  /** RESERVED for TM-6 subagent delegation; never written non-null in TM-2. */
+  delegatedSubagentSessionId?: string;
+  metadata?: JsonValue;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  /** Per-row OCC token, advanced on each `updatePlanTask` under the fence. */
+  version: number;
+}
+
+/**
+ * Session-owner fence shared by every plan-task mutator (§5.6 / §5.8). The
+ * adapter verifies, against the owning `SessionRecord`, that `ownerId` still
+ * holds the unexpired lease and that the session's `version` matches
+ * `ifSessionVersion` before any plan-task row changes — mirroring how
+ * `saveSession` fences. The SESSION is the serialized writer, so plan-task
+ * writes fence on the session's lease + version, not bare per-row OCC.
+ */
+export interface PlanTaskSessionFence {
+  harnessName?: string;
+  sessionId: string;
+  ownerId: string;
+  /** Expected current `SessionRecord.version`. */
+  ifSessionVersion: number;
+}
+
+/** Create one plan-task node. */
+export interface CreatePlanTaskInput {
+  fence: PlanTaskSessionFence;
+  /**
+   * The node to insert. `version`, `createdAt`, and `updatedAt` are adapter-set
+   * on insert (callers may pass them; adapters normalize). `taskId` must be
+   * caller-supplied (stable id). When `idempotencyKey` matches an existing
+   * task in the same session, the existing row is returned unchanged.
+   */
+  task: HarnessPlanTask;
+}
+
+/**
+ * Partial field write of a plan task by `taskId`, guarded by per-row OCC
+ * (`ifVersion`) INSIDE the session-owner fence. Only the provided fields are
+ * written; omitted fields are unchanged. Pass a field explicitly to `null`-able
+ * clearing via the dedicated optional booleans where a field is optional.
+ */
+export interface UpdatePlanTaskInput {
+  fence: PlanTaskSessionFence;
+  taskId: string;
+  /** Per-row OCC token observed on read. */
+  ifVersion: number;
+  patch: {
+    parentTaskId?: string;
+    clearParentTaskId?: boolean;
+    order?: number;
+    status?: HarnessPlanTaskStatus;
+    statusSource?: HarnessPlanTaskStatusSource;
+    content?: string;
+    activeForm?: string;
+    clearActiveForm?: boolean;
+    priority?: number;
+    clearPriority?: boolean;
+    blockedBy?: string[];
+    clearBlockedBy?: boolean;
+    origin?: string;
+    delegatedSubagentSessionId?: string;
+    metadata?: JsonValue;
+    clearMetadata?: boolean;
+    completedAt?: number;
+    clearCompletedAt?: boolean;
+  };
+}
+
+export interface UpdatePlanTaskResult {
+  /** New per-row version after the write — `ifVersion + 1`. */
+  version: number;
+}
+
+/** Cascade-delete a task plus every descendant (NOT reparent-to-root). */
+export interface DeletePlanTaskSubtreeInput {
+  fence: PlanTaskSessionFence;
+  rootTaskId: string;
+}
+
+export interface DeletePlanTaskSubtreeResult {
+  /** Number of plan-task rows removed (root + descendants). */
+  deletedCount: number;
+}
+
+/**
+ * One operation in a transaction-shaped multi-row mutation. Used by
+ * decompose/reparent in TM-3 / TM-4. All ops apply under one adapter boundary
+ * or none do.
+ */
+export type PlanTaskMutationOp =
+  | { kind: 'create'; task: HarnessPlanTask }
+  | {
+      kind: 'update';
+      taskId: string;
+      ifVersion: number;
+      patch: UpdatePlanTaskInput['patch'];
+    }
+  | { kind: 'deleteSubtree'; rootTaskId: string };
+
+export interface MutatePlanTasksForSessionInput {
+  fence: PlanTaskSessionFence;
+  ops: PlanTaskMutationOp[];
+}
+
+export interface ListPlanTasksInput {
+  harnessName?: string;
+  sessionId: string;
+  /** Page size. */
+  limit: number;
+  /** Opaque cursor returned by the previous page. */
+  cursor?: string;
+}
+
+export interface ListPlanTasksResult {
+  tasks: HarnessPlanTask[];
+  /** Present when more rows remain; pass to the next `listPlanTasks` call. */
+  cursor?: string;
+}
+
+/**
+ * The anti-forgetting bounded read: returns the next-N nodes of the subtree
+ * under `rootTaskId` (or the whole forest's roots-down when omitted), bounded
+ * by `depth` and optionally filtered by `status`. Always capped by `limit`.
+ */
+export interface LoadPlanTaskSubtreeInput {
+  harnessName?: string;
+  sessionId: string;
+  /** Root to walk from; omit to walk from session roots (no parent). */
+  rootTaskId?: string;
+  /**
+   * Max depth relative to the root (0 = just the root node / the roots when
+   * `rootTaskId` is omitted). Unbounded when omitted.
+   */
+  depth?: number;
+  /** Restrict to nodes with this status. */
+  status?: HarnessPlanTaskStatus;
+  /** Hard cap on returned nodes (the bounded next-N). */
+  limit: number;
+}
+
+export interface LoadPlanTaskSubtreeResult {
+  tasks: HarnessPlanTask[];
+  /** True when the bound (`limit`/`depth`) clipped the subtree. */
+  truncated: boolean;
+}

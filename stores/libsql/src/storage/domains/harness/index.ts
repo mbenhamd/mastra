@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import type { Client } from '@libsql/client';
+import type { Client, Transaction } from '@libsql/client';
 import {
   HarnessStorage,
   HarnessStorageAdmissionConflictError,
@@ -17,6 +17,8 @@ import {
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
@@ -33,6 +35,7 @@ import {
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
+  TABLE_HARNESS_PLAN_TASKS,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_SESSIONS,
@@ -40,7 +43,9 @@ import {
   TABLE_HARNESS_WAKEUPS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_SCHEMAS,
+  applyPlanTaskPatch,
   getSqlType,
+  walkPlanTaskSubtree,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
@@ -65,6 +70,19 @@ import type {
   CreateOrLoadChannelActionTokenResult,
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
+  CreatePlanTaskInput,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  MutatePlanTasksForSessionInput,
+  PlanTaskMutationOp,
+  PlanTaskSessionFence,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   DeleteSessionOptions,
   HarnessWakeupItem,
   HarnessSessionEventRecord,
@@ -125,6 +143,7 @@ export class HarnessLibSQL extends HarnessStorage {
   #compactionLocks = new Map<string, Promise<void>>();
   #sessionEventsReady: Promise<void> | undefined;
   #workspaceActionsReady: Promise<void> | undefined;
+  #planTasksReady: Promise<void> | undefined;
   #providerCallbackBindingIndexesReady: Promise<void> | undefined;
   #channelInboxIndexesReady: Promise<void> | undefined;
   #channelBindingIndexesReady: Promise<void> | undefined;
@@ -194,6 +213,7 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelActionTables();
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
+    await this.#ensurePlanTasksTable();
     await this.#db.alterTable({
       tableName: TABLE_HARNESS_SESSIONS,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_SESSIONS],
@@ -281,7 +301,9 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelActionTables();
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
+    await this.#ensurePlanTasksTable();
     this.#localThreadDeleteFences.clear();
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENT_REFERENCES}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENTS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_MESSAGE_RESULTS}`);
@@ -892,6 +914,7 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureSessionEventsTable();
     await this.#ensureWorkspaceActionsTable();
     await this.#ensureChannelBindingsTable();
+    await this.#ensurePlanTasksTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,
@@ -964,6 +987,12 @@ export class HarnessLibSQL extends HarnessStorage {
         // replacement session (mirrors the in-memory cleanupDeletedSession sweep).
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // §5.2g: cascade the whole plan-task tree owned by this session.
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });
@@ -1784,6 +1813,258 @@ export class HarnessLibSQL extends HarnessStorage {
       args,
     });
     return result.rows.map(row => rowToWorkspaceActionJournalEntry(row as Record<string, unknown>));
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan tasks (§5.1k) — session-owner-fenced model-authored task tree.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Assert the session-owner fence inside `tx`: the owning session row must be
+   * held by `ownerId` under an unexpired lease and have `version` matching
+   * `ifSessionVersion`. A LibSQL write transaction serializes concurrent lease
+   * writes, so no row lock is needed. Returns the resolved namespace.
+   */
+  async #assertPlanTaskFence(tx: Transaction, fence: PlanTaskSessionFence): Promise<string> {
+    const namespace = this.#resolveHarnessName(fence.harnessName);
+    const res = await tx.execute({
+      sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ?`,
+      args: [namespace, fence.sessionId],
+    });
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (!row) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
+    const ownerId = (row.owner_id ?? undefined) as string | undefined;
+    const leaseExpiresAt = row.lease_expires_at == null ? undefined : Number(row.lease_expires_at);
+    const now = Date.now();
+    const leaseHeld = ownerId !== undefined && leaseExpiresAt !== undefined && leaseExpiresAt > now;
+    if (leaseHeld && ownerId !== fence.ownerId) {
+      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId, leaseExpiresAt ?? 0);
+    }
+    const version = Number(row.version);
+    if (version !== fence.ifSessionVersion) {
+      throw new HarnessStorageVersionConflictError(fence.sessionId, fence.ifSessionVersion, version);
+    }
+    return namespace;
+  }
+
+  async createPlanTask({ fence, task }: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const stored = await this.#insertPlanTask(tx, namespace, fence.sessionId, task);
+      await tx.commit();
+      return stored;
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #insertPlanTask(
+    tx: Transaction,
+    namespace: string,
+    sessionId: string,
+    task: HarnessPlanTask,
+  ): Promise<HarnessPlanTask> {
+    if (task.idempotencyKey !== undefined) {
+      const existing = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+              WHERE harness_name = ? AND session_id = ? AND idempotency_key = ?
+              LIMIT 1`,
+        args: [namespace, sessionId, task.idempotencyKey],
+      });
+      if (existing.rows[0]) return rowToPlanTask(existing.rows[0] as Record<string, unknown>);
+    }
+    const now = Date.now();
+    const stored: HarnessPlanTask = {
+      ...task,
+      harnessName: namespace,
+      sessionId,
+      createdAt: task.createdAt ?? now,
+      updatedAt: now,
+      version: 1,
+    };
+    const cols = planTaskColumnValues(stored);
+    await tx.execute({
+      sql: `INSERT INTO ${TABLE_HARNESS_PLAN_TASKS} (${cols.names.join(', ')})
+            VALUES (${cols.names.map(() => '?').join(', ')})`,
+      args: cols.values,
+    });
+    return stored;
+  }
+
+  async updatePlanTask({ fence, taskId, ifVersion, patch }: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const version = await this.#updatePlanTaskRow(tx, namespace, fence.sessionId, taskId, ifVersion, patch);
+      await tx.commit();
+      return { version };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #updatePlanTaskRow(
+    tx: Transaction,
+    namespace: string,
+    sessionId: string,
+    taskId: string,
+    ifVersion: number,
+    patch: UpdatePlanTaskInput['patch'],
+  ): Promise<number> {
+    const res = await tx.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ? AND task_id = ?`,
+      args: [namespace, sessionId, taskId],
+    });
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (!row) throw new HarnessStoragePlanTaskNotFoundError(sessionId, taskId);
+    const existing = rowToPlanTask(row);
+    if (existing.version !== ifVersion) {
+      throw new HarnessStoragePlanTaskVersionConflictError(taskId, ifVersion, existing.version);
+    }
+    const next = applyPlanTaskPatch(existing, patch, ifVersion + 1);
+    const cols = planTaskColumnValues(next);
+    const byName = new Map<string, string | number | null>(cols.names.map((n, i) => [n, cols.values[i] ?? null]));
+    const updatable = cols.names.filter(n => n !== 'harness_name' && n !== 'session_id' && n !== 'task_id');
+    const setClause = updatable.map(n => `${n} = ?`).join(', ');
+    const setValues = updatable.map(n => byName.get(n) ?? null);
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_PLAN_TASKS}
+            SET ${setClause}
+            WHERE harness_name = ? AND session_id = ? AND task_id = ?`,
+      args: [...setValues, namespace, sessionId, taskId],
+    });
+    return next.version;
+  }
+
+  async deletePlanTaskSubtree({ fence, rootTaskId }: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const deletedCount = await this.#deletePlanTaskSubtreeRows(tx, namespace, fence.sessionId, rootTaskId);
+      await tx.commit();
+      return { deletedCount };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #deletePlanTaskSubtreeRows(
+    tx: Transaction,
+    namespace: string,
+    sessionId: string,
+    rootTaskId: string,
+  ): Promise<number> {
+    // §5.1k: walk parent_task_id with a recursive CTE; UNION (not UNION ALL)
+    // row-dedupes so a parent_task_id cycle terminates (cycle PREVENTION is TM-4,
+    // this is the defensive runtime guard). Delete the root + every descendant.
+    const result = await tx.execute({
+      sql: `WITH RECURSIVE subtree(task_id) AS (
+              SELECT task_id FROM ${TABLE_HARNESS_PLAN_TASKS}
+              WHERE harness_name = ? AND session_id = ? AND task_id = ?
+              UNION
+              SELECT t.task_id FROM ${TABLE_HARNESS_PLAN_TASKS} t
+              JOIN subtree ON t.parent_task_id = subtree.task_id
+              WHERE t.harness_name = ? AND t.session_id = ?
+            )
+            DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+              AND task_id IN (SELECT task_id FROM subtree)`,
+      args: [namespace, sessionId, rootTaskId, namespace, sessionId, namespace, sessionId],
+    });
+    return result.rowsAffected;
+  }
+
+  async mutatePlanTasksForSession({ fence, ops }: MutatePlanTasksForSessionInput): Promise<void> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      for (const op of ops) {
+        await this.#applyPlanTaskOp(tx, namespace, fence.sessionId, op);
+      }
+      await tx.commit();
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #applyPlanTaskOp(
+    tx: Transaction,
+    namespace: string,
+    sessionId: string,
+    op: PlanTaskMutationOp,
+  ): Promise<void> {
+    if (op.kind === 'create') {
+      await this.#insertPlanTask(tx, namespace, sessionId, op.task);
+      return;
+    }
+    if (op.kind === 'update') {
+      await this.#updatePlanTaskRow(tx, namespace, sessionId, op.taskId, op.ifVersion, op.patch);
+      return;
+    }
+    await this.#deletePlanTaskSubtreeRows(tx, namespace, sessionId, op.rootTaskId);
+  }
+
+  async listPlanTasks({ harnessName, sessionId, limit, cursor }: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    if (limit <= 0) return { tasks: [] };
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const conditions = ['harness_name = ?', 'session_id = ?'];
+    const args: (string | number)[] = [namespace, sessionId];
+    if (cursor !== undefined) {
+      const c = decodePlanTaskCursor(cursor);
+      conditions.push(
+        `(COALESCE(parent_task_id, '') > ? OR (COALESCE(parent_task_id, '') = ? AND ("order" > ? OR ("order" = ? AND task_id > ?))))`,
+      );
+      args.push(c.parent, c.parent, c.order, c.order, c.taskId);
+    }
+    // Fetch limit+1 so a cursor is emitted only when a further row exists.
+    args.push(limit + 1);
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY COALESCE(parent_task_id, '') ASC, "order" ASC, task_id ASC
+            LIMIT ?`,
+      args,
+    });
+    const fetched = result.rows.map(row => rowToPlanTask(row as Record<string, unknown>));
+    const hasMore = fetched.length > limit;
+    const tasks = hasMore ? fetched.slice(0, limit) : fetched;
+    const out: ListPlanTasksResult = { tasks };
+    if (hasMore && tasks.length > 0) {
+      out.cursor = encodePlanTaskCursor(tasks[tasks.length - 1]!);
+    }
+    return out;
+  }
+
+  async loadPlanTaskSubtree({
+    harnessName,
+    sessionId,
+    rootTaskId,
+    depth,
+    status,
+    limit,
+  }: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+            ORDER BY COALESCE(parent_task_id, '') ASC, "order" ASC, task_id ASC`,
+      args: [namespace, sessionId],
+    });
+    const tasks = result.rows.map(row => rowToPlanTask(row as Record<string, unknown>));
+    return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
   }
 
   async resolveOperationAdmissionEvidence({
@@ -4359,6 +4640,36 @@ export class HarnessLibSQL extends HarnessStorage {
     return this.#workspaceActionsReady;
   }
 
+  async #ensurePlanTasksTable(): Promise<void> {
+    if (this.#planTasksReady !== undefined) {
+      return this.#planTasksReady;
+    }
+    this.#planTasksReady = (async () => {
+      const planTasksConfig = TABLE_CONFIGS[TABLE_HARNESS_PLAN_TASKS];
+      await this.#db.createTable({
+        tableName: TABLE_HARNESS_PLAN_TASKS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+        compositePrimaryKey: planTasksConfig?.compositePrimaryKey,
+      });
+      await this.#client.execute({
+        // §5.1k: ordered listing + recursive subtree walk by parent_task_id.
+        sql: `CREATE INDEX IF NOT EXISTS idx_harness_plan_tasks_order
+              ON "${TABLE_HARNESS_PLAN_TASKS}" ("harness_name", "session_id", "parent_task_id", "order")`,
+        args: [],
+      });
+      await this.#client.execute({
+        // createPlanTask idempotency lookup.
+        sql: `CREATE INDEX IF NOT EXISTS idx_harness_plan_tasks_idempotency
+              ON "${TABLE_HARNESS_PLAN_TASKS}" ("harness_name", "session_id", "idempotency_key")`,
+        args: [],
+      });
+    })().catch(error => {
+      this.#planTasksReady = undefined;
+      throw error;
+    });
+    return this.#planTasksReady;
+  }
+
   async #ensureThreadDeleteFencesTable(): Promise<void> {
     const threadDeleteFencesConfig = TABLE_CONFIGS[TABLE_HARNESS_THREAD_DELETE_FENCES];
     await this.#db.createTable({
@@ -5711,6 +6022,100 @@ function parseJson(value: unknown): any {
     }
   }
   return value;
+}
+
+// ---------------------------------------------------------------------------
+// Plan-task helpers (§5.1k)
+// ---------------------------------------------------------------------------
+
+function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
+  const task: HarnessPlanTask = {
+    taskId: String(row.task_id),
+    harnessName: String(row.harness_name),
+    sessionId: String(row.session_id),
+    resourceId: String(row.resource_id),
+    threadId: String(row.thread_id),
+    order: Number(row.order),
+    status: String(row.status) as HarnessPlanTask['status'],
+    statusSource: String(row.status_source) as HarnessPlanTask['statusSource'],
+    content: String(row.content),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    version: Number(row.version),
+  };
+  if (row.idempotency_key != null) task.idempotencyKey = String(row.idempotency_key);
+  if (row.parent_task_id != null) task.parentTaskId = String(row.parent_task_id);
+  if (row.active_form != null) task.activeForm = String(row.active_form);
+  if (row.priority != null) task.priority = Number(row.priority);
+  if (row.blocked_by != null) task.blockedBy = (parseJson(row.blocked_by) ?? []) as string[];
+  if (row.origin != null) task.origin = String(row.origin);
+  if (row.delegated_subagent_session_id != null) {
+    task.delegatedSubagentSessionId = String(row.delegated_subagent_session_id);
+  }
+  if (row.metadata != null) task.metadata = parseJson(row.metadata) as JsonValue;
+  if (row.completed_at != null) task.completedAt = Number(row.completed_at);
+  return task;
+}
+
+function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values: (string | number | null)[] } {
+  const names = [
+    'harness_name',
+    'session_id',
+    'task_id',
+    'idempotency_key',
+    'resource_id',
+    'thread_id',
+    'parent_task_id',
+    '"order"',
+    'status',
+    'status_source',
+    'content',
+    'active_form',
+    'priority',
+    'blocked_by',
+    'origin',
+    'delegated_subagent_session_id',
+    'metadata',
+    'created_at',
+    'updated_at',
+    'completed_at',
+    'version',
+  ];
+  const values: (string | number | null)[] = [
+    task.harnessName,
+    task.sessionId,
+    task.taskId,
+    task.idempotencyKey ?? null,
+    task.resourceId,
+    task.threadId,
+    task.parentTaskId ?? null,
+    task.order,
+    task.status,
+    task.statusSource,
+    task.content,
+    task.activeForm ?? null,
+    task.priority ?? null,
+    task.blockedBy === undefined ? null : JSON.stringify(task.blockedBy),
+    task.origin ?? null,
+    task.delegatedSubagentSessionId ?? null,
+    task.metadata === undefined ? null : JSON.stringify(task.metadata),
+    task.createdAt,
+    task.updatedAt,
+    task.completedAt ?? null,
+    task.version,
+  ];
+  return { names, values };
+}
+
+function encodePlanTaskCursor(task: HarnessPlanTask): string {
+  return Buffer.from(JSON.stringify({ p: task.parentTaskId ?? '', o: task.order, t: task.taskId }), 'utf-8').toString(
+    'base64',
+  );
+}
+
+function decodePlanTaskCursor(cursor: string): { parent: string; order: number; taskId: string } {
+  const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8')) as { p: string; o: number; t: string };
+  return { parent: parsed.p, order: parsed.o, taskId: parsed.t };
 }
 
 function rowToAttachmentSemantic(row: Record<string, unknown>): AttachmentSemanticMetadata {

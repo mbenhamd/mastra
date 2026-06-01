@@ -41,3 +41,14 @@ cascades terminally to all active descendants per §5.5.
 
 Subagent depth is computed from the persisted `parentSessionId` chain per §2.4;
 §8 owns cap enforcement, including the restart-stable overflow behavior.
+
+`HarnessPlanTask` rows (§5.1k) are owned by the session that created them and are
+isolated by `(harnessName, sessionId)`: a parent and each subagent child own
+disjoint plan trees, and plan-task reads/writes never cross the session boundary.
+A child session keeps its own plan tree under its own `sessionId` even though it
+shares the parent's lease for *write ownership* — plan-task mutators are fenced on
+**the owning session's** lease/version, and because a child shares the parent's
+`ownerId`, the same live owner serializes both trees' writes. The reserved
+`delegatedSubagentSessionId` field (TM-6) will later link a parent plan node to a
+delegated child session, but in TM-2 it is never written and plan-task isolation
+stays strictly per-session.

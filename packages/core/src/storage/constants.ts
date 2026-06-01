@@ -61,6 +61,7 @@ export const TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS = 'mastra_harness_channel_act
 export const TABLE_HARNESS_CHANNEL_OUTBOX = 'mastra_harness_channel_outbox';
 export const TABLE_HARNESS_WAKEUPS = 'mastra_harness_wakeups';
 export const TABLE_HARNESS_WORKSPACE_ACTIONS = 'mastra_harness_workspace_actions';
+export const TABLE_HARNESS_PLAN_TASKS = 'mastra_harness_plan_tasks';
 
 /** Union of all core table name constants. */
 export type TABLE_NAMES =
@@ -111,7 +112,8 @@ export type TABLE_NAMES =
   | typeof TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS
   | typeof TABLE_HARNESS_CHANNEL_OUTBOX
   | typeof TABLE_HARNESS_WAKEUPS
-  | typeof TABLE_HARNESS_WORKSPACE_ACTIONS;
+  | typeof TABLE_HARNESS_WORKSPACE_ACTIONS
+  | typeof TABLE_HARNESS_PLAN_TASKS;
 
 export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
@@ -1022,6 +1024,35 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     result: { type: 'jsonb', nullable: true },
     created_at: { type: 'bigint', nullable: false },
   },
+  // Harness plan tasks (HARNESS_V1_SPEC.md §5.1k). The durable, arbitrary-depth,
+  // model-authored agent task/todo TREE — adjacency list via parent_task_id,
+  // sibling ordering via "order". Distinct from the runtime work-unit
+  // HarnessTask. `blocked_by` / `metadata` are JSON; cycle-checking + rollup
+  // that consume blocked_by are DEFERRED to TM-4. `delegated_subagent_session_id`
+  // is RESERVED for TM-6.
+  [TABLE_HARNESS_PLAN_TASKS]: {
+    harness_name: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    task_id: { type: 'text', nullable: false },
+    idempotency_key: { type: 'text', nullable: true },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    parent_task_id: { type: 'text', nullable: true },
+    order: { type: 'integer', nullable: false },
+    status: { type: 'text', nullable: false },
+    status_source: { type: 'text', nullable: false },
+    content: { type: 'text', nullable: false },
+    active_form: { type: 'text', nullable: true },
+    priority: { type: 'integer', nullable: true },
+    blocked_by: { type: 'jsonb', nullable: true },
+    origin: { type: 'text', nullable: true },
+    delegated_subagent_session_id: { type: 'text', nullable: true },
+    metadata: { type: 'jsonb', nullable: true },
+    created_at: { type: 'bigint', nullable: false },
+    updated_at: { type: 'bigint', nullable: false },
+    completed_at: { type: 'bigint', nullable: true },
+    version: { type: 'integer', nullable: false },
+  },
 };
 
 /**
@@ -1080,6 +1111,10 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
   [TABLE_HARNESS_WORKSPACE_ACTIONS]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_WORKSPACE_ACTIONS],
     compositePrimaryKey: ['harness_name', 'session_id', 'id'],
+  },
+  [TABLE_HARNESS_PLAN_TASKS]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+    compositePrimaryKey: ['harness_name', 'session_id', 'task_id'],
   },
 };
 

@@ -1850,3 +1850,24 @@ policy/map cannot be reconstructed; subagents inheriting the parent workspace
 inherit its policy, while fresh subagent workspaces use their configured policy;
 configuring `'restricted'` against a sandbox/provider path that cannot interpose
 on both foreground and background starts is a construction-time config error.
+
+**Plan-task storage (HarnessPlanTask)**
+
+Plan-task storage is tests-first across all three adapters (in-memory, PG,
+LibSQL — §5.1k). Each adapter proves: `createPlanTask` inserts a session-owned
+root or child node and `listPlanTasks` returns them paginated and ordered by
+`(parentTaskId, order)`; `updatePlanTask` advances the per-row `version` under
+the session-owner fence and rejects a stale per-row `version`; the
+session-owner fence rejects a wrong `ownerId` (lease conflict) and a stale
+`ifSessionVersion` (version conflict) for create/update/delete/multi-row ops;
+`deletePlanTaskSubtree` removes a node and every descendant (BFS / recursive
+CTE), not reparent-to-root, and defensively terminates on a `parentTaskId`
+cycle; `mutatePlanTasksForSession` applies multi-row ops all-or-nothing under
+one boundary; `loadPlanTaskSubtree({ rootTaskId?, depth?, status? })` returns a
+bounded next-N subtree; and the session delete cascade (§5.2g) removes every
+plan-task row owned by the deleted session. Adapter tests use a dedicated
+`harnessName` and clean up their own rows (no global truncate), matching the
+existing harness-domain good-citizen pattern. Status rollup, `blockedBy`
+cycle-prevention, the plan tool surface (§6.4), and the `plan_task_*` custom
+event (§10.3) are DEFERRED to TM-3 / TM-4 / TM-5 and are out of scope for the
+TM-2 storage tests.

@@ -18,6 +18,17 @@ import type {
   HarnessProviderCallbackBinding,
   ChannelInboxInitialClaim,
   ChannelInboxItem,
+  CreatePlanTaskInput,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  MutatePlanTasksForSessionInput,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   CreateOrLoadChannelActionReceiptResult,
   CreateOrLoadChannelActionTokenResult,
   CreateOrLoadChannelInboxItemResult,
@@ -198,6 +209,40 @@ export class HarnessStorageSessionNotFoundError extends HarnessStorageDomainErro
   }
 }
 
+/**
+ * Thrown by `updatePlanTask` / `mutatePlanTasksForSession` when a plan-task row
+ * targeted by `taskId` does not exist for the owning session (§5.1k).
+ */
+export class HarnessStoragePlanTaskNotFoundError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskNotFoundError';
+  readonly code = 'harness.storage.plan_task_not_found' as const;
+  constructor(
+    public readonly sessionId: string,
+    public readonly taskId: string,
+  ) {
+    super(`Plan task "${taskId}" not found for session "${sessionId}"`);
+  }
+}
+
+/**
+ * Thrown by a plan-task field write when the supplied per-row `ifVersion` does
+ * not match the row's current `version`. This is the field-write OCC token that
+ * runs INSIDE the session-owner fence (§5.8); a session-level conflict surfaces
+ * as `HarnessStorageVersionConflictError` and a wrong/expired owner as
+ * `HarnessStorageLeaseConflictError`.
+ */
+export class HarnessStoragePlanTaskVersionConflictError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskVersionConflictError';
+  readonly code = 'harness.storage.plan_task_version_conflict' as const;
+  constructor(
+    public readonly taskId: string,
+    public readonly expectedVersion: number,
+    public readonly actualVersion: number,
+  ) {
+    super(`Plan task "${taskId}" version conflict: expected ${expectedVersion}, found ${actualVersion}`);
+  }
+}
+
 export class HarnessStorageParentSessionUnavailableError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageParentSessionUnavailableError';
   readonly code = 'harness.storage.parent_session_unavailable' as const;
@@ -268,6 +313,14 @@ export class HarnessStorageWorkspaceActionJournalUnsupportedError extends Harnes
   readonly code = 'harness.storage.workspace_action_journal_unsupported' as const;
   constructor() {
     super('HarnessStorage workspace action journal must be implemented by this storage adapter');
+  }
+}
+
+export class HarnessStoragePlanTaskUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskUnsupportedError';
+  readonly code = 'harness.storage.plan_task_unsupported' as const;
+  constructor() {
+    super('HarnessStorage plan tasks must be implemented by this storage adapter');
   }
 }
 
@@ -1200,6 +1253,80 @@ export abstract class HarnessStorage extends StorageDomain {
   }): Promise<{ claimExpiresAt: number; storageNow: number }>;
 
   abstract updateHarnessWakeupItem(record: HarnessWakeupItem, opts: { claimId: string }): Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Plan tasks (HARNESS_V1_SPEC.md §5.1k / §4.8f)
+  //
+  // The durable, arbitrary-depth, model-authored agent task/todo TREE — distinct
+  // from the runtime work-unit `HarnessTask`. All mutators are session-owner
+  // fenced on `{ harnessName, sessionId, ownerId, ifSessionVersion }`: the
+  // adapter verifies the owning `SessionRecord` still has `ownerId` holding an
+  // unexpired lease (else `HarnessStorageLeaseConflictError`) and a `version`
+  // matching `ifSessionVersion` (else `HarnessStorageVersionConflictError`)
+  // before any row changes. Status ROLLUP, `blockedBy` cycle-prevention, the
+  // plan tool (§6.4), and the `plan_task_*` event (§10.3) are DEFERRED to
+  // TM-3 / TM-4 / TM-5; this layer persists `blockedBy` as data only.
+  //
+  // Concrete throw-by-default so adapters that do not yet support plan tasks
+  // inherit a clean unsupported error; the in-memory / PG / LibSQL adapters
+  // override with real implementations.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Insert one plan-task node under the session-owner fence. When the node's
+   * `idempotencyKey` matches an existing task in the same session, the existing
+   * row is returned unchanged (idempotent retry). Returns the stored row.
+   */
+  async createPlanTask(_opts: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Partial field write of a plan task by `taskId`, guarded by per-row OCC
+   * (`ifVersion`) inside the session-owner fence. Throws
+   * `HarnessStoragePlanTaskNotFoundError` when the row is missing and
+   * `HarnessStoragePlanTaskVersionConflictError` on per-row version mismatch.
+   */
+  async updatePlanTask(_opts: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Cascade-delete a task and ALL its descendants (walked by `parentTaskId` via
+   * a recursive CTE / BFS) under the session-owner fence — never reparent to
+   * root. The walk defensively guards cycles (visited set / `UNION`). No-op
+   * (deletedCount 0) when the root task does not exist.
+   */
+  async deletePlanTaskSubtree(_opts: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Transaction-shaped multi-row mutation (create/update/deleteSubtree ops) for
+   * decompose/reparent (TM-3 / TM-4). All ops apply under one adapter boundary
+   * or none do. Fenced on the session owner.
+   */
+  async mutatePlanTasksForSession(_opts: MutatePlanTasksForSessionInput): Promise<void> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * List plan tasks for a session (harnessName+sessionId scoped), paginated by
+   * `limit`/`cursor` and ordered by `(parentTaskId, order)`. Read-only — does
+   * not require the lease.
+   */
+  async listPlanTasks(_opts: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Focused bounded read: the next-N nodes of the subtree under `rootTaskId`
+   * (or session roots when omitted), bounded by `depth` and optionally filtered
+   * by `status`. The anti-forgetting "re-orient" read. Read-only.
+   */
+  async loadPlanTaskSubtree(_opts: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
 
   // -------------------------------------------------------------------------
   // Test-only

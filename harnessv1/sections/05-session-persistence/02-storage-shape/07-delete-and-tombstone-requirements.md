@@ -21,8 +21,10 @@ session-local queue and inbox-response receipts, `OperationAdmissionTombstone`
 rows, `ChannelBinding`, `ChannelInboxItem`, `ChannelActionReceipt`,
 `ChannelActionToken`, `ChannelOutboxItem` rows referencing the deleted `sessionId` or
 `owningSessionId`, `HarnessWakeupItem` rows with the deleted `sessionId` or an
-equivalent owning-session field, attachment metadata/bytes for the subtree, and
-reconstructable per-session workspace state. Durable adapters therefore need
+equivalent owning-session field, `HarnessPlanTask` rows (§5.1k) owned by the
+deleted `sessionId` — the whole plan tree for that session, walked by
+`parentTaskId` so no orphan node survives — attachment metadata/bytes for the
+subtree, and reconstructable per-session workspace state. Durable adapters therefore need
 indexes or internal bulk helpers by `sessionId` and `owningSessionId`; row-by-row
 updates are acceptable only when the delete fence prevents new work and stale
 claims from continuing. The cleanup must assert every dependent row's
