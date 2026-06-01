@@ -18,15 +18,16 @@
  * exactly the cross-process recovery path.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__';
+import { sha256CanonicalJson } from './canonical-json';
 import { Harness } from './harness';
-import type { Session } from './session';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
+import type { Session } from './session';
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -115,6 +116,112 @@ describe('task_delegate registration', () => {
     });
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     expect(createPlanTaskTools(parent)[TASK_DELEGATE_TOOL_ID]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// includeSubtree — faithful (lossless) subset transfer to the subagent
+// ---------------------------------------------------------------------------
+
+/** Extract the text the child agent received on its first stream call. */
+function childTaskText(childAgent: MockAgent): string {
+  const call = childAgent.streamCalls[0];
+  return JSON.stringify(call?.messages ?? '');
+}
+
+describe('task_delegate — includeSubtree faithful transfer', () => {
+  it('preserves taskId, status, order, blockedBy, and TRUE depth (multi-level)', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Hold the child so we can inspect the body it received before it settles.
+    let releaseChild!: () => void;
+    childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+
+    // root → childA (with grandchild) + childB; give them distinct statuses/order.
+    const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root task' } as any, toolCtx)) as any;
+    const childA = (await tools[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'child A', parentTaskId: root.taskId } as any,
+      toolCtx,
+    )) as any;
+    const childB = (await tools[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'child B', parentTaskId: root.taskId } as any,
+      toolCtx,
+    )) as any;
+    const grandchild = (await tools[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'grandchild', parentTaskId: childA.taskId } as any,
+      toolCtx,
+    )) as any;
+    // Mark childB completed and add a blockedBy edge so we can assert they survive.
+    await parent._internalStorage.mutatePlanTasksForSession({
+      fence: {
+        sessionId: parent.id,
+        ownerId: (parent as any)._internalOwnerId,
+        ifSessionVersion: (parent as any)._internalRecordVersion,
+      },
+      ops: [
+        {
+          kind: 'update',
+          taskId: childB.taskId,
+          ifVersion: (await planRow(parent, childB.taskId))!.version,
+          patch: { status: 'completed', statusSource: 'explicit', blockedBy: [childA.taskId] },
+        },
+      ],
+    });
+
+    await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: root.taskId, agentType: 'worker', task: 'do the root', includeSubtree: true } as any,
+      toolCtx,
+    );
+    await poll(() => childAgent.streamCalls.length > 0);
+    const body = childTaskText(childAgent);
+
+    // Every node id is present (lossless), not just the flat content list.
+    expect(body).toContain(`id=${root.taskId}`);
+    expect(body).toContain(`id=${childA.taskId}`);
+    expect(body).toContain(`id=${childB.taskId}`);
+    expect(body).toContain(`id=${grandchild.taskId}`);
+    // Status + blockedBy survive.
+    expect(body).toContain('status=completed');
+    expect(body).toContain(`blockedBy=${childA.taskId}`);
+    // TRUE depth: the grandchild is rendered two levels in (4 leading spaces),
+    // not flattened to one level like the old indent.
+    const lines = JSON.parse(body) as unknown;
+    const text = typeof lines === 'string' ? lines : JSON.stringify(lines);
+    const grandLine = text.split('\\n').find(l => l.includes(`id=${grandchild.taskId}`)) ?? '';
+    expect(grandLine).toMatch(/^.*\s{4}- \[/); // depth-2 indent (2 spaces per level)
+
+    releaseChild();
+    close();
+    await poll(async () => (await planRow(parent, root.taskId))?.status === 'completed');
+  });
+
+  it('signals truncation when the subtree is clipped at the node cap', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    let releaseChild!: () => void;
+    childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+
+    const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root' } as any, toolCtx)) as any;
+    // Add > the 100-node cap so the storage read reports truncated.
+    for (let i = 0; i < 110; i++) {
+      await tools[TASK_ADD_TOOL_ID]!.execute!({ content: `c${i}`, parentTaskId: root.taskId } as any, toolCtx);
+    }
+    await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: root.taskId, agentType: 'worker', includeSubtree: true } as any,
+      toolCtx,
+    );
+    await poll(() => childAgent.streamCalls.length > 0);
+    expect(childTaskText(childAgent)).toContain('TRUNCATED');
+
+    releaseChild();
+    close();
+    await poll(async () => (await planRow(parent, root.taskId))?.status === 'completed');
   });
 });
 
@@ -284,12 +391,21 @@ describe('task_delegate — recovery on rehydrate', () => {
     await b.harness.shutdown();
   });
 
-  it('a still-live delegated subagent re-attaches the completion hook on rehydrate', async () => {
+  // CRASH-FAITHFUL: the original detached drive promise is LOST before rollup
+  // (lease stolen at the DB level, no graceful drain). The child run was mid-flight
+  // when the process died, so there is NO live run to observe and NO terminal
+  // evidence — reconcile must FAIL-CLOSE the delegation rather than silently start
+  // a brand-new SECOND run. (A graceful re-run is not possible: a plain message
+  // turn has no run-resumption primitive, so the safe recovery is `failed`, which
+  // the parent agent can re-delegate.) Critically it does NOT send a second
+  // child.message: the deterministic delegation admissionId makes the re-issue a
+  // duplicate that observes the orphaned reservation instead of enqueuing a run.
+  it('a crash-orphaned in-flight delegation fails closed on rehydrate (no second run)', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db);
     const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    // Hold the child so it stays live across the "crash".
+    // Hold the child so it is genuinely mid-run at the moment of the crash.
     let releaseChild!: () => void;
     a.childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
 
@@ -304,36 +420,220 @@ describe('task_delegate — recovery on rehydrate', () => {
     close();
 
     // Crash A WITHOUT graceful drain: steal every A-owned lease at the DB level so
-    // A's live sessions are abandoned (its detached delegation driver is orphaned)
-    // and the rows stay ACTIVE (not closed) for B to recover. A graceful
-    // `shutdown()` cannot drain here because the delegated child turn is held open.
+    // A's live sessions (and its detached delegation driver) are abandoned and the
+    // rows stay ACTIVE (not closed) for B to recover.
     for (const [key, row] of db.harnessSessions) {
       if (row.ownerId === (parentA as any)._internalOwnerId) {
         db.harnessSessions.set(key, { ...row, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
       }
     }
 
-    // Fresh instance hydrates the parent → reconcile re-attaches the live hook.
+    // Fresh instance. Stage a child run that, IF the buggy path re-messaged, would
+    // complete to `completed` — so a `failed` result PROVES no second run was sent.
     const b = buildHarness(db);
-    // Hand B's child agent a run that completes when released.
     let releaseChildB!: () => void;
     b.childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChildB = r)), finishReason: 'stop' });
     const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
 
-    // The task is still in_progress (hook re-armed, subagent not yet terminal).
-    await new Promise(r => setTimeout(r, 30));
-    const beforeRows = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
-    expect(beforeRows.tasks.find(t => t.taskId === task.taskId)?.status).toBe('in_progress');
+    // Reconcile fail-closes the orphaned delegation (no live run, no terminal
+    // evidence) — the task rolls up `failed`, NOT `completed`.
+    await poll(async () => {
+      const page = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
+      return page.tasks.find(t => t.taskId === task.taskId)?.status === 'failed';
+    });
+    // B's staged child run was never consumed — no second run was enqueued.
+    expect(b.childAgent.streamCalls.length).toBe(0);
+    void releaseChild;
+    void releaseChildB;
+    void childId;
+    await b.harness.shutdown();
+  });
 
-    // The re-attached hook drives B's child turn; releasing it terminalizes the
-    // subagent and rolls the plan task up.
-    releaseChildB();
-    void releaseChild; // A's held run is abandoned with the dead instance.
+  // CRASH-FAITHFUL: the child run already COMPLETED (durable terminal evidence
+  // written by the delegation admissionId) before the crash, but the rollup hook
+  // was lost. Reconcile reads the durable `completed` evidence and rolls up
+  // `completed` — without re-acquiring or re-messaging the child.
+  it('a child that COMPLETED before the crash recovers as completed from durable evidence', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const close = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'delegated' } as any, toolCtx)) as any;
+    const res = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = res.subagentSessionId;
+
+    // The child completes (default run); its durable `completed` evidence is now
+    // persisted. Simulate the hook being lost by forcing the plan task BACK to
+    // in_progress, then crash A by stealing the lease (rows stay ACTIVE).
+    await poll(async () => (await planRow(parentA, task.taskId))?.status === 'completed');
+    const row = await planRow(parentA, task.taskId);
+    await parentA._internalStorage.mutatePlanTasksForSession({
+      fence: {
+        sessionId: parentA.id,
+        ownerId: (parentA as any)._internalOwnerId,
+        ifSessionVersion: (parentA as any)._internalRecordVersion,
+      },
+      ops: [
+        {
+          kind: 'update',
+          taskId: task.taskId,
+          ifVersion: row!.version,
+          patch: { status: 'in_progress', statusSource: 'explicit' },
+        },
+      ],
+    });
+    close();
+    for (const [key, r] of db.harnessSessions) {
+      if (r.ownerId === (parentA as any)._internalOwnerId) {
+        db.harnessSessions.set(key, { ...r, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+
+    const b = buildHarness(db);
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
     await poll(async () => {
       const page = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
       return page.tasks.find(t => t.taskId === task.taskId)?.status === 'completed';
     });
     void childId;
+    await b.harness.shutdown();
+  });
+
+  // CRASH-FAITHFUL: a CANCELLED delegated child recovers as `failed` even when its
+  // held run raced to a `complete`/`completed` durable evidence row — the
+  // `cancelRequest` marker overrides the evidence, mirroring the live driver. (The
+  // OLD recovery did handle cancel via the close marker, but only because it never
+  // consulted the durable evidence; the cancel override must survive now that
+  // evidence is authoritative.)
+  it('a CANCELLED child recovers as failed despite a raced completed evidence row', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Hold the child so we can cancel it → its delegated run records `failed`.
+    let releaseChild!: () => void;
+    a.childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+
+    const close = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'delegated' } as any, toolCtx)) as any;
+    const res = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = res.subagentSessionId;
+
+    const sub = await a.harness.session({ sessionId: childId, resourceId: 'u1' });
+    await sub.cancel({ reason: 'test cancel' });
+    releaseChild();
+    // Let the delegated turn settle to a durable `failed` evidence row.
+    await poll(async () => (await planRow(parentA, task.taskId))?.status === 'failed');
+    // Force the plan task BACK to in_progress so the rehydrate scan has work, and
+    // re-link it (cancel rolled it up + cleared the link path) so reconcile runs.
+    const row = await planRow(parentA, task.taskId);
+    await parentA._internalStorage.mutatePlanTasksForSession({
+      fence: {
+        sessionId: parentA.id,
+        ownerId: (parentA as any)._internalOwnerId,
+        ifSessionVersion: (parentA as any)._internalRecordVersion,
+      },
+      ops: [
+        {
+          kind: 'update',
+          taskId: task.taskId,
+          ifVersion: row!.version,
+          patch: { status: 'in_progress', statusSource: 'explicit', delegatedSubagentSessionId: childId },
+        },
+      ],
+    });
+    close();
+    await a.harness.shutdown();
+
+    // Fresh instance: the durable `failed` evidence (NOT a close-without-cancel
+    // guess) makes the recovery `failed`.
+    const b = buildHarness(db);
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await poll(async () => {
+      const page = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
+      return page.tasks.find(t => t.taskId === task.taskId)?.status === 'failed';
+    });
+    await b.harness.shutdown();
+  });
+
+  // CRASH-FAITHFUL #2 (lossy-recovery fix): a delegated run that FAILED durably
+  // (a rejecting agent error writes a `failed` message-result evidence row, keyed
+  // by the deterministic delegation admissionId) must recover as `failed`. The
+  // OLD recovery mapped any close-without-cancel child to `completed`, so this
+  // FAILED delegation would have masqueraded as completed. We seed the `failed`
+  // evidence row directly (the realistic rejecting-error path; MockAgent's
+  // resolve-with-error-finishReason is a mock artifact that the evidence primitive
+  // does not durably distinguish — see the reconcile doc + report) and assert the
+  // durable-evidence read wins over the close marker.
+  it('a child with durable FAILED evidence recovers as failed (not completed) on rehydrate', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const close = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+
+    // Hold the child so the delegation stays in_progress while we seed evidence.
+    let releaseChild!: () => void;
+    a.childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'delegated' } as any, toolCtx)) as any;
+    const res = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = res.subagentSessionId;
+
+    // Seed the child's durable `failed` message-result evidence under the SAME
+    // deterministic signalId the delegation admissionId derives (mirrors a real
+    // rejecting-error run). The child stays ACTIVE (not closed, not cancelled), so
+    // the close marker can't supply the outcome — only the durable evidence can.
+    const childRec = (await parentA._internalStorage.loadSession({ harnessName: 'default', sessionId: childId }))!;
+    const admissionId = `harness-delegate:${parentA.id}:${task.taskId}`;
+    const digest = sha256CanonicalJson({
+      kind: 'message-admission',
+      harnessName: childRec.harnessName,
+      sessionId: childRec.id,
+      resourceId: childRec.resourceId,
+      threadId: childRec.threadId,
+      admissionId,
+    });
+    const signalId = `harness-message-${digest.slice(0, 32)}`;
+    await parentA._internalStorage.writeMessageResultEvidence({
+      status: 'failed',
+      signalId,
+      runId: `${signalId}-run`,
+      harnessName: childRec.harnessName,
+      sessionId: childRec.id,
+      resourceId: childRec.resourceId,
+      threadId: childRec.threadId,
+      error: { name: 'HarnessExecutionError', message: 'delegated run failed' } as any,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    } as any);
+
+    // Crash A (steal leases) so B's reconcile reads the durable evidence.
+    close();
+    for (const [key, r] of db.harnessSessions) {
+      if (r.ownerId === (parentA as any)._internalOwnerId) {
+        db.harnessSessions.set(key, { ...r, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+    void releaseChild;
+
+    const b = buildHarness(db);
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await poll(async () => {
+      const page = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
+      return page.tasks.find(t => t.taskId === task.taskId)?.status === 'failed';
+    });
     await b.harness.shutdown();
   });
 });

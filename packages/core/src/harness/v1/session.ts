@@ -262,6 +262,11 @@ const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
+/** TM-6 reconcile-on-rehydrate bounded retry (transient/CAS/locked failures). */
+const DELEGATION_RECONCILE_MAX_RETRIES = 5;
+const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
+/** TM-6 `includeSubtree` transfer cap; a clipped subtree is flagged truncated. */
+const DELEGATED_SUBTREE_MAX_NODES = 100;
 const ACTION_CATALOG_DEFAULT_LIMIT = 100;
 const ACTION_CATALOG_MAX_LIMIT = 500;
 const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
@@ -983,6 +988,8 @@ export class Session {
   private readonly _activeTools = new Map<string, ActiveToolState>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /** TM-6 reconcile-on-rehydrate pending retry timers (cleared on close). */
+  private readonly _delegationReconcileRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   /**
    * §5.1k / TM-5 bounded plan-task summary for `getDisplayState()`. Kept in
    * memory and refreshed for FREE on every plan-task mutation (the mutator
@@ -11222,6 +11229,12 @@ export class Session {
     this._queueWakeAt = undefined;
   }
 
+  /** TM-6 — cancel any pending reconcile-on-rehydrate retry timers on teardown. */
+  private _clearDelegationReconcileTimers(): void {
+    for (const timer of this._delegationReconcileRetryTimers) clearTimeout(timer);
+    this._delegationReconcileRetryTimers.clear();
+  }
+
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
     if (this._queueResolvers.size === 0) {
       timer.unref?.();
@@ -11724,6 +11737,7 @@ export class Session {
    */
   _markClosed(updatedRecord: SessionRecord): void {
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
@@ -11752,6 +11766,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const [queuedItemId, resolver] of this._queueResolvers) {
@@ -11796,6 +11811,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const [queuedItemId, resolver] of this._queueResolvers) {
@@ -12033,21 +12049,37 @@ export class Session {
     if (!planRow) throw new HarnessValidationError('taskId', `unknown task "${input.taskId}"`);
     let taskBody = input.task ?? planRow.content;
     if (input.includeSubtree) {
-      // Surface the delegated subtree subset so the subagent sees the unit it owns.
+      // Surface the delegated subtree SUBSET so the subagent sees the unit it
+      // owns. This is a LOSSLESS transfer: every node keeps its stable taskId,
+      // parent edge, status, sibling order, and blockedBy ids, rendered by true
+      // depth (computed from the parent chain, not a flat one-level indent). A
+      // clipped subtree appends an explicit truncation marker so the subagent
+      // knows the unit it received is incomplete.
       const subtree = await this._storage.loadPlanTaskSubtree({
         harnessName: this._record.harnessName,
         sessionId: this.id,
         rootTaskId: input.taskId,
-        limit: 100,
+        limit: DELEGATED_SUBTREE_MAX_NODES,
       });
-      const lines = subtree.tasks.map(t => `${'  '.repeat(t.parentTaskId === undefined ? 0 : 1)}- ${t.content}`);
-      taskBody = `${taskBody}\n\nDelegated subtree:\n${lines.join('\n')}`;
+      taskBody = `${taskBody}\n\n${this._renderDelegatedSubtree(input.taskId, subtree.tasks, subtree.truncated)}`;
     }
 
     // Create the durable subagent SESSION (reuse the subagent-tool creation path:
     // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
     // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
     // tracked by the plan task across turns.
+    //
+    // ORPHAN WINDOW (bounded, accepted): a crash between this `session(...)` and
+    // the `planTaskDelegate` link write below leaves a subagent-tool child with
+    // `parentSessionId` set but NO plan task referencing it. This is identical to
+    // the `spawn_subagent` tool's create-then-use window and is reclaimed by the
+    // SAME §5.4/§5.6 lifecycle: the child ran no turn (no durable evidence, no
+    // work), holds only an unrenewable child lease, and is cascade-evicted as a
+    // descendant whose ancestry is not fully live (`lease_lost`, see
+    // `_renewLiveSessionLeaseSubtree` orphan handling) or closed when the parent
+    // terminalizes. The link write below is the durable point of no return; the
+    // child is best-effort closed on a rejected link so the only residual orphan
+    // is a crash precisely inside this window, which the lifecycle reclaims.
     const child = await this._harness.session({
       resourceId: this.resourceId,
       threadId: { fresh: true },
@@ -12089,24 +12121,97 @@ export class Session {
 
     // Arm the LIVE completion hook: drive the child's turn DETACHED (the parent
     // turn must not block), and roll the plan task up when the child settles. The
-    // durable `delegatedSubagentSessionId` link is what makes this recoverable —
-    // if this process dies before the hook fires, reconcile-on-rehydrate re-reads
-    // the child's terminal state and rolls up then.
+    // delegated `child.message` carries a DETERMINISTIC `admissionId` derived from
+    // the delegation link, so the run is durably idempotent: its terminal outcome
+    // (completed-with-result / failed-with-error) is persisted as message-result
+    // evidence on the child session, and a re-message with the same id observes
+    // the original run instead of enqueuing a second one. That durable evidence —
+    // plus the `delegatedSubagentSessionId` link — is what makes delegation
+    // recoverable: if this process dies before the hook fires,
+    // reconcile-on-rehydrate reads the child's terminal evidence and rolls up.
     void this._driveDelegatedSubagent(input.taskId, child, taskBody);
 
     return { ...view, subagentSessionId: child.id };
   }
 
   /**
+   * @internal — render a delegated subtree subset as a LOSSLESS structured block
+   * for the subagent. Each node keeps its stable `taskId`, parent edge, status,
+   * sibling order, and `blockedBy` ids, indented by its TRUE depth (computed from
+   * the in-subset parent chain). Nodes are ordered as a stable pre-order
+   * traversal (siblings by `order`, then `taskId`) so the same subtree always
+   * renders identically. A clipped subtree (the storage `truncated` flag, or a
+   * node whose parent fell outside the returned page) appends an explicit
+   * truncation marker so the subagent knows its unit is incomplete.
+   */
+  private _renderDelegatedSubtree(rootTaskId: string, tasks: HarnessPlanTask[], storageTruncated: boolean): string {
+    const byId = new Map(tasks.map(t => [t.taskId, t]));
+    const childrenOf = new Map<string | undefined, HarnessPlanTask[]>();
+    let parentDropped = false;
+    for (const t of tasks) {
+      // A node whose parent is not in the returned page (other than the root,
+      // whose parent is intentionally outside the subset) means the subtree was
+      // clipped above this node — flag it as truncated.
+      const parentKey =
+        t.taskId === rootTaskId
+          ? undefined
+          : t.parentTaskId !== undefined && byId.has(t.parentTaskId)
+            ? t.parentTaskId
+            : undefined;
+      if (t.taskId !== rootTaskId && (t.parentTaskId === undefined || !byId.has(t.parentTaskId))) {
+        parentDropped = true;
+      }
+      const bucket = childrenOf.get(parentKey);
+      if (bucket) bucket.push(t);
+      else childrenOf.set(parentKey, [t]);
+    }
+    for (const bucket of childrenOf.values()) {
+      bucket.sort((a, b) =>
+        a.order !== b.order ? a.order - b.order : a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0,
+      );
+    }
+    const lines: string[] = [];
+    const walk = (node: HarnessPlanTask, depth: number): void => {
+      const indent = '  '.repeat(depth);
+      const fields = [`id=${node.taskId}`, `status=${node.status}`, `order=${node.order}`];
+      if (node.blockedBy !== undefined && node.blockedBy.length > 0) {
+        fields.push(`blockedBy=${node.blockedBy.join(',')}`);
+      }
+      lines.push(`${indent}- [${fields.join(' ')}] ${node.content}`);
+      for (const child of childrenOf.get(node.taskId) ?? []) walk(child, depth + 1);
+    };
+    const root = byId.get(rootTaskId);
+    if (root) walk(root, 0);
+    let block = `Delegated subtree (lossless — taskId/status/order/blockedBy preserved):\n${lines.join('\n')}`;
+    if (storageTruncated || parentDropped) {
+      block += `\n(TRUNCATED: the subtree was clipped at ${DELEGATED_SUBTREE_MAX_NODES} nodes; some descendants are not shown.)`;
+    }
+    return block;
+  }
+
+  /**
+   * @internal — deterministic `admissionId` for a delegated subagent turn. Stable
+   * across restarts (keyed on the parent session + delegated task id) so the
+   * delegated `child.message` is durably idempotent: re-issuing it on rehydrate
+   * RE-ATTACHES to the original run (observes its terminal evidence) instead of
+   * enqueuing a fresh, duplicate run. Namespaced so it never collides with a
+   * caller-supplied admissionId.
+   */
+  private _delegationAdmissionId(taskId: string): string {
+    return `harness-delegate:${this.id}:${taskId}`;
+  }
+
+  /**
    * @internal — detached driver for a delegated subagent turn. On settle it
    * reconciles the plan task and closes the child (§5.6 auto-close). Never
    * rejects — a delegated subagent failure becomes a `failed` plan-task rollup,
-   * not an unhandled rejection on the parent.
+   * not an unhandled rejection on the parent. The `admissionId` makes the
+   * `child.message` durably idempotent (see `_delegationAdmissionId`).
    */
   private async _driveDelegatedSubagent(taskId: string, child: Session, taskBody: string): Promise<void> {
     let outcome: DelegatedSubagentOutcome;
     try {
-      const result = await child.message({ content: taskBody });
+      const result = await child.message({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) });
       // A resolved turn can still be a FAILURE: the mock/real agent surfaces an
       // abort/cancel as `finishReason: 'aborted' | 'error'` rather than a
       // rejection, and a cancelled child session records `cancelRequest`. Treat
@@ -12118,6 +12223,8 @@ export class Session {
       outcome = failed ? 'failed' : 'completed';
     } catch {
       // Subagent error / abort / cancel that rejected → the delegated task FAILED.
+      // (Includes the rehydrate re-attach observing a `failed` durable evidence
+      // row, or a crash-orphaned `pending` reservation that fail-closes.)
       outcome = 'failed';
     } finally {
       this._activeSubagents.delete(`delegate:${child.id}`);
@@ -12155,17 +12262,82 @@ export class Session {
   }
 
   /**
+   * @internal — read the DURABLE terminal outcome of a delegated subagent turn
+   * from the child session's message-result evidence (the same evidence the
+   * deterministic delegation `admissionId` persists; see
+   * `_delegationAdmissionId`). The signal id is reconstructed from the child's
+   * own record fields exactly as `_messageAdmissionIdentity` derives it, so this
+   * works even after the child session has CLOSED (evidence outlives the live
+   * session). Returns the mapped plan-task outcome, or `undefined` when no
+   * terminal evidence exists yet (still `pending`, absent, or a tombstone).
+   *
+   * COUPLING NOTE: the message-result-evidence primitive records `completed`
+   * whenever a turn RESOLVES and `failed` only when it REJECTS. A run that
+   * resolves with `finishReason: 'error'` (rather than rejecting) therefore
+   * persists `completed` evidence; the live driver still maps that to a `failed`
+   * delegation in-process via `result.finishReason`, but that distinction is not
+   * durably recorded, so a crash in that narrow window recovers as `completed`.
+   * Real agent errors reject (durable `failed`), and cancellation is captured by
+   * the `cancelRequest` override in the reconcile scan, so the only un-faithful
+   * crash window is resolve-with-error-finishReason. Closing it faithfully needs a
+   * durable per-run terminal that carries `finishReason` — a primitive v1 does not
+   * expose — so it is reported rather than papered over with a fragile heuristic.
+   */
+  private async _loadDelegationOutcomeFromEvidence(
+    childRecord: SessionRecord,
+    taskId: string,
+  ): Promise<DelegatedSubagentOutcome | undefined> {
+    const admissionId = this._delegationAdmissionId(taskId);
+    const digest = sha256CanonicalJson({
+      kind: 'message-admission',
+      harnessName: childRecord.harnessName,
+      sessionId: childRecord.id,
+      resourceId: childRecord.resourceId,
+      threadId: childRecord.threadId,
+      admissionId,
+    });
+    const signalId = `harness-message-${digest.slice(0, 32)}`;
+    let evidence: AgentSignalResultStatus | OperationAdmissionTombstone | null;
+    try {
+      evidence = await this._storage.loadMessageResultEvidence({
+        harnessName: childRecord.harnessName,
+        sessionId: childRecord.id,
+        resourceId: childRecord.resourceId,
+        threadId: childRecord.threadId,
+        signalId,
+      });
+    } catch {
+      return undefined;
+    }
+    if (!evidence || !('status' in evidence)) return undefined;
+    if (evidence.status === 'completed') return 'completed';
+    if (evidence.status === 'failed') return 'failed';
+    return undefined; // 'pending' — no terminal outcome yet.
+  }
+
+  /**
    * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
    * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
    * non-terminal and reconcile each against the delegated subagent session's
-   * DURABLE state:
-   *   - subagent terminalized (closed) while we were down → roll the plan task up
-   *     (completed/failed) from its terminal outcome;
-   *   - subagent still live → re-arm the live completion hook;
-   *   - subagent session gone/deleted → fail closed (`failed`).
-   * Best-effort + fire-and-forget; runs once after hydration.
+   * DURABLE state. The authority is the child's durable message-result evidence
+   * (persisted by the deterministic delegation `admissionId`), not a guess from
+   * the session close marker:
+   *   - durable terminal evidence (completed/failed) → roll the plan task up from
+   *     it (a FAILED delegated run recovers as `failed`, not `completed`);
+   *   - subagent session GONE/deleted → fail closed (`failed`);
+   *   - subagent CLOSED with no terminal evidence → map from the close marker
+   *     (cancelled = failed; clean close = completed) as a conservative fallback;
+   *   - subagent still LIVE with no terminal evidence → RE-ATTACH by re-issuing
+   *     the delegated `child.message` with the SAME deterministic admissionId,
+   *     which OBSERVES the original run (admission dedup) rather than enqueuing a
+   *     second one. A crash-orphaned `pending` reservation whose run died with
+   *     the old process fail-closes after the durable-wait timeout.
+   *
+   * Resilient: a transient/CAS failure on a single task does not strand it — the
+   * scan re-arms a bounded retry so a stuck `in_progress` delegation is not left
+   * with no path forward while the parent stays live.
    */
-  async _reconcileDelegationsOnHydrate(): Promise<void> {
+  async _reconcileDelegationsOnHydrate(attempt = 0): Promise<void> {
     if (this._state !== 'live') return;
     let cursor: string | undefined;
     const delegated: HarnessPlanTask[] = [];
@@ -12186,15 +12358,22 @@ export class Session {
         cursor = page.cursor;
       }
     } catch {
-      return; // best-effort: a later mutation/snapshot can retry
+      // Best-effort: the listing itself failed transiently — re-arm a bounded
+      // retry so a delegated task is not stranded by a flaky read.
+      this._scheduleDelegationReconcileRetry(attempt);
+      return;
     }
 
+    let needsRetry = false;
     for (const task of delegated) {
       const childId = task.delegatedSubagentSessionId!;
       let childRecord: SessionRecord | null;
       try {
         childRecord = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
       } catch {
+        // Transient storage error reading the child — retry the whole scan later
+        // rather than silently leaving this task stuck `in_progress`.
+        needsRetry = true;
         continue;
       }
       // Subagent session GONE/deleted → fail closed.
@@ -12202,24 +12381,39 @@ export class Session {
         await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
         continue;
       }
-      // Subagent session CLOSED → it terminalized; map to an outcome. A clean
-      // close reflects a completed delegated turn; a cancelled session is a
-      // failure. (v1 does not yet persist a durable per-run terminal status, so
-      // closed-without-cancel is treated as completed — the conservative,
-      // recoverable read of "the subagent finished".)
-      if (childRecord.closedAt !== undefined) {
-        const outcome: DelegatedSubagentOutcome = childRecord.cancelRequest !== undefined ? 'failed' : 'completed';
-        await this._reconcileDelegatedTask(task.taskId, childId, outcome);
+      // A CANCELLED subagent is a FAILED delegation regardless of how the run
+      // finishReason landed — mirrors the live driver's `cancelRequest` override
+      // (a run can race to `complete` after a cancel, but the delegation was
+      // cancelled, so the plan task fails). Checked before the evidence so a
+      // `completed` evidence row from that race cannot mask the cancel.
+      if (childRecord.cancelRequest !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
         continue;
       }
-      // Subagent still active → re-attach the live completion hook so a later
-      // terminalization rolls the plan task up.
+      // DURABLE terminal evidence is the authority — a delegated run that ERRORED
+      // before closing recovers as `failed`, not `completed`.
+      const durable = await this._loadDelegationOutcomeFromEvidence(childRecord, task.taskId);
+      if (durable !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, durable);
+        continue;
+      }
+      // Subagent session CLOSED with no terminal evidence → fall back to the close
+      // marker (a clean close is the conservative "the subagent finished" read;
+      // the cancel case is already handled above).
+      if (childRecord.closedAt !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'completed');
+        continue;
+      }
+      // Subagent still active → RE-ATTACH by re-issuing the delegated message with
+      // the deterministic admissionId. The dedup path observes the original run
+      // (no second run); a crash-orphaned `pending` fail-closes via the driver.
       let child: Session | undefined;
       try {
         child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
       } catch {
-        // Could not re-acquire the child (locked elsewhere / transient) — leave
-        // the link in place; a later hydrate scan retries.
+        // Could not re-acquire the child (locked elsewhere / transient) — retry
+        // the scan later so the task is not stranded.
+        needsRetry = true;
         continue;
       }
       this._activeSubagents.set(`delegate:${child.id}`, {
@@ -12231,6 +12425,28 @@ export class Session {
       });
       void this._driveDelegatedSubagent(task.taskId, child, task.content);
     }
+    if (needsRetry) this._scheduleDelegationReconcileRetry(attempt);
+  }
+
+  /**
+   * @internal — bounded retry for reconcile-on-rehydrate. A transient/CAS/locked
+   * failure on a delegated task re-arms the scan with exponential backoff (capped
+   * attempts) so a stuck `in_progress` delegation is not permanently stranded
+   * while the parent session stays live. A terminal/permanent outcome (gone →
+   * failed, durable terminal evidence) already fails-closed in the scan and is
+   * not retried.
+   */
+  private _scheduleDelegationReconcileRetry(attempt: number): void {
+    if (attempt >= DELEGATION_RECONCILE_MAX_RETRIES) return;
+    const next = attempt + 1;
+    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
+    const timer = setTimeout(() => {
+      this._delegationReconcileRetryTimers.delete(timer);
+      if (this._state !== 'live') return;
+      void this._reconcileDelegationsOnHydrate(next);
+    }, backoffMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    this._delegationReconcileRetryTimers.add(timer);
   }
 
   /** @internal — accessor for the Harness when it needs the owner id back. */
