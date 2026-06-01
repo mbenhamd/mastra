@@ -856,7 +856,7 @@ export interface SessionInternals {
   eventReplaySeed?: { epoch: string; nextSequence: number };
   /**
    * §10.5: when false, transient streaming deltas (`text_delta`,
-   * `subagent_text_delta`) are NOT persisted to the durable session-event log
+   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`) are NOT persisted to the durable session-event log
    * (live subscribers still receive them). Defaults to true.
    */
   persistTransientStreamingEvents?: boolean;

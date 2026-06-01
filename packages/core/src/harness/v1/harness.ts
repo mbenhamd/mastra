@@ -766,7 +766,7 @@ export class Harness {
   private _channelInboxRecoveryRunning = false;
   private readonly _maxQueueDepth: number;
   private readonly _queueBackpressure: HarnessQueueBackpressurePolicy;
-  /** §10.5: when false, skip persisting transient streaming deltas (text_delta / subagent_text_delta). */
+  /** §10.5: when false, skip persisting transient streaming deltas (text_delta / reasoning_delta / subagent_text_delta / subagent_reasoning_delta). */
   private readonly _persistTransientStreamingEvents: boolean;
   private readonly _closeTimeoutMs: number;
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
