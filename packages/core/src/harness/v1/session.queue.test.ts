@@ -526,9 +526,9 @@ describe('Session.queue() — admission', () => {
     const types = events.map(e => (e as { type: string }).type);
     expect(types).not.toContain('queue_item_started');
     expect(types).not.toContain('queue_item_replayed');
-    const completed = events.find(
-      e => (e as { type: string }).type === 'queue_completed',
-    ) as { queuedItemId: string } | undefined;
+    const completed = events.find(e => (e as { type: string }).type === 'queue_completed') as
+      | { queuedItemId: string }
+      | undefined;
     expect(completed?.queuedItemId).toBe(admitted.queuedItemId);
     await session.close();
   });
@@ -696,6 +696,165 @@ describe('Session.queue() — admission', () => {
     expect(first.text).toBe('first reply');
     expect(duplicate.text).toBe('first reply');
     expect(agent.streamCalls).toHaveLength(1);
+    await session.close();
+  });
+
+  // Regression lock for a SUSPECTED queue-wedge bug:
+  //
+  //   "If a queued item's dispatch throws (agent.sendSignal throws, or the run
+  //    terminalizes error), _runQueuedTurn's catch (~10180) emits agent_end:error
+  //    and rethrows but never moves the receipt off 'admitting' — so the item is
+  //    stuck 'admitting' forever and the queue WEDGES (later items never drain)."
+  //
+  // Ground truth (per the real flow): _runQueuedTurn rethrows → _maybeDrainQueue's
+  // catch (session.ts ~9967) sees a non-pending error → calls _failQueuedTurn
+  // (session.ts ~9978/10901), which transitions the receipt to 'failed', removes
+  // the item from pendingQueue, emits queue_failed, rejects the queue() resolver,
+  // clears _currentQueuedItemId, and re-kicks _maybeDrainQueue so the next item
+  // drains. The claim is therefore REFUTED; this test locks that in.
+  it('settles a failed queued dispatch and drains the next item (queue does not wedge)', async () => {
+    const { harness, agent } = setupHarness();
+    // Item 2's run succeeds; item 1's dispatch is forced to throw below.
+    agent.enqueueRun({ finishReason: 'stop', text: 'second reply' });
+
+    // Make ONLY the first queued dispatch throw a raw error from sendSignal —
+    // the genuine path into _runQueuedTurn's catch for a queued turn. We key on
+    // call count (item 1 drains head-of-line before item 2) and let every other
+    // sendSignal fall through to the real Agent.sendSignal so item 2 runs.
+    const realSendSignal = agent.sendSignal.bind(agent);
+    let sendSignalCalls = 0;
+    const sendSignalCallsPerItem = new Map<string, number>();
+    (agent as any).sendSignal = (signal: any, options: any) => {
+      sendSignalCalls++;
+      // No attachments → `signal.contents` is the raw queued content string.
+      const contents = typeof signal?.contents === 'string' ? signal.contents : JSON.stringify(signal?.contents);
+      sendSignalCallsPerItem.set(contents, (sendSignalCallsPerItem.get(contents) ?? 0) + 1);
+      if (sendSignalCalls === 1) {
+        throw new Error('boom: dispatch failed');
+      }
+      return realSendSignal(signal, options);
+    };
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+
+    // Queue two items. FIFO: 'first' drains first (and fails), 'second' next.
+    const firstAdmission = await session.admitQueue({ content: 'first', admissionId: 'queue-fail-first' });
+    const secondAdmission = await session.admitQueue({ content: 'second', admissionId: 'queue-ok-second' });
+
+    const first = session.queue({ content: 'first', admissionId: 'queue-fail-first' });
+    const second = session.queue({ content: 'second', admissionId: 'queue-ok-second' });
+    void first.catch(() => {});
+
+    // (1) The first item is SETTLED as failed (its queue() promise rejects).
+    // The raw 'boom' is projected through projectHarnessPublicError, so the
+    // surfaced message is the sanitized public form — the point is it REJECTS
+    // (settles) rather than hanging forever on 'admitting'.
+    await expect(first).rejects.toThrow();
+
+    // (2) The queue is NOT WEDGED — the second item still drains and completes.
+    const secondResult = await second;
+    expect(secondResult.text).toBe('second reply');
+
+    // Let any re-kicked drain settle so we can assert terminal ground truth.
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    // (1, cont.) The failed item's receipt is terminal 'failed' and it is
+    // DEQUEUED (not stuck on 'admitting', not lingering in pendingQueue).
+    const failedReceipt = session.getRecord().queueAdmissionReceipts?.[firstAdmission.queuedItemId];
+    expect(failedReceipt?.status).toBe('failed');
+    expect(failedReceipt?.error).toMatchObject({ code: expect.any(String) });
+    const completedReceipt = session.getRecord().queueAdmissionReceipts?.[secondAdmission.queuedItemId];
+    expect(completedReceipt?.status).toBe('completed');
+    expect(session.getRecord().pendingQueue).toEqual([]);
+
+    // (1, cont.) A queue_failed OperationEvent was emitted for the failed item,
+    // and a queue_completed for the second — the closed-union settlement surface.
+    const queueFailed = events.find(
+      e => e.type === 'queue_failed' && (e as { queuedItemId?: string }).queuedItemId === firstAdmission.queuedItemId,
+    );
+    expect(queueFailed).toBeDefined();
+    const queueCompleted = events.find(
+      e =>
+        e.type === 'queue_completed' && (e as { queuedItemId?: string }).queuedItemId === secondAdmission.queuedItemId,
+    );
+    expect(queueCompleted).toBeDefined();
+    // Note: because the throw originates INSIDE sendSignal (before agent_start),
+    // _runQueuedTurn's `agentStarted && !agentEndEmitted` gate (session.ts ~10181)
+    // is not satisfied, so no agent_end:error is emitted for this failure — the
+    // run was never registered. queue_failed is the settlement surface here.
+
+    // (3) The failed item is NOT re-run forever — bounded invocations. Item 1's
+    // content saw exactly one dispatch attempt; total dispatch calls are bounded.
+    expect(sendSignalCallsPerItem.get('first') ?? 0).toBe(1);
+    expect(sendSignalCalls).toBeLessThanOrEqual(3);
+
+    await session.close();
+  });
+
+  // Companion to the above, exercising the OTHER throw site the reviewer named:
+  // a failure AFTER agent_start (the run terminalizes/the completion rejects),
+  // which DOES hit _runQueuedTurn's `agentStarted && !agentEndEmitted` gate
+  // (session.ts ~10181) → emits agent_end:error → rethrows → _maybeDrainQueue
+  // catch → _failQueuedTurn. Same ground truth: settle + dequeue + drain next.
+  it('settles a queued run that fails AFTER agent_start and still drains the next item', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'first reply' });
+    agent.enqueueRun({ finishReason: 'stop', text: 'second reply' });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // Make ONLY the first queued item's run-completion reject — after sendSignal
+    // succeeded and agent_start was emitted. This is the post-dispatch failure
+    // path. The real method is restored for the second item.
+    const realAwait = (session as any)._awaitQueuedRunCompletion.bind(session);
+    let awaitCalls = 0;
+    (session as any)._awaitQueuedRunCompletion = async (...args: unknown[]) => {
+      awaitCalls++;
+      if (awaitCalls === 1) {
+        throw new Error('boom: run terminalized error');
+      }
+      return realAwait(...args);
+    };
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+
+    const firstAdmission = await session.admitQueue({ content: 'first', admissionId: 'queue-postsignal-fail' });
+    const secondAdmission = await session.admitQueue({ content: 'second', admissionId: 'queue-postsignal-ok' });
+
+    const first = session.queue({ content: 'first', admissionId: 'queue-postsignal-fail' });
+    const second = session.queue({ content: 'second', admissionId: 'queue-postsignal-ok' });
+    void first.catch(() => {});
+
+    await expect(first).rejects.toThrow();
+    const secondResult = await second;
+    expect(secondResult.text).toBe('second reply');
+
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(session.getRecord().queueAdmissionReceipts?.[firstAdmission.queuedItemId]?.status).toBe('failed');
+    expect(session.getRecord().queueAdmissionReceipts?.[secondAdmission.queuedItemId]?.status).toBe('completed');
+    expect(session.getRecord().pendingQueue).toEqual([]);
+
+    // queue_failed settlement + the post-agent_start agent_end:error emit.
+    expect(
+      events.some(
+        e => e.type === 'queue_failed' && (e as { queuedItemId?: string }).queuedItemId === firstAdmission.queuedItemId,
+      ),
+    ).toBe(true);
+    expect(events.some(e => e.type === 'agent_end' && (e as { finishReason?: string }).finishReason === 'error')).toBe(
+      true,
+    );
+
+    // Bounded: the failing item's completion was awaited exactly once (no
+    // unbounded re-run), and the second still ran.
+    expect(awaitCalls).toBe(2);
+
     await session.close();
   });
 
