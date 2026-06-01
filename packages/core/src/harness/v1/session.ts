@@ -74,7 +74,12 @@ import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
-import { assertJsonValue, jsonValuesEqual, sha256CanonicalJsonChecked as sha256CanonicalJson } from './canonical-json';
+import {
+  assertJsonValue,
+  canonicalJson,
+  jsonValuesEqual,
+  sha256CanonicalJsonChecked as sha256CanonicalJson,
+} from './canonical-json';
 // §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
 // and the tool-visible context.
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
@@ -3382,7 +3387,11 @@ export class Session {
   }
 
   private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor, workspaceId: string): string {
-    return [server.key, this._record.modeId, this._record.modelId ?? '', workspaceId].join('\0');
+    // canonicalJson is NUL-/sentinel-safe: every byte (incl. the historical '\0'
+    // separator) is JSON-escaped, so distinct (serverKey, modeId, modelId,
+    // workspaceId) tuples — any of which can carry arbitrary strings — never
+    // collide the way a single-char `join` could.
+    return canonicalJson([server.key, this._record.modeId, this._record.modelId ?? null, workspaceId]);
   }
 
   private _currentMcpActionCatalogWorkspaceId(): string {

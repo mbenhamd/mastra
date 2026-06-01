@@ -346,6 +346,40 @@ describe('workspace restore planner', () => {
     expect(firstStep(freshPlan).snapshot).toEqual({ text: 'old' });
     expect(firstStep(freshPlan).path?.relativePath).toBe('notes.md');
   });
+
+  it('keeps NUL-embedding affected paths distinct (composite-key collision-safety)', () => {
+    // Two journal paths whose (rootId, path, relativePath) tuples are DISTINCT but
+    // collide under the historical `${rootId}\0${path}\0${relativePath}` join: both
+    // serialize to the byte sequence `a\0b\0c\0d`. canonicalJson JSON-escapes the
+    // embedded NUL, so each path keeps its own affected-path entry instead of one
+    // silently absorbing the other.
+    const leftPath: WorkspaceActionJournalPath = {
+      rootId: 'a b',
+      rootPath: '/workspace/a',
+      path: 'c',
+      relativePath: 'd',
+    };
+    const rightPath: WorkspaceActionJournalPath = {
+      rootId: 'a',
+      rootPath: '/workspace/a',
+      path: 'b c',
+      relativePath: 'd',
+    };
+    // Guard the premise: these tuples genuinely collide under the old `\0` join.
+    const legacyJoin = (p: WorkspaceActionJournalPath) => `${p.rootId} ${p.path} ${p.relativePath}`;
+    expect(legacyJoin(leftPath)).toBe(legacyJoin(rightPath));
+
+    const plan = createWorkspaceRestorePlan({
+      scope: { kind: 'session' },
+      entries: [
+        journalEntry({ id: 'left', createdAt: 1000, path: leftPath, result: { before: 'L', after: 'L2' } }),
+        journalEntry({ id: 'right', createdAt: 1100, path: rightPath, result: { before: 'R', after: 'R2' } }),
+      ],
+    });
+
+    expect(plan.affectedPaths).toHaveLength(2);
+    expect(plan.affectedPaths.map(item => item.path)).toEqual(expect.arrayContaining([leftPath, rightPath]));
+  });
 });
 
 function firstStep(plan: WorkspaceRestorePlan) {

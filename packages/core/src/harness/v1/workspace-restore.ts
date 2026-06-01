@@ -4,6 +4,7 @@ import type {
   WorkspaceActionJournalPath,
   WorkspaceActionJournalPathFilter,
 } from '../../storage/domains/harness';
+import { canonicalJson } from './canonical-json';
 import { HarnessValidationError } from './errors';
 
 /** Selects which workspace journal entries should be projected into a restore plan. */
@@ -312,9 +313,15 @@ function workspaceActionPathFilterHasSelector(filter: WorkspaceActionJournalPath
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
 }
 
-/** Builds a deterministic path identity key for de-duplicating affected paths. */
+/**
+ * Builds a deterministic path identity key for de-duplicating affected paths.
+ * rootId/path/relativePath are free-form journal strings (filesystem paths can
+ * contain almost any byte), so canonicalJson — which JSON-escapes every byte
+ * incl. the historical '\0' separator — is used so distinct path tuples never
+ * collapse into one affected-path entry the way a single-char `join` could.
+ */
 function workspaceActionPathKey(path: WorkspaceActionJournalPath): string {
-  return `${path.rootId}\0${path.path}\0${path.relativePath}`;
+  return canonicalJson([path.rootId, path.path, path.relativePath]);
 }
 
 /** Orders journal rows the same way storage pagination orders them. */
