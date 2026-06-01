@@ -243,9 +243,9 @@ describe('Session.cancel()', () => {
     await session.cancel({ reason: 'cancel-after-complete-before-finalize' });
 
     expect(session.getRecord().pendingQueue).toEqual([]);
-    expect(
-      session.getRecord().queueAdmissionReceipts?.['completed-unfinalized']?.postRunFinalizedAt,
-    ).toEqual(expect.any(Number));
+    expect(session.getRecord().queueAdmissionReceipts?.['completed-unfinalized']?.postRunFinalizedAt).toEqual(
+      expect.any(Number),
+    );
     await expect(queued.promise).resolves.toBe(result);
   });
 
@@ -737,6 +737,93 @@ describe('Session.cancelQueuedItem()', () => {
 
     expect(events.map(e => (e as { type: string }).type)).not.toContain('queue_item_cancelled');
     await expect(session.cancelQueuedItem({ queuedItemId: '' })).rejects.toBeInstanceOf(HarnessValidationError);
+  });
+});
+
+describe('Session teardown — deferred queue-finalization timer (Codex#5)', () => {
+  // A parked post-cancellation finalization retry must NOT run drain /
+  // finalization on a session that was torn down (closed/evicted/deleted)
+  // while the retry was pending. Without the teardown guard, the retry hits
+  // `_flushUpdate`'s terminal reject and re-schedules itself forever — a
+  // perpetual no-op finalization loop on a dead session.
+  const FINALIZATION_RETRY_MS = 1_000;
+
+  function scheduleDeferredFinalization(session: any): void {
+    const item = {
+      id: 'completed-unfinalized',
+      admissionId: 'a',
+      enqueuedAt: Date.now(),
+      content: 'x',
+      attachments: [],
+    };
+    const full = { text: 'done', finishReason: 'stop', runId: 'run-1', steps: [] };
+    // `_deferCompletedQueuedItemFinalizationAfterCancellation` only reads
+    // `err.retryAt` (the internal `QueuePostRunFinalizationPendingError` is not
+    // exported), so a minimal stand-in carrying `retryAt` is sufficient here.
+    const pendingErr = { retryAt: Date.now() + FINALIZATION_RETRY_MS };
+    session._deferCompletedQueuedItemFinalizationAfterCancellation(item, full, 'default', pendingErr);
+  }
+
+  for (const teardown of ['closed', 'evicted', 'deleted'] as const) {
+    it(`does not settle finalization after the session is ${teardown}`, async () => {
+      vi.useFakeTimers();
+      try {
+        const { harness } = setupHarness();
+        const session = (await harness.session({ resourceId: 'u', threadId: { fresh: true } })) as any;
+        const settleSpy = vi.spyOn(session, '_settleCompletedQueuedItemAfterCancellation');
+
+        scheduleDeferredFinalization(session);
+
+        if (teardown === 'closed') session._markClosed(session.getRecord());
+        else if (teardown === 'evicted') session._markEvicted(session.getRecord());
+        else session._markDeleted();
+
+        // Advance well past the retry window; the parked timer must no-op.
+        await vi.advanceTimersByTimeAsync(FINALIZATION_RETRY_MS * 5);
+
+        expect(settleSpy).not.toHaveBeenCalled();
+        // No drainable state remains, so no reschedule loop is possible.
+        expect(session._canDrainQueue()).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it('still settles finalization while the session is live', async () => {
+    vi.useFakeTimers();
+    try {
+      const { harness } = setupHarness();
+      const session = (await harness.session({ resourceId: 'u', threadId: { fresh: true } })) as any;
+      const settleSpy = vi.spyOn(session, '_settleCompletedQueuedItemAfterCancellation').mockResolvedValue(undefined);
+
+      scheduleDeferredFinalization(session);
+      await vi.advanceTimersByTimeAsync(FINALIZATION_RETRY_MS + 1);
+
+      expect(settleSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('Session.waitForIdle() — timeoutMs validation (Codex#10)', () => {
+  for (const bad of [NaN, Infinity, -Infinity, -1, -0.5] as const) {
+    it(`rejects timeoutMs=${String(bad)}`, async () => {
+      const { harness } = setupHarness();
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      // Force the busy branch so validation runs before the idle short-circuit.
+      (session as any)._currentTurnAbortController = new AbortController();
+      expect(() => session.waitForIdle({ timeoutMs: bad })).toThrow(HarnessValidationError);
+    });
+  }
+
+  it('accepts a finite non-negative timeoutMs', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // Idle session resolves immediately regardless of the (valid) timeout.
+    await expect(session.waitForIdle({ timeoutMs: 0 })).resolves.toBeUndefined();
+    await expect(session.waitForIdle({ timeoutMs: 100 })).resolves.toBeUndefined();
   });
 });
 

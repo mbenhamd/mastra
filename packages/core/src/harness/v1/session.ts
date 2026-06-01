@@ -42,7 +42,6 @@ import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionEventReplayUnsupportedError,
-  HarnessStorageSessionNotFoundError,
   HarnessStorageVersionConflictError,
 } from '../../storage/domains/harness';
 import type {
@@ -73,9 +72,15 @@ import { convertStoredMessageToHarnessMessage } from '../_shared/message-convers
 import type { StoredMessageRow } from '../_shared/message-conversion';
 import type { HarnessMessage } from '../types';
 
+// §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
+// always validates caller-reachable input, so the checked variant is bound to the local name.
+import { assertJsonValue, jsonValuesEqual, sha256CanonicalJsonChecked as sha256CanonicalJson } from './canonical-json';
+// §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
+// and the tool-visible context.
+import { toHarnessDisplayStateSnapshotV1 } from './display-state';
+import type { HarnessDisplayStateSnapshotV1 } from './display-state';
 import {
   HarnessAbortedError,
-  type HarnessAbortReason,
   HarnessAdmissionConflictError,
   HarnessAttachmentUnavailableError,
   HarnessBusyError,
@@ -84,7 +89,6 @@ import {
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
-  type HarnessOutputGenerationReason,
   HarnessOverrideConflictError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
@@ -94,7 +98,6 @@ import {
   harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessSessionLockedError,
-  HarnessSessionNotFoundError,
   HarnessStateConflictError,
   HarnessStateSerializationError,
   HarnessSkillArgsValidationError,
@@ -103,18 +106,7 @@ import {
   HarnessWorkspaceLostError,
   redactPublicBoundaryRejection,
 } from './errors';
-// §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
-// always validates caller-reachable input, so the checked variant is bound to the local name.
-import {
-  assertJsonValue,
-  jsonValuesEqual,
-  sha256CanonicalJsonChecked as sha256CanonicalJson,
-} from './canonical-json';
-// §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
-// and the tool-visible context.
-import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
-import { toHarnessDisplayStateSnapshotV1 } from './display-state';
-import type { HarnessDisplayStateSnapshotV1 } from './display-state';
+import type { HarnessAbortReason, HarnessOutputGenerationReason } from './errors';
 import {
   assertCustomEventType,
   assertJsonSerializable,
@@ -137,6 +129,7 @@ import type {
   SubagentToolStartEvent,
 } from './events';
 import type { Harness } from './harness';
+import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
   AgentResult,
@@ -760,14 +753,7 @@ interface ActiveTurnWaiter {
 // HarnessRunOperationalState recovery record. Populated from live session state;
 // `getDisplayState().currentRun` is present only while a run is in flight.
 // ---------------------------------------------------------------------------
-export type HarnessRunStatus =
-  | 'starting'
-  | 'running'
-  | 'waiting'
-  | 'resuming'
-  | 'completed'
-  | 'failed'
-  | 'interrupted';
+export type HarnessRunStatus = 'starting' | 'running' | 'waiting' | 'resuming' | 'completed' | 'failed' | 'interrupted';
 
 export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 'use-skill' | 'inbox-response';
 
@@ -1237,7 +1223,10 @@ export class Session {
     // keys so a tool cannot smuggle reserved envelope fields.
     for (const key of Object.keys(input)) {
       if (key !== 'type' && key !== 'payload') {
-        throw new HarnessValidationError('ctx.emitCustomEvent', `unexpected field "${key}" — only "type" and "payload" are allowed`);
+        throw new HarnessValidationError(
+          'ctx.emitCustomEvent',
+          `unexpected field "${key}" — only "type" and "payload" are allowed`,
+        );
       }
     }
     assertCustomEventType(input.type);
@@ -1249,7 +1238,10 @@ export class Session {
     // legitimate in-run emit. A cleared turn controller means a stale/post-turn or
     // evicted context (both clear it via `_endTurn`).
     if (this._currentTurnAbortController === undefined) {
-      throw new HarnessValidationError('ctx.emitCustomEvent', 'no active turn — custom events may only be emitted during a run');
+      throw new HarnessValidationError(
+        'ctx.emitCustomEvent',
+        'no active turn — custom events may only be emitted during a run',
+      );
     }
     // Payload is optional; only validate JSON-serializability when one is present
     // (the walker treats a bare `undefined` as non-serializable).
@@ -1591,7 +1583,12 @@ export class Session {
   }): void {
     const id = opts.runId ?? this._currentRunId;
     if (id === undefined) return;
-    this._emitTurnEvent({ type: 'agent_end', runId: id, finishReason: opts.finishReason, usage: this._runUsage(opts.full) });
+    this._emitTurnEvent({
+      type: 'agent_end',
+      runId: id,
+      finishReason: opts.finishReason,
+      usage: this._runUsage(opts.full),
+    });
   }
 
   /**
@@ -2260,6 +2257,9 @@ export class Session {
    */
   waitForIdle(opts?: { timeoutMs?: number }): Promise<void> {
     this._assertLive('waitForIdle()');
+    if (opts?.timeoutMs !== undefined && (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs < 0)) {
+      throw new HarnessValidationError('waitForIdle().timeoutMs', 'timeoutMs must be a finite non-negative number');
+    }
     if (!this.isBusy()) return Promise.resolve();
 
     return new Promise<void>((resolve, reject) => {
@@ -5771,9 +5771,7 @@ export class Session {
       // §4.4c / §5.1: caller request context is part of admission identity when
       // present. Absent => omitted => the hash is byte-identical to pre-feature
       // evidence (backward-compatible). Mirrors the queue path's requestContext.
-      ...(persistedRequestContext
-        ? { requestContext: clonePersistedRequestContext(persistedRequestContext) }
-        : {}),
+      ...(persistedRequestContext ? { requestContext: clonePersistedRequestContext(persistedRequestContext) } : {}),
     };
   }
 
@@ -6411,7 +6409,13 @@ export class Session {
 
   private _pendingResumeFromSuspendedOutput(
     full: FullOutput<unknown>,
-    payload: { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] },
+    payload: {
+      toolCallId: string;
+      toolName: string;
+      args?: unknown;
+      suspendPayload?: unknown;
+      approvalReasons?: string[];
+    },
     queuedItemId = this._currentQueuedItemId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
@@ -7850,7 +7854,11 @@ export class Session {
 
     const itemId = pending.itemId ?? pending.toolCallId;
     if (requestedItemId !== undefined && requestedItemId !== itemId) {
-      throw new HarnessInboxItemNotFoundError(this.id, requestedItemId, expectedKind === 'sandbox-access' ? undefined : expectedKind);
+      throw new HarnessInboxItemNotFoundError(
+        this.id,
+        requestedItemId,
+        expectedKind === 'sandbox-access' ? undefined : expectedKind,
+      );
     }
     const responseHash =
       responseId !== undefined
@@ -8257,7 +8265,13 @@ export class Session {
       const suspendedPayload =
         full.finishReason === 'suspended'
           ? (full.suspendPayload as
-              | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] }
+              | {
+                  toolCallId: string;
+                  toolName: string;
+                  args?: unknown;
+                  suspendPayload?: unknown;
+                  approvalReasons?: string[];
+                }
               | undefined)
           : undefined;
       const suspendedPending =
@@ -8445,7 +8459,11 @@ export class Session {
       throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'itemId must be a string');
     }
     if (requestedItemId !== undefined && receipt.itemId !== requestedItemId) {
-      throw new HarnessInboxItemNotFoundError(this.id, requestedItemId, expectedKind === 'sandbox-access' ? undefined : expectedKind);
+      throw new HarnessInboxItemNotFoundError(
+        this.id,
+        requestedItemId,
+        expectedKind === 'sandbox-access' ? undefined : expectedKind,
+      );
     }
     const attemptedHash = this._computeInboxResponseHash({
       kind: expectedKind,
@@ -9109,7 +9127,10 @@ export class Session {
     attachments?: PersistedAttachment[];
   }): Promise<{ runId: string; signalId: string; willInterleave: boolean }> {
     if (opts.admissionId.length === 0) {
-      throw new HarnessValidationError('admitChannelSignalTurn().admissionId', 'admissionId must be a non-empty string');
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().admissionId',
+        'admissionId must be a non-empty string',
+      );
     }
     if (opts.expectedAdmissionHash.length === 0) {
       throw new HarnessValidationError(
@@ -10405,6 +10426,11 @@ export class Session {
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => {
+      // Teardown guard: if the session was closed/evicted/deleted while this
+      // retry was parked, `_settleCompletedQueuedItemAfterCancellation` would
+      // hit `_flushUpdate`'s terminal reject and reschedule itself forever — a
+      // perpetual no-op finalization loop on a dead session. Bail instead.
+      if (!this._canDrainQueue()) return;
       void this._settleCompletedQueuedItemAfterCancellation(item, full, modeId).catch(() => {
         this._notifyMaybeIdle();
       });
@@ -10599,8 +10625,7 @@ export class Session {
       return content;
     }
     const parts: Array<
-      | { type: 'text'; text: string }
-      | { type: 'file'; data: string; mediaType: string; filename?: string }
+      { type: 'text'; text: string } | { type: 'file'; data: string; mediaType: string; filename?: string }
     > = [{ type: 'text', text: content }];
     for (const attachment of attachments) {
       if (attachment.kind === 'url') {
@@ -11251,7 +11276,8 @@ export class Session {
           // reassignment. Carry the max so the local lease guard never fences a
           // still-valid session early. saveSession does not persist lease
           // metadata, so this is an in-memory reconciliation only.
-          const committedLeaseExpiresAt = Math.max(next.leaseExpiresAt ?? 0, this._record.leaseExpiresAt ?? 0) || undefined;
+          const committedLeaseExpiresAt =
+            Math.max(next.leaseExpiresAt ?? 0, this._record.leaseExpiresAt ?? 0) || undefined;
           this._record = {
             ...next,
             tokenUsage: { ...this._tokenUsage },
@@ -11509,7 +11535,8 @@ export class Session {
       // a fallback for the root (or a standalone flush where no subtree deadline
       // is supplied) and is overridden by any deadline already persisted on the
       // record (resumed close).
-      const closeDeadlineAt = this._record.closeDeadlineAt ?? params.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
+      const closeDeadlineAt =
+        this._record.closeDeadlineAt ?? params.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
       const next: SessionRecord = {
         ...this._record,
         closingAt,
