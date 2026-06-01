@@ -40,11 +40,16 @@ with `HarnessEventBase`. Custom events go through the same ordering and replay
 rules as built-in events. Subscribers should narrow by `type` and tolerate
 unknown types (forward-compatibility).
 
-> **Plan-task event (stub — TM-5).** The `plan_task_*` custom event that
-> projects `HarnessPlanTask` tree changes (create / update / status transition /
-> subtree delete — §5.1k) to subscribers is defined by TM-5, not here. It is a
-> custom event (not part of the closed built-in union in §10.2) emitted by the
-> live owner when the session mutates its plan tree. Its payload shape, ordering
-> guarantees relative to other session events, and the derived-status (TM-4)
-> projection are filled in by that lane. TM-2 ships only the durable storage
-> layer and emits no events.
+**Plan-task event (TM-3).** Every MUTATING plan-task tool (§6.4) emits the
+dotted custom event `papersflow.plan_task.updated` through this same
+`emitCustomEvent` validation + stamping path when the live owner mutates its
+plan tree (add / decompose / reparent / update / complete / status rollup —
+§5.1k). It is a CUSTOM event — NOT a member of the closed built-in union in
+§10.2 and NOT a reserved built-in-prefix family — so subscribers narrow by
+`type` and tolerate it like any other custom event. The TM-3 payload carries the
+`op` and the affected task ids; the read-only `plan_task_check` tool emits no
+event.
+
+> **Deferred (TM-5).** The richer `plan_task_*` payload projection (full node
+> deltas, derived-status projection detail, ordering guarantees relative to
+> other session events) is TM-5 polish on top of this TM-3 baseline event.

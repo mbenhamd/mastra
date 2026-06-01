@@ -32,11 +32,24 @@ Custom tool authors implementing similar suspension patterns should follow the
 same rule: act on the calling session only, and tag user-facing events with
 `source` for attribution.
 
-> **Plan-task tool surface (stub — TM-3).** The built-in tool that lets the
-> model create, decompose, reorder, reparent, and update the `HarnessPlanTask`
-> tree (§5.1k) is defined by TM-3, not here. That tool is the only model-facing
-> mutation path for plan tasks; it routes every write through the live `Session`
-> under its lease so the storage mutators stay session-owner-fenced (§5.6,
-> §5.8). Its field semantics, decompose/reparent multi-row behavior, and the
-> §5.1k status-rollup interaction (TM-4) are filled in by those lanes. TM-2 ships
-> only the durable storage layer.
+**Plan-task tool surface (TM-3 / TM-4).** The built-in plan-task tools
+(`task_add`, `task_decompose`, `task_reparent`, `task_update`, `task_complete`,
+`plan_task_check`, and the back-compat `task_write`) are the ONLY model-facing
+mutation path for the durable `HarnessPlanTask` tree (§5.1k). They are
+registered on the `harness:builtin` toolset and, like `task_write` /
+`submit_plan` / `ask_user` above, act on the calling session only: each tool
+routes its write through the live `Session` under its lease so the storage
+mutators stay session-owner-fenced (§5.6, §5.8). `task_decompose` and
+`task_reparent` are transaction-shaped multi-row writes. The TM-4 hierarchy
+layer runs over the loaded tree on every mutation: a `'derived'`-status parent's
+status rolls up from its children (the ratified truth-table) and from its own
+`blockedBy` dependencies, an explicit terminal status is never overwritten,
+reparent + `blockedBy` edges are cycle-checked, and at most one task per root
+subtree may be `in_progress`. Each mutating tool emits the
+`papersflow.plan_task.updated` custom event (§10.3). The `task_write` alias maps
+to add (no `taskId`) / update (`taskId`) semantics so an agent trained on the
+legacy single-tool name keeps working against the tree.
+
+> **Deferred (TM-5 / TM-6).** The `plan_task_*` event payload polish (TM-5) and
+> the `delegatedSubagentSessionId` subagent-delegation surface (TM-6) are not
+> yet implemented.

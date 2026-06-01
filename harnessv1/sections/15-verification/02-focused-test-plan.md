@@ -1867,7 +1867,45 @@ one boundary; `loadPlanTaskSubtree({ rootTaskId?, depth?, status? })` returns a
 bounded next-N subtree; and the session delete cascade (§5.2g) removes every
 plan-task row owned by the deleted session. Adapter tests use a dedicated
 `harnessName` and clean up their own rows (no global truncate), matching the
-existing harness-domain good-citizen pattern. Status rollup, `blockedBy`
-cycle-prevention, the plan tool surface (§6.4), and the `plan_task_*` custom
-event (§10.3) are DEFERRED to TM-3 / TM-4 / TM-5 and are out of scope for the
-TM-2 storage tests.
+existing harness-domain good-citizen pattern.
+
+**Plan-task tools + hierarchy semantics (§6.4 / §5.1k — TM-3 / TM-4)**
+
+The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
+
+- *Tools (§6.4 injection).* `createPlanTaskTools(session)` registers
+  `task_add` / `task_decompose` / `task_reparent` / `task_update` /
+  `task_complete` / `plan_task_check` / `task_write` (back-compat) under the
+  `harness:builtin` toolset the agent receives every turn; each tool routes its
+  write through the live session under its lease and acts on the calling session
+  only. A rejected mutation returns an `isError` tool payload (it does not abort
+  the turn). `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
+  BOUNDED next-N slice (never the whole tree by default) and emits no event.
+- *Custom event (§10.3).* Every MUTATING tool emits the dotted custom event
+  `papersflow.plan_task.updated` (carrying the op + affected task ids) through
+  the session's `_emitCustomEvent` path — not a §10.2 built-in union member, not
+  a built-in-prefix family.
+- *Rollup (RATIFIED truth-table).* A parent whose `statusSource` is `'derived'`
+  recomputes bottom-up on every status mutation: any child `failed` → failed;
+  else any `in_progress` → in_progress; else `blocked` (own unsatisfied
+  `blockedBy` dep or any child `blocked`) → blocked; else all children terminal
+  with at least one `completed` (`cancelled` counts as skipped/ok) → completed;
+  else all `cancelled` → cancelled; else pending. An explicit terminal status
+  (`statusSource: 'explicit'`) is NEVER overwritten by rollup.
+- *`blockedBy`.* An unsatisfied dependency (a dep still pending / in_progress /
+  blocked) factors into rollup as `blocked`; a `completed` / `cancelled` /
+  `failed` dep releases the block.
+- *Cycle prevention.* `task_reparent` rejects a move that would make a task its
+  own ancestor, and `task_update` rejects a `blockedBy` edge that would close a
+  dependency cycle — both with a typed `HarnessPlanTaskCycleError`.
+- *Per-root single in_progress.* Setting a task `in_progress` is rejected with
+  `HarnessPlanTaskInProgressConflictError` when another task in the SAME root
+  subtree is already `in_progress` (the spec-faithful choice is REJECT, so the
+  plan stays an explicit auditable record; the model must complete/pause the
+  current focus first).
+- *Transaction atomicity.* `task_decompose` / `task_reparent` and any rollup
+  write set commit through `mutatePlanTasksForSession` all-or-nothing under one
+  session-owner fence; a stale fence rejects and writes no rows.
+
+The `delegatedSubagentSessionId` delegation surface (TM-6) and the TM-5 event
+payload polish remain deferred.

@@ -1399,7 +1399,10 @@ describe('Session.message() — per-turn overrides', () => {
 
     const tools = { extra: { id: 'extra' } as any };
     await session.message({ content: 'hi', additionalTools: tools });
-    expect(agent.calls[0]!.options.toolsets).toEqual({ 'call:additional': tools });
+    // Per-call additionalTools land under `call:additional`. The always-on
+    // `harness:builtin` toolset (plan-task tools, §6.4) is also present.
+    expect(agent.calls[0]!.options.toolsets['call:additional']).toEqual(tools);
+    expect(agent.calls[0]!.options.toolsets['harness:builtin']).toBeDefined();
   });
 });
 

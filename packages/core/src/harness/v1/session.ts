@@ -80,6 +80,25 @@ import {
   jsonValuesEqual,
   sha256CanonicalJsonChecked as sha256CanonicalJson,
 } from './canonical-json';
+// §5.1k / §6.4 plan-task session operations (TM-3/TM-4): the live session is the
+// serialized writer for its plan tree; these helpers own rollup/cycle/in-progress.
+import {
+  planTaskAdd,
+  planTaskCheck,
+  planTaskComplete,
+  planTaskDecompose,
+  planTaskReparent,
+  planTaskUpdate,
+  PLAN_TASK_UPDATED_EVENT,
+} from './plan-task-session';
+import type {
+  AddTaskInput,
+  CheckInput,
+  DecomposeChildInput,
+  PlanTaskSessionPort,
+  PlanTaskView,
+  UpdateTaskInput,
+} from './plan-task-session';
 // §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
 // and the tool-visible context.
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
@@ -135,6 +154,7 @@ import type {
 } from './events';
 import type { Harness } from './harness';
 import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
+import { createPlanTaskTools } from './plan-task-tool';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
   AgentResult,
@@ -11367,13 +11387,19 @@ export class Session {
     if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = mode.additionalTools;
     if (callAdditional) toolsets[`call:additional`] = callAdditional;
 
-    // Built-in `spawn_subagent` tool. Registered automatically when the
-    // harness has any subagent types configured. Closes over this session
-    // so the tool can resolve the registry, create child sessions, bridge
-    // events back, and enforce the depth cap (§9).
+    // Built-in tools registered on the `harness:builtin` toolset (§6.4 / §9).
+    // `spawn_subagent` is conditional on subagent types being configured; the
+    // plan-task tools are always available. Both close over this session so they
+    // act on the calling session only (§6.4 ownership rule).
+    const builtins: ToolsInput = {};
     const spawn = createSpawnSubagentTool(this);
-    if (spawn) {
-      toolsets['harness:builtin'] = { [SPAWN_SUBAGENT_TOOL_ID]: spawn };
+    if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+    // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
+    // for the durable HarnessPlanTask tree; each write routes through this
+    // session under its lease.
+    Object.assign(builtins, createPlanTaskTools(this));
+    if (Object.keys(builtins).length > 0) {
+      toolsets['harness:builtin'] = builtins;
     }
 
     return Object.keys(toolsets).length === 0 ? undefined : toolsets;
@@ -11731,6 +11757,74 @@ export class Session {
       entry.reject(reason);
     }
     this._runCompletionPromises.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan tasks (HARNESS_V1_SPEC.md §5.1k / §6.4 — TM-3/TM-4).
+  //
+  // The model mutates its plan tree exclusively through the built-in plan-task
+  // tools (`task_add` / `task_decompose` / `task_reparent` / `task_update` /
+  // `task_complete` / `plan_task_check` / `task_write`), which call these
+  // methods. The session is the single serialized writer: every mutator fences
+  // on this owner + the current SessionRecord.version (§5.8), runs the TM-4
+  // hierarchy semantics, commits transaction-shaped via
+  // `mutatePlanTasksForSession`, and emits `papersflow.plan_task.updated`.
+  // -------------------------------------------------------------------------
+
+  /** Build the small port the plan-task operations need. */
+  private _planTaskPort(): PlanTaskSessionPort {
+    const session = this;
+    return {
+      id: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      harnessName: this._record.harnessName,
+      storage: this._storage,
+      ownerId: this._ownerId,
+      get sessionVersion() {
+        return session._record.version;
+      },
+      emitPlanTaskEvent: payload => session._emitPlanTaskEvent(payload),
+    };
+  }
+
+  /**
+   * Emit the `papersflow.plan_task.updated` custom event (§10.3). Goes through
+   * the same validation/stamping path as `ctx.emitCustomEvent`, so it is gated
+   * on an active turn — plan tasks are only mutated by tools running mid-turn.
+   */
+  private _emitPlanTaskEvent(payload: JsonValue): void {
+    this._emitCustomEvent({ type: PLAN_TASK_UPDATED_EVENT, payload });
+  }
+
+  /** @internal — `task_add`. Add one plan task. */
+  _planTaskAdd(input: AddTaskInput): Promise<PlanTaskView> {
+    return planTaskAdd(this._planTaskPort(), input);
+  }
+
+  /** @internal — `task_decompose`. Add N children under a parent atomically. */
+  _planTaskDecompose(parentTaskId: string, children: DecomposeChildInput[]): Promise<PlanTaskView[]> {
+    return planTaskDecompose(this._planTaskPort(), parentTaskId, children);
+  }
+
+  /** @internal — `task_reparent`. Move a subtree (cycle-checked). */
+  _planTaskReparent(taskId: string, newParentTaskId: string | null, order?: number): Promise<void> {
+    return planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order);
+  }
+
+  /** @internal — `task_update`. Patch status/content/priority/blockedBy. */
+  _planTaskUpdate(taskId: string, patch: UpdateTaskInput): Promise<PlanTaskView> {
+    return planTaskUpdate(this._planTaskPort(), taskId, patch);
+  }
+
+  /** @internal — `task_complete`. Mark completed; triggers rollup. */
+  _planTaskComplete(taskId: string): Promise<PlanTaskView> {
+    return planTaskComplete(this._planTaskPort(), taskId);
+  }
+
+  /** @internal — `plan_task_check`. The bounded anti-forgetting read. */
+  _planTaskCheck(input: CheckInput): Promise<{ tasks: PlanTaskView[]; truncated: boolean }> {
+    return planTaskCheck(this._planTaskPort(), input);
   }
 
   /** @internal — accessor for the Harness when it needs the owner id back. */
