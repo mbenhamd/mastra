@@ -4719,9 +4719,25 @@ export class HarnessLibSQL extends HarnessStorage {
             LIMIT 5`,
       args: [],
     });
-    if (result.rows.length === 0) return;
+    // A genuine duplicate-active row groups by (harness_name, resource_id, thread_id)
+    // and has COUNT(*) > 1. The SQL `HAVING COUNT(*) > 1` already enforces this, but
+    // guard against aggregate rows whose group key is NULL or whose count is not > 1
+    // (e.g. an all-NULL aggregate row for an empty table) so the uniqueness index is
+    // only blocked by real conflicts.
+    const duplicates = result.rows.filter(row => {
+      const record = row as Record<string, unknown>;
+      const count = Number(record.duplicate_count ?? 0);
+      return (
+        Number.isFinite(count) &&
+        count > 1 &&
+        record.harness_name != null &&
+        record.resource_id != null &&
+        record.thread_id != null
+      );
+    });
+    if (duplicates.length === 0) return;
 
-    const examples = result.rows
+    const examples = duplicates
       .map(row => {
         const record = row as Record<string, unknown>;
         return `${String(record.harness_name)}:${String(record.resource_id)}:${String(record.thread_id)} (${String(
