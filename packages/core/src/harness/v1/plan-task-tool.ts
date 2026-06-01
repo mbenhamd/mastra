@@ -27,6 +27,9 @@ export const TASK_REPARENT_TOOL_ID = 'task_reparent';
 export const TASK_UPDATE_TOOL_ID = 'task_update';
 export const TASK_COMPLETE_TOOL_ID = 'task_complete';
 export const TASK_CHECK_TOOL_ID = 'plan_task_check';
+/** TM-6 — durable subtask→subagent delegation (§5.1k / §5.6). Registered only
+ * when the harness has subagent types configured. */
+export const TASK_DELEGATE_TOOL_ID = 'task_delegate';
 /** Back-compat alias: maps to add (no taskId) / update (taskId) semantics. */
 export const TASK_WRITE_TOOL_ID = 'task_write';
 
@@ -42,6 +45,8 @@ const planTaskViewShape = {
   activeForm: z.string().optional(),
   priority: z.number().optional(),
   blockedBy: z.array(z.string()).optional(),
+  /** TM-6: the subagent session this task was durably delegated to, if any. */
+  delegatedSubagentSessionId: z.string().optional(),
 };
 
 /** Shared error fields appended to every tool's output schema. */
@@ -233,6 +238,53 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
     },
   });
 
+  // TM-6 — `task_delegate`: durably hand a plan task (and optionally its subtree
+  // subset) to a subagent SESSION. Distinct from `spawn_subagent` (a synchronous
+  // in-turn child): the parent turn does NOT block; the plan task carries the
+  // durable `delegatedSubagentSessionId` link and rolls up (completed/failed)
+  // when the subagent session terminalizes, across turns/restarts. Registered
+  // only when the harness has subagent types configured (mirrors spawn_subagent).
+  const harness = (session as unknown as { _harness?: { _listSubagentTypeIds(): string[] } })._harness;
+  const subagentTypeIds = harness?._listSubagentTypeIds() ?? [];
+  const taskDelegate =
+    subagentTypeIds.length === 0
+      ? undefined
+      : createTool({
+          id: TASK_DELEGATE_TOOL_ID,
+          description:
+            'Durably DELEGATE an existing plan task to a specialized subagent session. Unlike ' +
+            'spawn_subagent (which runs inline and blocks this turn), delegation hands the task off ' +
+            'to a subagent session whose completion this plan task tracks across turns: the task ' +
+            'stays in_progress until the subagent finishes, then rolls up completed or failed. Pass ' +
+            '`includeSubtree: true` to delegate the task and its descendants as one unit. Available ' +
+            'agent types: ' +
+            subagentTypeIds.join(', ') +
+            '.',
+          inputSchema: z.object({
+            taskId: z.string().describe('Existing plan task to delegate.'),
+            agentType: z.enum(subagentTypeIds as [string, ...string[]]).describe('Registered subagent type to run.'),
+            task: z
+              .string()
+              .optional()
+              .describe('Self-contained task description for the subagent. Defaults to the plan task title.'),
+            includeSubtree: z
+              .boolean()
+              .optional()
+              .describe('Delegate the task AND its descendants as one unit (surfaced to the subagent).'),
+            modelOverride: z.string().optional().describe('Model id override; falls back to the subagent default.'),
+          }),
+          outputSchema: z
+            .object({ ...planTaskViewShape, subagentSessionId: z.string().optional(), ...errorShape })
+            .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
+          execute: async input => {
+            try {
+              return (await session._planTaskDelegate(input)) as any;
+            } catch (err) {
+              return toToolError(err) as any;
+            }
+          },
+        });
+
   // Back-compat `task_write`: with a `taskId` it updates that task; without one
   // it adds a new task. Maps onto the same add/update semantics so an agent
   // trained on the legacy single-tool name keeps working against the tree.
@@ -284,5 +336,6 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
     [TASK_COMPLETE_TOOL_ID]: taskComplete,
     [TASK_CHECK_TOOL_ID]: taskCheck,
     [TASK_WRITE_TOOL_ID]: taskWrite,
+    ...(taskDelegate ? { [TASK_DELEGATE_TOOL_ID]: taskDelegate } : {}),
   };
 }

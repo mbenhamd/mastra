@@ -3569,6 +3569,11 @@ export class Harness {
     // §10.2: a session re-loaded from storage into the live cache emits a
     // (session-scoped, non-terminal) `session_hydrated` observer notification.
     session._emit({ type: 'session_hydrated' });
+    // TM-6 (§5.6): reconcile any durable subtask→subagent delegations whose
+    // completion hook was lost across the restart — load each delegated subagent
+    // session's terminal state and roll the plan task up, or re-arm the live
+    // hook. Fire-and-forget so hydration is not blocked on subagent reads.
+    void session._reconcileDelegationsOnHydrate();
     return session;
   }
 

@@ -50,6 +50,16 @@ subtree may be `in_progress`. Each mutating tool emits the
 to add (no `taskId`) / update (`taskId`) semantics so an agent trained on the
 legacy single-tool name keeps working against the tree.
 
-> **Deferred (TM-5 / TM-6).** The `plan_task_*` event payload polish (TM-5) and
-> the `delegatedSubagentSessionId` subagent-delegation surface (TM-6) are not
-> yet implemented.
+**Durable delegation tool (TM-6).** `task_delegate` is added to the same
+`harness:builtin` set, registered ONLY when subagent types are configured
+(mirroring `spawn_subagent`). It hands a plan task (and, with `includeSubtree`,
+its descendants) to a subagent SESSION whose terminal outcome the plan task
+tracks across turns and restarts via the durable `delegatedSubagentSessionId`
+link — distinct from `spawn_subagent`, which runs an inline child the parent
+awaits within the turn. The delegated task stays `in_progress` until the subagent
+session terminalizes, then rolls up `completed` / `failed` (cascading through the
+truth-table). See §5.6 for the wait-point, completion hook, and
+recovery-on-rehydrate.
+
+> **Deferred (TM-5).** The `plan_task_*` event payload polish (TM-5) is not yet
+> implemented.

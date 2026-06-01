@@ -30,8 +30,14 @@ proceeds.
   and the rollup that consumes it are DEFERRED to TM-4**; storage only persists
   and returns the column.
 - `origin?`.
-- `delegatedSubagentSessionId?` — **RESERVED for TM-6** subagent delegation;
-  nullable and never written non-null before that lane lands.
+- `delegatedSubagentSessionId?` — **LIVE (TM-6)**: the subagent SESSION this plan
+  task was durably delegated to. Written by `task_delegate` under the
+  session-owner fence in the SAME transaction that drives the task `in_progress`,
+  so the link and the status can never diverge across a crash. While the subagent
+  session has not terminalized the task stays `in_progress (delegated)`; when it
+  terminalizes the task rolls up `completed` / `failed` and the §5.1k truth-table
+  cascades to ancestors. See §5.6 for the delegation lifecycle, the durable
+  wait-point, and recovery-on-rehydrate.
 - `metadata?` (`JsonValue`).
 - `createdAt`, `updatedAt`, `completedAt?`.
 - `version` — per-row optimistic-concurrency token for the field write,

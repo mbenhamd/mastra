@@ -59,8 +59,10 @@ interface HarnessPlanTask {
   blockedBy?: string[];
 
   origin?: string;
-  // RESERVED for TM-6 subagent delegation. Always nullable; TM-2 never writes
-  // a non-null value.
+  // LIVE (TM-6): the subagent SESSION this plan task was durably delegated to.
+  // Written by `task_delegate` under the session-owner fence in the same
+  // transaction that drives the task `in_progress`; the task rolls up
+  // completed/failed when the subagent session terminalizes. See §5.6.
   delegatedSubagentSessionId?: string;
 
   metadata?: JsonValue;

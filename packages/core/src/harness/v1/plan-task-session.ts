@@ -136,6 +136,8 @@ export interface PlanTaskDelta {
   statusSource: 'explicit' | 'derived';
   order: number;
   content?: string;
+  /** TM-6: present when this op set/changed the delegation link. */
+  delegatedSubagentSessionId?: string;
 }
 
 /** The full event payload for `papersflow.plan_task.updated` (§10.3, TM-5). */
@@ -157,6 +159,8 @@ export interface PlanTaskView {
   activeForm?: string;
   priority?: number;
   blockedBy?: string[];
+  /** TM-6: the subagent session this task was durably delegated to, if any. */
+  delegatedSubagentSessionId?: string;
 }
 
 function toView(task: HarnessPlanTask): PlanTaskView {
@@ -171,6 +175,9 @@ function toView(task: HarnessPlanTask): PlanTaskView {
   if (task.activeForm !== undefined) view.activeForm = task.activeForm;
   if (task.priority !== undefined) view.priority = task.priority;
   if (task.blockedBy !== undefined) view.blockedBy = [...task.blockedBy];
+  if (task.delegatedSubagentSessionId !== undefined) {
+    view.delegatedSubagentSessionId = task.delegatedSubagentSessionId;
+  }
   return view;
 }
 
@@ -346,6 +353,8 @@ function buildCommitOps(
   // Tasks whose content this op set, so the delta carries it (a pure rollup of
   // an unrelated task omits content to stay compact).
   const contentTouched = new Set<string>();
+  // TM-6: tasks whose delegation link this op set, so the delta carries it.
+  const delegationTouched = new Set<string>();
   for (const op of structuralOps) {
     if (op.kind === 'create') {
       changedIds.add(op.task.taskId);
@@ -353,6 +362,7 @@ function buildCommitOps(
     } else if (op.kind === 'update') {
       changedIds.add(op.taskId);
       if (op.patch.content !== undefined) contentTouched.add(op.taskId);
+      if (op.patch.delegatedSubagentSessionId !== undefined) delegationTouched.add(op.taskId);
     }
   }
 
@@ -369,6 +379,9 @@ function buildCommitOps(
     };
     if (row.parentTaskId !== undefined) delta.parentTaskId = row.parentTaskId;
     if (contentTouched.has(id)) delta.content = row.content;
+    if (delegationTouched.has(id) && row.delegatedSubagentSessionId !== undefined) {
+      delta.delegatedSubagentSessionId = row.delegatedSubagentSessionId;
+    }
     deltas.push(delta);
   }
 
@@ -394,6 +407,24 @@ function fence(port: PlanTaskSessionPort) {
 function emit(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[], deltas: PlanTaskDelta[]): void {
   const payload: PlanTaskUpdatedPayload = { op, affectedTaskIds, deltas };
   port.emitPlanTaskEvent(payload as unknown as JsonValue);
+}
+
+/**
+ * Emit the `papersflow.plan_task.updated` event BEST-EFFORT (TM-6). The event
+ * is turn-gated (`_emitCustomEvent` rejects when no turn is in flight), but a
+ * rollup-from-delegation lands when the delegated subagent terminalizes —
+ * which may be OUTSIDE any parent turn (or even after restart). The durable
+ * truth is the committed storage write + refreshed summary; the event is a
+ * live convenience. So swallow a turn-gate rejection rather than failing the
+ * reconcile. A live subscriber that misses the out-of-turn delta re-reads via
+ * `plan_task_check` / the display summary.
+ */
+function emitBestEffort(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[], deltas: PlanTaskDelta[]): void {
+  try {
+    emit(port, op, affectedTaskIds, deltas);
+  } catch {
+    // out-of-turn delegated rollup — durable write already committed.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +689,153 @@ export async function planTaskUpdate(
 
 export async function planTaskComplete(port: PlanTaskSessionPort, taskId: string): Promise<PlanTaskView> {
   return planTaskUpdate(port, taskId, { status: 'completed' });
+}
+
+// ---------------------------------------------------------------------------
+// TM-6 — durable subtask → subagent DELEGATION (§5.1k / §5.6).
+//
+// `task_delegate` hands a plan node (and, optionally, its subtree subset) to a
+// subagent SESSION whose completion the plan task tracks across turns and
+// restarts. The durable link is the persisted `delegatedSubagentSessionId`
+// field on the plan task — NOT an in-memory await. While the subagent runs the
+// task stays `in_progress (delegated)`; when the subagent session terminalizes
+// the task rolls up `completed` / `failed` and the TM-4 truth-table cascades to
+// ancestors. The spawn + hook + reconcile orchestration lives on `Session` /
+// `Harness`; these pure ops own only the FENCED storage writes + rollup so they
+// stay unit-testable against a fake port.
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminal outcome of a delegated subagent SESSION as observed by the parent
+ * (live completion hook OR reconcile-on-rehydrate). Maps to a plan-task status:
+ *
+ *   - `'completed'` → the plan task becomes `completed` (rollup cascades),
+ *   - `'failed'`    → the plan task becomes `failed` (covers subagent error,
+ *     abort/cancel, and a fail-closed "subagent session gone/deleted").
+ */
+export type DelegatedSubagentOutcome = 'completed' | 'failed';
+
+export interface DelegateTaskInput {
+  /** Existing plan task to delegate. */
+  taskId: string;
+  /** The created/resolved subagent session id to link durably. */
+  subagentSessionId: string;
+}
+
+/**
+ * Write `delegatedSubagentSessionId` onto the plan task and mark it
+ * `in_progress` (delegated), all under the session-owner fence (§5.6 / §5.8).
+ * The single-in_progress-per-root invariant is enforced exactly as a manual
+ * `task_update({ status: 'in_progress' })` would be. The field write rides the
+ * same `mutatePlanTasksForSession` transaction as the status write so the link
+ * and the status can never diverge across a crash.
+ */
+export async function planTaskDelegate(port: PlanTaskSessionPort, input: DelegateTaskInput): Promise<PlanTaskView> {
+  if (typeof input.subagentSessionId !== 'string' || input.subagentSessionId.length === 0) {
+    throw new HarnessValidationError('subagentSessionId', 'subagentSessionId must be a non-empty string');
+  }
+  const tasks = await loadAllTasks(port);
+  const index = indexPlanTasks(tasks);
+  const task = index.byId.get(input.taskId);
+  if (!task) throw new HarnessValidationError('taskId', `unknown task "${input.taskId}"`);
+  if (task.delegatedSubagentSessionId !== undefined && task.delegatedSubagentSessionId !== input.subagentSessionId) {
+    throw new HarnessValidationError(
+      'taskId',
+      `task "${input.taskId}" is already delegated to subagent session "${task.delegatedSubagentSessionId}"`,
+    );
+  }
+
+  // Delegation drives the task `in_progress` — enforce the per-root single
+  // in_progress invariant (the delegated unit is now the active focus).
+  assertSingleInProgress(index, input.taskId, id =>
+    id === input.taskId ? 'in_progress' : (index.byId.get(id)?.status ?? 'pending'),
+  );
+
+  const updated: HarnessPlanTask = {
+    ...task,
+    status: 'in_progress',
+    statusSource: 'explicit',
+    delegatedSubagentSessionId: input.subagentSessionId,
+  };
+  const postTasks = tasks.map(t => (t.taskId === input.taskId ? updated : t));
+
+  const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
+  staged.explicitStatus.set(input.taskId, 'in_progress');
+
+  // The field write is a structural op (carries the link); the status write is
+  // folded in by buildCommitOps via the staged explicit map so both land in one
+  // transaction with the right per-row OCC token.
+  const structuralOps: PlanTaskMutationOp[] = [
+    {
+      kind: 'update',
+      taskId: input.taskId,
+      ifVersion: task.version,
+      patch: { delegatedSubagentSessionId: input.subagentSessionId },
+    },
+  ];
+  const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  refreshSummary(port, postTasks, deltas);
+  emit(port, 'delegate', [input.taskId], deltas);
+  return toView(updated);
+}
+
+export interface ReconcileDelegationInput {
+  taskId: string;
+  /** Terminal outcome observed from the delegated subagent session. */
+  outcome: DelegatedSubagentOutcome;
+  /** Expected delegated session id; a mismatch means the link moved — no-op. */
+  subagentSessionId: string;
+}
+
+export interface ReconcileDelegationResult {
+  /** True when a status write was committed (false = already terminal / stale link). */
+  reconciled: boolean;
+  view?: PlanTaskView;
+}
+
+/**
+ * Roll a delegated plan task up from its subagent session's TERMINAL outcome
+ * (TM-6). Called by the live completion hook AND by reconcile-on-rehydrate, so
+ * it is idempotent: if the task already carries an explicit terminal status (a
+ * prior reconcile committed, possibly before a crash) it is a no-op. The status
+ * write is `explicit` so it survives the rollup pass on its own subtree, and the
+ * TM-4 truth-table then cascades the change to ancestors. The event emit is
+ * BEST-EFFORT because a delegated subagent can terminalize outside any parent
+ * turn — the durable write + summary refresh are the authority.
+ *
+ * A stale `subagentSessionId` (the task was re-delegated to a different session)
+ * is a no-op so a late terminal callback from an abandoned session cannot
+ * clobber the live delegation.
+ */
+export async function planTaskReconcileDelegation(
+  port: PlanTaskSessionPort,
+  input: ReconcileDelegationInput,
+): Promise<ReconcileDelegationResult> {
+  const tasks = await loadAllTasks(port);
+  const index = indexPlanTasks(tasks);
+  const task = index.byId.get(input.taskId);
+  if (!task) return { reconciled: false };
+  // Link moved (re-delegated) — ignore the stale terminal signal.
+  if (task.delegatedSubagentSessionId !== input.subagentSessionId) return { reconciled: false };
+  // Idempotent: a task already driven to an explicit terminal status by a prior
+  // reconcile (e.g. before a crash) needs no second write.
+  if (task.statusSource === 'explicit' && TERMINAL_PLAN_TASK_STATUSES.has(task.status)) {
+    return { reconciled: false, view: toView(task) };
+  }
+
+  const nextStatus: HarnessPlanTaskStatus = input.outcome === 'completed' ? 'completed' : 'failed';
+  const updated: HarnessPlanTask = { ...task, status: nextStatus, statusSource: 'explicit' };
+  const postTasks = tasks.map(t => (t.taskId === input.taskId ? updated : t));
+
+  const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
+  staged.explicitStatus.set(input.taskId, nextStatus);
+
+  const { ops, deltas } = buildCommitOps(postTasks, [], staged);
+  await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  refreshSummary(port, postTasks, deltas);
+  emitBestEffort(port, 'delegate_settled', [input.taskId], deltas);
+  return { reconciled: true, view: toView(updated) };
 }
 
 export interface CheckInput {

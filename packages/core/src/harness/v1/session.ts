@@ -49,6 +49,7 @@ import type {
   GoalState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
+  HarnessPlanTask,
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   HarnessRuntimeDependencyRefs,
@@ -109,6 +110,7 @@ import {
   HarnessStateSerializationError,
   HarnessSkillArgsValidationError,
   HarnessSkillNotFoundError,
+  HarnessSubagentDepthExceededError,
   HarnessValidationError,
   HarnessWorkspaceLostError,
   redactPublicBoundaryRejection,
@@ -140,6 +142,7 @@ import type {
   AddTaskInput,
   CheckInput,
   DecomposeChildInput,
+  DelegatedSubagentOutcome,
   PlanTaskSessionPort,
   PlanTaskSummary,
   PlanTaskView,
@@ -150,11 +153,14 @@ import {
   planTaskCheck,
   planTaskComplete,
   planTaskDecompose,
+  planTaskDelegate,
+  planTaskReconcileDelegation,
   planTaskReparent,
   planTaskUpdate,
   computePlanTaskSummary,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
+import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import { createPlanTaskTools } from './plan-task-tool';
 import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
@@ -11876,6 +11882,260 @@ export class Session {
   /** @internal — `plan_task_check`. The bounded anti-forgetting read. */
   _planTaskCheck(input: CheckInput): Promise<{ tasks: PlanTaskView[]; truncated: boolean }> {
     return planTaskCheck(this._planTaskPort(), input);
+  }
+
+  // -------------------------------------------------------------------------
+  // TM-6 — durable subtask → subagent DELEGATION (§5.1k / §5.6 / §8).
+  //
+  // `task_delegate` hands a plan task (and, optionally, its subtree subset) to a
+  // subagent SESSION whose completion the plan task tracks across turns and
+  // restarts. Unlike `spawn_subagent` (a synchronous in-turn child the parent
+  // awaits inline), delegation is DURABLE: the link is the persisted
+  // `delegatedSubagentSessionId` on the plan task, the parent turn does NOT
+  // block, and the rollup fires from a completion HOOK on the child's terminal
+  // outcome — re-established by reconcile-on-rehydrate after a restart.
+  // -------------------------------------------------------------------------
+
+  /**
+   * @internal — `task_delegate`. Spawn/create a subagent SESSION for `taskId`,
+   * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
+   * and arm the live completion hook. Returns the view + the created subagent
+   * session id. Throws `HarnessValidationError` / `HarnessSubagentDepthExceededError`
+   * BEFORE any plan-task or session mutation so a rejected delegation is a no-op.
+   */
+  async _planTaskDelegate(input: {
+    taskId: string;
+    agentType: string;
+    task?: string;
+    includeSubtree?: boolean;
+    modelOverride?: string;
+  }): Promise<PlanTaskView & { subagentSessionId: string }> {
+    this._assertLive('task_delegate');
+    const def = this._harness._getSubagentType(input.agentType);
+    if (!def) {
+      throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
+    }
+    if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
+      throw new HarnessValidationError('modelOverride', 'must be a string when provided');
+    }
+
+    // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
+    // spawn tool's pre-creation gate).
+    const childDepth = this.subagentDepth + 1;
+    const maxDepth = this._harness._getSubagentMaxDepth();
+    if (childDepth > maxDepth) {
+      throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
+    }
+
+    // Resolve the delegated task body. Default to the plan task's own content so a
+    // delegation with no explicit `task` still hands the subagent a description.
+    const planForBody = await this._storage.loadPlanTaskSubtree({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      rootTaskId: input.taskId,
+      depth: 0,
+      limit: 1,
+    });
+    const planRow = planForBody.tasks[0];
+    if (!planRow) throw new HarnessValidationError('taskId', `unknown task "${input.taskId}"`);
+    let taskBody = input.task ?? planRow.content;
+    if (input.includeSubtree) {
+      // Surface the delegated subtree subset so the subagent sees the unit it owns.
+      const subtree = await this._storage.loadPlanTaskSubtree({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        rootTaskId: input.taskId,
+        limit: 100,
+      });
+      const lines = subtree.tasks.map(t => `${'  '.repeat(t.parentTaskId === undefined ? 0 : 1)}- ${t.content}`);
+      taskBody = `${taskBody}\n\nDelegated subtree:\n${lines.join('\n')}`;
+    }
+
+    // Create the durable subagent SESSION (reuse the subagent-tool creation path:
+    // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
+    // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
+    // tracked by the plan task across turns.
+    const child = await this._harness.session({
+      resourceId: this.resourceId,
+      threadId: { fresh: true },
+      parentSessionId: this.id,
+      origin: 'subagent-tool',
+      modeId: def.modeId,
+      modelId: input.modelOverride ?? def.defaultModelId,
+      subagentDepth: childDepth,
+    });
+    const subagentWorkspaceMode = def.workspace ?? 'inherit';
+    child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+
+    // Write the durable link + drive the task in_progress under the owner fence.
+    // If this rejects (e.g. single-in_progress conflict) the child session was
+    // created but never linked; close it best-effort so we leave no orphan.
+    let view: PlanTaskView;
+    try {
+      view = await planTaskDelegate(this._planTaskPort(), { taskId: input.taskId, subagentSessionId: child.id });
+    } catch (err) {
+      try {
+        await child.close();
+      } catch {
+        // best-effort cleanup
+      }
+      throw err;
+    }
+
+    // Track for display (mirrors the spawn tool) keyed by the subagent id so a
+    // delegated subagent renders while it runs.
+    this._activeSubagents.set(`delegate:${child.id}`, {
+      subagentSessionId: child.id,
+      agentType: input.agentType,
+      task: taskBody,
+      parentToolCallId: `delegate:${input.taskId}`,
+      startedAt: Date.now(),
+    });
+
+    // Arm the LIVE completion hook: drive the child's turn DETACHED (the parent
+    // turn must not block), and roll the plan task up when the child settles. The
+    // durable `delegatedSubagentSessionId` link is what makes this recoverable —
+    // if this process dies before the hook fires, reconcile-on-rehydrate re-reads
+    // the child's terminal state and rolls up then.
+    void this._driveDelegatedSubagent(input.taskId, child, taskBody);
+
+    return { ...view, subagentSessionId: child.id };
+  }
+
+  /**
+   * @internal — detached driver for a delegated subagent turn. On settle it
+   * reconciles the plan task and closes the child (§5.6 auto-close). Never
+   * rejects — a delegated subagent failure becomes a `failed` plan-task rollup,
+   * not an unhandled rejection on the parent.
+   */
+  private async _driveDelegatedSubagent(taskId: string, child: Session, taskBody: string): Promise<void> {
+    let outcome: DelegatedSubagentOutcome;
+    try {
+      const result = await child.message({ content: taskBody });
+      // A resolved turn can still be a FAILURE: the mock/real agent surfaces an
+      // abort/cancel as `finishReason: 'aborted' | 'error'` rather than a
+      // rejection, and a cancelled child session records `cancelRequest`. Treat
+      // any of those as a failed delegation so a cancelled subagent does not
+      // masquerade as a completed plan task.
+      const finishReason = (result as { finishReason?: string } | undefined)?.finishReason;
+      const failed =
+        finishReason === 'aborted' ||
+        finishReason === 'error' ||
+        child._record.cancelRequest !== undefined;
+      outcome = failed ? 'failed' : 'completed';
+    } catch {
+      // Subagent error / abort / cancel that rejected → the delegated task FAILED.
+      outcome = 'failed';
+    } finally {
+      this._activeSubagents.delete(`delegate:${child.id}`);
+    }
+    await this._reconcileDelegatedTask(taskId, child.id, outcome);
+    // §5.6 auto-close the delegated subagent once its work has settled.
+    try {
+      await child.close();
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * @internal — roll a delegated plan task up from its subagent session's
+   * terminal `outcome`. Idempotent + fence-guarded; emits best-effort because the
+   * subagent can terminalize outside any parent turn. Called by the live hook AND
+   * reconcile-on-rehydrate.
+   */
+  async _reconcileDelegatedTask(
+    taskId: string,
+    subagentSessionId: string,
+    outcome: DelegatedSubagentOutcome,
+  ): Promise<void> {
+    if (this._state === 'closed') return;
+    try {
+      await planTaskReconcileDelegation(this._planTaskPort(), { taskId, subagentSessionId, outcome });
+    } catch {
+      // A fence/version race is benign here — a later reconcile (or hydrate scan)
+      // re-reads the durable link and retries. The durable child outcome is the
+      // authority, not this one attempt.
+    }
+  }
+
+  /**
+   * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
+   * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
+   * non-terminal and reconcile each against the delegated subagent session's
+   * DURABLE state:
+   *   - subagent terminalized (closed) while we were down → roll the plan task up
+   *     (completed/failed) from its terminal outcome;
+   *   - subagent still live → re-arm the live completion hook;
+   *   - subagent session gone/deleted → fail closed (`failed`).
+   * Best-effort + fire-and-forget; runs once after hydration.
+   */
+  async _reconcileDelegationsOnHydrate(): Promise<void> {
+    if (this._state !== 'live') return;
+    let cursor: string | undefined;
+    const delegated: HarnessPlanTask[] = [];
+    try {
+      for (;;) {
+        const page = await this._storage.listPlanTasks({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          limit: 500,
+          cursor,
+        });
+        for (const t of page.tasks) {
+          if (t.delegatedSubagentSessionId !== undefined && !TERMINAL_PLAN_TASK_STATUSES.has(t.status)) {
+            delegated.push(t);
+          }
+        }
+        if (!page.cursor || page.tasks.length === 0) break;
+        cursor = page.cursor;
+      }
+    } catch {
+      return; // best-effort: a later mutation/snapshot can retry
+    }
+
+    for (const task of delegated) {
+      const childId = task.delegatedSubagentSessionId!;
+      let childRecord: SessionRecord | null;
+      try {
+        childRecord = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
+      } catch {
+        continue;
+      }
+      // Subagent session GONE/deleted → fail closed.
+      if (!childRecord) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        continue;
+      }
+      // Subagent session CLOSED → it terminalized; map to an outcome. A clean
+      // close reflects a completed delegated turn; a cancelled session is a
+      // failure. (v1 does not yet persist a durable per-run terminal status, so
+      // closed-without-cancel is treated as completed — the conservative,
+      // recoverable read of "the subagent finished".)
+      if (childRecord.closedAt !== undefined) {
+        const outcome: DelegatedSubagentOutcome = childRecord.cancelRequest !== undefined ? 'failed' : 'completed';
+        await this._reconcileDelegatedTask(task.taskId, childId, outcome);
+        continue;
+      }
+      // Subagent still active → re-attach the live completion hook so a later
+      // terminalization rolls the plan task up.
+      let child: Session | undefined;
+      try {
+        child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
+      } catch {
+        // Could not re-acquire the child (locked elsewhere / transient) — leave
+        // the link in place; a later hydrate scan retries.
+        continue;
+      }
+      this._activeSubagents.set(`delegate:${child.id}`, {
+        subagentSessionId: child.id,
+        agentType: 'delegated',
+        task: task.content,
+        parentToolCallId: `delegate:${task.taskId}`,
+        startedAt: Date.now(),
+      });
+      void this._driveDelegatedSubagent(task.taskId, child, task.content);
+    }
   }
 
   /** @internal — accessor for the Harness when it needs the owner id back. */

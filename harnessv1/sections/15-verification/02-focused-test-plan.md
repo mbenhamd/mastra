@@ -1907,5 +1907,33 @@ The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
   write set commit through `mutatePlanTasksForSession` all-or-nothing under one
   session-owner fence; a stale fence rejects and writes no rows.
 
-The `delegatedSubagentSessionId` delegation surface (TM-6) and the TM-5 event
-payload polish remain deferred.
+**Durable subtask → subagent delegation (§5.1k / §5.6 — TM-6)**
+
+The `task_delegate` tool and its durable wait-point / rollup / recovery are
+tests-first:
+
+- *Delegate write.* `task_delegate({ taskId, agentType, task?, includeSubtree? })`
+  spawns a subagent session (the normal `origin: 'subagent-tool'` /
+  `parentSessionId` path; §8 depth cap enforced BEFORE any mutation), writes
+  `delegatedSubagentSessionId` onto the plan task, and drives the task
+  `in_progress` in ONE fenced `mutatePlanTasksForSession` transaction so the link
+  and status never diverge. The parent turn does not block. The single-
+  `in_progress`-per-root invariant still rejects a conflicting delegation, an
+  unknown `agentType` returns an `isError` payload (the zod enum rejects it), and
+  the tool is registered only when subagent types exist.
+- *Durable wait-point + rollup.* The delegated task stays `in_progress` until the
+  subagent session terminalizes. A completion hook rolls it up: subagent
+  completed → `completed`; subagent error / abort / cancelled session → `failed`.
+  The §5.1k truth-table then cascades the derived status to ancestors. The link
+  is the persisted `delegatedSubagentSessionId`, not an in-memory await (no
+  coupling to `suspendTool` / the agent loop), and the rollup write is fenced and
+  emits its delta best-effort (out-of-turn terminalization skips the turn-gated
+  event; the durable write + summary are authoritative).
+- *Recovery on rehydrate.* Hydration scans non-terminal delegated tasks and
+  reconciles each against the subagent session's durable state: terminalized
+  while down → roll up from the outcome; still live → re-attach the hook; subagent
+  gone/deleted → fail closed (`failed`). Reconcile is idempotent (a terminal task
+  is a no-op) and ignores a stale link (re-delegated elsewhere) so a late callback
+  from an abandoned session cannot clobber the live delegation.
+
+The TM-5 event payload polish remains deferred.
