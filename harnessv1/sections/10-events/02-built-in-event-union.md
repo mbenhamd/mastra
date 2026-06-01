@@ -119,6 +119,12 @@ type StateEvent =
 type TurnEvent =
   | { type: 'agent_start';   runId: string; overrides?: PersistedRunOverrides }
   | { type: 'text_delta';    runId: string; signalId?: string; delta: string }
+  // Streaming reasoning/thinking text. Mirrors `text_delta`; emitted only when
+  // the model streams reasoning chunks (additive + opt-in — a non-reasoning
+  // model emits none). PapersFlow fork extension: upstream v1 left reasoning out
+  // of the built-in union, but the fork's chat UI renders a live thinking block,
+  // so reasoning is a first-class delta here rather than display-state-only.
+  | { type: 'reasoning_delta'; runId: string; signalId?: string; delta: string }
   | { type: 'agent_end';     runId: string; finishReason: string; usage: TokenUsage }
   // Diagnostic/run-surface error. `signalId` may attribute where the runtime
   // noticed the error, but promise settlement still uses OperationEvent below.
@@ -151,7 +157,8 @@ type ToolEvent =
 type SubagentEvent =
   | { type: 'subagent_start';      toolCallId: string; subagentSessionId: string; agentType: string; task: string; modelId: string; parentId?: string; depth: number }
   | { type: 'subagent_text_delta'; toolCallId: string; subagentSessionId: string; agentType: string; delta: string; parentId?: string; depth: number }
-  | { type: 'subagent_tool_start'; toolCallId: string; subagentSessionId: string; agentType: string; innerToolCallId: string; toolName: string; parentId?: string; depth: number }
+  | { type: 'subagent_reasoning_delta'; toolCallId: string; subagentSessionId: string; agentType: string; delta: string; parentId?: string; depth: number }
+  | { type: 'subagent_tool_start'; toolCallId: string; subagentSessionId: string; agentType: string; innerToolCallId: string; toolName: string; input: JsonValue; parentId?: string; depth: number }
   | { type: 'subagent_tool_end';   toolCallId: string; subagentSessionId: string; agentType: string; innerToolCallId: string; toolName: string; output: JsonValue; isError: boolean; parentId?: string; depth: number }
   | { type: 'subagent_end';        toolCallId: string; subagentSessionId: string; agentType: string; output: JsonValue; isError: boolean; durationMs: number; parentId?: string; depth: number };
 
