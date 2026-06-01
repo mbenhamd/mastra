@@ -15,8 +15,10 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { createPlanTaskTools } from './plan-task-tool';
+import { setupHarness } from './__test-utils__/setup';
+import type { HarnessEvent } from './events';
 import {
+  createPlanTaskTools,
   TASK_ADD_TOOL_ID,
   TASK_CHECK_TOOL_ID,
   TASK_COMPLETE_TOOL_ID,
@@ -25,8 +27,6 @@ import {
   TASK_UPDATE_TOOL_ID,
   TASK_WRITE_TOOL_ID,
 } from './plan-task-tool';
-import { setupHarness } from './__test-utils__/setup';
-import type { HarnessEvent } from './events';
 
 const PLAN_TASK_TOOL_IDS = [
   TASK_ADD_TOOL_ID,
@@ -83,11 +83,14 @@ describe('plan-task tool execution mid-turn', () => {
     await vitestPoll(() => agent.streamCalls.length > 0);
 
     const tools = createPlanTaskTools(session);
-    const result = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'plan thing' } as any, {
-      abortSignal: new AbortController().signal,
-      agent: { toolCallId: 'tc-1', runId: 'mock-run' },
-      requestContext: { get: () => undefined },
-    } as any)) as any;
+    const result = (await tools[TASK_ADD_TOOL_ID]!.execute!(
+      { content: 'plan thing' } as any,
+      {
+        abortSignal: new AbortController().signal,
+        agent: { toolCallId: 'tc-1', runId: 'mock-run' },
+        requestContext: { get: () => undefined },
+      } as any,
+    )) as any;
 
     expect(result.isError).toBeFalsy();
     expect(result.content).toBe('plan thing');
@@ -103,6 +106,45 @@ describe('plan-task tool execution mid-turn', () => {
     // Tree persisted.
     const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 });
     expect(stored.tasks.map(t => t.content)).toContain('plan thing');
+  });
+
+  it('getDisplayState surfaces the bounded plan-task summary after a mutation (no full tree)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Before any plan-task activity the summary is absent.
+    expect(session.getDisplayState().planTasks).toBeUndefined();
+
+    let release!: () => void;
+    const holdUntil = new Promise<void>(r => (release = r));
+    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
+    const turn = session.message({ content: 'go' });
+    await vitestPoll(() => agent.streamCalls.length > 0);
+
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-s', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root' } as any, ctx)) as any;
+    await tools[TASK_DECOMPOSE_TOOL_ID]!.execute!(
+      { parentTaskId: root.taskId, children: [{ content: 'c1' }, { content: 'c2' }] } as any,
+      ctx,
+    );
+    await tools[TASK_UPDATE_TOOL_ID]!.execute!({ taskId: root.taskId, status: 'in_progress' } as any, ctx);
+
+    const summary = session.getDisplayState().planTasks!;
+    expect(summary.total).toBe(3);
+    expect(summary.rootCount).toBe(1);
+    expect(summary.inProgressTaskIds).toEqual([root.taskId]);
+    expect(summary.byStatus.in_progress).toBe(1);
+    expect(summary.byStatus.pending).toBe(2);
+    // Bounded — no full tree embedded on the snapshot.
+    expect(Object.keys(summary).sort()).toEqual(['byStatus', 'inProgressTaskIds', 'rootCount', 'total']);
+
+    release();
+    await turn;
   });
 
   it('task_write back-compat: no taskId adds, taskId updates', async () => {
@@ -151,10 +193,7 @@ describe('plan-task tool execution mid-turn', () => {
       requestContext: { get: () => undefined },
     } as any;
     const a = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'a' } as any, ctx)) as any;
-    const b = (await tools[TASK_ADD_TOOL_ID]!.execute!(
-      { content: 'b', parentTaskId: a.taskId } as any,
-      ctx,
-    )) as any;
+    const b = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'b', parentTaskId: a.taskId } as any, ctx)) as any;
     // Reparent a under its own child b → cycle → isError payload.
     const res = (await tools[TASK_REPARENT_TOOL_ID]!.execute!(
       { taskId: a.taskId, newParentTaskId: b.taskId } as any,

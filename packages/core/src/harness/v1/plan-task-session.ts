@@ -57,6 +57,93 @@ export interface PlanTaskSessionPort {
   readonly sessionVersion: number;
   /** Emit the plan-task custom event (delegates to `_emitCustomEvent`). */
   emitPlanTaskEvent(payload: JsonValue): void;
+  /**
+   * Hand the session the freshly-recomputed bounded plan-task summary after a
+   * mutation (TM-5). The session caches it for `getDisplayState()` so the
+   * display snapshot never has to load the tree itself. Optional so a fake port
+   * (and the read-only `task_check`) can ignore it.
+   */
+  setPlanTaskSummary?(summary: PlanTaskSummary): void;
+}
+
+/**
+ * Bounded plan-task SUMMARY surfaced on the display-state snapshot (§4.2 / §5.1k,
+ * TM-5). Counts + the active `in_progress` task ids + the root count — NOT the
+ * full tree. A UI gets the live shape from this cheap summary, then drives detail
+ * off the `papersflow.plan_task.updated` event deltas and the bounded
+ * `plan_task_check` read. JSON-safe (primitives + a small id array).
+ */
+export interface PlanTaskSummary {
+  /** Total number of plan-task nodes in the session tree. */
+  total: number;
+  /** Count of nodes in each status (only present statuses appear). */
+  byStatus: Partial<Record<HarnessPlanTaskStatus, number>>;
+  /** Ids of the tasks currently `in_progress` (bounded: one per root by §5.1k). */
+  inProgressTaskIds: string[];
+  /** Number of root nodes (no resolvable parent). */
+  rootCount: number;
+}
+
+/**
+ * Compute the bounded {@link PlanTaskSummary} from the post-mutation tree the op
+ * already holds in memory — so the summary refresh costs NO extra storage I/O
+ * (the op loaded the tree for rollup/cycle work regardless). Roots are nodes with
+ * no `parentTaskId` resolvable in the set (matches `indexPlanTasks`).
+ */
+export function computePlanTaskSummary(
+  tasks: HarnessPlanTask[],
+  finalStatusOverride?: Map<string, HarnessPlanTaskStatus>,
+): PlanTaskSummary {
+  const byId = new Set(tasks.map(t => t.taskId));
+  const byStatus: Partial<Record<HarnessPlanTaskStatus, number>> = {};
+  const inProgressTaskIds: string[] = [];
+  let rootCount = 0;
+  for (const t of tasks) {
+    const status = finalStatusOverride?.get(t.taskId) ?? t.status;
+    byStatus[status] = (byStatus[status] ?? 0) + 1;
+    if (status === 'in_progress') inProgressTaskIds.push(t.taskId);
+    if (t.parentTaskId === undefined || !byId.has(t.parentTaskId)) rootCount += 1;
+  }
+  return { total: tasks.length, byStatus, inProgressTaskIds, rootCount };
+}
+
+/**
+ * Recompute + push the bounded summary to the session from the committed
+ * post-image. `postTasks` carries the structural shape; `deltas` carry the
+ * authoritative FINAL status of every task the op changed (including the rollup
+ * cascade), so we overlay them. Costs no extra I/O.
+ */
+function refreshSummary(port: PlanTaskSessionPort, postTasks: HarnessPlanTask[], deltas: PlanTaskDelta[]): void {
+  if (!port.setPlanTaskSummary) return;
+  const override = new Map<string, HarnessPlanTaskStatus>();
+  for (const d of deltas) override.set(d.taskId, d.status);
+  port.setPlanTaskSummary(computePlanTaskSummary(postTasks, override));
+}
+
+/**
+ * Compact per-task delta carried in the `papersflow.plan_task.updated` event
+ * (§10.3, TM-5). One entry per task the op CHANGED — the directly-edited rows
+ * AND every task whose DERIVED status flipped from the rollup cascade — so a UI
+ * can apply an incremental patch without re-reading the tree. Bounded to the
+ * affected set; JSON-safe (primitive fields only). `content` is included only
+ * when this op set it (add/decompose/content edit), so a pure status rollup
+ * stays compact.
+ */
+export interface PlanTaskDelta {
+  taskId: string;
+  parentTaskId?: string;
+  status: HarnessPlanTaskStatus;
+  statusSource: 'explicit' | 'derived';
+  order: number;
+  content?: string;
+}
+
+/** The full event payload for `papersflow.plan_task.updated` (§10.3, TM-5). */
+export interface PlanTaskUpdatedPayload {
+  op: string;
+  affectedTaskIds: string[];
+  /** Per-task post-image deltas for every changed task (bounded, JSON-safe). */
+  deltas: PlanTaskDelta[];
 }
 
 /** A plan-task as the model sees it through the tool boundary. */
@@ -123,18 +210,30 @@ interface StagedChange {
   derivedNodes: Set<string>;
 }
 
+interface CommitPlan {
+  ops: PlanTaskMutationOp[];
+  /**
+   * Post-image deltas (TM-5) for every task this op CHANGED: the directly-edited
+   * rows (structural ops) plus every task whose status the rollup flipped. Built
+   * from the post-mutation `postTasks` image folded with the final status/source
+   * decisions, so it reflects exactly what landed.
+   */
+  deltas: PlanTaskDelta[];
+}
+
 /**
  * Given the post-mutation task set + the staged status/source decisions, run
  * rollup and return the FULL ordered op list to commit (the caller's structural
- * ops PLUS the derived-status updates rollup produced). The caller passes the
- * structural ops (create/reparent updates) that change tree shape; this folds in
- * the status writes.
+ * ops PLUS the derived-status updates rollup produced), alongside the bounded
+ * per-task deltas for the event payload. The caller passes the structural ops
+ * (create/reparent updates) that change tree shape; this folds in the status
+ * writes.
  */
 function buildCommitOps(
   postTasks: HarnessPlanTask[],
   structuralOps: PlanTaskMutationOp[],
   staged: StagedChange,
-): PlanTaskMutationOp[] {
+): CommitPlan {
   // Stage the status map rollup should see: explicit statuses + the source flips.
   const stagedStatus = new Map<string, HarnessPlanTaskStatus>(staged.explicitStatus);
   const stagedSource = new Map<string, 'explicit' | 'derived'>();
@@ -153,7 +252,12 @@ function buildCommitOps(
   // status + statusSource + completedAt.
   const statusWrites = new Map<
     string,
-    { status?: HarnessPlanTaskStatus; statusSource?: 'explicit' | 'derived'; completedAt?: number; clearCompletedAt?: boolean }
+    {
+      status?: HarnessPlanTaskStatus;
+      statusSource?: 'explicit' | 'derived';
+      completedAt?: number;
+      clearCompletedAt?: boolean;
+    }
   >();
   const upsert = (id: string) => {
     let w = statusWrites.get(id);
@@ -233,7 +337,42 @@ function buildCommitOps(
     });
   }
 
-  return ops;
+  // ---- TM-5 deltas ---------------------------------------------------------
+  // The set of CHANGED tasks: every task targeted by a structural op (create /
+  // update) plus every task whose status/source was written (explicit set,
+  // source flip, or rollup cascade). For each we project a bounded post-image
+  // from `byId` (the post-mutation tree) folded with the final status decision.
+  const changedIds = new Set<string>(statusWrites.keys());
+  // Tasks whose content this op set, so the delta carries it (a pure rollup of
+  // an unrelated task omits content to stay compact).
+  const contentTouched = new Set<string>();
+  for (const op of structuralOps) {
+    if (op.kind === 'create') {
+      changedIds.add(op.task.taskId);
+      contentTouched.add(op.task.taskId);
+    } else if (op.kind === 'update') {
+      changedIds.add(op.taskId);
+      if (op.patch.content !== undefined) contentTouched.add(op.taskId);
+    }
+  }
+
+  const deltas: PlanTaskDelta[] = [];
+  for (const id of changedIds) {
+    const row = byId.get(id);
+    if (!row) continue; // defensive: should always resolve in the post-image
+    const w = statusWrites.get(id);
+    const delta: PlanTaskDelta = {
+      taskId: id,
+      status: w?.status ?? row.status,
+      statusSource: w?.statusSource ?? row.statusSource,
+      order: row.order,
+    };
+    if (row.parentTaskId !== undefined) delta.parentTaskId = row.parentTaskId;
+    if (contentTouched.has(id)) delta.content = row.content;
+    deltas.push(delta);
+  }
+
+  return { ops, deltas };
 }
 
 function fence(port: PlanTaskSessionPort) {
@@ -245,8 +384,16 @@ function fence(port: PlanTaskSessionPort) {
   };
 }
 
-function emit(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[]): void {
-  port.emitPlanTaskEvent({ op, affectedTaskIds });
+/**
+ * Emit the `papersflow.plan_task.updated` event (§10.3). `affectedTaskIds`
+ * preserves the op-meaningful order (e.g. `[parent, ...children]` for
+ * decompose); `deltas` carries the bounded per-task post-image for EVERY changed
+ * task — the directly-edited rows plus every task whose derived status the
+ * rollup cascade flipped — so a UI can patch incrementally without a re-read.
+ */
+function emit(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[], deltas: PlanTaskDelta[]): void {
+  const payload: PlanTaskUpdatedPayload = { op, affectedTaskIds, deltas };
+  port.emitPlanTaskEvent(payload as unknown as JsonValue);
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +458,9 @@ export async function planTaskAdd(port: PlanTaskSessionPort, input: AddTaskInput
   const postTasks = [...tasks, newTask];
   const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
   if (status === 'in_progress') {
-    assertSingleInProgress(indexWith(index, newTask), taskId, id => (id === taskId ? status : index.byId.get(id)?.status ?? 'pending'));
+    assertSingleInProgress(indexWith(index, newTask), taskId, id =>
+      id === taskId ? status : (index.byId.get(id)?.status ?? 'pending'),
+    );
     staged.explicitStatus.set(taskId, status);
   }
   // A new child flips its parent to 'derived' (unless the parent is
@@ -319,9 +468,10 @@ export async function planTaskAdd(port: PlanTaskSessionPort, input: AddTaskInput
   if (input.parentTaskId !== undefined) maybeFlipParentDerived(index, input.parentTaskId, staged);
 
   const structuralOps: PlanTaskMutationOp[] = [{ kind: 'create', task: newTask }];
-  const ops = buildCommitOps(postTasks, structuralOps, staged);
+  const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
-  emit(port, 'add', [taskId]);
+  refreshSummary(port, postTasks, deltas);
+  emit(port, 'add', [taskId], deltas);
   return toView(newTask);
 }
 
@@ -377,10 +527,11 @@ export async function planTaskDecompose(
   maybeFlipParentDerived(index, parentTaskId, staged);
 
   const structuralOps: PlanTaskMutationOp[] = created.map(task => ({ kind: 'create', task }));
-  const ops = buildCommitOps(postTasks, structuralOps, staged);
+  const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  refreshSummary(port, postTasks, deltas);
   const ids = created.map(t => t.taskId);
-  emit(port, 'decompose', [parentTaskId, ...ids]);
+  emit(port, 'decompose', [parentTaskId, ...ids], deltas);
   return created.map(toView);
 }
 
@@ -426,10 +577,11 @@ export async function planTaskReparent(
           : { parentTaskId: newParentTaskId, order: moved.order },
     },
   ];
-  const ops = buildCommitOps(postTasks, structuralOps, staged);
+  const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  refreshSummary(port, postTasks, deltas);
   const affected = [taskId, ...(newParentTaskId ? [newParentTaskId] : []), ...(oldParentId ? [oldParentId] : [])];
-  emit(port, 'reparent', affected);
+  emit(port, 'reparent', affected, deltas);
 }
 
 export interface UpdateTaskInput {
@@ -473,7 +625,9 @@ export async function planTaskUpdate(
   const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
   if (patch.status !== undefined) {
     if (patch.status === 'in_progress') {
-      assertSingleInProgress(index, taskId, id => (id === taskId ? 'in_progress' : index.byId.get(id)?.status ?? 'pending'));
+      assertSingleInProgress(index, taskId, id =>
+        id === taskId ? 'in_progress' : (index.byId.get(id)?.status ?? 'pending'),
+      );
     }
     staged.explicitStatus.set(taskId, patch.status);
   }
@@ -495,9 +649,10 @@ export async function planTaskUpdate(
   if (Object.keys(fieldPatch.kind === 'update' ? fieldPatch.patch : {}).length > 0) {
     structuralOps.push(fieldPatch);
   }
-  const ops = buildCommitOps(postTasks, structuralOps, staged);
+  const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
-  emit(port, 'update', [taskId]);
+  refreshSummary(port, postTasks, deltas);
+  emit(port, 'update', [taskId], deltas);
   return toView(updated);
 }
 

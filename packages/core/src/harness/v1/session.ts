@@ -82,23 +82,6 @@ import {
 } from './canonical-json';
 // §5.1k / §6.4 plan-task session operations (TM-3/TM-4): the live session is the
 // serialized writer for its plan tree; these helpers own rollup/cycle/in-progress.
-import {
-  planTaskAdd,
-  planTaskCheck,
-  planTaskComplete,
-  planTaskDecompose,
-  planTaskReparent,
-  planTaskUpdate,
-  PLAN_TASK_UPDATED_EVENT,
-} from './plan-task-session';
-import type {
-  AddTaskInput,
-  CheckInput,
-  DecomposeChildInput,
-  PlanTaskSessionPort,
-  PlanTaskView,
-  UpdateTaskInput,
-} from './plan-task-session';
 // §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
 // and the tool-visible context.
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
@@ -153,8 +136,27 @@ import type {
   SubagentToolStartEvent,
 } from './events';
 import type { Harness } from './harness';
-import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
+import type {
+  AddTaskInput,
+  CheckInput,
+  DecomposeChildInput,
+  PlanTaskSessionPort,
+  PlanTaskSummary,
+  PlanTaskView,
+  UpdateTaskInput,
+} from './plan-task-session';
+import {
+  planTaskAdd,
+  planTaskCheck,
+  planTaskComplete,
+  planTaskDecompose,
+  planTaskReparent,
+  planTaskUpdate,
+  computePlanTaskSummary,
+  PLAN_TASK_UPDATED_EVENT,
+} from './plan-task-session';
 import { createPlanTaskTools } from './plan-task-tool';
+import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
   AgentResult,
@@ -840,6 +842,12 @@ export interface SessionDisplayState {
 
   // Goal
   goal?: SessionRecord['goal'];
+
+  // Plan tasks (§5.1k / TM-5): a BOUNDED summary — counts + active in_progress
+  // ids + root count — NOT the full tree. UIs drive detail off the
+  // `papersflow.plan_task.updated` event deltas + the bounded `plan_task_check`
+  // read. Absent until the session has observed its plan tree.
+  planTasks?: PlanTaskSummary;
 }
 
 export type SessionDisplayPending = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies'>;
@@ -953,6 +961,15 @@ export class Session {
   private readonly _activeTools = new Map<string, ActiveToolState>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /**
+   * §5.1k / TM-5 bounded plan-task summary for `getDisplayState()`. Kept in
+   * memory and refreshed for FREE on every plan-task mutation (the mutator
+   * already holds the post-image), so a display snapshot never loads the tree.
+   * Seeded lazily once (`_planTaskSummarySeeded`) for a hydrated session that has
+   * pre-existing tasks but hasn't mutated yet; `undefined` until first observed.
+   */
+  private _planTaskSummary: PlanTaskSummary | undefined;
+  private _planTaskSummarySeeded = false;
   /**
    * Cumulative usage for the session's thread. Live counter, single source of
    * truth in-process. Seeded from `internals.record.tokenUsage` in the
@@ -6911,6 +6928,10 @@ export class Session {
     if (rec.goal !== undefined) snapshot.goal = rec.goal;
     const currentRun = this._buildCurrentRunProjection();
     if (currentRun !== undefined) snapshot.currentRun = currentRun;
+    // §5.1k / TM-5 bounded plan-task summary. Kick a one-time lazy seed (cheap,
+    // bounded) for a hydrated session, then surface the cached summary if present.
+    this._maybeSeedPlanTaskSummary();
+    if (this._planTaskSummary !== undefined) snapshot.planTasks = this._planTaskSummary;
     return snapshot;
   }
 
@@ -11785,7 +11806,37 @@ export class Session {
         return session._record.version;
       },
       emitPlanTaskEvent: payload => session._emitPlanTaskEvent(payload),
+      setPlanTaskSummary: summary => {
+        session._planTaskSummary = summary;
+        session._planTaskSummarySeeded = true;
+      },
     };
+  }
+
+  /**
+   * §5.1k / TM-5 — lazily seed the bounded plan-task summary ONCE for a hydrated
+   * session that may carry pre-existing plan tasks but hasn't mutated yet, so the
+   * first `getDisplayState()` after hydration eventually reflects the tree. A
+   * bounded single-page read (the plan tree is small per §5.1k); idempotent and
+   * fire-and-forget — any mutation recomputes the authoritative summary for free.
+   * Best-effort: a failed read leaves the summary unseeded for a later retry.
+   */
+  private _maybeSeedPlanTaskSummary(): void {
+    if (this._planTaskSummarySeeded) return;
+    this._planTaskSummarySeeded = true;
+    void this._storage
+      .listPlanTasks({ harnessName: this._record.harnessName, sessionId: this.id, limit: 500 })
+      .then(page => {
+        // A concurrent mutation may have set the authoritative summary first; only
+        // fill the seed if nothing has populated it yet.
+        if (this._planTaskSummary === undefined) {
+          this._planTaskSummary = computePlanTaskSummary(page.tasks);
+        }
+      })
+      .catch(() => {
+        // Allow a later snapshot to retry the seed.
+        this._planTaskSummarySeeded = false;
+      });
   }
 
   /**

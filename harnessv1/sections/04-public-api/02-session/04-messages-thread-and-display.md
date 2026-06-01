@@ -35,6 +35,21 @@
   // events, and snapshot refetch instead of a separate display subscription API.
   getDisplayState(): Readonly<HarnessDisplayStateSnapshotV1>;
   subscribe(listener: HarnessListener): () => void;
+  // Plan-task summary (TM-5). The snapshot carries an OPTIONAL bounded plan-task
+  // summary — NOT the full tree (§5.1k):
+  //   planTasks?: {
+  //     total: number;
+  //     byStatus: Partial<Record<HarnessPlanTaskStatus, number>>;
+  //     inProgressTaskIds: string[]; // bounded: one per root (§5.1k)
+  //     rootCount: number;
+  //   }
+  // It is absent until the session has observed its plan tree. It is cheap to
+  // compute: the session keeps it in memory and refreshes it for FREE on every
+  // plan-task mutation from the post-image the mutator already holds (no
+  // per-snapshot storage read), and lazily seeds it once (bounded single-page
+  // read) for a hydrated session that has pre-existing tasks but has not mutated
+  // yet. UIs drive per-task detail off the `papersflow.plan_task.updated` event
+  // deltas (§10.3) + the bounded `plan_task_check` read, not this summary.
   subscribeDisplayState(
     listener: (state: HarnessDisplayStateSnapshotV1) => void,
     opts?: { windowMs?: number },

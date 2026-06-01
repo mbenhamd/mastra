@@ -13,9 +13,9 @@
 
 import { describe, expect, it, beforeEach } from 'vitest';
 
-import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import type { JsonValue, SessionRecord } from '../../storage/domains/harness/types';
+import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { HarnessPlanTaskCycleError, HarnessPlanTaskInProgressConflictError } from './plan-task-hierarchy';
 import {
   planTaskAdd,
@@ -25,8 +25,8 @@ import {
   planTaskReparent,
   planTaskUpdate,
   PLAN_TASK_UPDATED_EVENT,
-  type PlanTaskSessionPort,
 } from './plan-task-session';
+import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
 
 const OWNER = 'owner-1';
 const SESSION_ID = 's1';
@@ -56,13 +56,15 @@ function sessionRecord(): SessionRecord {
 interface Harness {
   storage: InMemoryHarness;
   port: PlanTaskSessionPort;
-  events: Array<{ op: string; affectedTaskIds: string[] }>;
+  events: PlanTaskUpdatedPayload[];
+  summaries: PlanTaskSummary[];
 }
 
 async function setup(): Promise<Harness> {
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
   await storage.createOrLoadActiveSession(sessionRecord(), { initialLease: { ownerId: OWNER, ttlMs: 60_000 } });
-  const events: Array<{ op: string; affectedTaskIds: string[] }> = [];
+  const events: PlanTaskUpdatedPayload[] = [];
+  const summaries: PlanTaskSummary[] = [];
   const port: PlanTaskSessionPort = {
     id: SESSION_ID,
     resourceId: 'r1',
@@ -72,10 +74,13 @@ async function setup(): Promise<Harness> {
     ownerId: OWNER,
     sessionVersion: 1,
     emitPlanTaskEvent: (payload: JsonValue) => {
-      events.push(payload as { op: string; affectedTaskIds: string[] });
+      events.push(payload as unknown as PlanTaskUpdatedPayload);
+    },
+    setPlanTaskSummary: summary => {
+      summaries.push(summary);
     },
   };
-  return { storage, port, events };
+  return { storage, port, events, summaries };
 }
 
 async function listAll(storage: InMemoryHarness) {
@@ -96,7 +101,8 @@ describe('planTaskAdd', () => {
     expect(view.statusSource).toBe('explicit');
     const stored = await listAll(storage);
     expect(stored.get(view.taskId)?.content).toBe('do thing');
-    expect(events).toEqual([{ op: 'add', affectedTaskIds: [view.taskId] }]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ op: 'add', affectedTaskIds: [view.taskId] });
   });
 
   it('appends order among siblings', async () => {
@@ -132,7 +138,10 @@ describe('planTaskDecompose', () => {
     expect(stored.size).toBe(3);
     expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
     expect(stored.get(parent.taskId)?.status).toBe('pending');
-    expect(events.at(-1)).toEqual({ op: 'decompose', affectedTaskIds: [parent.taskId, ...children.map(c => c.taskId)] });
+    expect(events.at(-1)).toMatchObject({
+      op: 'decompose',
+      affectedTaskIds: [parent.taskId, ...children.map(c => c.taskId)],
+    });
   });
 
   it('rejects empty children list', async () => {
@@ -289,10 +298,171 @@ describe('planTaskCheck — bounded read', () => {
     expect(new Set(res.tasks.map(t => t.taskId))).toEqual(new Set([firstChild.taskId, root]));
   });
 
-  it('does not emit an event (read-only)', async () => {
-    const before = h.events.length;
+  it('does not emit an event nor refresh the summary (read-only)', async () => {
+    const beforeEvents = h.events.length;
+    const beforeSummaries = h.summaries.length;
     await planTaskCheck(h.port, { limit: 10 });
-    expect(h.events.length).toBe(before);
+    expect(h.events.length).toBe(beforeEvents);
+    expect(h.summaries.length).toBe(beforeSummaries);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TM-5: enriched event payload (per-task deltas, incl. rollup cascade)
+// ---------------------------------------------------------------------------
+
+/** A value is JSON-safe iff it round-trips through JSON without loss. */
+function assertJsonSafe(value: unknown): void {
+  expect(JSON.parse(JSON.stringify(value))).toEqual(value);
+}
+
+describe('TM-5 enriched event payload', () => {
+  it('add carries a compact delta with status/source/order/content + parentTaskId', async () => {
+    const { port, events } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parent' });
+    const child = await planTaskAdd(port, { content: 'child', parentTaskId: parent.taskId, status: 'in_progress' });
+
+    const payload = events.at(-1)!;
+    expect(payload.op).toBe('add');
+    const childDelta = payload.deltas.find(d => d.taskId === child.taskId)!;
+    expect(childDelta).toMatchObject({
+      taskId: child.taskId,
+      parentTaskId: parent.taskId,
+      status: 'in_progress',
+      statusSource: 'explicit',
+      content: 'child',
+    });
+    expect(typeof childDelta.order).toBe('number');
+    assertJsonSafe(payload);
+  });
+
+  it('add cascades the rollup: the parent that flipped derived appears in deltas with its rolled-up status', async () => {
+    const { port, events } = await setup();
+    const parent = await planTaskAdd(port, { content: 'parent' });
+    // Adding an in_progress child flips the parent to derived AND rolls it up.
+    const child = await planTaskAdd(port, { content: 'child', parentTaskId: parent.taskId, status: 'in_progress' });
+
+    const payload = events.at(-1)!;
+    const ids = payload.deltas.map(d => d.taskId).sort();
+    expect(ids).toEqual([parent.taskId, child.taskId].sort());
+    const parentDelta = payload.deltas.find(d => d.taskId === parent.taskId)!;
+    // The parent's status CHANGED via rollup (pending → in_progress) and its
+    // source flipped to derived — included even though it was not directly edited.
+    expect(parentDelta).toMatchObject({ status: 'in_progress', statusSource: 'derived' });
+    // A pure-rollup parent delta omits content (compact).
+    expect(parentDelta.content).toBeUndefined();
+  });
+
+  it('complete cascades: a derived parent whose status changes is in the deltas, bounded to the affected set', async () => {
+    const { port, events } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const [c1, c2] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    // An unrelated, untouched root must NOT appear in the complete's deltas.
+    const other = await planTaskAdd(port, { content: 'other' });
+    await planTaskComplete(port, c1!.taskId);
+    // c1 completed but c2 still pending → parent stays pending (no parent delta yet).
+    let payload = events.at(-1)!;
+    expect(payload.deltas.map(d => d.taskId)).toEqual([c1!.taskId]);
+
+    await planTaskComplete(port, c2!.taskId);
+    payload = events.at(-1)!;
+    const ids = new Set(payload.deltas.map(d => d.taskId));
+    // c2 (edited) + parent (rolled up to completed) — and NOT the unrelated root.
+    expect(ids).toEqual(new Set([c2!.taskId, parent.taskId]));
+    expect(ids.has(other.taskId)).toBe(false);
+    const parentDelta = payload.deltas.find(d => d.taskId === parent.taskId)!;
+    expect(parentDelta).toMatchObject({ status: 'completed', statusSource: 'derived' });
+    assertJsonSafe(payload);
+  });
+
+  it('decompose deltas cover the created children + the parent that flipped derived', async () => {
+    const { port, events } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const children = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    const payload = events.at(-1)!;
+    const ids = new Set(payload.deltas.map(d => d.taskId));
+    expect(ids).toEqual(new Set([parent.taskId, ...children.map(c => c.taskId)]));
+    // Children carry content (this op created them); each has the parent edge.
+    for (const c of children) {
+      const d = payload.deltas.find(x => x.taskId === c.taskId)!;
+      expect(d.parentTaskId).toBe(parent.taskId);
+      expect(d.content).toBe(c.content);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TM-5: bounded display-state summary (pushed to the session on mutation)
+// ---------------------------------------------------------------------------
+
+describe('TM-5 plan-task summary', () => {
+  it('counts/byStatus/inProgressTaskIds/rootCount track add → decompose → complete', async () => {
+    const { port, summaries } = await setup();
+
+    const r1 = await planTaskAdd(port, { content: 'r1' });
+    expect(summaries.at(-1)).toEqual({
+      total: 1,
+      byStatus: { pending: 1 },
+      inProgressTaskIds: [],
+      rootCount: 1,
+    });
+
+    // Second root.
+    const r2 = await planTaskAdd(port, { content: 'r2' });
+    expect(summaries.at(-1)).toMatchObject({ total: 2, rootCount: 2, byStatus: { pending: 2 } });
+
+    // Decompose r1 into two children: 4 nodes, 2 roots; r1 flips derived but
+    // stays pending (children pending).
+    const [c1, c2] = await planTaskDecompose(port, r1.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    expect(summaries.at(-1)).toMatchObject({ total: 4, rootCount: 2, byStatus: { pending: 4 } });
+
+    // Set c1 in_progress → its derived root r1 rolls up to in_progress too.
+    await planTaskUpdate(port, c1!.taskId, { status: 'in_progress' });
+    let s = summaries.at(-1)!;
+    expect(s.total).toBe(4);
+    expect(s.byStatus.in_progress).toBe(2); // c1 + derived r1
+    expect(s.byStatus.pending).toBe(2); // c2 + r2
+    expect(new Set(s.inProgressTaskIds)).toEqual(new Set([c1!.taskId, r1.taskId]));
+
+    // Complete c1 and c2 → r1 rolls up to completed.
+    await planTaskUpdate(port, c1!.taskId, { status: 'completed' });
+    await planTaskComplete(port, c2!.taskId);
+    s = summaries.at(-1)!;
+    expect(s.byStatus.completed).toBe(3); // c1 + c2 + derived r1
+    expect(s.byStatus.pending).toBe(1); // r2
+    expect(s.inProgressTaskIds).toEqual([]);
+    void r2;
+  });
+
+  it('is BOUNDED — it does NOT embed the full task tree, only counts + active ids + root count', async () => {
+    const { port, summaries } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    await planTaskDecompose(port, root.taskId, [{ content: 'c1' }, { content: 'c2' }, { content: 'c3' }]);
+    const s = summaries.at(-1)!;
+    // Exactly the bounded keys — no per-task array / content / tree embedded.
+    expect(Object.keys(s).sort()).toEqual(['byStatus', 'inProgressTaskIds', 'rootCount', 'total']);
+    // inProgressTaskIds is bounded by active focus, NOT total tasks.
+    expect(s.total).toBe(4);
+    expect(s.inProgressTaskIds.length).toBe(0);
+    assertJsonSafe(s);
+  });
+
+  it('the summary is computed from the in-memory post-image (no extra storage read on mutation)', async () => {
+    const { storage, port, summaries } = await setup();
+    // Count storage list calls to prove the summary refresh adds none beyond the
+    // op's own loadAllTasks.
+    let listCalls = 0;
+    const origList = storage.listPlanTasks.bind(storage);
+    (storage as unknown as { listPlanTasks: typeof storage.listPlanTasks }).listPlanTasks = (args => {
+      listCalls += 1;
+      return origList(args);
+    }) as typeof storage.listPlanTasks;
+
+    await planTaskAdd(port, { content: 'a' });
+    // One add does exactly one paged load for rollup/cycle work; the summary
+    // refresh reuses that post-image, so no SECOND list call is made.
+    expect(listCalls).toBe(1);
+    expect(summaries).toHaveLength(1);
   });
 });
 
@@ -311,9 +481,7 @@ describe('transaction atomicity', () => {
     const rec = (await storage.loadSession({ sessionId: SESSION_ID }))!;
     await storage.saveSession({ ...rec, lastActivityAt: 1 }, { ownerId: OWNER, ifVersion: 1 });
     // Now a decompose under the stale port version must reject and write nothing.
-    await expect(
-      planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]),
-    ).rejects.toThrow();
+    await expect(planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }])).rejects.toThrow();
     const after = await listAll(storage);
     expect(after.size).toBe(before.size); // only the original parent
   });
