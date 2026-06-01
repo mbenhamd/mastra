@@ -57,6 +57,7 @@ export type {
   TurnErrorEvent,
   TokenUsageChangedEvent,
   TextDeltaEvent,
+  ReasoningDeltaEvent,
   ToolEndEvent,
   ToolStartEvent,
 } from './events';

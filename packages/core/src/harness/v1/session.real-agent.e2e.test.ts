@@ -68,6 +68,26 @@ function textStream(deltas: string[]) {
   ]);
 }
 
+/**
+ * A raw provider stream that emits reasoning deltas, then text deltas, then
+ * finishes `stop`. The provider-level `reasoning-delta` chunk carries `delta`
+ * (AI-SDK v5 `LanguageModelV2StreamPart`); the v5 transform maps it into the
+ * mastra chunk `{ type:'reasoning-delta', payload:{ text } }` the harness reads.
+ */
+function reasoningTextStream(reasoningDeltas: string[], textDeltas: string[]) {
+  return convertArrayToReadableStream([
+    { type: 'stream-start', warnings: [] },
+    { type: 'response-metadata', id: 'id-reason', modelId: 'mock-model-id', timestamp: new Date(0) },
+    { type: 'reasoning-start', id: 'reason-1' },
+    ...reasoningDeltas.map(delta => ({ type: 'reasoning-delta', id: 'reason-1', delta })),
+    { type: 'reasoning-end', id: 'reason-1' },
+    { type: 'text-start', id: 'text-1' },
+    ...textDeltas.map(delta => ({ type: 'text-delta', id: 'text-1', delta })),
+    { type: 'text-end', id: 'text-1' },
+    { type: 'finish', finishReason: 'stop', usage: testUsage },
+  ]);
+}
+
 /** A raw provider stream that calls `toolName` with `inputJson`, finishing `tool-calls`. */
 function toolCallStream(toolCallId: string, toolName: string, inputJson: string) {
   return convertArrayToReadableStream([
@@ -752,8 +772,9 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       },
     });
 
-    // --- REAL child agent: model emits a real tool-call, then streamed text --
+    // --- REAL child agent: model emits a real tool-call, then reasoning+text --
     const childDeltas = ['The ', 'answer ', 'is ', '42.'];
+    const childReasoning = ['Let me ', 'check the fact.'];
     let childCall = 0;
     const childModel = new MockLanguageModelV2({
       doStream: async () => {
@@ -765,10 +786,12 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
             stream: childToolCallStream('child-tc-1', 'lookupFact', '{"topic":"the answer"}'),
           };
         }
+        // The child's post-tool turn streams reasoning, then its summary text —
+        // exercising both subagent_reasoning_delta (GAP-B) and subagent_text_delta.
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
-          stream: textStream(childDeltas),
+          stream: reasoningTextStream(childReasoning, childDeltas),
         };
       },
     });
@@ -884,9 +907,23 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       expect(subTextDeltas.every(e => e.subagentSessionId === childSessionId)).toBe(true);
       expect(subTextDeltas.every(e => e.depth === 1)).toBe(true);
 
+      // --- subagent_reasoning_delta (the child's REAL streamed reasoning) ----
+      // GAP-B: the child streamed reasoning before its summary; those surface as
+      // subagent_reasoning_delta with the same attribution as text deltas.
+      const subReasoningDeltas = events.filter(e => e.type === 'subagent_reasoning_delta') as Array<{
+        delta: string;
+        depth: number;
+        parentId: string;
+        subagentSessionId: string;
+      }>;
+      expect(subReasoningDeltas.map(e => e.delta)).toEqual(childReasoning);
+      expect(subReasoningDeltas.every(e => e.parentId === session.id)).toBe(true);
+      expect(subReasoningDeltas.every(e => e.subagentSessionId === childSessionId)).toBe(true);
+      expect(subReasoningDeltas.every(e => e.depth === 1)).toBe(true);
+
       // --- subagent_tool_start / subagent_tool_end (child's REAL tool) -------
       const subToolStart = events.find(e => e.type === 'subagent_tool_start') as
-        | { toolName: string; innerToolCallId: string; parentId: string; depth: number }
+        | { toolName: string; innerToolCallId: string; input: any; parentId: string; depth: number }
         | undefined;
       const subToolEnd = events.find(e => e.type === 'subagent_tool_end') as
         | { toolName: string; innerToolCallId: string; output: any; isError: boolean; parentId: string }
@@ -894,6 +931,8 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       expect(subToolStart).toBeDefined();
       expect(subToolStart!.toolName).toBe('lookupFact');
       expect(subToolStart!.innerToolCallId).toBe('child-tc-1');
+      // GAP-A: the subagent tool's projected input args reach the parent stream.
+      expect(subToolStart!.input).toEqual({ topic: 'the answer' });
       expect(subToolStart!.parentId).toBe(session.id);
       expect(subToolStart!.depth).toBe(1);
 

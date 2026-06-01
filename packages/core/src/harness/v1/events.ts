@@ -198,6 +198,20 @@ export interface TextDeltaEvent extends HarnessEventBase {
 }
 
 /**
+ * Streaming assistant reasoning/thinking text (§10.2). One `reasoning_delta`
+ * per `reasoning-delta` chunk the model streams within a turn — mirrors
+ * `text_delta`. Additive and entirely chunk-driven: it is emitted only when a
+ * reasoning chunk actually arrives, so models that do not stream reasoning (or
+ * have reasoning disabled) produce none. The harness never forces reasoning on.
+ */
+export interface ReasoningDeltaEvent extends HarnessEventBase {
+  type: 'reasoning_delta';
+  runId: string;
+  signalId?: string;
+  delta: string;
+}
+
+/**
  * Tool-call lifecycle (§10.2). `tool_start` when the (complete) tool call is
  * issued; `tool_end` when it resolves. Public payloads are JSON-safe
  * projections (raw non-JSON tool objects stay inside the runtime). §10.2 has no
@@ -606,6 +620,22 @@ export interface SubagentTextDeltaEvent extends HarnessEventBase {
   depth: number;
 }
 
+/**
+ * A subagent's streaming reasoning/thinking text, attributed to the parent
+ * (§10.2 / §10.6) — mirrors `subagent_text_delta`. Bridged from the child's
+ * own `reasoning_delta` events. Like all subagent deltas, additive and emitted
+ * only when the child actually streams reasoning.
+ */
+export interface SubagentReasoningDeltaEvent extends HarnessEventBase {
+  type: 'subagent_reasoning_delta';
+  toolCallId: string;
+  subagentSessionId: string;
+  agentType: string;
+  delta: string;
+  parentId?: string;
+  depth: number;
+}
+
 export interface SubagentToolStartEvent extends HarnessEventBase {
   type: 'subagent_tool_start';
   toolCallId: string;
@@ -613,6 +643,14 @@ export interface SubagentToolStartEvent extends HarnessEventBase {
   agentType: string;
   innerToolCallId: string;
   toolName: string;
+  /**
+   * JSON-safe projection of the subagent tool call's input/args — mirrors
+   * `tool_start.input` so consumers can render a subagent's tool args just
+   * like the top-level agent's. Sourced from the bridged `tool_start.input`,
+   * which was already projected at emit through
+   * {@link projectToolEventPayloadForJson} + `_internalMaxEventPayloadBytes`.
+   */
+  input: unknown;
   parentId?: string;
   depth: number;
 }
@@ -722,6 +760,7 @@ export type HarnessEvent =
   | PermissionPolicyChangedEvent
   | AgentStartEvent
   | TextDeltaEvent
+  | ReasoningDeltaEvent
   | ToolStartEvent
   | ToolEndEvent
   | AgentEndEvent
@@ -736,6 +775,7 @@ export type HarnessEvent =
   | PlanApprovalRequiredEvent
   | SubagentStartEvent
   | SubagentTextDeltaEvent
+  | SubagentReasoningDeltaEvent
   | SubagentToolStartEvent
   | SubagentToolEndEvent
   | SubagentEndEvent
@@ -1182,6 +1222,7 @@ const RESERVED_EVENT_PREFIXES: readonly string[] = [
   // with any of these (even dotted, e.g. `tool_start.progress` is rejected).
   'agent_',
   'text_',
+  'reasoning_',
   'message_',
   'queue_',
   'tool_',

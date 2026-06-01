@@ -130,6 +130,7 @@ import type {
   HarnessEventListener,
   HarnessEventUnsubscribe,
   SubagentEndEvent,
+  SubagentReasoningDeltaEvent,
   SubagentStartEvent,
   SubagentTextDeltaEvent,
   SubagentToolEndEvent,
@@ -1287,7 +1288,10 @@ export class Session {
     // recovers via the §10.5 snapshot/message path. Removes per-token write amplification.
     if (
       !this._persistTransientStreamingEvents &&
-      (event.type === 'text_delta' || event.type === 'subagent_text_delta')
+      (event.type === 'text_delta' ||
+        event.type === 'subagent_text_delta' ||
+        event.type === 'reasoning_delta' ||
+        event.type === 'subagent_reasoning_delta')
     ) {
       return;
     }
@@ -1356,6 +1360,7 @@ export class Session {
     event:
       | Omit<SubagentStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentTextDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
+      | Omit<SubagentReasoningDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
@@ -4288,6 +4293,20 @@ export class Session {
         const payload = chunk.payload as { id: string };
         if (this._currentMessageId === payload.id) {
           this._currentMessageId = undefined;
+        }
+        return;
+      }
+      case 'reasoning-delta': {
+        // §10.2 streaming reasoning. Mirrors `text-delta`: emit one
+        // `reasoning_delta` per chunk that carries real reasoning text (gate on
+        // non-empty + a known runId). `reasoning-start`/`reasoning-end` carry no
+        // text and define no message boundary, so they emit nothing (default
+        // case). The AI-SDK chunk is `{ type:'reasoning-delta', payload:{ text } }`
+        // (stream/types.ts ReasoningDeltaPayload; aisdk/v5/transform.ts maps the
+        // provider `reasoning-delta.delta` into `payload.text`).
+        const payload = chunk.payload as { id: string; text?: string };
+        if (runId !== undefined && typeof payload?.text === 'string' && payload.text.length > 0) {
+          this._emitTurnEvent({ type: 'reasoning_delta', runId, delta: payload.text });
         }
         return;
       }

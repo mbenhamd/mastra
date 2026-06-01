@@ -348,6 +348,50 @@ describe('Session events — fullStream drain', () => {
     expect(textDeltas.every(e => e.runId === 'fake-run')).toBe(true);
   });
 
+  it('emits reasoning_delta for each streamed reasoning chunk, gating on non-empty text (§10.2)', async () => {
+    const { harness, agent } = setup();
+    // Mastra-level fullStream chunks. `reasoning-delta` carries `payload.text`
+    // (stream/types.ts ReasoningDeltaPayload), mirroring `text-delta`.
+    agent.chunks = [
+      { type: 'reasoning-start', payload: { id: 'r-1' }, runId: 'fake-run' },
+      { type: 'reasoning-delta', payload: { id: 'r-1', text: 'think' }, runId: 'fake-run' },
+      { type: 'reasoning-delta', payload: { id: 'r-1', text: 'ing' }, runId: 'fake-run' },
+      // Empty reasoning text must not produce an event (mirrors text-delta).
+      { type: 'reasoning-delta', payload: { id: 'r-1', text: '' }, runId: 'fake-run' },
+      { type: 'reasoning-end', payload: { id: 'r-1' }, runId: 'fake-run' },
+      { type: 'text-delta', payload: { id: 'msg-1', text: 'answer' }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+    await session.message({ content: 'hi' });
+
+    const reasoningDeltas = events.filter(e => e.type === 'reasoning_delta') as Array<
+      Extract<HarnessEvent, { type: 'reasoning_delta' }>
+    >;
+    expect(reasoningDeltas.map(e => e.delta)).toEqual(['think', 'ing']);
+    expect(reasoningDeltas.every(e => e.runId === 'fake-run')).toBe(true);
+  });
+
+  it('emits NO reasoning_delta when the model streams no reasoning (additive — never forced on)', async () => {
+    const { harness, agent } = setup();
+    agent.chunks = [
+      { type: 'text-delta', payload: { id: 'msg-1', text: 'no thinking here' }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+    await session.message({ content: 'hi' });
+
+    expect(events.map(e => e.type)).not.toContain('reasoning_delta');
+  });
+
   const streamChunks = [
     { type: 'text-start', payload: { id: 'm' }, runId: 'fake-run' },
     { type: 'text-delta', payload: { id: 'm', text: 'hi' }, runId: 'fake-run' },

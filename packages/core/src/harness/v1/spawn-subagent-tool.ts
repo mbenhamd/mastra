@@ -179,6 +179,18 @@ export function createSpawnSubagentTool(parent: Session) {
               });
             }
             break;
+          case 'reasoning_delta':
+            if (typeof event.delta === 'string' && event.delta.length > 0) {
+              parent._emitSubagentEvent({
+                type: 'subagent_reasoning_delta',
+                toolCallId,
+                subagentSessionId: child.id,
+                agentType,
+                delta: event.delta,
+                depth: childDepth,
+              });
+            }
+            break;
           case 'tool_start':
             innerToolNames.set(event.toolCallId, event.toolName);
             parent._emitSubagentEvent({
@@ -188,6 +200,10 @@ export function createSpawnSubagentTool(parent: Session) {
               agentType,
               innerToolCallId: event.toolCallId,
               toolName: event.toolName,
+              // `event.input` is already the JSON-safe projection the child's
+              // own `_emitForChunk` produced via projectToolEventPayloadForJson
+              // + `_internalMaxEventPayloadBytes`, so forward it as-is.
+              input: event.input,
               depth: childDepth,
             });
             break;

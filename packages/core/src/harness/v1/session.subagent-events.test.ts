@@ -145,7 +145,33 @@ describe('Session._emitSubagentEvent', () => {
     });
   });
 
-  it('emits subagent_tool_start with innerToolCallId + toolName', async () => {
+  it('emits subagent_reasoning_delta with parentId + depth', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+
+    session._emitSubagentEvent({
+      type: 'subagent_reasoning_delta',
+      toolCallId: 'tool-call-1',
+      subagentSessionId: 'child-1',
+      agentType: 'explore',
+      delta: 'thinking',
+      depth: 1,
+    });
+
+    expect(events[0]).toMatchObject({
+      type: 'subagent_reasoning_delta',
+      delta: 'thinking',
+      depth: 1,
+      parentId: session.id,
+    });
+  });
+
+  it('emits subagent_tool_start with innerToolCallId + toolName + input', async () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
@@ -161,6 +187,7 @@ describe('Session._emitSubagentEvent', () => {
       agentType: 'explore',
       innerToolCallId: 'inner-tc-1',
       toolName: 'searchContent',
+      input: { query: 'usages of X' },
       depth: 1,
     });
 
@@ -168,6 +195,7 @@ describe('Session._emitSubagentEvent', () => {
       type: 'subagent_tool_start',
       innerToolCallId: 'inner-tc-1',
       toolName: 'searchContent',
+      input: { query: 'usages of X' },
       parentId: session.id,
     });
   });
