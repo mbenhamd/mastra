@@ -207,6 +207,59 @@ describe('plan-task tool execution mid-turn', () => {
   });
 });
 
+describe('plan-task concurrent-write serialization (§5.8 / TM-5)', () => {
+  // A single model turn can emit parallel tool calls (the agent loop runs a
+  // step's tool calls concurrently). Two `task_update` ops each driving a
+  // DIFFERENT sibling `in_progress` under the SAME root both read the same
+  // pre-image and both pass `assertSingleInProgress`. The storage fence keys on
+  // the SESSION version (which plan-task writes never bump) and per-row OCC only
+  // guards same-row writes, so without per-session serialization both commit and
+  // break the per-root single-`in_progress` invariant. `_serializePlanTaskWrite`
+  // runs each op (read + check + write) one-at-a-time on the flush chain, so the
+  // second op's read sees the first's committed `in_progress` and is rejected.
+  it('two concurrent task_update in_progress on sibling tasks under one root → exactly one wins', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    let release!: () => void;
+    const holdUntil = new Promise<void>(r => (release = r));
+    agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'done' });
+    const turn = session.message({ content: 'go' });
+    await vitestPoll(() => agent.streamCalls.length > 0);
+
+    const tools = createPlanTaskTools(session);
+    const ctx = {
+      abortSignal: new AbortController().signal,
+      agent: { toolCallId: 'tc-seed', runId: 'mock-run' },
+      requestContext: { get: () => undefined },
+    } as any;
+    // root with two pending sibling children.
+    const root = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'root' } as any, ctx)) as any;
+    const [c1, c2] = await session._planTaskDecompose(root.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+
+    // Fire both in_progress writes concurrently against the SAME pre-image.
+    const results = await Promise.allSettled([
+      session._planTaskUpdate(c1.taskId, { status: 'in_progress' }),
+      session._planTaskUpdate(c2.taskId, { status: 'in_progress' }),
+    ]);
+
+    const fulfilled = results.filter(r => r.status === 'fulfilled');
+    const rejected = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+    // Exactly one commits; the loser is rejected with the single-in_progress error.
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0]!.reason as Error).name).toBe('HarnessPlanTaskInProgressConflictError');
+
+    // Durable truth: exactly one child is in_progress under the root.
+    const stored = await session._internalStorage.listPlanTasks({ sessionId: session.id, limit: 50 });
+    const inProgress = stored.tasks.filter(t => t.status === 'in_progress' && t.statusSource === 'explicit');
+    expect(inProgress).toHaveLength(1);
+
+    release();
+    await turn;
+  });
+});
+
 /** Poll a predicate without a fixed sleep. */
 async function vitestPoll(pred: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();

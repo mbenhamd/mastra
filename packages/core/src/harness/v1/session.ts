@@ -138,6 +138,7 @@ import type {
   SubagentToolStartEvent,
 } from './events';
 import type { Harness } from './harness';
+import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import type {
   AddTaskInput,
   CheckInput,
@@ -160,7 +161,6 @@ import {
   computePlanTaskSummary,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
-import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import { createPlanTaskTools } from './plan-task-tool';
 import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
@@ -11401,6 +11401,36 @@ export class Session {
   }
 
   /**
+   * Serialize a plan-task read-modify-write op onto the same per-session
+   * `_flushChain` that serializes `_flushUpdate`.
+   *
+   * §5.8 / TM-5 concurrency: a single model turn can emit parallel tool calls
+   * (the agent loop executes tool calls in a step concurrently), so two
+   * `task_*` tools can run at once for one live session. Each plan-task op does
+   * a read (`listPlanTasks`) → compute (rollup / single-`in_progress` / cycle
+   * checks) → write (`mutatePlanTasksForSession`). The storage fence keys on the
+   * SESSION version, which plan-task writes do NOT bump, and per-row OCC only
+   * guards same-row writes — so two ops touching DIFFERENT rows (e.g. each
+   * driving a different sibling `in_progress`) both read the same pre-image,
+   * both pass their invariant checks, and both commit, violating the per-root
+   * single-`in_progress` / rollup invariants. Running the whole op body inside
+   * this chain makes them one-at-a-time per session, so the second op's read
+   * sees the first op's committed result and its invariant check is honored.
+   *
+   * Unlike `_flushUpdate`, errors propagate to the caller (a `task_*` tool must
+   * surface a conflict) but are swallowed from the stored chain link so one
+   * op's failure never poisons a later op.
+   */
+  private _serializePlanTaskWrite<T>(run: () => Promise<T>): Promise<T> {
+    const next = this._flushChain.then(run, run);
+    this._flushChain = next.then(
+      () => {},
+      () => {},
+    );
+    return next;
+  }
+
+  /**
    * Build the toolset surface for a single turn:
    *   - mode.tools (replace) wins over agent's own tools
    *   - mode.additionalTools merges with agent's tools
@@ -11854,29 +11884,29 @@ export class Session {
     this._emitCustomEvent({ type: PLAN_TASK_UPDATED_EVENT, payload });
   }
 
-  /** @internal — `task_add`. Add one plan task. */
+  /** @internal — `task_add`. Add one plan task. Serialized per session. */
   _planTaskAdd(input: AddTaskInput): Promise<PlanTaskView> {
-    return planTaskAdd(this._planTaskPort(), input);
+    return this._serializePlanTaskWrite(() => planTaskAdd(this._planTaskPort(), input));
   }
 
   /** @internal — `task_decompose`. Add N children under a parent atomically. */
   _planTaskDecompose(parentTaskId: string, children: DecomposeChildInput[]): Promise<PlanTaskView[]> {
-    return planTaskDecompose(this._planTaskPort(), parentTaskId, children);
+    return this._serializePlanTaskWrite(() => planTaskDecompose(this._planTaskPort(), parentTaskId, children));
   }
 
   /** @internal — `task_reparent`. Move a subtree (cycle-checked). */
   _planTaskReparent(taskId: string, newParentTaskId: string | null, order?: number): Promise<void> {
-    return planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order);
+    return this._serializePlanTaskWrite(() => planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order));
   }
 
   /** @internal — `task_update`. Patch status/content/priority/blockedBy. */
   _planTaskUpdate(taskId: string, patch: UpdateTaskInput): Promise<PlanTaskView> {
-    return planTaskUpdate(this._planTaskPort(), taskId, patch);
+    return this._serializePlanTaskWrite(() => planTaskUpdate(this._planTaskPort(), taskId, patch));
   }
 
   /** @internal — `task_complete`. Mark completed; triggers rollup. */
   _planTaskComplete(taskId: string): Promise<PlanTaskView> {
-    return planTaskComplete(this._planTaskPort(), taskId);
+    return this._serializePlanTaskWrite(() => planTaskComplete(this._planTaskPort(), taskId));
   }
 
   /** @internal — `plan_task_check`. The bounded anti-forgetting read. */
@@ -11972,7 +12002,9 @@ export class Session {
     // created but never linked; close it best-effort so we leave no orphan.
     let view: PlanTaskView;
     try {
-      view = await planTaskDelegate(this._planTaskPort(), { taskId: input.taskId, subagentSessionId: child.id });
+      view = await this._serializePlanTaskWrite(() =>
+        planTaskDelegate(this._planTaskPort(), { taskId: input.taskId, subagentSessionId: child.id }),
+      );
     } catch (err) {
       try {
         await child.close();
@@ -12019,9 +12051,7 @@ export class Session {
       // masquerade as a completed plan task.
       const finishReason = (result as { finishReason?: string } | undefined)?.finishReason;
       const failed =
-        finishReason === 'aborted' ||
-        finishReason === 'error' ||
-        child._record.cancelRequest !== undefined;
+        finishReason === 'aborted' || finishReason === 'error' || child._record.cancelRequest !== undefined;
       outcome = failed ? 'failed' : 'completed';
     } catch {
       // Subagent error / abort / cancel that rejected → the delegated task FAILED.
@@ -12051,7 +12081,9 @@ export class Session {
   ): Promise<void> {
     if (this._state === 'closed') return;
     try {
-      await planTaskReconcileDelegation(this._planTaskPort(), { taskId, subagentSessionId, outcome });
+      await this._serializePlanTaskWrite(() =>
+        planTaskReconcileDelegation(this._planTaskPort(), { taskId, subagentSessionId, outcome }),
+      );
     } catch {
       // A fence/version race is benign here — a later reconcile (or hydrate scan)
       // re-reads the durable link and retries. The durable child outcome is the
