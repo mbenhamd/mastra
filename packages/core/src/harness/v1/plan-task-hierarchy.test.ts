@@ -164,6 +164,73 @@ describe('rollupTree', () => {
     const { changed } = rollupTree(tasks);
     expect(changed.get('p')).toBe('blocked');
   });
+
+  // Finding 1: an explicit NON-terminal parent must STILL re-derive from
+  // children. Only an explicit TERMINAL status is immune.
+  it('explicit NON-terminal parent re-derives from children (a failed child rolls it to failed)', () => {
+    const tasks = [
+      // p was re-marked explicit 'pending' by the model, but it has children.
+      task({ taskId: 'p', status: 'pending', statusSource: 'explicit' }),
+      task({ taskId: 'c', parentTaskId: 'p', status: 'failed', statusSource: 'explicit' }),
+    ];
+    const { changed, source } = rollupTree(tasks);
+    expect(changed.get('p')).toBe('failed');
+    // It is now owned by child rollup → derived.
+    expect(source.get('p')).toBe('derived');
+  });
+
+  it('explicit terminal parent is STILL immune even with a failed child', () => {
+    const tasks = [
+      task({ taskId: 'p', status: 'completed', statusSource: 'explicit' }),
+      task({ taskId: 'c', parentTaskId: 'p', status: 'failed', statusSource: 'explicit' }),
+    ];
+    const { changed } = rollupTree(tasks);
+    expect(changed.has('p')).toBe(false);
+  });
+
+  // Finding 2: a non-terminal LEAF (no children) with an unsatisfied blockedBy
+  // dep must surface 'blocked' even though it started statusSource 'explicit'.
+  it('a non-terminal explicit LEAF with an unsatisfied blockedBy dep rolls to blocked', () => {
+    const tasks = [
+      task({ taskId: 'leaf', status: 'pending', statusSource: 'explicit', blockedBy: ['dep'] }),
+      task({ taskId: 'dep', status: 'in_progress', statusSource: 'explicit' }),
+    ];
+    const { changed, source } = rollupTree(tasks);
+    expect(changed.get('leaf')).toBe('blocked');
+    // A blockedBy overlay flips the node derived so it reverts to `pending` when
+    // the dep clears (a childless derived node has no anchor to any other status).
+    expect(source.get('leaf')).toBe('derived');
+  });
+
+  it('a derived childless leaf reverts to pending when its blockedBy dep clears', () => {
+    const tasks = [
+      // leaf already rolled to blocked/derived; dep now completed.
+      task({ taskId: 'leaf', status: 'blocked', statusSource: 'derived', blockedBy: ['dep'] }),
+      task({ taskId: 'dep', status: 'completed', statusSource: 'explicit' }),
+    ];
+    const { changed } = rollupTree(tasks);
+    expect(changed.get('leaf')).toBe('pending');
+  });
+
+  it('does NOT downgrade an explicit in_progress parent whose children are all pending', () => {
+    const tasks = [
+      task({ taskId: 'p', status: 'in_progress', statusSource: 'explicit' }),
+      task({ taskId: 'c1', parentTaskId: 'p', status: 'pending', statusSource: 'explicit' }),
+      task({ taskId: 'c2', parentTaskId: 'p', status: 'pending', statusSource: 'explicit' }),
+    ];
+    // Derived would be 'pending' (lower precedence) — must NOT clobber explicit in_progress.
+    const { changed } = rollupTree(tasks);
+    expect(changed.has('p')).toBe(false);
+  });
+
+  it('a non-terminal explicit leaf is NOT clobbered to pending when it has no unsatisfied dep', () => {
+    const tasks = [
+      // Explicit in_progress leaf, no children, no deps → must keep in_progress.
+      task({ taskId: 'leaf', status: 'in_progress', statusSource: 'explicit' }),
+    ];
+    const { changed } = rollupTree(tasks);
+    expect(changed.has('leaf')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -250,5 +317,32 @@ describe('assertSingleInProgress', () => {
   });
   it('allows when nothing else is in_progress', () => {
     expect(() => assertSingleInProgress(index, 'a1', statusOfFrom({}))).not.toThrow();
+  });
+
+  // Finding 5: a DERIVED rollup in_progress ancestor is NOT a competing focus —
+  // it just mirrors its explicit in_progress child. Re-confirming that child
+  // must not see its own rolled-up parent as a rival.
+  it('ignores a DERIVED in_progress ancestor (so re-confirming the in_progress child is idempotent)', () => {
+    const tree = [
+      task({ taskId: 'root', status: 'in_progress', statusSource: 'derived' }), // rolled up from c1
+      task({ taskId: 'c1', parentTaskId: 'root', status: 'in_progress', statusSource: 'explicit' }),
+    ];
+    const idx = indexPlanTasks(tree);
+    const statusOf = (id: string) => idx.byId.get(id)?.status ?? 'pending';
+    const sourceOf = (id: string) => idx.byId.get(id)?.statusSource ?? ('explicit' as const);
+    // Re-setting c1 in_progress must NOT throw on the derived 'root' ancestor.
+    expect(() => assertSingleInProgress(idx, 'c1', statusOf, sourceOf)).not.toThrow();
+  });
+
+  it('still rejects two EXPLICIT in_progress in the same root', () => {
+    const tree = [
+      task({ taskId: 'root', status: 'pending', statusSource: 'derived' }),
+      task({ taskId: 'c1', parentTaskId: 'root', status: 'in_progress', statusSource: 'explicit' }),
+      task({ taskId: 'c2', parentTaskId: 'root', status: 'pending', statusSource: 'explicit' }),
+    ];
+    const idx = indexPlanTasks(tree);
+    const statusOf = (id: string) => (id === 'c2' ? 'in_progress' : (idx.byId.get(id)?.status ?? 'pending'));
+    const sourceOf = (id: string) => idx.byId.get(id)?.statusSource ?? ('explicit' as const);
+    expect(() => assertSingleInProgress(idx, 'c2', statusOf, sourceOf)).toThrow(HarnessPlanTaskInProgressConflictError);
   });
 });

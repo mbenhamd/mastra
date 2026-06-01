@@ -202,6 +202,59 @@ describe('blockedBy → blocked rollup', () => {
     expect(stored.get(parent.taskId)?.status).toBe('pending');
     void child;
   });
+
+  // Finding 2: a LEAF (no children) with an unsatisfied blockedBy dep must
+  // surface 'blocked' — rollup is not limited to nodes that already have
+  // children. The leaf keeps statusSource 'explicit' and reverts when released.
+  it('a leaf with an unsatisfied blockedBy dep rolls to blocked, then reverts to its explicit status', async () => {
+    const { storage, port } = await setup();
+    const dep = await planTaskAdd(port, { content: 'dep' });
+    const leaf = await planTaskAdd(port, { content: 'leaf' });
+    // leaf is a childless explicit 'pending' node; give it a pending dep.
+    await planTaskUpdate(port, leaf.taskId, { blockedBy: [dep.taskId] });
+    let stored = await listAll(storage);
+    expect(stored.get(leaf.taskId)?.status).toBe('blocked');
+    // A blockedBy overlay flips the node derived so it reverts when the dep clears.
+    expect(stored.get(leaf.taskId)?.statusSource).toBe('derived');
+    // Completing the dep releases the block → leaf reverts to pending.
+    await planTaskComplete(port, dep.taskId);
+    stored = await listAll(storage);
+    expect(stored.get(leaf.taskId)?.status).toBe('pending');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1: explicit NON-terminal parent re-derives from children
+// ---------------------------------------------------------------------------
+
+describe('explicit non-terminal parent stays under rollup', () => {
+  it('a parent re-marked explicit pending still rolls to failed when a child fails', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    // Parent is now derived (gained children). Re-mark it EXPLICIT pending.
+    await planTaskUpdate(port, parent.taskId, { status: 'pending' });
+    let stored = await listAll(storage);
+    expect(stored.get(parent.taskId)?.status).toBe('pending');
+    expect(stored.get(parent.taskId)?.statusSource).toBe('explicit');
+    // A child now fails → the explicit-non-terminal parent must re-derive.
+    await planTaskUpdate(port, c1!.taskId, { status: 'failed' });
+    stored = await listAll(storage);
+    expect(stored.get(parent.taskId)?.status).toBe('failed');
+    expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
+  });
+
+  it('an explicit TERMINAL parent is still NEVER overwritten by a failing child', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    // Explicitly mark the parent cancelled (terminal) AFTER it has children.
+    await planTaskUpdate(port, parent.taskId, { status: 'cancelled' });
+    await planTaskUpdate(port, c1!.taskId, { status: 'failed' });
+    const stored = await listAll(storage);
+    expect(stored.get(parent.taskId)?.status).toBe('cancelled');
+    expect(stored.get(parent.taskId)?.statusSource).toBe('explicit');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -235,6 +288,25 @@ describe('cycle prevention', () => {
     // a blockedBy [b] would close a→b→a.
     await expect(planTaskUpdate(port, a.taskId, { blockedBy: [b.taskId] })).rejects.toThrow(HarnessPlanTaskCycleError);
   });
+
+  // Finding 4: decompose children[].blockedBy must get the SAME validation as
+  // task_add / task_update (unknown / cross-session / cycle rejection).
+  it('decompose rejects a child blockedBy referencing an unknown task', async () => {
+    const { port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    await expect(
+      planTaskDecompose(port, parent.taskId, [{ content: 'c1', blockedBy: ['does-not-exist'] }]),
+    ).rejects.toThrow(/unknown dependency/);
+  });
+
+  it('decompose accepts a child blockedBy referencing a known in-session task', async () => {
+    const { storage, port } = await setup();
+    const dep = await planTaskAdd(port, { content: 'dep' });
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1', blockedBy: [dep.taskId] }]);
+    const stored = await listAll(storage);
+    expect(stored.get(c1!.taskId)?.blockedBy).toEqual([dep.taskId]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -259,6 +331,46 @@ describe('per-root single in_progress', () => {
     const rootB = await planTaskAdd(port, { content: 'rootB' });
     await planTaskUpdate(port, rootA.taskId, { status: 'in_progress' });
     await expect(planTaskUpdate(port, rootB.taskId, { status: 'in_progress' })).resolves.toBeDefined();
+  });
+
+  // Finding 5: re-confirming an already-in_progress child is idempotent — its
+  // own derived rollup ancestor must NOT count as a competing in_progress.
+  it('re-setting an already-in_progress child to in_progress is idempotent (derived parent is not a rival)', async () => {
+    const { storage, port } = await setup();
+    const parent = await planTaskAdd(port, { content: 'p' });
+    const [c1] = await planTaskDecompose(port, parent.taskId, [{ content: 'c1' }, { content: 'c2' }]);
+    await planTaskUpdate(port, c1!.taskId, { status: 'in_progress' });
+    // The parent has now rolled up to derived in_progress.
+    let stored = await listAll(storage);
+    expect(stored.get(parent.taskId)?.status).toBe('in_progress');
+    expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
+    // Re-confirm c1 in_progress — must NOT throw on the derived parent.
+    await expect(planTaskUpdate(port, c1!.taskId, { status: 'in_progress' })).resolves.toBeDefined();
+  });
+
+  // Finding 3: a reparent that merges two roots, each holding their own explicit
+  // in_progress, must re-run the per-root single-in_progress invariant and reject.
+  it('reparent rejects merging two roots that each hold an explicit in_progress', async () => {
+    const { port } = await setup();
+    const rootA = await planTaskAdd(port, { content: 'rootA' });
+    const rootB = await planTaskAdd(port, { content: 'rootB' });
+    await planTaskUpdate(port, rootA.taskId, { status: 'in_progress' });
+    await planTaskUpdate(port, rootB.taskId, { status: 'in_progress' });
+    // Moving rootB under rootA would put two explicit in_progress in one root.
+    await expect(planTaskReparent(port, rootB.taskId, rootA.taskId)).rejects.toThrow(
+      HarnessPlanTaskInProgressConflictError,
+    );
+  });
+
+  it('reparent allows a move that keeps a single in_progress per root', async () => {
+    const { storage, port } = await setup();
+    const rootA = await planTaskAdd(port, { content: 'rootA' });
+    const rootB = await planTaskAdd(port, { content: 'rootB' });
+    await planTaskUpdate(port, rootA.taskId, { status: 'in_progress' });
+    // rootB has no in_progress → moving it under rootA is fine.
+    await expect(planTaskReparent(port, rootB.taskId, rootA.taskId)).resolves.toBeUndefined();
+    const stored = await listAll(storage);
+    expect(stored.get(rootB.taskId)?.parentTaskId).toBe(rootA.taskId);
   });
 });
 

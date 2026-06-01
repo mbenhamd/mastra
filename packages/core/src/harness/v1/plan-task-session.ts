@@ -248,7 +248,7 @@ function buildCommitOps(
   for (const id of staged.derivedNodes) {
     if (!stagedSource.has(id)) stagedSource.set(id, 'derived');
   }
-  const { changed } = rollupTree(postTasks, stagedStatus, stagedSource);
+  const { changed, source: rollupSource } = rollupTree(postTasks, stagedStatus, stagedSource);
 
   // Build a quick index of the post-mutation rows so we can attach the right
   // ifVersion to each status update.
@@ -287,8 +287,11 @@ function buildCommitOps(
   for (const [id, status] of changed) {
     const w = upsert(id);
     w.status = status;
-    // rollup only recomputes derived nodes, so the source is derived.
-    if (w.statusSource === undefined) w.statusSource = 'derived';
+    // Rollup reports the source it decided per node: 'derived' for a child
+    // rollup, 'explicit' for a pure blockedBy overlay on a childless node (which
+    // keeps its own identity so it reverts when the dep clears). An explicit set
+    // staged earlier in this op still wins (w.statusSource already 'explicit').
+    if (w.statusSource === undefined) w.statusSource = rollupSource.get(id) ?? 'derived';
   }
 
   // completedAt bookkeeping: set when a status becomes 'completed', clear when it
@@ -419,7 +422,12 @@ function emit(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[], 
  * reconcile. A live subscriber that misses the out-of-turn delta re-reads via
  * `plan_task_check` / the display summary.
  */
-function emitBestEffort(port: PlanTaskSessionPort, op: string, affectedTaskIds: string[], deltas: PlanTaskDelta[]): void {
+function emitBestEffort(
+  port: PlanTaskSessionPort,
+  op: string,
+  affectedTaskIds: string[],
+  deltas: PlanTaskDelta[],
+): void {
   try {
     emit(port, op, affectedTaskIds, deltas);
   } catch {
@@ -553,6 +561,25 @@ export async function planTaskDecompose(
     });
   });
 
+  // Validate each child's `blockedBy` exactly as task_add / task_update do:
+  // dependency ids must resolve within THIS session's tree (so unknown +
+  // cross-session deps reject) and must not close a dependency cycle. New
+  // siblings created in the same decompose are visible to each other, so a child
+  // may depend on a sibling created in the same call.
+  const depIndex = indexWith(index, ...created);
+  for (const child of created) {
+    if (!child.blockedBy || child.blockedBy.length === 0) continue;
+    for (const dep of child.blockedBy) {
+      if (!depIndex.byId.has(dep)) {
+        throw new HarnessValidationError('children.blockedBy', `unknown dependency task "${dep}"`);
+      }
+    }
+    assertNoBlockedByCycle(depIndex, child.taskId, child.blockedBy, id => {
+      const c = created.find(t => t.taskId === id);
+      return c?.blockedBy;
+    });
+  }
+
   const postTasks = [...tasks, ...created];
   const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
   maybeFlipParentDerived(index, parentTaskId, staged);
@@ -592,6 +619,22 @@ export async function planTaskReparent(
   };
   if (newParentTaskId === null) delete moved.parentTaskId;
   const postTasks = tasks.map(t => (t.taskId === taskId ? moved : t));
+
+  // Re-run the per-root single-in_progress invariant on the POST-move tree: a
+  // move can merge two roots that each held their own explicit in_progress into
+  // one root with two. Build the index over the post-image so `rootOf` resolves
+  // through the new edge, and only count EXPLICIT in_progress (a derived rollup
+  // in_progress just mirrors an explicit child — see assertSingleInProgress).
+  const postIndex = indexPlanTasks(postTasks);
+  for (const candidate of postTasks) {
+    if (candidate.status !== 'in_progress' || candidate.statusSource !== 'explicit') continue;
+    assertSingleInProgress(
+      postIndex,
+      candidate.taskId,
+      id => postIndex.byId.get(id)?.status ?? 'pending',
+      id => postIndex.byId.get(id)?.statusSource ?? 'explicit',
+    );
+  }
 
   const staged: StagedChange = { explicitStatus: new Map(), derivedNodes: new Set() };
   // New parent gains a child → derived (unless explicit-terminal).
@@ -890,9 +933,9 @@ function maybeFlipParentDerived(
   staged.derivedNodes.add(parentTaskId);
 }
 
-/** Build an index that includes a not-yet-stored task (for cycle/in-progress
- * checks on a create). */
-function indexWith(index: ReturnType<typeof indexPlanTasks>, extra: HarnessPlanTask) {
-  const tasks = [...index.byId.values(), extra];
+/** Build an index that includes one or more not-yet-stored tasks (for
+ * cycle/in-progress/dependency checks on a create or decompose). */
+function indexWith(index: ReturnType<typeof indexPlanTasks>, ...extra: HarnessPlanTask[]) {
+  const tasks = [...index.byId.values(), ...extra];
   return indexPlanTasks(tasks);
 }

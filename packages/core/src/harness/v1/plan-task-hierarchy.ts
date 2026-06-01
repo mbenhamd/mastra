@@ -182,18 +182,32 @@ export function assertNoBlockedByCycle(
 
 /**
  * Assert no OTHER task in the same root subtree as `taskId` is currently
- * `in_progress`. Used before setting `taskId` itself `in_progress`. `statusOf`
- * lets callers reflect a staged (not-yet-committed) status map.
+ * EXPLICITLY `in_progress`. Used before setting `taskId` itself `in_progress`.
+ * `statusOf` lets callers reflect a staged (not-yet-committed) status map.
+ *
+ * The invariant is "one EXPLICIT active work item per root" (§5.1k): only an
+ * explicit `in_progress` is a real competing focus. A DERIVED `in_progress`
+ * ancestor merely reflects the child that is the focus, so it must NOT count as
+ * a conflict — otherwise re-confirming the already-active child (an idempotent
+ * `task_update(child, { status: 'in_progress' })`) would see the child's own
+ * rolled-up ancestor as a rival and falsely reject. `sourceOf` reports the
+ * (possibly staged) statusSource; absent, every node is treated as explicit so
+ * the stricter check still holds for callers that do not track source.
  */
 export function assertSingleInProgress(
   index: PlanTaskIndex,
   taskId: string,
   statusOf: (id: string) => HarnessPlanTaskStatus,
+  sourceOf?: (id: string) => 'explicit' | 'derived',
 ): void {
   const root = rootOf(index, taskId);
   for (const task of index.byId.values()) {
     if (task.taskId === taskId) continue;
     if (statusOf(task.taskId) !== 'in_progress') continue;
+    // Only an EXPLICIT in_progress is a competing focus; a derived rollup
+    // in_progress just mirrors its in_progress child.
+    const source = sourceOf?.(task.taskId) ?? task.statusSource ?? 'explicit';
+    if (source !== 'explicit') continue;
     if (rootOf(index, task.taskId) === root) {
       throw new HarnessPlanTaskInProgressConflictError(taskId, task.taskId, root);
     }
@@ -220,9 +234,11 @@ export function assertSingleInProgress(
  *   6. else                                            → pending
  *
  * A node with NO children derives purely from its `blockedBy` deps: an
- * unsatisfied dep → blocked, otherwise its status is left to the caller (a
- * childless node has no children to roll up from, so derivation only forces
- * `blocked`; see `rollupTree`).
+ * unsatisfied dep → `blocked`, otherwise `pending` (the floor for a node with
+ * nothing to roll up from). `rollupTree` decides WHETHER to apply this derived
+ * value over an explicit status — it overrides an explicit non-terminal node
+ * only when the derived value has higher precedence or is a `blockedBy` overlay,
+ * so an explicit `in_progress` leaf with no deps is left untouched.
  */
 export function deriveStatus(
   task: HarnessPlanTask,
@@ -232,7 +248,9 @@ export function deriveStatus(
   const depBlocked = hasUnsatisfiedDep(task, statusOf);
 
   if (childIds.length === 0) {
-    // Childless derived node: only a dep can force it off `pending`.
+    // Childless node: only a dep can force it off `pending`. A childless derived
+    // node reverts to `pending` when its dep clears (it has no child to anchor
+    // any other status).
     return depBlocked ? 'blocked' : 'pending';
   }
 
@@ -261,14 +279,37 @@ export function deriveStatus(
   return 'pending';
 }
 
+/**
+ * Status precedence used to decide whether a derived rollup value supersedes an
+ * EXPLICIT non-terminal status (higher wins). Mirrors the `deriveStatus`
+ * truth-table ordering: a child `failed` (top) overrides everything; a derived
+ * `pending` (bottom) never downgrades an explicit `in_progress`/`blocked`.
+ * Terminal explicit statuses are handled separately (immune), so their relative
+ * order here only matters for derived-vs-derived comparisons.
+ */
+function precedence(status: HarnessPlanTaskStatus): number {
+  switch (status) {
+    case 'failed':
+      return 5;
+    case 'in_progress':
+      return 4;
+    case 'blocked':
+      return 3;
+    case 'completed':
+      return 2;
+    case 'cancelled':
+      return 1;
+    case 'pending':
+    default:
+      return 0;
+  }
+}
+
 /** True when any `blockedBy` dependency is not yet satisfied (i.e. not in a
  * terminal-ok state). A `failed`/`cancelled` dep does NOT keep a task blocked —
  * the work it waited on is over; the model decides what to do next. Only a dep
  * still `pending` / `in_progress` / `blocked` keeps a task blocked. */
-export function hasUnsatisfiedDep(
-  task: HarnessPlanTask,
-  statusOf: (id: string) => HarnessPlanTaskStatus,
-): boolean {
+export function hasUnsatisfiedDep(task: HarnessPlanTask, statusOf: (id: string) => HarnessPlanTaskStatus): boolean {
   if (!task.blockedBy || task.blockedBy.length === 0) return false;
   for (const depId of task.blockedBy) {
     const s = statusOf(depId);
@@ -282,13 +323,29 @@ export function hasUnsatisfiedDep(
 export interface RollupResult {
   /** taskId -> new derived status, only for rows whose status actually changed. */
   changed: Map<string, HarnessPlanTaskStatus>;
+  /**
+   * taskId -> the statusSource the caller should persist for a CHANGED row.
+   * `'derived'` when the new status came from CHILD rollup (the node's status is
+   * now owned by its children). `'explicit'` when the change is a pure
+   * `blockedBy` overlay on a childless node — the node keeps its explicit
+   * identity so it reverts to its own status when the dep releases. Only entries
+   * for ids present in `changed` are meaningful.
+   */
+  source: Map<string, 'explicit' | 'derived'>;
 }
 
 /**
- * Recompute every `derived` node bottom-up over the whole tree. Explicit
- * terminal statuses are NEVER overwritten (statusSource:'explicit' wins). A
- * node is recomputed iff its `statusSource === 'derived'`. Returns only the
- * rows whose status changed, so the caller commits a minimal write set.
+ * Recompute every node bottom-up over the whole tree EXCEPT those carrying an
+ * explicit TERMINAL status (completed/cancelled/failed), which are NEVER
+ * overwritten (the ratified "explicit terminal wins" rule). An explicit
+ * NON-terminal node (a parent re-marked `pending`, or a leaf with a `blockedBy`
+ * dep) IS re-derived: a parent re-reflects its children, and a leaf surfaces
+ * `blocked` while a dep is unsatisfied.
+ *
+ * statusSource of a CHANGED row: `'derived'` when the new status came from child
+ * rollup (the node has children whose roll-up now owns it); `'explicit'` when it
+ * is only a `blockedBy` overlay on a childless node (the node keeps its own
+ * identity and reverts when the dep releases).
  *
  * `stagedStatus` carries statuses already decided in the current mutation (e.g.
  * the explicit status the caller just set) so rollup sees the post-mutation
@@ -320,19 +377,53 @@ export function rollupTree(
   };
   const ordered = [...index.byId.keys()].sort((a, b) => computeDepth(b) - computeDepth(a));
 
+  // Source the rollup decided for each recomputed node (only meaningful for ids
+  // it actually recomputed; defaults to the node's current source otherwise).
+  const derivedSource = new Map<string, 'explicit' | 'derived'>();
   for (const id of ordered) {
-    if (sourceOf(id) !== 'derived') continue; // explicit status wins, never overwritten
+    const current = statusOf(id);
+    const source = sourceOf(id);
+    // Explicit TERMINAL status is immune — never recomputed.
+    if (source === 'explicit' && TERMINAL_PLAN_TASK_STATUSES.has(current)) continue;
+
     const task = index.byId.get(id)!;
     const childIds = index.childrenByParent.get(id) ?? [];
     const next = deriveStatus(task, childIds, statusOf);
-    working.set(id, next);
+
+    if (source === 'derived') {
+      // Fully rollup-owned: always take the derived value.
+      working.set(id, next);
+      derivedSource.set(id, 'derived');
+      continue;
+    }
+
+    // Explicit NON-terminal node: the model's chosen status holds UNLESS the
+    // derived value supersedes it. It supersedes when it has strictly higher
+    // precedence (e.g. a child `failed` overrides explicit `in_progress`), or
+    // when it is a `blockedBy` overlay (an unsatisfied own-dep always surfaces
+    // as `blocked` on a non-terminal node). An equal-or-lower derived value
+    // (e.g. children all `pending` while the model marked the parent
+    // `in_progress`) does NOT downgrade the explicit status.
+    const depOverlay = next === 'blocked' && hasUnsatisfiedDep(task, statusOf);
+    if (depOverlay || precedence(next) > precedence(current)) {
+      working.set(id, next);
+      // A child rollup makes the node rollup-owned (→ derived); a pure dep
+      // overlay also flips it derived so it reverts to `pending` when the dep
+      // clears (a childless derived node has no anchor to any other status).
+      derivedSource.set(id, 'derived');
+    }
+    // else: keep the explicit status (no working.set; derivedSource untouched).
   }
 
   const changed = new Map<string, HarnessPlanTaskStatus>();
+  const source = new Map<string, 'explicit' | 'derived'>();
   for (const task of tasks) {
     const next = working.get(task.taskId)!;
     const prev = stagedStatus?.get(task.taskId) ?? task.status;
-    if (next !== prev) changed.set(task.taskId, next);
+    if (next !== prev) {
+      changed.set(task.taskId, next);
+      source.set(task.taskId, derivedSource.get(task.taskId) ?? sourceOf(task.taskId));
+    }
   }
-  return { changed };
+  return { changed, source };
 }
