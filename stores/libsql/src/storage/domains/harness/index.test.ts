@@ -3955,6 +3955,20 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     expect(page2.cursor).toBeUndefined();
   });
 
+  it('listPlanTasks keyset-continues even when the cursor row was deleted between pages', async () => {
+    const { sessionId, version } = await setupSession();
+    for (let i = 0; i < 4; i++) {
+      await storage.createPlanTask({ fence: fence(sessionId, version), task: planTask(sessionId, { taskId: `r${i}`, order: i }) });
+    }
+    const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+    expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+    // Delete the cursor's own row before the next page — keyset continues at r2
+    // (cross-adapter parity with the in-memory adapter).
+    await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'r1' });
+    const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+    expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
+  });
+
   it('listPlanTasks isolates by session', async () => {
     const a = await setupSession('sess-a', { threadId: 'thread-a' });
     const b = await setupSession('sess-b', { threadId: 'thread-b' });

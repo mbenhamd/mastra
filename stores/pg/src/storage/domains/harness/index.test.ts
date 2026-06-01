@@ -2061,6 +2061,21 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       expect(page2.cursor).toBeUndefined();
     });
 
+    it('listPlanTasks keyset-continues even when the cursor row was deleted between pages', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      for (let i = 0; i < 4; i++) {
+        await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: `r${i}`, order: i }) });
+      }
+      const page1 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+      expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+      // Delete the cursor's own row before the next page — keyset continues at r2
+      // (cross-adapter parity with the in-memory adapter).
+      await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'r1' });
+      const page2 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+      expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
+    });
+
     it('listPlanTasks isolates by session', async () => {
       const harness = store.stores.harness!;
       const a = await setupSession('sess-a', { threadId: 'thread-a' });

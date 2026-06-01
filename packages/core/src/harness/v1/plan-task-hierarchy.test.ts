@@ -346,3 +346,82 @@ describe('assertSingleInProgress', () => {
     expect(() => assertSingleInProgress(idx, 'c2', statusOf, sourceOf)).toThrow(HarnessPlanTaskInProgressConflictError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// PF-787 triple-check — deep / diamond / cascade edge cases
+// (pure-hierarchy units the prior suite left to higher-level session tests)
+// ---------------------------------------------------------------------------
+
+describe('rollupTree — deep chains (stack-safety + multi-level cascade)', () => {
+  // A single linear chain root → … → leaf. Each parent is explicit-pending
+  // (non-terminal → recomputed); the leaf carries the explicit status.
+  function deepChain(depth: number, leafStatus: HarnessPlanTaskStatus): HarnessPlanTask[] {
+    const tasks: HarnessPlanTask[] = [];
+    for (let i = 0; i < depth; i++) {
+      const isLeaf = i === depth - 1;
+      tasks.push(
+        task({
+          taskId: `n${i}`,
+          parentTaskId: i === 0 ? undefined : `n${i - 1}`,
+          status: isLeaf ? leafStatus : 'pending',
+          statusSource: 'explicit',
+        }),
+      );
+    }
+    return tasks;
+  }
+
+  it('does NOT overflow the stack and rolls a failed leaf up to the root across a 6000-deep chain', () => {
+    const tasks = deepChain(6000, 'failed');
+    // The fix replaced recursive depth computation with an iterative walk — a chain
+    // this deep would blow the JS call stack under the old recursion.
+    const { changed } = rollupTree(tasks);
+    expect(changed.get('n0')).toBe('failed'); // root inherits the deep failure
+    expect(changed.get('n2999')).toBe('failed'); // a mid-chain node too
+  });
+
+  it('cascades an in_progress leaf up through >5 intermediate levels', () => {
+    const tasks = deepChain(8, 'in_progress');
+    const { changed } = rollupTree(tasks);
+    for (let i = 0; i < 7; i++) expect(changed.get(`n${i}`)).toBe('in_progress');
+    expect(changed.get('n7')).toBeUndefined(); // the explicit leaf itself is unchanged
+  });
+});
+
+describe('blockedBy — diamond graphs', () => {
+  // Diamond: a → {b, c} → d (d depends on b and c, both depend on a).
+  const diamond = () =>
+    indexPlanTasks([
+      task({ taskId: 'a' }),
+      task({ taskId: 'b', blockedBy: ['a'] }),
+      task({ taskId: 'c', blockedBy: ['a'] }),
+      task({ taskId: 'd', blockedBy: ['b', 'c'] }),
+    ]);
+
+  it('allows an acyclic diamond (d depends on both b and c)', () => {
+    expect(() => assertNoBlockedByCycle(diamond(), 'd', ['b', 'c'], () => undefined)).not.toThrow();
+  });
+
+  it('rejects closing the diamond into a cycle (a depends on d → a→d→b→a)', () => {
+    expect(() =>
+      assertNoBlockedByCycle(diamond(), 'a', ['d'], id => (id === 'a' ? ['d'] : undefined)),
+    ).toThrow(HarnessPlanTaskCycleError);
+  });
+});
+
+describe('blockedBy — a failed/cancelled dependency RELEASES the block', () => {
+  const dependent = task({ taskId: 'x', blockedBy: ['dep'] });
+
+  it('a failed dependency unblocks (childless → pending, not blocked)', () => {
+    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'failed' }))).toBe('pending');
+    expect(hasUnsatisfiedDep(dependent, statusOfFrom({ dep: 'failed' }))).toBe(false);
+  });
+
+  it('a cancelled dependency unblocks too', () => {
+    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'cancelled' }))).toBe('pending');
+  });
+
+  it('a still-pending dependency keeps it blocked', () => {
+    expect(deriveStatus(dependent, [], statusOfFrom({ dep: 'pending' }))).toBe('blocked');
+  });
+});

@@ -44,6 +44,8 @@ import {
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_SCHEMAS,
   applyPlanTaskPatch,
+  decodePlanTaskCursor,
+  encodePlanTaskCursor,
   getSqlType,
   walkPlanTaskSubtree,
 } from '@mastra/core/storage';
@@ -6146,16 +6148,6 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
   return { names, values };
 }
 
-function encodePlanTaskCursor(task: HarnessPlanTask): string {
-  return Buffer.from(JSON.stringify({ p: task.parentTaskId ?? '', o: task.order, t: task.taskId }), 'utf-8').toString(
-    'base64',
-  );
-}
-
-function decodePlanTaskCursor(cursor: string): { parent: string; order: number; taskId: string } {
-  const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8')) as { p: string; o: number; t: string };
-  return { parent: parsed.p, order: parsed.o, taskId: parsed.t };
-}
 
 function rowToAttachmentSemantic(row: Record<string, unknown>): AttachmentSemanticMetadata {
   const semantic: AttachmentSemanticMetadata = { kind: toAttachmentKind(row.kind) };

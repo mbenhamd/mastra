@@ -57,6 +57,43 @@ export function comparePlanTaskOrder(a: HarnessPlanTask, b: HarnessPlanTask): nu
   return a.taskId.localeCompare(b.taskId);
 }
 
+/** Decoded keyset position of a `listPlanTasks` cursor. */
+export interface PlanTaskCursor {
+  parent: string;
+  order: number;
+  taskId: string;
+}
+
+/**
+ * Opaque base64 keyset cursor over the `comparePlanTaskOrder` sort key
+ * (parentTaskId, order, taskId). SHARED by every adapter so the cursor TOKEN is
+ * byte-identical and pagination semantics — including continuation when the
+ * cursor's own row was deleted between pages — match across InMemory/PG/LibSQL.
+ */
+export function encodePlanTaskCursor(task: HarnessPlanTask): string {
+  return Buffer.from(JSON.stringify({ p: task.parentTaskId ?? '', o: task.order, t: task.taskId }), 'utf-8').toString(
+    'base64',
+  );
+}
+
+export function decodePlanTaskCursor(cursor: string): PlanTaskCursor {
+  const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8')) as { p: string; o: number; t: string };
+  return { parent: parsed.p, order: parsed.o, taskId: parsed.t };
+}
+
+/**
+ * True when `task` sorts STRICTLY AFTER `cursor` under `comparePlanTaskOrder`.
+ * Mirrors the SQL keyset WHERE predicate so the in-memory adapter keyset-CONTINUES
+ * from the cursor position even when the cursor's own row was deleted (the old
+ * `findIndex(taskId === cursor)` returned -1 and silently restarted from the head).
+ */
+export function planTaskAfterCursor(task: HarnessPlanTask, cursor: PlanTaskCursor): boolean {
+  const p = task.parentTaskId ?? '';
+  if (p !== cursor.parent) return p > cursor.parent;
+  if (task.order !== cursor.order) return task.order > cursor.order;
+  return task.taskId.localeCompare(cursor.taskId) > 0;
+}
+
 /**
  * Depth-first preorder bounded subtree walk (§5.1k `loadPlanTaskSubtree`). Input
  * `tasks` is the session's full task set (any order); the walk sorts siblings by

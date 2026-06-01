@@ -366,14 +366,48 @@ export function rollupTree(
     stagedStatusSource?.get(id) ?? index.byId.get(id)?.statusSource ?? 'explicit';
   const statusOf = (id: string): HarnessPlanTaskStatus => working.get(id) ?? 'pending';
 
-  // Process children before parents: order nodes by descending depth.
+  // Process children before parents: order nodes by descending depth. Depth is
+  // computed by walking the parent chain ITERATIVELY (not recursively) so an
+  // arbitrarily deep plan tree can never overflow the JS call stack, and with a
+  // `seen` guard so a (defensively-handled) parent cycle terminates instead of
+  // looping — recursion here had neither property.
   const depth = new Map<string, number>();
   const computeDepth = (id: string): number => {
-    if (depth.has(id)) return depth.get(id)!;
-    const parent = index.byId.get(id)?.parentTaskId;
-    const d = parent !== undefined && index.byId.has(parent) ? computeDepth(parent) + 1 : 0;
-    depth.set(id, d);
-    return d;
+    const cached = depth.get(id);
+    if (cached !== undefined) return cached;
+    // Collect the uncached ancestor chain [id, parent, …] until we hit a cached
+    // node, a root (no in-index parent), or a cycle; then assign depths downward.
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let cur: string | undefined = id;
+    let baseDepth = 0; // depth to assign to the topmost chain entry
+    while (cur !== undefined) {
+      const cachedCur = depth.get(cur);
+      if (cachedCur !== undefined) {
+        baseDepth = cachedCur + 1; // chain entries hang BELOW the cached anchor
+        break;
+      }
+      if (seen.has(cur)) {
+        baseDepth = 0; // cycle: treat the chain top as a root (defensive)
+        break;
+      }
+      seen.add(cur);
+      const parent: string | undefined = index.byId.get(cur)?.parentTaskId;
+      const nextParent: string | undefined = parent !== undefined && index.byId.has(parent) ? parent : undefined;
+      chain.push(cur);
+      if (nextParent === undefined) {
+        baseDepth = 0; // `cur` is a true root → depth 0
+        break;
+      }
+      cur = nextParent;
+    }
+    // chain is [id, …, top]; `top` gets baseDepth, each child one deeper.
+    let d = baseDepth;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      depth.set(chain[i]!, d);
+      d += 1;
+    }
+    return depth.get(id)!;
   };
   const ordered = [...index.byId.keys()].sort((a, b) => computeDepth(b) - computeDepth(a));
 

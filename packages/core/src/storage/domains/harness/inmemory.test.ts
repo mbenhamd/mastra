@@ -3525,10 +3525,33 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
 
     const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
     expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
-    expect(page1.cursor).toBe('r1');
+    // Opaque base64 keyset token (no longer the raw taskId) — same shape as PG/LibSQL.
+    expect(typeof page1.cursor).toBe('string');
+    expect(page1.cursor).not.toBe('r1');
     const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
     expect(page2.tasks.map(t => t.taskId)).toEqual(['c0', 'c1']);
     expect(page2.cursor).toBeUndefined();
+  });
+
+  it('listPlanTasks keyset-continues even when the cursor row was deleted between pages', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // Four roots r0..r3 in order.
+    for (let i = 0; i < 4; i++) {
+      await storage.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: `r${i}`, order: i }),
+      });
+    }
+    const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+    expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+
+    // Delete the cursor's own row (r1) before fetching the next page. A keyset
+    // cursor must still continue at r2 — the old findIndex(taskId) cursor would
+    // have returned -1 and silently restarted from the head (r0).
+    await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'r1' });
+    const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+    expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
   });
 
   it('listPlanTasks isolates by session', async () => {

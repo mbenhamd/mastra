@@ -28,7 +28,14 @@ import {
   HarnessStorageWakeupTransitionError,
 } from './base';
 import type { WriteMessageResultEvidenceResult } from './base';
-import { applyPlanTaskPatch, comparePlanTaskOrder, walkPlanTaskSubtree } from './plan-task-helpers';
+import {
+  applyPlanTaskPatch,
+  comparePlanTaskOrder,
+  decodePlanTaskCursor,
+  encodePlanTaskCursor,
+  planTaskAfterCursor,
+  walkPlanTaskSubtree,
+} from './plan-task-helpers';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
@@ -2935,12 +2942,14 @@ export class InMemoryHarness extends HarnessStorage {
       matched.push(task);
     }
     matched.sort(comparePlanTaskOrder);
-    const start = cursor === undefined ? 0 : matched.findIndex(t => t.taskId === cursor) + 1;
-    const page = matched.slice(start, start + limit);
-    const nextIndex = start + limit;
+    // Keyset cursor on the (parentTaskId, order, taskId) sort key — identical token
+    // + continuation semantics to PG/LibSQL (a deleted cursor row still continues
+    // from its sort position instead of silently restarting from the head).
+    const after = cursor === undefined ? matched : matched.filter(t => planTaskAfterCursor(t, decodePlanTaskCursor(cursor)));
+    const page = after.slice(0, limit);
     const result: ListPlanTasksResult = { tasks: page.map(clonePlanTask) };
-    if (nextIndex < matched.length && page.length > 0) {
-      result.cursor = page[page.length - 1]!.taskId;
+    if (after.length > limit && page.length > 0) {
+      result.cursor = encodePlanTaskCursor(page[page.length - 1]!);
     }
     return result;
   }
