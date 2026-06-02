@@ -27,3 +27,7 @@ new Harness({
 ```
 
 The workspace itself stays owned by the session/resource model (files, sandbox, browser, provider resume state) and is unchanged across mode switches.
+
+The permission policy is now ENFORCED at tool execution (pre-action gate): a `deny` blocks the call (the model gets a non-aborting result it can react to), an `ask` suspends for approval, and `allow` runs the tool. Enforcement is opt-in — a harness that configures no permission policy (no `mode.permissions`, no explicit `defaultPermissionPolicy`) gates nothing, exactly as before.
+
+Subagents now correctly inherit the parent session's mode when a `SubagentDefinition` omits `modeId` (previously they fell back to the harness default mode).
