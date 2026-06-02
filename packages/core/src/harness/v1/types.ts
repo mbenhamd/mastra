@@ -1307,14 +1307,13 @@ export interface SubagentDefinition {
    * and/or use the mode's `permissions` gate — this field augments, it does not
    * hide the backing agent's own tools (which the agent assembles downstream).
    *
-   * DURABILITY (follow-up): like `workspace` below, this override is applied to
-   * the live child session in-memory and is NOT persisted on the child record.
-   * A DELEGATED subagent reattached after a crash/rehydrate is re-driven by
-   * session id and does not currently restore this override (the subagent type
-   * id is not persisted on the child to re-resolve it). For a durable tool
-   * surface, bind the subagent to a `modeId` (mode tools persist). Making both
-   * `tools` and `workspace` survive reattach needs persisting the subagent type
-   * id on the child and re-resolving the definition in the delegation reconcile.
+   * DURABILITY: this override is applied to the live child session in-memory and
+   * is not stored on the child record. For a DELEGATED subagent (`task_delegate`)
+   * it IS restored on reattach: the subagent type id is persisted on the plan-task
+   * delegation link (`delegatedSubagentTypeId`) and the reattach reconcile
+   * re-resolves this definition (`tools` + `workspace`) onto the reloaded child. A
+   * `spawn_subagent` child is transient (runs inline, auto-closed) and is not
+   * reattached, so its override lives only for that in-process run.
    */
   tools?: ToolsInput;
 
