@@ -2175,5 +2175,23 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
       expect(listed.tasks).toHaveLength(0);
     });
+
+    it('countPlanTasksByStatus aggregates by status and counts roots + orphans', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      // Two real roots (one with a child) + an orphan whose parent is unresolvable.
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r1', order: 0, status: 'in_progress' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r2', order: 1, status: 'pending' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r1', order: 0, status: 'completed' }) });
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 2, status: 'pending' }) });
+
+      const counts = await harness.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+      expect(counts.total).toBe(4);
+      // The orphan's parent is not in the set, so it counts as a root alongside r1/r2.
+      expect(counts.rootCount).toBe(3);
+      expect(counts.byStatus.in_progress).toBe(1);
+      expect(counts.byStatus.pending).toBe(2);
+      expect(counts.byStatus.completed).toBe(1);
+    });
   });
 });

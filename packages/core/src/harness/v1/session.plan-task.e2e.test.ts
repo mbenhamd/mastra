@@ -439,3 +439,91 @@ describe('Harness v1 plan-task E2E — PT4 recovery across a process restart', (
     }
   });
 });
+
+// ===========================================================================
+// PT5 — decompose + plan_task_check + reparent + update through the real loop
+//        (rounds out real-loop coverage of the rest of the plan-task tool surface)
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT5 decompose / check / reparent / update', () => {
+  it('drives task_decompose, plan_task_check, task_reparent and task_update through the real agent loop', async () => {
+    let rootId: string | undefined;
+    let childIds: string[] = [];
+    let checkTaskIds: string[] = [];
+    const erroredTools: string[] = [];
+
+    let call = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        call++;
+        if (call === 1) {
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-add', 'task_add', JSON.stringify({ content: 'Root' })) };
+        }
+        if (call === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt5-decompose', 'task_decompose', JSON.stringify({ parentTaskId: rootId, children: [{ content: 'Step 1' }, { content: 'Step 2' }] })),
+          };
+        }
+        if (call === 3) {
+          // Re-orient: a real plan_task_check read under the root.
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-check', 'plan_task_check', JSON.stringify({ rootTaskId: rootId })) };
+        }
+        if (call === 4) {
+          // Promote Step 1 to a root.
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-reparent', 'task_reparent', JSON.stringify({ taskId: childIds[0], newParentTaskId: null })) };
+        }
+        if (call === 5) {
+          // Complete Step 2 via task_update (not task_complete).
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-update', 'task_update', JSON.stringify({ taskId: childIds[1], status: 'completed' })) };
+        }
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['Done.']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'shape the plan', model });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-pt5', threadId: { fresh: true } });
+      session.subscribe(e => {
+        if (e.type !== 'tool_end') return;
+        const ev = e as any;
+        if (String(ev.toolName).startsWith('task_') || ev.toolName === 'plan_task_check') {
+          if (ev.isError) erroredTools.push(ev.toolName);
+        }
+        if (ev.toolName === 'task_add' && ev.output?.taskId) rootId = ev.output.taskId;
+        if (ev.toolName === 'task_decompose' && Array.isArray(ev.output?.children)) {
+          childIds = ev.output.children.map((c: any) => c.taskId);
+        }
+        if (ev.toolName === 'plan_task_check' && Array.isArray(ev.output?.tasks)) {
+          checkTaskIds = ev.output.tasks.map((t: any) => t.taskId);
+        }
+      });
+
+      await session.message({ content: 'build, inspect, and reshape the plan' });
+
+      expect(rootId).toBeDefined();
+      expect(childIds).toHaveLength(2);
+      // No plan-task tool errored through the real loop.
+      expect(erroredTools).toEqual([]);
+      // plan_task_check returned the bounded slice under the root: the root itself
+      // plus both decomposed children (proves rootTaskId filtering, not just "an array").
+      expect(checkTaskIds).toEqual(expect.arrayContaining([rootId, childIds[0], childIds[1]]));
+
+      const page = await (session as any)._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 });
+      const byId = new Map<string, any>(page.tasks.map((t: any) => [t.taskId, t]));
+      expect(page.tasks).toHaveLength(3);
+      // Step 1 was reparented to the root (parent cleared).
+      expect(byId.get(childIds[0]).parentTaskId).toBeUndefined();
+      // Step 2 was completed via task_update.
+      expect(byId.get(childIds[1]).status).toBe('completed');
+
+      // Two roots now (Root + the promoted Step 1).
+      const summary = session.getDisplayState().planTasks!;
+      expect(summary.total).toBe(3);
+      expect(summary.rootCount).toBe(2);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});

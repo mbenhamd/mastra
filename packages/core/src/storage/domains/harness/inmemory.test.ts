@@ -3554,6 +3554,27 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
   });
 
+  it('listPlanTasks rejects a malformed/foreign cursor with a clear error', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
+    // Undecodable token and a base64 token of the wrong shape both fail clearly,
+    // rather than silently restarting or comparing against undefined keyset fields.
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: 'not-a-cursor!!' }),
+    ).rejects.toThrow(/Invalid plan-task cursor/);
+    const wrongShape = Buffer.from(JSON.stringify({ foo: 'bar' }), 'utf-8').toString('base64');
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: wrongShape }),
+    ).rejects.toThrow(/malformed keyset payload/);
+    // A non-finite `order` (e.g. a hand-crafted token with 1e309 → Infinity) is the
+    // right type but would corrupt keyset comparison, so it must be rejected too.
+    const nonFinite = Buffer.from('{"p":"","o":1e309,"t":"x"}', 'utf-8').toString('base64');
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: nonFinite }),
+    ).rejects.toThrow(/malformed keyset payload/);
+  });
+
   it('listPlanTasks isolates by session', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const a = await setupSession(storage, { id: 'sess-a', threadId: 'thread-a' });

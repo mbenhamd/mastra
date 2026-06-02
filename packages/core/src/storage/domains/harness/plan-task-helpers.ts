@@ -77,7 +77,23 @@ export function encodePlanTaskCursor(task: HarnessPlanTask): string {
 }
 
 export function decodePlanTaskCursor(cursor: string): PlanTaskCursor {
-  const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8')) as { p: string; o: number; t: string };
+  let parsed: { p?: unknown; o?: unknown; t?: unknown };
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+  } catch {
+    throw new Error('Invalid plan-task cursor: not a decodable keyset token');
+  }
+  // Validate the decoded shape — a foreign/truncated token can base64-decode to
+  // valid JSON of the wrong shape, which would otherwise compare as undefined and
+  // silently corrupt pagination. Fail clearly instead.
+  if (
+    typeof parsed?.p !== 'string' ||
+    typeof parsed?.o !== 'number' ||
+    !Number.isFinite(parsed.o) ||
+    typeof parsed?.t !== 'string'
+  ) {
+    throw new Error('Invalid plan-task cursor: malformed keyset payload');
+  }
   return { parent: parsed.p, order: parsed.o, taskId: parsed.t };
 }
 
