@@ -404,9 +404,11 @@ describe('Subagent workspace inheritance — runtime', () => {
 
     const registry = (harness as unknown as { _workspaceRegistry: any })._workspaceRegistry;
     // Inheriting first ensures the (live) parent's workspace is materialized...
-    await (harness as unknown as {
-      _internalEnsureParentWorkspaceForInherit: (id: string) => Promise<void>;
-    })._internalEnsureParentWorkspaceForInherit(parent.id);
+    await (
+      harness as unknown as {
+        _internalEnsureParentWorkspaceForInherit: (id: string) => Promise<void>;
+      }
+    )._internalEnsureParentWorkspaceForInherit(parent.id);
     expect(created).toHaveLength(1); // parent materialized on demand
 
     // ...then the child inherit acquire shares that same parent workspace.
@@ -580,12 +582,16 @@ describe('HarnessRequestContext §6.1 workspace accessors (F12)', () => {
     expect(session.peekWorkspace()).toBeUndefined();
   });
 
-  it('getActivityTimeline rejects with an explicit "not implemented" error (deferred §5.6/§10.6)', async () => {
+  it('getActivityTimeline resolves a read-time projection from the request-context slot (§5.1b.4)', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'hi' });
     const slot = getHarnessSlot(agent.streamCalls);
-    await expect(slot.getActivityTimeline()).rejects.toThrow(/activity timeline read-model.*not implemented/);
+    const tl = await slot.getActivityTimeline();
+    expect(tl.sessionId).toBe(session.id);
+    expect(tl.threadId).toBe(session.threadId);
+    expect(tl.includeDescendants).toBe(false);
+    expect(Array.isArray(tl.entries)).toBe(true);
   });
 });
 
