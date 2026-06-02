@@ -647,11 +647,19 @@ describe('Harness v1 plan-task E2E — PT7 graceful close + reopen', () => {
     const modelA = new MockLanguageModelV2({
       doStream: async () => {
         callA++;
-        if (callA === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt7-add', 'task_add', JSON.stringify({ content: 'Survive close' })) };
+        if (callA === 1)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt7-add', 'task_add', JSON.stringify({ content: 'Survive close' })),
+          };
         return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
       },
     });
-    const harnessA = newSharedHarness(db, new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelA }));
+    const harnessA = newSharedHarness(
+      db,
+      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelA }),
+    );
     let sessionId: string;
     try {
       const sessionA = await harnessA.session({ resourceId: 'u-pt7', threadId: { fresh: true } });
@@ -676,11 +684,19 @@ describe('Harness v1 plan-task E2E — PT7 graceful close + reopen', () => {
     const modelB = new MockLanguageModelV2({
       doStream: async () => {
         callB++;
-        if (callB === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt7-add2', 'task_add', JSON.stringify({ content: 'After reopen' })) };
+        if (callB === 1)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt7-add2', 'task_add', JSON.stringify({ content: 'After reopen' })),
+          };
         return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
       },
     });
-    const harnessB = newSharedHarness(db, new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelB }));
+    const harnessB = newSharedHarness(
+      db,
+      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelB }),
+    );
     try {
       const sessionB = await harnessB.session({ sessionId, resourceId: 'u-pt7' });
       // It is the SAME session, brought back to a live state (reopen clears closedAt).
@@ -702,6 +718,99 @@ describe('Harness v1 plan-task E2E — PT7 graceful close + reopen', () => {
       expect(sessionB.getDisplayState().planTasks!.total).toBe(2);
     } finally {
       await harnessB.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// PT8 — CONCURRENT two-session isolation (the race PT6 left uncovered)
+//        A BARRIER forces both sessions' first model turns to be simultaneously
+//        in flight before either proceeds, so this fails (deadlocks → times out)
+//        if the harness serialized the two turns — i.e. it actually proves the
+//        loops interleave, not just that two awaited turns happen to end clean.
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT8 concurrent per-session isolation', () => {
+  it('two sessions building plans CONCURRENTLY (proven overlapping) keep independent trees', async () => {
+    // Barrier: the first model turn of each session blocks until BOTH have arrived,
+    // guaranteeing real overlap. If the runtime serialized sessions, the second
+    // turn would never start and `await barrier` would time out → the test fails.
+    let arrived = 0;
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>(r => (releaseBarrier = r));
+    let bothInFlight = false;
+    const keyOrder: string[] = [];
+
+    const model = new MockLanguageModelV2({
+      doStream: async (options: any) => {
+        const promptStr = JSON.stringify(options?.prompt ?? '');
+        const hasAlpha = promptStr.includes('alpha');
+        const hasBeta = promptStr.includes('beta');
+        // Self-validating: every call must carry EXACTLY one session key.
+        if (hasAlpha === hasBeta) throw new Error(`PT8 prompt must contain exactly one key, got: ${promptStr.slice(0, 200)}`);
+        const key = hasAlpha ? 'alpha' : 'beta';
+        const firstTurn = !keyOrder.includes(key);
+
+        if (firstTurn) {
+          keyOrder.push(key);
+          arrived += 1;
+          if (arrived === 2) {
+            bothInFlight = true;
+            releaseBarrier();
+          }
+          // Block until the OTHER session's first turn is also in flight (or bail
+          // loudly if the runtime serialized us and the partner never arrives).
+          await Promise.race([
+            barrier,
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('PT8 barrier timed out — turns did not overlap (serialized?)')), 2000)),
+          ]);
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(`tc-${key}`, 'task_add', JSON.stringify({ content: `${key}-task` })),
+          };
+        }
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['done']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'plan', model });
+    const harness = newHarness(agent);
+    try {
+      const [sessionA, sessionB] = await Promise.all([
+        harness.session({ resourceId: 'cc-a', threadId: { fresh: true } }),
+        harness.session({ resourceId: 'cc-b', threadId: { fresh: true } }),
+      ]);
+      const aEvents: HarnessEvent[] = [];
+      const bEvents: HarnessEvent[] = [];
+      sessionA.subscribe(e => aEvents.push(e));
+      sessionB.subscribe(e => bEvents.push(e));
+
+      await Promise.all([sessionA.message({ content: 'plan alpha' }), sessionB.message({ content: 'plan beta' })]);
+
+      // The barrier was reached by BOTH first turns → they genuinely overlapped.
+      expect(bothInFlight).toBe(true);
+      expect(keyOrder.sort()).toEqual(['alpha', 'beta']);
+
+      const aPage = await (sessionA as any)._internalStorage.listPlanTasks({ sessionId: sessionA.id, limit: 10 });
+      const bPage = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId: sessionB.id, limit: 10 });
+      // Each session got exactly its own task — no cross-contamination under interleave.
+      expect(aPage.tasks.map((t: any) => t.content)).toEqual(['alpha-task']);
+      expect(bPage.tasks.map((t: any) => t.content)).toEqual(['beta-task']);
+      expect(sessionA.getDisplayState().planTasks!.total).toBe(1);
+      expect(sessionB.getDisplayState().planTasks!.total).toBe(1);
+
+      // Custom events are isolated too — neither stream references the other's task.
+      const aTaskIds = new Set<string>(aPage.tasks.map((t: any) => t.taskId));
+      const bTaskIds = new Set<string>(bPage.tasks.map((t: any) => t.taskId));
+      const customs = (evs: HarnessEvent[]) => evs.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
+      const aCustoms = customs(aEvents);
+      const bCustoms = customs(bEvents);
+      expect(aCustoms.length).toBeGreaterThan(0);
+      expect(bCustoms.length).toBeGreaterThan(0);
+      for (const c of aCustoms) for (const id of c.payload.affectedTaskIds) expect(aTaskIds.has(id)).toBe(true);
+      for (const c of bCustoms) for (const id of c.payload.affectedTaskIds) expect(bTaskIds.has(id)).toBe(true);
+    } finally {
+      await harness.shutdown();
     }
   });
 });
