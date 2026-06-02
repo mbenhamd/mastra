@@ -3828,6 +3828,9 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     });
     const after = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
     expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
+    // The updated link also hydrates through a subtree read (not just list).
+    const afterSub = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'd1', depth: 0, limit: 10 });
+    expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
   });
 
   it('countPlanTasksByStatus is empty for a session with no plan tasks', async () => {
