@@ -2065,13 +2065,14 @@ export interface HarnessRequestContext<TState = unknown> {
   resolveWorkspace: () => Promise<Workspace>;
 
   /**
-   * §6.1 / §5.6 / §10.6 bounded, redacted activity timeline. DEFERRED: the
-   * underlying activity read-model is not built in this Harness build, so calling
-   * this rejects with a clear error rather than returning partial data. The full
-   * `(opts?: ActivityTimelineOptions) => Promise<SessionActivityTimeline>`
-   * signature lands with the read-model (tracked as a follow-up).
+   * §6.1 / §5.1b.4 / §5.6 / §10.6 bounded, redacted activity timeline — a
+   * READ-TIME projection over this session's durable thread/message log, goal,
+   * and pending inbox (plus descendant subagent entries under
+   * `includeDescendants`). Never settles promises, proves delivery, claims rows,
+   * or mutates state. The lower-durability source kinds (operation-result /
+   * durable-work / channel / file-reference) are not emitted yet.
    */
-  getActivityTimeline: () => Promise<never>;
+  getActivityTimeline: (opts?: ActivityTimelineOptions) => Promise<SessionActivityTimeline>;
 
   /**
    * Invoke a skill programmatically from inside a tool. Delegates to
@@ -2101,4 +2102,103 @@ export interface GoalOptions {
   judgeModel?: string;
   maxTurns?: number;
   kickoff?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// §5.1b.4 / §5.6 / §10.6 — activity timeline read model.
+//
+// `SessionActivityTimeline` is a bounded, redacted UX projection assembled at
+// READ TIME from existing durable authorities (the thread/message log,
+// structured tool_call/tool_result parts, session-owned goal + pending inbox,
+// and — under `includeDescendants` — descendant subagent summaries). It is NOT a
+// persisted record, durable event stream, or generic activity ledger, never
+// settles SDK promises / proves delivery / claims rows / mutates storage, and
+// omits raw payloads, request context, token strings, hashes, and unredacted
+// errors. Ordering is `(occurredAt ASC, sessionId ASC, entryId ASC)`; the cursor
+// is a forward seek over that key plus the addressed session + `includeDescendants`
+// scope (a cursor from one scope rejects for the other). See HARNESS_V1_SPEC.md
+// §5.1b.4 + the §9 session-snapshot read-time-model rules.
+// ---------------------------------------------------------------------------
+
+export interface ActivityTimelineOptions {
+  cursor?: string;
+  limit?: number;
+  /** When true, include descendant subagent entries per the §5.6 / §10.6 ownership rules. */
+  includeDescendants?: boolean;
+}
+
+export type ActivityTimelineEntryKind =
+  | 'message'
+  | 'message-tool-call'
+  | 'message-tool-result'
+  | 'operation-result'
+  | 'pending-inbox'
+  | 'goal'
+  | 'durable-work'
+  | 'channel'
+  | 'subagent'
+  | 'file-reference';
+
+export type ActivityTimelineSourceKind =
+  | 'thread-message'
+  | 'message-part'
+  | 'result-lookup'
+  | 'session-snapshot'
+  | 'pending-inbox'
+  | 'subagent-session'
+  | 'durable-work-summary'
+  | 'channel-diagnostics'
+  | 'workspace-projection'
+  | 'application-datastore';
+
+export interface ActivityTimelineSourceRef {
+  kind: ActivityTimelineSourceKind;
+  id: string;
+  route?: 'thread-messages' | 'signal-result' | 'queue-result' | 'subagent-inbox' | 'channel-diagnostics';
+}
+
+export interface ActivityTimelineActor {
+  kind: 'user' | 'assistant' | 'system' | 'tool' | 'channel' | 'goal' | 'subagent' | 'harness';
+  label?: string;
+  channelId?: string;
+  providerId?: string;
+}
+
+export interface ActivityTimelineEntry {
+  /**
+   * Deterministic, source-derived id (e.g. `message:<sessionId>:<messageId>` or
+   * `message-tool-call:<sessionId>:<messageId>:<partIndex>`). Stable for UI
+   * de-dupe while the source evidence exists; NOT an SSE id or read cursor.
+   */
+  entryId: string;
+  kind: ActivityTimelineEntryKind;
+  sessionId: string;
+  threadId: string;
+  occurredAt: number;
+  updatedAt?: number;
+  runId?: string;
+  signalId?: string;
+  queuedItemId?: string;
+  toolCallId?: string;
+  subagentSessionId?: string;
+  parentSessionId?: string;
+  parentEntryId?: string;
+  depth?: number;
+  actor?: ActivityTimelineActor;
+  sourceDurability: 'durable' | 'retention-bound' | 'best-effort' | 'live-only';
+  sourceRefs: ActivityTimelineSourceRef[];
+  title: string;
+  summary?: string;
+  /** Redacted, display-oriented JSON only — never raw payloads/args/results. */
+  payload?: JsonValue;
+}
+
+export interface SessionActivityTimeline {
+  sessionId: string;
+  threadId: string;
+  generatedAt: number;
+  includeDescendants: boolean;
+  entries: ActivityTimelineEntry[];
+  nextCursor?: string;
+  truncated: boolean;
 }

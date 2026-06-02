@@ -64,6 +64,7 @@ import type {
   SaveAttachmentReferenceInput,
   SessionGrants,
   SessionRecord,
+  SessionSummary,
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
@@ -75,6 +76,8 @@ import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
+import { buildActivityTimeline  } from './activity-timeline';
+import type {ActivityTimelineSessionInput} from './activity-timeline';
 import {
   assertJsonValue,
   canonicalJson,
@@ -211,6 +214,8 @@ import type {
   SessionSignalResult,
   SetStateOptions,
   ToolCategory,
+  ActivityTimelineOptions,
+  SessionActivityTimeline,
 } from './types';
 
 type MessageAdmissionIdentity = {
@@ -7172,6 +7177,117 @@ export class Session {
     return result.messages.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
   }
 
+  /**
+   * §5.1b.4 / §5.6 / §10.6 — bounded, redacted activity timeline. A READ-TIME
+   * projection assembled from this session's durable thread/message log + goal +
+   * pending inbox, and (under `includeDescendants`) descendant subagent entries.
+   * It never settles promises, proves delivery, claims rows, or mutates state.
+   * The lower-durability source kinds (operation-result / durable-work / channel /
+   * file-reference) are not emitted yet — see {@link buildActivityTimeline}.
+   */
+  async getActivityTimeline(opts: ActivityTimelineOptions = {}): Promise<SessionActivityTimeline> {
+    this._assertLive('getActivityTimeline()');
+    const includeDescendants = opts.includeDescendants === true;
+    const generatedAt = Date.now();
+
+    const sessions: ActivityTimelineSessionInput[] = [
+      {
+        sessionId: this.id,
+        threadId: this.threadId,
+        depth: 0,
+        messages: await this._activityMessagesForThread(this.threadId, this.resourceId),
+        ...(this._record.goal
+          ? {
+              goal: {
+                id: this._record.goal.id,
+                objective: this._record.goal.objective,
+                status: this._record.goal.status,
+                createdAt: this._record.goal.createdAt,
+                ...(this._record.goal.lastDecision ? { lastDecision: this._record.goal.lastDecision } : {}),
+              },
+            }
+          : {}),
+        ...(this._record.pendingResume
+          ? {
+              pendingInbox: [
+                {
+                  itemId: this._record.pendingResume.itemId ?? this._record.pendingResume.toolCallId,
+                  kind: this._record.pendingResume.kind,
+                  requestedAt: this._record.pendingResume.requestedAt,
+                  ...(this._record.pendingResume.toolName ? { toolName: this._record.pendingResume.toolName } : {}),
+                  ...(this._record.pendingResume.runId ? { runId: this._record.pendingResume.runId } : {}),
+                },
+              ],
+            }
+          : {}),
+      },
+    ];
+
+    if (includeDescendants) {
+      // Bounded BFS over non-deleted descendant subagent sessions sharing this
+      // (harnessName, resourceId). Each contributes a `subagent` entry plus its
+      // own message log; descendant goal/pending are deferred with the heavier
+      // source kinds. Caps keep the read-time projection server-bounded (§9).
+      const MAX_DESCENDANTS = 50;
+      const MAX_DEPTH = 4;
+      const collected: { id: string; threadId: string; parentSessionId: string; depth: number }[] = [];
+      let frontier = [{ id: this.id, depth: 0 }];
+      const visited = new Set<string>([this.id]);
+      while (frontier.length > 0 && collected.length < MAX_DESCENDANTS) {
+        const nextFrontier: { id: string; depth: number }[] = [];
+        for (const node of frontier) {
+          if (node.depth >= MAX_DEPTH) continue;
+          let children: SessionSummary[];
+          try {
+            children = await this._storage.listSessions({
+              harnessName: this._record.harnessName,
+              resourceId: this.resourceId,
+              parentSessionId: node.id,
+            });
+          } catch {
+            continue; // best-effort: a flaky list does not fail the whole timeline
+          }
+          for (const child of children) {
+            if (visited.has(child.id) || collected.length >= MAX_DESCENDANTS) continue;
+            visited.add(child.id);
+            collected.push({ id: child.id, threadId: child.threadId, parentSessionId: node.id, depth: node.depth + 1 });
+            nextFrontier.push({ id: child.id, depth: node.depth + 1 });
+          }
+        }
+        frontier = nextFrontier;
+      }
+      for (const child of collected) {
+        sessions.push({
+          sessionId: child.id,
+          threadId: child.threadId,
+          parentSessionId: child.parentSessionId,
+          depth: child.depth,
+          messages: await this._activityMessagesForThread(child.threadId, this.resourceId),
+          subagent: {
+            parentSessionId: child.parentSessionId,
+            childSessionId: child.id,
+            // SessionSummary carries no createdAt; use the addressed turn time as a
+            // stable, bounded best-effort anchor for the subagent entry.
+            createdAt: generatedAt,
+          },
+        });
+      }
+    }
+
+    return buildActivityTimeline(
+      { addressedSessionId: this.id, addressedThreadId: this.threadId, generatedAt, sessions },
+      opts,
+    );
+  }
+
+  /** Read a thread's persisted message log for the activity timeline (capped). */
+  private async _activityMessagesForThread(threadId: string, resourceId: string): Promise<HarnessMessage[]> {
+    const memory = await this._harness._internalTryGetMemoryStorage();
+    if (!memory) return [];
+    const result = await memory.listMessages({ threadId, resourceId, perPage: false });
+    return result.messages.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
+  }
+
   // -------------------------------------------------------------------------
   // Goals — §4.7.
   //
@@ -11754,14 +11870,9 @@ export class Session {
       isWorkspaceReady: () => session.isWorkspaceReady(),
       getWorkspace: () => session.peekWorkspace(),
       resolveWorkspace: () => session.resolveWorkspace(),
-      // §5.6/§10.6 activity timeline read-model is not built in this Harness build.
-      getActivityTimeline: () =>
-        Promise.reject(
-          new HarnessValidationError(
-            'getActivityTimeline()',
-            'the activity timeline read-model (§5.6/§10.6) is not implemented in this Harness build',
-          ),
-        ),
+      // §5.1b.4/§5.6/§10.6 activity timeline — delegate to the owning session so the
+      // read-time projection logic lives in one place.
+      getActivityTimeline: (opts?: ActivityTimelineOptions) => session.getActivityTimeline(opts),
       // Tool-facing skill execution. Delegates back to the owning session
       // so resolution, args validation, prompt construction, and dispatch
       // stay in one place (§4.6).
