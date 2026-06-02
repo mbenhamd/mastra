@@ -39,6 +39,9 @@ export function applyPlanTaskPatch(
   if (patch.delegatedSubagentSessionId !== undefined) {
     next.delegatedSubagentSessionId = patch.delegatedSubagentSessionId;
   }
+  if (patch.delegatedSubagentTypeId !== undefined) {
+    next.delegatedSubagentTypeId = patch.delegatedSubagentTypeId;
+  }
   if (patch.metadata !== undefined) next.metadata = cloneJsonValue(patch.metadata);
   if (patch.clearMetadata === true) delete next.metadata;
   if (patch.completedAt !== undefined) next.completedAt = patch.completedAt;

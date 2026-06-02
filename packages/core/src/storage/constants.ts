@@ -1047,6 +1047,11 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     blocked_by: { type: 'jsonb', nullable: true },
     origin: { type: 'text', nullable: true },
     delegated_subagent_session_id: { type: 'text', nullable: true },
+    // Subagent TYPE id of a delegated task, persisted alongside the session id so
+    // a delegated subagent reattached after rehydrate can re-resolve its
+    // SubagentDefinition (tools / workspace mode) — those overrides are otherwise
+    // in-memory only (§9 / TM-6).
+    delegated_subagent_type_id: { type: 'text', nullable: true },
     metadata: { type: 'jsonb', nullable: true },
     created_at: { type: 'bigint', nullable: false },
     updated_at: { type: 'bigint', nullable: false },

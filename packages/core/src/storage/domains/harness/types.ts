@@ -1543,8 +1543,15 @@ export interface HarnessPlanTask {
    */
   blockedBy?: string[];
   origin?: string;
-  /** RESERVED for TM-6 subagent delegation; never written non-null in TM-2. */
+  /** Subagent session id this task was delegated to (TM-6). */
   delegatedSubagentSessionId?: string;
+  /**
+   * Subagent TYPE id of the delegation (§9). Persisted with the session id so a
+   * delegated subagent reattached after rehydrate can re-resolve its
+   * `SubagentDefinition` and restore the `tools` / `workspace` overrides (which
+   * are applied to the live child in-memory and not otherwise durable).
+   */
+  delegatedSubagentTypeId?: string;
   metadata?: JsonValue;
   createdAt: number;
   updatedAt: number;
@@ -1607,6 +1614,7 @@ export interface UpdatePlanTaskInput {
     clearBlockedBy?: boolean;
     origin?: string;
     delegatedSubagentSessionId?: string;
+    delegatedSubagentTypeId?: string;
     metadata?: JsonValue;
     clearMetadata?: boolean;
     completedAt?: number;

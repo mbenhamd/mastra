@@ -763,6 +763,12 @@ export interface DelegateTaskInput {
   taskId: string;
   /** The created/resolved subagent session id to link durably. */
   subagentSessionId: string;
+  /**
+   * Subagent TYPE id, persisted alongside the session id so a reattached
+   * delegated subagent can re-resolve its SubagentDefinition (tools / workspace)
+   * after rehydrate (§9). Omitted ⇒ no type recorded (overrides not restorable).
+   */
+  subagentTypeId?: string;
 }
 
 /**
@@ -799,6 +805,7 @@ export async function planTaskDelegate(port: PlanTaskSessionPort, input: Delegat
     status: 'in_progress',
     statusSource: 'explicit',
     delegatedSubagentSessionId: input.subagentSessionId,
+    ...(input.subagentTypeId !== undefined ? { delegatedSubagentTypeId: input.subagentTypeId } : {}),
   };
   const postTasks = tasks.map(t => (t.taskId === input.taskId ? updated : t));
 
@@ -813,7 +820,10 @@ export async function planTaskDelegate(port: PlanTaskSessionPort, input: Delegat
       kind: 'update',
       taskId: input.taskId,
       ifVersion: task.version,
-      patch: { delegatedSubagentSessionId: input.subagentSessionId },
+      patch: {
+        delegatedSubagentSessionId: input.subagentSessionId,
+        ...(input.subagentTypeId !== undefined ? { delegatedSubagentTypeId: input.subagentTypeId } : {}),
+      },
     },
   ];
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);

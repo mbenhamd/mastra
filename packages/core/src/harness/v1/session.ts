@@ -12329,7 +12329,13 @@ export class Session {
     let view: PlanTaskView;
     try {
       view = await this._serializePlanTaskWrite(() =>
-        planTaskDelegate(this._planTaskPort(), { taskId: input.taskId, subagentSessionId: child.id }),
+        planTaskDelegate(this._planTaskPort(), {
+          taskId: input.taskId,
+          subagentSessionId: child.id,
+          // Persist the subagent type so a reattach-on-rehydrate can re-resolve the
+          // SubagentDefinition and restore the tools / workspace overrides (§9).
+          subagentTypeId: input.agentType,
+        }),
       );
     } catch (err) {
       try {
@@ -12654,6 +12660,18 @@ export class Session {
         // the scan later so the task is not stranded.
         needsRetry = true;
         continue;
+      }
+      // §9 — restore the SubagentDefinition overrides on the reattached child. The
+      // `tools` / `workspace` overrides are applied in-memory at delegate time and
+      // are not persisted on the child, so re-resolve them from the durable
+      // subagent type id before re-driving (unknown/unset type ⇒ mode-derived
+      // surface, the documented fallback).
+      if (task.delegatedSubagentTypeId !== undefined) {
+        const def = this._harness._getSubagentType(task.delegatedSubagentTypeId);
+        if (def) {
+          child._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
+          if (def.tools) child._subagentToolsOverride = def.tools;
+        }
       }
       this._activeSubagents.set(`delegate:${child.id}`, {
         subagentSessionId: child.id,

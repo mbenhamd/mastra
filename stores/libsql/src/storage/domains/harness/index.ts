@@ -4692,6 +4692,13 @@ export class HarnessLibSQL extends HarnessStorage {
         schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
         compositePrimaryKey: planTasksConfig?.compositePrimaryKey,
       });
+      // Migrate columns added after the table's first creation onto existing
+      // deployments (createTable is CREATE TABLE IF NOT EXISTS and never alters).
+      await this.#db.alterTable({
+        tableName: TABLE_HARNESS_PLAN_TASKS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+        ifNotExists: ['delegated_subagent_type_id'],
+      });
       await this.#client.execute({
         // §5.1k: ordered listing + recursive subtree walk by parent_task_id.
         sql: `CREATE INDEX IF NOT EXISTS idx_harness_plan_tasks_order
@@ -6093,6 +6100,9 @@ function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
   if (row.delegated_subagent_session_id != null) {
     task.delegatedSubagentSessionId = String(row.delegated_subagent_session_id);
   }
+  if (row.delegated_subagent_type_id != null) {
+    task.delegatedSubagentTypeId = String(row.delegated_subagent_type_id);
+  }
   if (row.metadata != null) task.metadata = parseJson(row.metadata) as JsonValue;
   if (row.completed_at != null) task.completedAt = Number(row.completed_at);
   return task;
@@ -6116,6 +6126,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     'blocked_by',
     'origin',
     'delegated_subagent_session_id',
+    'delegated_subagent_type_id',
     'metadata',
     'created_at',
     'updated_at',
@@ -6139,6 +6150,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.blockedBy === undefined ? null : JSON.stringify(task.blockedBy),
     task.origin ?? null,
     task.delegatedSubagentSessionId ?? null,
+    task.delegatedSubagentTypeId ?? null,
     task.metadata === undefined ? null : JSON.stringify(task.metadata),
     task.createdAt,
     task.updatedAt,

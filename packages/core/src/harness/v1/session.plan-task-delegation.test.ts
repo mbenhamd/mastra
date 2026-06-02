@@ -19,9 +19,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { createTool } from '../../tools';
 
 import { MockAgent } from './__test-utils__';
 import { sha256CanonicalJson } from './canonical-json';
@@ -255,6 +257,9 @@ describe('task_delegate — link + in_progress', () => {
     // Durable link persisted, task still in_progress while the subagent runs.
     const row = await planRow(parent, task.taskId);
     expect(row?.delegatedSubagentSessionId).toBe(res.subagentSessionId);
+    // §9 — the subagent TYPE id is persisted too, so a reattach-on-rehydrate can
+    // re-resolve the SubagentDefinition (tools / workspace) for the reloaded child.
+    expect(row?.delegatedSubagentTypeId).toBe('worker');
     expect(row?.status).toBe('in_progress');
 
     releaseChild();
@@ -695,5 +700,82 @@ describe('task_delegate — recovery on rehydrate', () => {
       return page.tasks.find(t => t.taskId === task.taskId)?.status === 'failed';
     });
     await b.harness.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §9 — reattach-on-rehydrate restores the SubagentDefinition tools/workspace
+// override (which is applied in-memory at delegate time and not persisted on the
+// child) by re-resolving the persisted subagent TYPE id.
+// ---------------------------------------------------------------------------
+
+describe('task_delegate — reattach restores the subagent override from the persisted type', () => {
+  function buildTooledHarness(db: InMemoryDB) {
+    const parentAgent = new MockAgent({ id: 'parent-agent' });
+    const childAgent = new MockAgent({ id: 'child-agent' });
+    const extraTool = createTool({
+      id: 'extraTool',
+      description: 'extra',
+      inputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db }) },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          tooled: {
+            agentId: 'child-agent',
+            modeId: 'worker-mode',
+            description: 'worker with an extra tool',
+            tools: { extraTool },
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+    return { harness, parentAgent, childAgent };
+  }
+
+  it('re-resolves def.tools + workspace onto the reattached child', async () => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildTooledHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Hold the child so it stays ACTIVE (non-terminal) across the simulated restart.
+    let releaseChild!: () => void;
+    childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'do it' } as any, toolCtx)) as any;
+    const res = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'tooled' } as any,
+      toolCtx,
+    )) as any;
+    close();
+
+    const child = await harness.session({ sessionId: res.subagentSessionId, resourceId: 'u1' });
+    // Live delegate set the override; the persisted row carries the type.
+    expect(Object.keys((child as any)._subagentToolsOverride ?? {})).toContain('extraTool');
+
+    // Simulate a process restart that lost the in-memory-only overrides.
+    (child as any)._subagentToolsOverride = undefined;
+    (child as any)._subagentInheritWorkspace = undefined;
+
+    // Reattach reconcile re-resolves the SubagentDefinition from the persisted type.
+    await parent._reconcileDelegationsOnHydrate();
+    await poll(() => (child as any)._subagentToolsOverride !== undefined);
+    expect(Object.keys((child as any)._subagentToolsOverride)).toContain('extraTool');
+    expect((child as any)._subagentInheritWorkspace).toBe(true);
+
+    releaseChild();
+    await harness.shutdown();
   });
 });
