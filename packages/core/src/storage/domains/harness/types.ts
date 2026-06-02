@@ -174,6 +174,13 @@ export interface PendingResume {
   /** Mode whose backing agent produced this pending resume. */
   modeId?: string;
   /**
+   * Per-turn `yolo` carried forward across suspend → resume so a queued turn
+   * that requested auto-grant (`QueueOverrides.yolo`) keeps auto-granting
+   * tool-approval interrupts on the resumed run too. `deny` is still a hard
+   * block; `yolo` never bypasses it. Absent ⇒ no auto-grant on resume.
+   */
+  yolo?: boolean;
+  /**
    * Runtime identities captured when this work was admitted. Recovery uses
    * these stable ids to fail closed if the process restarts with a different
    * execution surface.

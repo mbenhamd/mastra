@@ -265,6 +265,82 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     }
   });
 
+  it('YOLO (queued turn) auto-grants a policy ASK — the tool runs without suspending', async () => {
+    // A queued turn carries `yolo`. With policy `ask`, the gate would normally
+    // suspend; `yolo` auto-grants so the tool runs and the turn completes.
+    const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'ask' }, tools: {} } });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const result = (await session.queue({ content: 'write it', yolo: true })) as any;
+      expect(ran.writeDoc).toBe(true);
+      expect(result.finishReason).not.toBe('suspended');
+      expect(result.text).toContain('done');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('YOLO never bypasses a DENY — the denied tool still never runs', async () => {
+    // `yolo` is honored only AFTER the deny short-circuit, and `deny` also removes
+    // the tool pre-exposure. A yolo'd queued turn cannot run a denied tool.
+    const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'deny' }, tools: {} } });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const result = (await session.queue({ content: 'write it', yolo: true })) as any;
+      expect(ran.writeDoc).toBe(false);
+      expect(result.finishReason).not.toBe('suspended');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('YOLO auto-grants a TOOL-OWNED approval even with NO permission policy configured', async () => {
+    // `requireApproval: true` makes the tool ask on its own — independent of the
+    // §4.2e gate. `yolo` is threaded regardless of gate engagement, so it grants
+    // this too. (Without yolo this queued turn would suspend.)
+    const ran = { danger: false };
+    const danger = createTool({
+      id: 'danger',
+      description: 'dangerous',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: async () => {
+        ran.danger = true;
+        return { ok: true };
+      },
+    });
+    let call = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        call++;
+        if (call === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('d-1', 'danger', '{}'),
+          };
+        }
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['done']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'x', model, tools: { danger } });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      // No permissions, no defaultPermissionPolicy → the §4.2e gate is OFF.
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const result = (await session.queue({ content: 'go', yolo: true })) as any;
+      expect(ran.danger).toBe(true); // tool-owned approval auto-granted by yolo
+      expect(result.finishReason).not.toBe('suspended');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('UNCONFIGURED harness gates nothing — the tool runs (pre-§4.2e behavior preserved)', async () => {
     // No mode.permissions and no explicit defaultPermissionPolicy → gate OFF.
     const { harness, ran } = buildHarness({});

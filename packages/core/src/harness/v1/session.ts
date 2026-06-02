@@ -965,6 +965,12 @@ export class Session {
   >();
   /** `queuedItem.id` of the turn currently running (live or suspended). */
   private _currentQueuedItemId?: string;
+  /**
+   * `yolo` of the turn currently running. Set at drain-begin from the queued
+   * item so suspend-capture can persist it onto `pendingResume` and a resumed
+   * run keeps auto-granting tool approvals (§4.2e). Cleared with the turn.
+   */
+  private _currentTurnYolo = false;
   /** `queuedItem.source` of the turn currently running. Used by the goal
    *  judge loop to skip re-judging on goal-driven continuation turns. */
   private _currentQueuedItemSource?: 'user' | 'goal';
@@ -1514,6 +1520,9 @@ export class Session {
     this._currentRunSignalId = undefined;
     this._currentMessageId = undefined;
     this._currentTraceId = undefined;
+    // Default OFF each turn; queued-drain / resume re-arm it from the item /
+    // captured pendingResume below so non-yolo turns never inherit a stale value.
+    this._currentTurnYolo = false;
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
@@ -6544,6 +6553,8 @@ export class Session {
       ...(queuedItemId !== undefined ? { queuedItemId } : {}),
       ...(originSignalId !== undefined ? { originSignalId } : {}),
       modeId,
+      // §4.2e — carry the active turn's yolo so the resumed run keeps auto-granting.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(modeId, modelId),
       payload: this._buildResumePayload(kind, payload),
     };
@@ -8269,6 +8280,9 @@ export class Session {
     // `session.abort()` can cancel an in-flight resume (e.g. ESC after the
     // user approved a tool that's now grinding through a long workflow).
     const turnAbortController = this._beginTurn(undefined);
+    // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
+    // Re-arm the transient so a re-suspend on this resumed run persists it again.
+    this._currentTurnYolo = pending.yolo === true;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
     const finishResumedTurn = () => {
@@ -8311,6 +8325,7 @@ export class Session {
         modeId: resumeModeId,
         modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
         abortSignal: turnAbortController.signal,
+        yolo: pending.yolo === true,
       });
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
@@ -10260,6 +10275,9 @@ export class Session {
       modeId: effectiveModeId,
       modelId: item.model ?? this._record.modelId,
     });
+    // §4.2e — arm per-turn yolo for the drain so suspend-capture persists it onto
+    // pendingResume (so a later resume keeps auto-granting). `_beginTurn` reset it.
+    this._currentTurnYolo = item.yolo === true;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
     const finishQueuedTurn = () => {
@@ -10282,6 +10300,7 @@ export class Session {
           modelId: this._modelIdForQueuedItem(item.id),
           abortSignal: turnAbortController.signal,
           persistedRequestContext: item.requestContext,
+          yolo: item.yolo === true,
         }),
         activeTurnWaiter.promise,
       ]);
@@ -11634,6 +11653,14 @@ export class Session {
     abortSignal: AbortSignal;
     persistedRequestContext?: PersistedRequestContextInput;
     resolveWorkspace?: boolean;
+    /**
+     * Per-turn `yolo` (§4.2e / `QueueOverrides.yolo`). When `true`, auto-grant any
+     * tool-approval interrupt this turn would raise — the policy-level `ask` AND a
+     * tool-owned `requireApproval`/`needsApprovalFn`. It NEVER bypasses a permission
+     * `deny`, which stays a hard block. Only the queued-turn drain sets it today
+     * (a queued item persists `yolo` so it survives crash replay).
+     */
+    yolo?: boolean;
   }): Promise<RequestContext> {
     const session = this;
     const stateSnapshot = (this._record.state ?? {}) as unknown;
@@ -11748,6 +11775,14 @@ export class Session {
         '__mastra_toolPermissionPolicy',
         (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy),
       ]);
+    }
+    // §4.2e `yolo` — a per-turn auto-grant for tool-approval interrupts. Threaded
+    // independently of the permission gate because a tool can require approval
+    // (`requireApproval`/`needsApprovalFn`) even when no permission policy is
+    // configured. The loop's tool-call step honors it AFTER the `deny` short-circuit,
+    // so `yolo` suppresses `ask`/approval but can never run a denied tool.
+    if (turn.yolo === true) {
+      entries.push(['__mastra_yoloAutoApprove', true]);
     }
     return new RequestContext(entries);
   }

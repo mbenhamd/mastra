@@ -499,6 +499,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           };
         }
 
+        // §4.2e per-turn `yolo`: a caller (the harness queued-turn drain) may thread
+        // `__mastra_yoloAutoApprove` to auto-grant any approval interrupt this turn
+        // raises — the policy-level `ask` AND a tool-owned `requireApproval`/
+        // `needsApprovalFn`. It is honored ONLY here, AFTER the `deny` short-circuit
+        // above, so `yolo` can never run a denied tool.
+        const yoloAutoApprove = requestContext.get('__mastra_yoloAutoApprove') === true;
+
         const approvalRequirement = await resolveToolApprovalRequirement({
           tool,
           args,
@@ -514,7 +521,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // pending approval can show WHY (matches the durable agent path).
         const approvalReasons: string[] = [...approvalRequirement.reasons];
         if (toolPermissionPolicy === 'ask') approvalReasons.push('policy');
-        const toolRequiresApproval = approvalRequirement.required || toolPermissionPolicy === 'ask';
+        // `yolo` suppresses the interrupt entirely (deny already returned above).
+        const toolRequiresApproval =
+          !yoloAutoApprove && (approvalRequirement.required || toolPermissionPolicy === 'ask');
 
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(
