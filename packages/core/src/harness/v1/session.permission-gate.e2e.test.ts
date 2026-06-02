@@ -10,7 +10,7 @@
  * Only the language model is mocked; the Agent + tools + loop are real.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Agent } from '../../agent';
@@ -294,10 +294,9 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     }
   });
 
-  it('YOLO auto-grants a TOOL-OWNED approval even with NO permission policy configured', async () => {
-    // `requireApproval: true` makes the tool ask on its own — independent of the
-    // §4.2e gate. `yolo` is threaded regardless of gate engagement, so it grants
-    // this too. (Without yolo this queued turn would suspend.)
+  it('YOLO does NOT suppress a TOOL-OWNED approval — the turn still suspends', async () => {
+    // Per spec, yolo clears ONLY the policy-level ask; a tool's own `requireApproval`
+    // is independent of the §4.2e gate and survives yolo, so the turn still suspends.
     const ran = { danger: false };
     const danger = createTool({
       id: 'danger',
@@ -333,9 +332,13 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     });
     try {
       const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-      const result = (await session.queue({ content: 'go', yolo: true })) as any;
-      expect(ran.danger).toBe(true); // tool-owned approval auto-granted by yolo
-      expect(result.finishReason).not.toBe('suspended');
+      // The turn suspends for the tool-owned approval, so the queue promise does not
+      // resolve — observe the durable pending state instead of awaiting it.
+      void session.queue({ content: 'go', yolo: true });
+      await vi.waitFor(() => {
+        expect(session.getRecord().pendingResume?.kind).toBe('tool-approval');
+      });
+      expect(ran.danger).toBe(false); // tool-owned approval NOT auto-granted by yolo
     } finally {
       await harness.shutdown();
     }

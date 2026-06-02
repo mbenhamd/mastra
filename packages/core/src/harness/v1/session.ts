@@ -11672,11 +11672,12 @@ export class Session {
     persistedRequestContext?: PersistedRequestContextInput;
     resolveWorkspace?: boolean;
     /**
-     * Per-turn `yolo` (§4.2e / `QueueOverrides.yolo`). When `true`, auto-grant any
-     * tool-approval interrupt this turn would raise — the policy-level `ask` AND a
-     * tool-owned `requireApproval`/`needsApprovalFn`. It NEVER bypasses a permission
-     * `deny`, which stays a hard block. Only the queued-turn drain sets it today
-     * (a queued item persists `yolo` so it survives crash replay).
+     * Per-turn `yolo` (§4.2e / `QueueOverrides.yolo`). When `true`, clear the
+     * POLICY-level approval reason this turn would raise (an effective `ask` from
+     * the permission gate). Per spec it suppresses ONLY the `policy` reason — it
+     * never suppresses a tool-owned `requireApproval`/`needsApprovalFn`, and never
+     * bypasses a `deny`. Only the queued-turn drain sets it today (a queued item
+     * persists `yolo` so it survives crash replay).
      */
     yolo?: boolean;
   }): Promise<RequestContext> {
@@ -11794,11 +11795,11 @@ export class Session {
         (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy),
       ]);
     }
-    // §4.2e `yolo` — a per-turn auto-grant for tool-approval interrupts. Threaded
-    // independently of the permission gate because a tool can require approval
-    // (`requireApproval`/`needsApprovalFn`) even when no permission policy is
-    // configured. The loop's tool-call step honors it AFTER the `deny` short-circuit,
-    // so `yolo` suppresses `ask`/approval but can never run a denied tool.
+    // §4.2e `yolo` — a per-turn suppressor for the POLICY-level approval reason
+    // (an effective `ask` from the permission gate). Per spec it clears ONLY the
+    // `policy` reason; it never suppresses a tool-owned `requireApproval`/
+    // `needsApprovalFn`, and never bypasses a `deny`. The loop's tool-call step
+    // honors it AFTER the `deny` short-circuit.
     if (turn.yolo === true) {
       entries.push(['__mastra_yoloAutoApprove', true]);
     }

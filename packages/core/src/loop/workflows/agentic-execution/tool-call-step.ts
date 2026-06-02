@@ -500,10 +500,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
 
         // §4.2e per-turn `yolo`: a caller (the harness queued-turn drain) may thread
-        // `__mastra_yoloAutoApprove` to auto-grant any approval interrupt this turn
-        // raises — the policy-level `ask` AND a tool-owned `requireApproval`/
-        // `needsApprovalFn`. It is honored ONLY here, AFTER the `deny` short-circuit
-        // above, so `yolo` can never run a denied tool.
+        // `__mastra_yoloAutoApprove` to clear the POLICY-level approval reason — i.e.
+        // an effective `ask` from the permission gate. Per spec it suppresses ONLY the
+        // `policy` reason; it NEVER suppresses a tool-owned reason (a tool's static
+        // `requireApproval` / its `needsApprovalFn` callback), and (since `deny`
+        // already returned above) it can never run a denied tool. Mirrors how a grant
+        // clears the policy ask at the resolver — yolo does it per-run here.
         const yoloAutoApprove = requestContext.get('__mastra_yoloAutoApprove') === true;
 
         const approvalRequirement = await resolveToolApprovalRequirement({
@@ -517,13 +519,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         });
         // §4.2e additive reasons: tool-owned reasons (tool-config / tool-fn) from
         // the requirement, plus a `policy` reason when the session permission gate
-        // forces `ask`. Surfaced on the approval chunk + suspend payload so the
-        // pending approval can show WHY (matches the durable agent path).
+        // forces `ask` AND per-run `yolo` did not clear it. Surfaced on the approval
+        // chunk + suspend payload so the pending approval can show WHY (matches the
+        // durable agent path). Tool-owned reasons survive yolo.
+        const policyAsk = toolPermissionPolicy === 'ask' && !yoloAutoApprove;
         const approvalReasons: string[] = [...approvalRequirement.reasons];
-        if (toolPermissionPolicy === 'ask') approvalReasons.push('policy');
-        // `yolo` suppresses the interrupt entirely (deny already returned above).
-        const toolRequiresApproval =
-          !yoloAutoApprove && (approvalRequirement.required || toolPermissionPolicy === 'ask');
+        if (policyAsk) approvalReasons.push('policy');
+        const toolRequiresApproval = approvalRequirement.required || policyAsk;
 
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(

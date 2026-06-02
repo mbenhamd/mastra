@@ -1717,9 +1717,12 @@ export interface QueueOverrides {
   /** Override the active mode for this queued turn. Must be a known mode id. */
   mode?: string;
   /**
-   * If `true`, auto-grant any tool-approval interrupts raised during this
-   * queued turn. Mirrors `HarnessOverrides.yolo`. Persisted on the queued
-   * item so it survives crash replay.
+   * If `true`, clear the POLICY-level approval reason for this queued turn — an
+   * effective `ask` from the §4.2e permission gate, the same reason a session
+   * grant clears. It suppresses ONLY that `policy` reason: a tool-owned approval
+   * (a tool's static `requireApproval` or its `needsApprovalFn`) still suspends,
+   * and a `deny` is still a hard block. Persisted on the queued item so it
+   * survives crash replay (and carried across suspend → resume).
    */
   yolo?: boolean;
 
