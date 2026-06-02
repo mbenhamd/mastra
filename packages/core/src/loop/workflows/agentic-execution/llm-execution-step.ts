@@ -889,6 +889,41 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             }
           }
 
+          // §4.2e PRE-EXPOSURE gate: when a session threads a per-tool permission
+          // resolver on the request context, drop `deny` tools from the final
+          // surface BEFORE the model/provider call (and from `activeTools`), and
+          // fail closed if a forced `toolChoice` names a denied tool. Opt-in and a
+          // strict no-op when no resolver is present, so non-harness agents are
+          // unaffected. `ask`/`allow` tools stay exposed (`ask` still suspends at
+          // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
+          // pattern above.
+          const permissionPolicy = requestContext?.get('__mastra_toolPermissionPolicy') as
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined;
+          if (permissionPolicy && currentStep.tools) {
+            const toolSurface = currentStep.tools as Record<string, unknown>;
+            for (const toolName of Object.keys(toolSurface)) {
+              if (permissionPolicy(toolName) === 'deny') delete toolSurface[toolName];
+            }
+            if (Array.isArray(currentStep.activeTools)) {
+              currentStep.activeTools = (currentStep.activeTools as string[]).filter(
+                name => permissionPolicy(name) !== 'deny',
+              ) as typeof currentStep.activeTools;
+            }
+            const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
+            if (
+              toolChoice &&
+              typeof toolChoice === 'object' &&
+              toolChoice.type === 'tool' &&
+              typeof toolChoice.toolName === 'string' &&
+              permissionPolicy(toolChoice.toolName) === 'deny'
+            ) {
+              throw new Error(
+                `Forced toolChoice names a permission-denied tool "${toolChoice.toolName}" (pre-exposure gate, §4.2e)`,
+              );
+            }
+          }
+
           // Store activeTools on _internal so toolCallStep can enforce them
           if (_internal) {
             _internal.stepActiveTools = currentStep.activeTools as string[] | undefined;

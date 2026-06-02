@@ -95,22 +95,15 @@ function buildHarness(opts: { permissions?: HarnessMode['permissions']; defaultP
 }
 
 describe('Harness v1 §4.2e permission gate — enforced through the real loop', () => {
-  it('DENY blocks the tool with a non-aborting result; the tool never runs, the turn completes', async () => {
+  it('DENY blocks the tool (removed pre-exposure); it never runs and the turn completes', async () => {
     const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'deny' }, tools: {} } });
     try {
       const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-      const events: HarnessEvent[] = [];
-      session.subscribe(e => events.push(e));
-
       const result = (await session.message({ content: 'write it' })) as any;
-
-      // The tool did NOT execute.
+      // The denied tool never executes (removed at the pre-exposure gate; the
+      // pre-action gate is the safety net for tools that slip through — see the
+      // resume test below). The turn completes normally, not suspended.
       expect(ran.writeDoc).toBe(false);
-      // The tool_end carries the denial result (non-aborting → model can react).
-      const toolEnd = events.find(e => e.type === 'tool_end' && (e as any).toolName === 'writeDoc') as any;
-      expect(toolEnd).toBeDefined();
-      expect(String(toolEnd.output)).toMatch(/denied by the session permission policy/i);
-      // The turn still completed normally.
       expect(result.finishReason).not.toBe('suspended');
       expect(result.text).toContain('done');
     } finally {
@@ -233,6 +226,40 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
       expect(toolEnd.isError).toBe(false);
       expect(toolEnd.output?.taskId).toBeTruthy();
       expect(session.getDisplayState().planTasks?.total).toBe(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('PRE-EXPOSURE: a denied tool is not even shown to the model (allowed tools still are)', async () => {
+    const readTool = createTool({ id: 'readDoc', description: 'read', inputSchema: z.object({}), execute: async () => ({}) });
+    const writeTool = createTool({ id: 'writeDoc', description: 'edit', inputSchema: z.object({}), execute: async () => ({}) });
+    let seenToolsJson = '';
+    const model = new MockLanguageModelV2({
+      doStream: async (options: any) => {
+        seenToolsJson = JSON.stringify(options?.tools ?? []);
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'x',
+      model,
+      tools: { readDoc: readTool, writeDoc: writeTool },
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
+      defaultModeId: 'default',
+      toolCategoryResolver: (n: string) => (n === 'writeDoc' ? 'edit' : n === 'readDoc' ? 'read' : null),
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      await session.message({ content: 'go' });
+      expect(seenToolsJson).toContain('readDoc'); // allowed tool exposed to the model
+      expect(seenToolsJson).not.toContain('writeDoc'); // denied tool hidden BEFORE the model call
     } finally {
       await harness.shutdown();
     }

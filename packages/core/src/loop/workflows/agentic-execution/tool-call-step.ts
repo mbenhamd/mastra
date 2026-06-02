@@ -11,7 +11,7 @@ import { toStandardSchema, standardSchemaToJSONSchema } from '../../../schema';
 import { safeEnqueue } from '../../../stream/base';
 import { ChunkFrom } from '../../../stream/types';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
-import { resolveToolRequiresApproval } from '../../../tools/approval';
+import { resolveToolApprovalRequirement } from '../../../tools/approval';
 import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
@@ -499,16 +499,22 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           };
         }
 
-        const toolRequiresApproval =
-          (await resolveToolRequiresApproval({
-            tool,
-            args,
-            requireToolApproval: Boolean(requireToolApproval),
-            requestContext,
-            workspace: _internal?.stepWorkspace,
-            logger,
-            toolName: inputData.toolName,
-          })) || toolPermissionPolicy === 'ask';
+        const approvalRequirement = await resolveToolApprovalRequirement({
+          tool,
+          args,
+          requireToolApproval: Boolean(requireToolApproval),
+          requestContext,
+          workspace: _internal?.stepWorkspace,
+          logger,
+          toolName: inputData.toolName,
+        });
+        // §4.2e additive reasons: tool-owned reasons (tool-config / tool-fn) from
+        // the requirement, plus a `policy` reason when the session permission gate
+        // forces `ask`. Surfaced on the approval chunk + suspend payload so the
+        // pending approval can show WHY (matches the durable agent path).
+        const approvalReasons: string[] = [...approvalRequirement.reasons];
+        if (toolPermissionPolicy === 'ask') approvalReasons.push('policy');
+        const toolRequiresApproval = approvalRequirement.required || toolPermissionPolicy === 'ask';
 
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(
@@ -533,6 +539,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolName: inputData.toolName,
                   args: inputData.args,
                   resumeSchema: JSON.stringify(standardSchemaToJSONSchema(approvalSchema)),
+                  ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
               },
               'approval',
@@ -558,6 +565,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolCallId: inputData.toolCallId,
                   toolName: inputData.toolName,
                   args: inputData.args,
+                  ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
                 __streamState: streamState.serialize(),
               },
