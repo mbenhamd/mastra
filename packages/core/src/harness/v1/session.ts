@@ -11674,7 +11674,48 @@ export class Session {
     if (persistedRequestContext?.channel) {
       entries.push(['channel', persistedRequestContext.channel]);
     }
+    // §4.2e permission GATE — thread a per-tool policy resolver the loop's
+    // tool-call step consults (deny → block, ask → require approval, allow →
+    // proceed). OPT-IN: only engaged when the operator configured a policy
+    // (mode.permissions/runtime rules, or an explicit defaultPermissionPolicy),
+    // so an unconfigured harness keeps today's no-gate behavior.
+    if (this._toolPermissionGateEngaged()) {
+      entries.push(['__mastra_toolPermissionPolicy', (toolName: string) => session._resolveToolPolicy(toolName)]);
+    }
     return new RequestContext(entries);
+  }
+
+  /**
+   * Whether the §4.2e permission gate is engaged for this session. True when the
+   * session has ANY per-tool/category rule, OR the harness `defaultPermissionPolicy`
+   * was explicitly configured. When neither holds, the gate is OFF (no resolver is
+   * threaded) and tools run ungated, preserving pre-§4.2e behavior.
+   */
+  private _toolPermissionGateEngaged(): boolean {
+    if (this._harness._isDefaultPermissionPolicyConfigured()) return true;
+    const rules = this._record.permissionRules;
+    return Object.keys(rules.categories).length > 0 || Object.keys(rules.tools).length > 0;
+  }
+
+  /**
+   * Resolve the effective permission policy for a tool (§4.2e order): a per-tool
+   * rule wins, else the tool's category rule, else the harness default. A matching
+   * tool/category GRANT turns an `ask` into `allow` (a grant suppresses only the
+   * policy-level ask; it never overrides a `deny`).
+   */
+  private _resolveToolPolicy(toolName: string): PermissionPolicy {
+    const { permissionRules: rules, sessionGrants: grants } = this._record;
+    const category = this._harness.getToolCategory({ toolName }) ?? undefined;
+    let policy: PermissionPolicy =
+      (rules.tools[toolName] as PermissionPolicy | undefined) ??
+      (category !== undefined ? (rules.categories[category] as PermissionPolicy | undefined) : undefined) ??
+      this._harness._getDefaultPermissionPolicy();
+    if (policy === 'ask') {
+      const granted =
+        grants.tools.includes(toolName) || (category !== undefined && grants.categories.includes(category));
+      if (granted) policy = 'allow';
+    }
+    return policy;
   }
 
   private async _setTurnState<TState = unknown>(

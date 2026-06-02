@@ -775,6 +775,11 @@ export class Harness {
   private readonly _subagentMaxDepth: number;
   private readonly _goalDefaults: { defaultJudgeModel?: string; defaultMaxTurns: number };
   private readonly _defaultPermissionPolicy: PermissionPolicy;
+  /** True when the operator explicitly set `defaultPermissionPolicy` (vs the
+   *  implicit 'ask'). Gates whether the permission GATE is engaged for a session
+   *  that declares no per-tool/category rules — so an unconfigured harness keeps
+   *  today's no-gate behavior (§4.2e enforcement is opt-in). */
+  private readonly _defaultPermissionPolicyConfigured: boolean;
   private readonly _toolCategoryResolver?: (toolName: string) => ToolCategory | null;
   private readonly _modelCatalog: ReadonlyMap<string, ModelInfo>;
   private readonly _modelAuthStatusResolver?: (modelId: string) => ModelAuthStatus | Promise<ModelAuthStatus>;
@@ -954,6 +959,7 @@ export class Harness {
       throw new HarnessConfigError('toolCategories', 'must be a Record<string, ToolCategory>');
     }
     this._defaultPermissionPolicy = config.defaultPermissionPolicy ?? DEFAULT_PERMISSION_POLICY;
+    this._defaultPermissionPolicyConfigured = config.defaultPermissionPolicy !== undefined;
     // `toolCategoryResolver` is primary; `toolCategories` is sugar that
     // desugars to `(name) => toolCategories[name] ?? null`. When both are
     // provided the resolver wins (§9.1 sugar contract).
@@ -3230,6 +3236,13 @@ export class Harness {
   /** @internal — Session reads this as the floor when no per-tool / per-category rule applies. */
   _getDefaultPermissionPolicy(): PermissionPolicy {
     return this._defaultPermissionPolicy;
+  }
+
+  /** @internal — whether `defaultPermissionPolicy` was explicitly configured.
+   *  Session uses this to decide if the §4.2e permission gate is engaged even
+   *  when the session declares no per-tool/category rules (opt-in enforcement). */
+  _isDefaultPermissionPolicyConfigured(): boolean {
+    return this._defaultPermissionPolicyConfigured;
   }
 
   /**

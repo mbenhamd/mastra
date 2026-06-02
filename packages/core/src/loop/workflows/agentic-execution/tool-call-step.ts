@@ -481,15 +481,34 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           await removeToolMetadata(inputData.toolName, 'approval');
         }
 
-        const toolRequiresApproval = await resolveToolRequiresApproval({
-          tool,
-          args,
-          requireToolApproval: Boolean(requireToolApproval),
-          requestContext,
-          workspace: _internal?.stepWorkspace,
-          logger,
-          toolName: inputData.toolName,
-        });
+        // Per-tool permission policy gate (§4.2e). A caller (e.g. the harness)
+        // may thread a resolver on the request context that returns
+        // 'allow' | 'ask' | 'deny' for a tool name. `deny` blocks the call with a
+        // non-aborting result the model can react to; `ask` forces approval (it is
+        // OR'd with tool-owned/global approval, never suppressing them); `allow`
+        // defers entirely to the tool's own approval config.
+        const toolPermissionPolicy = (
+          requestContext.get('__mastra_toolPermissionPolicy') as
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined
+        )?.(inputData.toolName);
+        if (toolPermissionPolicy === 'deny') {
+          return {
+            ...inputData,
+            result: `Tool "${inputData.toolName}" was denied by the session permission policy.`,
+          };
+        }
+
+        const toolRequiresApproval =
+          (await resolveToolRequiresApproval({
+            tool,
+            args,
+            requireToolApproval: Boolean(requireToolApproval),
+            requestContext,
+            workspace: _internal?.stepWorkspace,
+            logger,
+            toolName: inputData.toolName,
+          })) || toolPermissionPolicy === 'ask';
 
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(
