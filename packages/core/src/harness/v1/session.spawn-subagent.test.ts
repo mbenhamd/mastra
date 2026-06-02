@@ -240,3 +240,46 @@ describe('spawn_subagent tool — execution', () => {
     expect(childRecord?.closedAt).toBeDefined();
   });
 });
+
+describe('spawn_subagent — mode inheritance (§9)', () => {
+  it('a subagent type with NO modeId inherits the PARENT current mode, not the harness default', async () => {
+    const parentAgent = new FakeAgent('parent-agent');
+    const childAgent = new FakeAgent('child-agent');
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'parentMode', agentId: 'parent-agent' },
+        { id: 'childMode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          // No modeId → inherits the parent's CURRENT mode (§9).
+          inheriter: { agentId: 'child-agent', description: 'inherits parent mode' },
+          // Control: an explicit modeId is honored as-is.
+          pinned: { agentId: 'child-agent', modeId: 'childMode', description: 'pinned mode' },
+        },
+      },
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await parent.switchMode({ mode: 'parentMode' });
+      const tool = createSpawnSubagentTool(parent)!;
+
+      const inherited = (await tool.execute!({ agentType: 'inheriter', task: 't' } as any, execCtx('tc-a'))) as any;
+      const inheritedRec = await storage.loadSession({ sessionId: inherited.subagentSessionId });
+      // Inherits the parent's CURRENT mode ('parentMode'), NOT the harness default ('default').
+      expect(inheritedRec!.modeId).toBe('parentMode');
+
+      const pinned = (await tool.execute!({ agentType: 'pinned', task: 't' } as any, execCtx('tc-b'))) as any;
+      const pinnedRec = await storage.loadSession({ sessionId: pinned.subagentSessionId });
+      expect(pinnedRec!.modeId).toBe('childMode'); // explicit modeId still honored
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});

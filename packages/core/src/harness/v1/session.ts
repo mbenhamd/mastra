@@ -12140,7 +12140,9 @@ export class Session {
       threadId: { fresh: true },
       parentSessionId: this.id,
       origin: 'subagent-tool',
-      modeId: def.modeId,
+      // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
+      // documented), not the harness default mode.
+      modeId: def.modeId ?? this._record.modeId,
       modelId: input.modelOverride ?? def.defaultModelId,
       subagentDepth: childDepth,
     });
