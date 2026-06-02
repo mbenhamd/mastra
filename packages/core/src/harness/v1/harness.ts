@@ -69,6 +69,7 @@ import type { MemoryStorage } from '../../storage/domains/memory/base';
 import { InMemoryStore } from '../../storage/mock';
 import type { Workspace } from '../../workspace';
 
+import { canonicalJson, sha256CanonicalJson } from './canonical-json';
 import { HarnessChannelRegistry } from './channel-registry';
 import {
   HarnessAttachmentInUseError,
@@ -85,16 +86,16 @@ import {
   HarnessSessionConflictError,
   HarnessSessionCorruptError,
   HarnessSessionDeleteBlockedError,
-  type HarnessSessionDeleteBlocker,
+  
   HarnessSessionDeletedError,
   HarnessSessionLockedError,
   HarnessSessionNotFoundError,
   HarnessStorageError,
   HarnessThreadNotFoundError,
   HarnessValidationError,
-  HarnessWorkspaceProviderMismatchError,
+  HarnessWorkspaceProviderMismatchError
 } from './errors';
-import { canonicalJson, sha256CanonicalJson } from './canonical-json';
+import type {HarnessSessionDeleteBlocker} from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { Session } from './session';
@@ -1076,6 +1077,52 @@ export class Harness {
           `modes[${mode.id}]`,
           `cannot set both "tools" and "additionalTools" — choose replace OR augment`,
         );
+      }
+      if (mode.permissions !== undefined) {
+        const { permissions } = mode;
+        const validShape =
+          typeof permissions === 'object' &&
+          permissions !== null &&
+          typeof permissions.categories === 'object' &&
+          permissions.categories !== null &&
+          typeof permissions.tools === 'object' &&
+          permissions.tools !== null;
+        if (!validShape) {
+          throw new HarnessConfigError(
+            `modes[${mode.id}].permissions`,
+            `must be a PermissionRules { categories: Record<string, 'allow'|'ask'|'deny'>, tools: {...} }`,
+          );
+        }
+        for (const [scope, map] of [
+          ['categories', permissions.categories],
+          ['tools', permissions.tools],
+        ] as const) {
+          for (const [key, policy] of Object.entries(map)) {
+            if (policy !== 'allow' && policy !== 'ask' && policy !== 'deny') {
+              throw new HarnessConfigError(
+                `modes[${mode.id}].permissions.${scope}["${key}"]`,
+                `must be 'allow' | 'ask' | 'deny' (received: ${JSON.stringify(policy)})`,
+              );
+            }
+          }
+        }
+      }
+      if (mode.workspaceTools !== undefined) {
+        const expose = mode.workspaceTools?.expose;
+        if (!Array.isArray(expose)) {
+          throw new HarnessConfigError(
+            `modes[${mode.id}].workspaceTools.expose`,
+            `must be an array of tool categories ('read' | 'edit' | 'execute')`,
+          );
+        }
+        for (const cat of expose) {
+          if (cat !== 'read' && cat !== 'edit' && cat !== 'execute' && cat !== 'mcp' && cat !== 'other') {
+            throw new HarnessConfigError(
+              `modes[${mode.id}].workspaceTools.expose`,
+              `unknown tool category ${JSON.stringify(cat)}`,
+            );
+          }
+        }
       }
       this._modesById.set(mode.id, mode);
     }
@@ -3178,6 +3225,26 @@ export class Harness {
     return this._defaultPermissionPolicy;
   }
 
+  /**
+   * @internal — the base `permissionRules` a mode establishes when entered
+   * (§4.2e). Returns a fresh copy when the mode declares `permissions`, or
+   * `undefined` when it does not — in which case entering the mode leaves the
+   * session's existing rules untouched (opt-in). Consumed by Session on create,
+   * `switchMode`, and the plan-approval mode transition.
+   */
+  _modePermissionRules(modeId: string): PermissionRules | undefined {
+    const perms = this._getMode(modeId).permissions;
+    return perms ? clonePermissionRules(perms) : undefined;
+  }
+
+  /**
+   * @internal — the workspace tool categories a mode EXPOSES, or `undefined` when
+   * the mode imposes no workspace-tool profile (every tool stays exposed).
+   */
+  _modeWorkspaceToolExpose(modeId: string): readonly ToolCategory[] | undefined {
+    return this._getMode(modeId).workspaceTools?.expose;
+  }
+
   // -------------------------------------------------------------------------
   // Session resolver — §4.1, §5.3.
   // -------------------------------------------------------------------------
@@ -3439,7 +3506,10 @@ export class Harness {
       modeId,
       modelId: init.modelId ?? '',
       subagentModelOverrides: {},
-      permissionRules: emptyPermissionRules(),
+      // The initial mode SEEDS the base permission policy when it declares one
+      // (§4.2e); otherwise the session starts with empty rules. Runtime grants +
+      // setPolicy overlay this base.
+      permissionRules: this._modePermissionRules(modeId) ?? emptyPermissionRules(),
       sessionGrants: emptySessionGrants(),
       tokenUsage: zeroTokenUsage(),
       pendingQueue: [],
@@ -5971,6 +6041,12 @@ async function waitForThreadDeleteFenceRetry(): Promise<void> {
 
 function emptyPermissionRules(): PermissionRules {
   return { categories: {}, tools: {} };
+}
+
+/** Deep-ish copy so a mode's declared base policy is never mutated by runtime
+ *  `session.permissions.setPolicy()` after it has been seeded onto a session. */
+function clonePermissionRules(rules: PermissionRules): PermissionRules {
+  return { categories: { ...rules.categories }, tools: { ...rules.tools } };
 }
 
 function emptySessionGrants(): SessionGrants {

@@ -6590,7 +6590,15 @@ export class Session {
     this._harness._getMode(opts.mode);
     const previousModeId = this._record.modeId;
     if (previousModeId === opts.mode) return;
-    await this._flushUpdate(prev => ({ ...prev, modeId: opts.mode }));
+    // §4.2e — entering a mode re-establishes its base permission policy when it
+    // declares one (the mode owns the base; runtime grants/setPolicy overlay it).
+    // A mode that declares no `permissions` leaves the existing rules untouched.
+    const seededRules = this._harness._modePermissionRules(opts.mode);
+    await this._flushUpdate(prev => ({
+      ...prev,
+      modeId: opts.mode,
+      ...(seededRules !== undefined ? { permissionRules: seededRules } : {}),
+    }));
     this._emitter.emit({ type: 'mode_changed', modeId: opts.mode, previousModeId });
   }
 
@@ -8391,8 +8399,16 @@ export class Session {
       let alreadyAccounted = false;
       if (completingQueuedItemId !== undefined) {
         if (modeFlipTarget && modeFlipTarget !== previousModeId) {
+          // §4.2e — a plan-approval mode transition re-establishes the target
+          // mode's base permission policy (when it declares one), exactly like
+          // create + switchMode. Keeps permissionRules consistent with modeId.
+          const seededRules = this._harness._modePermissionRules(modeFlipTarget);
           await Promise.race([
-            this._flushUpdate(prev => ({ ...prev, modeId: modeFlipTarget })),
+            this._flushUpdate(prev => ({
+              ...prev,
+              modeId: modeFlipTarget,
+              ...(seededRules !== undefined ? { permissionRules: seededRules } : {}),
+            })),
             activeTurnWaiter.promise,
           ]);
         }
@@ -8441,7 +8457,12 @@ export class Session {
                 },
               };
             }
-            if (modeFlipTarget) next.modeId = modeFlipTarget;
+            if (modeFlipTarget) {
+              next.modeId = modeFlipTarget;
+              // §4.2e — re-seed the base permission policy for the transitioned mode.
+              const seededRules = this._harness._modePermissionRules(modeFlipTarget);
+              if (seededRules !== undefined) next.permissionRules = seededRules;
+            }
             if (completingQueuedItemId !== undefined) {
               next.pendingQueue = (prev.pendingQueue ?? []).filter(x => x.id !== completingQueuedItemId);
               const receipt = prev.queueAdmissionReceipts?.[completingQueuedItemId];
@@ -11489,10 +11510,18 @@ export class Session {
    * Returns undefined when no overrides apply (agent runs with its own tools).
    */
   private _buildToolsets(mode: HarnessMode, callAdditional?: ToolsInput): Record<string, ToolsInput> | undefined {
+    // §4.2e workspace tool profile: when the mode declares `workspaceTools.expose`,
+    // withhold workspace-category tools (read/edit/execute) NOT in the list from
+    // the harness-controlled toolsets (mode + per-call). mcp/other/uncategorized
+    // tools and the harness built-ins are never filtered. Needs a configured
+    // `toolCategoryResolver`; with none, categories are null and nothing is hidden.
+    const expose = mode.workspaceTools?.expose;
+    const profile = (tools: ToolsInput): ToolsInput =>
+      expose ? this._applyWorkspaceToolProfile(tools, expose) : tools;
     const toolsets: Record<string, ToolsInput> = {};
-    if (mode.tools) toolsets[`mode:${mode.id}`] = mode.tools;
-    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = mode.additionalTools;
-    if (callAdditional) toolsets[`call:additional`] = callAdditional;
+    if (mode.tools) toolsets[`mode:${mode.id}`] = profile(mode.tools);
+    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
+    if (callAdditional) toolsets[`call:additional`] = profile(callAdditional);
 
     // Built-in tools registered on the `harness:builtin` toolset (§6.4 / §9).
     // `spawn_subagent` is conditional on subagent types being configured; the
@@ -11510,6 +11539,25 @@ export class Session {
     }
 
     return Object.keys(toolsets).length === 0 ? undefined : toolsets;
+  }
+
+  /**
+   * Withhold workspace-category tools (`read`/`edit`/`execute`) whose category is
+   * NOT in `expose` (§4.2e workspace tool profile). `mcp`/`other`/uncategorized
+   * tools pass through unchanged — the profile governs the workspace tool surface
+   * only, never the workspace itself. Returns a fresh map; the input is untouched.
+   */
+  private _applyWorkspaceToolProfile(tools: ToolsInput, expose: readonly ToolCategory[]): ToolsInput {
+    if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) return tools;
+    const allowed = new Set<ToolCategory>(expose);
+    const out: Record<string, unknown> = {};
+    for (const [name, tool] of Object.entries(tools as Record<string, unknown>)) {
+      const category = this._harness.getToolCategory({ toolName: name });
+      const isWorkspaceCategory = category === 'read' || category === 'edit' || category === 'execute';
+      if (isWorkspaceCategory && !allowed.has(category)) continue; // withheld for this mode
+      out[name] = tool;
+    }
+    return out as ToolsInput;
   }
 
   /**

@@ -33,9 +33,9 @@ import type {
   HarnessAttachmentKind,
   HarnessPrimitiveType,
   PersistedRequestContextInput,
-  HarnessRowErrorCode,
   HarnessStorage,
   JsonValue,
+  PermissionRules,
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
@@ -94,6 +94,33 @@ export interface HarnessMode {
    * mode change. Must reference another mode's `id`.
    */
   transitionsTo?: string;
+
+  /**
+   * Base permission policy this mode establishes (§4.2e). When set, ENTERING the
+   * mode — session create, `switchMode`, or a plan-approval `transitionsTo` flip —
+   * seeds the session's `permissionRules` with a copy of this policy: the mode
+   * owns the base. Runtime `session.permissions.setPolicy()` and grants overlay it
+   * until the next mode entry re-establishes the base. Modes that omit this field
+   * leave the session's existing rules untouched (opt-in, backward compatible).
+   *
+   * This governs the permission GATE (allow/ask/deny at call time). It is
+   * orthogonal to the workspace, which stays owned by the session/resource.
+   */
+  permissions?: PermissionRules;
+
+  /**
+   * Optional workspace tool profile: the workspace tool CATEGORIES
+   * (`read` / `edit` / `execute`) this mode EXPOSES to the model. When set, a tool
+   * whose resolved category is a workspace category NOT listed in `expose` is
+   * withheld from the model for the duration of the mode (`mcp` / `other` /
+   * uncategorized tools and the harness built-ins are unaffected).
+   *
+   * This gates tool EXPOSURE only — it never touches the workspace itself. The
+   * durable world (files, sandbox state, browser state, provider resume state)
+   * stays tied to the session/resource ownership model and is unchanged across
+   * mode switches.
+   */
+  workspaceTools?: { expose: ToolCategory[] };
 
   /**
    * Arbitrary user-defined metadata. Pass-through only — the harness
