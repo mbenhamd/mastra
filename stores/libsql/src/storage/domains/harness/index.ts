@@ -4694,11 +4694,22 @@ export class HarnessLibSQL extends HarnessStorage {
       });
       // Migrate columns added after the table's first creation onto existing
       // deployments (createTable is CREATE TABLE IF NOT EXISTS and never alters).
-      await this.#db.alterTable({
-        tableName: TABLE_HARNESS_PLAN_TASKS,
-        schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
-        ifNotExists: ['delegated_subagent_type_id'],
-      });
+      // SQLite has no `ADD COLUMN IF NOT EXISTS`, and the shared alterTable does a
+      // check-then-add — so two instances starting at once can both see the column
+      // missing and one ALTER loses the race. Swallow only that duplicate-column
+      // error (the column ends up present either way); rethrow anything else.
+      try {
+        await this.#db.alterTable({
+          tableName: TABLE_HARNESS_PLAN_TASKS,
+          schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+          ifNotExists: ['delegated_subagent_type_id'],
+        });
+      } catch (error) {
+        const cause = (error as { cause?: unknown })?.cause ?? error;
+        if (!/duplicate column/i.test(String((cause as { message?: unknown })?.message ?? cause))) {
+          throw error;
+        }
+      }
       await this.#client.execute({
         // §5.1k: ordered listing + recursive subtree walk by parent_task_id.
         sql: `CREATE INDEX IF NOT EXISTS idx_harness_plan_tasks_order
