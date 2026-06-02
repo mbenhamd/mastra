@@ -1080,30 +1080,34 @@ export class Harness {
       }
       if (mode.permissions !== undefined) {
         const { permissions } = mode;
-        const validShape =
-          typeof permissions === 'object' &&
-          permissions !== null &&
-          typeof permissions.categories === 'object' &&
-          permissions.categories !== null &&
-          typeof permissions.tools === 'object' &&
-          permissions.tools !== null;
-        if (!validShape) {
+        const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+          typeof v === 'object' && v !== null && !Array.isArray(v);
+        if (!isPlainObject(permissions) || !isPlainObject(permissions.categories) || !isPlainObject(permissions.tools)) {
           throw new HarnessConfigError(
             `modes[${mode.id}].permissions`,
-            `must be a PermissionRules { categories: Record<string, 'allow'|'ask'|'deny'>, tools: {...} }`,
+            `must be a PermissionRules { categories: Record<ToolCategory, 'allow'|'ask'|'deny'>, tools: Record<string, ...> }`,
           );
         }
-        for (const [scope, map] of [
-          ['categories', permissions.categories],
-          ['tools', permissions.tools],
-        ] as const) {
-          for (const [key, policy] of Object.entries(map)) {
-            if (policy !== 'allow' && policy !== 'ask' && policy !== 'deny') {
-              throw new HarnessConfigError(
-                `modes[${mode.id}].permissions.${scope}["${key}"]`,
-                `must be 'allow' | 'ask' | 'deny' (received: ${JSON.stringify(policy)})`,
-              );
-            }
+        for (const [key, policy] of Object.entries(permissions.categories)) {
+          if (key !== 'read' && key !== 'edit' && key !== 'execute' && key !== 'mcp' && key !== 'other') {
+            throw new HarnessConfigError(`modes[${mode.id}].permissions.categories`, `unknown tool category "${key}"`);
+          }
+          if (policy !== 'allow' && policy !== 'ask' && policy !== 'deny') {
+            throw new HarnessConfigError(
+              `modes[${mode.id}].permissions.categories["${key}"]`,
+              `must be 'allow' | 'ask' | 'deny' (received: ${JSON.stringify(policy)})`,
+            );
+          }
+        }
+        for (const [key, policy] of Object.entries(permissions.tools)) {
+          if (key.length === 0) {
+            throw new HarnessConfigError(`modes[${mode.id}].permissions.tools`, `tool name keys must be non-empty`);
+          }
+          if (policy !== 'allow' && policy !== 'ask' && policy !== 'deny') {
+            throw new HarnessConfigError(
+              `modes[${mode.id}].permissions.tools["${key}"]`,
+              `must be 'allow' | 'ask' | 'deny' (received: ${JSON.stringify(policy)})`,
+            );
           }
         }
       }
@@ -1112,14 +1116,17 @@ export class Harness {
         if (!Array.isArray(expose)) {
           throw new HarnessConfigError(
             `modes[${mode.id}].workspaceTools.expose`,
-            `must be an array of tool categories ('read' | 'edit' | 'execute')`,
+            `must be an array of workspace tool categories ('read' | 'edit' | 'execute')`,
           );
         }
         for (const cat of expose) {
-          if (cat !== 'read' && cat !== 'edit' && cat !== 'execute' && cat !== 'mcp' && cat !== 'other') {
+          // Only workspace categories are meaningful — the profile filter only acts
+          // on read/edit/execute, so mcp/other (or anything else) are rejected to
+          // avoid a config knob that silently does nothing.
+          if (cat !== 'read' && cat !== 'edit' && cat !== 'execute') {
             throw new HarnessConfigError(
               `modes[${mode.id}].workspaceTools.expose`,
-              `unknown tool category ${JSON.stringify(cat)}`,
+              `must be a workspace tool category ('read' | 'edit' | 'execute'), got ${JSON.stringify(cat)}`,
             );
           }
         }
@@ -3235,14 +3242,6 @@ export class Harness {
   _modePermissionRules(modeId: string): PermissionRules | undefined {
     const perms = this._getMode(modeId).permissions;
     return perms ? clonePermissionRules(perms) : undefined;
-  }
-
-  /**
-   * @internal — the workspace tool categories a mode EXPOSES, or `undefined` when
-   * the mode imposes no workspace-tool profile (every tool stays exposed).
-   */
-  _modeWorkspaceToolExpose(modeId: string): readonly ToolCategory[] | undefined {
-    return this._getMode(modeId).workspaceTools?.expose;
   }
 
   // -------------------------------------------------------------------------

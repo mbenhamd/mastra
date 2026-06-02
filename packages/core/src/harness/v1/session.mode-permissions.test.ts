@@ -178,3 +178,60 @@ describe('Mode workspace tool profile (§4.2e)', () => {
     ).toThrow(/workspaceTools/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Inheritance footgun + grants behavior + harder malformed-rejection coverage
+// (raised by the 5-angle harsh review)
+// ---------------------------------------------------------------------------
+
+describe('Mode permission seeding — inheritance + grants edge cases (§4.2e)', () => {
+  it('STICKY INHERITANCE: a permissive base survives into a no-permissions mode (documented opt-in footgun)', async () => {
+    const modes: HarnessMode[] = [
+      { id: 'allowAll', agentId: 'default', permissions: { categories: { edit: 'allow', execute: 'allow' }, tools: {} } },
+      { id: 'plain', agentId: 'default' }, // declares no permissions → inherits
+    ];
+    const { harness } = setupHarness({ modes, defaultModeId: 'allowAll' });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.switchMode({ mode: 'plain' });
+      // The permissive base is STICKY: `plain` does not own/clear permissions, so
+      // `allow` carries over. This is the intentional opt-in semantics — a mode
+      // that wants a neutral base must declare `permissions: { categories: {}, tools: {} }`.
+      expect(session.permissions.getRules().categories.edit).toBe('allow');
+      expect(session.permissions.getRules().categories.execute).toBe('allow');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('runtime grants PERSIST across a mode switch (only permissionRules are re-seeded)', async () => {
+    const modes: HarnessMode[] = [
+      { id: 'a', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } },
+      { id: 'b', agentId: 'default', permissions: { categories: {}, tools: {} } },
+    ];
+    const { harness } = setupHarness({ modes, defaultModeId: 'a' });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.permissions.grantCategory({ category: 'read' });
+      expect(session.permissions.getGrants().categories).toContain('read');
+      await session.switchMode({ mode: 'b' });
+      // Re-seed replaces permissionRules but leaves sessionGrants intact.
+      expect(session.permissions.getRules().categories.edit).toBeUndefined(); // b's base
+      expect(session.permissions.getGrants().categories).toContain('read'); // grant survives
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('rejects malformed mode permissions at construction (array, bad category key, empty tool key)', () => {
+    const cases: HarnessMode[][] = [
+      [{ id: 'm', agentId: 'default', permissions: { categories: [] as any, tools: {} } }],
+      [{ id: 'm', agentId: 'default', permissions: { categories: { bogus: 'deny' } as any, tools: {} } }],
+      [{ id: 'm', agentId: 'default', permissions: { categories: {}, tools: { '': 'deny' } } }],
+      [{ id: 'm', agentId: 'default', permissions: [] as any }],
+    ];
+    for (const modes of cases) {
+      expect(() => setupHarness({ modes, defaultModeId: 'm' })).toThrow(/permissions/);
+    }
+  });
+});

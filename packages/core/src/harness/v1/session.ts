@@ -10575,7 +10575,14 @@ export class Session {
       }
       const now = Date.now();
       const next: SessionRecord = { ...prev };
-      if (opts?.modeId !== undefined) next.modeId = opts.modeId;
+      if (opts?.modeId !== undefined) {
+        next.modeId = opts.modeId;
+        // §4.2e — re-seed the base permission policy WITH the modeId flip so a crash
+        // between this queued-completion write and the later settlement flush can
+        // never persist the target mode alongside the previous mode's rules.
+        const seededRules = this._harness._modePermissionRules(opts.modeId);
+        if (seededRules !== undefined) next.permissionRules = seededRules;
+      }
       if (receipt) {
         next.queueAdmissionReceipts = {
           ...(prev.queueAdmissionReceipts ?? {}),

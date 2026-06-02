@@ -110,15 +110,22 @@ export interface HarnessMode {
 
   /**
    * Optional workspace tool profile: the workspace tool CATEGORIES
-   * (`read` / `edit` / `execute`) this mode EXPOSES to the model. When set, a tool
-   * whose resolved category is a workspace category NOT listed in `expose` is
-   * withheld from the model for the duration of the mode (`mcp` / `other` /
-   * uncategorized tools and the harness built-ins are unaffected).
+   * (`read` / `edit` / `execute`) this mode EXPOSES on the HARNESS-CONTROLLED tool
+   * surface — `mode.tools`, `mode.additionalTools`, and per-call `additionalTools`.
+   * A tool in those toolsets whose resolved category (via
+   * `HarnessConfig.toolCategoryResolver`) is a workspace category NOT listed in
+   * `expose` is withheld from the model; `mcp` / `other` / uncategorized tools and
+   * the harness built-ins pass through. Without a `toolCategoryResolver` nothing is
+   * filtered.
    *
-   * This gates tool EXPOSURE only — it never touches the workspace itself. The
-   * durable world (files, sandbox state, browser state, provider resume state)
-   * stays tied to the session/resource ownership model and is unchanged across
-   * mode switches.
+   * SCOPE: this filters only what the harness injects via toolsets. The backing
+   * agent's OWN tools and provider-supplied workspace tools are assembled by the
+   * agent downstream and are governed by the permission policy (`permissions`
+   * above — e.g. a category `deny`), not by this exposure profile.
+   *
+   * This never touches the workspace itself. The durable world (files, sandbox,
+   * browser, provider resume state) stays tied to the session/resource ownership
+   * model and is unchanged across mode switches.
    */
   workspaceTools?: { expose: ToolCategory[] };
 

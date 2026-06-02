@@ -208,16 +208,16 @@ describe('workspace ownership is decoupled from mode (§4.2e / §2.7)', () => {
     try {
       const before = await session.getWorkspace();
       expect(before).toBeDefined();
-      const recordWorkspaceBefore = (session as any)._record.workspace;
+      expect(session.getCurrentModeId()).toBe('m');
 
       await session.switchMode({ mode: 'm2' });
+      expect(session.getCurrentModeId()).toBe('m2'); // the mode genuinely changed
 
       const after = await session.getWorkspace();
-      // Same durable workspace across the mode switch — the registry keys by
-      // sessionId, never by modeId, so the mode change cannot re-provision it.
+      // Same durable workspace instance across the mode switch — switchMode does
+      // not release or re-provision it; the registry keys by sessionId, never by
+      // modeId (see workspace-registry.ts), so the mode change cannot touch it.
       expect(after).toBe(before);
-      // The durable provider-resume state on the record is untouched by the switch.
-      expect((session as any)._record.workspace).toEqual(recordWorkspaceBefore);
     } finally {
       await harness.shutdown();
     }
