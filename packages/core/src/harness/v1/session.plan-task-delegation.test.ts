@@ -564,15 +564,75 @@ describe('task_delegate — recovery on rehydrate', () => {
     await b.harness.shutdown();
   });
 
+  // CRASH-FAITHFUL: a delegated run that RESOLVED with a non-success finishReason
+  // ('error'/'aborted') settles as `completed` evidence (it resolved, did not
+  // reject), but the durable `result` carries finishReason, so recovery reads it
+  // back and rolls the task up `failed` — matching the live driver. This closes
+  // the former resolve-with-error crash window (which used to recover `completed`).
+  it('a child that RESOLVED with finishReason error recovers as failed from the durable result', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // The child RESOLVES with finishReason:'error' (a resolve, NOT a reject) → its
+    // durable message-result evidence is `completed` with result.finishReason='error'.
+    a.childAgent.enqueueRun({ finishReason: 'error' });
+
+    const close = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'delegated' } as any, toolCtx)) as any;
+    const res = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = res.subagentSessionId;
+
+    // Live driver maps finishReason:'error' → failed.
+    await poll(async () => (await planRow(parentA, task.taskId))?.status === 'failed');
+
+    // Simulate the rollup hook being lost: force the task BACK to in_progress and
+    // re-link (the failed rollup cleared the link), then crash A (steal lease).
+    const row = await planRow(parentA, task.taskId);
+    await parentA._internalStorage.mutatePlanTasksForSession({
+      fence: {
+        sessionId: parentA.id,
+        ownerId: (parentA as any)._internalOwnerId,
+        ifSessionVersion: (parentA as any)._internalRecordVersion,
+      },
+      ops: [
+        {
+          kind: 'update',
+          taskId: task.taskId,
+          ifVersion: row!.version,
+          patch: { status: 'in_progress', statusSource: 'explicit', delegatedSubagentSessionId: childId },
+        },
+      ],
+    });
+    close();
+    for (const [key, r] of db.harnessSessions) {
+      if (r.ownerId === (parentA as any)._internalOwnerId) {
+        db.harnessSessions.set(key, { ...r, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+
+    // Fresh instance: recovery reads the durable `completed` evidence whose
+    // result.finishReason === 'error' → rolls up `failed`, NOT completed.
+    const b = buildHarness(db);
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await poll(async () => {
+      const page = await parentB._internalStorage.listPlanTasks({ sessionId: parentB.id, limit: 100 });
+      return page.tasks.find(t => t.taskId === task.taskId)?.status === 'failed';
+    });
+    await b.harness.shutdown();
+  });
+
   // CRASH-FAITHFUL #2 (lossy-recovery fix): a delegated run that FAILED durably
   // (a rejecting agent error writes a `failed` message-result evidence row, keyed
   // by the deterministic delegation admissionId) must recover as `failed`. The
   // OLD recovery mapped any close-without-cancel child to `completed`, so this
   // FAILED delegation would have masqueraded as completed. We seed the `failed`
-  // evidence row directly (the realistic rejecting-error path; MockAgent's
-  // resolve-with-error-finishReason is a mock artifact that the evidence primitive
-  // does not durably distinguish — see the reconcile doc + report) and assert the
-  // durable-evidence read wins over the close marker.
+  // evidence row directly (the rejecting-error path) and assert the durable-evidence
+  // read wins over the close marker.
   it('a child with durable FAILED evidence recovers as failed (not completed) on rehydrate', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db);

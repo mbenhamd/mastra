@@ -12271,17 +12271,18 @@ export class Session {
    * session). Returns the mapped plan-task outcome, or `undefined` when no
    * terminal evidence exists yet (still `pending`, absent, or a tombstone).
    *
-   * COUPLING NOTE: the message-result-evidence primitive records `completed`
-   * whenever a turn RESOLVES and `failed` only when it REJECTS. A run that
-   * resolves with `finishReason: 'error'` (rather than rejecting) therefore
-   * persists `completed` evidence; the live driver still maps that to a `failed`
-   * delegation in-process via `result.finishReason`, but that distinction is not
-   * durably recorded, so a crash in that narrow window recovers as `completed`.
-   * Real agent errors reject (durable `failed`), and cancellation is captured by
-   * the `cancelRequest` override in the reconcile scan, so the only un-faithful
-   * crash window is resolve-with-error-finishReason. Closing it faithfully needs a
-   * durable per-run terminal that carries `finishReason` — a primitive v1 does not
-   * expose — so it is reported rather than papered over with a fragile heuristic.
+   * FAITHFUL ACROSS CRASH: the message-result-evidence primitive records
+   * `completed` whenever a turn RESOLVES and `failed` only when it REJECTS, so a
+   * run that resolves with `finishReason: 'error' | 'aborted'` (rather than
+   * rejecting) settles as `completed` evidence. But the durable evidence carries
+   * the run's full `result` (the `AgentResult`/`FullOutput`, persisted at the
+   * `status: 'completed'` write), and that result carries `finishReason`. So we
+   * read it back here and map a non-success finishReason to a `failed` delegation
+   * — exactly what the live driver does in-process via `result.finishReason`.
+   * This closes the former resolve-with-error crash window WITHOUT a new
+   * primitive: rejecting runs are durable `failed`, resolve-with-error/aborted
+   * runs are now durable-`completed`-but-finishReason-failed, and cancellation is
+   * captured by the `cancelRequest` override in the reconcile scan.
    */
   private async _loadDelegationOutcomeFromEvidence(
     childRecord: SessionRecord,
@@ -12310,7 +12311,14 @@ export class Session {
       return undefined;
     }
     if (!evidence || !('status' in evidence)) return undefined;
-    if (evidence.status === 'completed') return 'completed';
+    if (evidence.status === 'completed') {
+      // A turn that RESOLVED but with a non-success finishReason is a FAILED
+      // delegation (the live driver maps it the same way). The finishReason rides
+      // on the durable `result` payload, so this stays faithful across a crash.
+      const finishReason = (evidence as { result?: { finishReason?: unknown } }).result?.finishReason;
+      if (finishReason === 'error' || finishReason === 'aborted') return 'failed';
+      return 'completed';
+    }
     if (evidence.status === 'failed') return 'failed';
     return undefined; // 'pending' — no terminal outcome yet.
   }
