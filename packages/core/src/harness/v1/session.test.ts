@@ -224,6 +224,7 @@ describe('Session — surface area (M1)', () => {
         'withExtendedLease',
         'waitForIdle',
         'listMessages',
+        'getActivityTimeline',
         'message',
         'queue',
         'signal',
