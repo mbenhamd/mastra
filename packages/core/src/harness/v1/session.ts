@@ -3029,6 +3029,13 @@ export class Session {
    */
   _subagentInheritWorkspace?: boolean;
 
+  /**
+   * @internal — `SubagentDefinition.tools` for a spawned subagent session, set at
+   * spawn/delegate time. Layered onto the subagent's tool surface in
+   * `_buildToolsets` (§9). Undefined for non-subagent sessions.
+   */
+  _subagentToolsOverride?: ToolsInput;
+
   /** @internal — writes the latest opaque workspace state into the session record. */
   private async _persistWorkspaceState(state: unknown): Promise<void> {
     const providerId = this._harness._workspaceRegistry.providerId;
@@ -11569,6 +11576,10 @@ export class Session {
     if (mode.tools) toolsets[`mode:${mode.id}`] = profile(mode.tools);
     if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
     if (callAdditional) toolsets[`call:additional`] = profile(callAdditional);
+    // §9 — a SubagentDefinition.tools override (set on the child session at spawn)
+    // is layered onto the subagent's surface, subject to the same workspace-tool
+    // profile + permission gate as any other tool.
+    if (this._subagentToolsOverride) toolsets[`subagent:tools`] = profile(this._subagentToolsOverride);
 
     // Built-in tools registered on the `harness:builtin` toolset (§6.4 / §9).
     // `spawn_subagent` is conditional on subagent types being configured; the
@@ -12252,6 +12263,7 @@ export class Session {
     });
     const subagentWorkspaceMode = def.workspace ?? 'inherit';
     child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+    if (def.tools) child._subagentToolsOverride = def.tools;
 
     // Write the durable link + drive the task in_progress under the owner fence.
     // If this rejects (e.g. single-in_progress conflict) the child session was

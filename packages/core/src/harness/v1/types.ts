@@ -1300,14 +1300,12 @@ export interface SubagentDefinition {
   defaultModelId?: string;
 
   /**
-   * Tool surface override for this subagent type.
-   *
-   * NOT YET WIRED: this field is accepted but not currently applied to the
-   * subagent session — the child runs its MODE's tools (`mode.tools` /
-   * `additionalTools`) plus the harness built-ins. To constrain a subagent's
-   * tools today, bind it to a `modeId` whose mode carries the intended `tools`,
-   * and/or use the mode's `permissions` gate. Honoring this field directly is a
-   * follow-up.
+   * Extra tools layered onto this subagent type's surface, on top of its mode's
+   * tools + the harness built-ins (subject to the same workspace-tool profile and
+   * permission gate as any other tool). To strictly CONSTRAIN a subagent to a
+   * minimal surface, also bind it to a `modeId` whose mode carries that surface
+   * and/or use the mode's `permissions` gate — this field augments, it does not
+   * hide the backing agent's own tools (which the agent assembles downstream).
    */
   tools?: ToolsInput;
 

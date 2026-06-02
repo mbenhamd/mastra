@@ -148,6 +148,7 @@ export function createSpawnSubagentTool(parent: Session) {
       // `kind: 'per-session'` (validated at harness construction).
       const subagentWorkspaceMode = def.workspace ?? 'inherit';
       child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+      if (def.tools) child._subagentToolsOverride = def.tools;
 
       // Bridge the child's per-turn events into the parent's subscriber
       // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and

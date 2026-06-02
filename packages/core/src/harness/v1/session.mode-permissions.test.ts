@@ -167,6 +167,21 @@ describe('Mode workspace tool profile (§4.2e)', () => {
     }
   });
 
+  it('a SubagentDefinition.tools override is layered onto the subagent tool surface (§9)', async () => {
+    const modes: HarnessMode[] = [{ id: 'sub', agentId: 'default' }];
+    const { harness } = setupHarness({ modes, defaultModeId: 'sub' });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // Simulate the spawn/delegate wiring that sets the child's override.
+      (session as any)._subagentToolsOverride = { extraTool: tool('extraTool') };
+      const toolsets = (session as any)._buildToolsets(harness.getMode('sub')!);
+      expect(toolsets['subagent:tools']).toBeDefined();
+      expect(Object.keys(toolsets['subagent:tools'])).toEqual(['extraTool']);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('without a workspaceTools profile, every mode tool is exposed', async () => {
     const modes: HarnessMode[] = [
       { id: 'all', agentId: 'default', tools: { readDoc: tool('readDoc'), editDoc: tool('editDoc') } },
