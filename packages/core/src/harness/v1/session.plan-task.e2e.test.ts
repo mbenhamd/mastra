@@ -596,7 +596,9 @@ describe('Harness v1 plan-task E2E — PT6 per-session isolation', () => {
     try {
       const sessionA = await harness.session({ resourceId: 'iso-a', threadId: { fresh: true } });
       const sessionB = await harness.session({ resourceId: 'iso-b', threadId: { fresh: true } });
+      const aEvents: HarnessEvent[] = [];
       const bEvents: HarnessEvent[] = [];
+      sessionA.subscribe(e => aEvents.push(e));
       sessionB.subscribe(e => bEvents.push(e));
 
       await sessionA.message({ content: 'plan A' });
@@ -612,13 +614,18 @@ describe('Harness v1 plan-task E2E — PT6 per-session isolation', () => {
       expect(sessionA.getDisplayState().planTasks!.total).toBe(1);
       expect(sessionB.getDisplayState().planTasks!.total).toBe(2);
 
-      // The custom plan-task events B received are all for B's own task ids.
+      // Each session's custom plan-task events reference ONLY its own task ids —
+      // neither stream leaks the other session's tasks.
+      const aTaskIds = new Set<string>(aPage.tasks.map((t: any) => t.taskId));
       const bTaskIds = new Set<string>(bPage.tasks.map((t: any) => t.taskId));
-      const bCustoms = bEvents.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
+      const customsFor = (events: HarnessEvent[]) =>
+        events.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
+      const aCustoms = customsFor(aEvents);
+      const bCustoms = customsFor(bEvents);
+      expect(aCustoms.length).toBeGreaterThan(0);
       expect(bCustoms.length).toBeGreaterThan(0);
-      for (const c of bCustoms) {
-        for (const id of c.payload.affectedTaskIds) expect(bTaskIds.has(id)).toBe(true);
-      }
+      for (const c of aCustoms) for (const id of c.payload.affectedTaskIds) expect(aTaskIds.has(id)).toBe(true);
+      for (const c of bCustoms) for (const id of c.payload.affectedTaskIds) expect(bTaskIds.has(id)).toBe(true);
     } finally {
       await harness.shutdown();
     }
@@ -632,52 +639,67 @@ describe('Harness v1 plan-task E2E — PT6 per-session isolation', () => {
 // ===========================================================================
 
 describe('Harness v1 plan-task E2E — PT7 graceful close + reopen', () => {
-  it('plan tasks persist across an explicit session.close() and a reopen by sessionId', async () => {
+  it('persists a plan tree across an explicit session.close(), then reopens the SAME (closed) session and stays writable', async () => {
     const db = new InMemoryDB();
-    let call = 0;
-    const buildModel = () =>
-      new MockLanguageModelV2({
-        doStream: async () => {
-          call++;
-          if (call === 1)
-            return {
-              rawCall: { rawPrompt: null, rawSettings: {} },
-              warnings: [],
-              stream: toolCallStream('pt7-add', 'task_add', JSON.stringify({ content: 'Survive close' })),
-            };
-          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
-        },
-      });
 
-    const harnessA = newSharedHarness(
-      db,
-      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: buildModel() }),
-    );
+    // Session A adds one task, then is closed.
+    let callA = 0;
+    const modelA = new MockLanguageModelV2({
+      doStream: async () => {
+        callA++;
+        if (callA === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt7-add', 'task_add', JSON.stringify({ content: 'Survive close' })) };
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
+      },
+    });
+    const harnessA = newSharedHarness(db, new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelA }));
     let sessionId: string;
     try {
       const sessionA = await harnessA.session({ resourceId: 'u-pt7', threadId: { fresh: true } });
       await sessionA.message({ content: 'add one task' });
       sessionId = sessionA.id;
-      // GRACEFUL close (not a crash): writes the close marker.
+      // GRACEFUL close (not a crash).
       await sessionA.close();
-      // The durable tree is untouched by close.
+      // The close marker is actually persisted (so the reopen path below is genuinely
+      // a reopen-AFTER-close, not a hydrate of a still-active record).
+      const closedRec = await (sessionA as any)._internalStorage.loadSession({ sessionId });
+      expect(closedRec).not.toBeNull();
+      expect(typeof closedRec.closedAt).toBe('number');
+      // close() does not delete the tree.
       const afterClose = await (sessionA as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
       expect(afterClose.tasks.map((t: any) => t.content)).toEqual(['Survive close']);
     } finally {
       await harnessA.shutdown();
     }
 
-    // Reopen the SAME session id on a fresh harness over the same db.
-    const harnessB = newSharedHarness(
-      db,
-      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: buildModel() }),
-    );
+    // Fresh harness; session B adds a SECOND task after reopen (proving it is writable).
+    let callB = 0;
+    const modelB = new MockLanguageModelV2({
+      doStream: async () => {
+        callB++;
+        if (callB === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt7-add2', 'task_add', JSON.stringify({ content: 'After reopen' })) };
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
+      },
+    });
+    const harnessB = newSharedHarness(db, new Agent({ id: 'default', name: 'default', instructions: 'plan', model: modelB }));
     try {
       const sessionB = await harnessB.session({ sessionId, resourceId: 'u-pt7' });
-      const page = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
-      expect(page.tasks.map((t: any) => t.content)).toEqual(['Survive close']);
+      // It is the SAME session, brought back to a live state (reopen clears closedAt).
+      expect(sessionB.id).toBe(sessionId);
+      expect(sessionB.lifecycleState).toBe('live');
+      const reopenedRec = await (sessionB as any)._internalStorage.loadSession({ sessionId });
+      expect(reopenedRec.closedAt).toBeUndefined();
+
+      // The pre-close tree recovered + surfaces through the display projection.
+      const recovered = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
+      expect(recovered.tasks.map((t: any) => t.content)).toEqual(['Survive close']);
       await poll(() => sessionB.getDisplayState().planTasks !== undefined);
       expect(sessionB.getDisplayState().planTasks!.total).toBe(1);
+
+      // The reopened session is writable: a new turn adds a second task.
+      await sessionB.message({ content: 'add another task' });
+      const both = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
+      expect(both.tasks.map((t: any) => t.content).sort()).toEqual(['After reopen', 'Survive close']);
+      expect(sessionB.getDisplayState().planTasks!.total).toBe(2);
     } finally {
       await harnessB.shutdown();
     }
