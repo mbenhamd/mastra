@@ -160,7 +160,17 @@ import {
   planTaskUpdate,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
-import { createPlanTaskTools } from './plan-task-tool';
+import {
+  createPlanTaskTools,
+  TASK_ADD_TOOL_ID,
+  TASK_CHECK_TOOL_ID,
+  TASK_COMPLETE_TOOL_ID,
+  TASK_DECOMPOSE_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+  TASK_REPARENT_TOOL_ID,
+  TASK_UPDATE_TOOL_ID,
+  TASK_WRITE_TOOL_ID,
+} from './plan-task-tool';
 import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
@@ -647,6 +657,24 @@ const JUDGE_TRUNCATE_LIMIT = 4000;
 
 const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mcp', 'other'];
 const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
+
+/**
+ * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate).
+ * These are harness infrastructure, NOT user/agent tools, so the §4.2e permission
+ * gate never applies to them — an engaged default 'deny'/'ask' must not block or
+ * suspend the harness's own orchestration. Kept in sync with `_buildToolsets`.
+ */
+const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
+  TASK_ADD_TOOL_ID,
+  TASK_DECOMPOSE_TOOL_ID,
+  TASK_REPARENT_TOOL_ID,
+  TASK_UPDATE_TOOL_ID,
+  TASK_COMPLETE_TOOL_ID,
+  TASK_CHECK_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+  TASK_WRITE_TOOL_ID,
+  SPAWN_SUBAGENT_TOOL_ID,
+]);
 
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
   if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
@@ -11692,7 +11720,23 @@ export class Session {
     // (mode.permissions/runtime rules, or an explicit defaultPermissionPolicy),
     // so an unconfigured harness keeps today's no-gate behavior.
     if (this._toolPermissionGateEngaged()) {
-      entries.push(['__mastra_toolPermissionPolicy', (toolName: string) => session._resolveToolPolicy(toolName)]);
+      // Snapshot rules/grants/default at turn-build time so a concurrent
+      // switchMode (or runtime setPolicy) mid-turn cannot retroactively re-gate an
+      // in-flight turn. Resume rebuilds the context (re-snapshots the CURRENT
+      // policy), so parked approvals still re-evaluate per §4.2e.
+      const ruleSnapshot: PermissionRules = {
+        categories: { ...this._record.permissionRules.categories },
+        tools: { ...this._record.permissionRules.tools },
+      };
+      const grantSnapshot: SessionGrants = {
+        categories: [...this._record.sessionGrants.categories],
+        tools: [...this._record.sessionGrants.tools],
+      };
+      const defaultPolicy = this._harness._getDefaultPermissionPolicy();
+      entries.push([
+        '__mastra_toolPermissionPolicy',
+        (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy),
+      ]);
     }
     return new RequestContext(entries);
   }
@@ -11710,18 +11754,25 @@ export class Session {
   }
 
   /**
-   * Resolve the effective permission policy for a tool (§4.2e order): a per-tool
-   * rule wins, else the tool's category rule, else the harness default. A matching
-   * tool/category GRANT turns an `ask` into `allow` (a grant suppresses only the
-   * policy-level ask; it never overrides a `deny`).
+   * Resolve the effective permission policy for a tool (§4.2e order) against a
+   * per-turn POLICY SNAPSHOT: a per-tool rule wins, else the tool's category rule,
+   * else the harness default. A matching tool/category GRANT turns an `ask` into
+   * `allow` (a grant suppresses only the policy-level ask; it never overrides a
+   * `deny`). Harness-owned built-ins always resolve to `allow` — they are
+   * infrastructure, never gated by the session policy.
    */
-  private _resolveToolPolicy(toolName: string): PermissionPolicy {
-    const { permissionRules: rules, sessionGrants: grants } = this._record;
+  private _resolveToolPolicy(
+    toolName: string,
+    rules: PermissionRules,
+    grants: SessionGrants,
+    defaultPolicy: PermissionPolicy,
+  ): PermissionPolicy {
+    if (HARNESS_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
     const category = this._harness.getToolCategory({ toolName }) ?? undefined;
     let policy: PermissionPolicy =
       (rules.tools[toolName] as PermissionPolicy | undefined) ??
       (category !== undefined ? (rules.categories[category] as PermissionPolicy | undefined) : undefined) ??
-      this._harness._getDefaultPermissionPolicy();
+      defaultPolicy;
     if (policy === 'ask') {
       const granted =
         grants.tools.includes(toolName) || (category !== undefined && grants.categories.includes(category));

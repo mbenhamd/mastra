@@ -283,3 +283,25 @@ describe('spawn_subagent — mode inheritance (§9)', () => {
     }
   });
 });
+
+describe('subagent type validation (§9)', () => {
+  it('rejects a subagent type whose modeId is backed by a DIFFERENT agent than def.agentId', () => {
+    expect(
+      () =>
+        new Harness({
+          agents: { a: new FakeAgent('a'), b: new FakeAgent('b') } as any,
+          modes: [
+            { id: 'default', agentId: 'a' },
+            { id: 'b-mode', agentId: 'b' },
+          ],
+          defaultModeId: 'default',
+          sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+          subagents: {
+            maxDepth: 2,
+            // agentId 'a' but modeId 'b-mode' runs agent 'b' → must be rejected.
+            types: { mismatch: { agentId: 'a', modeId: 'b-mode', description: 'bad' } },
+          },
+        }),
+    ).toThrow(/conflicts with mode/);
+  });
+});

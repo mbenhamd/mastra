@@ -86,16 +86,15 @@ import {
   HarnessSessionConflictError,
   HarnessSessionCorruptError,
   HarnessSessionDeleteBlockedError,
-  
   HarnessSessionDeletedError,
   HarnessSessionLockedError,
   HarnessSessionNotFoundError,
   HarnessStorageError,
   HarnessThreadNotFoundError,
   HarnessValidationError,
-  HarnessWorkspaceProviderMismatchError
+  HarnessWorkspaceProviderMismatchError,
 } from './errors';
-import type {HarnessSessionDeleteBlocker} from './errors';
+import type { HarnessSessionDeleteBlocker } from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { Session } from './session';
@@ -1088,7 +1087,11 @@ export class Harness {
         const { permissions } = mode;
         const isPlainObject = (v: unknown): v is Record<string, unknown> =>
           typeof v === 'object' && v !== null && !Array.isArray(v);
-        if (!isPlainObject(permissions) || !isPlainObject(permissions.categories) || !isPlainObject(permissions.tools)) {
+        if (
+          !isPlainObject(permissions) ||
+          !isPlainObject(permissions.categories) ||
+          !isPlainObject(permissions.tools)
+        ) {
           throw new HarnessConfigError(
             `modes[${mode.id}].permissions`,
             `must be a PermissionRules { categories: Record<ToolCategory, 'allow'|'ask'|'deny'>, tools: Record<string, ...> }`,
@@ -1346,11 +1349,23 @@ export class Harness {
           `references unknown agent "${def.agentId}" — Mastra has no such agent registered`,
         );
       }
-      if (def.modeId !== undefined && !this._modesById.has(def.modeId)) {
-        throw new HarnessConfigError(
-          `subagents.types["${agentType}"].modeId`,
-          `references unknown mode "${def.modeId}"`,
-        );
+      if (def.modeId !== undefined) {
+        const mode = this._modesById.get(def.modeId);
+        if (!mode) {
+          throw new HarnessConfigError(
+            `subagents.types["${agentType}"].modeId`,
+            `references unknown mode "${def.modeId}"`,
+          );
+        }
+        // The subagent runs the MODE's agent (sessions resolve their agent from
+        // the mode). So a `modeId` whose mode is backed by a DIFFERENT agent than
+        // `def.agentId` would silently run the wrong agent. Reject the mismatch.
+        if (mode.agentId !== def.agentId) {
+          throw new HarnessConfigError(
+            `subagents.types["${agentType}"]`,
+            `agentId "${def.agentId}" conflicts with mode "${def.modeId}".agentId "${mode.agentId}" — the subagent runs the mode's agent, so they must match`,
+          );
+        }
       }
     }
     let boundHarnesses = boundHarnessesByMastra.get(mastra);
@@ -1778,14 +1793,12 @@ export class Harness {
       // message (signing-secret config errors, expected-vs-actual signature hints,
       // stack-derived prose) MUST NOT be echoed to the anonymous caller. Surface a
       // fixed redacted message; the real cause stays local-only (logged here).
-      this._mastra
-        ?.getLogger?.()
-        ?.error?.('[harness/v1] channel inbound verification failed', {
-          harnessName: this._harnessName,
-          channelId,
-          providerId: routeContext.providerId,
-          error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
-        });
+      this._mastra?.getLogger?.()?.error?.('[harness/v1] channel inbound verification failed', {
+        harnessName: this._harnessName,
+        channelId,
+        providerId: routeContext.providerId,
+        error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+      });
       return {
         kind: 'verify_failed',
         httpStatus: 401,
@@ -2085,7 +2098,9 @@ export class Harness {
       // attempt) so the persisted payload always matches the admissionHash, which
       // omits absent fields.
       const admissionDelivery: ChannelIngressDelivery =
-        resolved.admission?.delivery ?? this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ?? 'queue';
+        resolved.admission?.delivery ??
+        this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ??
+        'queue';
       const admissionMode = resolved.admission?.mode;
       const admissionModel = resolved.admission?.model;
       // signal() has no per-turn `model` override (types.ts SessionSignalOptions),
@@ -2467,216 +2482,218 @@ export class Harness {
         cfg.claimRenewMs,
         async (): Promise<'queued' | 'accepted'> => {
           if (row.admissionHash !== undefined) {
-        // REPLAY-ONLY: never re-run channel policy once admissionHash exists.
-        if (
-          row.resourceId === undefined ||
-          row.threadId === undefined ||
-          row.sessionId === undefined ||
-          row.bindingId === undefined
-        ) {
-          throw new HarnessValidationError(
-            'recoverChannelInboxOnce',
-            'inbox row carries admissionHash but is missing resolved binding/resource/thread/session ids',
+            // REPLAY-ONLY: never re-run channel policy once admissionHash exists.
+            if (
+              row.resourceId === undefined ||
+              row.threadId === undefined ||
+              row.sessionId === undefined ||
+              row.bindingId === undefined
+            ) {
+              throw new HarnessValidationError(
+                'recoverChannelInboxOnce',
+                'inbox row carries admissionHash but is missing resolved binding/resource/thread/session ids',
+              );
+            }
+            const bindingId = row.bindingId;
+            const session = await this.session({
+              resourceId: row.resourceId,
+              threadId: row.threadId,
+              sessionId: row.sessionId,
+            } as SessionResolveOptions);
+            // The inbox state machine forbids a direct failed → terminal transition; a
+            // retried 'failed' row must pass back through 'admitted' first (clearing
+            // its stale failure metadata). An already-'admitted' row replays directly.
+            let base = row;
+            if (row.status === 'failed') {
+              const readmittedRow: ChannelInboxItem = {
+                ...row,
+                status: 'admitted',
+                admittedAt: row.admittedAt ?? now,
+                updatedAt: now,
+                failedAt: undefined,
+                deadAt: undefined,
+                nextAttemptAt: undefined,
+                lastError: undefined,
+              };
+              await storage.updateChannelInboxItem(readmittedRow, { claimId });
+              persisted = readmittedRow;
+              base = readmittedRow;
+            }
+            // Replay the persisted delivery mode (NOT a re-run of policy). A row whose
+            // policy selected signal delivery replays as a signal; otherwise queue.
+            if (row.delivery === 'signal') {
+              const admit = await session._admitChannelSignalTurn({
+                content: row.content,
+                admissionId: row.id,
+                requestContext: row.requestContext,
+                expectedAdmissionHash: row.admissionHash,
+                attachments: row.attachments,
+                ...(row.mode !== undefined ? { mode: row.mode } : {}),
+              });
+              const acceptedRow: ChannelInboxItem = {
+                ...base,
+                status: 'accepted',
+                runId: admit.runId,
+                signalId: admit.signalId,
+                acceptedAt: base.acceptedAt ?? now,
+                updatedAt: now,
+                failedAt: undefined,
+                deadAt: undefined,
+                nextAttemptAt: undefined,
+                lastError: undefined,
+              };
+              await storage.updateChannelInboxItem(acceptedRow, { claimId });
+              persisted = acceptedRow;
+              this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, bindingId);
+              return 'accepted';
+            }
+            const admit = await session._admitChannelQueueTurn({
+              content: row.content,
+              admissionId: row.id,
+              requestContext: row.requestContext,
+              attachments: row.attachments,
+              expectedAdmissionHash: row.admissionHash,
+              ...(row.mode !== undefined ? { mode: row.mode } : {}),
+              ...(row.model !== undefined ? { model: row.model } : {}),
+            });
+            const queuedRow: ChannelInboxItem = {
+              ...base,
+              status: 'queued',
+              queuedItemId: admit.queuedItemId,
+              queuedAt: base.queuedAt ?? now,
+              updatedAt: now,
+              failedAt: undefined,
+              deadAt: undefined,
+              nextAttemptAt: undefined,
+              lastError: undefined,
+            };
+            await storage.updateChannelInboxItem(queuedRow, { claimId });
+            persisted = queuedRow;
+            this._emitChannelIngressAdmitted(row, admit.queuedItemId, bindingId);
+            return 'queued';
+          }
+          // FROM-SCRATCH: no admissionHash → resume from binding resolution. Keep this
+          // sequence in lockstep with admitChannelInbound (§14.2 steps 5-9).
+          const ctx = reconstructChannelIngressContext(row);
+          const { binding, resolved } = await this._resolveChannelBindingForIngress(ctx);
+          const session = await this.session({
+            resourceId: resolved.resourceId,
+            threadId: resolved.threadId,
+            sessionId: resolved.sessionId,
+          } as SessionResolveOptions);
+          const requestContext = buildChannelRequestContext(ctx, binding.id);
+          // Mirror admitChannelInbound: re-normalize attachments against the resolved
+          // session, choose the delivery mode (policy or channel default), and replay
+          // through the matching admit method.
+          const persistedAttachments = await this._normalizeChannelInboundAttachments(session, ctx);
+          const admissionDelivery: ChannelIngressDelivery =
+            resolved.admission?.delivery ??
+            this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ??
+            'queue';
+          const admissionMode = resolved.admission?.mode;
+          const admissionModel = resolved.admission?.model;
+          if (admissionDelivery === 'signal' && admissionModel !== undefined) {
+            throw new HarnessValidationError(
+              'recoverChannelInboxOnce',
+              "delivery: 'signal' cannot carry a policy `model` override — signal turns have no per-turn model",
+            );
+          }
+          if (admissionDelivery === 'signal') {
+            const admissionHash = session._channelSignalAdmissionHash(
+              { content: ctx.content, mode: admissionMode },
+              persistedAttachments,
+              requestContext,
+            );
+            const admittedRow: ChannelInboxItem = {
+              ...row,
+              status: 'admitted',
+              bindingId: binding.id,
+              resourceId: resolved.resourceId,
+              threadId: resolved.threadId,
+              sessionId: resolved.sessionId,
+              delivery: 'signal',
+              admissionHash,
+              mode: admissionMode,
+              model: undefined,
+              attachments: persistedAttachments,
+              requestContext,
+              admittedAt: now,
+              updatedAt: now,
+              failedAt: undefined,
+              deadAt: undefined,
+              nextAttemptAt: undefined,
+              lastError: undefined,
+            };
+            await storage.updateChannelInboxItem(admittedRow, { claimId });
+            persisted = admittedRow;
+            const admit = await session._admitChannelSignalTurn({
+              content: ctx.content,
+              admissionId: row.id,
+              requestContext,
+              expectedAdmissionHash: admissionHash,
+              attachments: persistedAttachments,
+              mode: admissionMode,
+            });
+            const acceptedRow: ChannelInboxItem = {
+              ...admittedRow,
+              status: 'accepted',
+              runId: admit.runId,
+              signalId: admit.signalId,
+              acceptedAt: now,
+              updatedAt: now,
+            };
+            await storage.updateChannelInboxItem(acceptedRow, { claimId });
+            persisted = acceptedRow;
+            this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, binding.id);
+            return 'accepted';
+          }
+          const admissionHash = session._channelQueueAdmissionHash(
+            { content: ctx.content, mode: admissionMode, model: admissionModel },
+            persistedAttachments,
+            requestContext,
           );
-        }
-        const bindingId = row.bindingId;
-        const session = await this.session({
-          resourceId: row.resourceId,
-          threadId: row.threadId,
-          sessionId: row.sessionId,
-        } as SessionResolveOptions);
-        // The inbox state machine forbids a direct failed → terminal transition; a
-        // retried 'failed' row must pass back through 'admitted' first (clearing
-        // its stale failure metadata). An already-'admitted' row replays directly.
-        let base = row;
-        if (row.status === 'failed') {
-          const readmittedRow: ChannelInboxItem = {
+          const admittedRow: ChannelInboxItem = {
             ...row,
             status: 'admitted',
-            admittedAt: row.admittedAt ?? now,
+            bindingId: binding.id,
+            resourceId: resolved.resourceId,
+            threadId: resolved.threadId,
+            sessionId: resolved.sessionId,
+            delivery: 'queue',
+            admissionHash,
+            mode: admissionMode,
+            model: admissionModel,
+            attachments: persistedAttachments,
+            requestContext,
+            admittedAt: now,
             updatedAt: now,
             failedAt: undefined,
             deadAt: undefined,
             nextAttemptAt: undefined,
             lastError: undefined,
           };
-          await storage.updateChannelInboxItem(readmittedRow, { claimId });
-          persisted = readmittedRow;
-          base = readmittedRow;
-        }
-        // Replay the persisted delivery mode (NOT a re-run of policy). A row whose
-        // policy selected signal delivery replays as a signal; otherwise queue.
-        if (row.delivery === 'signal') {
-          const admit = await session._admitChannelSignalTurn({
-            content: row.content,
+          await storage.updateChannelInboxItem(admittedRow, { claimId });
+          persisted = admittedRow;
+          const admit = await session._admitChannelQueueTurn({
+            content: ctx.content,
             admissionId: row.id,
-            requestContext: row.requestContext,
-            expectedAdmissionHash: row.admissionHash,
-            attachments: row.attachments,
-            ...(row.mode !== undefined ? { mode: row.mode } : {}),
+            requestContext,
+            attachments: persistedAttachments,
+            expectedAdmissionHash: admissionHash,
+            mode: admissionMode,
+            model: admissionModel,
           });
-          const acceptedRow: ChannelInboxItem = {
-            ...base,
-            status: 'accepted',
-            runId: admit.runId,
-            signalId: admit.signalId,
-            acceptedAt: base.acceptedAt ?? now,
+          const queuedRow: ChannelInboxItem = {
+            ...admittedRow,
+            status: 'queued',
+            queuedItemId: admit.queuedItemId,
+            queuedAt: now,
             updatedAt: now,
-            failedAt: undefined,
-            deadAt: undefined,
-            nextAttemptAt: undefined,
-            lastError: undefined,
           };
-          await storage.updateChannelInboxItem(acceptedRow, { claimId });
-          persisted = acceptedRow;
-          this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, bindingId);
-          return 'accepted';
-        }
-        const admit = await session._admitChannelQueueTurn({
-          content: row.content,
-          admissionId: row.id,
-          requestContext: row.requestContext,
-          attachments: row.attachments,
-          expectedAdmissionHash: row.admissionHash,
-          ...(row.mode !== undefined ? { mode: row.mode } : {}),
-          ...(row.model !== undefined ? { model: row.model } : {}),
-        });
-        const queuedRow: ChannelInboxItem = {
-          ...base,
-          status: 'queued',
-          queuedItemId: admit.queuedItemId,
-          queuedAt: base.queuedAt ?? now,
-          updatedAt: now,
-          failedAt: undefined,
-          deadAt: undefined,
-          nextAttemptAt: undefined,
-          lastError: undefined,
-        };
-        await storage.updateChannelInboxItem(queuedRow, { claimId });
-        persisted = queuedRow;
-        this._emitChannelIngressAdmitted(row, admit.queuedItemId, bindingId);
-        return 'queued';
-      }
-      // FROM-SCRATCH: no admissionHash → resume from binding resolution. Keep this
-      // sequence in lockstep with admitChannelInbound (§14.2 steps 5-9).
-      const ctx = reconstructChannelIngressContext(row);
-      const { binding, resolved } = await this._resolveChannelBindingForIngress(ctx);
-      const session = await this.session({
-        resourceId: resolved.resourceId,
-        threadId: resolved.threadId,
-        sessionId: resolved.sessionId,
-      } as SessionResolveOptions);
-      const requestContext = buildChannelRequestContext(ctx, binding.id);
-      // Mirror admitChannelInbound: re-normalize attachments against the resolved
-      // session, choose the delivery mode (policy or channel default), and replay
-      // through the matching admit method.
-      const persistedAttachments = await this._normalizeChannelInboundAttachments(session, ctx);
-      const admissionDelivery: ChannelIngressDelivery =
-        resolved.admission?.delivery ?? this._channelRegistry.getConfig(ctx.channelId)?.ingress?.defaultDelivery ?? 'queue';
-      const admissionMode = resolved.admission?.mode;
-      const admissionModel = resolved.admission?.model;
-      if (admissionDelivery === 'signal' && admissionModel !== undefined) {
-        throw new HarnessValidationError(
-          'recoverChannelInboxOnce',
-          "delivery: 'signal' cannot carry a policy `model` override — signal turns have no per-turn model",
-        );
-      }
-      if (admissionDelivery === 'signal') {
-        const admissionHash = session._channelSignalAdmissionHash(
-          { content: ctx.content, mode: admissionMode },
-          persistedAttachments,
-          requestContext,
-        );
-        const admittedRow: ChannelInboxItem = {
-          ...row,
-          status: 'admitted',
-          bindingId: binding.id,
-          resourceId: resolved.resourceId,
-          threadId: resolved.threadId,
-          sessionId: resolved.sessionId,
-          delivery: 'signal',
-          admissionHash,
-          mode: admissionMode,
-          model: undefined,
-          attachments: persistedAttachments,
-          requestContext,
-          admittedAt: now,
-          updatedAt: now,
-          failedAt: undefined,
-          deadAt: undefined,
-          nextAttemptAt: undefined,
-          lastError: undefined,
-        };
-        await storage.updateChannelInboxItem(admittedRow, { claimId });
-        persisted = admittedRow;
-        const admit = await session._admitChannelSignalTurn({
-          content: ctx.content,
-          admissionId: row.id,
-          requestContext,
-          expectedAdmissionHash: admissionHash,
-          attachments: persistedAttachments,
-          mode: admissionMode,
-        });
-        const acceptedRow: ChannelInboxItem = {
-          ...admittedRow,
-          status: 'accepted',
-          runId: admit.runId,
-          signalId: admit.signalId,
-          acceptedAt: now,
-          updatedAt: now,
-        };
-        await storage.updateChannelInboxItem(acceptedRow, { claimId });
-        persisted = acceptedRow;
-        this._emitChannelIngressSignalAdmitted(row, admit.runId, admit.signalId, binding.id);
-        return 'accepted';
-      }
-      const admissionHash = session._channelQueueAdmissionHash(
-        { content: ctx.content, mode: admissionMode, model: admissionModel },
-        persistedAttachments,
-        requestContext,
-      );
-      const admittedRow: ChannelInboxItem = {
-        ...row,
-        status: 'admitted',
-        bindingId: binding.id,
-        resourceId: resolved.resourceId,
-        threadId: resolved.threadId,
-        sessionId: resolved.sessionId,
-        delivery: 'queue',
-        admissionHash,
-        mode: admissionMode,
-        model: admissionModel,
-        attachments: persistedAttachments,
-        requestContext,
-        admittedAt: now,
-        updatedAt: now,
-        failedAt: undefined,
-        deadAt: undefined,
-        nextAttemptAt: undefined,
-        lastError: undefined,
-      };
-      await storage.updateChannelInboxItem(admittedRow, { claimId });
-      persisted = admittedRow;
-      const admit = await session._admitChannelQueueTurn({
-        content: ctx.content,
-        admissionId: row.id,
-        requestContext,
-        attachments: persistedAttachments,
-        expectedAdmissionHash: admissionHash,
-        mode: admissionMode,
-        model: admissionModel,
-      });
-      const queuedRow: ChannelInboxItem = {
-        ...admittedRow,
-        status: 'queued',
-        queuedItemId: admit.queuedItemId,
-        queuedAt: now,
-        updatedAt: now,
-      };
-      await storage.updateChannelInboxItem(queuedRow, { claimId });
-      persisted = queuedRow;
-      this._emitChannelIngressAdmitted(row, admit.queuedItemId, binding.id);
-      return 'queued';
+          await storage.updateChannelInboxItem(queuedRow, { claimId });
+          persisted = queuedRow;
+          this._emitChannelIngressAdmitted(row, admit.queuedItemId, binding.id);
+          return 'queued';
         },
       );
     } catch (err) {
@@ -2703,7 +2720,12 @@ export class Harness {
     // entry-level `forceDead` path (maxAttempts exhausted on claim) keeps the row's
     // own last code rather than reclassifying.
     const classified = failure.forceDead
-      ? { status: 'dead' as const, code: originalRow.lastError?.code ?? 'unknown', retryable: false, nextAttemptAt: undefined }
+      ? {
+          status: 'dead' as const,
+          code: originalRow.lastError?.code ?? 'unknown',
+          retryable: false,
+          nextAttemptAt: undefined,
+        }
       : classifyChannelInboxFailure(failure.error, {
           attempts,
           maxAttempts: cfg.maxAttempts,
@@ -3304,9 +3326,8 @@ export class Harness {
       }
       // Cold resolve — two concurrent by-thread callers for the same
       // (resourceId, threadId) share one resolution.
-      return this._singleflightResolve(
-        canonicalJson(['thread', resourceId, threadId]),
-        () => this._resolveByThread(storage, opts),
+      return this._singleflightResolve(canonicalJson(['thread', resourceId, threadId]), () =>
+        this._resolveByThread(storage, opts),
       );
     }
 
@@ -3471,7 +3492,6 @@ export class Harness {
       subagentDepth: opts.subagentDepth,
     });
   }
-
 
   // -------------------------------------------------------------------------
   // Session creation / hydration.
@@ -4556,8 +4576,7 @@ export class Harness {
     subtreeCloseDeadlineAt?: number,
   ): Promise<CloseTreeNode> {
     const closingAt = node.record.closingAt ?? Date.now();
-    const closeDeadlineAt =
-      node.record.closeDeadlineAt ?? subtreeCloseDeadlineAt ?? closingAt + this._closeTimeoutMs;
+    const closeDeadlineAt = node.record.closeDeadlineAt ?? subtreeCloseDeadlineAt ?? closingAt + this._closeTimeoutMs;
     if (node.live) {
       let record: SessionRecord;
       try {
@@ -5051,7 +5070,11 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
-      throw new HarnessStorageError({ operation: 'session_save', sessionId: eventPersistenceError.sessionId, cause: eventPersistenceError.error });
+      throw new HarnessStorageError({
+        operation: 'session_save',
+        sessionId: eventPersistenceError.sessionId,
+        cause: eventPersistenceError.error,
+      });
     }
 
     for (const session of sessions) {
@@ -5081,7 +5104,11 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
-      throw new HarnessStorageError({ operation: 'session_save', sessionId: eventPersistenceError.sessionId, cause: eventPersistenceError.error });
+      throw new HarnessStorageError({
+        operation: 'session_save',
+        sessionId: eventPersistenceError.sessionId,
+        cause: eventPersistenceError.error,
+      });
     }
 
     for (const session of sessions) {
@@ -5505,7 +5532,6 @@ export class Harness {
           updatedAt: new Date(),
         },
       });
-
     },
 
     /**
@@ -6114,10 +6140,7 @@ function deriveChannelSessionId(resourceId: string, threadId: string): string {
  * `bindingId` is absent at inbox-create (binding not yet resolved) and present
  * once the binding is committed.
  */
-function buildChannelRequestContext(
-  ctx: ChannelIngressContext,
-  bindingId?: string,
-): PersistedRequestContextInput {
+function buildChannelRequestContext(ctx: ChannelIngressContext, bindingId?: string): PersistedRequestContextInput {
   return {
     channel: {
       origin: 'inbound',
@@ -6237,7 +6260,9 @@ function classifyChannelInboxFailure(
   opts: { attempts: number; maxAttempts: number; now: number; retryBackoffMs: (attempt: number) => number },
 ): { status: 'failed' | 'dead'; code: HarnessRowErrorCode; retryable: boolean; nextAttemptAt?: number } {
   const { attempts, maxAttempts, now, retryBackoffMs } = opts;
-  const backoffRetry = (code: HarnessRowErrorCode): {
+  const backoffRetry = (
+    code: HarnessRowErrorCode,
+  ): {
     status: 'failed' | 'dead';
     code: HarnessRowErrorCode;
     retryable: boolean;

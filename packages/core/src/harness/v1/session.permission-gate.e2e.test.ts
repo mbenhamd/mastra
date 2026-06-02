@@ -196,6 +196,48 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     }
   });
 
+  it('harness BUILT-INS (plan-task tools) bypass the gate even under defaultPermissionPolicy deny', async () => {
+    // An explicit default 'deny' engages the gate and would block any non-builtin
+    // tool. The harness's own built-ins (task_add etc.) must still run — else the
+    // gate would break the harness's own orchestration.
+    let call = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        call++;
+        if (call === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('b-add', 'task_add', JSON.stringify({ content: 'plan step' })),
+          };
+        }
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['done']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'plan', model });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      defaultPermissionPolicy: 'deny', // gate engaged; would deny any non-builtin tool
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'plan it' });
+      // The built-in task_add ran (not denied) → a real plan task was created.
+      const toolEnd = events.find(e => e.type === 'tool_end' && (e as any).toolName === 'task_add') as any;
+      expect(toolEnd).toBeDefined();
+      expect(toolEnd.isError).toBe(false);
+      expect(toolEnd.output?.taskId).toBeTruthy();
+      expect(session.getDisplayState().planTasks?.total).toBe(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('UNCONFIGURED harness gates nothing — the tool runs (pre-§4.2e behavior preserved)', async () => {
     // No mode.permissions and no explicit defaultPermissionPolicy → gate OFF.
     const { harness, ran } = buildHarness({});

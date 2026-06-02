@@ -173,6 +173,18 @@ observational memory, workspace, goal, and token-usage semantics):
   // same session-owned decision path above rather than processor output,
   // request-context data, or tool-supplied state as authority:
   //
+  // IMPLEMENTATION STATUS (harness-v1): the PRE-ACTION gate (2, below) is wired —
+  // the loop's tool-call step consults a session-owned per-tool policy resolver
+  // (threaded on the request context) and `deny` blocks the call, `ask` suspends
+  // for approval, `allow` proceeds; it re-evaluates on resume; harness-owned
+  // built-ins bypass it; enforcement is opt-in (a session with no rule + no
+  // explicit `defaultPermissionPolicy` gates nothing). NOT yet implemented and
+  // tracked as follow-ups: the PRE-EXPOSURE gate (1, below) — denied tools are
+  // currently NOT hidden from the model, only refused at action time; the
+  // additive `approvalReasons` composition in the main loop (the durable agent
+  // path carries reasons; the main-loop pending approval does not yet); and the
+  // per-run `yolo` policy-ask→allow override (the bit is persisted but inert).
+  //
   // 1. Pre-exposure gate. After static tools, per-turn `addTools`, processors,
   //    ToolSearch, `prepareStep`, workspace wrappers, child-session/subagent
   //    toolset composition, `activeTools`, and `toolChoice` have produced the final

@@ -1268,12 +1268,21 @@ export type HarnessWorkspaceConfig =
  * `subagent_*` events.
  */
 export interface SubagentDefinition {
-  /** Backing agent id. Must reference a key in `HarnessConfig.agents`. */
+  /**
+   * Backing agent id. Must reference a key in `HarnessConfig.agents`.
+   *
+   * NOTE: the subagent session resolves its running agent from its MODE
+   * (`mode.agentId`), not from this field directly. When `modeId` is set, it MUST
+   * be backed by this same `agentId` (validated at construction). When `modeId` is
+   * unset the subagent inherits the PARENT's mode — and therefore the parent
+   * mode's agent — so this field is advisory in that case.
+   */
   agentId: string;
 
   /**
-   * Mode the subagent's session runs in. Resolves in `HarnessConfig.modes`.
-   * If unset, the subagent inherits the parent's mode.
+   * Mode the subagent's session runs in. Resolves in `HarnessConfig.modes`; its
+   * `agentId` must equal this type's `agentId`. If unset, the subagent inherits
+   * the parent's current mode (and thus that mode's agent).
    */
   modeId?: string;
 
@@ -1291,17 +1300,24 @@ export interface SubagentDefinition {
   defaultModelId?: string;
 
   /**
-   * Tool surface override for this subagent type. When set, the subagent
-   * runs with exactly these tools (replaces the backing agent's tools).
-   * Mutually exclusive with the mode's own `tools` overlay — caller wins.
+   * Tool surface override for this subagent type.
+   *
+   * NOT YET WIRED: this field is accepted but not currently applied to the
+   * subagent session — the child runs its MODE's tools (`mode.tools` /
+   * `additionalTools`) plus the harness built-ins. To constrain a subagent's
+   * tools today, bind it to a `modeId` whose mode carries the intended `tools`,
+   * and/or use the mode's `permissions` gate. Honoring this field directly is a
+   * follow-up.
    */
   tools?: ToolsInput;
 
   /**
-   * Workspace ownership model for the subagent session. `'inherit'` reuses
-   * the parent's workspace; `'fresh'` provisions a new one. Default:
-   * `'inherit'`. Workspace plumbing lands in a later slice — the field is
-   * accepted now so configs don't need to change later.
+   * Workspace ownership model for the subagent session. `'inherit'` (default)
+   * shares the parent's workspace via a refcount on the same registry entry;
+   * `'fresh'` provisions the subagent its own per-session workspace (only valid
+   * under `workspace.kind: 'per-session'`, validated at construction). This
+   * controls FILESYSTEM/sandbox ownership only — it does not reset the
+   * subagent's mode, tools, or permissions.
    */
   workspace?: 'inherit' | 'fresh';
 }
