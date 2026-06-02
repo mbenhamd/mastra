@@ -814,3 +814,61 @@ describe('Harness v1 plan-task E2E — PT8 concurrent per-session isolation', ()
     }
   });
 });
+
+// ===========================================================================
+// PT9 — a REJECTED plan-task mutation returns an isError tool payload through
+//        the real loop WITHOUT aborting the turn (§15.2), and leaves the tree
+//        uncorrupted so the agent can recover and continue.
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT9 rejected mutation surfaces isError, turn survives', () => {
+  it('a cycle-creating task_reparent returns isError mid-turn and the turn still completes with the tree intact', async () => {
+    let rootId: string | undefined;
+    let call = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        call++;
+        if (call === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt9-add', 'task_add', JSON.stringify({ content: 'Root' })) };
+        // Illegal: make the task its own parent → cycle → must be REJECTED (isError),
+        // not throw and abort the turn.
+        if (call === 2) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt9-cycle', 'task_reparent', JSON.stringify({ taskId: rootId, newParentTaskId: rootId })) };
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['Recovered after rejection.']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'plan', model });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-pt9', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => {
+        events.push(e);
+        if (e.type === 'tool_end' && (e as any).toolName === 'task_add' && (e as any).output?.taskId) rootId = (e as any).output.taskId;
+      });
+
+      const result = (await session.message({ content: 'add then illegally reparent' })) as any;
+
+      // The rejection travels as an `isError` PAYLOAD (§15.2 / spawn_subagent
+      // convention), NOT as a thrown tool error: the plan-task tool catches the
+      // cycle and returns `{ isError: true, errorName }`, so the LOOP-level
+      // tool_end.isError stays false while the OUTPUT carries the rejection.
+      const reparentEnd = events.find(e => e.type === 'tool_end' && (e as any).toolName === 'task_reparent') as
+        | (ToolEndEvent & { output: any })
+        | undefined;
+      expect(reparentEnd).toBeDefined();
+      expect(reparentEnd!.isError).toBe(false); // the tool did not THROW
+      expect(reparentEnd!.output.isError).toBe(true); // ...but the mutation was REJECTED
+      expect(String(reparentEnd!.output.errorName)).toMatch(/Cycle/);
+
+      // The turn was NOT aborted — it ran to a normal completion after the rejection.
+      expect(result.text).toContain('Recovered');
+
+      // The tree is uncorrupted: the root is still a root (reparent did not partially apply).
+      const page = await (session as any)._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 });
+      expect(page.tasks).toHaveLength(1);
+      expect(page.tasks[0].taskId).toBe(rootId);
+      expect(page.tasks[0].parentTaskId).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
