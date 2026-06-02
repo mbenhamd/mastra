@@ -10886,6 +10886,10 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId: params.modeId ?? this._record.modeId,
+      // §4.2e — carry the active turn's yolo so a later tool approval on the
+      // resumed run is still auto-granted (pre-registered pendings win over the
+      // suspend-capture merge, so yolo must be stamped here too).
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         params.modeId ?? this._record.modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
@@ -10945,6 +10949,8 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId,
+      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
@@ -11013,6 +11019,8 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId: submittingModeId,
+      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         submittingModeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),

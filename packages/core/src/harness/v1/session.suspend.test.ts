@@ -439,6 +439,48 @@ describe('Session — suspend capture on message()', () => {
     });
   });
 
+  it('§4.2e: a pre-registered question pending carries the active turn yolo (so resume keeps auto-granting)', async () => {
+    // Regression for the yolo-lost-on-pre-registered-pending bug: registerQuestion
+    // writes the pending BEFORE suspend capture, and capture early-returns on the
+    // matching run/toolCallId, so yolo must be stamped on the registered pending.
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // Arm the turn yolo as the queued-drain / resume paths do.
+    (session as any)._currentTurnYolo = true;
+    await (session as any)._registerQuestion({
+      questionId: 'tc-yolo-q',
+      question: 'proceed?',
+      runId: 'run-yolo-q',
+      toolCallId: 'tc-yolo-q',
+    });
+    await (session as any)._maybeCaptureSuspend({
+      runId: 'run-yolo-q',
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-yolo-q', toolName: 'ask_user', args: { question: 'proceed?' } },
+    });
+    expect(session.getRecord().pendingResume?.yolo).toBe(true);
+  });
+
+  it('§4.2e: a non-yolo turn does NOT stamp yolo on a pre-registered question pending', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // _currentTurnYolo defaults false; do not arm it.
+    await (session as any)._registerQuestion({
+      questionId: 'tc-plain-q',
+      question: 'proceed?',
+      runId: 'run-plain-q',
+      toolCallId: 'tc-plain-q',
+    });
+    await (session as any)._maybeCaptureSuspend({
+      runId: 'run-plain-q',
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-plain-q', toolName: 'ask_user', args: { question: 'proceed?' } },
+    });
+    expect(session.getRecord().pendingResume?.yolo).toBeUndefined();
+  });
+
   it('keeps a registered question when suspend capture reports a generic tool suspension', async () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
