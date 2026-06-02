@@ -95,9 +95,7 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
   it('rejects a malformed mode permission policy at construction', () => {
     expect(() =>
       setupHarness({
-        modes: [
-          { id: 'bad', agentId: 'default', permissions: { categories: { edit: 'nope' as any }, tools: {} } },
-        ],
+        modes: [{ id: 'bad', agentId: 'default', permissions: { categories: { edit: 'nope' as any }, tools: {} } }],
         defaultModeId: 'bad',
       }),
     ).toThrow(/permissions/);
@@ -110,7 +108,15 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
 
 const tool = (id: string) => createTool({ id, description: id, inputSchema: z.object({}), execute: async () => ({}) });
 const categoryResolver = (name: string): 'read' | 'edit' | 'execute' | 'mcp' | 'other' | null =>
-  name === 'readDoc' ? 'read' : name === 'editDoc' ? 'edit' : name === 'runCmd' ? 'execute' : name === 'mcpThing' ? 'mcp' : null;
+  name === 'readDoc'
+    ? 'read'
+    : name === 'editDoc'
+      ? 'edit'
+      : name === 'runCmd'
+        ? 'execute'
+        : name === 'mcpThing'
+          ? 'mcp'
+          : null;
 
 describe('Mode workspace tool profile (§4.2e)', () => {
   it('withholds workspace-category tools not in expose; mcp/uncategorized stay', async () => {
@@ -118,7 +124,13 @@ describe('Mode workspace tool profile (§4.2e)', () => {
       {
         id: 'reader',
         agentId: 'default',
-        tools: { readDoc: tool('readDoc'), editDoc: tool('editDoc'), runCmd: tool('runCmd'), mcpThing: tool('mcpThing'), misc: tool('misc') },
+        tools: {
+          readDoc: tool('readDoc'),
+          editDoc: tool('editDoc'),
+          runCmd: tool('runCmd'),
+          mcpThing: tool('mcpThing'),
+          misc: tool('misc'),
+        },
         workspaceTools: { expose: ['read'] },
       },
     ];
@@ -169,13 +181,17 @@ describe('Mode workspace tool profile (§4.2e)', () => {
     }
   });
 
-  it('rejects an unknown category in workspaceTools.expose at construction', () => {
-    expect(() =>
-      setupHarness({
-        modes: [{ id: 'bad', agentId: 'default', workspaceTools: { expose: ['bogus' as any] } }],
-        defaultModeId: 'bad',
-      }),
-    ).toThrow(/workspaceTools/);
+  it('rejects non-workspace categories (bogus, mcp, other) in workspaceTools.expose at construction', () => {
+    // The filter only acts on read/edit/execute, so mcp/other (and anything else)
+    // must be rejected rather than silently doing nothing.
+    for (const cat of ['bogus', 'mcp', 'other']) {
+      expect(() =>
+        setupHarness({
+          modes: [{ id: 'bad', agentId: 'default', workspaceTools: { expose: [cat as any] } }],
+          defaultModeId: 'bad',
+        }),
+      ).toThrow(/workspaceTools/);
+    }
   });
 });
 
@@ -187,7 +203,11 @@ describe('Mode workspace tool profile (§4.2e)', () => {
 describe('Mode permission seeding — inheritance + grants edge cases (§4.2e)', () => {
   it('STICKY INHERITANCE: a permissive base survives into a no-permissions mode (documented opt-in footgun)', async () => {
     const modes: HarnessMode[] = [
-      { id: 'allowAll', agentId: 'default', permissions: { categories: { edit: 'allow', execute: 'allow' }, tools: {} } },
+      {
+        id: 'allowAll',
+        agentId: 'default',
+        permissions: { categories: { edit: 'allow', execute: 'allow' }, tools: {} },
+      },
       { id: 'plain', agentId: 'default' }, // declares no permissions → inherits
     ];
     const { harness } = setupHarness({ modes, defaultModeId: 'allowAll' });
