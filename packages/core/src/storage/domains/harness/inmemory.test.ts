@@ -2258,7 +2258,12 @@ describe('InMemoryHarness channel action ledger', () => {
       });
       // A heartbeat extends the storage-owned claim to now + 5100.
       await expect(
-        storage.renewChannelActionReceiptClaim({ receiptId: 'receipt-1', claimId: 'claim-1', now: now + 100, claimTtlMs: 5000 }),
+        storage.renewChannelActionReceiptClaim({
+          receiptId: 'receipt-1',
+          claimId: 'claim-1',
+          now: now + 100,
+          claimTtlMs: 5000,
+        }),
       ).resolves.toEqual({ claimExpiresAt: now + 5100, storageNow: now + 100 });
 
       // A worker holding the PRE-renewal snapshot writes back the stale (smaller)
@@ -2763,10 +2768,9 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     const storage = new InMemoryHarness({ db });
     const owner = 'owner-A';
     const ttl = 30_000;
-    await storage.createOrLoadActiveSession(
-      sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }),
-      { initialLease: { ownerId: owner, ttlMs: ttl } },
-    );
+    await storage.createOrLoadActiveSession(sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }), {
+      initialLease: { ownerId: owner, ttlMs: ttl },
+    });
     await storage.createOrLoadActiveSession(
       sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
       { initialLease: { ownerId: owner, ttlMs: ttl } },
@@ -2800,10 +2804,7 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
   it('skips closed descendants (they hold no live lease)', async () => {
     const { storage, owner } = await setupTree();
     const child2 = await storage.loadSession({ sessionId: 'child-2' });
-    await storage.saveSession(
-      { ...child2!, closedAt: Date.now() },
-      { ownerId: owner, ifVersion: child2!.version },
-    );
+    await storage.saveSession({ ...child2!, closedAt: Date.now() }, { ownerId: owner, ifVersion: child2!.version });
 
     const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
 
@@ -3179,7 +3180,9 @@ describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
 
   it('matches the external tuple with the missing-optional-id sentinel', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
-    await storage.saveChannelBinding(makeBinding({ id: 'bind-dm', externalTenantId: undefined, externalChannelId: undefined }));
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'bind-dm', externalTenantId: undefined, externalChannelId: undefined }),
+    );
     expect(
       await storage.loadChannelBindingByExternal({
         harnessName: 'default',
@@ -3260,11 +3263,20 @@ describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await storage.saveChannelBinding(makeBinding({ id: 'b-a', externalThreadId: 'A', lastOutboundAt: 30 }));
     await storage.saveChannelBinding(makeBinding({ id: 'b-b', externalThreadId: 'B', lastOutboundAt: 20 }));
-    await storage.saveChannelBinding(makeBinding({ id: 'b-c', externalThreadId: 'C', lastOutboundAt: 10, sessionId: 'session-other' }));
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'b-c', externalThreadId: 'C', lastOutboundAt: 10, sessionId: 'session-other' }),
+    );
 
-    expect((await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).map(b => b.id)).toEqual(['b-a', 'b-b']);
+    expect((await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).map(b => b.id)).toEqual([
+      'b-a',
+      'b-b',
+    ]);
 
-    const page1 = await storage.listActiveChannelBindingsForScope({ harnessName: 'default', channelId: 'support', limit: 2 });
+    const page1 = await storage.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      channelId: 'support',
+      limit: 2,
+    });
     expect(page1.bindings.map(b => b.id)).toEqual(['b-a', 'b-b']); // lastOutboundAt DESC
     expect(page1.nextCursor).toBe('b-b');
     const page2 = await storage.listActiveChannelBindingsForScope({
@@ -3322,7 +3334,9 @@ describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
     // Same id update is allowed.
     await expect(storage.saveChannelBinding(makeBinding({ id: 'b1', lastInboundAt: 99 }))).resolves.toBeUndefined();
     // A non-active row for the tuple is allowed.
-    await expect(storage.saveChannelBinding(makeBinding({ id: 'b1-old', status: 'replaced' }))).resolves.toBeUndefined();
+    await expect(
+      storage.saveChannelBinding(makeBinding({ id: 'b1-old', status: 'replaced' })),
+    ).resolves.toBeUndefined();
     // A second ACTIVE row for the same tuple is rejected.
     await expect(storage.saveChannelBinding(makeBinding({ id: 'b2' }))).rejects.toBeInstanceOf(
       HarnessStorageChannelBindingConflictError,
@@ -3361,7 +3375,9 @@ describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
 
   it('touchChannelBindingInbound returns null for an unknown binding', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
-    expect(await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'missing', at: 1 })).toBeNull();
+    expect(
+      await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'missing', at: 1 }),
+    ).toBeNull();
   });
 
   it('throws unsupported from the base default (channel bindings opt-in per adapter)', async () => {
@@ -3512,8 +3528,14 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
     // roots r0,r1 then children of r0 (c1,c0) — expected order: r0,r1,c0,c1
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r1', order: 1 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r1', order: 1 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
     await storage.createPlanTask({
       fence: fence(sessionId, version),
       task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1 }),
@@ -3557,7 +3579,10 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
   it('listPlanTasks rejects a malformed/foreign cursor with a clear error', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
     // Undecodable token and a base64 token of the wrong shape both fail clearly,
     // rather than silently restarting or comparing against undefined keyset fields.
     await expect(
@@ -3579,8 +3604,14 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const a = await setupSession(storage, { id: 'sess-a', threadId: 'thread-a' });
     const b = await setupSession(storage, { id: 'sess-b', threadId: 'thread-b' });
-    await storage.createPlanTask({ fence: fence(a.sessionId, a.version), task: sampleTask(a.sessionId, { taskId: 'ta' }) });
-    await storage.createPlanTask({ fence: fence(b.sessionId, b.version), task: sampleTask(b.sessionId, { taskId: 'tb' }) });
+    await storage.createPlanTask({
+      fence: fence(a.sessionId, a.version),
+      task: sampleTask(a.sessionId, { taskId: 'ta' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(b.sessionId, b.version),
+      task: sampleTask(b.sessionId, { taskId: 'tb' }),
+    });
     const listedA = await storage.listPlanTasks({ harnessName: 'default', sessionId: a.sessionId, limit: 10 });
     expect(listedA.tasks.map(t => t.taskId)).toEqual(['ta']);
   });
@@ -3590,10 +3621,22 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const { sessionId, version } = await setupSession(storage);
     // root -> a -> b ; root -> c ; standalone d
     await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root' }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'd', order: 9 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'd', order: 9 }),
+    });
 
     const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'root' });
     expect(res.deletedCount).toBe(4); // root,a,b,c
@@ -3604,8 +3647,14 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
   it('deletePlanTaskSubtree terminates on a parentTaskId cycle (defensive guard)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'x', parentTaskId: 'y' }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'y', parentTaskId: 'x' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'x', parentTaskId: 'y' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'y', parentTaskId: 'x' }),
+    });
     const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'x' });
     expect(res.deletedCount).toBe(2);
     const remaining = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
@@ -3615,7 +3664,10 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
   it('mutatePlanTasksForSession applies multi-row ops atomically', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'p', order: 0 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+    });
     await storage.mutatePlanTasksForSession({
       fence: fence(sessionId, version),
       ops: [
@@ -3632,7 +3684,10 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
   it('mutatePlanTasksForSession rejects all ops when one op conflicts', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'p', order: 0 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+    });
     const { HarnessStoragePlanTaskVersionConflictError } = await import('./base');
     await expect(
       storage.mutatePlanTasksForSession({
@@ -3652,22 +3707,50 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
     // root -> a -> b ; root -> c(completed)
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }),
+    });
 
     // depth 1 from root: root, a, c (not b)
-    const d1 = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', depth: 1, limit: 10 });
+    const d1 = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'root',
+      depth: 1,
+      limit: 10,
+    });
     expect(d1.tasks.map(t => t.taskId)).toEqual(['root', 'a', 'c']);
     expect(d1.truncated).toBe(false);
 
     // status filter
-    const completed = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, status: 'completed', limit: 10 });
+    const completed = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      status: 'completed',
+      limit: 10,
+    });
     expect(completed.tasks.map(t => t.taskId)).toEqual(['c']);
 
     // limit truncation
-    const limited = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'root', limit: 2 });
+    const limited = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'root',
+      limit: 2,
+    });
     expect(limited.tasks).toHaveLength(2);
     expect(limited.truncated).toBe(true);
   });
@@ -3676,10 +3759,22 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
     // 2 roots; root 'r0' has 2 children (one completed); 'r1' standalone in_progress.
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r0', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'r1', order: 1, status: 'in_progress' }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1, status: 'completed' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r1', order: 1, status: 'in_progress' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1, status: 'completed' }),
+    });
 
     const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
     expect(counts.total).toBe(4);
@@ -3691,11 +3786,48 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
     // 'orphan' points at a parent that does not exist in the session set.
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root', order: 0 }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 0 }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 0 }),
+    });
     const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
     expect(counts.total).toBe(2);
     expect(counts.rootCount).toBe(2);
+  });
+
+  it('round-trips the delegatedSubagentSessionId link (TM-6) through create, list, subtree, and update', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const created = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'd1', delegatedSubagentSessionId: 'sub-abc' }),
+    });
+    expect(created.delegatedSubagentSessionId).toBe('sub-abc');
+    // The durable link survives a list read.
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+    // ...and a bounded subtree read.
+    const sub = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'd1',
+      depth: 0,
+      limit: 10,
+    });
+    expect(sub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+    // Re-delegation updates the link in place.
+    await storage.updatePlanTask({
+      fence: fence(sessionId, version),
+      taskId: 'd1',
+      ifVersion: created.version,
+      patch: { delegatedSubagentSessionId: 'sub-xyz' },
+    });
+    const after = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
   });
 
   it('countPlanTasksByStatus is empty for a session with no plan tasks', async () => {
@@ -3709,7 +3841,10 @@ describe('InMemoryHarness plan tasks (§5.1k)', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const { sessionId, version } = await setupSession(storage);
     await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't1' }) });
-    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't2', parentTaskId: 't1' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 't2', parentTaskId: 't1' }),
+    });
     await storage.deleteSession({ harnessName: 'default', sessionId });
     const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
     expect(listed.tasks).toHaveLength(0);
