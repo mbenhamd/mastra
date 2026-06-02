@@ -8266,10 +8266,22 @@ export class Session {
     let full: FullOutput<unknown>;
     try {
       assertResumedTurnNotDeleted();
+      // §4.2e / §6.1 — rebuild + pass the harness RequestContext on RESUME too, so
+      // the resumed turn carries the 'harness' slot AND the per-tool permission gate
+      // resolver. The resolver is a live closure (not serializable into the suspend
+      // snapshot via toJSON), so without this a resumed turn would run UNGATED — the
+      // §4.2e pre-action gate must re-evaluate before resume/execute, not just on the
+      // initial turn.
+      const resumeRequestContext = await this._buildRequestContext({
+        modeId: resumeModeId,
+        modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
+        abortSignal: turnAbortController.signal,
+      });
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
         abortSignal: turnAbortController.signal,
+        requestContext: resumeRequestContext,
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);

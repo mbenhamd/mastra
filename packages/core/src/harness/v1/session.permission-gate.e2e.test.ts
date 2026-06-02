@@ -49,10 +49,7 @@ function toolCallStream(toolCallId: string, toolName: string, inputJson: string)
  * records when it runs) then replies. `permissions` / `defaultPermissionPolicy`
  * configure the gate.
  */
-function buildHarness(opts: {
-  permissions?: HarnessMode['permissions'];
-  defaultPermissionPolicy?: PermissionPolicy;
-}) {
+function buildHarness(opts: { permissions?: HarnessMode['permissions']; defaultPermissionPolicy?: PermissionPolicy }) {
   const ran = { writeDoc: false };
   const writeDoc = createTool({
     id: 'writeDoc',
@@ -80,7 +77,11 @@ function buildHarness(opts: {
   });
 
   const agent = new Agent({ id: 'default', name: 'default', instructions: 'use writeDoc', model, tools: { writeDoc } });
-  const mode: HarnessMode = { id: 'default', agentId: 'default', ...(opts.permissions ? { permissions: opts.permissions } : {}) };
+  const mode: HarnessMode = {
+    id: 'default',
+    agentId: 'default',
+    ...(opts.permissions ? { permissions: opts.permissions } : {}),
+  };
   const harness = new Harness({
     agents: { default: agent } as any,
     storage: new InMemoryStore(),
@@ -168,6 +169,28 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
       await session.permissions.grantCategory({ category: 'edit' });
       await session.message({ content: 'write it' });
       expect(ran.writeDoc).toBe(true); // grant suppressed the policy-level ask
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('the gate RE-EVALUATES on resume: a deny set after an ask blocks the approved tool', async () => {
+    // §4.2e pre-action gate must run before RESUME, not just the initial turn:
+    // the resumed turn carries the rebuilt request context + resolver.
+    const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'ask' }, tools: {} } });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'write it' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(ran.writeDoc).toBe(false);
+
+      // Flip the policy to deny WHILE the call is parked behind approval.
+      await session.permissions.setPolicy({ category: 'edit', policy: 'deny' });
+      // Approve the original ask — but the resume must re-evaluate and now DENY.
+      await session.respondToToolApproval({ approved: true });
+
+      // Re-evaluated on resume → blocked; the tool still never ran.
+      expect(ran.writeDoc).toBe(false);
     } finally {
       await harness.shutdown();
     }
