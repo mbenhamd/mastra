@@ -1306,6 +1306,15 @@ export interface SubagentDefinition {
    * minimal surface, also bind it to a `modeId` whose mode carries that surface
    * and/or use the mode's `permissions` gate — this field augments, it does not
    * hide the backing agent's own tools (which the agent assembles downstream).
+   *
+   * DURABILITY (follow-up): like `workspace` below, this override is applied to
+   * the live child session in-memory and is NOT persisted on the child record.
+   * A DELEGATED subagent reattached after a crash/rehydrate is re-driven by
+   * session id and does not currently restore this override (the subagent type
+   * id is not persisted on the child to re-resolve it). For a durable tool
+   * surface, bind the subagent to a `modeId` (mode tools persist). Making both
+   * `tools` and `workspace` survive reattach needs persisting the subagent type
+   * id on the child and re-resolving the definition in the delegation reconcile.
    */
   tools?: ToolsInput;
 

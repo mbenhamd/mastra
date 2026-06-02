@@ -173,17 +173,25 @@ observational memory, workspace, goal, and token-usage semantics):
   // same session-owned decision path above rather than processor output,
   // request-context data, or tool-supplied state as authority:
   //
-  // IMPLEMENTATION STATUS (harness-v1): the PRE-ACTION gate (2, below) is wired —
-  // the loop's tool-call step consults a session-owned per-tool policy resolver
-  // (threaded on the request context) and `deny` blocks the call, `ask` suspends
-  // for approval, `allow` proceeds; it re-evaluates on resume; harness-owned
-  // built-ins bypass it; enforcement is opt-in (a session with no rule + no
-  // explicit `defaultPermissionPolicy` gates nothing). NOT yet implemented and
-  // tracked as follow-ups: the PRE-EXPOSURE gate (1, below) — denied tools are
-  // currently NOT hidden from the model, only refused at action time; the
-  // additive `approvalReasons` composition in the main loop (the durable agent
-  // path carries reasons; the main-loop pending approval does not yet); and the
-  // per-run `yolo` policy-ask→allow override (the bit is persisted but inert).
+  // IMPLEMENTATION STATUS (harness-v1): BOTH gates are wired. The PRE-ACTION gate
+  // (2, below) — the loop's tool-call step consults a session-owned per-tool policy
+  // resolver (threaded on the request context): `deny` blocks the call, `ask`
+  // suspends for approval, `allow` proceeds; it re-evaluates on resume; harness-owned
+  // built-ins bypass it; enforcement is opt-in (a session with no rule + no explicit
+  // `defaultPermissionPolicy` gates nothing). The PRE-EXPOSURE gate (1, below) —
+  // `deny` tools are removed from the final `tools`/`activeTools` before the model
+  // call and a forced `toolChoice` naming a denied tool rejects. The additive
+  // `approvalReasons` composition (tool-config / tool-fn / policy) is carried on the
+  // main-loop approval chunk + suspend payload. Per-run `yolo` clears ONLY the policy
+  // ask (a session grant does the same at the resolver); it never suppresses a
+  // tool-owned approval and never bypasses `deny`, and it carries across suspend →
+  // resume. On rehydrate, an UNTOUCHED session re-seeds to its mode's current
+  // declared permissions when those changed (a runtime-overlaid session is left
+  // alone). DENY-LOOP NOTE: because pre-exposure removes denied tools from the model
+  // surface, the model cannot loop re-calling a denied tool; the pre-action `deny`
+  // string is the safety net for any tool that slips through (e.g. a forced choice
+  // resolved earlier). No blanket per-turn `maxSteps` is imposed by the gate — that
+  // is a separate operator knob, not a permission concern.
   //
   // 1. Pre-exposure gate. After static tools, per-turn `addTools`, processors,
   //    ToolSearch, `prepareStep`, workspace wrappers, child-session/subagent
