@@ -659,10 +659,12 @@ const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mc
 const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
 
 /**
- * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate).
- * These are harness infrastructure, NOT user/agent tools, so the §4.2e permission
- * gate never applies to them — an engaged default 'deny'/'ask' must not block or
- * suspend the harness's own orchestration. Kept in sync with `_buildToolsets`.
+ * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate,
+ * and the HITL suspension tools ask_user / submit_plan). These are harness
+ * infrastructure, NOT user/agent tools, so the §4.2e permission gate never applies
+ * to them — an engaged default 'deny'/'ask' must not block or suspend the harness's
+ * own orchestration (denying ask_user/submit_plan would break the question /
+ * plan-approval flows the gate itself relies on). Kept in sync with `_buildToolsets`.
  */
 const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_ADD_TOOL_ID,
@@ -674,6 +676,8 @@ const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_DELEGATE_TOOL_ID,
   TASK_WRITE_TOOL_ID,
   SPAWN_SUBAGENT_TOOL_ID,
+  ASK_USER_TOOL_ID,
+  SUBMIT_PLAN_TOOL_ID,
 ]);
 
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {

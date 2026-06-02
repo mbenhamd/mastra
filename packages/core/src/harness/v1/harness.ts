@@ -3700,7 +3700,12 @@ export class Harness {
     // Current mode declares no permissions → entry leaves rules untouched, so
     // there is nothing to reconcile against.
     if (currentModeSeed === undefined) return record;
-    // Touched at runtime (rules diverged from the recorded seed) → respect it.
+    // A runtime GRANT is also an overlay (it lives in sessionGrants, not
+    // permissionRules), so a granted session is "touched" even though its rules
+    // still match the seed — re-seeding could change the base under a grant
+    // (e.g. ask→deny, which a grant cannot lift). Respect it: leave alone.
+    if (record.sessionGrants.categories.length > 0 || record.sessionGrants.tools.length > 0) return record;
+    // Touched via setPolicy (rules diverged from the recorded seed) → respect it.
     if (sha256CanonicalJsonChecked(record.permissionRules) !== seedHash) return record;
     const newSeedHash = sha256CanonicalJsonChecked(currentModeSeed);
     // Mode config unchanged → no-op.

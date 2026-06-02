@@ -92,6 +92,24 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
     }
   });
 
+  it('the HITL built-ins ask_user/submit_plan bypass the gate under a deny default', async () => {
+    const { harness } = setupHarness({ modes: [{ id: 'm', agentId: 'default' }], defaultModeId: 'm' });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const rules = { categories: {}, tools: {} };
+      const grants = { categories: [], tools: [] };
+      // ask_user / submit_plan are harness HITL infrastructure — never gated, else a
+      // deny default would break the question / plan-approval suspension flows.
+      for (const id of ['ask_user', 'submit_plan', 'task_add', 'spawn_subagent']) {
+        expect((session as any)._resolveToolPolicy(id, rules, grants, 'deny')).toBe('allow');
+      }
+      // A non-builtin user tool is still denied under the deny default.
+      expect((session as any)._resolveToolPolicy('someUserTool', rules, grants, 'deny')).toBe('deny');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('rejects a malformed mode permission policy at construction', () => {
     expect(() =>
       setupHarness({
@@ -325,6 +343,33 @@ describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
       // Touched → respect the runtime intent; do NOT clobber with the new config.
       expect(rules.categories.edit).toBe('ask'); // original seed, NOT the redeployed 'deny'
       expect(rules.categories.read).toBe('deny'); // the runtime overlay survives
+    } finally {
+      await h2.shutdown();
+    }
+  });
+
+  it('LEAVES a GRANT-only session alone on rehydrate (grants are an overlay too)', async () => {
+    const { harness: h1, storage } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
+      defaultModeId: 'm',
+    });
+    const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session.id;
+    // Grant edit at runtime: this leaves permissionRules == seed but adds an overlay
+    // in sessionGrants, so the session must NOT be re-seeded on rehydrate.
+    await session.permissions.grantCategory({ category: 'edit' });
+    await h1.shutdown();
+
+    const { harness: h2 } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
+      defaultModeId: 'm',
+      sessions: { storage },
+    });
+    try {
+      const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
+      // Not clobbered by the redeployed 'deny'; the grant survives.
+      expect(rehydrated.permissions.getRules().categories.edit).toBe('ask');
+      expect(rehydrated.permissions.getGrants().categories).toContain('edit');
     } finally {
       await h2.shutdown();
     }
