@@ -457,26 +457,54 @@ describe('Harness v1 plan-task E2E — PT5 decompose / check / reparent / update
       doStream: async () => {
         call++;
         if (call === 1) {
-          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-add', 'task_add', JSON.stringify({ content: 'Root' })) };
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt5-add', 'task_add', JSON.stringify({ content: 'Root' })),
+          };
         }
         if (call === 2) {
           return {
             rawCall: { rawPrompt: null, rawSettings: {} },
             warnings: [],
-            stream: toolCallStream('pt5-decompose', 'task_decompose', JSON.stringify({ parentTaskId: rootId, children: [{ content: 'Step 1' }, { content: 'Step 2' }] })),
+            stream: toolCallStream(
+              'pt5-decompose',
+              'task_decompose',
+              JSON.stringify({ parentTaskId: rootId, children: [{ content: 'Step 1' }, { content: 'Step 2' }] }),
+            ),
           };
         }
         if (call === 3) {
           // Re-orient: a real plan_task_check read under the root.
-          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-check', 'plan_task_check', JSON.stringify({ rootTaskId: rootId })) };
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt5-check', 'plan_task_check', JSON.stringify({ rootTaskId: rootId })),
+          };
         }
         if (call === 4) {
           // Promote Step 1 to a root.
-          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-reparent', 'task_reparent', JSON.stringify({ taskId: childIds[0], newParentTaskId: null })) };
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(
+              'pt5-reparent',
+              'task_reparent',
+              JSON.stringify({ taskId: childIds[0], newParentTaskId: null }),
+            ),
+          };
         }
         if (call === 5) {
           // Complete Step 2 via task_update (not task_complete).
-          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt5-update', 'task_update', JSON.stringify({ taskId: childIds[1], status: 'completed' })) };
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(
+              'pt5-update',
+              'task_update',
+              JSON.stringify({ taskId: childIds[1], status: 'completed' }),
+            ),
+          };
         }
         return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['Done.']) };
       },
@@ -524,6 +552,134 @@ describe('Harness v1 plan-task E2E — PT5 decompose / check / reparent / update
       expect(summary.rootCount).toBe(2);
     } finally {
       await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// PT6 — plan-task trees are ISOLATED per session (no cross-session bleed)
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT6 per-session isolation', () => {
+  it('two sessions in the same harness keep independent plan trees (list, count, display)', async () => {
+    // One agent, driven deterministically by call order: session A runs first
+    // (adds "A-task"), then session B (adds "B-task" + a second "B-extra").
+    let call = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        call++;
+        if (call === 1)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('a-add', 'task_add', JSON.stringify({ content: 'A-task' })),
+          };
+        if (call === 2)
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['A done']) };
+        if (call === 3)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('b-add', 'task_add', JSON.stringify({ content: 'B-task' })),
+          };
+        if (call === 4)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('b-add2', 'task_add', JSON.stringify({ content: 'B-extra' })),
+          };
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['B done']) };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'plan', model });
+    const harness = newHarness(agent);
+    try {
+      const sessionA = await harness.session({ resourceId: 'iso-a', threadId: { fresh: true } });
+      const sessionB = await harness.session({ resourceId: 'iso-b', threadId: { fresh: true } });
+      const bEvents: HarnessEvent[] = [];
+      sessionB.subscribe(e => bEvents.push(e));
+
+      await sessionA.message({ content: 'plan A' });
+      await sessionB.message({ content: 'plan B' });
+
+      // Storage is scoped per session: A sees only its task, B sees only its two.
+      const aPage = await (sessionA as any)._internalStorage.listPlanTasks({ sessionId: sessionA.id, limit: 10 });
+      const bPage = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId: sessionB.id, limit: 10 });
+      expect(aPage.tasks.map((t: any) => t.content)).toEqual(['A-task']);
+      expect(bPage.tasks.map((t: any) => t.content).sort()).toEqual(['B-extra', 'B-task']);
+
+      // Bounded display summaries don't bleed across sessions.
+      expect(sessionA.getDisplayState().planTasks!.total).toBe(1);
+      expect(sessionB.getDisplayState().planTasks!.total).toBe(2);
+
+      // The custom plan-task events B received are all for B's own task ids.
+      const bTaskIds = new Set<string>(bPage.tasks.map((t: any) => t.taskId));
+      const bCustoms = bEvents.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
+      expect(bCustoms.length).toBeGreaterThan(0);
+      for (const c of bCustoms) {
+        for (const id of c.payload.affectedTaskIds) expect(bTaskIds.has(id)).toBe(true);
+      }
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// PT7 — a plan tree survives a GRACEFUL session.close() and reopens intact
+//        (distinct from PT4's crash/shutdown path — close() marks the session
+//        closed, so this guards reopen-after-close)
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT7 graceful close + reopen', () => {
+  it('plan tasks persist across an explicit session.close() and a reopen by sessionId', async () => {
+    const db = new InMemoryDB();
+    let call = 0;
+    const buildModel = () =>
+      new MockLanguageModelV2({
+        doStream: async () => {
+          call++;
+          if (call === 1)
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: toolCallStream('pt7-add', 'task_add', JSON.stringify({ content: 'Survive close' })),
+            };
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['ok']) };
+        },
+      });
+
+    const harnessA = newSharedHarness(
+      db,
+      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: buildModel() }),
+    );
+    let sessionId: string;
+    try {
+      const sessionA = await harnessA.session({ resourceId: 'u-pt7', threadId: { fresh: true } });
+      await sessionA.message({ content: 'add one task' });
+      sessionId = sessionA.id;
+      // GRACEFUL close (not a crash): writes the close marker.
+      await sessionA.close();
+      // The durable tree is untouched by close.
+      const afterClose = await (sessionA as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
+      expect(afterClose.tasks.map((t: any) => t.content)).toEqual(['Survive close']);
+    } finally {
+      await harnessA.shutdown();
+    }
+
+    // Reopen the SAME session id on a fresh harness over the same db.
+    const harnessB = newSharedHarness(
+      db,
+      new Agent({ id: 'default', name: 'default', instructions: 'plan', model: buildModel() }),
+    );
+    try {
+      const sessionB = await harnessB.session({ sessionId, resourceId: 'u-pt7' });
+      const page = await (sessionB as any)._internalStorage.listPlanTasks({ sessionId, limit: 10 });
+      expect(page.tasks.map((t: any) => t.content)).toEqual(['Survive close']);
+      await poll(() => sessionB.getDisplayState().planTasks !== undefined);
+      expect(sessionB.getDisplayState().planTasks!.total).toBe(1);
+    } finally {
+      await harnessB.shutdown();
     }
   });
 });
