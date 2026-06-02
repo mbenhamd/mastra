@@ -6643,7 +6643,9 @@ export class Session {
     await this._flushUpdate(prev => ({
       ...prev,
       modeId: opts.mode,
-      ...(seededRules !== undefined ? { permissionRules: seededRules } : {}),
+      ...(seededRules !== undefined
+        ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
+        : {}),
     }));
     this._emitter.emit({ type: 'mode_changed', modeId: opts.mode, previousModeId });
   }
@@ -8469,7 +8471,9 @@ export class Session {
             this._flushUpdate(prev => ({
               ...prev,
               modeId: modeFlipTarget,
-              ...(seededRules !== undefined ? { permissionRules: seededRules } : {}),
+              ...(seededRules !== undefined
+                ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
+                : {}),
             })),
             activeTurnWaiter.promise,
           ]);
@@ -8523,7 +8527,10 @@ export class Session {
               next.modeId = modeFlipTarget;
               // §4.2e — re-seed the base permission policy for the transitioned mode.
               const seededRules = this._harness._modePermissionRules(modeFlipTarget);
-              if (seededRules !== undefined) next.permissionRules = seededRules;
+              if (seededRules !== undefined) {
+                next.permissionRules = seededRules;
+                next.permissionRulesSeedHash = sha256CanonicalJson(seededRules);
+              }
             }
             if (completingQueuedItemId !== undefined) {
               next.pendingQueue = (prev.pendingQueue ?? []).filter(x => x.id !== completingQueuedItemId);
@@ -10647,7 +10654,10 @@ export class Session {
         // between this queued-completion write and the later settlement flush can
         // never persist the target mode alongside the previous mode's rules.
         const seededRules = this._harness._modePermissionRules(opts.modeId);
-        if (seededRules !== undefined) next.permissionRules = seededRules;
+        if (seededRules !== undefined) {
+          next.permissionRules = seededRules;
+          next.permissionRulesSeedHash = sha256CanonicalJson(seededRules);
+        }
       }
       if (receipt) {
         next.queueAdmissionReceipts = {

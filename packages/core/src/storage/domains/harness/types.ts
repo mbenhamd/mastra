@@ -353,6 +353,16 @@ export interface SessionRecord {
   // Permissions
   permissionRules: PermissionRules;
   sessionGrants: SessionGrants;
+  /**
+   * §4.2e seed provenance: the stable hash of the `permissionRules` last SEEDED
+   * by a mode entry (create / switchMode / plan-approval transition). Runtime
+   * `setPolicy`/grant mutators do NOT update it, so `hash(permissionRules) ===
+   * permissionRulesSeedHash` means "untouched since seed". On rehydrate the
+   * harness uses this to re-seed an UNTOUCHED session when the mode's declared
+   * permissions changed since it was persisted, while leaving runtime-overlaid
+   * sessions alone. Absent on legacy records ⇒ no reconcile (leave as-is).
+   */
+  permissionRulesSeedHash?: string;
 
   // Counters
   tokenUsage: TokenUsage;

@@ -69,7 +69,7 @@ import type { MemoryStorage } from '../../storage/domains/memory/base';
 import { InMemoryStore } from '../../storage/mock';
 import type { Workspace } from '../../workspace';
 
-import { canonicalJson, sha256CanonicalJson } from './canonical-json';
+import { canonicalJson, sha256CanonicalJson, sha256CanonicalJsonChecked } from './canonical-json';
 import { HarnessChannelRegistry } from './channel-registry';
 import {
   HarnessAttachmentInUseError,
@@ -3540,8 +3540,10 @@ export class Harness {
       subagentModelOverrides: {},
       // The initial mode SEEDS the base permission policy when it declares one
       // (§4.2e); otherwise the session starts with empty rules. Runtime grants +
-      // setPolicy overlay this base.
+      // setPolicy overlay this base. Record the seed hash so a later rehydrate can
+      // tell whether the rules are still the untouched seed (see _hydrate).
       permissionRules: this._modePermissionRules(modeId) ?? emptyPermissionRules(),
+      permissionRulesSeedHash: sha256CanonicalJsonChecked(this._modePermissionRules(modeId) ?? emptyPermissionRules()),
       sessionGrants: emptySessionGrants(),
       tokenUsage: zeroTokenUsage(),
       pendingQueue: [],
@@ -3661,12 +3663,12 @@ export class Harness {
   private async _hydrate(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
     await this._enforceMaxLiveCap();
     const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
-    const record: SessionRecord = {
+    const record: SessionRecord = this._reconcilePermissionSeedOnHydrate({
       ...stored,
       ownerId: this.ownerId,
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
-    };
+    });
     const session = this._publish(storage, record, await this._eventReplaySeedFor(storage, record));
     // §10.2: a session re-loaded from storage into the live cache emits a
     // (session-scoped, non-terminal) `session_hydrated` observer notification.
@@ -3680,6 +3682,33 @@ export class Harness {
   }
 
   /**
+   * §4.2e seed reconciliation on rehydrate. If a session's `permissionRules` are
+   * still EXACTLY the value its mode last seeded (untouched by runtime
+   * `setPolicy`/grants) AND that mode's declared `permissions` changed since the
+   * session was persisted (e.g. a redeploy tightened a category), re-seed to the
+   * new config. A runtime-overlaid session (its rules differ from the recorded
+   * seed) is LEFT ALONE — rehydrate is not a mode entry and must not clobber a
+   * caller's runtime intent. Legacy records with no `permissionRulesSeedHash`
+   * are also left as-is (provenance unknown ⇒ conservative). The re-seed is
+   * in-memory only here; it persists on the session's next durable write and is
+   * deterministic/idempotent across repeated hydrations.
+   */
+  private _reconcilePermissionSeedOnHydrate(record: SessionRecord): SessionRecord {
+    const seedHash = record.permissionRulesSeedHash;
+    if (seedHash === undefined) return record;
+    const currentModeSeed = this._modePermissionRules(record.modeId);
+    // Current mode declares no permissions → entry leaves rules untouched, so
+    // there is nothing to reconcile against.
+    if (currentModeSeed === undefined) return record;
+    // Touched at runtime (rules diverged from the recorded seed) → respect it.
+    if (sha256CanonicalJsonChecked(record.permissionRules) !== seedHash) return record;
+    const newSeedHash = sha256CanonicalJsonChecked(currentModeSeed);
+    // Mode config unchanged → no-op.
+    if (newSeedHash === seedHash) return record;
+    return { ...record, permissionRules: currentModeSeed, permissionRulesSeedHash: newSeedHash };
+  }
+
+  /**
    * Reopen a Closed (reopenable) record (§5.3/§5.5): prove ownership via the
    * lease, then durably clear the closed/closing markers under CAS so the
    * record returns to its current-owner key as Active. Reuses the same lease +
@@ -3690,7 +3719,7 @@ export class Harness {
   private async _reopen(storage: HarnessStorage, stored: SessionRecord): Promise<Session> {
     await this._enforceMaxLiveCap();
     const lease = await this._acquireLease(storage, stored.harnessName, stored.id);
-    const reopened: SessionRecord = {
+    const reopened: SessionRecord = this._reconcilePermissionSeedOnHydrate({
       ...stored,
       closedAt: undefined,
       closingAt: undefined,
@@ -3698,7 +3727,7 @@ export class Harness {
       ownerId: this.ownerId,
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
-    };
+    });
     let saved: { version: number };
     try {
       saved = await storage.saveSession(reopened, {

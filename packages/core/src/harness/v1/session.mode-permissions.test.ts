@@ -270,3 +270,83 @@ describe('Mode permission seeding — inheritance + grants edge cases (§4.2e)',
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Seed reconciliation on rehydrate (§4.2e) — a redeploy that changes a mode's
+// declared permissions re-seeds an UNTOUCHED session on hydrate, but leaves a
+// runtime-overlaid session alone.
+// ---------------------------------------------------------------------------
+
+describe('Mode permission seed reconciliation on rehydrate (§4.2e)', () => {
+  it('re-seeds an UNTOUCHED session when the mode permissions changed since it was persisted', async () => {
+    const { harness: h1, storage } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
+      defaultModeId: 'm',
+    });
+    const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session.id;
+    expect(session.permissions.getRules().categories.edit).toBe('ask');
+    await h1.shutdown();
+
+    // "Redeploy" with the SAME storage but a tightened mode config.
+    const { harness: h2 } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
+      defaultModeId: 'm',
+      sessions: { storage },
+    });
+    try {
+      const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
+      // Untouched since seed → picks up the new declared base.
+      expect(rehydrated.permissions.getRules().categories.edit).toBe('deny');
+    } finally {
+      await h2.shutdown();
+    }
+  });
+
+  it('LEAVES a runtime-overlaid session alone on rehydrate even if the mode config changed', async () => {
+    const { harness: h1, storage } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: {} } }],
+      defaultModeId: 'm',
+    });
+    const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session.id;
+    // Runtime overlay → rules now differ from the recorded seed.
+    await session.permissions.setPolicy({ category: 'read', policy: 'deny' });
+    await h1.shutdown();
+
+    const { harness: h2 } = setupHarness({
+      modes: [{ id: 'm', agentId: 'default', permissions: { categories: { edit: 'deny' }, tools: {} } }],
+      defaultModeId: 'm',
+      sessions: { storage },
+    });
+    try {
+      const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
+      const rules = rehydrated.permissions.getRules();
+      // Touched → respect the runtime intent; do NOT clobber with the new config.
+      expect(rules.categories.edit).toBe('ask'); // original seed, NOT the redeployed 'deny'
+      expect(rules.categories.read).toBe('deny'); // the runtime overlay survives
+    } finally {
+      await h2.shutdown();
+    }
+  });
+
+  it('is a no-op when the mode permissions are unchanged across rehydrate', async () => {
+    const modes: HarnessMode[] = [
+      { id: 'm', agentId: 'default', permissions: { categories: { edit: 'ask' }, tools: { x: 'deny' } } },
+    ];
+    const { harness: h1, storage } = setupHarness({ modes, defaultModeId: 'm' });
+    const session = await h1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session.id;
+    await h1.shutdown();
+
+    const { harness: h2 } = setupHarness({ modes, defaultModeId: 'm', sessions: { storage } });
+    try {
+      const rehydrated = await h2.session({ sessionId, resourceId: 'u1' });
+      const rules = rehydrated.permissions.getRules();
+      expect(rules.categories.edit).toBe('ask');
+      expect(rules.tools.x).toBe('deny');
+    } finally {
+      await h2.shutdown();
+    }
+  });
+});
