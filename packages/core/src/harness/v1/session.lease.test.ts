@@ -8,8 +8,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { HarnessStorageLeaseConflictError } from '../../storage/domains/harness/base';
+import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { setupHarness } from './__test-utils__/setup';
@@ -248,8 +248,12 @@ describe('Lease heartbeat coordination', () => {
 
     // §5.8: the root renews the whole subtree; the child is never renewed on its
     // own row, and gets the same atomic expiry as the root.
-    expect(subtree).toHaveBeenCalledWith(expect.objectContaining({ rootSessionId: parent.id, ownerId: harness.ownerId }));
-    expect(subtree.mock.calls.some(([arg]) => (arg as { rootSessionId: string }).rootSessionId === child.id)).toBe(false);
+    expect(subtree).toHaveBeenCalledWith(
+      expect.objectContaining({ rootSessionId: parent.id, ownerId: harness.ownerId }),
+    );
+    expect(subtree.mock.calls.some(([arg]) => (arg as { rootSessionId: string }).rootSessionId === child.id)).toBe(
+      false,
+    );
     expect(perSession).not.toHaveBeenCalled();
     expect(child.getRecord().leaseExpiresAt).toBe(parent.getRecord().leaseExpiresAt);
   });
@@ -268,7 +272,9 @@ describe('Lease heartbeat coordination', () => {
 
     await child.extendLease({ ttlMs: 5 * 60_000 });
 
-    expect(subtree).toHaveBeenCalledWith(expect.objectContaining({ rootSessionId: parent.id, ownerId: harness.ownerId }));
+    expect(subtree).toHaveBeenCalledWith(
+      expect.objectContaining({ rootSessionId: parent.id, ownerId: harness.ownerId }),
+    );
     expect(perSession).not.toHaveBeenCalled();
   });
 
@@ -407,7 +413,9 @@ describe('Lease takeover contention', () => {
     const session = await harness.session({ threadId: 't-wait-fail', resourceId: 'u' });
     await session.extendLease({ ttlMs: 5 * 60_000 });
 
-    const { harness: waiter } = setupHarness({ sessions: { storage: sharedStorage, lockMode: 'wait', lockWaitMs: 40 } });
+    const { harness: waiter } = setupHarness({
+      sessions: { storage: sharedStorage, lockMode: 'wait', lockWaitMs: 40 },
+    });
     await expect(waiter.session({ sessionId: session.id })).rejects.toBeInstanceOf(HarnessSessionLockedError);
   });
 
@@ -415,7 +423,9 @@ describe('Lease takeover contention', () => {
     // `'steal'` is reserved but not implemented; the public API must reject it
     // rather than silently degrade to `'fail'`.
     expect(() =>
-      setupHarness({ sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }), lockMode: 'steal' as never } }),
+      setupHarness({
+        sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }), lockMode: 'steal' as never },
+      }),
     ).toThrow(HarnessConfigError);
   });
 
@@ -470,5 +480,42 @@ describe('Lease takeover contention', () => {
         state: { ...((p.state as Record<string, unknown>) ?? {}), mine: true },
       })),
     ).rejects.toBeInstanceOf(HarnessSessionLockedError);
+  });
+});
+
+describe('pre-eviction warning (§O3)', () => {
+  it('emits session_eviction_warning immediately before a pressure eviction', async () => {
+    const { harness } = setupHarness({ sessions: { maxLive: 1 } });
+    const events: Array<{ type: string; reason?: string; sessionId?: string }> = [];
+    harness.subscribe(e => events.push({ type: e.type, reason: (e as any).reason, sessionId: e.sessionId }));
+
+    const a = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // Creating a second session exceeds maxLive=1 → evicts A under pressure.
+    await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const forA = events.filter(
+      e => e.sessionId === a.id && (e.type === 'session_eviction_warning' || e.type === 'session_evicted'),
+    );
+    expect(forA.map(e => e.type)).toEqual(['session_eviction_warning', 'session_evicted']);
+    expect(forA.every(e => e.reason === 'pressure')).toBe(true);
+  });
+
+  it('does NOT warn for a forced lease_lost eviction', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const events: string[] = [];
+    session.subscribe(e => events.push(e.type));
+    // Steal the lease so the next extension observes lease loss → forced eviction.
+    await storage.releaseSessionLease({ sessionId: session.id, harnessName: 'default', ownerId: harness.ownerId });
+    await storage.acquireSessionLease({
+      sessionId: session.id,
+      harnessName: 'default',
+      ownerId: 'other',
+      ttlMs: 30_000,
+    });
+    await expect(session.extendLease({ ttlMs: 60_000 })).rejects.toBeInstanceOf(HarnessSessionLockedError);
+
+    expect(events).toContain('session_evicted');
+    expect(events).not.toContain('session_eviction_warning');
   });
 });

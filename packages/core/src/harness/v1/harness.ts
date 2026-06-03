@@ -4425,6 +4425,13 @@ export class Harness {
       if (this._liveSessions.get(session.id) !== session) return;
     }
     const record = session.getRecord() as SessionRecord;
+    // §O3 — advisory pre-eviction notice for SOFT evictions only (cap pressure /
+    // idle reaper), emitted AFTER the flush drain + live-map recheck above so it
+    // never warns for a session that self-evicted as `lease_lost` mid-drain. The
+    // forced reasons (shutdown / lease_lost / pinned_timeout) get no warning.
+    if (reason === 'pressure' || reason === 'idle') {
+      session._emit({ type: 'session_eviction_warning', reason });
+    }
     session._markEvicted(record);
     session._emit({ type: 'session_evicted', reason });
     try {

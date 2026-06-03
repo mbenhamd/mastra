@@ -92,6 +92,21 @@ export interface SessionEvictedEvent extends HarnessEventBase {
 }
 
 /**
+ * ADVISORY pre-eviction notice (§O3). Emitted immediately before a SOFT,
+ * non-forced eviction (`pressure` = live-cap enforcer, `idle` = idle reaper) so
+ * an external consumer can react best-effort (e.g. stop sending, surface a
+ * banner) before the session leaves the live cache. The session's durable state
+ * is already flushed by the time this fires; eviction is NOT terminal (the
+ * session rehydrates on next access). This is advisory only: listeners are
+ * sync fire-and-forget and CANNOT delay or veto the eviction (the forced
+ * `shutdown` / `lease_lost` / `pinned_timeout` paths emit no warning).
+ */
+export interface SessionEvictionWarningEvent extends HarnessEventBase {
+  type: 'session_eviction_warning';
+  reason: 'idle' | 'pressure';
+}
+
+/**
  * Session re-loaded from storage into the live cache on next access (§10.2).
  * Non-terminal observer notification; the durable session is unchanged.
  */
@@ -815,6 +830,7 @@ export type HarnessEvent =
   | SessionClosingEvent
   | SessionClosedEvent
   | SessionEvictedEvent
+  | SessionEvictionWarningEvent
   | SessionHydratedEvent
   | HarnessShutdownEvent
   | ModeChangedEvent
@@ -1232,6 +1248,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'session_closing',
   'session_closed',
   'session_evicted',
+  'session_eviction_warning',
   'session_pin_overflow',
   'mode_changed',
   'model_changed',
