@@ -1613,6 +1613,11 @@ export class Session {
    */
   private _emitAbortedToolEnds(): void {
     if (this._activeTools.size === 0) return;
+    // A turn that PARKED for resume (suspend / tool-approval / question /
+    // plan-approval) is NOT abandoned — the parked tool resumes and emits its own
+    // real tool_end. Only synthesize for genuinely terminal turns (abort / error /
+    // complete-with-dangling-tool); never tombstone a tool that will resume.
+    if (this._record.pendingResume !== undefined) return;
     const runId = this._currentRunId;
     if (runId === undefined) return;
     // Defensive bound: drop the tombstone set if it grew large (aborted tools
