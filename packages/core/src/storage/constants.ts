@@ -1058,6 +1058,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     metadata: { type: 'jsonb', nullable: true },
     created_at: { type: 'bigint', nullable: false },
     updated_at: { type: 'bigint', nullable: false },
+    started_at: { type: 'bigint', nullable: true },
     completed_at: { type: 'bigint', nullable: true },
     version: { type: 'integer', nullable: false },
   },

@@ -262,6 +262,7 @@ function buildCommitOps(
     {
       status?: HarnessPlanTaskStatus;
       statusSource?: 'explicit' | 'derived';
+      startedAt?: number;
       completedAt?: number;
       clearCompletedAt?: boolean;
     }
@@ -294,14 +295,24 @@ function buildCommitOps(
     if (w.statusSource === undefined) w.statusSource = rollupSource.get(id) ?? 'derived';
   }
 
-  // completedAt bookkeeping: set when a status becomes 'completed', clear when it
-  // moves away from 'completed'.
+  // Timestamp bookkeeping. Key off the PERSISTED `completedAt`/`startedAt`
+  // presence on the post-image row — NOT off a `prev` status, because the
+  // explicit-set callers pre-apply the new `status` into `postTasks` (so a
+  // status-based "did it just transition" check would always see the new value
+  // and never fire). completedAt: set when entering 'completed' if not already
+  // stamped, clear when leaving. startedAt (span-summary O7): set ONCE the first
+  // time a task is in_progress (preserved across later oscillation so it always
+  // marks when work first began).
   const now = Date.now();
   for (const [id, w] of statusWrites) {
     if (w.status === undefined) continue;
-    const prev = byId.get(id)?.status;
-    if (w.status === 'completed' && prev !== 'completed') w.completedAt = now;
-    else if (w.status !== 'completed' && prev === 'completed') w.clearCompletedAt = true;
+    const row = byId.get(id);
+    if (w.status === 'completed') {
+      if (row?.completedAt === undefined) w.completedAt = now;
+    } else if (row?.completedAt !== undefined) {
+      w.clearCompletedAt = true;
+    }
+    if (w.status === 'in_progress' && row?.startedAt === undefined) w.startedAt = now;
   }
 
   // Build the final op list: structural ops first (they may create rows the
@@ -328,6 +339,7 @@ function buildCommitOps(
     if (createOp) {
       if (w.status !== undefined) createOp.task.status = w.status;
       if (w.statusSource !== undefined) createOp.task.statusSource = w.statusSource;
+      if (w.startedAt !== undefined) createOp.task.startedAt = w.startedAt;
       if (w.completedAt !== undefined) createOp.task.completedAt = w.completedAt;
       if (w.clearCompletedAt) delete createOp.task.completedAt;
       continue;
@@ -341,6 +353,7 @@ function buildCommitOps(
       patch: {
         ...(w.status !== undefined ? { status: w.status } : {}),
         ...(w.statusSource !== undefined ? { statusSource: w.statusSource } : {}),
+        ...(w.startedAt !== undefined ? { startedAt: w.startedAt } : {}),
         ...(w.completedAt !== undefined ? { completedAt: w.completedAt } : {}),
         ...(w.clearCompletedAt ? { clearCompletedAt: true } : {}),
       },

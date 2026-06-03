@@ -44,6 +44,7 @@ export function applyPlanTaskPatch(
   }
   if (patch.metadata !== undefined) next.metadata = cloneJsonValue(patch.metadata);
   if (patch.clearMetadata === true) delete next.metadata;
+  if (patch.startedAt !== undefined) next.startedAt = patch.startedAt;
   if (patch.completedAt !== undefined) next.completedAt = patch.completedAt;
   if (patch.clearCompletedAt === true) delete next.completedAt;
   next.version = nextVersion;

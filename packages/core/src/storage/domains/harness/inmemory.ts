@@ -3219,6 +3219,7 @@ function normalizePlanTask(task: HarnessPlanTask): HarnessPlanTask {
     next.delegatedSubagentTypeId = task.delegatedSubagentTypeId;
   }
   if (task.metadata !== undefined) next.metadata = cloneJson(task.metadata);
+  if (task.startedAt !== undefined) next.startedAt = task.startedAt;
   if (task.completedAt !== undefined) next.completedAt = task.completedAt;
   return next;
 }

@@ -313,6 +313,45 @@ describe('cycle prevention', () => {
 });
 
 // ---------------------------------------------------------------------------
+// startedAt (span-summary O7)
+// ---------------------------------------------------------------------------
+
+describe('plan-task startedAt (O7)', () => {
+  it('sets startedAt once on first in_progress, preserves it through completion', async () => {
+    const { storage, port } = await setup();
+    const t = await planTaskAdd(port, { content: 'work' });
+    expect((await listAll(storage)).get(t.taskId)?.startedAt).toBeUndefined();
+
+    await planTaskUpdate(port, t.taskId, { status: 'in_progress' });
+    const started = (await listAll(storage)).get(t.taskId)?.startedAt;
+    expect(typeof started).toBe('number');
+
+    // Re-confirming in_progress does not move startedAt.
+    await planTaskUpdate(port, t.taskId, { status: 'in_progress', activeForm: 'working' });
+    expect((await listAll(storage)).get(t.taskId)?.startedAt).toBe(started);
+
+    // Completing sets completedAt and keeps the original startedAt.
+    await planTaskUpdate(port, t.taskId, { status: 'completed' });
+    const done = (await listAll(storage)).get(t.taskId);
+    expect(done?.completedAt).toBeGreaterThanOrEqual(started!);
+    expect(done?.startedAt).toBe(started);
+  });
+
+  it('leaves startedAt unset for a task that never started', async () => {
+    const { storage, port } = await setup();
+    const t = await planTaskAdd(port, { content: 'never started' });
+    await planTaskUpdate(port, t.taskId, { content: 'renamed' });
+    expect((await listAll(storage)).get(t.taskId)?.startedAt).toBeUndefined();
+  });
+
+  it('stamps startedAt when a task is CREATED directly as in_progress', async () => {
+    const { storage, port } = await setup();
+    const t = await planTaskAdd(port, { content: 'born running', status: 'in_progress' });
+    expect((await listAll(storage)).get(t.taskId)?.startedAt).toEqual(expect.any(Number));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Single in_progress per root
 // ---------------------------------------------------------------------------
 

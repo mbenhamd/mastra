@@ -1664,6 +1664,13 @@ export interface HarnessPlanTask {
   metadata?: JsonValue;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Wall-clock time the task FIRST transitioned to `in_progress` (span-summary
+   * O7). Set once (preserved across later status oscillation) so a consumer can
+   * compute work duration as `completedAt - startedAt`. Absent until the task
+   * has started and on rows persisted before this field landed.
+   */
+  startedAt?: number;
   completedAt?: number;
   /** Per-row OCC token, advanced on each `updatePlanTask` under the fence. */
   version: number;
@@ -1726,6 +1733,7 @@ export interface UpdatePlanTaskInput {
     delegatedSubagentTypeId?: string;
     metadata?: JsonValue;
     clearMetadata?: boolean;
+    startedAt?: number;
     completedAt?: number;
     clearCompletedAt?: boolean;
   };

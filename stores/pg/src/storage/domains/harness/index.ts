@@ -5167,7 +5167,7 @@ export class HarnessPG extends HarnessStorage {
       await this.#db.alterTable({
         tableName: TABLE_HARNESS_PLAN_TASKS,
         schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
-        ifNotExists: ['delegated_subagent_type_id'],
+        ifNotExists: ['delegated_subagent_type_id', 'started_at'],
       });
       await this.#createDefaultIndexes(['idx_harness_plan_tasks_order']);
       await this.#createDefaultIndexes(['idx_harness_plan_tasks_idempotency']);
@@ -6642,6 +6642,7 @@ function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
     task.delegatedSubagentTypeId = String(row.delegated_subagent_type_id);
   }
   if (row.metadata != null) task.metadata = parseJson(row.metadata) as JsonValue;
+  if (row.started_at != null) task.startedAt = Number(row.started_at);
   if (row.completed_at != null) task.completedAt = Number(row.completed_at);
   return task;
 }
@@ -6668,6 +6669,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     'metadata',
     'created_at',
     'updated_at',
+    'started_at',
     'completed_at',
     'version',
   ];
@@ -6692,6 +6694,7 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.metadata === undefined ? null : JSON.stringify(task.metadata),
     task.createdAt,
     task.updatedAt,
+    task.startedAt ?? null,
     task.completedAt ?? null,
     task.version,
   ];

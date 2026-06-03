@@ -2071,13 +2071,14 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
         fence: fence(sessionId, version),
         taskId: 'task-1',
         ifVersion: 1,
-        patch: { status: 'in_progress', activeForm: 'doing it', completedAt: 5000, blockedBy: ['x'] },
+        patch: { status: 'in_progress', activeForm: 'doing it', startedAt: 4000, completedAt: 5000, blockedBy: ['x'] },
       });
       expect(r1.version).toBe(2);
       const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
       expect(listed.tasks[0]).toMatchObject({
         status: 'in_progress',
         activeForm: 'doing it',
+        startedAt: 4000,
         completedAt: 5000,
         blockedBy: ['x'],
         version: 2,

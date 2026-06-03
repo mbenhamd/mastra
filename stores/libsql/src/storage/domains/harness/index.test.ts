@@ -3967,6 +3967,7 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
       patch: {
         status: 'in_progress',
         activeForm: 'doing it',
+        startedAt: 4000,
         completedAt: 5000,
         blockedBy: ['x', 'y'],
         metadata: { a: 1 },
@@ -3977,6 +3978,7 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     expect(listed.tasks[0]).toMatchObject({
       status: 'in_progress',
       activeForm: 'doing it',
+      startedAt: 4000,
       completedAt: 5000,
       blockedBy: ['x', 'y'],
       metadata: { a: 1 },
