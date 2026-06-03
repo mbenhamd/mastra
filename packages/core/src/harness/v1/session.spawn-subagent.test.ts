@@ -345,3 +345,70 @@ describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
     }
   });
 });
+
+describe('spawn_subagent tool — toolAllowlist (§M4)', () => {
+  it('wires a definition toolAllowlist onto the child session', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { 'parent-agent': new FakeAgent('parent-agent'), 'child-agent': new FakeAgent('child-agent') } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'scoped-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          scoped: {
+            agentId: 'child-agent',
+            modeId: 'scoped-mode',
+            description: 'a scoped subagent',
+            toolAllowlist: ['readDoc', 'search'],
+          },
+        },
+      },
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // Acquire the child the spawn tool will create + observe its allowlist by
+      // re-resolving the type the way spawn does (the spawn wiring sets the field
+      // from def.toolAllowlist).
+      const def = (harness as any)._getSubagentType('scoped');
+      expect(def.toolAllowlist).toEqual(['readDoc', 'search']);
+      const child = await harness.session({
+        resourceId: 'u1',
+        threadId: { fresh: true },
+        parentSessionId: parent.id,
+        origin: 'subagent-tool',
+        modeId: 'scoped-mode',
+        subagentDepth: 1,
+      });
+      // Mirror the spawn wiring + assert the resolver hard-denies a non-listed tool.
+      (child as any)._subagentToolAllowlist = def.toolAllowlist;
+      expect((child as any)._toolPermissionGateEngaged()).toBe(true);
+      expect((child as any)._resolveToolPolicy('writeDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set(def.toolAllowlist))).toBe('deny');
+      expect((child as any)._resolveToolPolicy('readDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set(def.toolAllowlist))).toBe('allow');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('rejects a malformed toolAllowlist at construction', () => {
+    const base = {
+      agents: { a: new FakeAgent('a') } as any,
+      modes: [{ id: 'm', agentId: 'a' }],
+      defaultModeId: 'm',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    };
+    for (const bad of [{ toolAllowlist: 'x' as any }, { toolAllowlist: [''] }, { toolAllowlist: ['dup', 'dup'] }]) {
+      expect(
+        () =>
+          new Harness({
+            ...base,
+            subagents: { types: { t: { agentId: 'a', description: 'd', ...bad } } },
+          } as any),
+      ).toThrow(/toolAllowlist/);
+    }
+  });
+});

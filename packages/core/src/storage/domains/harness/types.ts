@@ -338,6 +338,18 @@ export interface SessionRecord {
   subagentDepth?: number;
 
   /**
+   * The `subagents.types` key this session was spawned/delegated under, when it
+   * is a subagent child (M4). Persisted so a child hydrated DIRECTLY by id — not
+   * only via the parent's delegation-reattach — can re-resolve its
+   * `SubagentDefinition` and restore the per-subagent overrides (`tools`,
+   * `workspace`, and the `toolAllowlist` HARD capability scope) before any turn
+   * or queue drain. Without this a restored/other-instance hydrate of a durable
+   * delegated child would run fail-OPEN (its allowlist lost). Absent on
+   * top-level sessions and on records persisted before this field landed.
+   */
+  subagentTypeId?: string;
+
+  /**
    * True when the session was created with `threadId: { fresh: true }` and
    * therefore owns the underlying thread under `MemoryStorage`. Read by the
    * harness layer on cascade-delete to decide whether to tear the thread

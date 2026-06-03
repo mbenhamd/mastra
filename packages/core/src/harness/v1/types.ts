@@ -1369,6 +1369,22 @@ export interface SubagentDefinition {
   tools?: ToolsInput;
 
   /**
+   * §SA/M4 — hard capability scope for this subagent: when set, the subagent may
+   * call ONLY the model-visible tools whose final exposed NAME is in this list.
+   * Enforced at the §4.2e pre-exposure gate (a non-listed tool is removed before
+   * the model call AND hard-denied at action time), so it constrains the agent's
+   * own tools + MCP tools + the per-turn surface — unlike `tools`, which only
+   * augments. HITL/local builtins (ask_user, submit_plan, plan-task tools) are
+   * always available; `spawn_subagent` and `task_delegate` are NOT auto-kept — to
+   * let a scoped subagent spawn/delegate, list them explicitly (prevents a
+   * restricted subagent from escalating via a broader child). Entries are final
+   * exposed names (after the agent's name normalization); it is a name allowlist,
+   * not a provider/server-identity scope. Restored on a delegated subagent's
+   * reattach via `delegatedSubagentTypeId`, like `tools`/`workspace`.
+   */
+  toolAllowlist?: string[];
+
+  /**
    * Workspace ownership model for the subagent session. `'inherit'` (default)
    * shares the parent's workspace via a refcount on the same registry entry;
    * `'fresh'` provisions the subagent its own per-session workspace (only valid
@@ -1420,6 +1436,14 @@ interface SessionResolveCommon {
    * should leave this unset; it defaults to `0`.
    */
   subagentDepth?: number;
+
+  /**
+   * @internal — the `subagents.types` key this child is spawned/delegated under
+   * (M4). Persisted on the child `SessionRecord` so its per-subagent overrides
+   * (tools / workspace / toolAllowlist) survive a direct-by-id hydrate, not only
+   * the parent's delegation-reattach. Top-level callers leave this unset.
+   */
+  subagentTypeId?: string;
 }
 
 export interface SessionResolveByThread extends SessionResolveCommon {

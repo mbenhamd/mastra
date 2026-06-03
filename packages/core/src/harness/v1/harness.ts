@@ -1031,6 +1031,22 @@ export class Harness {
         if (typeof def.description !== 'string' || def.description.length === 0) {
           throw new HarnessConfigError(`subagents.types["${agentType}"].description`, 'is required');
         }
+        if (def.toolAllowlist !== undefined) {
+          const field = `subagents.types["${agentType}"].toolAllowlist`;
+          if (!Array.isArray(def.toolAllowlist)) {
+            throw new HarnessConfigError(field, 'must be an array of tool names');
+          }
+          const seen = new Set<string>();
+          for (const name of def.toolAllowlist) {
+            if (typeof name !== 'string' || name.length === 0) {
+              throw new HarnessConfigError(field, 'entries must be non-empty strings');
+            }
+            if (seen.has(name)) {
+              throw new HarnessConfigError(field, `duplicate tool name "${name}"`);
+            }
+            seen.add(name);
+          }
+        }
         subagentTypes.set(agentType, def);
       }
       this._subagentMaxDepth = config.subagents.maxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH;
@@ -3587,6 +3603,7 @@ export class Harness {
         modeId: opts.modeId,
         modelId: opts.modelId,
         subagentDepth: opts.subagentDepth,
+        subagentTypeId: opts.subagentTypeId,
       });
     }
 
@@ -3630,6 +3647,7 @@ export class Harness {
       modeId: opts.modeId,
       modelId: opts.modelId,
       subagentDepth: opts.subagentDepth,
+      subagentTypeId: opts.subagentTypeId,
     });
   }
 
@@ -3649,6 +3667,7 @@ export class Harness {
       modeId?: string;
       modelId?: string;
       subagentDepth?: number;
+      subagentTypeId?: string;
     },
   ): Promise<Session> {
     await this._enforceMaxLiveCap();
@@ -3675,6 +3694,7 @@ export class Harness {
       origin: init.origin,
       ownsThread: init.ownsThread,
       subagentDepth: init.subagentDepth ?? 0,
+      ...(init.subagentTypeId !== undefined && { subagentTypeId: init.subagentTypeId }),
       modeId,
       modelId: init.modelId ?? '',
       subagentModelOverrides: {},
@@ -3941,6 +3961,24 @@ export class Harness {
       persistTransientStreamingEvents: this._persistTransientStreamingEvents,
     });
     if (workspaceLost) session._markWorkspaceLost();
+
+    // M4 — restore the per-subagent overrides (tools / workspace / toolAllowlist)
+    // from the persisted subagent type on EVERY adopt path, not only the parent's
+    // delegation-reattach. A durable delegated child hydrated directly by id (on a
+    // restart or a different instance) would otherwise run with `toolAllowlist`
+    // lost — a fail-OPEN that exposes tools outside its scope. Runs BEFORE the
+    // queue-drain below so a replayed turn already sees the scope. Best-effort and
+    // consistent with the reattach path (`_reconcileDelegationsOnHydrate`): an
+    // unknown/removed type leaves the overrides unset.
+    if (record.subagentTypeId !== undefined) {
+      const def = this._getSubagentType(record.subagentTypeId);
+      if (def) {
+        session._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
+        if (def.tools) session._subagentToolsOverride = def.tools;
+        if (def.toolAllowlist) session._subagentToolAllowlist = def.toolAllowlist;
+      }
+    }
+
     this._hasAdoptedSessions = true;
     this._liveSessions.set(record.id, session);
 

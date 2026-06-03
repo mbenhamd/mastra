@@ -683,6 +683,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     parent_session_id: { type: 'text', nullable: true },
     origin: { type: 'text', nullable: false },
     subagent_depth: { type: 'integer', nullable: true },
+    subagent_type_id: { type: 'text', nullable: true },
     owns_thread: { type: 'boolean', nullable: false },
     mode_id: { type: 'text', nullable: false },
     model_id: { type: 'text', nullable: false },

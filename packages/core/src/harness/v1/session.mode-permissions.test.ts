@@ -105,6 +105,42 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
       }
       // A non-builtin user tool is still denied under the deny default.
       expect((session as any)._resolveToolPolicy('someUserTool', rules, grants, 'deny')).toBe('deny');
+      // Without an allowlist, escalation builtins (spawn_subagent/task_delegate)
+      // still bypass the gate even under a deny default (unchanged behavior).
+      expect((session as any)._resolveToolPolicy('task_delegate', rules, grants, 'deny')).toBe('allow');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('M4: a subagent toolAllowlist hard-denies non-listed tools and gates escalation builtins', async () => {
+    const { harness } = setupHarness({ modes: [{ id: 'm', agentId: 'default' }], defaultModeId: 'm' });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const rules = { categories: {}, tools: {} };
+      const grants = { categories: [], tools: [] };
+      const resolve = (name: string, allow?: Set<string>) =>
+        (session as any)._resolveToolPolicy(name, rules, grants, 'allow', allow);
+      const allow = new Set(['readDoc']);
+      // Listed tool → falls through to the policy (here 'allow').
+      expect(resolve('readDoc', allow)).toBe('allow');
+      // Non-listed user tool → HARD deny (the allowlist is the capability cap).
+      expect(resolve('writeDoc', allow)).toBe('deny');
+      // HITL/local builtins are always kept regardless of the allowlist.
+      expect(resolve('ask_user', allow)).toBe('allow');
+      expect(resolve('task_add', allow)).toBe('allow');
+      // Escalation builtins are NOT auto-kept under an allowlist → denied unless listed.
+      expect(resolve('spawn_subagent', allow)).toBe('deny');
+      expect(resolve('task_delegate', allow)).toBe('deny');
+      expect(resolve('spawn_subagent', new Set(['spawn_subagent']))).toBe('allow');
+      // The allowlist deny is HARD: a non-listed tool with an explicit allow rule is still denied.
+      expect(
+        (session as any)._resolveToolPolicy('writeDoc', { categories: {}, tools: { writeDoc: 'allow' } }, grants, 'allow', allow),
+      ).toBe('deny');
+      // A subagent allowlist engages the gate on its own (so the resolver threads).
+      expect((session as any)._toolPermissionGateEngaged()).toBe(false);
+      (session as any)._subagentToolAllowlist = ['readDoc'];
+      expect((session as any)._toolPermissionGateEngaged()).toBe(true);
     } finally {
       await harness.shutdown();
     }

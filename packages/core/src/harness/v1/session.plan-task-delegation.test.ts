@@ -705,8 +705,9 @@ describe('task_delegate — recovery on rehydrate', () => {
 
 // ---------------------------------------------------------------------------
 // §9 — reattach-on-rehydrate restores the SubagentDefinition tools/workspace
-// override (which is applied in-memory at delegate time and not persisted on the
-// child) by re-resolving the persisted subagent TYPE id.
+// override by re-resolving the persisted subagent TYPE id. (The type is also
+// persisted on the child record for the direct-hydrate path; see the M4
+// fail-closed test below.)
 // ---------------------------------------------------------------------------
 
 describe('task_delegate — reattach restores the subagent override from the persisted type', () => {
@@ -777,5 +778,114 @@ describe('task_delegate — reattach restores the subagent override from the per
 
     releaseChild();
     await harness.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4 — a subagent child carries its `subagents.types` key on its own record, so
+// a child hydrated DIRECTLY by id (on a restart / other instance) restores its
+// per-subagent overrides — including the `toolAllowlist` HARD capability scope —
+// WITHOUT relying on the parent's delegation-reattach. Without this the directly
+// hydrated child ran fail-OPEN (allowlist lost ⇒ non-listed tools exposed).
+// ---------------------------------------------------------------------------
+
+describe('subagent child — direct hydrate restores the persisted scope (M4 fail-closed)', () => {
+  function buildScopedHarness(db: InMemoryDB) {
+    const parentAgent = new MockAgent({ id: 'parent-agent' });
+    const childAgent = new MockAgent({ id: 'child-agent' });
+    const extraTool = createTool({
+      id: 'extraTool',
+      description: 'extra',
+      inputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db }) },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          scoped: {
+            agentId: 'child-agent',
+            modeId: 'worker-mode',
+            description: 'a hard-scoped worker',
+            tools: { extraTool },
+            toolAllowlist: ['readDoc', 'extraTool'],
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+    return { harness, parentAgent, childAgent };
+  }
+
+  it('task_delegate persists the subagent type id on the child record', async () => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildScopedHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Let the child's detached run finish on its own so shutdown can drain. The
+    // child record (carrying subagentTypeId) is written synchronously at delegate.
+    childAgent.enqueueRun({ finishReason: 'stop', text: 'done' });
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'scoped work' } as any, toolCtx)) as any;
+    const res = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'scoped' } as any,
+      toolCtx,
+    )) as any;
+    const childRecord = await parent._internalStorage.loadSession({
+      harnessName: 'default',
+      sessionId: res.subagentSessionId,
+    });
+    expect(childRecord?.subagentTypeId).toBe('scoped');
+    close();
+    await harness.shutdown();
+  });
+
+  it('a child hydrated DIRECTLY by id on a fresh instance keeps its toolAllowlist (no parent reattach)', async () => {
+    const db = new InMemoryDB();
+    const a = buildScopedHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Create a durable subagent child the way delegate/spawn do (origin +
+    // parentSessionId + persisted subagentTypeId), without running a turn so the
+    // record stays ACTIVE across the simulated restart.
+    const childA = await a.harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parentA.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+      subagentTypeId: 'scoped',
+    } as any);
+    const childId = childA.id;
+    expect((childA as any)._subagentToolAllowlist).toEqual(['readDoc', 'extraTool']);
+    await a.harness.shutdown();
+
+    // Fresh instance hydrates the CHILD directly by id — NOT via the parent's
+    // delegation-reattach (the parent is never hydrated here).
+    const b = buildScopedHarness(db);
+    const childB = await b.harness.session({ sessionId: childId, resourceId: 'u1' });
+    expect((childB as any)._subagentToolAllowlist).toEqual(['readDoc', 'extraTool']);
+    expect((childB as any)._toolPermissionGateEngaged()).toBe(true);
+    // A non-listed tool is hard-denied even on the directly-hydrated child.
+    expect(
+      (childB as any)._resolveToolPolicy(
+        'writeDoc',
+        { categories: {}, tools: {} },
+        { categories: [], tools: [] },
+        'allow',
+        new Set(['readDoc', 'extraTool']),
+      ),
+    ).toBe('deny');
+    // The persisted tools + workspace overrides are restored on the same path.
+    expect(Object.keys((childB as any)._subagentToolsOverride ?? {})).toContain('extraTool');
+    expect((childB as any)._subagentInheritWorkspace).toBe(true);
+    await b.harness.shutdown();
   });
 });

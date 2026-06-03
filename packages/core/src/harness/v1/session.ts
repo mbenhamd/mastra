@@ -689,6 +689,16 @@ const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   SUBMIT_PLAN_TOOL_ID,
 ]);
 
+/**
+ * The subset of harness built-ins that a per-subagent `toolAllowlist` does NOT
+ * auto-keep (M4): `spawn_subagent` / `task_delegate` are capability-escalation
+ * vectors — a scoped subagent could otherwise run a broader child. Under an
+ * allowlist these must be listed explicitly to be available; without an allowlist
+ * they bypass the gate as normal harness infrastructure. Everything else in
+ * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
+ */
+const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([SPAWN_SUBAGENT_TOOL_ID, TASK_DELEGATE_TOOL_ID]);
+
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
   if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
     throw new HarnessValidationError(method, `unknown ToolCategory ${JSON.stringify(value)}`);
@@ -3135,6 +3145,15 @@ export class Session {
    * `_buildToolsets` (§9). Undefined for non-subagent sessions.
    */
   _subagentToolsOverride?: ToolsInput;
+
+  /**
+   * @internal — `SubagentDefinition.toolAllowlist` for a spawned/delegated subagent
+   * session (M4): the hard name-scope this subagent may call. Composed into the
+   * §4.2e permission resolver so a non-listed tool is denied (removed pre-exposure).
+   * Undefined ⇒ no allowlist scope. Set at spawn/delegate; restored on a delegated
+   * child's reattach from `delegatedSubagentTypeId`.
+   */
+  _subagentToolAllowlist?: readonly string[];
 
   /** @internal — writes the latest opaque workspace state into the session record. */
   private async _persistWorkspaceState(state: unknown): Promise<void> {
@@ -12106,9 +12125,13 @@ export class Session {
         tools: [...this._record.sessionGrants.tools],
       };
       const defaultPolicy = this._harness._getDefaultPermissionPolicy();
+      // M4: snapshot the subagent allowlist alongside the policy so a non-listed
+      // tool resolves to a hard `deny` (the §14.7 channel fence already ran upstream
+      // at the pre-exposure gate; this composes after it and ahead of the policy).
+      const allowlistSnapshot = this._subagentToolAllowlist ? new Set(this._subagentToolAllowlist) : undefined;
       entries.push([
         '__mastra_toolPermissionPolicy',
-        (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy),
+        (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
       ]);
     }
     // §4.2e `yolo` — a per-turn suppressor for the POLICY-level approval reason
@@ -12130,6 +12153,9 @@ export class Session {
    */
   private _toolPermissionGateEngaged(): boolean {
     if (this._harness._isDefaultPermissionPolicyConfigured()) return true;
+    // M4: a subagent capability allowlist must engage the gate too — the resolver
+    // is what hard-denies (and pre-exposure removes) tools outside the scope.
+    if (this._subagentToolAllowlist !== undefined) return true;
     const rules = this._record.permissionRules;
     return Object.keys(rules.categories).length > 0 || Object.keys(rules.tools).length > 0;
   }
@@ -12147,8 +12173,18 @@ export class Session {
     rules: PermissionRules,
     grants: SessionGrants,
     defaultPolicy: PermissionPolicy,
+    allowlist?: ReadonlySet<string>,
   ): PermissionPolicy {
-    if (HARNESS_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
+    // Always-kept builtins (HITL + local plan-task orchestration) bypass the gate
+    // entirely — but the escalation builtins (spawn_subagent / task_delegate) do
+    // NOT, so an allowlist below can still gate them (anti-escalation, M4).
+    if (HARNESS_BUILTIN_TOOL_IDS.has(toolName) && !ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
+    // M4 — subagent capability scope: a tool outside the allowlist is a hard deny
+    // (removed pre-exposure; refused at action time), regardless of permission rules.
+    if (allowlist !== undefined && !allowlist.has(toolName)) return 'deny';
+    // Escalation builtins that are either un-scoped (no allowlist) or explicitly
+    // listed run as normal harness infrastructure.
+    if (ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
     const category = this._harness.getToolCategory({ toolName }) ?? undefined;
     let policy: PermissionPolicy =
       (rules.tools[toolName] as PermissionPolicy | undefined) ??
@@ -12630,10 +12666,15 @@ export class Session {
       modeId: def.modeId ?? this._record.modeId,
       modelId: input.modelOverride ?? def.defaultModelId,
       subagentDepth: childDepth,
+      // M4 — persist the type so the durable delegated child's per-subagent
+      // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
+      // hydrate, not only this parent's delegation-reattach.
+      subagentTypeId: input.agentType,
     });
     const subagentWorkspaceMode = def.workspace ?? 'inherit';
     child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
     if (def.tools) child._subagentToolsOverride = def.tools;
+    if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
 
     // Write the durable link + drive the task in_progress under the owner fence.
     // If this rejects (e.g. single-in_progress conflict) the child session was
@@ -12983,6 +13024,7 @@ export class Session {
         if (def) {
           child._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
           if (def.tools) child._subagentToolsOverride = def.tools;
+          if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
         }
       }
       this._activeSubagents.set(`delegate:${child.id}`, {

@@ -161,6 +161,9 @@ export function createSpawnSubagentTool(parent: Session) {
           modeId: def.modeId ?? parent.getCurrentModeId(),
           modelId: modelOverride ?? def.defaultModelId,
           subagentDepth: childDepth,
+          // M4 — persist the type so the child's per-subagent overrides (tools /
+          // workspace / toolAllowlist) survive a direct-by-id hydrate.
+          subagentTypeId: agentType,
         });
 
         // Workspace inheritance (§2.7 / §8). `'inherit'` (default) makes the
@@ -170,6 +173,7 @@ export function createSpawnSubagentTool(parent: Session) {
         const subagentWorkspaceMode = def.workspace ?? 'inherit';
         child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
         if (def.tools) child._subagentToolsOverride = def.tools;
+        if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
 
         // Bridge the child's per-turn events into the parent's subscriber
         // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and
