@@ -13,7 +13,7 @@
  *   - event ids share a single epoch and are monotonic
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { Agent } from '../../agent';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
@@ -378,9 +378,7 @@ describe('Session events — fullStream drain', () => {
 
   it('emits NO reasoning_delta when the model streams no reasoning (additive — never forced on)', async () => {
     const { harness, agent } = setup();
-    agent.chunks = [
-      { type: 'text-delta', payload: { id: 'msg-1', text: 'no thinking here' }, runId: 'fake-run' },
-    ];
+    agent.chunks = [{ type: 'text-delta', payload: { id: 'msg-1', text: 'no thinking here' }, runId: 'fake-run' }];
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     const events: HarnessEvent[] = [];
@@ -875,7 +873,11 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
     }
     const shared = { ok: true };
     agent.chunks = [
-      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'mastra' } }, runId: 'fake-run' },
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'mastra' } },
+        runId: 'fake-run',
+      },
       {
         type: 'tool-result',
         payload: {
@@ -1228,5 +1230,36 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
     expect(live.input).toEqual({ when: '2026-05-19T00:00:00.000Z', nested: { ok: true } });
     expect(live.input.when).not.toBeInstanceOf(Date);
     expect(live.input).toEqual(replay.input);
+  });
+});
+
+describe('Session event-persistence failure surfacing (§10.2)', () => {
+  it('emits a live storage_error (once) when appendSessionEvent fails, instead of silently degrading', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      // Fail the first durable append → trips the latch.
+      vi.spyOn(storage, 'appendSessionEvent').mockRejectedValueOnce(new Error('disk full'));
+
+      await session.message({ content: 'hi' });
+      // Drain the persistence tail so the latch-trip catch (which emits) has run.
+      await session._flushEventPersistence().catch(() => {});
+
+      const storageErrors = events.filter(e => e.type === 'storage_error') as any[];
+      expect(storageErrors).toHaveLength(1);
+      expect(storageErrors[0].operation).toBe('session_event_append');
+      expect(storageErrors[0].error.code).toBe('harness.storage');
+      expect(storageErrors[0].resourceId).toBe('u1');
+
+      // A second turn does not emit another storage_error (latch already surfaced).
+      await session.message({ content: 'again' }).catch(() => {});
+      await session._flushEventPersistence().catch(() => {});
+      expect(events.filter(e => e.type === 'storage_error')).toHaveLength(1);
+    } finally {
+      // shutdown surfaces the latched event-persistence error we injected.
+      await harness.shutdown().catch(() => {});
+    }
   });
 });

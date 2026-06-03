@@ -111,6 +111,7 @@ import {
   HarnessSessionLockedError,
   HarnessStateConflictError,
   HarnessStateSerializationError,
+  HarnessStorageError,
   HarnessSkillArgsValidationError,
   HarnessSkillNotFoundError,
   HarnessSubagentDepthExceededError,
@@ -1431,8 +1432,31 @@ export class Session {
       });
     this._eventPersistenceTail = task.catch(err => {
       if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return;
+      // Latch FIRST so the storage_error emit below (and any concurrent appends)
+      // short-circuit re-persistence; surface the failure exactly once.
+      const firstTrip = this._eventPersistenceError === undefined;
       this._eventPersistenceError = err;
       console.error('[harness/v1] session event persistence failed:', err);
+      // §10.2: the durable event log is now degraded — a reconnect past the gap
+      // recovers via the §10.5 snapshot path, but that is LATER. Emit a live
+      // `storage_error` so subscribers learn the log stopped persisting in real
+      // time rather than only discovering the gap on reconnect. Live-only: the
+      // latch is already set, so this event is not itself re-persisted.
+      if (firstTrip) {
+        const isStorageErr = err instanceof HarnessStorageError;
+        this._emitter.emit({
+          type: 'storage_error',
+          operation: 'session_event_append',
+          retryable: isStorageErr ? err.retryable : false,
+          error: {
+            code: 'harness.storage',
+            message: isStorageErr ? err.message : 'session event persistence failed',
+          },
+          resourceId: record.resourceId,
+          threadId: record.threadId,
+          harnessName: record.harnessName,
+        } as EmitInput);
+      }
     });
   }
 

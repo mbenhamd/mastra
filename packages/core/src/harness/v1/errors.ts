@@ -456,9 +456,7 @@ export class HarnessExecutionError extends HarnessError {
  * impersonates by setting `name = 'Harness…'`).
  */
 function isHarnessOwnError(err: unknown): boolean {
-  return (
-    err instanceof Error && typeof (err as { name?: unknown }).name === 'string' && err.name.startsWith('Harness')
-  );
+  return err instanceof Error && typeof (err as { name?: unknown }).name === 'string' && err.name.startsWith('Harness');
 }
 
 /**
@@ -710,6 +708,7 @@ export type HarnessStorageOperation =
   | 'channel_outbox'
   | 'wakeup'
   | 'attachment'
+  | 'session_event_append'
   | 'workspace_cleanup';
 
 /** The known, tenant-checked row a storage error is scoped to (§4.5d). */
