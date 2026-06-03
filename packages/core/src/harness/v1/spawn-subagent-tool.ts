@@ -282,6 +282,25 @@ export function createSpawnSubagentTool(parent: Session) {
         let isError = false;
         try {
           result = await child.message({ content: task, abortSignal: ctx.abortSignal });
+          // §S3.3 — an inline spawn_subagent has NO independent driver to resume a
+          // human-in-the-loop suspension, and the child is auto-closed below. A
+          // default `message()` RESOLVES (not rejects) with finishReason
+          // 'suspended', so without this it would be reported as a successful
+          // `subagent_end{isError:false}` and the child closed mid-suspension.
+          // Treat it as an error result so the parent model gets an error-shaped
+          // tool output instead of a misleading completion.
+          if ((result as { finishReason?: string } | undefined)?.finishReason === 'suspended') {
+            isError = true;
+            result = {
+              isError: true,
+              errorName: 'HarnessSubagentSuspendedError',
+              reason: 'inline_subagent_suspended_unresumable',
+              message:
+                `Subagent "${agentType}" suspended for human input, but an inline spawn_subagent cannot be ` +
+                `resumed. Re-invoke it with self-contained context that does not require approval/input.`,
+              subagentSessionId: child.id,
+            };
+          }
         } catch (err) {
           isError = true;
           result = err instanceof Error ? err.message : String(err);
@@ -312,6 +331,10 @@ export function createSpawnSubagentTool(parent: Session) {
         return {
           subagentSessionId: child.id,
           result,
+          // §S3.3 — surface isError on the tool OUTPUT (not only on subagent_end)
+          // so the parent model receives an error-shaped result for a thrown OR
+          // suspended subagent, instead of a value that looks like success.
+          ...(isError ? { isError: true } : {}),
         };
       } finally {
         // Release the SA3 reservation on every exit path (create failure, run

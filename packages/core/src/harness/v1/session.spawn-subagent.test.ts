@@ -508,3 +508,30 @@ describe('subagent live progress projection (§SA2)', () => {
     }
   });
 });
+
+describe('spawn_subagent — inline suspension is an error, not a completion (§S3.3)', () => {
+  it('reports a HITL-suspended inline subagent as isError + HarnessSubagentSuspendedError', async () => {
+    const { harness, childAgent } = setup();
+    // Drive the child to a HITL suspension: a default message() RESOLVES with
+    // finishReason 'suspended' (it does not reject).
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'c-tc', toolName: 'need_input', args: {} },
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: any[] = [];
+      parent.subscribe(e => events.push(e));
+      const tool = createSpawnSubagentTool(parent)!;
+      const out = (await tool.execute!({ agentType: 'explore', task: 'explore X' } as any, execCtx('tc-susp'))) as any;
+      // The inline subagent cannot be resumed → error result, NOT a success.
+      expect(out.isError).toBe(true);
+      expect((out.result as { errorName?: string })?.errorName).toBe('HarnessSubagentSuspendedError');
+      const end = events.find(e => e.type === 'subagent_end') as { isError?: boolean } | undefined;
+      expect(end?.isError).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
