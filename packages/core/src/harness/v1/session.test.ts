@@ -209,6 +209,7 @@ describe('Session — surface area (M1)', () => {
         'admitQueue',
         'cancel',
         'cancelQueuedItem',
+        'cancelSubagent',
         'close',
         'delete',
         'rename',
