@@ -27,6 +27,7 @@ import { createStep } from '../../../workflows/workflow';
 import type { OuterLLMRun } from '../../types';
 import { ToolNotFoundError } from '../errors';
 import { toolCallInputSchema, toolCallOutputSchema } from '../schema';
+import { notifyToolDenied } from './tool-permission-notify';
 
 type AddToolMetadataOptions = {
   toolCallId: string;
@@ -493,6 +494,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             | undefined
         )?.(inputData.toolName);
         if (toolPermissionPolicy === 'deny') {
+          // §O4 — surface WHY a tool was blocked (action-time deny is otherwise
+          // opaque: only a generic result reaches the model). Optional, sync,
+          // fire-and-forget, isolated; a non-harness caller threads no callback.
+          notifyToolDenied(requestContext, {
+            toolName: inputData.toolName,
+            stage: 'action',
+            toolCallId: inputData.toolCallId,
+          });
           return {
             ...inputData,
             result: `Tool "${inputData.toolName}" was denied by the session permission policy.`,

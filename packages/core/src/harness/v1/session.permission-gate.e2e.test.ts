@@ -111,6 +111,35 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     }
   });
 
+  it('§O4: a DENY surfaces a pre-exposure tool_denied (the tool is removed from the model surface)', async () => {
+    const { harness } = buildHarness({ permissions: { categories: { edit: 'deny' }, tools: {} } });
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'write it' });
+
+      const denied = events.filter(e => e.type === 'tool_denied') as Array<{ toolName: string; stage: string }>;
+      expect(denied.some(e => e.stage === 'pre-exposure' && e.toolName === 'writeDoc')).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('§O4: an UNCONFIGURED gate emits no tool_denied (allowed tool runs)', async () => {
+    const { harness, ran } = buildHarness({});
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'write it' });
+      expect(ran.writeDoc).toBe(true);
+      expect(events.some(e => e.type === 'tool_denied')).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('ALLOW runs the tool', async () => {
     const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'allow' }, tools: {} } });
     try {
@@ -173,6 +202,8 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
     const { harness, ran } = buildHarness({ permissions: { categories: { edit: 'ask' }, tools: {} } });
     try {
       const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
       const suspended = (await session.message({ content: 'write it' })) as any;
       expect(suspended.finishReason).toBe('suspended');
       expect(ran.writeDoc).toBe(false);
@@ -184,6 +215,14 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
 
       // Re-evaluated on resume → blocked; the tool still never ran.
       expect(ran.writeDoc).toBe(false);
+      // §O4: the approved tool reached ACTION time and was refused there → a
+      // tool_denied(stage:'action') surfaces the rationale (it slipped past the
+      // pre-exposure gate because the surface was built while policy was 'ask').
+      expect(
+        (events.filter(e => e.type === 'tool_denied') as Array<{ toolName: string; stage: string }>).some(
+          e => e.stage === 'action' && e.toolName === 'writeDoc',
+        ),
+      ).toBe(true);
     } finally {
       await harness.shutdown();
     }
@@ -232,8 +271,18 @@ describe('Harness v1 §4.2e permission gate — enforced through the real loop',
   });
 
   it('PRE-EXPOSURE: a denied tool is not even shown to the model (allowed tools still are)', async () => {
-    const readTool = createTool({ id: 'readDoc', description: 'read', inputSchema: z.object({}), execute: async () => ({}) });
-    const writeTool = createTool({ id: 'writeDoc', description: 'edit', inputSchema: z.object({}), execute: async () => ({}) });
+    const readTool = createTool({
+      id: 'readDoc',
+      description: 'read',
+      inputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const writeTool = createTool({
+      id: 'writeDoc',
+      description: 'edit',
+      inputSchema: z.object({}),
+      execute: async () => ({}),
+    });
     let seenToolsJson = '';
     const model = new MockLanguageModelV2({
       doStream: async (options: any) => {

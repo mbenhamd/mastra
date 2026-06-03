@@ -12499,6 +12499,27 @@ export class Session {
         (toolName: string) =>
           session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
       ]);
+      // §O4 — deny observability: the loop calls this when the policy above blocks
+      // a tool (pre-exposure removal or action-time refusal), so a `tool_denied`
+      // event surfaces WHY instead of the denial being silent. Sync + best-effort.
+      entries.push([
+        '__mastra_onToolDenied',
+        (info: {
+          toolName: string;
+          stage: 'pre-exposure' | 'action';
+          toolCallId?: string;
+          forcedToolChoice?: boolean;
+        }) => {
+          session._emitTurnEvent({
+            type: 'tool_denied',
+            toolName: info.toolName,
+            stage: info.stage,
+            ...(info.toolCallId !== undefined ? { toolCallId: info.toolCallId } : {}),
+            ...(info.forcedToolChoice ? { forcedToolChoice: true } : {}),
+            ...(session._currentRunId !== undefined ? { runId: session._currentRunId } : {}),
+          });
+        },
+      ]);
     }
     // §4.2e `yolo` — a per-turn suppressor for the POLICY-level approval reason
     // (an effective `ask` from the permission gate). Per spec it clears ONLY the

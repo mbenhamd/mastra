@@ -266,6 +266,23 @@ export interface AgentEndEvent extends HarnessEventBase {
 }
 
 /**
+ * §O4 — a tool was blocked by the §4.2e permission gate. Closes the "deny is
+ * silent" observability gap: a `pre-exposure` denial removes the tool from the
+ * model surface before the call (otherwise invisible), and an `action` denial
+ * refuses an issued tool-call (otherwise only a generic tool result). Emitted
+ * best-effort from the shared loop's optional deny callback; carries no tool
+ * args. `toolCallId` is present only for an action denial; `forcedToolChoice` is
+ * true when a forced `toolChoice` named a denied tool (the run then errors).
+ */
+export interface ToolDeniedEvent extends HarnessEventBase {
+  type: 'tool_denied';
+  toolName: string;
+  stage: 'pre-exposure' | 'action';
+  toolCallId?: string;
+  forcedToolChoice?: boolean;
+}
+
+/**
  * Compact per-run tool aggregate carried on `run_completed` and the durable run
  * summary (span-summary S4). Bounded by the number of DISTINCT tool names in the
  * run; never carries per-call inputs/outputs. `errors` counts tool calls whose
@@ -847,6 +864,7 @@ export type HarnessEvent =
   | ToolEndEvent
   | AgentEndEvent
   | RunCompletedEvent
+  | ToolDeniedEvent
   | TurnErrorEvent
   | SignalCompletedEvent
   | SignalFailedEvent
@@ -1268,6 +1286,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'task_updated',
   'tool_end',
   'run_completed',
+  'tool_denied',
   'suspension_required',
   'suspension_resolved',
   'sandbox_access_requested',

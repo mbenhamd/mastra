@@ -55,6 +55,7 @@ import { buildMessagesFromChunks } from './build-messages-from-chunks';
 import type { CollectedChunk } from './build-messages-from-chunks';
 import { resolveConfiguredToolCallConcurrency, updateToolCallForeachConcurrency } from './tool-call-concurrency';
 import type { ToolCallForeachOptions } from './tool-call-concurrency';
+import { notifyToolDenied } from './tool-permission-notify';
 
 function getRequestInputProcessors({
   inputProcessors,
@@ -902,24 +903,49 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             | undefined;
           if (permissionPolicy && currentStep.tools) {
             const toolSurface = currentStep.tools as Record<string, unknown>;
-            for (const toolName of Object.keys(toolSurface)) {
-              if (permissionPolicy(toolName) === 'deny') delete toolSurface[toolName];
-            }
-            if (Array.isArray(currentStep.activeTools)) {
-              currentStep.activeTools = (currentStep.activeTools as string[]).filter(
-                name => permissionPolicy(name) !== 'deny',
-              ) as typeof currentStep.activeTools;
-            }
             const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
-            if (
+            // §O4 — the forced-toolChoice denied tool (if any), resolved up front so
+            // its `tool_denied` event carries `forcedToolChoice: true` on its FIRST
+            // (deduped) emit even when the tool is also present in the surface.
+            const forcedDeniedName =
               toolChoice &&
               typeof toolChoice === 'object' &&
               toolChoice.type === 'tool' &&
               typeof toolChoice.toolName === 'string' &&
               permissionPolicy(toolChoice.toolName) === 'deny'
-            ) {
+                ? toolChoice.toolName
+                : undefined;
+            // Surface each pre-exposure removal exactly once (a denied tool is
+            // otherwise dropped silently); dedup across the surface + activeTools +
+            // the forced-choice branch.
+            const deniedNames = new Set<string>();
+            const notifyDenied = (toolName: string): void => {
+              if (deniedNames.has(toolName)) return;
+              deniedNames.add(toolName);
+              notifyToolDenied(requestContext, {
+                toolName,
+                stage: 'pre-exposure',
+                ...(toolName === forcedDeniedName ? { forcedToolChoice: true } : {}),
+              });
+            };
+            for (const toolName of Object.keys(toolSurface)) {
+              if (permissionPolicy(toolName) === 'deny') {
+                delete toolSurface[toolName];
+                notifyDenied(toolName);
+              }
+            }
+            if (Array.isArray(currentStep.activeTools)) {
+              currentStep.activeTools = (currentStep.activeTools as string[]).filter(name => {
+                if (permissionPolicy(name) !== 'deny') return true;
+                notifyDenied(name);
+                return false;
+              }) as typeof currentStep.activeTools;
+            }
+            if (forcedDeniedName !== undefined) {
+              // Covers a forced denied tool that was not in the surface/activeTools.
+              notifyDenied(forcedDeniedName);
               throw new Error(
-                `Forced toolChoice names a permission-denied tool "${toolChoice.toolName}" (pre-exposure gate, §4.2e)`,
+                `Forced toolChoice names a permission-denied tool "${forcedDeniedName}" (pre-exposure gate, §4.2e)`,
               );
             }
           }
