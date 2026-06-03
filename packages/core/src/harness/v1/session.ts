@@ -271,6 +271,9 @@ type ActionCatalogMcpTimedOutWork = {
  * Shared with the built-in `askUser` / `submitPlan` tools so the contract
  * lives in a single place (`packages/core/src/tools/builtin`).
  */
+/** Defensive cap on the synthetic-aborted-tool tombstone set (§10.2 / S1). */
+const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
+
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
@@ -1030,6 +1033,14 @@ export class Session {
   private readonly _turnAbortSignalCleanups = new WeakMap<AbortController, () => void>();
   private readonly _operationEvidenceSignalIds = new Set<string>();
   private readonly _activeTools = new Map<string, ActiveToolState>();
+  /**
+   * `${runId}:${toolCallId}` of tools for which a SYNTHETIC aborted `tool_end`
+   * was emitted at turn end (§10.2). A late real `tool-result`/`tool-error` chunk
+   * for the same key (the abort path can reach `_endTurn` before the drain
+   * delivers the real result) is suppressed ONCE so the consumer never sees two
+   * terminals for one tool. Bounded by `_maxAbortedToolTombstones`.
+   */
+  private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
   /** TM-6 reconcile-on-rehydrate pending retry timers (cleared on close). */
@@ -1604,6 +1615,12 @@ export class Session {
     if (this._activeTools.size === 0) return;
     const runId = this._currentRunId;
     if (runId === undefined) return;
+    // Defensive bound: drop the tombstone set if it grew large (aborted tools
+    // whose late real result never arrived). Losing suppression for very old
+    // entries is harmless — their late result is extremely unlikely by then.
+    if (this._abortedToolTombstones.size > MAX_ABORTED_TOOL_TOMBSTONES) {
+      this._abortedToolTombstones.clear();
+    }
     for (const tool of this._activeTools.values()) {
       this._emitTurnEvent({
         type: 'tool_end',
@@ -1613,6 +1630,9 @@ export class Session {
         output: { aborted: true, reason: 'turn ended before the tool produced a result' },
         isError: true,
       } as EmitInput);
+      // Suppress a late real terminal for this tool (the drain may still deliver
+      // its tool-result/tool-error after this turn ended).
+      this._abortedToolTombstones.add(`${runId}:${tool.toolCallId}`);
     }
   }
 
@@ -4550,6 +4570,11 @@ export class Session {
         // back to the `_activeTools` entry for any chunk shape that omits it.
         const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
+        // Suppress a real terminal that arrives AFTER a synthetic aborted tool_end
+        // was already emitted for this (runId, toolCallId) — one-shot (S1).
+        if (runId !== undefined && this._abortedToolTombstones.delete(`${runId}:${payload.toolCallId}`)) {
+          return;
+        }
         if (runId !== undefined) {
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
@@ -4576,6 +4601,10 @@ export class Session {
         // that omit it.
         const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
+        // One-shot suppression of a late real terminal after a synthetic abort (S1).
+        if (runId !== undefined && this._abortedToolTombstones.delete(`${runId}:${payload.toolCallId}`)) {
+          return;
+        }
         if (runId !== undefined) {
           // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
           // `harnessEventJsonReplacer` keeps name/code/message — NOT flattened

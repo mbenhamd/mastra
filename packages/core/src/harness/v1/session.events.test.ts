@@ -1267,6 +1267,46 @@ describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
     }
   });
 
+  it('suppresses (one-shot) a late real tool_end that arrives after a synthetic aborted tool_end', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      // Simulate: a tool was active on run-x when the turn ended → synthetic abort.
+      (session as any)._currentRunId = 'run-x';
+      (session as any)._activeTools.set('tc1', {
+        toolCallId: 'tc1',
+        toolName: 'lookup',
+        args: {},
+        startedAt: Date.now(),
+      });
+      (session as any)._emitAbortedToolEnds();
+
+      // A late REAL tool-result for the same (runId, toolCallId) arrives on the drain.
+      (session as any)._emitForChunk({
+        type: 'tool-result',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', result: { ok: true } },
+        runId: 'run-x',
+      });
+      let ends = events.filter(e => e.type === 'tool_end' && (e as any).toolCallId === 'tc1') as any[];
+      expect(ends).toHaveLength(1); // late real terminal suppressed
+      expect(ends[0].isError).toBe(true); // the synthetic aborted one
+      expect((ends[0].output as any).aborted).toBe(true);
+
+      // One-shot: a SECOND late result for the same key is no longer suppressed.
+      (session as any)._emitForChunk({
+        type: 'tool-result',
+        payload: { toolCallId: 'tc1', toolName: 'lookup', result: {} },
+        runId: 'run-x',
+      });
+      ends = events.filter(e => e.type === 'tool_end' && (e as any).toolCallId === 'tc1') as any[];
+      expect(ends).toHaveLength(2);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('does NOT synthesize a tool_end when the tool settled normally (no duplicate)', async () => {
     const { harness, agent } = setup();
     agent.chunks = [
