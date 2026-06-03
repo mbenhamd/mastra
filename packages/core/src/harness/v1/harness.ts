@@ -69,7 +69,7 @@ import type { MemoryStorage } from '../../storage/domains/memory/base';
 import { InMemoryStore } from '../../storage/mock';
 import type { Workspace } from '../../workspace';
 
-import { canonicalJson, sha256CanonicalJson, sha256CanonicalJsonChecked } from './canonical-json';
+import { assertJsonValue, canonicalJson, sha256CanonicalJson, sha256CanonicalJsonChecked } from './canonical-json';
 import { HarnessChannelRegistry } from './channel-registry';
 import {
   HarnessAttachmentInUseError,
@@ -186,6 +186,12 @@ function assertOmThreshold(value: unknown, field: string): number {
   return value;
 }
 
+function assertOmStepObject(value: unknown, field: string): void {
+  if (value !== undefined && (typeof value !== 'object' || value === null || Array.isArray(value))) {
+    throw new HarnessConfigError(field, 'must be an object when provided');
+  }
+}
+
 /**
  * Normalize + validate the §9.2 `ObservationalMemoryConfig` into resolved,
  * JSON-safe defaults. `true` enables OM with defaults; `false`/omitted disables
@@ -195,14 +201,19 @@ function assertOmThreshold(value: unknown, field: string): number {
 function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | undefined): ResolvedObservationalMemory {
   if (config === undefined || config === false) return { enabled: false, scope: 'thread' };
   if (config === true) return { enabled: true, scope: 'thread' };
-  if (typeof config !== 'object' || Array.isArray(config)) {
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) {
     throw new HarnessConfigError('observationalMemory', 'must be a boolean or a config object');
+  }
+  if (config.enabled !== undefined && typeof config.enabled !== 'boolean') {
+    throw new HarnessConfigError('observationalMemory.enabled', 'must be a boolean when provided');
   }
   const enabled = config.enabled !== false;
   const scope = config.scope ?? 'thread';
   if (scope !== 'thread' && scope !== 'resource') {
     throw new HarnessConfigError('observationalMemory.scope', "must be 'thread' or 'resource'");
   }
+  assertOmStepObject(config.observation, 'observationalMemory.observation');
+  assertOmStepObject(config.reflection, 'observationalMemory.reflection');
   const sharedModel = config.model !== undefined ? assertOmModelId(config.model, 'observationalMemory.model') : undefined;
   const observerModelId =
     config.observation?.model !== undefined
@@ -220,8 +231,19 @@ function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | un
     config.reflection?.observationTokens !== undefined
       ? assertOmThreshold(config.reflection.observationTokens, 'observationalMemory.reflection.observationTokens')
       : undefined;
-  if (config.processorOptions !== undefined && (typeof config.processorOptions !== 'object' || config.processorOptions === null || Array.isArray(config.processorOptions))) {
-    throw new HarnessConfigError('observationalMemory.processorOptions', 'must be a JSON object');
+  if (config.processorOptions !== undefined) {
+    if (typeof config.processorOptions !== 'object' || config.processorOptions === null || Array.isArray(config.processorOptions)) {
+      throw new HarnessConfigError('observationalMemory.processorOptions', 'must be a JSON object');
+    }
+    // Recursively reject non-JSON-safe values (functions, symbols, cycles, …).
+    try {
+      assertJsonValue(config.processorOptions, 'observationalMemory.processorOptions');
+    } catch (err) {
+      throw new HarnessConfigError(
+        'observationalMemory.processorOptions',
+        err instanceof Error ? err.message : 'must be JSON-safe',
+      );
+    }
   }
   return {
     enabled,

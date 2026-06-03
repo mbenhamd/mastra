@@ -36,7 +36,6 @@ import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import type { AgentSignalContents } from '../../agent/signals';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
-import type { ObservationalMemoryOptions } from '../../memory/types';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
 import {
@@ -4746,7 +4745,7 @@ export class Session {
     assertOwnedMessageTurnNotDeleted();
 
     const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-      memory: this._memoryRunOption(),
+      memory: { thread: this.threadId, resource: this.resourceId },
       abortSignal: turnAbortSignal,
       requestContext,
       ...(toolsets ? { toolsets } : {}),
@@ -6050,7 +6049,7 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-          memory: this._memoryRunOption(),
+          memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
           ...(toolsets ? { toolsets } : {}),
@@ -6366,7 +6365,7 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-          memory: this._memoryRunOption(),
+          memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
           ...(toolsets ? { toolsets } : {}),
@@ -8145,70 +8144,50 @@ export class Session {
     await this._omWriteConfig(prev => ({ ...prev, reflectorModelId: opts.model }));
   }
 
-  /** Commit an OM config patch under the session lease (preserves scope/thresholds). */
+  /** The full per-session OM snapshot seeded from the resolved harness defaults. */
+  private _omDefaultSeed(): NonNullable<SessionRecord['observationalMemory']> {
+    const d = this._omDefaults();
+    return {
+      scope: d.scope,
+      ...(d.observerModelId !== undefined ? { observerModelId: d.observerModelId } : {}),
+      ...(d.reflectorModelId !== undefined ? { reflectorModelId: d.reflectorModelId } : {}),
+      ...(d.observationThreshold !== undefined ? { observationThreshold: d.observationThreshold } : {}),
+      ...(d.reflectionThreshold !== undefined ? { reflectionThreshold: d.reflectionThreshold } : {}),
+    };
+  }
+
+  /**
+   * Commit an OM config patch under the session lease. When the session has no
+   * persisted OM snapshot yet (a legacy/unseeded record), the base is the FULL
+   * resolved default seed — not a bare `{ scope }` — so a single-field switch
+   * freezes the effective scope/thresholds/peer model rather than dropping them.
+   */
   private async _omWriteConfig(
     patch: (
       prev: NonNullable<SessionRecord['observationalMemory']>,
     ) => NonNullable<SessionRecord['observationalMemory']>,
   ): Promise<void> {
     await this._flushUpdate(prev => {
-      const base = prev.observationalMemory ?? { scope: this._omDefaults().scope };
+      const base = prev.observationalMemory ?? this._omDefaultSeed();
       return { ...prev, observationalMemory: patch(base) };
     });
   }
 
-  /**
-   * §9.2 — the effective OM option to thread into a turn's `memory.options`, built
-   * from the per-session snapshot (record) over the resolved harness defaults.
-   * Returns `undefined` when OM is disabled (so turns keep today's no-OM behavior).
-   * Only emits `observation`/`reflection` (never a top-level `model`) — the memory
-   * package forbids combining the shared `model` with per-step models. Threshold
-   * `undefined` lets the memory adapter apply its own default. `processorOptions`
-   * is NOT threaded here yet (opaque adapter-owned; tracked as a follow-up).
-   */
-  private _observationalMemoryRunOption(): boolean | ObservationalMemoryOptions | undefined {
-    const defaults = this._harness._getObservationalMemoryDefaults();
-    if (!defaults.enabled) return undefined;
-    const rec = this._record.observationalMemory;
-    const scope = rec?.scope ?? defaults.scope;
-    const observerModelId = rec?.observerModelId ?? defaults.observerModelId;
-    const reflectorModelId = rec?.reflectorModelId ?? defaults.reflectorModelId;
-    const observationThreshold = rec?.observationThreshold ?? defaults.observationThreshold;
-    const reflectionThreshold = rec?.reflectionThreshold ?? defaults.reflectionThreshold;
-    const observation =
-      observerModelId !== undefined || observationThreshold !== undefined
-        ? {
-            ...(observerModelId !== undefined ? { model: observerModelId } : {}),
-            ...(observationThreshold !== undefined ? { messageTokens: observationThreshold } : {}),
-          }
-        : undefined;
-    const reflection =
-      reflectorModelId !== undefined || reflectionThreshold !== undefined
-        ? {
-            ...(reflectorModelId !== undefined ? { model: reflectorModelId } : {}),
-            ...(reflectionThreshold !== undefined ? { observationTokens: reflectionThreshold } : {}),
-          }
-        : undefined;
-    return {
-      scope,
-      ...(observation ? { observation } : {}),
-      ...(reflection ? { reflection } : {}),
-    };
-  }
-
-  /** Per-turn `memory` option, adding `options.observationalMemory` when OM is enabled. */
-  private _memoryRunOption(): {
-    thread: string;
-    resource: string;
-    options?: { observationalMemory: boolean | ObservationalMemoryOptions };
-  } {
-    const om = this._observationalMemoryRunOption();
-    return {
-      thread: this.threadId,
-      resource: this.resourceId,
-      ...(om !== undefined ? { options: { observationalMemory: om } } : {}),
-    };
-  }
+  // §9.2 PER-TURN OM ENABLEMENT — DEFERRED (BLOCKED ON @mastra/memory).
+  //
+  // Threading `memory.options.observationalMemory` into a turn does NOT enable or
+  // configure OM at runtime: `@mastra/memory` builds its OM engine ONLY from the
+  // Memory instance's CONSTRUCTOR `threadConfig.observationalMemory` (index.ts
+  // `_initOMEngine` returns null otherwise), and the per-turn path forwards only
+  // `temporalMarkers` to the processor — models/scope/thresholds are fixed at
+  // construction. Worse, core memory SKIPS the MessageHistory input processor
+  // whenever it sees OM "enabled" in the effective config (memory.ts), so passing
+  // a runtime OM option for an Agent whose Memory was NOT constructed with OM would
+  // SUPPRESS normal history WITHOUT attaching OM. So the harness does NOT thread a
+  // per-turn OM option today; `session.om.*` records durable per-session config
+  // intent (above), and effective enablement requires the Agent's Memory to be
+  // constructed with OM. Faithful runtime enablement needs upstream support for
+  // runtime OM engine construction/override.
 
   private async _resume(
     expectedKind: PendingResume['kind'],
@@ -10564,7 +10543,7 @@ export class Session {
       ]);
       assertQueuedTurnNotDeleted();
       const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-        memory: this._memoryRunOption(),
+        memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext,
         ...(toolsets ? { toolsets } : {}),
