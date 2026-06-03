@@ -134,6 +134,9 @@ import type {
   HarnessEvent,
   HarnessEventListener,
   HarnessEventUnsubscribe,
+  RunCompletedEvent,
+  RunCompletedStatus,
+  RunToolRollup,
   SubagentEndEvent,
   SubagentReasoningDeltaEvent,
   SubagentStartEvent,
@@ -872,6 +875,49 @@ export interface SessionRunProjection {
   updatedAt: number;
 }
 
+// ---------------------------------------------------------------------------
+// Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
+// `run_completed` event + the durable run summary. An OpenRunSpan is opened at
+// the run's FIRST `agent_start` (agent_start is emitted ONCE per run; a resume
+// reuses the runId and emits only the terminal `agent_end`) and finalized +
+// removed at the run's terminal `agent_end`. It is intentionally NOT cleared by
+// `_resetTurnTracking`/`_endTurn`, so it survives an in-process suspend/resume
+// and the duration spans the whole run (including any HITL wait). A run whose
+// original start was lost to a process restart has NO OpenRunSpan when its
+// terminal fires post-restart → the summary is marked `reconstructed` and omits
+// the start/duration/rollup rather than publishing falsely precise metrics.
+// ---------------------------------------------------------------------------
+
+/** @internal — captured run identity for a run summary (mirrors the live projection's effective identity). */
+interface RunSpanIdentity {
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  operationKind?: HarnessRunOperationRefKind;
+}
+
+/** @internal — in-memory accumulator for one in-flight run's span + tool rollup. */
+interface OpenRunSpan {
+  startedAt: number;
+  identity: RunSpanIdentity;
+  /** Per-tool-call start times (runId-scoped), used to compute `tool_end.durationMs` even across an in-process suspend. */
+  activeToolStarts: Map<string, { toolName: string; startedAt: number }>;
+  rollup: {
+    count: number;
+    errors: number;
+    totalDurationMs: number;
+    maxDurationMs: number;
+    perTool: Map<string, { count: number; errors: number; totalDurationMs: number }>;
+  };
+}
+
+/** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
+const MAX_FINALIZED_RUN_IDS = 4096;
+
 export interface SessionDisplayState {
   // Identity
   sessionId: string;
@@ -1039,6 +1085,15 @@ export class Session {
   private _currentRunSignalId?: string;
   private _currentMessageId?: string;
   private _currentTraceId?: string;
+  /**
+   * Span-summary — in-flight run span accumulators, keyed by runId. Opened at a
+   * run's first `agent_start`, finalized + deleted at its terminal `agent_end`.
+   * NOT reset per turn, so it survives an in-process suspend/resume. See
+   * {@link OpenRunSpan}.
+   */
+  private readonly _openRuns = new Map<string, OpenRunSpan>();
+  /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
+  private readonly _finalizedRunIds = new Set<string>();
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
   private readonly _turnAbortSignalCleanups = new WeakMap<AbortController, () => void>();
   private readonly _operationEvidenceSignalIds = new Set<string>();
@@ -1492,10 +1547,187 @@ export class Session {
    * back to its `queue()` item.
    */
   private _emitTurnEvent(event: EmitInput): HarnessEvent {
-    if (this._currentQueuedItemId !== undefined && (event as { queuedItemId?: string }).queuedItemId === undefined) {
-      return this._emitter.emit({ ...event, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    // Span-summary: enrich `tool_end` with durationMs + accumulate the run's
+    // tool rollup BEFORE emit, so the live subscriber and the durable row carry
+    // the same value. Returns the (possibly enriched) event to emit.
+    const toEmit = this._trackRunSpanPreEmit(event);
+    let emitted: HarnessEvent;
+    if (this._currentQueuedItemId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
+      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    } else {
+      emitted = this._emitter.emit(toEmit);
     }
-    return this._emitter.emit(event);
+    // Span-summary: open the run span on `agent_start`; finalize (emit
+    // `run_completed`) on a terminal `agent_end`. Runs AFTER emit so
+    // `run_completed` follows its `agent_end`.
+    this._trackRunSpanPostEmit(emitted);
+    return emitted;
+  }
+
+  /**
+   * Span-summary pre-emit hook. On `tool_start`, records the call's start in the
+   * open run span. On `tool_end`, computes `durationMs` from that start (when
+   * known) and folds the call into the run's tool rollup, returning an event
+   * carrying `durationMs`. All other events pass through unchanged. Counting
+   * happens HERE — the single emit choke — so a suppressed/never-emitted
+   * `tool_end` (e.g. a late real result dropped by the aborted-tool tombstone)
+   * cannot double-count, and a synthetic aborted `tool_end` counts exactly once.
+   */
+  private _trackRunSpanPreEmit(event: EmitInput): EmitInput {
+    const type = (event as { type?: string }).type;
+    if (type === 'tool_start') {
+      const e = event as { runId?: string; toolCallId?: string; toolName?: string };
+      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
+      if (span && e.toolCallId !== undefined) {
+        span.activeToolStarts.set(e.toolCallId, { toolName: e.toolName ?? 'unknown', startedAt: Date.now() });
+      }
+      return event;
+    }
+    if (type === 'tool_end') {
+      const e = event as { runId?: string; toolCallId?: string; toolName?: string; isError?: boolean; durationMs?: number };
+      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
+      if (!span) return event;
+      const toolName = e.toolName ?? 'unknown';
+      const start = e.toolCallId !== undefined ? span.activeToolStarts.get(e.toolCallId) : undefined;
+      let durationMs: number | undefined = e.durationMs;
+      if (durationMs === undefined && start) durationMs = Math.max(0, Date.now() - start.startedAt);
+      if (e.toolCallId !== undefined) span.activeToolStarts.delete(e.toolCallId);
+      // Fold into the rollup (count every emitted terminal; duration only when known).
+      const r = span.rollup;
+      r.count += 1;
+      const isError = e.isError === true;
+      if (isError) r.errors += 1;
+      if (durationMs !== undefined) {
+        r.totalDurationMs += durationMs;
+        if (durationMs > r.maxDurationMs) r.maxDurationMs = durationMs;
+      }
+      const per = r.perTool.get(toolName) ?? { count: 0, errors: 0, totalDurationMs: 0 };
+      per.count += 1;
+      if (isError) per.errors += 1;
+      if (durationMs !== undefined) per.totalDurationMs += durationMs;
+      r.perTool.set(toolName, per);
+      return durationMs !== undefined ? ({ ...event, durationMs } as EmitInput) : event;
+    }
+    return event;
+  }
+
+  /**
+   * Span-summary post-emit hook. Opens the run span on the run's first
+   * `agent_start`; on a terminal (non-suspended) `agent_end`, finalizes the run
+   * exactly once (emits `run_completed`, persists the durable summary).
+   */
+  private _trackRunSpanPostEmit(event: HarnessEvent): void {
+    if (event.type === 'agent_start') {
+      const runId = event.runId;
+      if (runId !== undefined && !this._openRuns.has(runId)) {
+        this._openRuns.set(runId, {
+          startedAt: this._currentRunStartedAt ?? event.timestamp,
+          identity: this._captureRunSpanIdentity(),
+          activeToolStarts: new Map(),
+          rollup: { count: 0, errors: 0, totalDurationMs: 0, maxDurationMs: 0, perTool: new Map() },
+        });
+      }
+      return;
+    }
+    if (event.type === 'agent_end' && event.finishReason !== 'suspended') {
+      this._finalizeRunSpan(event.runId, event.finishReason, event.usage, event.timestamp);
+    }
+  }
+
+  /** Capture the run's effective identity (mirrors {@link _buildCurrentRunProjection}'s live branch). */
+  private _captureRunSpanIdentity(): RunSpanIdentity {
+    const rec = this._record;
+    const modeId = this._currentRunModeId ?? rec.modeId;
+    const identity: RunSpanIdentity = {
+      resourceId: rec.resourceId,
+      threadId: rec.threadId,
+      agentId: this._modeAgentId(modeId),
+      modeId,
+      modelId: this._currentRunModelId ?? rec.modelId,
+      operationKind: this._currentQueuedItemId !== undefined ? 'queue' : 'signal',
+    };
+    if (rec.parentSessionId !== undefined) identity.parentSessionId = rec.parentSessionId;
+    if (this._currentTraceId !== undefined) identity.traceId = this._currentTraceId;
+    return identity;
+  }
+
+  /**
+   * Emit the canonical `run_completed` event for a terminal run, exactly once.
+   * A run with a live {@link OpenRunSpan} reports trusted start/duration/rollup;
+   * a run whose start was lost to a restart is marked `reconstructed` and omits
+   * those (usage + identity + finishReason are still reported).
+   */
+  private _finalizeRunSpan(
+    runId: string,
+    finishReason: string,
+    usage: TokenUsage,
+    completedAt: number,
+  ): void {
+    if (this._finalizedRunIds.has(runId)) return;
+    if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
+    this._finalizedRunIds.add(runId);
+
+    const span = this._openRuns.get(runId);
+    const reconstructed = span === undefined;
+    const identity = span?.identity ?? this._captureRunSpanIdentity();
+    const status: RunCompletedStatus =
+      finishReason === 'complete' ? 'completed' : finishReason === 'error' ? 'failed' : 'interrupted';
+
+    const event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'> = {
+      type: 'run_completed',
+      runId,
+      status,
+      finishReason,
+      usage,
+      completedAt,
+      resourceId: identity.resourceId,
+      threadId: identity.threadId,
+      agentId: identity.agentId,
+      modeId: identity.modeId,
+      modelId: identity.modelId,
+      ...(identity.parentSessionId !== undefined ? { parentSessionId: identity.parentSessionId } : {}),
+      ...(identity.traceId !== undefined ? { traceId: identity.traceId } : {}),
+      ...(identity.operationKind !== undefined ? { operationKind: identity.operationKind } : {}),
+    };
+    if (reconstructed) {
+      event.reconstructed = true;
+    } else {
+      event.startedAt = span!.startedAt;
+      event.durationMs = Math.max(0, completedAt - span!.startedAt);
+      event.toolRollup = this._materializeToolRollup(span!.rollup);
+    }
+    this._openRuns.delete(runId);
+
+    // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
+    // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
+    this._emitTurnEvent(event as EmitInput);
+
+    // Slice B (durable run summary) is wired here.
+    this._persistRunSummary(event, status, reconstructed);
+  }
+
+  /** Convert the in-memory rollup (Maps) into the JSON-safe {@link RunToolRollup}. */
+  private _materializeToolRollup(rollup: OpenRunSpan['rollup']): RunToolRollup {
+    const perTool: RunToolRollup['perTool'] = {};
+    for (const [name, v] of rollup.perTool) {
+      perTool[name] = { count: v.count, errors: v.errors, totalDurationMs: v.totalDurationMs };
+    }
+    return {
+      count: rollup.count,
+      errors: rollup.errors,
+      totalDurationMs: rollup.totalDurationMs,
+      maxDurationMs: rollup.maxDurationMs,
+      perTool,
+    };
+  }
+
+  /** Span-summary Slice B hook — persist the durable run summary. No-op until the storage adapters land. */
+  private _persistRunSummary(
+    _event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>,
+    _status: RunCompletedStatus,
+    _reconstructed: boolean,
+  ): void {
+    // Wired in Slice B.
   }
 
   /**
@@ -12317,6 +12549,10 @@ export class Session {
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
+    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
+    // that will never reach a terminal here) so they cannot accumulate.
+    this._openRuns.clear();
+    this._finalizedRunIds.clear();
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
   }
@@ -12326,6 +12562,8 @@ export class Session {
     const err = new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     this._leaseExtensionDeadline = undefined;
     this._state = 'deleted';
+    this._openRuns.clear();
+    this._finalizedRunIds.clear();
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
     const activeTurn = this._currentTurnAbortController;

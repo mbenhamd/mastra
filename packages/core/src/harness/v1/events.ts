@@ -29,7 +29,7 @@ import type {
 
 import { HarnessError, HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
 import type { EventSerializationReason, HarnessStorageOperation, HarnessStorageSubject } from './errors';
-import type { SessionLifecycleState, TokenUsage } from './session';
+import type { HarnessRunOperationRefKind, SessionLifecycleState, TokenUsage } from './session';
 import type { PermissionPolicy, ToolCategory } from './types';
 
 // ---------------------------------------------------------------------------
@@ -233,6 +233,14 @@ export interface ToolEndEvent extends HarnessEventBase {
   toolName: string;
   output: unknown;
   isError: boolean;
+  /**
+   * Wall-clock duration of the tool call in ms, when a matching `tool_start` was
+   * observed in this process for `(runId, toolCallId)` (span-summary S3/S4).
+   * ABSENT — not zero — when the start is unknown: a resumed/hydrated tool whose
+   * start predates a restart, or a synthetic aborted terminal. Consumers key by
+   * `(runId, toolCallId)` and treat a missing value as "unknown", never 0.
+   */
+  durationMs?: number;
 }
 
 export interface AgentEndEvent extends HarnessEventBase {
@@ -240,6 +248,64 @@ export interface AgentEndEvent extends HarnessEventBase {
   runId: string;
   finishReason: string;
   usage: TokenUsage;
+}
+
+/**
+ * Compact per-run tool aggregate carried on `run_completed` and the durable run
+ * summary (span-summary S4). Bounded by the number of DISTINCT tool names in the
+ * run; never carries per-call inputs/outputs. `errors` counts tool calls whose
+ * terminal was `isError`. Durations are summed/maxed over the calls whose start
+ * was observed in-process; a call with an unknown start contributes to `count`
+ * but not to the duration aggregates.
+ */
+export interface RunToolRollup {
+  count: number;
+  errors: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+  perTool: Record<string, { count: number; errors: number; totalDurationMs: number }>;
+}
+
+/** Terminal disposition of a run (span-summary). `complete`→completed, `error`→failed, `aborted`→interrupted. */
+export type RunCompletedStatus = 'completed' | 'failed' | 'interrupted';
+
+/**
+ * Canonical terminal run signal (span-summary O6). Emitted EXACTLY ONCE per run,
+ * when it reaches a NON-suspended terminal (complete / error / abort) — never on
+ * a suspend (the run parks and later resumes under the same `runId`). Carries the
+ * run identity, wall-clock timing, finish reason, per-run token `usage` (RAW —
+ * cost is a consumer concern, computed by Doxa from usage + model id), and a
+ * compact tool rollup.
+ *
+ * `reconstructed: true` marks a run whose originating start was lost (it began
+ * before a process restart and completed after): `startedAt`, `durationMs` and
+ * `toolRollup` are then ABSENT rather than falsely precise, while `usage`,
+ * identity and `finishReason` are still reported.
+ */
+export interface RunCompletedEvent extends HarnessEventBase {
+  type: 'run_completed';
+  runId: string;
+  status: RunCompletedStatus;
+  finishReason: string;
+  usage: TokenUsage;
+  completedAt: number;
+  /** Run-start wall-clock time; ABSENT on a `reconstructed` run. */
+  startedAt?: number;
+  /** `completedAt - startedAt`; ABSENT on a `reconstructed` run. */
+  durationMs?: number;
+  reconstructed?: boolean;
+  // Identity (sessionId is on HarnessEventBase).
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  /** The operation that drove the run (signal / queue / sync-generate / use-skill / inbox-response), when known. */
+  operationKind?: HarnessRunOperationRefKind;
+  /** Compact tool aggregate; ABSENT on a `reconstructed` run (partial in-memory state cannot be trusted). */
+  toolRollup?: RunToolRollup;
 }
 
 /**
@@ -764,6 +830,7 @@ export type HarnessEvent =
   | ToolStartEvent
   | ToolEndEvent
   | AgentEndEvent
+  | RunCompletedEvent
   | TurnErrorEvent
   | SignalCompletedEvent
   | SignalFailedEvent
@@ -1183,6 +1250,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'shell_output',
   'task_updated',
   'tool_end',
+  'run_completed',
   'suspension_required',
   'suspension_resolved',
   'sandbox_access_requested',
