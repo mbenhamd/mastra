@@ -341,6 +341,23 @@ export interface RunCompletedEvent extends HarnessEventBase {
 }
 
 /**
+ * §S3.1 — a RESUME attempt (respondTo*) failed but the suspension remains
+ * RETRYABLE. This is NON-terminal: it does NOT finalize the run (no `agent_end` /
+ * `run_completed`), because the harness reverts the resume marker so the
+ * suspension returns to `waiting` and a subsequent `respondTo*` can retry. It
+ * lets an event-only consumer learn the resume failed WITHOUT mistaking the run
+ * as completed or failed (the prior gap: a failed resume emitted no event, so
+ * consumers saw the run stuck "running"). `retryable` reflects whether the
+ * suspension was restored to a retryable state.
+ */
+export interface ResumeFailedEvent extends HarnessEventBase {
+  type: 'resume_failed';
+  runId: string;
+  retryable: boolean;
+  error: { code: string; message: string };
+}
+
+/**
  * Diagnostic/run-surface error (§10.2). `signalId` may attribute where the
  * runtime noticed the error, but promise settlement uses the OperationEvents
  * (`signal_failed` / `queue_failed`), not this event.
@@ -865,6 +882,7 @@ export type HarnessEvent =
   | AgentEndEvent
   | RunCompletedEvent
   | ToolDeniedEvent
+  | ResumeFailedEvent
   | TurnErrorEvent
   | SignalCompletedEvent
   | SignalFailedEvent
@@ -1287,6 +1305,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'tool_end',
   'run_completed',
   'tool_denied',
+  'resume_failed',
   'suspension_required',
   'suspension_resolved',
   'sandbox_access_requested',

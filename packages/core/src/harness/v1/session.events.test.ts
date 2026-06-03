@@ -1402,3 +1402,38 @@ describe('Session events — serialization failure isolation (§S4.2)', () => {
     }
   });
 });
+
+describe('Session events — resume failure surfaces a non-terminal resume_failed (§S3.1)', () => {
+  it('emits resume_failed{retryable} (no terminal agent_end) and keeps the suspension retryable', async () => {
+    const { harness, agent } = setup();
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc1', toolName: 'do_thing', args: {} },
+    };
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'do it' });
+      expect(events.some(e => e.type === 'tool_approval_required')).toBe(true);
+
+      // Make the resume attempt fail.
+      agent.resumeStream = async () => {
+        throw new Error('resume boom');
+      };
+      await expect(session.respondToToolApproval({ approved: true })).rejects.toThrow();
+
+      const rfIdx = events.findIndex(e => e.type === 'resume_failed');
+      expect(rfIdx).toBeGreaterThanOrEqual(0);
+      expect((events[rfIdx] as { retryable?: boolean }).retryable).toBe(true);
+      // NON-terminal: the failed resume does not finalize the run.
+      expect(events.slice(rfIdx).some(e => e.type === 'agent_end')).toBe(false);
+      expect(events.slice(rfIdx).some(e => e.type === 'run_completed')).toBe(false);
+      // The suspension is restored → retryable.
+      expect(session.getRecord().pendingResume).toBeDefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});

@@ -9190,6 +9190,18 @@ export class Session {
       } catch {
         // best-effort; closing/closed/deleted session — see comment above.
       }
+      // §S3.1 — surface the failed resume as a NON-terminal `resume_failed` event so
+      // an event-only consumer learns the attempt failed instead of seeing the run
+      // stuck "running". It is deliberately NOT a terminal `agent_end`: the marker
+      // revert above restored the suspension to `waiting`, so a subsequent
+      // `respondTo*` can retry (finalizing here would wrongly mark the run failed and
+      // poison a later retry's run_completed/run-summary for the same runId).
+      this._emitTurnEvent({
+        type: 'resume_failed',
+        runId: pending.runId,
+        retryable: true,
+        error: projectHarnessPublicError(thrown),
+      });
       // §13.3f.1 — respondTo* (this resume) is a public §4.2b boundary; the
       // resumed agent run (resumeStream / getFullOutput) can reject with a raw
       // provider/runtime error. Redact before rejecting the caller's promise.
