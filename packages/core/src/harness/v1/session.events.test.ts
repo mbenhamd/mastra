@@ -1233,6 +1233,60 @@ describe('Session events — tool payload JSON-safety at emit (live === replay)'
   });
 });
 
+describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
+  it('emits a synthetic aborted tool_end for a tool that never produced a result before the turn ended', async () => {
+    const { harness, agent } = setup();
+    // A tool-call chunk with NO matching tool-result → the tool is still active
+    // when the turn ends. The harness must synthesize a terminal tool_end so the
+    // consumer gets a tool_start → tool_end pair for every tool.
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-dangle', toolName: 'lookup', args: {} }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'hi' });
+
+      const starts = events.filter(e => e.type === 'tool_start') as any[];
+      const ends = events.filter(e => e.type === 'tool_end') as any[];
+      expect(starts.map(e => e.toolCallId)).toContain('tc-dangle');
+      const end = ends.find(e => e.toolCallId === 'tc-dangle');
+      expect(end).toBeDefined();
+      expect(end.isError).toBe(true);
+      expect(end.toolName).toBe('lookup');
+      // Attributed to the session's actual run id (not necessarily the chunk's
+      // hardcoded one); just assert it is a real run id.
+      expect(typeof end.runId).toBe('string');
+      expect(end.runId.length).toBeGreaterThan(0);
+      expect((end.output as any).aborted).toBe(true);
+      // Exactly one terminal (no duplicate from a later real result).
+      expect(ends.filter(e => e.toolCallId === 'tc-dangle')).toHaveLength(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does NOT synthesize a tool_end when the tool settled normally (no duplicate)', async () => {
+    const { harness, agent } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-ok', toolName: 'lookup', args: {} }, runId: 'fake-run' },
+      { type: 'tool-result', payload: { toolCallId: 'tc-ok', result: { ok: true } }, runId: 'fake-run' },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      await session.message({ content: 'hi' });
+      const ends = (events.filter(e => e.type === 'tool_end') as any[]).filter(e => e.toolCallId === 'tc-ok');
+      expect(ends).toHaveLength(1);
+      expect(ends[0].isError).toBe(false); // the real result, not a synthetic abort
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
 describe('Session event-persistence failure surfacing (§10.2)', () => {
   it('emits a live storage_error (once) when appendSessionEvent fails, instead of silently degrading', async () => {
     const { harness, storage } = setup();

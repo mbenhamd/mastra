@@ -1574,6 +1574,12 @@ export class Session {
     this._turnAbortSignalCleanups.delete(controller);
     if (this._currentTurnAbortController === controller) {
       this._currentTurnAbortController = undefined;
+      // §10.2 — any tool still in the active set when the turn ends produced no
+      // tool-result/error chunk (the turn aborted/errored/closed before it
+      // settled). Emit a synthetic aborted `tool_end` for each BEFORE clearing so
+      // a streaming consumer always gets a terminal for every `tool_start`. On a
+      // normal turn the drain already removed every tool, so this is a no-op.
+      this._emitAbortedToolEnds();
       this._currentRunId = undefined;
       this._currentRunStartedAt = undefined;
       this._currentRunModeId = undefined;
@@ -1585,6 +1591,29 @@ export class Session {
       this._toolInputBuffers.clear();
     }
     this._notifyMaybeIdle();
+  }
+
+  /**
+   * Emit a synthetic aborted `tool_end` for every tool still in the active set —
+   * tools whose turn ended before they produced a result/error chunk. Keeps the
+   * `tool_start` → `tool_end` pairing complete for streaming consumers. Skips when
+   * the run id is unknown (cannot attribute the terminal). Best-effort: emitted on
+   * the live subscriber stream like any other turn event.
+   */
+  private _emitAbortedToolEnds(): void {
+    if (this._activeTools.size === 0) return;
+    const runId = this._currentRunId;
+    if (runId === undefined) return;
+    for (const tool of this._activeTools.values()) {
+      this._emitTurnEvent({
+        type: 'tool_end',
+        runId,
+        toolCallId: tool.toolCallId,
+        toolName: tool.toolName,
+        output: { aborted: true, reason: 'turn ended before the tool produced a result' },
+        isError: true,
+      } as EmitInput);
+    }
   }
 
   private _createActiveTurnWaiter(): ActiveTurnWaiter {
