@@ -40,6 +40,8 @@ export interface HarnessTestSetupOptions {
   modelAuthStatusResolver?: HarnessConfig['modelAuthStatusResolver'];
   /** Optional attachment ingress policy (§13.7). */
   files?: HarnessConfig['files'];
+  /** Optional Observational Memory config (§9.2). */
+  observationalMemory?: HarnessConfig['observationalMemory'];
 }
 
 export interface HarnessTestSetup {
@@ -77,6 +79,7 @@ export function setupHarness(opts: HarnessTestSetupOptions = {}): HarnessTestSet
     ...(opts.skills ? { skills: opts.skills } : {}),
     ...(opts.modelAuthStatusResolver ? { modelAuthStatusResolver: opts.modelAuthStatusResolver } : {}),
     ...(opts.files ? { files: opts.files } : {}),
+    ...(opts.observationalMemory !== undefined ? { observationalMemory: opts.observationalMemory } : {}),
   });
   const firstAgent = Object.values(agents)[0]!;
   return { harness, agent: firstAgent, agents, storage };

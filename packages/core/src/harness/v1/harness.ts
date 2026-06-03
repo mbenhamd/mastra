@@ -142,6 +142,7 @@ import type {
   ThreadRenameOptions,
   ThreadSetSettingsOptions,
   ToolCategory,
+  ObservationalMemoryConfig,
 } from './types';
 import { WorkspaceRegistry } from './workspace-registry';
 
@@ -159,6 +160,92 @@ const EVICTION_FLUSH_DRAIN_BUDGET_MS = 5_000;
 const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = 'ask';
+
+/** §9.2 — resolved, JSON-safe Observational Memory defaults for a harness. */
+interface ResolvedObservationalMemory {
+  enabled: boolean;
+  scope: 'thread' | 'resource';
+  observerModelId?: string;
+  reflectorModelId?: string;
+  observationThreshold?: number;
+  reflectionThreshold?: number;
+  processorOptions?: Record<string, JsonValue>;
+}
+
+function assertOmModelId(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new HarnessConfigError(field, 'must be a non-empty string');
+  }
+  return value;
+}
+
+function assertOmThreshold(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new HarnessConfigError(field, 'must be a positive integer');
+  }
+  return value;
+}
+
+/**
+ * Normalize + validate the §9.2 `ObservationalMemoryConfig` into resolved,
+ * JSON-safe defaults. `true` enables OM with defaults; `false`/omitted disables
+ * it. A per-channel `observation.model` / `reflection.model` overrides the shared
+ * `model`. Throws `HarnessConfigError` on malformed input.
+ */
+function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | undefined): ResolvedObservationalMemory {
+  if (config === undefined || config === false) return { enabled: false, scope: 'thread' };
+  if (config === true) return { enabled: true, scope: 'thread' };
+  if (typeof config !== 'object' || Array.isArray(config)) {
+    throw new HarnessConfigError('observationalMemory', 'must be a boolean or a config object');
+  }
+  const enabled = config.enabled !== false;
+  const scope = config.scope ?? 'thread';
+  if (scope !== 'thread' && scope !== 'resource') {
+    throw new HarnessConfigError('observationalMemory.scope', "must be 'thread' or 'resource'");
+  }
+  const sharedModel = config.model !== undefined ? assertOmModelId(config.model, 'observationalMemory.model') : undefined;
+  const observerModelId =
+    config.observation?.model !== undefined
+      ? assertOmModelId(config.observation.model, 'observationalMemory.observation.model')
+      : sharedModel;
+  const reflectorModelId =
+    config.reflection?.model !== undefined
+      ? assertOmModelId(config.reflection.model, 'observationalMemory.reflection.model')
+      : sharedModel;
+  const observationThreshold =
+    config.observation?.messageTokens !== undefined
+      ? assertOmThreshold(config.observation.messageTokens, 'observationalMemory.observation.messageTokens')
+      : undefined;
+  const reflectionThreshold =
+    config.reflection?.observationTokens !== undefined
+      ? assertOmThreshold(config.reflection.observationTokens, 'observationalMemory.reflection.observationTokens')
+      : undefined;
+  if (config.processorOptions !== undefined && (typeof config.processorOptions !== 'object' || config.processorOptions === null || Array.isArray(config.processorOptions))) {
+    throw new HarnessConfigError('observationalMemory.processorOptions', 'must be a JSON object');
+  }
+  return {
+    enabled,
+    scope,
+    ...(observerModelId !== undefined ? { observerModelId } : {}),
+    ...(reflectorModelId !== undefined ? { reflectorModelId } : {}),
+    ...(observationThreshold !== undefined ? { observationThreshold } : {}),
+    ...(reflectionThreshold !== undefined ? { reflectionThreshold } : {}),
+    ...(config.processorOptions !== undefined ? { processorOptions: config.processorOptions } : {}),
+  };
+}
+
+/** Project resolved OM defaults into the persisted per-session snapshot fields. */
+function observationalMemorySeedFromDefaults(
+  resolved: ResolvedObservationalMemory,
+): NonNullable<SessionRecord['observationalMemory']> {
+  return {
+    scope: resolved.scope,
+    ...(resolved.observerModelId !== undefined ? { observerModelId: resolved.observerModelId } : {}),
+    ...(resolved.reflectorModelId !== undefined ? { reflectorModelId: resolved.reflectorModelId } : {}),
+    ...(resolved.observationThreshold !== undefined ? { observationThreshold: resolved.observationThreshold } : {}),
+    ...(resolved.reflectionThreshold !== undefined ? { reflectionThreshold: resolved.reflectionThreshold } : {}),
+  };
+}
 const DEFAULT_CHANNEL_OUTBOX_CLAIM_TTL_MS = 30_000;
 const DEFAULT_CHANNEL_OUTBOX_BATCH_SIZE = 10;
 const DEFAULT_CHANNEL_OUTBOX_MAX_ATTEMPTS = 3;
@@ -779,6 +866,8 @@ export class Harness {
    *  that declares no per-tool/category rules — so an unconfigured harness keeps
    *  today's no-gate behavior (§4.2e enforcement is opt-in). */
   private readonly _defaultPermissionPolicyConfigured: boolean;
+  /** §9.2 — resolved, JSON-safe Observational Memory defaults for this harness. */
+  private readonly _observationalMemory: ResolvedObservationalMemory;
   private readonly _toolCategoryResolver?: (toolName: string) => ToolCategory | null;
   private readonly _modelCatalog: ReadonlyMap<string, ModelInfo>;
   private readonly _modelAuthStatusResolver?: (modelId: string) => ModelAuthStatus | Promise<ModelAuthStatus>;
@@ -959,6 +1048,7 @@ export class Harness {
     }
     this._defaultPermissionPolicy = config.defaultPermissionPolicy ?? DEFAULT_PERMISSION_POLICY;
     this._defaultPermissionPolicyConfigured = config.defaultPermissionPolicy !== undefined;
+    this._observationalMemory = resolveObservationalMemoryConfig(config.observationalMemory);
     // `toolCategoryResolver` is primary; `toolCategories` is sugar that
     // desugars to `(name) => toolCategories[name] ?? null`. When both are
     // provided the resolver wins (§9.1 sugar contract).
@@ -3267,6 +3357,12 @@ export class Harness {
     return this._defaultPermissionPolicyConfigured;
   }
 
+  /** @internal — resolved, JSON-safe OM defaults (§9.2). Session reads these as the
+   *  fallback behind per-session `SessionRecord.observationalMemory` overrides. */
+  _getObservationalMemoryDefaults(): ResolvedObservationalMemory {
+    return this._observationalMemory;
+  }
+
   /**
    * @internal — the base `permissionRules` a mode establishes when entered
    * (§4.2e). Returns a fresh copy when the mode declares `permissions`, or
@@ -3545,6 +3641,11 @@ export class Harness {
       permissionRules: this._modePermissionRules(modeId) ?? emptyPermissionRules(),
       permissionRulesSeedHash: sha256CanonicalJsonChecked(this._modePermissionRules(modeId) ?? emptyPermissionRules()),
       sessionGrants: emptySessionGrants(),
+      // §9.2 — seed the per-session OM config snapshot from the resolved harness
+      // defaults so it survives hydration and `session.om.*` reads/overrides it.
+      ...(this._observationalMemory.enabled
+        ? { observationalMemory: observationalMemorySeedFromDefaults(this._observationalMemory) }
+        : {}),
       tokenUsage: zeroTokenUsage(),
       pendingQueue: [],
       state: {},

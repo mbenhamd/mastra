@@ -1229,11 +1229,55 @@ export interface HarnessConfigCommon {
    */
   workspace?: HarnessWorkspaceConfig;
 
-  // Remaining fields (files, intervals, observationalMemory) land here as we
-  // wire them up.
+  /**
+   * §9.2 Observational Memory. JSON-safe resolved defaults for OM in this
+   * harness; per-session model overrides live on `SessionRecord.observationalMemory`
+   * and are surfaced via `session.om.*`. `true` enables OM with defaults, `false`
+   * (or omitted) disables it. Raw observation rows remain advisory MemoryStorage
+   * data outside the session lease/CAS boundary (§5.2).
+   */
+  observationalMemory?: ObservationalMemoryConfig;
+
+  // Remaining fields (files, intervals) land here as we wire them up.
 
   [key: string]: unknown;
 }
+
+/**
+ * §9.2 — JSON-safe Observational Memory configuration. A harness-local subset of
+ * the memory-package OM options: it carries only serializable resolved defaults +
+ * scope, never live model objects, storage handles, functions, or processor
+ * internals. `processorOptions` is an opaque adapter-owned bag (JSON only).
+ */
+export type ObservationalMemoryConfig =
+  | boolean
+  | {
+      /** `false` disables OM; omitted means enabled when the object form is present. */
+      enabled?: boolean;
+      /**
+       * Creation-time lookup scope for OM records. Defaults to `'thread'`.
+       * `'resource'` is an explicit privacy/authorization choice — snapshots may
+       * summarize other threads for the same authenticated resource. Existing
+       * sessions never change scope implicitly.
+       */
+      scope?: 'thread' | 'resource';
+      /** Default model id for BOTH observer and reflector. */
+      model?: string;
+      observation?: {
+        /** Observer model id (overrides `model`). */
+        model?: string;
+        /** Observation trigger threshold (message tokens). */
+        messageTokens?: number;
+      };
+      reflection?: {
+        /** Reflector model id (overrides `model`). */
+        model?: string;
+        /** Reflection trigger threshold (observation tokens). */
+        observationTokens?: number;
+      };
+      /** Opaque adapter-owned OM processor options (JSON-safe only). */
+      processorOptions?: Record<string, JsonValue>;
+    };
 
 /**
  * Discriminated union of workspace configurations (§2.7).

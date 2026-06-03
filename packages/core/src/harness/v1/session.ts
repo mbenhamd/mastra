@@ -8079,6 +8079,81 @@ export class Session {
     });
   }
 
+  // -------------------------------------------------------------------------
+  // Observational Memory — §4.2e / §9.2.
+  //
+  // OM is advisory memory context, not a recovery proof boundary. The config
+  // accessors below read the resolved per-session OM config (the persisted
+  // `SessionRecord.observationalMemory` snapshot, falling back to the harness
+  // defaults); the model switches are session-config writes that commit under
+  // the session lease via `_flushUpdate` and never touch raw MemoryStorage rows.
+  // The redacted snapshot read (`getRecord`/`loadProgress`, §4.8) is a separate
+  // follow-up slice.
+  // -------------------------------------------------------------------------
+
+  readonly om = Object.freeze({
+    getObserverModelId: (): string | null => this._omObserverModelId(),
+    getReflectorModelId: (): string | null => this._omReflectorModelId(),
+    getObservationThreshold: (): number => this._omObservationThreshold(),
+    getReflectionThreshold: (): number => this._omReflectionThreshold(),
+    switchObserverModel: (opts: { model: string }): Promise<void> => this._omSwitchObserverModel(opts),
+    switchReflectorModel: (opts: { model: string }): Promise<void> => this._omSwitchReflectorModel(opts),
+  });
+
+  private _omDefaults() {
+    return this._harness._getObservationalMemoryDefaults();
+  }
+
+  private _omObserverModelId(): string | null {
+    this._assertLive('om.getObserverModelId()');
+    return this._record.observationalMemory?.observerModelId ?? this._omDefaults().observerModelId ?? null;
+  }
+
+  private _omReflectorModelId(): string | null {
+    this._assertLive('om.getReflectorModelId()');
+    return this._record.observationalMemory?.reflectorModelId ?? this._omDefaults().reflectorModelId ?? null;
+  }
+
+  /** Effective observation trigger threshold. `0` means "use the memory adapter default". */
+  private _omObservationThreshold(): number {
+    this._assertLive('om.getObservationThreshold()');
+    return this._record.observationalMemory?.observationThreshold ?? this._omDefaults().observationThreshold ?? 0;
+  }
+
+  /** Effective reflection trigger threshold. `0` means "use the memory adapter default". */
+  private _omReflectionThreshold(): number {
+    this._assertLive('om.getReflectionThreshold()');
+    return this._record.observationalMemory?.reflectionThreshold ?? this._omDefaults().reflectionThreshold ?? 0;
+  }
+
+  private async _omSwitchObserverModel(opts: { model: string }): Promise<void> {
+    this._assertLive('om.switchObserverModel()');
+    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
+      throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
+    }
+    if (this._record.observationalMemory?.observerModelId === opts.model) return;
+    await this._omWriteConfig(prev => ({ ...prev, observerModelId: opts.model }));
+  }
+
+  private async _omSwitchReflectorModel(opts: { model: string }): Promise<void> {
+    this._assertLive('om.switchReflectorModel()');
+    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
+      throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
+    }
+    if (this._record.observationalMemory?.reflectorModelId === opts.model) return;
+    await this._omWriteConfig(prev => ({ ...prev, reflectorModelId: opts.model }));
+  }
+
+  /** Commit an OM config patch under the session lease (preserves scope/thresholds). */
+  private async _omWriteConfig(
+    patch: (prev: NonNullable<SessionRecord['observationalMemory']>) => NonNullable<SessionRecord['observationalMemory']>,
+  ): Promise<void> {
+    await this._flushUpdate(prev => {
+      const base = prev.observationalMemory ?? { scope: this._omDefaults().scope };
+      return { ...prev, observationalMemory: patch(base) };
+    });
+  }
+
   private async _resume(
     expectedKind: PendingResume['kind'],
     resumeData: unknown,

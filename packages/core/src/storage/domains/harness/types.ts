@@ -383,10 +383,17 @@ export interface SessionRecord {
   queueAdmissionReceipts?: Record<string, QueueAdmissionReceipt>;
   inboxResponseReceipts?: Record<string, InboxResponseReceipt>;
 
-  // Observational memory config (per-session override)
+  // Observational memory config — JSON-safe resolved defaults + per-session model
+  // overrides used to rebuild the OM wrapper after hydration (§5.1a). Never stores
+  // active observations, buffered chunks/reflections, history generations, raw
+  // config blobs, provider clients, functions, or processor locks — those remain
+  // advisory MemoryStorage rows outside the session lease/CAS boundary.
   observationalMemory?: {
+    scope?: 'thread' | 'resource';
     observerModelId?: string;
     reflectorModelId?: string;
+    observationThreshold?: number;
+    reflectionThreshold?: number;
   };
 
   // Active goal
