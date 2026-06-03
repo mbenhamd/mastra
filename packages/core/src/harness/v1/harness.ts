@@ -214,7 +214,8 @@ function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | un
   }
   assertOmStepObject(config.observation, 'observationalMemory.observation');
   assertOmStepObject(config.reflection, 'observationalMemory.reflection');
-  const sharedModel = config.model !== undefined ? assertOmModelId(config.model, 'observationalMemory.model') : undefined;
+  const sharedModel =
+    config.model !== undefined ? assertOmModelId(config.model, 'observationalMemory.model') : undefined;
   const observerModelId =
     config.observation?.model !== undefined
       ? assertOmModelId(config.observation.model, 'observationalMemory.observation.model')
@@ -232,7 +233,11 @@ function resolveObservationalMemoryConfig(config: ObservationalMemoryConfig | un
       ? assertOmThreshold(config.reflection.observationTokens, 'observationalMemory.reflection.observationTokens')
       : undefined;
   if (config.processorOptions !== undefined) {
-    if (typeof config.processorOptions !== 'object' || config.processorOptions === null || Array.isArray(config.processorOptions)) {
+    if (
+      typeof config.processorOptions !== 'object' ||
+      config.processorOptions === null ||
+      Array.isArray(config.processorOptions)
+    ) {
       throw new HarnessConfigError('observationalMemory.processorOptions', 'must be a JSON object');
     }
     // Recursively reject non-JSON-safe values (functions, symbols, cycles, …).
@@ -881,6 +886,8 @@ export class Harness {
   private readonly _fileConfig: Readonly<HarnessFileConfig>;
   private readonly _subagentTypes: ReadonlyMap<string, SubagentDefinition>;
   private readonly _subagentMaxDepth: number;
+  /** §SA3 — per-parent concurrent `spawn_subagent` cap; `undefined` = no limit. */
+  private readonly _subagentMaxConcurrent?: number;
   private readonly _goalDefaults: { defaultJudgeModel?: string; defaultMaxTurns: number };
   private readonly _defaultPermissionPolicy: PermissionPolicy;
   /** True when the operator explicitly set `defaultPermissionPolicy` (vs the
@@ -1029,6 +1036,16 @@ export class Harness {
       this._subagentMaxDepth = config.subagents.maxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH;
       if (this._subagentMaxDepth < 1) {
         throw new HarnessConfigError('subagents.maxDepth', 'must be a positive integer');
+      }
+      if (config.subagents.maxConcurrent !== undefined) {
+        if (
+          typeof config.subagents.maxConcurrent !== 'number' ||
+          !Number.isInteger(config.subagents.maxConcurrent) ||
+          config.subagents.maxConcurrent < 1
+        ) {
+          throw new HarnessConfigError('subagents.maxConcurrent', 'must be a positive integer');
+        }
+        this._subagentMaxConcurrent = config.subagents.maxConcurrent;
       }
     } else {
       this._subagentMaxDepth = DEFAULT_SUBAGENT_MAX_DEPTH;
@@ -1712,6 +1729,11 @@ export class Harness {
   /** @internal — Session enforces the subagent depth cap inside the spawn tool. */
   _getSubagentMaxDepth(): number {
     return this._subagentMaxDepth;
+  }
+
+  /** @internal — per-parent concurrent spawn_subagent cap (SA3); `undefined` = no limit. */
+  _getSubagentMaxConcurrent(): number | undefined {
+    return this._subagentMaxConcurrent;
   }
 
   /** @internal — Session reads the resolved mode for per-turn overlays. */

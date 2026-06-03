@@ -1043,6 +1043,10 @@ export class Session {
   private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /** §SA3 — count of `spawn_subagent` children currently in flight from this parent
+   *  (incremented at the spawn gate, decremented when the child settles). Used for
+   *  the `subagents.maxConcurrent` backpressure check; counts the create window too. */
+  _subagentSpawnInFlight = 0;
   /** TM-6 reconcile-on-rehydrate pending retry timers (cleared on close). */
   private readonly _delegationReconcileRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   /**

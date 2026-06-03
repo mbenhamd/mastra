@@ -1108,9 +1108,16 @@ export interface HarnessConfigCommon {
    * a session at depth equal to or greater than `maxDepth` returns a tool
    * error containing `HarnessSubagentDepthExceededError`. Default: `1`
    * (the top-level session can spawn one level of subagents).
+   *
+   * `maxConcurrent` caps how many `spawn_subagent` subagents a single parent
+   * session may run AT ONCE (backpressure). A spawn while that many are already
+   * in flight returns a tool error (`HarnessSubagentConcurrencyLimitError`)
+   * instead of unbounded child-session creation. Omitted ⇒ no per-parent limit
+   * (still bounded harness-wide by `sessions.maxLive`).
    */
   subagents?: {
     maxDepth?: number;
+    maxConcurrent?: number;
     types: Record<string, SubagentDefinition>;
   };
 

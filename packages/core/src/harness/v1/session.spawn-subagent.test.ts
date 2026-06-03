@@ -77,7 +77,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup(opts?: { maxDepth?: number; chunks?: any[] }) {
+function setup(opts?: { maxDepth?: number; maxConcurrent?: number; chunks?: any[] }) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent');
   if (opts?.chunks) childAgent.chunks = opts.chunks;
@@ -92,6 +92,7 @@ function setup(opts?: { maxDepth?: number; chunks?: any[] }) {
     sessions: { storage },
     subagents: {
       maxDepth: opts?.maxDepth ?? 2,
+      ...(opts?.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
       types: {
         explore: {
           agentId: 'child-agent',
@@ -303,5 +304,44 @@ describe('subagent type validation (§9)', () => {
           },
         }),
     ).toThrow(/conflicts with mode/);
+  });
+});
+
+describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
+  it('rejects a spawn once maxConcurrent in-flight is reached, then allows after one frees', async () => {
+    const { harness } = setup({ maxConcurrent: 1 });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      // One spawn already in flight (the create→run window the counter reserves).
+      (parent as any)._subagentSpawnInFlight = 1;
+      const rejected = (await tool.execute!({ agentType: 'explore', task: 'x' } as any, execCtx('tc-2'))) as any;
+      expect(rejected.isError).toBe(true);
+      expect(rejected.errorName).toBe('HarnessSubagentConcurrencyLimitError');
+      expect(rejected.maxConcurrent).toBe(1);
+      expect(rejected.subagentSessionId).toBe('');
+
+      // Free the slot → a spawn proceeds (child runs to completion) and releases.
+      (parent as any)._subagentSpawnInFlight = 0;
+      const ok = (await tool.execute!({ agentType: 'explore', task: 'y' } as any, execCtx('tc-3'))) as any;
+      expect(ok.isError).toBeFalsy();
+      expect(typeof ok.subagentSessionId).toBe('string');
+      expect((parent as any)._subagentSpawnInFlight).toBe(0); // reservation released in finally
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does not gate spawns when maxConcurrent is unset (no per-parent limit)', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      (parent as any)._subagentSpawnInFlight = 99; // would exceed any limit
+      const ok = (await tool.execute!({ agentType: 'explore', task: 'z' } as any, execCtx('tc-4'))) as any;
+      expect(ok.isError).toBeFalsy();
+    } finally {
+      await harness.shutdown();
+    }
   });
 });
