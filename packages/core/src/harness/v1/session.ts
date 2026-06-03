@@ -36,6 +36,7 @@ import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import type { AgentSignalContents } from '../../agent/signals';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
+import type { ObservationalMemoryOptions } from '../../memory/types';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
 import {
@@ -76,8 +77,8 @@ import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
-import { buildActivityTimeline  } from './activity-timeline';
-import type {ActivityTimelineSessionInput} from './activity-timeline';
+import { buildActivityTimeline } from './activity-timeline';
+import type { ActivityTimelineSessionInput } from './activity-timeline';
 import {
   assertJsonValue,
   canonicalJson,
@@ -4745,7 +4746,7 @@ export class Session {
     assertOwnedMessageTurnNotDeleted();
 
     const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-      memory: { thread: this.threadId, resource: this.resourceId },
+      memory: this._memoryRunOption(),
       abortSignal: turnAbortSignal,
       requestContext,
       ...(toolsets ? { toolsets } : {}),
@@ -6049,7 +6050,7 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-          memory: { thread: this.threadId, resource: this.resourceId },
+          memory: this._memoryRunOption(),
           abortSignal: turnAbortSignal,
           requestContext,
           ...(toolsets ? { toolsets } : {}),
@@ -6365,7 +6366,7 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-          memory: { thread: this.threadId, resource: this.resourceId },
+          memory: this._memoryRunOption(),
           abortSignal: turnAbortSignal,
           requestContext,
           ...(toolsets ? { toolsets } : {}),
@@ -8146,12 +8147,67 @@ export class Session {
 
   /** Commit an OM config patch under the session lease (preserves scope/thresholds). */
   private async _omWriteConfig(
-    patch: (prev: NonNullable<SessionRecord['observationalMemory']>) => NonNullable<SessionRecord['observationalMemory']>,
+    patch: (
+      prev: NonNullable<SessionRecord['observationalMemory']>,
+    ) => NonNullable<SessionRecord['observationalMemory']>,
   ): Promise<void> {
     await this._flushUpdate(prev => {
       const base = prev.observationalMemory ?? { scope: this._omDefaults().scope };
       return { ...prev, observationalMemory: patch(base) };
     });
+  }
+
+  /**
+   * §9.2 — the effective OM option to thread into a turn's `memory.options`, built
+   * from the per-session snapshot (record) over the resolved harness defaults.
+   * Returns `undefined` when OM is disabled (so turns keep today's no-OM behavior).
+   * Only emits `observation`/`reflection` (never a top-level `model`) — the memory
+   * package forbids combining the shared `model` with per-step models. Threshold
+   * `undefined` lets the memory adapter apply its own default. `processorOptions`
+   * is NOT threaded here yet (opaque adapter-owned; tracked as a follow-up).
+   */
+  private _observationalMemoryRunOption(): boolean | ObservationalMemoryOptions | undefined {
+    const defaults = this._harness._getObservationalMemoryDefaults();
+    if (!defaults.enabled) return undefined;
+    const rec = this._record.observationalMemory;
+    const scope = rec?.scope ?? defaults.scope;
+    const observerModelId = rec?.observerModelId ?? defaults.observerModelId;
+    const reflectorModelId = rec?.reflectorModelId ?? defaults.reflectorModelId;
+    const observationThreshold = rec?.observationThreshold ?? defaults.observationThreshold;
+    const reflectionThreshold = rec?.reflectionThreshold ?? defaults.reflectionThreshold;
+    const observation =
+      observerModelId !== undefined || observationThreshold !== undefined
+        ? {
+            ...(observerModelId !== undefined ? { model: observerModelId } : {}),
+            ...(observationThreshold !== undefined ? { messageTokens: observationThreshold } : {}),
+          }
+        : undefined;
+    const reflection =
+      reflectorModelId !== undefined || reflectionThreshold !== undefined
+        ? {
+            ...(reflectorModelId !== undefined ? { model: reflectorModelId } : {}),
+            ...(reflectionThreshold !== undefined ? { observationTokens: reflectionThreshold } : {}),
+          }
+        : undefined;
+    return {
+      scope,
+      ...(observation ? { observation } : {}),
+      ...(reflection ? { reflection } : {}),
+    };
+  }
+
+  /** Per-turn `memory` option, adding `options.observationalMemory` when OM is enabled. */
+  private _memoryRunOption(): {
+    thread: string;
+    resource: string;
+    options?: { observationalMemory: boolean | ObservationalMemoryOptions };
+  } {
+    const om = this._observationalMemoryRunOption();
+    return {
+      thread: this.threadId,
+      resource: this.resourceId,
+      ...(om !== undefined ? { options: { observationalMemory: om } } : {}),
+    };
   }
 
   private async _resume(
@@ -10508,7 +10564,7 @@ export class Session {
       ]);
       assertQueuedTurnNotDeleted();
       const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-        memory: { thread: this.threadId, resource: this.resourceId },
+        memory: this._memoryRunOption(),
         abortSignal: turnAbortController.signal,
         requestContext,
         ...(toolsets ? { toolsets } : {}),

@@ -118,3 +118,59 @@ describe('session.om — config resolution + accessors (§9.2)', () => {
     expect(() => setupHarness({ observationalMemory: { observation: { model: '' } } })).toThrow(/model/);
   });
 });
+
+describe('session.om — per-turn enablement (§9.2)', () => {
+  it('threads memory.options.observationalMemory into a turn when OM is enabled', async () => {
+    const { harness, agent } = setupHarness({
+      observationalMemory: {
+        scope: 'resource',
+        observation: { model: 'anthropic/claude-haiku-4-5', messageTokens: 20_000 },
+        reflection: { observationTokens: 80_000 },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.message({ content: 'hi' });
+      const memory = (agent.streamCalls.at(-1)!.options as any).memory;
+      expect(memory.thread).toBe(session.threadId);
+      expect(memory.resource).toBe('u1');
+      const om = memory.options?.observationalMemory;
+      expect(om).toBeDefined();
+      expect(om.scope).toBe('resource');
+      expect(om.observation.model).toBe('anthropic/claude-haiku-4-5');
+      expect(om.observation.messageTokens).toBe(20_000);
+      expect(om.reflection.observationTokens).toBe(80_000);
+      // No top-level `model` (would conflict with per-step models).
+      expect(om.model).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does NOT set memory.options when OM is disabled (no behavior change)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.message({ content: 'hi' });
+      const memory = (agent.streamCalls.at(-1)!.options as any).memory;
+      expect(memory.thread).toBe(session.threadId);
+      expect(memory.options).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a session-level switchObserverModel is reflected in the next turn option', async () => {
+    const { harness, agent } = setupHarness({ observationalMemory: { observation: { messageTokens: 10_000 } } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.om.switchObserverModel({ model: 'openai/gpt-4o-mini' });
+      await session.message({ content: 'hi' });
+      const om = (agent.streamCalls.at(-1)!.options as any).memory.options.observationalMemory;
+      expect(om.observation.model).toBe('openai/gpt-4o-mini');
+      expect(om.observation.messageTokens).toBe(10_000);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
