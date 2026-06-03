@@ -529,6 +529,96 @@ export interface HarnessRunOperationalState {
   error?: { code: HarnessRowErrorCode; message: string };
 }
 
+// ---------------------------------------------------------------------------
+// Span-summary (S3/S4/O1/O2/O6) — durable per-run history.
+//
+// One row per COMPLETED run, written once (first terminal wins) at the run's
+// non-suspended terminal. This is analytics HISTORY — distinct from the
+// single-run, fail-closed `HarnessRunOperationalState` recovery lane and never
+// overwritten in place. Token usage is stored RAW; cost is a consumer concern
+// (Doxa prices usage + modelId). PII-light: NO tool inputs/outputs are stored,
+// only counts/durations.
+// ---------------------------------------------------------------------------
+
+/** Terminal disposition of a run in the durable summary. */
+export type HarnessRunSummaryStatus = 'completed' | 'failed' | 'interrupted';
+
+/** Compact per-run tool aggregate stored on a run summary (bounded by distinct tool names; no per-call payloads). */
+export interface HarnessRunSummaryToolRollup {
+  count: number;
+  errors: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+  perTool: Record<string, { count: number; errors: number; totalDurationMs: number }>;
+}
+
+/** Durable summary of one completed run (span-summary O1/O2). */
+export interface HarnessRunSummary {
+  harnessName: string;
+  runId: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  /** The driving operation's kind, when known (signal/queue/sync-generate/use-skill/inbox-response). */
+  operationKind?: HarnessRunOperationRef['kind'];
+  status: HarnessRunSummaryStatus;
+  finishReason: string;
+  /**
+   * `true` when the run's start was lost to a process restart: `startedAt`,
+   * `durationMs`, and `toolRollup` are then absent (not falsely precise), while
+   * usage + identity + finishReason are still recorded.
+   */
+  reconstructed: boolean;
+  startedAt?: number;
+  completedAt: number;
+  durationMs?: number;
+  usage: TokenUsage;
+  toolRollup?: HarnessRunSummaryToolRollup;
+  /** When the summary was finalized (the run's terminal time; set by the writer, equals `completedAt`). */
+  createdAt: number;
+}
+
+/** Save one run summary (span-summary). Idempotent: the FIRST terminal for a runId wins; later writes are no-ops. */
+export interface SaveRunSummaryInput {
+  summary: HarnessRunSummary;
+}
+
+export interface LoadRunSummaryInput {
+  harnessName?: string;
+  runId: string;
+}
+
+/**
+ * List a session's completed-run summaries, newest first, ordered by
+ * `(completedAt DESC, runId DESC)`. The keyset cursor is COMPOSITE
+ * (`beforeCompletedAt` + `beforeRunId`) so rows that share a `completedAt`
+ * across a page boundary are neither skipped nor duplicated. Pass BOTH cursor
+ * fields from the previous result's `next*` to fetch the next page.
+ */
+export interface ListRunSummariesInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId?: string;
+  limit?: number;
+  /** Composite keyset cursor (completedAt component). Pair with `beforeRunId`. */
+  beforeCompletedAt?: number;
+  /** Composite keyset cursor (runId tiebreaker for rows sharing `beforeCompletedAt`). */
+  beforeRunId?: string;
+}
+
+export interface ListRunSummariesResult {
+  summaries: HarnessRunSummary[];
+  /** Present when more rows may exist; pass with `nextBeforeRunId` as the next call's cursor. */
+  nextBeforeCompletedAt?: number;
+  /** Composite cursor tiebreaker for the next page. */
+  nextBeforeRunId?: string;
+}
+
 /**
  * Lightweight projection of `SessionRecord`, used by `listSessions(...)`.
  */

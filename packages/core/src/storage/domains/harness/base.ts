@@ -28,6 +28,11 @@ import type {
   LoadPlanTaskSubtreeInput,
   LoadPlanTaskSubtreeResult,
   PlanTaskCountSummary,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
   MutatePlanTasksForSessionInput,
   UpdatePlanTaskInput,
   UpdatePlanTaskResult,
@@ -323,6 +328,14 @@ export class HarnessStoragePlanTaskUnsupportedError extends HarnessStorageDomain
   readonly code = 'harness.storage.plan_task_unsupported' as const;
   constructor() {
     super('HarnessStorage plan tasks must be implemented by this storage adapter');
+  }
+}
+
+export class HarnessStorageRunSummaryUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageRunSummaryUnsupportedError';
+  readonly code = 'harness.storage.run_summary_unsupported' as const;
+  constructor() {
+    super('HarnessStorage run summaries must be implemented by this storage adapter');
   }
 }
 
@@ -1339,6 +1352,37 @@ export abstract class HarnessStorage extends StorageDomain {
    */
   async countPlanTasksByStatus(_opts: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
     throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2). Durable per-run HISTORY — one row per
+  // completed run, written once (first terminal wins). Distinct from the
+  // single-run `HarnessRunOperationalState` recovery lane. Read-only listing
+  // does not require the lease.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Write one run summary. IDEMPOTENT: the first terminal for a `runId` wins;
+   * a later write for the same `(harnessName, runId)` is a no-op (so duplicate
+   * terminal paths and cross-instance retries cannot clobber or duplicate the
+   * row). Returns the stored summary (the existing one on a no-op).
+   */
+  async saveRunSummary(_opts: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
+  }
+
+  /** Load one run summary by `runId`, or `null` when absent. Read-only. */
+  async loadRunSummary(_opts: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
+  }
+
+  /**
+   * List a session's completed-run summaries, newest first (by `completedAt`,
+   * ties broken by `runId`), keyset-paginated via `beforeCompletedAt`.
+   * Read-only.
+   */
+  async listRunSummaries(_opts: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
   }
 
   // -------------------------------------------------------------------------

@@ -62,6 +62,11 @@ import type {
   CreateOrLoadActiveSessionResult,
   CountPlanTasksByStatusInput,
   CreatePlanTaskInput,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
   DeletePlanTaskSubtreeInput,
   DeletePlanTaskSubtreeResult,
   HarnessPlanTask,
@@ -2993,6 +2998,66 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2)
+  // -------------------------------------------------------------------------
+
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    const namespace = resolveHarnessName(summary.harnessName, this.harnessName);
+    const key = `${namespace}::${summary.runId}`;
+    const existing = this.db.harnessRunSummaries.get(key);
+    // Idempotent: first terminal wins; a later write is a no-op.
+    if (existing) return cloneJson(existing);
+    const stored: HarnessRunSummary = cloneJson({ ...summary, harnessName: namespace });
+    this.db.harnessRunSummaries.set(key, stored);
+    return cloneJson(stored);
+  }
+
+  async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const found = this.db.harnessRunSummaries.get(`${namespace}::${runId}`);
+    return found ? cloneJson(found) : null;
+  }
+
+  async listRunSummaries({
+    harnessName,
+    sessionId,
+    resourceId,
+    limit,
+    beforeCompletedAt,
+    beforeRunId,
+  }: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    // Composite keyset: a row is "before" the cursor when its completedAt is
+    // strictly less, OR equal with a strictly-lesser runId (matches the
+    // (completedAt DESC, runId DESC) order) — so same-timestamp rows at a page
+    // boundary are neither skipped nor duplicated.
+    const beforeCursor = (s: HarnessRunSummary): boolean => {
+      if (beforeCompletedAt === undefined) return true;
+      if (s.completedAt < beforeCompletedAt) return true;
+      if (s.completedAt === beforeCompletedAt && beforeRunId !== undefined) return s.runId < beforeRunId;
+      return false;
+    };
+    const rows = [...this.db.harnessRunSummaries.values()].filter(
+      s =>
+        s.harnessName === namespace &&
+        s.sessionId === sessionId &&
+        (resourceId === undefined || s.resourceId === resourceId) &&
+        beforeCursor(s),
+    );
+    // Newest first; ties broken by runId descending for a stable keyset order.
+    rows.sort((a, b) => (b.completedAt - a.completedAt) || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0));
+    const cap = limit ?? 50;
+    const page = rows.slice(0, cap);
+    const result: ListRunSummariesResult = { summaries: page.map(cloneJson) };
+    if (rows.length > cap) {
+      const last = page[page.length - 1]!;
+      result.nextBeforeCompletedAt = last.completedAt;
+      result.nextBeforeRunId = last.runId;
+    }
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
   // Test-only
   // -------------------------------------------------------------------------
 
@@ -3012,6 +3077,7 @@ export class InMemoryHarness extends HarnessStorage {
     this.db.harnessChannelOutbox.clear();
     this.db.harnessWakeupItems.clear();
     this.db.harnessPlanTasks.clear();
+    this.db.harnessRunSummaries.clear();
     this.db.harnessThreadDeleteFences.clear();
   }
 }

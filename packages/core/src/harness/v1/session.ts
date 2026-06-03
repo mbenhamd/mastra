@@ -50,6 +50,7 @@ import type {
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
   HarnessPlanTask,
+  HarnessRunSummary,
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   HarnessRuntimeDependencyRefs,
@@ -1094,6 +1095,8 @@ export class Session {
   private readonly _openRuns = new Map<string, OpenRunSpan>();
   /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
   private readonly _finalizedRunIds = new Set<string>();
+  /** Span-summary — tail promise serializing best-effort durable run-summary writes (Slice B). */
+  private _runSummaryPersistence: Promise<void> = Promise.resolve();
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
   private readonly _turnAbortSignalCleanups = new WeakMap<AbortController, () => void>();
   private readonly _operationEvidenceSignalIds = new Set<string>();
@@ -1721,13 +1724,53 @@ export class Session {
     };
   }
 
-  /** Span-summary Slice B hook — persist the durable run summary. No-op until the storage adapters land. */
+  /**
+   * Span-summary Slice B — persist the durable run summary (one row per run,
+   * idempotent first-terminal-wins). Best-effort and OFF the turn's critical
+   * path: a failed write logs once and never throws (the `run_completed` event
+   * itself is already emitted + persisted in the event log, so the summary table
+   * is a secondary projection). Writes are chained on a tail so tests can flush.
+   */
   private _persistRunSummary(
-    _event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>,
-    _status: RunCompletedStatus,
-    _reconstructed: boolean,
+    event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>,
+    status: RunCompletedStatus,
+    reconstructed: boolean,
   ): void {
-    // Wired in Slice B.
+    const summary: HarnessRunSummary = {
+      harnessName: this._record.harnessName,
+      runId: event.runId,
+      sessionId: this.id,
+      resourceId: event.resourceId,
+      threadId: event.threadId,
+      agentId: event.agentId,
+      modeId: event.modeId,
+      modelId: event.modelId,
+      status,
+      finishReason: event.finishReason,
+      reconstructed,
+      completedAt: event.completedAt,
+      usage: event.usage,
+      createdAt: event.completedAt,
+      ...(event.parentSessionId !== undefined ? { parentSessionId: event.parentSessionId } : {}),
+      ...(event.traceId !== undefined ? { traceId: event.traceId } : {}),
+      ...(event.operationKind !== undefined ? { operationKind: event.operationKind } : {}),
+      ...(event.startedAt !== undefined ? { startedAt: event.startedAt } : {}),
+      ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+      ...(event.toolRollup !== undefined ? { toolRollup: event.toolRollup } : {}),
+    };
+    this._runSummaryPersistence = this._runSummaryPersistence
+      .then(() => this._storage.saveRunSummary({ summary }))
+      .then(
+        () => undefined,
+        err => {
+          console.error('[harness/v1] run summary persistence failed:', err);
+        },
+      );
+  }
+
+  /** @internal — await all in-flight run-summary writes (tests). */
+  async _internalFlushRunSummaries(): Promise<void> {
+    await this._runSummaryPersistence;
   }
 
   /**

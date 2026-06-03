@@ -84,7 +84,7 @@ function setup() {
     defaultModeId: 'default',
     sessions: { storage },
   });
-  return { harness, agent };
+  return { harness, agent, storage };
 }
 
 const USAGE = { promptTokens: 1, completionTokens: 2, totalTokens: 3 };
@@ -211,5 +211,121 @@ describe('span-summary — run_completed event (Slice A)', () => {
     expect(rc.usage).toEqual(USAGE);
     expect(rc.resourceId).toBe('u1');
     expect(rc.agentId).toBe('default');
+  });
+});
+
+describe('span-summary — durable run history (Slice B)', () => {
+  it('persists a completed run summary readable via loadRunSummary + listRunSummaries', async () => {
+    const { harness, agent, storage } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'lookup', args: { q: 'x' } } },
+      { type: 'tool-result', payload: { toolCallId: 'tc1', result: { ok: true } } },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const completed: RunCompletedEvent[] = [];
+    session.subscribe(e => {
+      if (e.type === 'run_completed') completed.push(e as RunCompletedEvent);
+    });
+
+    await session.message({ content: 'hi' });
+    await (session as any)._internalFlushRunSummaries();
+
+    const runId = completed[0]!.runId;
+    const row = await storage.loadRunSummary({ runId });
+    expect(row).not.toBeNull();
+    expect(row!.runId).toBe(runId);
+    expect(row!.sessionId).toBe(session.id);
+    expect(row!.status).toBe('completed');
+    expect(row!.reconstructed).toBe(false);
+    expect(typeof row!.startedAt).toBe('number');
+    expect(typeof row!.durationMs).toBe('number');
+    expect(row!.toolRollup?.count).toBe(1);
+    expect(row!.agentId).toBe('default');
+
+    const listed = await storage.listRunSummaries({ sessionId: session.id });
+    expect(listed.summaries.map(s => s.runId)).toContain(runId);
+  });
+
+  it('persists a reconstructed run with null start/duration/rollup but real usage + identity', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    (session as any)._emitTurnEvent({ type: 'agent_end', runId: 'r-recon', finishReason: 'error', usage: USAGE });
+    await (session as any)._internalFlushRunSummaries();
+
+    const row = await storage.loadRunSummary({ runId: 'r-recon' });
+    expect(row).not.toBeNull();
+    expect(row!.reconstructed).toBe(true);
+    expect(row!.status).toBe('failed');
+    expect(row!.startedAt).toBeUndefined();
+    expect(row!.durationMs).toBeUndefined();
+    expect(row!.toolRollup).toBeUndefined();
+    expect(row!.usage).toEqual(USAGE);
+    expect(row!.sessionId).toBe(session.id);
+  });
+
+  it('is idempotent — a duplicate terminal does not overwrite the first summary', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Direct storage idempotency: first write wins.
+    const base = {
+      harnessName: 'default',
+      runId: 'r-idem',
+      sessionId: session.id,
+      resourceId: 'u1',
+      threadId: session.threadId,
+      agentId: 'default',
+      modeId: 'default',
+      modelId: '',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      completedAt: 100,
+      usage: USAGE,
+      createdAt: 100,
+    };
+    const first = await storage.saveRunSummary({ summary: { ...base, durationMs: 5 } });
+    const second = await storage.saveRunSummary({ summary: { ...base, durationMs: 999, status: 'failed' } });
+    expect(first.durationMs).toBe(5);
+    expect(second.durationMs).toBe(5);
+    expect(second.status).toBe('completed');
+  });
+
+  it('composite keyset paging returns same-completedAt rows without skipping (InMemory)', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const mk = (runId: string, completedAt: number) => ({
+      harnessName: 'default',
+      runId,
+      sessionId: session.id,
+      resourceId: 'u1',
+      threadId: session.threadId,
+      agentId: 'default',
+      modeId: 'default',
+      modelId: '',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      completedAt,
+      usage: USAGE,
+      createdAt: completedAt,
+    });
+    // Two rows share completedAt=200.
+    for (const s of [mk('a', 300), mk('b', 200), mk('c', 200), mk('d', 100)]) {
+      await storage.saveRunSummary({ summary: s });
+    }
+    const seen: string[] = [];
+    let cursorC: number | undefined;
+    let cursorR: string | undefined;
+    for (let i = 0; i < 10; i++) {
+      const p = await storage.listRunSummaries({ sessionId: session.id, limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      seen.push(...p.summaries.map(s => s.runId));
+      if (p.nextBeforeCompletedAt === undefined) break;
+      cursorC = p.nextBeforeCompletedAt;
+      cursorR = p.nextBeforeRunId;
+    }
+    // (completedAt DESC, runId DESC): a(300), c(200), b(200), d(100).
+    expect(seen).toEqual(['a', 'c', 'b', 'd']);
   });
 });

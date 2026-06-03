@@ -62,6 +62,7 @@ export const TABLE_HARNESS_CHANNEL_OUTBOX = 'mastra_harness_channel_outbox';
 export const TABLE_HARNESS_WAKEUPS = 'mastra_harness_wakeups';
 export const TABLE_HARNESS_WORKSPACE_ACTIONS = 'mastra_harness_workspace_actions';
 export const TABLE_HARNESS_PLAN_TASKS = 'mastra_harness_plan_tasks';
+export const TABLE_HARNESS_RUN_SUMMARIES = 'mastra_harness_run_summaries';
 
 /** Union of all core table name constants. */
 export type TABLE_NAMES =
@@ -113,7 +114,8 @@ export type TABLE_NAMES =
   | typeof TABLE_HARNESS_CHANNEL_OUTBOX
   | typeof TABLE_HARNESS_WAKEUPS
   | typeof TABLE_HARNESS_WORKSPACE_ACTIONS
-  | typeof TABLE_HARNESS_PLAN_TASKS;
+  | typeof TABLE_HARNESS_PLAN_TASKS
+  | typeof TABLE_HARNESS_RUN_SUMMARIES;
 
 export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
@@ -1059,6 +1061,28 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     completed_at: { type: 'bigint', nullable: true },
     version: { type: 'integer', nullable: false },
   },
+  [TABLE_HARNESS_RUN_SUMMARIES]: {
+    harness_name: { type: 'text', nullable: false },
+    run_id: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    parent_session_id: { type: 'text', nullable: true },
+    agent_id: { type: 'text', nullable: false },
+    mode_id: { type: 'text', nullable: false },
+    model_id: { type: 'text', nullable: false },
+    trace_id: { type: 'text', nullable: true },
+    operation_kind: { type: 'text', nullable: true },
+    status: { type: 'text', nullable: false },
+    finish_reason: { type: 'text', nullable: false },
+    reconstructed: { type: 'boolean', nullable: false },
+    started_at: { type: 'bigint', nullable: true },
+    completed_at: { type: 'bigint', nullable: false },
+    duration_ms: { type: 'bigint', nullable: true },
+    usage: { type: 'jsonb', nullable: false },
+    tool_rollup: { type: 'jsonb', nullable: true },
+    created_at: { type: 'bigint', nullable: false },
+  },
 };
 
 /**
@@ -1088,6 +1112,10 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
   [TABLE_HARNESS_SESSION_EVENTS]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_SESSION_EVENTS],
     compositePrimaryKey: ['harness_name', 'session_id', 'epoch', 'sequence'],
+  },
+  [TABLE_HARNESS_RUN_SUMMARIES]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_RUN_SUMMARIES],
+    compositePrimaryKey: ['harness_name', 'run_id'],
   },
   [TABLE_HARNESS_THREAD_DELETE_FENCES]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_THREAD_DELETE_FENCES],

@@ -683,6 +683,71 @@ describe('HarnessPG', () => {
     expect(topLevel?.subagentTypeId).toBeUndefined();
   });
 
+  it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
+    const harness = store.stores.harness!;
+    const mk = (runId: string, completedAt: number, over: Record<string, unknown> = {}) => ({
+      harnessName: 'default',
+      runId,
+      sessionId: 'session-rs',
+      resourceId: 'u1',
+      threadId: 'thread-rs',
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      startedAt: completedAt - 10,
+      completedAt,
+      durationMs: 10,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      toolRollup: { count: 1, errors: 0, totalDurationMs: 4, maxDurationMs: 4, perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } } },
+      createdAt: completedAt,
+      ...over,
+    });
+
+    const saved = await harness.saveRunSummary({ summary: mk('rs-1', 100) as any });
+    expect(saved.durationMs).toBe(10);
+    // Idempotent: a later write for the same runId is a no-op.
+    const again = await harness.saveRunSummary({ summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any });
+    expect(again.durationMs).toBe(10);
+    expect(again.status).toBe('completed');
+
+    const loaded = await harness.loadRunSummary({ runId: 'rs-1' });
+    expect(loaded?.toolRollup?.perTool.lookup?.count).toBe(1);
+    expect(loaded?.usage.totalTokens).toBe(3);
+
+    await harness.saveRunSummary({ summary: mk('rs-2', 200) as any });
+    await harness.saveRunSummary({ summary: mk('rs-3', 300) as any });
+    // Newest-first; composite keyset paging.
+    const page1 = await harness.listRunSummaries({ sessionId: 'session-rs', limit: 2 });
+    expect(page1.summaries.map(s => s.runId)).toEqual(['rs-3', 'rs-2']);
+    expect(page1.nextBeforeCompletedAt).toBe(200);
+    const page2 = await harness.listRunSummaries({
+      sessionId: 'session-rs',
+      limit: 2,
+      beforeCompletedAt: page1.nextBeforeCompletedAt,
+      beforeRunId: page1.nextBeforeRunId,
+    });
+    expect(page2.summaries.map(s => s.runId)).toEqual(['rs-1']);
+    expect(page2.nextBeforeCompletedAt).toBeUndefined();
+
+    // Tie boundary: two rows share completedAt=200 — paging with limit 1 must
+    // return BOTH (no skip) thanks to the composite (completedAt, runId) cursor.
+    await harness.saveRunSummary({ summary: mk('rs-2b', 200) as any });
+    const seen: string[] = [];
+    let cursorC: number | undefined;
+    let cursorR: string | undefined;
+    for (let i = 0; i < 10; i++) {
+      const p = await harness.listRunSummaries({ sessionId: 'session-rs', limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      seen.push(...p.summaries.map(s => s.runId));
+      if (p.nextBeforeCompletedAt === undefined) break;
+      cursorC = p.nextBeforeCompletedAt;
+      cursorR = p.nextBeforeRunId;
+    }
+    expect(seen).toEqual(['rs-3', 'rs-2b', 'rs-2', 'rs-1']);
+  });
+
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();

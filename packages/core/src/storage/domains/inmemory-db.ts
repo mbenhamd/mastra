@@ -31,6 +31,7 @@ import type {
   ChannelInboxItem,
   ChannelOutboxItem,
   HarnessPlanTask,
+  HarnessRunSummary,
   HarnessProviderCallbackBinding,
   HarnessWakeupItem,
   HarnessSessionEventRecord,
@@ -133,6 +134,8 @@ export class InMemoryDB {
   readonly harnessChannelOutbox = new Map<string, ChannelOutboxItem>();
   readonly harnessWakeupItems = new Map<string, HarnessWakeupItem>();
   readonly harnessPlanTasks = new Map<string, HarnessPlanTask>();
+  /** Span-summary durable run history, keyed by `${harnessName}::${runId}`. */
+  readonly harnessRunSummaries = new Map<string, HarnessRunSummary>();
   readonly harnessThreadDeleteFences = new Map<
     string,
     { threadId: string; ownerId: string; leaseId: string; createdAt: number; expiresAt: number }
@@ -200,6 +203,7 @@ export class InMemoryDB {
     this.harnessChannelOutbox.clear();
     this.harnessWakeupItems.clear();
     this.harnessPlanTasks.clear();
+    this.harnessRunSummaries.clear();
     this.harnessThreadDeleteFences.clear();
   }
 }

@@ -35,6 +35,7 @@ import {
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
   TABLE_HARNESS_PLAN_TASKS,
+  TABLE_HARNESS_RUN_SUMMARIES,
   TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_SESSIONS,
@@ -75,6 +76,11 @@ import type {
   DeletePlanTaskSubtreeResult,
   HarnessPlanTask,
   HarnessPlanTaskStatus,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
   ListPlanTasksInput,
   ListPlanTasksResult,
   LoadPlanTaskSubtreeInput,
@@ -149,6 +155,7 @@ const HARNESS_TABLE_NAMES = [
   TABLE_HARNESS_WAKEUPS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_HARNESS_PLAN_TASKS,
+  TABLE_HARNESS_RUN_SUMMARIES,
 ] as const;
 
 class PgHarnessClient {
@@ -539,6 +546,7 @@ export class HarnessPG extends HarnessStorage {
   #sessionEventsReady: Promise<void> | undefined;
   #workspaceActionsReady: Promise<void> | undefined;
   #planTasksReady: Promise<void> | undefined;
+  #runSummariesReady: Promise<void> | undefined;
   #compactionLocks = new Map<string, Promise<void>>();
   #channelBindingIndexesReady: Promise<void> | undefined;
   #providerCallbackBindingIndexesReady: Promise<void> | undefined;
@@ -565,6 +573,7 @@ export class HarnessPG extends HarnessStorage {
     TABLE_HARNESS_WAKEUPS,
     TABLE_HARNESS_WORKSPACE_ACTIONS,
     TABLE_HARNESS_PLAN_TASKS,
+    TABLE_HARNESS_RUN_SUMMARIES,
   ] as const;
 
   constructor(config: PgDomainConfig & { harnessName?: string }) {
@@ -646,6 +655,7 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
     await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     await this.#db.alterTable({
       tableName: TABLE_HARNESS_SESSIONS,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_SESSIONS],
@@ -728,7 +738,9 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
     await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     this.#localThreadDeleteFences.clear();
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_RUN_SUMMARIES}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENT_REFERENCES}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENTS}`);
@@ -2569,6 +2581,86 @@ export class HarnessPG extends HarnessStorage {
     }
     const rootCount = Number((rootsResult.rows[0] as { n: unknown } | undefined)?.n ?? 0);
     return { total, byStatus, rootCount };
+  }
+
+  // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2)
+  // -------------------------------------------------------------------------
+
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(summary.harnessName);
+    const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
+    const cols = runSummaryColumnValues(stored);
+    // First-terminal-wins idempotency: a later write for the same (harness, run)
+    // is a no-op.
+    await this.#client.execute({
+      sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
+            VALUES (${cols.names.map(() => '?').join(', ')})
+            ON CONFLICT (harness_name, run_id) DO NOTHING`,
+      args: cols.values,
+    });
+    // Return the authoritative stored row (the existing one on a no-op).
+    const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });
+    return existing ?? stored;
+  }
+
+  async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const res = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES} WHERE harness_name = ? AND run_id = ? LIMIT 1`,
+      args: [namespace, runId],
+    });
+    return res.rows[0] ? rowToRunSummary(res.rows[0] as Record<string, unknown>) : null;
+  }
+
+  async listRunSummaries({
+    harnessName,
+    sessionId,
+    resourceId,
+    limit,
+    beforeCompletedAt,
+    beforeRunId,
+  }: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const cap = limit ?? 50;
+    const where: string[] = ['harness_name = ?', 'session_id = ?'];
+    const args: QueryValues = [namespace, sessionId];
+    if (resourceId !== undefined) {
+      where.push('resource_id = ?');
+      args.push(resourceId);
+    }
+    if (beforeCompletedAt !== undefined) {
+      // Composite keyset for the (completed_at DESC, run_id DESC) order so
+      // same-timestamp rows at a page boundary are not skipped.
+      if (beforeRunId !== undefined) {
+        where.push('(completed_at < ? OR (completed_at = ? AND run_id < ?))');
+        args.push(beforeCompletedAt, beforeCompletedAt, beforeRunId);
+      } else {
+        where.push('completed_at < ?');
+        args.push(beforeCompletedAt);
+      }
+    }
+    // Fetch one extra row to detect whether more pages remain.
+    args.push(cap + 1);
+    const res = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES}
+            WHERE ${where.join(' AND ')}
+            ORDER BY completed_at DESC, run_id DESC
+            LIMIT ?`,
+      args,
+    });
+    const all = (res.rows as Record<string, unknown>[]).map(rowToRunSummary);
+    const page = all.slice(0, cap);
+    const result: ListRunSummariesResult = { summaries: page };
+    if (all.length > cap) {
+      const last = page[page.length - 1]!;
+      result.nextBeforeCompletedAt = last.completedAt;
+      result.nextBeforeRunId = last.runId;
+    }
+    return result;
   }
 
   async resolveOperationAdmissionEvidence({
@@ -5086,6 +5178,24 @@ export class HarnessPG extends HarnessStorage {
     return this.#planTasksReady;
   }
 
+  async #ensureRunSummariesTable(): Promise<void> {
+    if (this.#runSummariesReady !== undefined) {
+      return this.#runSummariesReady;
+    }
+    this.#runSummariesReady = (async () => {
+      const config = TABLE_CONFIGS[TABLE_HARNESS_RUN_SUMMARIES];
+      await this.#db.createTable({
+        tableName: TABLE_HARNESS_RUN_SUMMARIES,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_RUN_SUMMARIES],
+        compositePrimaryKey: config?.compositePrimaryKey,
+      });
+    })().catch(error => {
+      this.#runSummariesReady = undefined;
+      throw error;
+    });
+    return this.#runSummariesReady;
+  }
+
   async #ensureThreadDeleteFencesTable(): Promise<void> {
     const threadDeleteFencesConfig = TABLE_CONFIGS[TABLE_HARNESS_THREAD_DELETE_FENCES];
     await this.#db.createTable({
@@ -6584,6 +6694,80 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.updatedAt,
     task.completedAt ?? null,
     task.version,
+  ];
+  return { names, values };
+}
+
+function rowToRunSummary(row: Record<string, unknown>): HarnessRunSummary {
+  const summary: HarnessRunSummary = {
+    harnessName: String(row.harness_name),
+    runId: String(row.run_id),
+    sessionId: String(row.session_id),
+    resourceId: String(row.resource_id),
+    threadId: String(row.thread_id),
+    agentId: String(row.agent_id),
+    modeId: String(row.mode_id),
+    modelId: String(row.model_id),
+    status: String(row.status) as HarnessRunSummary['status'],
+    finishReason: String(row.finish_reason),
+    reconstructed: row.reconstructed === true || row.reconstructed === 1 || row.reconstructed === '1',
+    completedAt: Number(row.completed_at),
+    usage: (parseJson(row.usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }) as HarnessRunSummary['usage'],
+    createdAt: Number(row.created_at),
+  };
+  if (row.parent_session_id != null) summary.parentSessionId = String(row.parent_session_id);
+  if (row.trace_id != null) summary.traceId = String(row.trace_id);
+  if (row.operation_kind != null) summary.operationKind = String(row.operation_kind) as HarnessRunSummary['operationKind'];
+  if (row.started_at != null) summary.startedAt = Number(row.started_at);
+  if (row.duration_ms != null) summary.durationMs = Number(row.duration_ms);
+  if (row.tool_rollup != null) summary.toolRollup = parseJson(row.tool_rollup) as HarnessRunSummary['toolRollup'];
+  return summary;
+}
+
+function runSummaryColumnValues(summary: HarnessRunSummary): { names: string[]; values: QueryValues } {
+  const names = [
+    'harness_name',
+    'run_id',
+    'session_id',
+    'resource_id',
+    'thread_id',
+    'parent_session_id',
+    'agent_id',
+    'mode_id',
+    'model_id',
+    'trace_id',
+    'operation_kind',
+    'status',
+    'finish_reason',
+    'reconstructed',
+    'started_at',
+    'completed_at',
+    'duration_ms',
+    'usage',
+    'tool_rollup',
+    'created_at',
+  ];
+  const values: QueryValues = [
+    summary.harnessName,
+    summary.runId,
+    summary.sessionId,
+    summary.resourceId,
+    summary.threadId,
+    summary.parentSessionId ?? null,
+    summary.agentId,
+    summary.modeId,
+    summary.modelId,
+    summary.traceId ?? null,
+    summary.operationKind ?? null,
+    summary.status,
+    summary.finishReason,
+    summary.reconstructed,
+    summary.startedAt ?? null,
+    summary.completedAt,
+    summary.durationMs ?? null,
+    JSON.stringify(summary.usage),
+    summary.toolRollup === undefined ? null : JSON.stringify(summary.toolRollup),
+    summary.createdAt,
   ];
   return { names, values };
 }
