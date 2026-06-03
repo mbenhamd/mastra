@@ -701,7 +701,10 @@ const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
  * they bypass the gate as normal harness infrastructure. Everything else in
  * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
  */
-const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([SPAWN_SUBAGENT_TOOL_ID, TASK_DELEGATE_TOOL_ID]);
+const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
+  SPAWN_SUBAGENT_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+]);
 
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
   if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
@@ -809,6 +812,22 @@ export interface ActiveSubagentState {
   task: string;
   parentToolCallId: string;
   startedAt: number;
+  /**
+   * Live child-run progress for the parent's display snapshot (§SA2). Lets a
+   * polling / reconnecting / display-state consumer see a subagent's inner
+   * progress from the PARENT snapshot alone (streaming consumers can still read
+   * the `subagent_*` event family). Best-effort + in-memory: updated as the
+   * child's bridged events arrive; absent fields mean "not yet observed".
+   */
+  status?: 'running' | 'completed' | 'failed';
+  /** The child's currently-executing tool, if one is in flight; cleared when it ends. */
+  currentToolName?: string;
+  /** Count of child tool calls observed so far. */
+  toolCalls?: number;
+  /** The child run's token usage, populated at the child's terminal. */
+  usage?: TokenUsage;
+  /** Last time this projection was updated from a child event. */
+  updatedAt?: number;
 }
 
 /** Cumulative token usage for the session's thread. */
@@ -1587,7 +1606,13 @@ export class Session {
       return event;
     }
     if (type === 'tool_end') {
-      const e = event as { runId?: string; toolCallId?: string; toolName?: string; isError?: boolean; durationMs?: number };
+      const e = event as {
+        runId?: string;
+        toolCallId?: string;
+        toolName?: string;
+        isError?: boolean;
+        durationMs?: number;
+      };
       const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
       if (!span) return event;
       const toolName = e.toolName ?? 'unknown';
@@ -1660,12 +1685,7 @@ export class Session {
    * a run whose start was lost to a restart is marked `reconstructed` and omits
    * those (usage + identity + finishReason are still reported).
    */
-  private _finalizeRunSpan(
-    runId: string,
-    finishReason: string,
-    usage: TokenUsage,
-    completedAt: number,
-  ): void {
+  private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
     if (this._finalizedRunIds.has(runId)) return;
     if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
     this._finalizedRunIds.add(runId);
@@ -1800,6 +1820,45 @@ export class Session {
       return this._emitter.emit({ ...stamped, queuedItemId: this._currentQueuedItemId } as EmitInput);
     }
     return this._emitter.emit(stamped);
+  }
+
+  /**
+   * @internal — §SA2: fold a bridged CHILD turn event into the parent's
+   * `_activeSubagents` display projection so a polling/reconnecting consumer can
+   * see the subagent's live inner progress (status / current tool / tool count /
+   * usage) from the parent snapshot alone. Best-effort: a no-op if the key was
+   * already cleared (child closed). `key` is the spawn `toolCallId` or the
+   * delegate `delegate:<childId>` key.
+   */
+  _internalUpdateSubagentProgress(key: string, event: HarnessEvent): void {
+    const entry = this._activeSubagents.get(key);
+    if (!entry) return;
+    switch (event.type) {
+      case 'agent_start':
+        entry.status = 'running';
+        break;
+      case 'tool_start':
+        entry.currentToolName = event.toolName;
+        entry.toolCalls = (entry.toolCalls ?? 0) + 1;
+        break;
+      case 'tool_end':
+        // Best-effort clear: only when the ending tool is the one we last showed
+        // (concurrent inner tools just leave the most-recent name until it ends).
+        if (entry.currentToolName === event.toolName) entry.currentToolName = undefined;
+        break;
+      case 'agent_end':
+        entry.status =
+          event.finishReason === 'error' || event.finishReason === 'aborted'
+            ? 'failed'
+            : event.finishReason === 'complete'
+              ? 'completed'
+              : entry.status;
+        entry.usage = event.usage;
+        break;
+      default:
+        return; // text/reasoning deltas don't change the projection
+    }
+    entry.updatedAt = Date.now();
   }
 
   /** @internal — number of registered listeners (for tests). */
@@ -12406,7 +12465,8 @@ export class Session {
       const allowlistSnapshot = this._subagentToolAllowlist ? new Set(this._subagentToolAllowlist) : undefined;
       entries.push([
         '__mastra_toolPermissionPolicy',
-        (toolName: string) => session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
+        (toolName: string) =>
+          session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
       ]);
     }
     // §4.2e `yolo` — a per-turn suppressor for the POLICY-level approval reason
@@ -13081,6 +13141,11 @@ export class Session {
    */
   private async _driveDelegatedSubagent(taskId: string, child: Session, taskBody: string): Promise<void> {
     let outcome: DelegatedSubagentOutcome;
+    // §SA2 — fold the detached child's live progress into the parent's display
+    // projection (the delegate path has no event bridge of its own, unlike the
+    // spawn tool). Unsubscribed in the finally below.
+    const progressKey = `delegate:${child.id}`;
+    const unsubProgress = child.subscribe(event => this._internalUpdateSubagentProgress(progressKey, event));
     try {
       const result = await child.message({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) });
       // A resolved turn can still be a FAILURE: the mock/real agent surfaces an
@@ -13098,6 +13163,7 @@ export class Session {
       // row, or a crash-orphaned `pending` reservation that fail-closes.)
       outcome = 'failed';
     } finally {
+      unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
     }
     await this._reconcileDelegatedTask(taskId, child.id, outcome);

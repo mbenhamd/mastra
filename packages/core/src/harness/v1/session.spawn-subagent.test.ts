@@ -387,8 +387,24 @@ describe('spawn_subagent tool — toolAllowlist (§M4)', () => {
       // Mirror the spawn wiring + assert the resolver hard-denies a non-listed tool.
       (child as any)._subagentToolAllowlist = def.toolAllowlist;
       expect((child as any)._toolPermissionGateEngaged()).toBe(true);
-      expect((child as any)._resolveToolPolicy('writeDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set(def.toolAllowlist))).toBe('deny');
-      expect((child as any)._resolveToolPolicy('readDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set(def.toolAllowlist))).toBe('allow');
+      expect(
+        (child as any)._resolveToolPolicy(
+          'writeDoc',
+          { categories: {}, tools: {} },
+          { categories: [], tools: [] },
+          'allow',
+          new Set(def.toolAllowlist),
+        ),
+      ).toBe('deny');
+      expect(
+        (child as any)._resolveToolPolicy(
+          'readDoc',
+          { categories: {}, tools: {} },
+          { categories: [], tools: [] },
+          'allow',
+          new Set(def.toolAllowlist),
+        ),
+      ).toBe('allow');
     } finally {
       await harness.shutdown();
     }
@@ -409,6 +425,86 @@ describe('spawn_subagent tool — toolAllowlist (§M4)', () => {
             subagents: { types: { t: { agentId: 'a', description: 'd', ...bad } } },
           } as any),
       ).toThrow(/toolAllowlist/);
+    }
+  });
+});
+
+describe('subagent live progress projection (§SA2)', () => {
+  it('folds bridged child events into the parent activeSubagents display snapshot', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const key = 'tc-sa2';
+      (parent as any)._activeSubagents.set(key, {
+        subagentSessionId: 'child-1',
+        agentType: 'explore',
+        task: 'look around',
+        parentToolCallId: key,
+        startedAt: 1,
+      });
+      const upd = (e: any) => (parent as any)._internalUpdateSubagentProgress(key, e);
+
+      upd({ type: 'agent_start', runId: 'r' });
+      upd({ type: 'tool_start', runId: 'r', toolCallId: 'it1', toolName: 'readDoc', input: {} });
+      let snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.status).toBe('running');
+      expect(snap.currentToolName).toBe('readDoc');
+      expect(snap.toolCalls).toBe(1);
+
+      upd({ type: 'tool_end', runId: 'r', toolCallId: 'it1', toolName: 'readDoc', output: {}, isError: false });
+      snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.currentToolName).toBeUndefined();
+      expect(snap.toolCalls).toBe(1);
+
+      upd({
+        type: 'agent_end',
+        runId: 'r',
+        finishReason: 'complete',
+        usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
+      });
+      snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.status).toBe('completed');
+      expect(snap.usage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('maps an errored/aborted child terminal to failed status', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const key = 'tc-sa2b';
+      (parent as any)._activeSubagents.set(key, {
+        subagentSessionId: 'child-2',
+        agentType: 'explore',
+        task: 't',
+        parentToolCallId: key,
+        startedAt: 1,
+      });
+      (parent as any)._internalUpdateSubagentProgress(key, {
+        type: 'agent_end',
+        runId: 'r',
+        finishReason: 'error',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      });
+      expect(parent.getDisplayState().activeSubagents[key]!.status).toBe('failed');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('is a no-op once the subagent entry was cleared (child closed)', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // No entry for this key — must not throw.
+      expect(() =>
+        (parent as any)._internalUpdateSubagentProgress('gone', { type: 'agent_start', runId: 'r' }),
+      ).not.toThrow();
+      expect(parent.getDisplayState().activeSubagents.gone).toBeUndefined();
+    } finally {
+      await harness.shutdown();
     }
   });
 });

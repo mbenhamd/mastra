@@ -183,6 +183,9 @@ export function createSpawnSubagentTool(parent: Session) {
         const resolvedModelId = modelOverride ?? def.defaultModelId ?? '';
         const unsub = child.subscribe(event => {
           if (!event.type) return;
+          // §SA2 — fold the child's live progress into the parent's display
+          // projection (keyed by this spawn's toolCallId).
+          parent._internalUpdateSubagentProgress(toolCallId, event);
           switch (event.type) {
             case 'agent_start':
               parent._emitSubagentEvent({
