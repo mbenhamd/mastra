@@ -1357,3 +1357,48 @@ describe('Session event-persistence failure surfacing (§10.2)', () => {
     }
   });
 });
+
+describe('Session events — serialization failure isolation (§S4.2)', () => {
+  it('stores a contiguity-preserving sentinel for one unserializable event and keeps persisting later events', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await session.setState({ a: 1 }); // good event #1 (state_changed)
+      // A circular payload pushed straight through the emitter bypasses emit-time
+      // custom-event validation, so it reaches the persistence snapshot and fails.
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      (session as unknown as { _emitter: { emit(e: unknown): unknown } })._emitter.emit({
+        type: 'badns.bad',
+        payload: circular,
+      });
+      await session.setState({ a: 2 }); // good event #2 — must still persist
+
+      // The log must NOT be latched: flush resolves rather than throwing.
+      await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+      expect((session as unknown as { _eventPersistenceError?: unknown })._eventPersistenceError).toBeUndefined();
+
+      const st = await storage.getSessionEventReplayState({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+      });
+      const rows = await storage.listSessionEvents({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        epoch: st!.epoch,
+        afterSequence: 0,
+        limit: 100,
+      });
+      const types = rows.map(r => (r.event as { type: string }).type);
+      // The unserializable event's slot became a storage_error sentinel...
+      const sentinelIdx = types.indexOf('storage_error');
+      expect(sentinelIdx).toBeGreaterThanOrEqual(0);
+      // ...and a normal event persisted AFTER it — proving the log was NOT latched.
+      expect(types.slice(sentinelIdx + 1)).toContain('state_changed');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});

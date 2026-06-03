@@ -1505,14 +1505,40 @@ export class Session {
       return;
     }
     let parsed: ReturnType<typeof parseHarnessEventId>;
-    let storedEvent: JsonValue;
     try {
       parsed = parseHarnessEventId(event.id);
+    } catch (err) {
+      // The event id encodes the ledger slot (epoch:sequence). If it cannot be
+      // parsed we cannot place a contiguity-preserving sentinel, so fail-stop.
+      this._eventPersistenceError = err;
+      console.error('[harness/v1] session event id parse failed:', err);
+      return;
+    }
+    let storedEvent: JsonValue;
+    try {
       storedEvent = snapshotHarnessEventForJson(event);
     } catch (err) {
-      this._eventPersistenceError = err;
-      console.error('[harness/v1] session event serialization failed:', err);
-      return;
+      // §S4.2 — ONE unserializable event must not poison the whole durable log.
+      // The live subscriber already received the real event; substitute a JSON-safe
+      // `storage_error` SENTINEL at the SAME (epoch, sequence) so the ledger stays
+      // CONTIGUOUS (the slot is filled, not skipped → no undetected replay gap) and
+      // later events keep persisting normally. A reconnect replaying this slot sees
+      // the sentinel instead of the lost event.
+      console.error('[harness/v1] session event serialization failed; storing replay sentinel:', err);
+      storedEvent = {
+        id: event.id,
+        type: 'storage_error',
+        timestamp: event.timestamp,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        operation: 'session_event_append',
+        retryable: false,
+        error: {
+          code: 'harness.event_serialization',
+          message: `event serialization failed; original "${(event as { type?: string }).type ?? 'unknown'}" event omitted from the durable log`,
+        },
+      } as unknown as JsonValue;
     }
     const record = this._record;
     const task = this._eventPersistenceTail
