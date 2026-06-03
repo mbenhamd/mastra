@@ -1334,11 +1334,12 @@ describe('Session event-persistence failure surfacing (§10.2)', () => {
     try {
       const events: HarnessEvent[] = [];
       session.subscribe(e => events.push(e));
-      // Fail the first durable append → trips the latch.
+      // Fail the first durable append → surfaces a live storage_error (§S4.1 backlogs
+      // the failed slot for retry; the failure is still surfaced once, not silently).
       vi.spyOn(storage, 'appendSessionEvent').mockRejectedValueOnce(new Error('disk full'));
 
       await session.message({ content: 'hi' });
-      // Drain the persistence tail so the latch-trip catch (which emits) has run.
+      // Drain the persistence tail so the failure-surfacing emit has run.
       await session._flushEventPersistence().catch(() => {});
 
       const storageErrors = events.filter(e => e.type === 'storage_error') as any[];
@@ -1347,12 +1348,110 @@ describe('Session event-persistence failure surfacing (§10.2)', () => {
       expect(storageErrors[0].error.code).toBe('harness.storage');
       expect(storageErrors[0].resourceId).toBe('u1');
 
-      // A second turn does not emit another storage_error (latch already surfaced).
+      // A second turn does not emit another storage_error (already surfaced this episode).
       await session.message({ content: 'again' }).catch(() => {});
       await session._flushEventPersistence().catch(() => {});
       expect(events.filter(e => e.type === 'storage_error')).toHaveLength(1);
     } finally {
-      // shutdown surfaces the latched event-persistence error we injected.
+      await harness.shutdown().catch(() => {});
+    }
+  });
+});
+
+describe('Session events — transient append backlog retries to contiguity (§S4.1)', () => {
+  it('retries a transiently-failed append ahead of later events, recovering a contiguous log', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      // Reject the first 3 durable appends, then let everything succeed. The failed
+      // slots must be retried (in order) ahead of later sequences so the log stays gap-free.
+      let calls = 0;
+      const real = storage.appendSessionEvent.bind(storage);
+      vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async (rec: any) => {
+        calls += 1;
+        if (calls <= 3) throw new Error(`transient blip #${calls}`);
+        return real(rec);
+      });
+
+      await session.setState({ a: 1 });
+      await session.setState({ a: 2 });
+      await session.setState({ a: 3 });
+      await session.setState({ a: 4 });
+      await session.setState({ a: 5 });
+
+      // A quiet flush drains the backlog (retry-on-flush) → resolves, not throws.
+      await expect(session._flushEventPersistence()).resolves.toBeUndefined();
+      expect((session as unknown as { _eventPersistenceError?: unknown })._eventPersistenceError).toBeUndefined();
+      expect((session as unknown as { _failedEventAppends: unknown[] })._failedEventAppends).toHaveLength(0);
+      // Exactly one episode surfaced live (retryable), despite 3 failed appends.
+      const storageErrors = events.filter(e => e.type === 'storage_error') as any[];
+      expect(storageErrors).toHaveLength(1);
+      expect(storageErrors[0].retryable).toBe(true);
+
+      // The durable log is contiguous: sequences strictly increasing, no gap.
+      const st = await storage.getSessionEventReplayState({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+      });
+      const rows = await storage.listSessionEvents({
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        epoch: st!.epoch,
+        afterSequence: st!.oldestSequence - 1, // inclusive of the very first slot (seq 0)
+        limit: 1000,
+      });
+      const seqs = rows.map(r => r.sequence);
+      for (let i = 1; i < seqs.length; i++) {
+        expect(seqs[i]).toBe(seqs[i - 1]! + 1);
+      }
+      // The very first slot (seq 0) — the failed-then-retried append — is present,
+      // proving the backlog retried it ahead of later sequences.
+      expect(seqs[0]).toBe(0);
+      // Every emitted state_changed landed durably — nothing dropped despite the blips.
+      const persistedStateChanges = rows.filter(r => (r.event as { type: string }).type === 'state_changed').length;
+      const emittedStateChanges = events.filter(e => e.type === 'state_changed').length;
+      expect(emittedStateChanges).toBeGreaterThanOrEqual(4);
+      expect(persistedStateChanges).toBe(emittedStateChanges);
+    } finally {
+      await harness.shutdown().catch(() => {});
+    }
+  });
+
+  it('hard-latches with a terminal non-retryable storage_error when the backlog overflows', async () => {
+    const { harness, storage } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      // Persistent failure: every append rejects, so the backlog grows unbounded
+      // until it crosses MAX_PENDING_FAILED_EVENT_APPENDS (256) and fail-stops.
+      vi.spyOn(storage, 'appendSessionEvent').mockRejectedValue(new Error('disk gone'));
+
+      for (let i = 0; i < 260; i++) {
+        await session.setState({ n: i });
+      }
+      await session._flushEventPersistence().catch(() => {});
+
+      // Hard-latched.
+      expect((session as unknown as { _eventPersistenceError?: unknown })._eventPersistenceError).toBeDefined();
+      // Backlog cleared on overflow (no unbounded retention).
+      expect((session as unknown as { _failedEventAppends: unknown[] })._failedEventAppends).toHaveLength(0);
+      // flush now rejects (the latched, unrecoverable error).
+      await expect(session._flushEventPersistence()).rejects.toBeDefined();
+
+      const storageErrors = events.filter(e => e.type === 'storage_error') as any[];
+      // First surfaced as retryable; the overflow tipped it to a terminal non-retryable.
+      expect(storageErrors.some(e => e.retryable === true)).toBe(true);
+      const terminal = storageErrors.filter(e => e.retryable === false);
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0].error.message).toContain('backlog overflow');
+    } finally {
       await harness.shutdown().catch(() => {});
     }
   });

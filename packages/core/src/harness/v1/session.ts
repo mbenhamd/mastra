@@ -234,6 +234,23 @@ type Deferred<T> = {
   reject: (reason: unknown) => void;
 };
 
+/**
+ * §S4.1 — a pending event-ledger append awaiting transient-failure retry. Everything
+ * except `storedAt` is captured at enqueue time; `storedAt` is stamped at write time so
+ * each retry records its own persistence timestamp.
+ */
+type PendingEventAppend = {
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  eventId: string;
+  epoch: string;
+  sequence: number;
+  event: JsonValue;
+  emittedAt: number;
+};
+
 type MessageAdmissionStart = {
   admissionHash: string;
   modeId: string;
@@ -285,6 +302,15 @@ const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
+/**
+ * §S4.1 — max transiently-failed event-ledger appends retained for retry before
+ * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
+ * the durable log: the failed slot is backlogged and retried (in order) ahead of any
+ * later sequence on the next append, preserving ledger contiguity. Past this bound we
+ * can no longer guarantee retry without unbounded memory, so we hard-latch and let a
+ * reconnect recover via the §10.5 snapshot path.
+ */
+const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
 /** TM-6 reconcile-on-rehydrate bounded retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_MAX_RETRIES = 5;
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
@@ -1262,7 +1288,19 @@ export class Session {
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   private _eventPersistenceTail: Promise<void> = Promise.resolve();
+  /** HARD latch — unrecoverable durable-log failure (id unparseable, or §S4.1 backlog overflow). */
   private _eventPersistenceError: unknown;
+  /**
+   * §S4.1 — ordered backlog of event-ledger appends that failed transiently, awaiting
+   * retry. Retried FIFO ahead of any later sequence on the next append so the durable
+   * log stays contiguous (no skipped slot → no undetected replay gap).
+   */
+  private readonly _failedEventAppends: PendingEventAppend[] = [];
+  /**
+   * §S4.1 — true once a transient append failure has been surfaced live (one
+   * `storage_error` per degraded episode). Reset when the backlog fully drains.
+   */
+  private _eventPersistenceDegraded = false;
   private readonly _backgroundTurnCompletions = new Set<Promise<unknown>>();
 
   /** @internal — constructed by the Harness, not directly. */
@@ -1482,9 +1520,31 @@ export class Session {
 
   /** @internal — waits for prior event ledger writes before replay decisions. */
   async _flushEventPersistence(): Promise<void> {
+    // §S4.1 — give a transient backlog one retry so a QUIET session (no new events
+    // arriving to drive the on-append retry) can still recover its durable log before
+    // a replay decision is made.
+    if (this._failedEventAppends.length > 0 && this._eventPersistenceError === undefined) {
+      this._eventPersistenceTail = this._eventPersistenceTail
+        .catch(() => undefined)
+        .then(() => this._processEventPersistence(undefined));
+    }
     await this._eventPersistenceTail;
     if (this._eventPersistenceError !== undefined) {
       throw this._eventPersistenceError;
+    }
+    // §S4.1 — an un-drained backlog means the ledger is NOT yet contiguous; replaying
+    // it now would silently miss the queued tail. Surface a retryable storage error so
+    // the caller falls back to the §10.5 snapshot path instead of replaying a gap.
+    if (this._failedEventAppends.length > 0) {
+      throw new HarnessStorageError({
+        operation: 'session_event_append',
+        cause: undefined,
+        retryable: true,
+        sessionId: this._record.id,
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      });
     }
   }
 
@@ -1541,51 +1601,126 @@ export class Session {
       } as unknown as JsonValue;
     }
     const record = this._record;
-    const task = this._eventPersistenceTail
+    const next: PendingEventAppend = {
+      harnessName: record.harnessName,
+      sessionId: record.id,
+      resourceId: record.resourceId,
+      threadId: record.threadId,
+      eventId: event.id,
+      epoch: parsed.epoch,
+      sequence: parsed.sequence,
+      event: storedEvent,
+      emittedAt: event.timestamp,
+    };
+    // Serialize all ledger work on the tail so appends + backlog retries stay ordered.
+    this._eventPersistenceTail = this._eventPersistenceTail
       .catch(() => undefined)
-      .then(async () => {
-        if (this._eventPersistenceError !== undefined) return;
-        await this._storage.appendSessionEvent({
-          harnessName: record.harnessName,
-          sessionId: record.id,
-          resourceId: record.resourceId,
-          threadId: record.threadId,
-          eventId: event.id,
-          epoch: parsed.epoch,
-          sequence: parsed.sequence,
-          event: storedEvent,
-          emittedAt: event.timestamp,
-          storedAt: Date.now(),
-        });
-      });
-    this._eventPersistenceTail = task.catch(err => {
-      if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return;
-      // Latch FIRST so the storage_error emit below (and any concurrent appends)
-      // short-circuit re-persistence; surface the failure exactly once.
-      const firstTrip = this._eventPersistenceError === undefined;
-      this._eventPersistenceError = err;
-      console.error('[harness/v1] session event persistence failed:', err);
-      // §10.2: the durable event log is now degraded — a reconnect past the gap
-      // recovers via the §10.5 snapshot path, but that is LATER. Emit a live
-      // `storage_error` so subscribers learn the log stopped persisting in real
-      // time rather than only discovering the gap on reconnect. Live-only: the
-      // latch is already set, so this event is not itself re-persisted.
-      if (firstTrip) {
-        const isStorageErr = err instanceof HarnessStorageError;
-        this._emitter.emit({
-          type: 'storage_error',
-          operation: 'session_event_append',
-          retryable: isStorageErr ? err.retryable : false,
-          error: {
-            code: 'harness.storage',
-            message: isStorageErr ? err.message : 'session event persistence failed',
-          },
-          resourceId: record.resourceId,
-          threadId: record.threadId,
-          harnessName: record.harnessName,
-        } as EmitInput);
+      .then(() => this._processEventPersistence(next));
+  }
+
+  /**
+   * §S4.1 — durable event-ledger writer. Runs serialized on `_eventPersistenceTail`.
+   * Drains any transiently-failed backlog FIFO, then appends `next` (when provided).
+   * Never throws: a re-failed append is re-queued for the next attempt, and an
+   * unbounded backlog hard-latches. Contiguity is preserved — `next` never jumps ahead
+   * of an earlier un-persisted slot.
+   */
+  private async _processEventPersistence(next: PendingEventAppend | undefined): Promise<void> {
+    if (this._eventPersistenceError !== undefined) return; // hard latch (id-parse / overflow)
+
+    // 1) Retry the backlog in order; STOP at the first re-failure so a later sequence
+    //    never persists ahead of an earlier failed one.
+    while (this._failedEventAppends.length > 0) {
+      const head = this._failedEventAppends[0]!;
+      try {
+        await this._storage.appendSessionEvent({ ...head, storedAt: Date.now() });
+        this._failedEventAppends.shift();
+      } catch (err) {
+        if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) {
+          // Storage has no event ledger at all → nothing to retry; drop the backlog.
+          this._failedEventAppends.length = 0;
+          this._eventPersistenceDegraded = false;
+          return;
+        }
+        if (next) this._backlogFailedAppend(next, err);
+        return;
       }
-    });
+    }
+    // Backlog fully drained → durable log is contiguous again.
+    if (this._eventPersistenceDegraded) this._eventPersistenceDegraded = false;
+
+    if (!next) return;
+
+    // 2) Append the new event.
+    try {
+      await this._storage.appendSessionEvent({ ...next, storedAt: Date.now() });
+    } catch (err) {
+      if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return;
+      this._backlogFailedAppend(next, err);
+    }
+  }
+
+  /**
+   * §S4.1 — queue a failed append for retry. Surfaces a live `storage_error` once per
+   * degraded episode (so subscribers learn the log is lagging in real time), and
+   * hard-latches if the backlog exceeds {@link MAX_PENDING_FAILED_EVENT_APPENDS}.
+   */
+  private _backlogFailedAppend(args: PendingEventAppend, err: unknown): void {
+    this._failedEventAppends.push(args);
+    if (!this._eventPersistenceDegraded) {
+      this._eventPersistenceDegraded = true;
+      console.error('[harness/v1] session event persistence failed; backlogged for retry:', err);
+      // §10.2: the durable log is lagging. Emit a live, RETRYABLE storage_error so
+      // subscribers learn now (vs only discovering the lag on reconnect). The degraded
+      // flag is already set, so this event's own append — queued behind the backlog —
+      // does not re-trigger this emit.
+      const isStorageErr = err instanceof HarnessStorageError;
+      this._emitter.emit({
+        type: 'storage_error',
+        operation: 'session_event_append',
+        retryable: true,
+        error: {
+          code: 'harness.storage',
+          message: isStorageErr ? err.message : 'session event persistence failed',
+        },
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      } as EmitInput);
+    }
+    if (this._failedEventAppends.length > MAX_PENDING_FAILED_EVENT_APPENDS) {
+      // Past the bound we cannot keep retrying without unbounded memory → fail-stop.
+      // Reconnect past the gap recovers via the §10.5 snapshot path.
+      const overflow = new HarnessStorageError({
+        operation: 'session_event_append',
+        cause: err,
+        retryable: false,
+        sessionId: this._record.id,
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      });
+      this._eventPersistenceError = overflow;
+      this._failedEventAppends.length = 0;
+      console.error(
+        `[harness/v1] session event backlog exceeded ${MAX_PENDING_FAILED_EVENT_APPENDS}; durable log fail-stop:`,
+        err,
+      );
+      // The earlier retryable storage_error promised retries we can no longer make;
+      // emit a terminal NON-retryable one so subscribers fall back to snapshot recovery.
+      this._emitter.emit({
+        type: 'storage_error',
+        operation: 'session_event_append',
+        retryable: false,
+        error: {
+          code: 'harness.storage',
+          message: 'session event persistence backlog overflow; durable log degraded',
+        },
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      } as EmitInput);
+    }
   }
 
   /**
