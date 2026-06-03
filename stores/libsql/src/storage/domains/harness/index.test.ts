@@ -163,14 +163,19 @@ describe('HarnessLibSQL attachments', () => {
   });
 
   it('round-trips subagentTypeId on the session record (M4)', async () => {
-    await storage.saveSession(sampleSession({ subagentTypeId: 'scoped-worker' }), { ownerId: 'h', ifVersion: 0 });
+    await storage.saveSession(sampleSession({ subagentTypeId: 'scoped-worker', subagentToolAllowlistScoped: true }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
     const loaded = await storage.loadSession({ sessionId: 'session-1' });
     expect(loaded?.subagentTypeId).toBe('scoped-worker');
+    expect(loaded?.subagentToolAllowlistScoped).toBe(true);
 
     // A record without the field round-trips as undefined (legacy / top-level).
     await storage.saveSession(sampleSession({ id: 'session-2', threadId: 'thread-2' }), { ownerId: 'h', ifVersion: 0 });
     const topLevel = await storage.loadSession({ sessionId: 'session-2' });
     expect(topLevel?.subagentTypeId).toBeUndefined();
+    expect(topLevel?.subagentToolAllowlistScoped).toBeUndefined();
   });
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {

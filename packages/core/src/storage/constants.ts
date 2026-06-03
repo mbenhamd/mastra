@@ -686,6 +686,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     origin: { type: 'text', nullable: false },
     subagent_depth: { type: 'integer', nullable: true },
     subagent_type_id: { type: 'text', nullable: true },
+    subagent_tool_allowlist_scoped: { type: 'boolean', nullable: true },
     owns_thread: { type: 'boolean', nullable: false },
     mode_id: { type: 'text', nullable: false },
     model_id: { type: 'text', nullable: false },

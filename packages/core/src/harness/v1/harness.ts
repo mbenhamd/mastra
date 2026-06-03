@@ -3695,6 +3695,13 @@ export class Harness {
       ownsThread: init.ownsThread,
       subagentDepth: init.subagentDepth ?? 0,
       ...(init.subagentTypeId !== undefined && { subagentTypeId: init.subagentTypeId }),
+      // M4: record whether this child was created with a hard toolAllowlist, so a
+      // later hydrate can fail CLOSED if the type definition is gone. Derived from
+      // the live def at create time (the type definitely resolves now).
+      ...(init.subagentTypeId !== undefined &&
+        this._getSubagentType(init.subagentTypeId)?.toolAllowlist !== undefined && {
+          subagentToolAllowlistScoped: true,
+        }),
       modeId,
       modelId: init.modelId ?? '',
       subagentModelOverrides: {},
@@ -3968,14 +3975,21 @@ export class Harness {
     // restart or a different instance) would otherwise run with `toolAllowlist`
     // lost — a fail-OPEN that exposes tools outside its scope. Runs BEFORE the
     // queue-drain below so a replayed turn already sees the scope. Best-effort and
-    // consistent with the reattach path (`_reconcileDelegationsOnHydrate`): an
-    // unknown/removed type leaves the overrides unset.
+    // consistent with the reattach path (`_reconcileDelegationsOnHydrate`).
     if (record.subagentTypeId !== undefined) {
       const def = this._getSubagentType(record.subagentTypeId);
       if (def) {
         session._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
         if (def.tools) session._subagentToolsOverride = def.tools;
         if (def.toolAllowlist) session._subagentToolAllowlist = def.toolAllowlist;
+      } else if (record.subagentToolAllowlistScoped === true) {
+        // M4 config-drift: the type was DELETED from config but this child WAS
+        // scoped — fail CLOSED. An empty allowlist engages the gate and denies
+        // every non-builtin tool (incl. spawn/delegate), rather than fail OPEN by
+        // leaving the scope unset. The tools/workspace overrides are
+        // unrecoverable here, but losing those is a capability DOWNGRADE (safe),
+        // unlike losing the allowlist which would be an UPGRADE.
+        session._subagentToolAllowlist = [];
       }
     }
 

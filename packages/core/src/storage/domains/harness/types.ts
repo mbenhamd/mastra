@@ -350,6 +350,21 @@ export interface SessionRecord {
   subagentTypeId?: string;
 
   /**
+   * True when this subagent child was created with a `toolAllowlist` (a HARD
+   * capability scope), persisted so hydrate can FAIL CLOSED rather than fail
+   * OPEN on config drift (M4): if `subagentTypeId`'s definition was DELETED from
+   * config while this child persists, the allowlist cannot be re-resolved — but
+   * because this flag records that the child WAS scoped, hydrate restores an
+   * empty allowlist (deny every non-builtin tool) instead of leaving it unset.
+   * Distinguishes a deleted-scoped child from a legitimately-unscoped one (which
+   * leaves the flag false/absent and is correctly left unrestricted). Absent on
+   * records persisted before this field landed — such a legacy scoped child
+   * whose type is later deleted is indistinguishable from an unscoped one and
+   * cannot fail closed; newly created scoped subagents always carry the flag.
+   */
+  subagentToolAllowlistScoped?: boolean;
+
+  /**
    * True when the session was created with `threadId: { fresh: true }` and
    * therefore owns the underlying thread under `MemoryStorage`. Read by the
    * harness layer on cascade-delete to decide whether to tear the thread

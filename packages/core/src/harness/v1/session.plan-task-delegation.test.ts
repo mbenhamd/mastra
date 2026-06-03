@@ -888,4 +888,99 @@ describe('subagent child — direct hydrate restores the persisted scope (M4 fai
     expect((childB as any)._subagentInheritWorkspace).toBe(true);
     await b.harness.shutdown();
   });
+
+  it('FAILS CLOSED when a scoped child is hydrated but its subagent type was DELETED from config (M4-residual)', async () => {
+    const db = new InMemoryDB();
+    const a = buildScopedHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const childA = await a.harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parentA.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+      subagentTypeId: 'scoped',
+    } as any);
+    const childId = childA.id;
+    await a.harness.shutdown();
+
+    // Fresh instance whose config NO LONGER defines the 'scoped' subagent type
+    // (a redeploy removed it). The child's allowlist cannot be re-resolved, but
+    // the persisted scoped-flag makes hydrate fail CLOSED (empty allowlist).
+    const parentAgent = new MockAgent({ id: 'parent-agent' });
+    const childAgent = new MockAgent({ id: 'child-agent' });
+    const bHarness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db }) },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          // 'scoped' is GONE; only an unrelated type remains.
+          other: { agentId: 'child-agent', modeId: 'worker-mode', description: 'unrelated' },
+        },
+      },
+    });
+    const childB = await bHarness.session({ sessionId: childId, resourceId: 'u1' });
+    // Fail CLOSED: empty allowlist engages the gate and denies every non-builtin.
+    expect((childB as any)._subagentToolAllowlist).toEqual([]);
+    expect((childB as any)._toolPermissionGateEngaged()).toBe(true);
+    expect(
+      (childB as any)._resolveToolPolicy('readDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set([])),
+    ).toBe('deny');
+    await bHarness.shutdown();
+  });
+
+  it('an UNSCOPED child whose type was deleted stays unrestricted (no false fail-closed)', async () => {
+    const db = new InMemoryDB();
+    const parentAgent = new MockAgent({ id: 'parent-agent' });
+    const childAgent = new MockAgent({ id: 'child-agent' });
+    const a = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db }) },
+      subagents: {
+        maxDepth: 2,
+        // 'plain' has NO toolAllowlist → unscoped.
+        types: { plain: { agentId: 'child-agent', modeId: 'worker-mode', description: 'unscoped worker' } },
+      },
+    });
+    const parentA = await a.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const childA = await a.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parentA.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+      subagentTypeId: 'plain',
+    } as any);
+    const childId = childA.id;
+    await a.shutdown();
+
+    // Hydrate on an instance where 'plain' is gone. An unscoped child must NOT be
+    // wrongly fail-closed (it never had a capability scope).
+    const b = new Harness({
+      agents: { 'parent-agent': new MockAgent({ id: 'parent-agent' }), 'child-agent': new MockAgent({ id: 'child-agent' }) } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db }) },
+      subagents: { maxDepth: 2, types: { other: { agentId: 'child-agent', modeId: 'worker-mode', description: 'x' } } },
+    });
+    const childB = await b.session({ sessionId: childId, resourceId: 'u1' });
+    expect((childB as any)._subagentToolAllowlist).toBeUndefined();
+    await b.shutdown();
+  });
 });

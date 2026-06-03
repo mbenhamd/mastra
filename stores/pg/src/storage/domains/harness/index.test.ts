@@ -667,12 +667,13 @@ describe('HarnessPG', () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
 
-    await harness!.saveSession(createSampleSessionRecord({ subagentTypeId: 'scoped-worker' }), {
-      ownerId: 'h',
-      ifVersion: 0,
-    });
+    await harness!.saveSession(
+      createSampleSessionRecord({ subagentTypeId: 'scoped-worker', subagentToolAllowlistScoped: true }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
     const loaded = await harness!.loadSession({ sessionId: 'session-1' });
     expect(loaded?.subagentTypeId).toBe('scoped-worker');
+    expect(loaded?.subagentToolAllowlistScoped).toBe(true);
 
     // A record without the field round-trips as undefined (legacy / top-level).
     await harness!.saveSession(createSampleSessionRecord({ id: 'session-2', threadId: 'thread-2' }), {
@@ -681,6 +682,7 @@ describe('HarnessPG', () => {
     });
     const topLevel = await harness!.loadSession({ sessionId: 'session-2' });
     expect(topLevel?.subagentTypeId).toBeUndefined();
+    expect(topLevel?.subagentToolAllowlistScoped).toBeUndefined();
   });
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
