@@ -931,7 +931,13 @@ describe('subagent child — direct hydrate restores the persisted scope (M4 fai
     expect((childB as any)._subagentToolAllowlist).toEqual([]);
     expect((childB as any)._toolPermissionGateEngaged()).toBe(true);
     expect(
-      (childB as any)._resolveToolPolicy('readDoc', { categories: {}, tools: {} }, { categories: [], tools: [] }, 'allow', new Set([])),
+      (childB as any)._resolveToolPolicy(
+        'readDoc',
+        { categories: {}, tools: {} },
+        { categories: [], tools: [] },
+        'allow',
+        new Set([]),
+      ),
     ).toBe('deny');
     await bHarness.shutdown();
   });
@@ -970,7 +976,10 @@ describe('subagent child — direct hydrate restores the persisted scope (M4 fai
     // Hydrate on an instance where 'plain' is gone. An unscoped child must NOT be
     // wrongly fail-closed (it never had a capability scope).
     const b = new Harness({
-      agents: { 'parent-agent': new MockAgent({ id: 'parent-agent' }), 'child-agent': new MockAgent({ id: 'child-agent' }) } as any,
+      agents: {
+        'parent-agent': new MockAgent({ id: 'parent-agent' }),
+        'child-agent': new MockAgent({ id: 'child-agent' }),
+      } as any,
       modes: [
         { id: 'default', agentId: 'parent-agent' },
         { id: 'worker-mode', agentId: 'child-agent' },
@@ -982,5 +991,40 @@ describe('subagent child — direct hydrate restores the persisted scope (M4 fai
     const childB = await b.session({ sessionId: childId, resourceId: 'u1' });
     expect((childB as any)._subagentToolAllowlist).toBeUndefined();
     await b.shutdown();
+  });
+});
+
+describe('cancelSubagent (§SA1)', () => {
+  it('cancels an in-flight delegated child and rolls its plan task up to failed', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Hold the child mid-run so it is genuinely in-flight when we cancel it.
+    let releaseChild!: () => void;
+    childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
+
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'cancel me' } as any, toolCtx)) as any;
+    const res = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = res.subagentSessionId;
+
+    // The child is live + active. Targeted cancel of just this subagent.
+    await parent.cancelSubagent({ subagentSessionId: childId });
+    releaseChild();
+    close();
+
+    // The delegation driver maps the child's cancelRequest → a FAILED plan task.
+    await poll(async () => (await planRow(parent, task.taskId))?.status === 'failed');
+    await harness.shutdown();
+  });
+
+  it('is a no-op for an unknown / non-child subagent id', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await expect(parent.cancelSubagent({ subagentSessionId: 'not-a-child' })).resolves.toBeUndefined();
+    await harness.shutdown();
   });
 });

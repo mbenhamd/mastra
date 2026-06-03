@@ -3016,6 +3016,37 @@ export class Session {
     return this._cancelInternal(opts, undefined);
   }
 
+  /**
+   * §SA1 — cancel ONE in-flight subagent of this session by its session id,
+   * without cancelling this parent or its siblings. The target must be an active
+   * subagent of THIS session (`getDisplayState().activeSubagents` /
+   * `subagent_*` events expose the id); a non-child id, an already-settled child,
+   * or a child not live in this process is a safe no-op.
+   *
+   * Cancellation reaches the child via the same harness-owned parent-origin
+   * cascade as a full `cancel()` does for all children — so an inline
+   * `spawn_subagent` child aborts its turn (the spawn tool's `finally` then closes
+   * it), and a detached `task_delegate` child aborts + the delegation driver rolls
+   * its plan task up to `failed` (its `cancelRequest` is also honored by
+   * reconcile-on-rehydrate). Same-process only: a child owned by another live
+   * instance is not reachable here.
+   */
+  async cancelSubagent(opts: { subagentSessionId: string; reason?: string }): Promise<void> {
+    this._assertNotDeleted();
+    // Ownership guard: only cancel a subagent THIS session is actively running.
+    const isOwnChild = Array.from(this._activeSubagents.values()).some(
+      s => s.subagentSessionId === opts.subagentSessionId,
+    );
+    if (!isOwnChild) return;
+    const child = this._harness._internalGetLiveSession(opts.subagentSessionId);
+    if (!child) return; // not live in this process — best-effort no-op
+    try {
+      await child._cancelInternal({ reason: opts.reason ?? 'subagent_cancelled', requestedBy: this.id }, this.id);
+    } catch {
+      // Best-effort: a late race (child already settling/closed) must not throw.
+    }
+  }
+
   private async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
