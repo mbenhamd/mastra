@@ -7,7 +7,7 @@
  * follow-up slice and is not exercised here.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { setupHarness } from './__test-utils__/setup';
 
@@ -83,6 +83,29 @@ describe('session.om — config resolution + accessors (§9.2)', () => {
       expect(session.getRecord().observationalMemory?.reflectorModelId).toBe('openai/gpt-4o-mini');
     } finally {
       await harness.shutdown();
+    }
+  });
+
+  it('warns ONCE that a model switch records intent but does not change runtime OM (still records it)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { harness } = setupHarness({ observationalMemory: { model: 'google/gemini-2.5-flash' } });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      try {
+        await session.om.switchObserverModel({ model: 'anthropic/claude-haiku-4-5' });
+        await session.om.switchReflectorModel({ model: 'openai/gpt-4o-mini' });
+        // Warned exactly once for the session, and the message names the constraint.
+        const omWarnings = warn.mock.calls.filter(c => String(c[0]).includes('Observational Memory'));
+        expect(omWarnings).toHaveLength(1);
+        expect(String(omWarnings[0]![0])).toMatch(/threadConfig\.observationalMemory/);
+        // Intent is STILL recorded (read-back works) despite the runtime no-op.
+        expect(session.om.getObserverModelId()).toBe('anthropic/claude-haiku-4-5');
+        expect(session.om.getReflectorModelId()).toBe('openai/gpt-4o-mini');
+      } finally {
+        await harness.shutdown();
+      }
+    } finally {
+      warn.mockRestore();
     }
   });
 

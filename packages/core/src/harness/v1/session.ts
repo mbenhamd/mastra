@@ -8564,6 +8564,19 @@ export class Session {
   // the session lease via `_flushUpdate` and never touch raw MemoryStorage rows.
   // The redacted snapshot read (`getRecord`/`loadProgress`, §4.8) is a separate
   // follow-up slice.
+  //
+  // CONTRACT (read this): `switchObserverModel`/`switchReflectorModel` record
+  // durable per-session INTENT — they do NOT change runtime OM behavior today.
+  // Effective OM (its observer/reflector models, scope, and thresholds) is fixed
+  // at the Agent's Memory CONSTRUCTION via `Memory.threadConfig.observationalMemory`;
+  // the harness deliberately does NOT thread a per-turn OM option, because core
+  // Memory builds its OM engine only from constructor config AND suppresses the
+  // MessageHistory processor whenever it sees OM "enabled" (so a runtime OM option
+  // for a Memory not constructed with OM would drop history without attaching OM —
+  // see the DEFERRED note on `_omWriteConfig`). To actually USE OM, construct the
+  // Agent's Memory with OM; the `om.get*` accessors then report that resolved
+  // config, and the switches stay recorded intent until upstream adds runtime OM
+  // override. An explicit switch logs a one-time advisory (see `_warnOmIntentInert`).
   // -------------------------------------------------------------------------
 
   readonly om = Object.freeze({
@@ -8606,6 +8619,7 @@ export class Session {
     if (typeof opts?.model !== 'string' || opts.model.length === 0) {
       throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
     }
+    this._warnOmIntentInert();
     if (this._record.observationalMemory?.observerModelId === opts.model) return;
     await this._omWriteConfig(prev => ({ ...prev, observerModelId: opts.model }));
   }
@@ -8615,8 +8629,34 @@ export class Session {
     if (typeof opts?.model !== 'string' || opts.model.length === 0) {
       throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
     }
+    this._warnOmIntentInert();
     if (this._record.observationalMemory?.reflectorModelId === opts.model) return;
     await this._omWriteConfig(prev => ({ ...prev, reflectorModelId: opts.model }));
+  }
+
+  /** @internal — guards {@link _warnOmIntentInert} to once per live session. */
+  private _omIntentInertWarned = false;
+
+  /**
+   * §9.2 OM honesty — warn ONCE per session that an explicit `session.om.*` model
+   * switch records durable per-session INTENT but does NOT change runtime OM
+   * behavior. OM observer/reflector models, scope, and thresholds are fixed at
+   * the Agent's Memory CONSTRUCTION (Memory `threadConfig.observationalMemory`);
+   * the per-turn path forwards only temporal markers, so a session-level switch
+   * is inert at runtime today — and core Memory SUPPRESSES MessageHistory when it
+   * sees OM "enabled", so a runtime OM option for non-OM-constructed Memory would
+   * drop history WITHOUT attaching OM. The config is still recorded (read-back via
+   * `om.get*`) for forward-compat + declared-intent inspection. Advisory only.
+   */
+  private _warnOmIntentInert(): void {
+    if (this._omIntentInertWarned) return;
+    this._omIntentInertWarned = true;
+    console.warn(
+      '[harness/v1] session.om model switch records durable per-session intent but does NOT change runtime ' +
+        'Observational Memory behavior: OM models/scope/thresholds are fixed at the Agent Memory construction ' +
+        '(threadConfig.observationalMemory). Effective OM requires constructing the Memory with OM; per-session ' +
+        'runtime override is pending upstream support. The intent is still recorded for read-back.',
+    );
   }
 
   /** The full per-session OM snapshot seeded from the resolved harness defaults. */
