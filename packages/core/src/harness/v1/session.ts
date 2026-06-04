@@ -1011,11 +1011,16 @@ export interface SessionDisplayState {
   planTasks?: PlanTaskSummary;
 }
 
-export type SessionDisplayPending = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies'>;
+export type SessionDisplayPending = Omit<
+  NonNullable<SessionRecord['pendingResume']>,
+  'runtimeDependencies' | 'requestContext'
+>;
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
   if (!pending) return null;
-  const { runtimeDependencies: _runtimeDependencies, ...displayPending } = pending;
+  // Strip storage-internal recovery fields (runtimeDependencies) and the caller
+  // app bag (requestContext) — neither belongs on the public display projection.
+  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
   return displayPending;
 }
 
@@ -1129,6 +1134,14 @@ export class Session {
    * queuedItemId discriminates those) and for paths with no originating signal.
    */
   private _currentRunSignalId?: string;
+  /**
+   * §5.1 — the active turn's caller request context (the `app` metadata bag +
+   * trusted `channel` projection). Stashed in `_buildRequestContext` so a
+   * suspension can persist it on `PendingResume` and a `respondTo*` resume can
+   * rebuild the SAME context (queued drains already carry it via
+   * `item.requestContext`; resume previously dropped it). Cleared per turn.
+   */
+  private _currentTurnRequestContext?: PersistedRequestContextInput;
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
@@ -2071,6 +2084,7 @@ export class Session {
     this._currentRunModeId = undefined;
     this._currentRunModelId = undefined;
     this._currentRunSignalId = undefined;
+    this._currentTurnRequestContext = undefined;
     this._currentMessageId = undefined;
     this._currentTraceId = undefined;
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
@@ -2105,6 +2119,7 @@ export class Session {
       this._currentRunModeId = undefined;
       this._currentRunModelId = undefined;
       this._currentRunSignalId = undefined;
+      this._currentTurnRequestContext = undefined;
       this._currentMessageId = undefined;
       this._currentTraceId = undefined;
       this._activeTools.clear();
@@ -7201,6 +7216,11 @@ export class Session {
       // §4.2e — carry the active turn's yolo so the resumed run keeps auto-granting.
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(modeId, modelId),
+      // §5.1 — persist the suspended turn's caller app bag so a resume rebuilds the
+      // SAME context (a re-suspend re-captures it because resume re-stashes it).
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: this._buildResumePayload(kind, payload),
     };
 
@@ -9258,6 +9278,11 @@ export class Session {
         modeId: resumeModeId,
         modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
         abortSignal: turnAbortController.signal,
+        // §5.1 — rebuild the SAME caller app bag the suspended turn carried (the
+        // queued-drain path already threads `item.requestContext`; resume used to
+        // drop it). `_buildRequestContext` re-stashes it so a re-suspend on this
+        // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
+        ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
         yolo: pending.yolo === true,
       });
       const resumeStream = agent.resumeStream(resumeData, {
@@ -11847,6 +11872,10 @@ export class Session {
         params.modeId ?? this._record.modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         question: params.question,
         ...(params.options ? { options: params.options } : {}),
@@ -11908,6 +11937,10 @@ export class Session {
         modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         sandboxAccess: {
           semanticType: params.semanticType,
@@ -11978,6 +12011,10 @@ export class Session {
         submittingModeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         ...(params.title !== undefined ? { title: params.title } : {}),
         plan: params.plan,
@@ -12629,6 +12666,14 @@ export class Session {
     const persistedRequestContext = turn.persistedRequestContext
       ? clonePersistedRequestContext(turn.persistedRequestContext)
       : undefined;
+    // §5.1 — stash the turn's caller context so a suspension can persist it on
+    // `PendingResume` and a resume rebuild the SAME app bag. GUARDED on
+    // `turn.persistedRequestContext` so non-turn callers (e.g. `mcp.listTools`,
+    // which pass no caller context) never clobber an active turn's stash; the
+    // per-turn reset in `_resetTurnTracking` keeps turn N's bag out of turn N+1.
+    if (persistedRequestContext !== undefined) {
+      this._currentTurnRequestContext = persistedRequestContext;
+    }
     // §6.2 strict-lazy materialization: context construction MUST NOT cold-start a
     // (cloud) workspace solely to fill the `ctx.workspace` field. Default to the
     // cached handle (non-materializing); a tool that needs the filesystem calls

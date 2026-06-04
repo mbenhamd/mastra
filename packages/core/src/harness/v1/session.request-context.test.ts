@@ -122,3 +122,72 @@ describe('skills.use() — request-context', () => {
 // the unit/logic review rather than here, since deterministically holding a concurrent in-flight
 // turn open against MockAgent is racy; HarnessConfigError is imported to keep the contract visible.
 void HarnessConfigError;
+
+describe('respondTo* resume — request-context restoration (§5.1 / C3)', () => {
+  it('persists the suspended turn app bag on PendingResume, rebuilds it on resume, and a re-suspend re-persists it', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Turn 1: suspend on a tool approval with a caller app bag.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'r1',
+      suspendPayload: { toolCallId: 'tc1', toolName: 'do_thing', args: {} },
+    });
+    await session.message({ content: 'go', requestContext: { app: { tenant: 't1', plan: 'pro' } } });
+
+    // The suspended turn's app bag is persisted on the pending resume (storage-internal)...
+    const pending = session.getRecord().pendingResume;
+    expect(pending?.toolCallId).toBe('tc1');
+    expect(pending?.requestContext?.metadata).toEqual({ tenant: 't1', plan: 'pro' });
+    // ...and STRIPPED from the public display projection (like runtimeDependencies).
+    const displayPending = session.getDisplayState().pending as Record<string, unknown> | null;
+    expect(displayPending).not.toBeNull();
+    expect(displayPending).not.toHaveProperty('requestContext');
+
+    // Resume → suspend AGAIN, proving the restored bag is re-stashed + re-persisted.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'r1',
+      suspendPayload: { toolCallId: 'tc2', toolName: 'do_thing', args: {} },
+    });
+    await session.respondToToolApproval({ approved: true });
+
+    // The RESUMED run received the SAME app bag the suspended turn carried.
+    const resumeCtx = (agent.resumeCalls.at(-1)!.options as any).requestContext;
+    expect(resumeCtx).toBeDefined();
+    expect(resumeCtx.get('app')).toEqual({ tenant: 't1', plan: 'pro' });
+
+    // The re-suspension re-persisted the bag for the NEXT resume too.
+    const pending2 = session.getRecord().pendingResume;
+    expect(pending2?.toolCallId).toBe('tc2');
+    expect(pending2?.requestContext?.metadata).toEqual({ tenant: 't1', plan: 'pro' });
+
+    // Final resume completes and still carries the bag.
+    agent.enqueueRun({ finishReason: 'stop', text: 'done', runId: 'r1' });
+    const result = await session.respondToToolApproval({ approved: true });
+    expect((result as { text?: string }).text).toBe('done');
+    const finalCtx = (agent.resumeCalls.at(-1)!.options as any).requestContext;
+    expect(finalCtx.get('app')).toEqual({ tenant: 't1', plan: 'pro' });
+  });
+
+  it('resumes a legacy pending (no persisted requestContext) with no app bag — additive back-compat', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Suspend WITHOUT a caller request context.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'r2',
+      suspendPayload: { toolCallId: 'tc1', toolName: 'do_thing', args: {} },
+    });
+    await session.message({ content: 'go' });
+    expect(session.getRecord().pendingResume?.requestContext).toBeUndefined();
+
+    agent.enqueueRun({ finishReason: 'stop', text: 'ok', runId: 'r2' });
+    await session.respondToToolApproval({ approved: true });
+    const resumeCtx = (agent.resumeCalls.at(-1)!.options as any).requestContext;
+    expect(resumeCtx).toBeDefined(); // the harness slot is always rebuilt...
+    expect(resumeCtx.get('app')).toBeUndefined(); // ...but there is no app bag to restore
+  });
+});

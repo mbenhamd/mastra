@@ -187,6 +187,17 @@ export interface PendingResume {
    */
   runtimeDependencies?: HarnessRuntimeDependencyRefs;
   /**
+   * §5.1 caller request context (the `app` metadata bag + trusted `channel`
+   * projection) captured from the turn that SUSPENDED, so a `respondTo*` resume
+   * rebuilds the SAME app bag the suspended run carried — mirroring how
+   * `QueuedItem.requestContext` is threaded back in on queue drain. This is the
+   * ORIGINAL turn's context, never the responder's. Absent on legacy rows ⇒
+   * resume rebuilds with no caller app bag (prior behaviour). Storage-internal:
+   * stripped from the public `SessionDisplayPending` / `PendingInteraction`
+   * projections alongside `runtimeDependencies`.
+   */
+  requestContext?: PersistedRequestContextInput;
+  /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
    * "wrote resumedAt" and "cleared pendingResume" does not double-resume.
