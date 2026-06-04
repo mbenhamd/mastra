@@ -295,15 +295,27 @@ export class AgentThreadStreamRuntime {
       for (const waiter of pending) waiter();
     };
 
+    // A real `MastraModelOutput` exposes `fullStream` as an evented getter that
+    // yields a fresh independent stream on every access, so the drain loop can
+    // read it lazily without competing with the caller. The synthetic
+    // persisted-signal output (#broadcastPersistedSignal) instead defines
+    // `fullStream` as a one-shot OWN-PROPERTY ReadableStream that only one
+    // consumer can drain. Capture that single stream up front so the drain owns
+    // it, then (below) redefine the own property to a multicast replay so the
+    // caller reads through the same buffer instead of racing the drain.
+    const ownFullStream = Object.prototype.hasOwnProperty.call(output, 'fullStream');
+    const capturedSource = ownFullStream ? (output.fullStream as any) : undefined;
+
     const start = () => {
       if (started) return;
       started = true;
       void (async () => {
         try {
-          // Read `output.fullStream` lazily so a real MastraModelOutput's evented
-          // getter yields a fresh stream for the drain loop, independent of the
-          // caller's own `output.fullStream` access.
-          const source = output.fullStream as any;
+          // For getter-based outputs read `output.fullStream` lazily so the
+          // evented getter yields a fresh stream for the drain loop, independent
+          // of the caller's own access; for own-property one-shot outputs drain
+          // the single captured stream.
+          const source = ownFullStream ? capturedSource : (output.fullStream as any);
           if (!source) return;
           for await (const part of source) {
             runtime.#markApprovalSuspendedFromPart(pubsub, runId, part);
@@ -359,6 +371,26 @@ export class AgentThreadStreamRuntime {
         },
       });
     };
+
+    // For the own-property one-shot path, redefine `fullStream` to a multicast
+    // replay stream so the caller reads through the shared buffer (single drain,
+    // no starvation) instead of racing the eager drain for the single stream.
+    if (ownFullStream) {
+      Object.defineProperty(output, 'fullStream', {
+        configurable: true,
+        enumerable: true,
+        get: () => createSubscriberStream(),
+      });
+    }
+
+    // Kick the drain eagerly (matching upstream's `#withBroadcastStream`, whose
+    // buffer fills regardless of subscribers). A LOCAL run consumed only by the
+    // original caller — with no thread subscribers — must still run the drain so
+    // `#markApprovalSuspendedFromPart` observes a `tool-call-approval` part and
+    // marks the run approval-suspended; otherwise the finalizer treats a
+    // suspended run as completed and clears its record. The buffer-fills-
+    // regardless memory profile was explicitly accepted by review.
+    start();
 
     return createSubscriberStream;
   }
