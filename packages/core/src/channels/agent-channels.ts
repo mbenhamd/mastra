@@ -1560,7 +1560,12 @@ export class AgentChannels {
     // stuck approval. So we emit the built-in approval card here, which is the
     // faithful legacy equivalent. Kept in sync with the slack
     // `mapLegacyToolDisplay` shim.
-    if (!fn && deprecatedFormatToolCall) {
+    //
+    // Like `cards`, the legacy fn applies ONLY when `toolDisplay` is not set in
+    // ANY form: an explicit string mode (e.g. `'cards'`) must win over a legacy
+    // `formatToolCall` supplied alongside it by a cast/JS caller — matching the
+    // slack mapper, which returns an explicit `toolDisplay` immediately.
+    if (requested === undefined && deprecatedFormatToolCall) {
       fn = event => {
         if (event.kind === 'approval') {
           return { kind: 'post', message: renderBuiltInToolEvent(event, 'cards') };

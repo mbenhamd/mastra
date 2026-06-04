@@ -845,6 +845,35 @@ describe('consumeAgentStream', () => {
       expect(texts).toContain('🛠 weather=sunny');
     });
 
+    it('explicit toolDisplay mode wins over a legacy formatToolCall supplied alongside it', async () => {
+      // A cast/JS caller can set both; the explicit string mode must win —
+      // matching the slack mapLegacyToolDisplay shim (explicit returns first).
+      const formatToolCall = vi.fn(({ toolName, result }: any) => `🛠 ${toolName}=${String(result)}`);
+      const { channels, calls, chatThread } = makeChannels({
+        streaming: false,
+        toolDisplay: 'cards',
+        formatToolCall,
+      });
+      await drive(
+        channels,
+        [
+          { type: 'tool-call', payload: { toolCallId: 't1', toolName: 'weather', args: { city: 'NYC' } } },
+          {
+            type: 'tool-result',
+            payload: { toolCallId: 't1', toolName: 'weather', args: { city: 'NYC' }, result: 'sunny' },
+          },
+          { type: 'finish', payload: {} },
+        ],
+        chatThread,
+      );
+      expect(formatToolCall).not.toHaveBeenCalled();
+      const texts = calls
+        .filter(c => c.kind === 'post')
+        .map(p => (p as any).arg)
+        .filter((a): a is string => typeof a === 'string');
+      expect(texts.some(t => t.includes('🛠'))).toBe(false);
+    });
+
     it('deprecated formatToolCall still posts the built-in approval card in static mode', async () => {
       // Regression: setting `formatToolCall` shims into a `toolDisplayFn`, which
       // makes core treat the adapter as approval-capable (no auto-approve). If
