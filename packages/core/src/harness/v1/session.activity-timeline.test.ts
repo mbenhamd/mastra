@@ -132,4 +132,37 @@ describe('Session.getActivityTimeline() — session wiring (§5.1b.4)', () => {
       await harness.shutdown();
     }
   });
+
+  it('does not lose entries when a same-timestamp run exceeds the bounded read (PR #200 P2)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // 12 messages share ONE timestamp (storage orders only by createdAt; the
+      // timeline tiebreaks by entryId) + 2 later messages.
+      await seed(harness, [
+        ...Array.from({ length: 12 }, (_, i) =>
+          userMessage(`same-${String(i).padStart(2, '0')}`, session.threadId, 'u1', `same-${i}`, new Date(5000)),
+        ),
+        userMessage('later-0', session.threadId, 'u1', 'later-0', new Date(6000)),
+        userMessage('later-1', session.threadId, 'u1', 'later-1', new Date(7000)),
+      ]);
+
+      // Walk ALL pages with limit 5; the union must be exactly the 14 entries,
+      // no duplicates, no skips — even though every page boundary lands inside
+      // the same-timestamp run.
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      for (let guard = 0; guard < 10; guard++) {
+        const page = await session.getActivityTimeline({ limit: 5, ...(cursor ? { cursor } : {}) });
+        seen.push(...page.entries.map(e => e.summary as string));
+        if (!page.truncated || !page.nextCursor) break;
+        cursor = page.nextCursor;
+      }
+      expect(seen).toHaveLength(14);
+      expect(new Set(seen).size).toBe(14);
+      expect(seen.slice(12)).toEqual(['later-0', 'later-1']);
+    } finally {
+      await harness.shutdown();
+    }
+  });
 });

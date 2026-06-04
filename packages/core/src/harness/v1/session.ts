@@ -7890,7 +7890,7 @@ export class Session {
       // source kinds. Caps keep the read-time projection server-bounded (§9).
       const MAX_DESCENDANTS = 50;
       const MAX_DEPTH = 4;
-      const collected: { id: string; threadId: string; parentSessionId: string; depth: number }[] = [];
+      const collected: { id: string; threadId: string; parentSessionId: string; depth: number; lastActivityAt: number }[] = [];
       let frontier = [{ id: this.id, depth: 0 }];
       const visited = new Set<string>([this.id]);
       while (frontier.length > 0 && collected.length < MAX_DESCENDANTS) {
@@ -7910,7 +7910,13 @@ export class Session {
           for (const child of children) {
             if (visited.has(child.id) || collected.length >= MAX_DESCENDANTS) continue;
             visited.add(child.id);
-            collected.push({ id: child.id, threadId: child.threadId, parentSessionId: node.id, depth: node.depth + 1 });
+            collected.push({
+              id: child.id,
+              threadId: child.threadId,
+              parentSessionId: node.id,
+              depth: node.depth + 1,
+              lastActivityAt: child.lastActivityAt,
+            });
             nextFrontier.push({ id: child.id, depth: node.depth + 1 });
           }
         }
@@ -7926,9 +7932,11 @@ export class Session {
           subagent: {
             parentSessionId: child.parentSessionId,
             childSessionId: child.id,
-            // SessionSummary carries no createdAt; use the addressed turn time as a
-            // stable, bounded best-effort anchor for the subagent entry.
-            createdAt: generatedAt,
+            // DURABLE anchor (PR #200 review): `generatedAt` regenerated per request,
+            // so a cursor page could re-return / reorder the subagent entry forever.
+            // SessionSummary has no createdAt, but lastActivityAt is stored and only
+            // moves on real child activity — stable across paginated reads.
+            createdAt: child.lastActivityAt,
           },
         });
       }
@@ -7956,17 +7964,68 @@ export class Session {
   ): Promise<HarnessMessage[]> {
     const memory = await this._harness._internalTryGetMemoryStorage();
     if (!memory) return [];
-    const result = await memory.listMessages({
-      threadId,
-      resourceId,
-      perPage: bound.limit + 1,
-      page: 0,
-      orderBy: { field: 'createdAt', direction: 'ASC' },
-      ...(bound.sinceOccurredAt !== undefined
-        ? { filter: { dateRange: { start: new Date(bound.sinceOccurredAt) } } }
-        : {}),
-    });
-    return result.messages.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
+    const pageSize = bound.limit + 1;
+    const fetchPage = (page: number, startMs: number | undefined, startExclusive: boolean) =>
+      memory.listMessages({
+        threadId,
+        resourceId,
+        perPage: pageSize,
+        page,
+        orderBy: { field: 'createdAt', direction: 'ASC' },
+        ...(startMs !== undefined ? { filter: { dateRange: { start: new Date(startMs), startExclusive } } } : {}),
+      });
+    const msgTs = (msg: { createdAt: unknown }) => new Date(msg.createdAt as Date).getTime();
+
+    // PR #200 review (P2): storage orders only by createdAt while the timeline
+    // tiebreaks by (occurredAt, sessionId, entryId), so a fetch boundary that
+    // splits a SAME-TIMESTAMP run lets storage return an arbitrary subset of that
+    // run — entries can be skipped across cursor pages or `truncated`
+    // under-reported. Two invariants restore correctness while staying bounded:
+    //   1. COHORT COMPLETENESS — every timestamp present in the returned rows is
+    //      returned COMPLETELY (keep paging while the trailing timestamp repeats),
+    //      so buildActivityTimeline's precise tiebreak always sees full cohorts.
+    //   2. CURSOR PROGRESS — accumulate at least `limit + 1` rows STRICTLY AFTER
+    //      the cursor timestamp (a cursor parked at the end of a large cohort
+    //      otherwise refetches only already-consumed rows and the walk stalls).
+    // Each fetch stays bounded; the pre-P6.3 code read the entire log, so this
+    // remains a strict win even on pathological same-timestamp data.
+    const rows: Awaited<ReturnType<typeof fetchPage>>['messages'] = [];
+    let windowStartMs = bound.sinceOccurredAt;
+    let windowExclusive = false;
+    let beyondCursorCount = 0;
+    for (;;) {
+      const first = await fetchPage(0, windowStartMs, windowExclusive);
+      let fetched = first.messages;
+      rows.push(...fetched);
+      let exhausted = fetched.length < pageSize;
+      if (!exhausted) {
+        // Invariant 1: complete the trailing timestamp's cohort.
+        const boundaryMs = msgTs(fetched[fetched.length - 1]!);
+        for (let page = 1; ; page++) {
+          const next = await fetchPage(page, windowStartMs, windowExclusive);
+          let advanced = next.messages.length === 0;
+          for (const msg of next.messages) {
+            if (msgTs(msg) === boundaryMs) {
+              rows.push(msg);
+            } else {
+              advanced = true;
+              break;
+            }
+          }
+          if (next.messages.length < pageSize) exhausted = !advanced && true;
+          if (advanced || next.messages.length < pageSize) break;
+        }
+        // Invariant 2: continue strictly past the completed cohort if needed.
+        windowStartMs = boundaryMs;
+        windowExclusive = true;
+      }
+      beyondCursorCount =
+        bound.sinceOccurredAt === undefined
+          ? rows.length
+          : rows.reduce((n, msg) => (msgTs(msg) > bound.sinceOccurredAt! ? n + 1 : n), 0);
+      if (exhausted || beyondCursorCount >= pageSize) break;
+    }
+    return rows.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
   }
 
   // -------------------------------------------------------------------------
