@@ -82,7 +82,7 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
       throw new Error('WhatsApp inbound signature verification failed');
     }
 
-    const payload = this.#parsePayload(rawBody, request.body);
+    const payload = this.#parsePayload(rawBody);
     return this.#projectFirstChatMessage(payload);
   }
 
@@ -164,10 +164,13 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
     return JSON.stringify(request.body ?? {});
   }
 
-  #parsePayload(rawBody: Uint8Array | string, parsedBody: unknown): WhatsAppWebhookPayload {
-    if (parsedBody && typeof parsedBody === 'object') {
-      return parsedBody as WhatsAppWebhookPayload;
-    }
+  /**
+   * Parse the payload STRICTLY from the signed bytes. The signature is verified
+   * over `rawBody`, so we never trust a pre-parsed `request.body`: middleware
+   * could mutate the parsed object so it diverges from the bytes we just
+   * authenticated, which would admit unsigned data as a chat turn.
+   */
+  #parsePayload(rawBody: Uint8Array | string): WhatsAppWebhookPayload {
     const text = typeof rawBody === 'string' ? rawBody : Buffer.from(rawBody).toString('utf8');
     return JSON.parse(text) as WhatsAppWebhookPayload;
   }
@@ -181,6 +184,14 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
         // `field: 'messages'` carries both inbound messages and status callbacks.
         if (change.field !== 'messages') continue;
         const value = change.value ?? {};
+        // Reject inbound events addressed to a different business phone number.
+        // In shared-webhook setups (one endpoint fanning out to many numbers)
+        // this prevents cross-number admission: only events whose
+        // `metadata.phone_number_id` matches the configured one are admitted.
+        const metadataPhoneNumberId = value.metadata?.phone_number_id;
+        if (metadataPhoneNumberId !== this.#config.phoneNumberId) {
+          throw new Error('WhatsApp inbound: phone_number_id mismatch');
+        }
         const messages = value.messages ?? [];
         // A chat turn is either a `text` body or an `interactive` button/list
         // reply (the user tapped a quick-reply button / picked a list row). Other
@@ -203,7 +214,7 @@ export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
           conversationKind: 'dm',
           trigger: 'message',
           externalTenantId: entry.id, // WhatsApp Business Account id
-          externalChannelId: value.metadata?.phone_number_id, // business phone-number id
+          externalChannelId: metadataPhoneNumberId, // business phone-number id
           externalThreadId: from, // per-user conversation == the user's wa_id
           externalMessageId: message.id,
           // The reply `title` is the user-facing turn content; the developer-set

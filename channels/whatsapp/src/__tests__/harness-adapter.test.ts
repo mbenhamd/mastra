@@ -217,6 +217,33 @@ describe('WhatsAppHarnessAdapter.verifyInbound', () => {
     );
   });
 
+  it('throws when metadata.phone_number_id does not match the configured number', async () => {
+    const adapter = makeAdapter();
+    const payload = textPayload();
+    payload.entry[0]!.changes[0]!.value.metadata = { phone_number_id: 'someone-elses-number' };
+    await expect(adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never)).rejects.toThrow(
+      /phone_number_id mismatch/i,
+    );
+  });
+
+  it('parses the payload from the signed bytes, ignoring a mutated request.body', async () => {
+    const adapter = makeAdapter();
+    const signedPayload = textPayload();
+    const rawBody = JSON.stringify(signedPayload);
+    // A different object than the signed bytes (as a mutating middleware might supply).
+    const mutatedBody = textPayload();
+    mutatedBody.entry[0]!.changes[0]!.value.messages![0]!.text = { body: 'evil injected text' };
+    const request = {
+      method: 'POST',
+      path: '/inbound',
+      headers: { 'x-hub-signature-256': sign(rawBody) },
+      rawBody,
+      body: mutatedBody,
+    };
+    const envelope = await adapter.verifyInbound(request as never, routeCtx as never);
+    expect(envelope.content).toBe('hello from whatsapp');
+  });
+
   it('maps an interactive button_reply into a chat envelope (title as content, id in raw)', async () => {
     const adapter = makeAdapter();
     const payload = textPayload();
