@@ -2083,6 +2083,101 @@ describe('Agent signals', () => {
     }
   });
 
+  it('marks a caller-only approval-suspended run without any thread subscribers', async () => {
+    // Regression: the local multicast drain detects the approval marker. With no
+    // thread subscribers nothing pulls a subscriber stream, so the drain must be
+    // kicked eagerly at registration — otherwise #markApprovalSuspendedFromPart
+    // never runs and the finalizer wrongly treats the suspended run as completed,
+    // clearing its record. Here there is NO subscribeToThread caller at all.
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'caller-only-approval-agent' } as Agent<any, any, any, any>;
+    const threadId = 'caller-only-approval-thread';
+    const resourceId = 'caller-only-approval-user';
+    const runId = 'caller-only-approval-run';
+
+    let finishSuspended!: () => void;
+    const suspendedFinished = new Promise<void>(resolve => {
+      finishSuspended = resolve;
+    });
+    const suspendedCompletion = runtime.registerRun(
+      agent,
+      {
+        runId,
+        status: 'suspended',
+        fullStream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'start', runId });
+            controller.enqueue({
+              type: 'tool-call-approval',
+              runId,
+              payload: { toolCallId: 'tool-call-1', toolName: 'testTool' },
+            });
+            controller.close();
+          },
+        }),
+        _waitUntilFinished: () => suspendedFinished,
+      } as any,
+      { memory: { thread: threadId, resource: resourceId } } as any,
+    );
+
+    // Drive and await the finalizer with no subscriber ever attached.
+    finishSuspended();
+    await withTimeout(
+      suspendedCompletion ?? Promise.resolve(),
+      'Timed out waiting for caller-only approval-suspended finalizer',
+    );
+    await nextTick();
+
+    // The approval marker must have been set by the eager drain: the thread stays
+    // blocked (active) and the run record is retained rather than finalized-as-
+    // completed and deleted.
+    expect(runtime.getThreadState({ resourceId, threadId })).toBe('active');
+    expect(runtime.getRunOutput(runId)).toBeDefined();
+
+    // A subsequent resume reuses the same runId and must re-register cleanly
+    // (the retained record is dropped via #clearApprovalSuspendedRunForResume).
+    let finishResumed!: () => void;
+    const resumedFinished = new Promise<void>(resolve => {
+      finishResumed = resolve;
+    });
+    const resumedCompletion = runtime.registerRun(
+      agent,
+      {
+        runId,
+        status: 'running',
+        fullStream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'start', runId });
+            controller.enqueue({ type: 'text-start', runId, payload: { id: 'text-1' } });
+            controller.enqueue({
+              type: 'text-delta',
+              runId,
+              payload: { id: 'text-1', text: 'approved response' },
+            });
+            controller.enqueue({ type: 'text-end', runId, payload: { id: 'text-1' } });
+            controller.enqueue({
+              type: 'finish',
+              runId,
+              payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+            });
+            controller.close();
+            finishResumed();
+          },
+        }),
+        _waitUntilFinished: () => resumedFinished,
+      } as any,
+      { memory: { thread: threadId, resource: resourceId } } as any,
+    );
+
+    await withTimeout(resumedCompletion ?? Promise.resolve(), 'Timed out waiting for resumed run completion');
+    await nextTick();
+
+    // The resumed run completed normally: the thread is idle again and the record
+    // is cleared.
+    expect(runtime.getThreadState({ resourceId, threadId })).toBe('idle');
+    expect(runtime.getRunOutput(runId)).toBeUndefined();
+  });
+
   it('queues queueMessage until the active run completes', async () => {
     let releaseFirst!: () => void;
     const firstFinished = new Promise<void>(resolve => {
