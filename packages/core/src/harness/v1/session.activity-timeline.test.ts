@@ -5,7 +5,7 @@
  * activity-timeline.test.ts; here we verify the session wiring.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { MastraDBMessage } from '../../agent/types';
 
@@ -83,6 +83,51 @@ describe('Session.getActivityTimeline() — session wiring (§5.1b.4)', () => {
       const second = await session.getActivityTimeline({ cursor: first.nextCursor, limit: 2 });
       expect(second.entries).toHaveLength(1);
       expect(second.truncated).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('reads at most `limit + 1` messages per thread instead of the whole log (P6.3), and still paginates correctly', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const memory = await harness._internalTryGetMemoryStorage();
+      if (!memory) throw new Error('test setup expected memory storage');
+      // 50 messages — far more than the page limit below.
+      await seed(
+        harness,
+        Array.from({ length: 50 }, (_, i) =>
+          userMessage(`m${i}`, session.threadId, 'u1', `msg-${i}`, new Date(1000 + i)),
+        ),
+      );
+
+      const listSpy = vi.spyOn(memory, 'listMessages');
+      const first = await session.getActivityTimeline({ limit: 5 });
+
+      // The bounded read: perPage is `limit + 1` (NOT `false`), ordered ascending.
+      expect(listSpy).toHaveBeenCalled();
+      const args = listSpy.mock.calls[0]![0] as {
+        perPage?: number | false;
+        orderBy?: { field?: string; direction?: string };
+        filter?: unknown;
+      };
+      expect(args.perPage).toBe(6);
+      expect(args.orderBy).toEqual({ field: 'createdAt', direction: 'ASC' });
+      expect(args.filter).toBeUndefined(); // no cursor on the first page
+
+      // Output is still correct: first page is the 5 oldest, truncated, with a cursor.
+      expect(first.entries).toHaveLength(5);
+      expect(first.entries.map(e => e.summary)).toEqual(['msg-0', 'msg-1', 'msg-2', 'msg-3', 'msg-4']);
+      expect(first.truncated).toBe(true);
+
+      // The next page reads with an inclusive dateRange lower bound from the cursor.
+      listSpy.mockClear();
+      const second = await session.getActivityTimeline({ cursor: first.nextCursor, limit: 5 });
+      const args2 = listSpy.mock.calls[0]![0] as { perPage?: number | false; filter?: { dateRange?: { start?: Date } } };
+      expect(args2.perPage).toBe(6);
+      expect(args2.filter?.dateRange?.start).toBeInstanceOf(Date);
+      expect(second.entries.map(e => e.summary)).toEqual(['msg-5', 'msg-6', 'msg-7', 'msg-8', 'msg-9']);
     } finally {
       await harness.shutdown();
     }

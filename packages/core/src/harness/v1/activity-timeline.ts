@@ -148,6 +148,36 @@ function decodeCursor(
   return { o: decoded.o, s: decoded.s, e: decoded.e };
 }
 
+/**
+ * §6.1 / P6.3 — compute the bounded per-thread message-read window for
+ * `getActivityTimeline` BEFORE any source scan. Returns the same `limit`
+ * {@link buildActivityTimeline} will apply, plus the inclusive lower-bound
+ * `occurredAt` implied by an optional forward cursor. A caller reads at most
+ * `limit + 1` oldest-at/after-cursor messages PER THREAD instead of the whole
+ * log: the timeline paginates forward (oldest→newest, `slice(0, limit)` after an
+ * ascending sort), so the oldest `limit` global entries can span at most
+ * `limit + 1` messages from any one thread (entries within a message share the
+ * message's `occurredAt`), and the `+1` keeps truncation detection exact when a
+ * single thread alone overflows the page. The precise `> cursor` tiebreak and the
+ * final slice stay in {@link buildActivityTimeline}; the lower bound is
+ * intentionally INCLUSIVE on `occurredAt` so a same-timestamp boundary is not
+ * over-excluded by the coarse date filter. Decoding the cursor here also makes a
+ * malformed/wrong-scope cursor reject BEFORE the read rather than after.
+ */
+export function activityTimelineMessageReadBound(
+  opts: ActivityTimelineOptions,
+  addressedSessionId: string,
+  includeDescendants: boolean,
+): { limit: number; sinceOccurredAt?: number } {
+  if (opts.limit !== undefined && (typeof opts.limit !== 'number' || !Number.isInteger(opts.limit) || opts.limit < 1)) {
+    throw new HarnessValidationError('limit', 'must be a positive integer when provided');
+  }
+  const limit = Math.min(opts.limit ?? ACTIVITY_TIMELINE_DEFAULT_LIMIT, ACTIVITY_TIMELINE_MAX_LIMIT);
+  const sinceOccurredAt =
+    opts.cursor !== undefined ? decodeCursor(opts.cursor, addressedSessionId, includeDescendants).o : undefined;
+  return sinceOccurredAt !== undefined ? { limit, sinceOccurredAt } : { limit };
+}
+
 /** `(occurredAt, sessionId, entryId)` total order. */
 function compareKeys(a: CursorKey, b: CursorKey): number {
   if (a.o !== b.o) return a.o - b.o;

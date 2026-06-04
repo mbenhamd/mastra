@@ -77,7 +77,7 @@ import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
-import { buildActivityTimeline } from './activity-timeline';
+import { activityTimelineMessageReadBound, buildActivityTimeline } from './activity-timeline';
 import type { ActivityTimelineSessionInput } from './activity-timeline';
 import {
   assertJsonValue,
@@ -7825,13 +7825,17 @@ export class Session {
     this._assertLive('getActivityTimeline()');
     const includeDescendants = opts.includeDescendants === true;
     const generatedAt = Date.now();
+    // P6.3 — derive the bounded per-thread read window up front (also validates
+    // limit + decodes/validates the cursor BEFORE any message scan), so each thread
+    // reads at most `limit + 1` messages instead of its whole log.
+    const readBound = activityTimelineMessageReadBound(opts, this.id, includeDescendants);
 
     const sessions: ActivityTimelineSessionInput[] = [
       {
         sessionId: this.id,
         threadId: this.threadId,
         depth: 0,
-        messages: await this._activityMessagesForThread(this.threadId, this.resourceId),
+        messages: await this._activityMessagesForThread(this.threadId, this.resourceId, readBound),
         ...(this._record.goal
           ? {
               goal: {
@@ -7898,7 +7902,7 @@ export class Session {
           threadId: child.threadId,
           parentSessionId: child.parentSessionId,
           depth: child.depth,
-          messages: await this._activityMessagesForThread(child.threadId, this.resourceId),
+          messages: await this._activityMessagesForThread(child.threadId, this.resourceId, readBound),
           subagent: {
             parentSessionId: child.parentSessionId,
             childSessionId: child.id,
@@ -7916,11 +7920,32 @@ export class Session {
     );
   }
 
-  /** Read a thread's persisted message log for the activity timeline (capped). */
-  private async _activityMessagesForThread(threadId: string, resourceId: string): Promise<HarnessMessage[]> {
+  /**
+   * Read a thread's persisted message log for the activity timeline, BOUNDED to the
+   * oldest `limit + 1` messages at/after the optional cursor (P6.3). Previously this
+   * read `perPage: false` (the whole thread log) for every session in the timeline —
+   * up to 1 + MAX_DESCENDANTS threads — then discarded all but `limit` entries. The
+   * inclusive `dateRange.start` + ascending order + `perPage = limit + 1` are a correct
+   * superset of what `buildActivityTimeline` can place on the page; it still applies the
+   * precise `> cursor` filter and the final `limit` slice, so output is unchanged.
+   */
+  private async _activityMessagesForThread(
+    threadId: string,
+    resourceId: string,
+    bound: { limit: number; sinceOccurredAt?: number },
+  ): Promise<HarnessMessage[]> {
     const memory = await this._harness._internalTryGetMemoryStorage();
     if (!memory) return [];
-    const result = await memory.listMessages({ threadId, resourceId, perPage: false });
+    const result = await memory.listMessages({
+      threadId,
+      resourceId,
+      perPage: bound.limit + 1,
+      page: 0,
+      orderBy: { field: 'createdAt', direction: 'ASC' },
+      ...(bound.sinceOccurredAt !== undefined
+        ? { filter: { dateRange: { start: new Date(bound.sinceOccurredAt) } } }
+        : {}),
+    });
     return result.messages.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
   }
 
