@@ -35,8 +35,41 @@ const RESERVED_REQUEST_CONTEXT_KEYS: ReadonlySet<string> = new Set([
   'userRoles',
 ]);
 
+/**
+ * §4.4c — the canonical reserved-key predicate. A key is infrastructure-owned (never a
+ * caller `app` key) when it is an explicit reserved top-level slot or carries the
+ * `mastra__*` / `__mastra*` namespace prefix. Single source of truth for both
+ * {@link rejectNonAppKey} (admission-time rejection) and {@link stripReservedAppKeys}
+ * (resume-time hygiene), so the two paths can never drift.
+ */
+export function isReservedRequestContextKey(key: string): boolean {
+  return RESERVED_REQUEST_CONTEXT_KEYS.has(key) || key.startsWith('mastra__') || key.startsWith('__mastra');
+}
+
+/**
+ * Drop reserved (infrastructure-owned) keys from a persisted caller `app` metadata bag.
+ * Used on the resume restore path, where `pendingResume.requestContext.metadata` is read
+ * back VERBATIM from durable storage and was never re-run through
+ * {@link validateCallerRequestContext}. Admission already rejects reserved keys, so a
+ * faithfully-persisted bag is unaffected; this strips any that a tampered/legacy durable
+ * record smuggled in before the bag becomes the tool-visible `app` slot. Returns the same
+ * reference when nothing was stripped (no allocation in the common case).
+ */
+export function stripReservedAppKeys<T>(metadata: Record<string, T>): Record<string, T> {
+  // Persisted `app` metadata is canonical JSON (string keys only), so `Object.keys`
+  // covers every key a durable record can carry.
+  let cleaned: Record<string, T> | undefined;
+  for (const key of Object.keys(metadata)) {
+    if (isReservedRequestContextKey(key)) {
+      if (cleaned === undefined) cleaned = { ...metadata };
+      delete cleaned[key];
+    }
+  }
+  return cleaned ?? metadata;
+}
+
 function rejectNonAppKey(key: string, path: string): never {
-  if (RESERVED_REQUEST_CONTEXT_KEYS.has(key) || key.startsWith('mastra__') || key.startsWith('__mastra')) {
+  if (isReservedRequestContextKey(key)) {
     throw new HarnessValidationError(
       `${path}.${key}`,
       `request-context key "${key}" is infrastructure-owned and cannot be supplied by callers`,
