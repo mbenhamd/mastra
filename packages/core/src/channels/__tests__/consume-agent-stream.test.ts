@@ -844,6 +844,97 @@ describe('consumeAgentStream', () => {
       const texts = posts.map(p => (p as any).arg).filter((a): a is string => typeof a === 'string');
       expect(texts).toContain('🛠 weather=sunny');
     });
+
+    it('explicit toolDisplay mode wins over a legacy formatToolCall supplied alongside it', async () => {
+      // A cast/JS caller can set both; the explicit string mode must win —
+      // matching the slack mapLegacyToolDisplay shim (explicit returns first).
+      const formatToolCall = vi.fn(({ toolName, result }: any) => `🛠 ${toolName}=${String(result)}`);
+      const { channels, calls, chatThread } = makeChannels({
+        streaming: false,
+        toolDisplay: 'cards',
+        formatToolCall,
+      });
+      await drive(
+        channels,
+        [
+          { type: 'tool-call', payload: { toolCallId: 't1', toolName: 'weather', args: { city: 'NYC' } } },
+          {
+            type: 'tool-result',
+            payload: { toolCallId: 't1', toolName: 'weather', args: { city: 'NYC' }, result: 'sunny' },
+          },
+          { type: 'finish', payload: {} },
+        ],
+        chatThread,
+      );
+      expect(formatToolCall).not.toHaveBeenCalled();
+      const texts = calls
+        .filter(c => c.kind === 'post')
+        .map(p => (p as any).arg)
+        .filter((a): a is string => typeof a === 'string');
+      expect(texts.some(t => t.includes('🛠'))).toBe(false);
+    });
+
+    it('deprecated formatToolCall still posts the built-in approval card in static mode', async () => {
+      // Regression: setting `formatToolCall` shims into a `toolDisplayFn`, which
+      // makes core treat the adapter as approval-capable (no auto-approve). If
+      // the shim returned `undefined` for the approval event the static driver
+      // would skip the card while the run stays suspended — a stuck approval.
+      // The shim must emit the built-in approval card so it IS posted.
+      const { channels, calls, chatThread } = makeChannels({
+        streaming: false,
+        formatToolCall: ({ toolName, result }) => `🛠 ${toolName}=${String(result)}`,
+      });
+      await drive(
+        channels,
+        [
+          {
+            type: 'tool-call-approval',
+            payload: { toolCallId: 't1', toolName: 'deleteFile', args: { path: '/x' } },
+          },
+          { type: 'finish', payload: {} },
+        ],
+        chatThread,
+      );
+
+      // The approval card IS posted (not skipped) and carries the Approve/Deny
+      // buttons keyed to the toolCallId.
+      const posts = calls.filter(c => c.kind === 'post') as Extract<Call, { kind: 'post' }>[];
+      expect(posts.length).toBeGreaterThan(0);
+      const serialized = JSON.stringify(posts.map(p => p.arg));
+      expect(serialized).toContain('tool_approve:t1');
+      expect(serialized).toContain('tool_deny:t1');
+    });
+
+    it('deprecated formatToolCall passes the stripped display name, not the raw tool id', async () => {
+      // 1.2.x `formatToolCall` received the display name. Events carry both a
+      // raw `toolName` and a stripped `displayName`; the shim must pass the
+      // latter (falling back to `toolName`).
+      let receivedToolName: string | undefined;
+      const { channels, chatThread } = makeChannels({
+        streaming: false,
+        formatToolCall: ({ toolName, result }) => {
+          receivedToolName = toolName;
+          return `=${String(result)}`;
+        },
+      });
+      await drive(
+        channels,
+        [
+          { type: 'tool-call', payload: { toolCallId: 't1', toolName: 'my_tool', args: {} } },
+          {
+            type: 'tool-result',
+            payload: { toolCallId: 't1', toolName: 'my_tool', args: {}, result: 'ok' },
+          },
+          { type: 'finish', payload: {} },
+        ],
+        chatThread,
+      );
+
+      // The tracker derives `displayName` from `toolName` (e.g. snake_case →
+      // humanized); the shim must forward that, not the raw id.
+      expect(receivedToolName).toBeDefined();
+      expect(receivedToolName).not.toBe('');
+    });
   });
 
   describe('adaptive typing status', () => {

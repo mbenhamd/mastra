@@ -1,5 +1,7 @@
 export { AgentChannels } from './agent-channels';
 export { ChatChannelProcessor } from './processor';
+export { renderBuiltInToolEvent } from './stream-helpers';
+export { getChatModule } from './chat-lazy';
 export { MastraStateAdapter } from './state-adapter';
 export { defaultTypingStatus } from './typing-status';
 export type { TypingStatusContext, TypingStatusFn, TypingStatusReturn } from './typing-status';

@@ -6,7 +6,11 @@ import {
   type ChannelInstallationInfo,
   type ChannelConnectResult,
   type ChannelAdapterConfig,
+  type PostableMessage,
+  type ToolDisplay,
+  type ToolDisplayEvent,
   AgentChannels,
+  renderBuiltInToolEvent,
 } from '@mastra/core/channels';
 import type { ApiRoute, ContextWithMastra } from '@mastra/core/server';
 import { type ChannelsStorage, type ChannelInstallation } from '@mastra/core/storage';
@@ -27,6 +31,69 @@ import {
 import type { SlackProviderConfig, SlashCommandConfig, SlackConnectOptions, SlackAdapterChannelConfig } from './types';
 
 const PLATFORM = 'slack';
+
+/**
+ * Deprecated tool-display callback shape (`formatToolCall`) kept for backward
+ * compatibility — see `SlackAdapterChannelConfigBase`. Matches the core
+ * `resolveToolDisplay` shim contract.
+ */
+type LegacyFormatToolCall = (info: {
+  toolName: string;
+  args: Record<string, unknown>;
+  result: unknown;
+  isError?: boolean;
+}) => PostableMessage | null;
+
+/**
+ * Map the deprecated `cards` / `formatToolCall` fields onto the current
+ * `toolDisplay` path, mirroring the core `AgentChannels.resolveToolDisplay`
+ * shim so the two never drift. An explicit `toolDisplay` always wins (mapping
+ * fires only when `toolDisplay` is `undefined`). Returns the resolved
+ * `toolDisplay` (or `undefined` when no field applies, leaving the caller's
+ * default in charge). Exported for unit coverage of the back-compat shim.
+ *
+ * @internal
+ */
+export function mapLegacyToolDisplay(opts: {
+  toolDisplay?: ToolDisplay;
+  cards?: boolean;
+  formatToolCall?: LegacyFormatToolCall;
+}): ToolDisplay | undefined {
+  if (opts.toolDisplay !== undefined) return opts.toolDisplay;
+  // `formatToolCall` → a `ToolDisplayFn` posting on `result`/`error` only; every
+  // other event defers to the built-in renderer (returns `undefined`).
+  if (opts.formatToolCall) {
+    const formatToolCall = opts.formatToolCall;
+    return (event: ToolDisplayEvent) => {
+      // APPROVAL phase: the 1.2.x `formatToolCall` API had no approval
+      // rendering, so the faithful equivalent is the built-in approval card
+      // (with Approve/Deny buttons). Core treats ANY `toolDisplayFn` as
+      // approval-capable, so it does NOT auto-approve when one is set; if this
+      // shim returned `undefined` here the static driver would skip posting the
+      // card while the run stays suspended — a stuck approval. Returning the
+      // built-in card keeps the approval flow working.
+      if (event.kind === 'approval') {
+        return { kind: 'post', message: renderBuiltInToolEvent(event, 'cards') };
+      }
+      // RUNNING phase: 1.2.x `formatToolCall` only fired on result/error, so
+      // there was no "Running…" card. Defer (skip) to preserve that.
+      if (event.kind !== 'result' && event.kind !== 'error') return undefined;
+      const value = event.kind === 'result' ? event.result : event.error;
+      const message = formatToolCall({
+        // 1.2.x passed the stripped display name, not the raw tool id.
+        toolName: event.displayName || event.toolName,
+        args: (event.args ?? {}) as Record<string, unknown>,
+        result: value,
+        isError: event.kind === 'error' ? true : event.isError,
+      });
+      if (message == null) return undefined;
+      return { kind: 'post', message };
+    };
+  }
+  // `cards: true` → `'cards'`, `cards: false` → `'text'`.
+  if (opts.cards !== undefined) return opts.cards ? 'cards' : 'text';
+  return undefined;
+}
 
 /**
  * Create a hash of the agent config for change detection.
@@ -756,7 +823,7 @@ export class SlackProvider implements ChannelProvider {
    * fallback or preserved options.
    */
   #resolveSlackAdapterConfig(): SlackAdapterChannelConfig {
-    // eslint-disable-next-line @typescript-eslint/no-deprecated -- intentional read of deprecated alias for back-compat
+    /* eslint-disable @typescript-eslint/no-deprecated -- intentional read of deprecated aliases for back-compat */
     const {
       adapterConfig,
       cors,
@@ -765,6 +832,8 @@ export class SlackProvider implements ChannelProvider {
       streaming: topLevelStreaming,
       typingStatus,
       toolDisplay: topLevelToolDisplay,
+      cards: topLevelCards,
+      formatToolCall: topLevelFormatToolCall,
     } = this.#channelConfig;
     const topLevel = {
       cors,
@@ -773,6 +842,8 @@ export class SlackProvider implements ChannelProvider {
       streaming: topLevelStreaming,
       typingStatus,
       toolDisplay: topLevelToolDisplay,
+      cards: topLevelCards,
+      formatToolCall: topLevelFormatToolCall,
     };
     const filteredTopLevel = Object.fromEntries(Object.entries(topLevel).filter(([, value]) => value !== undefined));
     const filteredAdapterConfig = Object.fromEntries(
@@ -784,15 +855,29 @@ export class SlackProvider implements ChannelProvider {
     //   - `toolDisplay: 'grouped'`  — tools collapse into a single "Thinking Steps" widget (streaming only).
     // Users can opt out of any of these by passing the field at the top level (or via `adapterConfig`).
     // Keep in sync with the `@default` JSDoc on `SlackAdapterChannelConfig` in ./types.ts.
-    const merged = { ...filteredAdapterConfig, ...filteredTopLevel } as Partial<SlackAdapterChannelConfig>;
+    const merged = { ...filteredAdapterConfig, ...filteredTopLevel } as Partial<SlackAdapterChannelConfig> & {
+      cards?: boolean;
+      formatToolCall?: LegacyFormatToolCall;
+    };
     const streaming = merged.streaming ?? true;
+    // §back-compat — map the deprecated `cards` / `formatToolCall` fields onto the
+    // current `toolDisplay` path BEFORE applying the Slack default, so a consumer that
+    // still passes only a legacy field gets its faithful behavior (not the `'grouped'`
+    // default). The shim mirrors the core `resolveToolDisplay` semantics.
+    const { cards: deprecatedCards, formatToolCall: deprecatedFormatToolCall, ...rest } = merged;
+    const mappedToolDisplay = mapLegacyToolDisplay({
+      toolDisplay: rest.toolDisplay,
+      cards: deprecatedCards,
+      formatToolCall: deprecatedFormatToolCall,
+    });
     // `'grouped'` requires streaming; fall back to `'cards'` when streaming is off.
-    const toolDisplay = merged.toolDisplay ?? (streaming ? 'grouped' : 'cards');
+    const toolDisplay = mappedToolDisplay ?? (streaming ? 'grouped' : 'cards');
     return {
-      ...merged,
+      ...rest,
       streaming,
       toolDisplay,
     } as SlackAdapterChannelConfig;
+    /* eslint-enable @typescript-eslint/no-deprecated */
   }
 
   /**

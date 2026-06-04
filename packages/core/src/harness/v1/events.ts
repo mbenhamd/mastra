@@ -1173,13 +1173,30 @@ export class EventEmitter {
   private seq: number;
   private readonly scope: EmitterScope;
   private readonly onEvent?: HarnessEventListener;
+  private readonly maxCustomEventPayloadBytes?: () => number | undefined;
 
   constructor(
     scope: EmitterScope = {},
-    opts: { onEvent?: HarnessEventListener; epoch?: string; nextSequence?: number } = {},
+    opts: {
+      onEvent?: HarnessEventListener;
+      epoch?: string;
+      nextSequence?: number;
+      /**
+       * §10.3 / §13.x — opt-in byte cap for a CUSTOM (dotted-type) event's
+       * `payload`, evaluated at emit. Mirrors the tool-event cap
+       * ({@link projectToolEventPayloadForJson} + `_internalMaxEventPayloadBytes`):
+       * an oversized custom payload is replaced AT EMIT by the
+       * {@link TOOL_PAYLOAD_TOO_LARGE} sentinel so live === durable replay by
+       * construction. Returns `undefined` (NO cap, payload untouched) when the
+       * host has not set `files.maxEventPayloadBytes`, keeping an unconfigured
+       * harness byte-identical to before this feature existed.
+       */
+      maxCustomEventPayloadBytes?: () => number | undefined;
+    } = {},
   ) {
     this.scope = scope;
     this.onEvent = opts.onEvent;
+    this.maxCustomEventPayloadBytes = opts.maxCustomEventPayloadBytes;
     this.epoch = opts.epoch ?? randomUUID();
     this.seq = opts.nextSequence ?? 0;
     formatHarnessEventId(this.epoch, this.seq);
@@ -1195,14 +1212,39 @@ export class EventEmitter {
 
   emit(event: EmitInput, overrides?: { sessionId?: string }): HarnessEvent {
     const sessionId = overrides?.sessionId ?? this.scope.sessionId;
+    const bounded = this.applyCustomEventPayloadCap(event);
     const stamped = {
-      ...event,
+      ...bounded,
       id: formatHarnessEventId(this.epoch, this.seq++),
       timestamp: Date.now(),
       ...(sessionId !== undefined && { sessionId }),
     } as HarnessEvent;
     this.dispatch(stamped);
     return stamped;
+  }
+
+  /**
+   * §10.3 / §13.x — bound a custom (dotted-type) event's `payload` at emit,
+   * exactly as the tool-event sites bound `tool_start.input` / `tool_end.output`.
+   * When a cap is configured and the payload's serialized size exceeds it, the
+   * `payload` field is replaced by the {@link TOOL_PAYLOAD_TOO_LARGE} sentinel
+   * (the same projection helper, same sentinel) so the durable replay row matches
+   * the live value by construction. Non-custom events, payload-less events, and
+   * an unconfigured cap pass through UNCHANGED (no projection, no round-trip), so
+   * an unconfigured harness is byte-identical to before this feature existed.
+   */
+  private applyCustomEventPayloadCap(event: EmitInput): EmitInput {
+    const maxBytes = this.maxCustomEventPayloadBytes?.();
+    if (maxBytes === undefined) return event;
+    const type = (event as { type?: unknown }).type;
+    // Only CustomEvent carries a `payload`; it is a dotted, non-reserved type.
+    if (typeof type !== 'string' || !type.includes('.')) return event;
+    if (RESERVED_EVENT_PREFIXES.some(prefix => type.startsWith(prefix))) return event;
+    if (!Object.prototype.hasOwnProperty.call(event, 'payload')) return event;
+    const payload = (event as { payload?: unknown }).payload;
+    if (payload === undefined) return event;
+    const projected = projectToolEventPayloadForJson(payload, `${type}.payload`, maxBytes);
+    return { ...event, payload: projected } as EmitInput;
   }
 
   /**

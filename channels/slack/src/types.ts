@@ -2,6 +2,7 @@ import type {
   ChannelAdapterConfig,
   ChannelConfig,
   ChannelHandlers,
+  PostableMessage,
   StaticToolDisplay,
   StreamingConfig,
   ToolDisplay,
@@ -42,6 +43,40 @@ interface SlackAdapterChannelConfigBase {
    * @default true
    */
   typingStatus?: ChannelAdapterConfig['typingStatus'];
+
+  /**
+   * @deprecated Use `toolDisplay` instead. Kept for backward compatibility:
+   * `cards: true` maps to `toolDisplay: 'cards'`, `cards: false` to
+   * `toolDisplay: 'text'`. The mapping is applied only when `toolDisplay` is
+   * not also set (an explicit `toolDisplay` always wins).
+   */
+  cards?: boolean;
+
+  /**
+   * @deprecated Use `toolDisplay` (function form) instead. Kept for backward
+   * compatibility: this per-tool result/error renderer is shimmed onto a
+   * `ToolDisplayFn` that emits `{ kind: 'post', message }` for `result`/`error`
+   * events (and defers every other event to the built-in renderer). The mapping
+   * is applied only when `toolDisplay` is not also set.
+   *
+   * Migration:
+   * ```ts
+   * // before
+   * formatToolCall: ({ toolName, args, result, isError }) => `${toolName}: ${result}`
+   * // after
+   * toolDisplay: event => {
+   *   if (event.kind !== 'result' && event.kind !== 'error') return undefined;
+   *   const value = event.kind === 'result' ? event.result : event.error;
+   *   return { kind: 'post', message: `${event.toolName}: ${value}` };
+   * }
+   * ```
+   */
+  formatToolCall?: (info: {
+    toolName: string;
+    args: Record<string, unknown>;
+    result: unknown;
+    isError?: boolean;
+  }) => PostableMessage | null;
 }
 
 /**

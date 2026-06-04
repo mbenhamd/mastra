@@ -1376,6 +1376,10 @@ export class Session {
         onEvent: event => this._enqueueSessionEventPersistence(event),
         epoch: internals.eventReplaySeed?.epoch,
         nextSequence: internals.eventReplaySeed?.nextSequence,
+        // §10.3 / §13.x — bound an oversized CUSTOM-event payload at emit with the
+        // SAME projection + sentinel the tool-event sites use, read at emit time so
+        // the cap tracks `files.maxEventPayloadBytes`. Undefined → no cap (opt-in).
+        maxCustomEventPayloadBytes: () => this._harness._internalMaxEventPayloadBytes,
       },
     );
   }
