@@ -60,6 +60,13 @@ export class AgentChannels {
   private chat: Chat | null = null;
   /** Stored initialization promise so webhook handlers can await readiness on serverless cold starts. */
   private initPromise: Promise<void> | null = null;
+  /**
+   * Monotonic lifecycle counter. Bumped on `close()` so in-flight gateway
+   * reconnect loops started by a previous instance can detect they are stale
+   * and stop, rather than reconnecting forever after the channels were torn
+   * down (e.g. when a provider rebuilds AgentChannels). See PF-559.
+   */
+  private lifecycleGeneration = 0;
   private agent!: Agent<any, any, any, any>;
   private logger?: IMastraLogger;
   private customState: StateAdapter | undefined;
@@ -241,6 +248,7 @@ export class AgentChannels {
       return this.initPromise;
     }
 
+    const generation = this.lifecycleGeneration;
     this.initPromise = (async () => {
       // Resolve state adapter: custom > Mastra storage > in-memory fallback
       if (this.customState) {
@@ -550,7 +558,7 @@ export class AgentChannels {
             durationMs?: number,
           ) => Promise<Response>;
 
-          this.startGatewayLoop(name, startGateway);
+          this.startGatewayLoop(name, startGateway, generation);
         }
       }
     })();
@@ -703,6 +711,13 @@ export class AgentChannels {
    * would otherwise stay registered for the lifetime of the process.
    */
   close(): void {
+    // Bump the lifecycle generation first so any in-flight gateway reconnect
+    // loops from this instance see they are stale and stop (PF-559), and reset
+    // init state so the SDK can be rebuilt cleanly by a provider.
+    this.lifecycleGeneration += 1;
+    this.initPromise = null;
+    this.chat = null;
+
     for (const entry of this.threadSubscriptions.values()) {
       try {
         entry.subscription.unsubscribe();
@@ -1448,12 +1463,16 @@ export class AgentChannels {
   private startGatewayLoop(
     name: string,
     startGateway: (options: { waitUntil: (p: Promise<unknown>) => void }, durationMs?: number) => Promise<Response>,
+    generation: number,
   ): void {
     const DURATION = 24 * 60 * 60 * 1000;
     const RETRY_DELAY = 5000;
 
+    // Stop reconnecting once `close()` bumps the lifecycle generation past the
+    // one this loop was started with (PF-559) — otherwise a torn-down instance
+    // keeps reopening gateway sessions forever.
     const reconnect = async () => {
-      while (true) {
+      while (generation === this.lifecycleGeneration) {
         try {
           let resolve: () => void;
           let reject: (err: unknown) => void;
@@ -1473,8 +1492,10 @@ export class AgentChannels {
             DURATION,
           );
           await done;
+          if (generation !== this.lifecycleGeneration) break;
           this.log('info', `[${name}] Gateway session ended, reconnecting...`);
         } catch (err) {
+          if (generation !== this.lifecycleGeneration) break;
           this.log('error', `[${name}] Gateway error, retrying in ${RETRY_DELAY / 1000}s`, err);
           await new Promise(r => setTimeout(r, RETRY_DELAY));
         }
