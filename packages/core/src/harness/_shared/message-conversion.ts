@@ -208,7 +208,14 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
       }
     }
 
-    if (signal.type === 'system-reminder' || signal.type === 'reactive') {
+    // 'reactive' is broader than reminders: only rows whose tagName is the
+    // reminder tag (or absent — normalizeSignalType defaults reactive rows to
+    // 'system-reminder') render as reminders. Custom reactive rows (e.g.
+    // GitHub subscribe/unsubscribe control signals) fall through unchanged.
+    if (
+      signal.type === 'system-reminder' ||
+      (signal.type === 'reactive' && (signal.tagName ?? 'system-reminder') === 'system-reminder')
+    ) {
       // `msg.role === 'signal'` rows parsed through `mastraDBMessageToSignal`
       // must not fall through to the parts loop; return a user message even
       // when `toSystemReminderContent` cannot build a reminder payload.
