@@ -1885,6 +1885,14 @@ describe('Agent Routes Authorization', () => {
           })(),
         }));
 
+        // Baseline timer count owned by the shared Mastra/storage machinery
+        // (e.g. background flush timers wired up via the mastra instance in
+        // beforeEach). The handler must clear the single heartbeat timer it
+        // schedules on abort, returning the count to this baseline — asserting
+        // an absolute 0 conflates the handler's timer with unrelated framework
+        // timers and is non-deterministic.
+        const baselineTimerCount = vi.getTimerCount();
+
         const stream = (await SUBSCRIBE_AGENT_THREAD_ROUTE.handler({
           mastra,
           agentId: 'test-agent',
@@ -1895,12 +1903,14 @@ describe('Agent Routes Authorization', () => {
         } as any)) as ReadableStream;
 
         const reader = stream.getReader();
+        // Sanity check: the handler scheduled exactly one heartbeat timer.
+        expect(vi.getTimerCount()).toBe(baselineTimerCount + 1);
         abortController.abort();
         await Promise.resolve();
 
         expect(abort).not.toHaveBeenCalled();
         expect(unsubscribe).toHaveBeenCalledTimes(1);
-        expect(vi.getTimerCount()).toBe(0);
+        expect(vi.getTimerCount()).toBe(baselineTimerCount);
         await vi.advanceTimersByTimeAsync(25_000);
         await expect(reader.read()).resolves.toEqual({ value: undefined, done: true });
       } finally {
