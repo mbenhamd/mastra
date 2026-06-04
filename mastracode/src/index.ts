@@ -20,7 +20,7 @@ import {
   StreamErrorRetryProcessor,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
-import { InMemoryHarness, MastraCompositeStore } from '@mastra/core/storage';
+import { InMemoryDB, InMemoryHarness, MastraCompositeStore } from '@mastra/core/storage';
 import { DuckDBStore } from '@mastra/duckdb';
 
 import {
@@ -293,7 +293,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     }
   }
 
-  const harnessStorage = new InMemoryHarness();
+  const harnessStorage = new InMemoryHarness({ db: new InMemoryDB() });
 
   // Compose the main storage with the DuckDB observability domain (if available)
   const storage = new MastraCompositeStore({
