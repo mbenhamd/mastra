@@ -1183,18 +1183,15 @@ describe('Agent Routes Authorization', () => {
     });
 
     it('should validate typed user-message signal contents and attributes', () => {
+      // Post-merge `AgentSignalContents` is `string | Array<TextPart | FilePart>` — bare
+      // content parts, not `{ role }`-wrapped core/DB messages (core `agent/signals.ts`).
       const body = {
         signal: {
           type: 'user-message',
           contents: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'describe these files' },
-                { type: 'file', data: 'data:image/png;base64,image-data', mimeType: 'image/png' },
-                { type: 'file', data: 'file-data', mimeType: 'application/pdf', filename: 'brief.pdf' },
-              ],
-            },
+            { type: 'text', text: 'describe these files' },
+            { type: 'file', data: 'data:image/png;base64,image-data', mediaType: 'image/png' },
+            { type: 'file', data: 'file-data', mediaType: 'application/pdf', filename: 'brief.pdf' },
           ],
           attributes: { intent: 'follow-up', count: 1, urgent: false, empty: null },
           metadata: { source: 'studio' },
@@ -1206,7 +1203,7 @@ describe('Agent Routes Authorization', () => {
       expect(sendAgentSignalBodySchema.safeParse(body).success).toBe(true);
     });
 
-    it('should validate string user-message signal contents and message array wrappers', () => {
+    it('should validate string and content-part user-message signal contents', () => {
       expect(
         sendAgentSignalBodySchema.safeParse({
           signal: { type: 'user-message', contents: 'hello' },
@@ -1217,54 +1214,53 @@ describe('Agent Routes Authorization', () => {
 
       expect(
         sendAgentSignalBodySchema.safeParse({
-          signal: { type: 'user-message', contents: ['hello', { role: 'user', content: 'again' }] },
+          signal: { type: 'user-message', contents: [{ type: 'text', text: 'again' }] },
           resourceId: 'user-a',
           threadId: 'thread-a',
         }).success,
       ).toBe(true);
     });
 
-    it('should accept Mastra DB message shaped user-message signal contents', () => {
+    it('should reject `{ role }`-shaped user-message signal contents', () => {
+      // The runtime no longer accepts core-message / Mastra-DB-message shaped contents
+      // (`contentsToSignalParts` only maps text/file parts), so the schema rejects them.
       expect(
         sendAgentSignalBodySchema.safeParse({
           signal: {
             type: 'user-message',
-            contents: [
-              {
-                id: 'stored-message-1',
-                role: 'user',
-                createdAt: '2026-05-08T00:00:00.000Z',
-                threadId: 'thread-a',
-                resourceId: 'user-a',
-                content: {
-                  format: 2,
-                  content: 'stored hello',
-                  parts: [{ type: 'text', text: 'stored hello' }],
-                  metadata: { source: 'memory' },
-                },
-              },
-            ],
-          },
-          resourceId: 'user-a',
-          threadId: 'thread-a',
-        }).success,
-      ).toBe(true);
-    });
-
-    it('should reject raw user-message content part arrays without message roles', () => {
-      expect(
-        sendAgentSignalBodySchema.safeParse({
-          signal: {
-            type: 'user-message',
-            contents: [
-              { type: 'text', text: 'missing role wrapper' },
-              { type: 'file', data: 'file-data', mimeType: 'application/pdf' },
-            ],
+            contents: [{ role: 'user', content: 'not allowed' }],
           },
           resourceId: 'user-a',
           threadId: 'thread-a',
         }).success,
       ).toBe(false);
+
+      expect(
+        sendAgentSignalBodySchema.safeParse({
+          signal: {
+            type: 'user-message',
+            contents: ['hello', { role: 'user', content: 'again' }],
+          },
+          resourceId: 'user-a',
+          threadId: 'thread-a',
+        }).success,
+      ).toBe(false);
+    });
+
+    it('should accept raw user-message content part arrays', () => {
+      expect(
+        sendAgentSignalBodySchema.safeParse({
+          signal: {
+            type: 'user-message',
+            contents: [
+              { type: 'text', text: 'describe this file' },
+              { type: 'file', data: 'file-data', mediaType: 'application/pdf' },
+            ],
+          },
+          resourceId: 'user-a',
+          threadId: 'thread-a',
+        }).success,
+      ).toBe(true);
     });
 
     it('should reject unknown signal types', () => {

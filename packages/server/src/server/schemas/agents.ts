@@ -37,11 +37,29 @@ const baseSignalSchema = z.object({
   attributes: signalAttributesSchema.optional(),
 });
 
-const signalMessageInputSchema = z.object({ role: z.string() }).passthrough();
+// `AgentSignalContents` (core `agent/signals.ts`) is `string | Array<TextPart | FilePart>`
+// after the upstream message-first signals merge — bare content parts, not `{ role }`
+// core messages. Model the part shapes so the inferred body type stays assignable to
+// `AgentMessageInput` / `AgentSignalInput`.
+const partProviderOptionsSchema = z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional();
+
+const signalTextPartSchema = z.object({
+  type: z.literal('text'),
+  text: z.string(),
+  providerOptions: partProviderOptionsSchema,
+});
+
+const signalFilePartSchema = z.object({
+  type: z.literal('file'),
+  data: z.string(),
+  mediaType: z.string(),
+  filename: z.string().optional(),
+  providerOptions: partProviderOptionsSchema,
+});
+
 const userMessageSignalContentsSchema = z.union([
   z.string(),
-  signalMessageInputSchema,
-  z.array(z.union([z.string(), signalMessageInputSchema])),
+  z.array(z.union([signalTextPartSchema, signalFilePartSchema])),
 ]);
 
 const agentMessageInputObjectSchema = z.object({
@@ -53,16 +71,23 @@ const agentMessageInputObjectSchema = z.object({
 
 const agentMessageInputSchema = z.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
 
+// `user`/`user-message` signals carry rich user content (string or text/file parts);
+// every other supported signal category is a context signal that must use string
+// contents. Restrict `type` to the runtime's `AgentSignalType` set (see core
+// `agent/signals.ts` `normalizeSignalType`) so unknown types are rejected at the edge
+// instead of throwing inside the runtime.
 const userMessageAgentSignalSchema = baseSignalSchema.extend({
-  type: z.literal('user-message'),
+  type: z.enum(['user', 'user-message']),
+  tagName: z.string().optional(),
   contents: userMessageSignalContentsSchema,
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
 });
 
 const contextAgentSignalSchema = baseSignalSchema.extend({
-  type: z.string().refine(type => type !== 'user-message', {
-    message: 'non-user signal types must not be user-message',
-  }),
+  type: z.enum(['state', 'reactive', 'notification', 'system-reminder']),
+  tagName: z.string().optional(),
   contents: z.string(),
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
 });
 
 const agentSignalSchema = z.union([userMessageAgentSignalSchema, contextAgentSignalSchema]);
