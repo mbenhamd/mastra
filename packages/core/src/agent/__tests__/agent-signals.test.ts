@@ -1984,6 +1984,105 @@ describe('Agent signals', () => {
     }
   });
 
+  it('re-registers an approval-suspended run on resume without rejecting the retained record', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'approval-resume-agent' } as Agent<any, any, any, any>;
+    const threadId = 'approval-resume-thread';
+    const resourceId = 'approval-resume-user';
+    const runId = 'approval-resume-run';
+
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      // Register the suspended run that emits a tool-call-approval part. The
+      // completion finalizer surfaces run-suspended and retains its records so
+      // the thread stays blocked awaiting approval.
+      let finishSuspended!: () => void;
+      const suspendedFinished = new Promise<void>(resolve => {
+        finishSuspended = resolve;
+      });
+      const suspendedCompletion = runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'suspended',
+          fullStream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'start', runId });
+              controller.enqueue({
+                type: 'tool-call-approval',
+                runId,
+                payload: { toolCallId: 'tool-call-1', toolName: 'testTool' },
+              });
+              controller.close();
+            },
+          }),
+          _waitUntilFinished: () => suspendedFinished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+
+      await withTimeout(iterator.next(), 'Timed out waiting for approval run start');
+      await withTimeout(iterator.next(), 'Timed out waiting for approval chunk');
+      // Drive and await the finalizer so run-suspended has propagated to the
+      // subscriber; the approval marker must keep the thread blocked (active).
+      finishSuspended();
+      await withTimeout(
+        suspendedCompletion ?? Promise.resolve(),
+        'Timed out waiting for approval-suspended finalizer',
+      );
+      await nextTick();
+      expect(runtime.getThreadState({ resourceId, threadId })).toBe('active');
+
+      // The resume reuses the same runId. Without the fix this throws
+      // "already registered" / "already reserved" and the resume wedges.
+      const resumedRun = readNextRun(iterator);
+      let finishResumed!: () => void;
+      const resumedFinished = new Promise<void>(resolve => {
+        finishResumed = resolve;
+      });
+      expect(() =>
+        runtime.registerRun(
+          agent,
+          {
+            runId,
+            status: 'running',
+            fullStream: new ReadableStream({
+              start(controller) {
+                setTimeout(() => {
+                  controller.enqueue({ type: 'start', runId });
+                  controller.enqueue({ type: 'text-start', runId, payload: { id: 'text-1' } });
+                  controller.enqueue({
+                    type: 'text-delta',
+                    runId,
+                    payload: { id: 'text-1', text: 'approved response' },
+                  });
+                  controller.enqueue({ type: 'text-end', runId, payload: { id: 'text-1' } });
+                  controller.enqueue({
+                    type: 'finish',
+                    runId,
+                    payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+                  });
+                  controller.close();
+                  finishResumed();
+                }, 5);
+              },
+            }),
+            _waitUntilFinished: () => resumedFinished,
+          } as any,
+          { memory: { thread: threadId, resource: resourceId } } as any,
+        ),
+      ).not.toThrow();
+
+      await expect(withTimeout(resumedRun, 'Timed out waiting for resumed run')).resolves.toMatchObject({
+        value: { runId, text: 'approved response' },
+      });
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
   it('queues queueMessage until the active run completes', async () => {
     let releaseFirst!: () => void;
     const firstFinished = new Promise<void>(resolve => {

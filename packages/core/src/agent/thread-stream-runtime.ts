@@ -252,8 +252,49 @@ export class AgentThreadStreamRuntime {
     });
   }
 
+  #markApprovalSuspendedFromPart(pubsub: PubSub | undefined, runId: string, part: unknown) {
+    // A tool-call-approval part marks the run as approval-suspended so thread
+    // subscribers don't treat the resulting run-suspended as a terminal idle.
+    if (part && typeof part === 'object' && 'type' in part && part.type === 'tool-call-approval') {
+      this.#getState(pubsub).approvalSuspendedRunIds.add(runId);
+    }
+  }
+
+  // For local (EventEmitterPubSub) runs the fork does not republish the stream,
+  // so the broadcast part-loop that detects approval suspension never runs and
+  // the subscriber stream reads `output.fullStream` directly. Wrap that stream
+  // with an inline detection passthrough so the approval marker is recorded
+  // *before* each part is yielded to the local subscriber — matching upstream's
+  // always-running broadcast loop where `emitPart` sets the marker before the
+  // part is buffered for subscribers. An inline wrapper (not `tee`) keeps the
+  // marker write ordered ahead of the subscriber observing the part, avoiding a
+  // race where `getThreadState` is queried before a detached detector caught up.
+  #attachLocalApprovalDetection<OUTPUT>(output: MastraModelOutput<OUTPUT>, pubsub: PubSub | undefined) {
+    const source = output.fullStream as any;
+    if (!source) return;
+    if (!Object.prototype.hasOwnProperty.call(output, 'fullStream')) return;
+
+    const runtime = this;
+    const runId = output.runId;
+
+    const fullStream = (async function* () {
+      for await (const part of source) {
+        runtime.#markApprovalSuspendedFromPart(pubsub, runId, part);
+        yield part;
+      }
+    })();
+    Object.defineProperty(output, 'fullStream', {
+      configurable: true,
+      enumerable: true,
+      value: fullStream,
+    });
+  }
+
   #prepareBroadcastSource<OUTPUT>(output: MastraModelOutput<OUTPUT>, pubsub: PubSub | undefined, key: string) {
-    if (this.#getPubSub(pubsub) instanceof EventEmitterPubSub) return;
+    if (this.#getPubSub(pubsub) instanceof EventEmitterPubSub) {
+      this.#attachLocalApprovalDetection(output, pubsub);
+      return;
+    }
 
     let source = output.fullStream as any;
     if (!source) return;
@@ -301,11 +342,7 @@ export class AgentThreadStreamRuntime {
     if (!source) return;
 
     for await (const part of source) {
-      // A tool-call-approval part marks the run as approval-suspended so thread
-      // subscribers don't treat the resulting run-suspended as a terminal idle.
-      if (part && typeof part === 'object' && 'type' in part && part.type === 'tool-call-approval') {
-        this.#getState(pubsub).approvalSuspendedRunIds.add(output.runId);
-      }
+      this.#markApprovalSuspendedFromPart(pubsub, output.runId, part);
       await this.#publishAndWait(pubsub, key, {
         type: 'stream-part',
         runId: output.runId,
@@ -366,6 +403,9 @@ export class AgentThreadStreamRuntime {
 
     const state = this.#getState(pubsub);
     const key = this.#threadKey(resourceId, threadId);
+    // An approval resume reuses the suspended run's id; drop its retained record
+    // so the reservation can re-establish it on the same thread (upstream parity).
+    this.#clearApprovalSuspendedRunForResume(state, runId, key);
     const existingKey = state.threadKeysByRunId.get(runId) ?? state.pendingIdleThreadKeysByRunId.get(runId);
     if (existingKey) {
       const reservedAgentId = state.reservedAgentIdsByRunId.get(runId);
@@ -765,6 +805,44 @@ export class AgentThreadStreamRuntime {
     }
   }
 
+  /**
+   * Clears the retained record for an approval-suspended run so it can be
+   * re-reserved/re-registered by a resume on the same thread.
+   *
+   * The completion finalizer leaves `threadRunsById`/`threadKeysByRunId`/
+   * `activeThreadRunIds`/`approvalSuspendedRunIds` in place for an
+   * approval-suspended run so the thread stays blocked awaiting approval. The
+   * fork's reservation guards (`reserveRun`/`registerRun`) reject a runId that
+   * is still registered, which would wedge an approval resume that reuses the
+   * same runId. Upstream resumes by simply re-`registerRun`ing the same id
+   * (overwriting the record); we reproduce that within the fork's machinery by
+   * quietly dropping the stale record here — without aborting subscribers,
+   * rejecting waiters, or dropping pending signals queued behind the approval
+   * (those must still flow to the resumed run). Returns true if a stale
+   * approval-suspended record was cleared for this thread key.
+   */
+  #clearApprovalSuspendedRunForResume(
+    state: AgentThreadRuntimeState,
+    runId: string,
+    key: string,
+  ): boolean {
+    if (!state.approvalSuspendedRunIds.has(runId)) return false;
+    const reservedKey = state.threadKeysByRunId.get(runId);
+    if (reservedKey !== undefined && reservedKey !== key) return false;
+
+    state.approvalSuspendedRunIds.delete(runId);
+    state.threadRunsById.delete(runId);
+    if (state.threadKeysByRunId.get(runId) === key) {
+      state.threadKeysByRunId.delete(runId);
+    }
+    if (state.activeThreadRunIds.get(key) === runId) {
+      state.activeThreadRunIds.delete(key);
+    }
+    state.reservedAgentIdsByRunId.delete(runId);
+    state.watchedThreadRunIds.delete(runId);
+    return true;
+  }
+
   async #persistSignal(
     agent: Agent<any, any, any, any>,
     signal: CreatedAgentSignal,
@@ -876,6 +954,9 @@ export class AgentThreadStreamRuntime {
 
     const state = this.#getState(pubsub);
     const key = this.#threadKey(resourceId, threadId);
+    // An approval resume re-registers the suspended run's id; drop its retained
+    // record so registration overwrites it on the same thread (upstream parity).
+    this.#clearApprovalSuspendedRunForResume(state, output.runId, key);
     const existingKey =
       state.threadKeysByRunId.get(output.runId) ?? state.pendingIdleThreadKeysByRunId.get(output.runId);
     const inflightIdleKey = state.inflightIdleThreadKeysByRunId.get(output.runId);
