@@ -4581,7 +4581,7 @@ describe('Agent signals', () => {
       memory: { thread: 'cross-agent-thread', resource: 'cross-agent-user' },
     });
     const firstText = firstStream.text;
-    await nextTick();
+    await waitForCondition(() => firstStarted);
     expect(firstStarted).toBe(true);
 
     const signalResult = await secondAgent.sendSignal(
