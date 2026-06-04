@@ -179,11 +179,7 @@ import {
   TASK_UPDATE_TOOL_ID,
   TASK_WRITE_TOOL_ID,
 } from './plan-task-tool';
-import {
-  callerRequestContextToPersisted,
-  stripReservedAppKeys,
-  validateCallerRequestContext,
-} from './request-context-input';
+import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
   AgentResult,
@@ -9341,16 +9337,6 @@ export class Session {
       // snapshot via toJSON), so without this a resumed turn would run UNGATED — the
       // §4.2e pre-action gate must re-evaluate before resume/execute, not just on the
       // initial turn.
-      // §4.4c hygiene — `pending.requestContext` is restored VERBATIM from the durable
-      // pendingResume record and never re-run through `validateCallerRequestContext`, so
-      // a tampered/legacy durable bag could carry reserved (infrastructure-owned) keys in
-      // its `metadata`. Strip them with the canonical admission predicate before the bag
-      // becomes the tool-visible `app` slot. A faithfully-persisted bag (admission already
-      // rejected reserved keys) is unchanged.
-      const sanitizedPendingRequestContext =
-        pending.requestContext?.metadata !== undefined
-          ? { ...pending.requestContext, metadata: stripReservedAppKeys(pending.requestContext.metadata) }
-          : pending.requestContext;
       const resumeRequestContext = await this._buildRequestContext({
         modeId: resumeModeId,
         modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
@@ -9359,7 +9345,7 @@ export class Session {
         // queued-drain path already threads `item.requestContext`; resume used to
         // drop it). `_buildRequestContext` re-stashes it so a re-suspend on this
         // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
-        ...(sanitizedPendingRequestContext ? { persistedRequestContext: sanitizedPendingRequestContext } : {}),
+        ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
         yolo: pending.yolo === true,
       });
       const resumeStream = agent.resumeStream(resumeData, {
