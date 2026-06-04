@@ -19,7 +19,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { MockAgent, setupHarness } from './__test-utils__';
-import { HarnessSessionCancelledError } from './errors';
+import { HarnessAbortedError } from './errors';
 
 class AbortIgnoringMockAgent extends MockAgent {
   override async stream(messages: any, options?: any): Promise<any> {
@@ -121,21 +121,25 @@ describe('Session.abort()', () => {
     // The hold loses to abort — mock agent surfaces finishReason='aborted'
     // and Session unwinds cleanly.
     await inflight;
-    expect(abortReason).toBe('user-cancelled');
+    // §6.2: the abort reason is a typed HarnessAbortedError; public abort() is
+    // ordinary agent-layer cancellation, so a caller string does not become the
+    // structured reason.
+    expect(abortReason).toBeInstanceOf(HarnessAbortedError);
+    expect(abortReason).toMatchObject({ reason: 'agent_aborted', sessionId: session.id });
     expect(session.isRunning()).toBe(false);
     const agentEnds = events.filter(event => (event as { type?: string }).type === 'agent_end');
     expect(agentEnds).toEqual([
       expect.objectContaining({
         type: 'agent_end',
-        reason: 'aborted',
+        finishReason: 'aborted',
       }),
     ]);
 
-    // Per-turn signal handed to the agent must have aborted with the same
-    // reason that `session.abort()` supplied.
+    // Per-turn signal handed to the agent carries the same typed HarnessAbortedError.
     const turnSignal = agent.streamCalls[0]!.options.abortSignal as AbortSignal;
     expect(turnSignal.aborted).toBe(true);
-    expect((turnSignal as { reason?: unknown }).reason).toBe('user-cancelled');
+    expect((turnSignal as { reason?: unknown }).reason).toBeInstanceOf(HarnessAbortedError);
+    expect((turnSignal as { reason?: HarnessAbortedError }).reason).toMatchObject({ reason: 'agent_aborted' });
   });
 
   it('settles message() and emits one aborted agent_end when the agent ignores abort', async () => {
@@ -152,13 +156,13 @@ describe('Session.abort()', () => {
     await waitFor(() => session.isRunning());
     session.abort({ reason: 'user-cancelled' });
 
-    await expect(inflight).rejects.toBeInstanceOf(HarnessSessionCancelledError);
+    await expect(inflight).rejects.toBeInstanceOf(HarnessAbortedError);
     expect(session.isRunning()).toBe(false);
     const agentEnds = events.filter(event => (event as { type?: string }).type === 'agent_end');
     expect(agentEnds).toEqual([
       expect.objectContaining({
         type: 'agent_end',
-        reason: 'aborted',
+        finishReason: 'aborted',
       }),
     ]);
 
@@ -179,7 +183,9 @@ describe('Session.abort()', () => {
 
     const turnSignal = agent.streamCalls[0]!.options.abortSignal as AbortSignal;
     expect(turnSignal.aborted).toBe(true);
-    expect((turnSignal as { reason?: unknown }).reason).toBe('session_aborted');
+    // §6.2: default public abort() → typed HarnessAbortedError('agent_aborted').
+    expect((turnSignal as { reason?: unknown }).reason).toBeInstanceOf(HarnessAbortedError);
+    expect((turnSignal as { reason?: HarnessAbortedError }).reason).toMatchObject({ reason: 'agent_aborted' });
   });
 
   it('does not let a completed caller abort signal cancel a later turn', async () => {
@@ -228,7 +234,7 @@ describe('Session.abort()', () => {
     session.abort({ reason: 'queue-cancel' });
     await queued;
 
-    expect(abortReason).toBe('queue-cancel');
+    expect(abortReason).toMatchObject({ reason: 'agent_aborted', sessionId: session.id });
     expect(session.isRunning()).toBe(false);
   });
 
@@ -264,13 +270,14 @@ describe('Session.abort()', () => {
     session.abort({ reason: 'resume-cancel' });
     await inflight;
 
-    expect(abortReason).toBe('resume-cancel');
+    expect(abortReason).toMatchObject({ reason: 'agent_aborted', sessionId: session.id });
     expect(session.isRunning()).toBe(false);
 
-    // The resume call's abortSignal got the abort.
+    // The resume call's abortSignal got the typed abort.
     const resumeSignal = agent.resumeCalls[0]!.options.abortSignal!;
     expect(resumeSignal.aborted).toBe(true);
-    expect((resumeSignal as { reason?: unknown }).reason).toBe('resume-cancel');
+    expect((resumeSignal as { reason?: unknown }).reason).toBeInstanceOf(HarnessAbortedError);
+    expect((resumeSignal as { reason?: HarnessAbortedError }).reason).toMatchObject({ reason: 'agent_aborted' });
   });
 
   it('second abort() after the turn ended is a no-op', async () => {

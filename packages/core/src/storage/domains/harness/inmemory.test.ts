@@ -12,6 +12,8 @@ import {
   HarnessStorageChannelOutboxClaimConflictError,
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
+  HarnessStorageLeaseConflictError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
@@ -24,6 +26,7 @@ import type {
   ChannelActionToken,
   ChannelInboxItem,
   ChannelOutboxItem,
+  HarnessPlanTask,
   HarnessProviderCallbackBinding,
   HarnessWakeupItem,
   SessionRecord,
@@ -134,6 +137,64 @@ describe('InMemoryHarness admission storage contract', () => {
       }),
     ).rejects.toBeInstanceOf(HarnessStorageDeleteGuardConflictError);
     await expect(storage.loadSession({ sessionId: 'active' })).resolves.toMatchObject({ id: 'active' });
+  });
+
+  // §5.2a/§5.3/§5.5 cross-adapter parity: closing a session then resolving the
+  // SAME (resourceId, threadId) must surface the CLOSED owner (reopen
+  // candidate), not null and not a second active record. PG/LibSQL assert the
+  // identical behavior in their own suites.
+  it('returns the closed current owner by thread for reopen (no fresh active row)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ id: 'closed-owner', closedAt: 2000, lastActivityAt: 2000 }), {
+      ownerId: 'h-1',
+      ifVersion: 0,
+    });
+
+    // loadSessionByThread must surface the closed owner.
+    await expect(
+      storage.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ id: 'closed-owner', closedAt: 2000 });
+
+    // createOrLoadActiveSession must return the closed owner as created:false
+    // (the harness reopens it) instead of inserting a second active record.
+    const admitted = await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'would-be-fresh', lastActivityAt: 3000 }),
+      { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+    );
+    expect(admitted).toMatchObject({
+      created: false,
+      leaseAcquired: false,
+      record: expect.objectContaining({ id: 'closed-owner', closedAt: 2000 }),
+    });
+    await expect(storage.loadSession({ sessionId: 'would-be-fresh' })).resolves.toBeNull();
+  });
+
+  // §4.5b cross-adapter parity: a child admitted under a CLOSING parent must
+  // surface the parent's closing window (closingAt + closeDeadlineAt) so the
+  // caller can build a spec-accurate HarnessSessionClosingError.
+  it('carries the parent closing window on parent-unavailable (closing)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(
+      sampleSession({
+        id: 'closing-parent',
+        closingAt: 5000,
+        closeDeadlineAt: 9000,
+        lastActivityAt: 5000,
+      }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      storage.createOrLoadActiveSession(
+        sampleSession({ id: 'child', threadId: 'child-thread', parentSessionId: 'closing-parent' }),
+        { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+      ),
+    ).rejects.toMatchObject({
+      name: 'HarnessStorageParentSessionUnavailableError',
+      reason: 'closing',
+      closingAt: 5000,
+      closeDeadlineAt: 9000,
+    });
   });
 
   it('rejects guarded batch delete without deleting earlier rows', async () => {
@@ -1124,7 +1185,7 @@ describe('InMemoryHarness admission storage contract', () => {
         sessionId: 'session-1',
         resourceId: 'resource-1',
         threadId: 'thread-2',
-        kind: 'message',
+        kind: 'signal',
         admissionId: 'admission-1',
         attemptedAdmissionHash: 'hash-2',
       }),
@@ -1542,7 +1603,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const terminal = sampleChannelInbox({
       status: 'accepted',
-      delivery: 'message',
+      delivery: 'signal',
       runId: 'run-1',
       signalId: 'signal-1',
       acceptedAt: 0,
@@ -1562,7 +1623,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(
-      sampleChannelInbox({ status: 'admitted', delivery: 'message', admittedAt: now + 50 }),
+      sampleChannelInbox({ status: 'admitted', delivery: 'signal', admittedAt: now + 50 }),
       {
         initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
       },
@@ -1570,10 +1631,64 @@ describe('InMemoryHarness channel inbox ledger', () => {
 
     await expect(
       storage.updateChannelInboxItem(
-        sampleChannelInbox({ status: 'accepted', delivery: 'message', acceptedAt: now + 100, admittedAt: now + 50 }),
+        sampleChannelInbox({ status: 'accepted', delivery: 'signal', acceptedAt: now + 100, admittedAt: now + 50 }),
         { claimId: 'claim-1' },
       ),
     ).rejects.toBeInstanceOf(HarnessStorageChannelInboxTransitionError);
+  });
+
+  it('preserves a renewed claim expiry across a status update (heartbeat is not rolled back)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const now = Date.now();
+    await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
+      initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5_000 }, // stale expiry: now+5_000
+    });
+    // Heartbeat extends the claim far into the future (now+61_000).
+    const renewed = await storage.renewChannelInboxClaim({
+      inboxItemId: 'inbox-1',
+      claimId: 'claim-1',
+      now: now + 1_000,
+      claimTtlMs: 60_000,
+    });
+    expect(renewed.claimExpiresAt).toBe(now + 61_000);
+
+    // A KEEP-claim status update (record still carries claimId) whose record has
+    // the STALE original claimExpiresAt must NOT roll the renewal back.
+    await storage.updateChannelInboxItem(
+      sampleChannelInbox({
+        status: 'admitted',
+        delivery: 'queue',
+        admittedAt: now + 50,
+        claimId: 'claim-1',
+        claimExpiresAt: now + 5_000,
+      }),
+      { claimId: 'claim-1' },
+    );
+
+    // Past the STALE 5s expiry but before the renewed 61s expiry: still claimed →
+    // empty result. A rollback to now+5_000 would have made it claimable here.
+    const tooEarly = await storage.claimChannelInboxItems({
+      harnessName: 'default',
+      channelId: 'support',
+      statuses: ['admitted'],
+      claimId: 'too-early',
+      limit: 1,
+      now: now + 10_000,
+      claimTtlMs: 1_000,
+    });
+    expect(tooEarly).toHaveLength(0);
+
+    // Past the renewed expiry: now reclaimable (confirms the row + renewed expiry).
+    const afterRenewed = await storage.claimChannelInboxItems({
+      harnessName: 'default',
+      channelId: 'support',
+      statuses: ['admitted'],
+      claimId: 'reader',
+      limit: 1,
+      now: now + 62_000,
+      claimTtlMs: 1_000,
+    });
+    expect(afterRenewed.map(r => r.id)).toEqual(['inbox-1']);
   });
 });
 
@@ -2133,6 +2248,49 @@ describe('InMemoryHarness channel action ledger', () => {
     }
   });
 
+  it('does not let a stale KEEP-claim update roll back a renewed action receipt claim', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const now = 10_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt(), {
+        initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
+      });
+      // A heartbeat extends the storage-owned claim to now + 5100.
+      await expect(
+        storage.renewChannelActionReceiptClaim({
+          receiptId: 'receipt-1',
+          claimId: 'claim-1',
+          now: now + 100,
+          claimTtlMs: 5000,
+        }),
+      ).resolves.toEqual({ claimExpiresAt: now + 5100, storageNow: now + 100 });
+
+      // A worker holding the PRE-renewal snapshot writes back the stale (smaller)
+      // claimExpiresAt while keeping its claim. The live expiry must not regress.
+      await storage.updateChannelActionReceipt(
+        sampleChannelActionReceipt({
+          status: 'accepted',
+          acceptedAt: now + 200,
+          updatedAt: now + 200,
+          claimId: 'claim-1',
+          claimExpiresAt: now + 5000, // stale: predates the renewal
+        }),
+        { claimId: 'claim-1' },
+      );
+
+      const stored = await storage.loadChannelActionReceiptByTokenId({
+        harnessName: 'default',
+        channelId: 'support',
+        actionTokenId: 'action-token-1',
+      });
+      expect(stored?.status).toBe('accepted'); // the non-claim update still applied
+      expect(stored?.claimExpiresAt).toBe(now + 5100); // claim NOT rolled back
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('validates new action receipt rows before insert and keeps terminal saves idempotent', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
     await expect(
@@ -2604,6 +2762,106 @@ describe('InMemoryHarness channel diagnostics', () => {
   });
 });
 
+describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
+  async function setupTree() {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const owner = 'owner-A';
+    const ttl = 30_000;
+    await storage.createOrLoadActiveSession(sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }), {
+      initialLease: { ownerId: owner, ttlMs: ttl },
+    });
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-2', threadId: 't-c2', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'grandchild', threadId: 't-gc', parentSessionId: 'child-1', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: ttl } },
+    );
+    return { storage, owner, db };
+  }
+
+  it('renews the root and every active descendant to one capped expiry', async () => {
+    const { storage, owner } = await setupTree();
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    expect(result.renewedDescendantCount).toBe(3);
+    const ids = ['root', 'child-1', 'child-2', 'grandchild'];
+    const records = await Promise.all(ids.map(id => storage.loadSession({ sessionId: id })));
+    for (const record of records) {
+      // Every entry shares one expiry (capped at the root's new lease).
+      expect(record?.leaseExpiresAt).toBe(result.expiresAt);
+      expect(record?.ownerId).toBe(owner);
+    }
+  });
+
+  it('skips closed descendants (they hold no live lease)', async () => {
+    const { storage, owner } = await setupTree();
+    const child2 = await storage.loadSession({ sessionId: 'child-2' });
+    await storage.saveSession({ ...child2!, closedAt: Date.now() }, { ownerId: owner, ifVersion: child2!.version });
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    // child-2 is closed → not counted (root + child-1 + grandchild = 2 descendants).
+    expect(result.renewedDescendantCount).toBe(2);
+  });
+
+  it('is all-or-nothing: a descendant owned by another instance fences without renewing the root', async () => {
+    const { storage, owner } = await setupTree();
+    // Re-create grandchild's lease under a different owner to simulate a split.
+    const grandchild = await storage.loadSession({ sessionId: 'grandchild' });
+    await storage.releaseSessionLease({ sessionId: 'grandchild', ownerId: owner });
+    await storage.acquireSessionLease({ sessionId: 'grandchild', ownerId: 'owner-B', ttlMs: 30_000 });
+    const rootBefore = await storage.loadSession({ sessionId: 'root' });
+
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Atomic: the root lease must NOT have advanced.
+    const rootAfter = await storage.loadSession({ sessionId: 'root' });
+    expect(rootAfter?.leaseExpiresAt).toBe(rootBefore?.leaseExpiresAt);
+    expect(grandchild?.ownerId).toBe(owner); // sanity: it was owner's before the split
+  });
+
+  it('re-adopts a same-owner descendant whose mirror lapsed (§5.8 repair, not a fence)', async () => {
+    const { storage, owner, db } = await setupTree();
+    // Simulate a lagging/lapsed mirror: same owner, but its lease already expired.
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith('grandchild'));
+    if (!key) throw new Error('expected grandchild record');
+    const lapsed = db.harnessSessions.get(key)!;
+    db.harnessSessions.set(key, { ...lapsed, leaseExpiresAt: Date.now() - 60_000 });
+
+    const result = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+
+    // Lapsed same-owner descendant is extended (re-adopted), not fenced.
+    expect(result.renewedDescendantCount).toBe(3);
+    const grandchild = await storage.loadSession({ sessionId: 'grandchild' });
+    expect(grandchild?.leaseExpiresAt).toBe(result.expiresAt);
+    expect(grandchild?.ownerId).toBe(owner);
+  });
+
+  it('throws not-found for a missing root', async () => {
+    const { storage, owner } = await setupTree();
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'nope', ownerId: owner, ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+  });
+
+  it('throws lease-conflict when the caller is not the root owner', async () => {
+    const { storage } = await setupTree();
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'someone-else', ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+});
+
 function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     harnessName: 'default',
@@ -2816,3 +3074,782 @@ function sampleChannelOutbox(overrides: Partial<ChannelOutboxItem> = {}): Channe
     ...overrides,
   };
 }
+
+describe('InMemoryHarness channel bindings (§5.1h / §14.1)', () => {
+  function makeBinding(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'bind-1',
+      harnessName: 'default',
+      channelId: 'support',
+      providerId: 'slack',
+      status: 'active' as const,
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      resourceId: 'res-1',
+      threadId: 'thread-1',
+      sessionId: 'session-1',
+      mode: 'thread-resource' as const,
+      generation: 1,
+      createdAt: 1000,
+      updatedAt: 1000,
+      ...overrides,
+    };
+  }
+
+  it('saves and loads a binding by id, and looks it up by external tuple', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding());
+    expect(await storage.loadChannelBinding({ bindingId: 'bind-1' })).toMatchObject({ id: 'bind-1', status: 'active' });
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-1' });
+    // Non-active rows are not returned by the external-tuple lookup.
+    await storage.saveChannelBinding(makeBinding({ status: 'closed' }));
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toBeNull();
+  });
+
+  it('hard-deletes session-scoped bindings on session deletion, freeing the conversation to rebind', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ harnessName: 'default' }), { ownerId: 'h-1', ifVersion: 0 });
+    await storage.saveChannelBinding(makeBinding());
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-1' });
+
+    const active = await storage.loadSession({ sessionId: 'session-1' });
+    if (!active) throw new Error('expected session');
+    await storage.saveSession(
+      { ...active, closedAt: 2000, lastActivityAt: 2000 },
+      { ownerId: 'h-1', ifVersion: active.version },
+    );
+    const closed = await storage.loadSession({ sessionId: 'session-1' });
+    if (!closed) throw new Error('expected session');
+    await storage.deleteSession({
+      sessionId: 'session-1',
+      ifVersion: closed.version,
+      expectedResourceId: closed.resourceId,
+      expectedThreadId: closed.threadId,
+      expectedParentSessionId: closed.parentSessionId ?? null,
+      expectedCreatedAt: closed.createdAt,
+      requireClosed: true,
+    });
+
+    // The session-scoped binding is gone — no orphan blocks the conversation.
+    expect(await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).toEqual([]);
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: 'T1',
+        externalChannelId: 'C1',
+        externalThreadId: 'TS1',
+      }),
+    ).toBeNull();
+    // A replacement session can claim the same tuple without a §5.2h conflict
+    // (before the cleanup, the stale active binding would have rejected this).
+    await expect(
+      storage.saveChannelBinding(makeBinding({ id: 'bind-2', sessionId: 'session-2' })),
+    ).resolves.toBeUndefined();
+  });
+
+  it('matches the external tuple with the missing-optional-id sentinel', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'bind-dm', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-dm' });
+  });
+
+  it('a literal single-space external id does not alias the missing-optional-id sentinel', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    // Binding A omits the optional external ids (sentinel-normalised).
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'bind-missing', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    // Binding B uses a real single-space external id — a distinct tuple that must
+    // NOT alias the missing-id sentinel. Both active rows coexist because they are
+    // different conversations.
+    await storage.saveChannelBinding(makeBinding({ id: 'bind-space', externalTenantId: ' ', externalChannelId: ' ' }));
+
+    // The missing-id tuple resolves to the missing-id binding only.
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-missing' });
+
+    // The single-space tuple resolves to the single-space binding only.
+    expect(
+      await storage.loadChannelBindingByExternal({
+        harnessName: 'default',
+        channelId: 'support',
+        platform: 'slack',
+        externalTenantId: ' ',
+        externalChannelId: ' ',
+        externalThreadId: 'TS1',
+      }),
+    ).toMatchObject({ id: 'bind-space' });
+  });
+
+  it('resolveChannelBinding is idempotent for the same tuple (created once)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const first = await storage.resolveChannelBinding({ candidate: makeBinding() });
+    expect(first).toMatchObject({ created: true });
+    const second = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'bind-2' }) });
+    expect(second.created).toBe(false);
+    expect(second.binding.id).toBe('bind-1'); // existing active binding wins
+  });
+
+  it('resolveChannelBinding replacement fences the prior binding and bumps generation', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.resolveChannelBinding({ candidate: makeBinding() });
+    const replaced = await storage.resolveChannelBinding({
+      candidate: makeBinding({ id: 'bind-2', threadId: 'thread-2', sessionId: 'session-2' }),
+      replaceBindingId: 'bind-1',
+    });
+    expect(replaced).toMatchObject({ created: true, replacedBindingId: 'bind-1' });
+    expect(replaced.binding.generation).toBe(2);
+    const prior = await storage.loadChannelBinding({ bindingId: 'bind-1' });
+    expect(prior).toMatchObject({ status: 'replaced', replacedByBindingId: 'bind-2' });
+    // Exactly one active binding for the tuple after replacement.
+    const active = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+    });
+    expect(active?.id).toBe('bind-2');
+  });
+
+  it('lists bindings for a session and paginates active bindings for a scope, then deletes', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding({ id: 'b-a', externalThreadId: 'A', lastOutboundAt: 30 }));
+    await storage.saveChannelBinding(makeBinding({ id: 'b-b', externalThreadId: 'B', lastOutboundAt: 20 }));
+    await storage.saveChannelBinding(
+      makeBinding({ id: 'b-c', externalThreadId: 'C', lastOutboundAt: 10, sessionId: 'session-other' }),
+    );
+
+    expect((await storage.listChannelBindingsForSession({ sessionId: 'session-1' })).map(b => b.id)).toEqual([
+      'b-a',
+      'b-b',
+    ]);
+
+    const page1 = await storage.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      channelId: 'support',
+      limit: 2,
+    });
+    expect(page1.bindings.map(b => b.id)).toEqual(['b-a', 'b-b']); // lastOutboundAt DESC
+    expect(page1.nextCursor).toBe('b-b');
+    const page2 = await storage.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      channelId: 'support',
+      limit: 2,
+      cursor: 'b-b',
+    });
+    expect(page2.bindings.map(b => b.id)).toEqual(['b-c']);
+    expect(page2.nextCursor).toBeUndefined();
+
+    await storage.deleteChannelBinding({ bindingId: 'b-a' });
+    expect(await storage.loadChannelBinding({ bindingId: 'b-a' })).toBeNull();
+  });
+
+  it('replacement keeps one-active-per-tuple even with a stale replaceBindingId (§14.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    // Two distinct active conversations (same tenant/channel, different thread).
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'A', externalThreadId: 'TS-A' }) });
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'B', externalThreadId: 'TS-B' }) });
+    // Replace B's conversation with a fresh binding, but pass A's id (stale/wrong).
+    const res = await storage.resolveChannelBinding({
+      candidate: makeBinding({ id: 'B2', externalThreadId: 'TS-B', sessionId: 'session-B2' }),
+      replaceBindingId: 'A',
+    });
+    // The tuple's active (B) is replaced — NOT the unrelated A named by the stale id.
+    expect(res).toMatchObject({ created: true, replacedBindingId: 'B' });
+    expect(res.binding.generation).toBe(2);
+    expect((await storage.loadChannelBinding({ bindingId: 'A' }))?.status).toBe('active');
+    expect((await storage.loadChannelBinding({ bindingId: 'B' }))?.status).toBe('replaced');
+    const activeB = await storage.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS-B',
+    });
+    expect(activeB?.id).toBe('B2');
+  });
+
+  it('accepts the binding-local closedReason values (§5.1h / §13.3f.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveChannelBinding(makeBinding({ status: 'closed', closedReason: 'platform_unlinked', closedAt: 5 }));
+    expect(await storage.loadChannelBinding({ bindingId: 'bind-1' })).toMatchObject({
+      status: 'closed',
+      closedReason: 'platform_unlinked',
+    });
+  });
+
+  it('saveChannelBinding rejects a second active binding for the same tuple (§5.2h)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { HarnessStorageChannelBindingConflictError } = await import('./base');
+    await storage.saveChannelBinding(makeBinding({ id: 'b1' }));
+    // Same id update is allowed.
+    await expect(storage.saveChannelBinding(makeBinding({ id: 'b1', lastInboundAt: 99 }))).resolves.toBeUndefined();
+    // A non-active row for the tuple is allowed.
+    await expect(
+      storage.saveChannelBinding(makeBinding({ id: 'b1-old', status: 'replaced' })),
+    ).resolves.toBeUndefined();
+    // A second ACTIVE row for the same tuple is rejected.
+    await expect(storage.saveChannelBinding(makeBinding({ id: 'b2' }))).rejects.toBeInstanceOf(
+      HarnessStorageChannelBindingConflictError,
+    );
+  });
+
+  it('generation is monotonic per tuple across replacement (§14.1)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const r1 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g1', generation: 1 }) });
+    expect(r1.binding.generation).toBe(1);
+    const r2 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g2' }), replaceBindingId: 'g1' });
+    expect(r2.binding.generation).toBe(2);
+    // A fresh resolve after the prior is replaced does not regress generation.
+    const r3 = await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'g3' }), replaceBindingId: 'g2' });
+    expect(r3.binding.generation).toBe(3);
+  });
+
+  it('touchChannelBindingInbound advances the activity marker forward only and never regresses it (§14.1 / PF-813)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.resolveChannelBinding({ candidate: makeBinding({ id: 'b1', createdAt: 1000, updatedAt: 1000 }) });
+
+    // First inbound advances both markers forward.
+    const t1 = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 2000 });
+    expect(t1).toMatchObject({ id: 'b1', lastInboundAt: 2000, updatedAt: 2000 });
+
+    // A delayed/out-of-order OLDER ingress must NOT regress the marker (the core
+    // PF-813 guarantee: a stale read-modify-write would have clobbered 2000 → 1500).
+    const stale = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 1500 });
+    expect(stale).toMatchObject({ lastInboundAt: 2000, updatedAt: 2000 });
+    expect(await storage.loadChannelBinding({ bindingId: 'b1' })).toMatchObject({ lastInboundAt: 2000 });
+
+    // A newer ingress advances again.
+    const t2 = await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'b1', at: 3000 });
+    expect(t2).toMatchObject({ lastInboundAt: 3000, updatedAt: 3000 });
+  });
+
+  it('touchChannelBindingInbound returns null for an unknown binding', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    expect(
+      await storage.touchChannelBindingInbound({ harnessName: 'default', bindingId: 'missing', at: 1 }),
+    ).toBeNull();
+  });
+
+  it('throws unsupported from the base default (channel bindings opt-in per adapter)', async () => {
+    const { HarnessStorageChannelBindingUnsupportedError } = await import('./base');
+    expect(HarnessStorageChannelBindingUnsupportedError).toBeDefined();
+  });
+});
+
+describe('InMemoryHarness plan tasks (§5.1k)', () => {
+  const OWNER = 'owner-1';
+
+  // Create an active session with a lease so plan-task writes have a fence to
+  // pass. createOrLoadActiveSession installs version 1 + the initial lease.
+  async function setupSession(
+    storage: InMemoryHarness,
+    overrides: Partial<SessionRecord> = {},
+  ): Promise<{ sessionId: string; version: number }> {
+    const record = sampleSession({ id: 'plan-session', ...overrides });
+    const res = await storage.createOrLoadActiveSession(record, {
+      initialLease: { ownerId: OWNER, ttlMs: 30_000 },
+    });
+    return { sessionId: record.id, version: res.version };
+  }
+
+  function fence(sessionId: string, ifSessionVersion: number, owner = OWNER) {
+    return { harnessName: 'default', sessionId, ownerId: owner, ifSessionVersion };
+  }
+
+  function sampleTask(sessionId: string, overrides: Partial<HarnessPlanTask> = {}): HarnessPlanTask {
+    return {
+      taskId: 'task-1',
+      harnessName: 'default',
+      sessionId,
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      order: 0,
+      status: 'pending',
+      statusSource: 'explicit',
+      content: 'do the thing',
+      createdAt: 1000,
+      updatedAt: 1000,
+      version: 0,
+      ...overrides,
+    };
+  }
+
+  it('creates a root task and lists it', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const created = await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+    expect(created).toMatchObject({ taskId: 'task-1', status: 'pending', version: 1, statusSource: 'explicit' });
+
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toHaveLength(1);
+    expect(listed.tasks[0]).toMatchObject({ taskId: 'task-1', content: 'do the thing' });
+    expect(listed.cursor).toBeUndefined();
+  });
+
+  it('createPlanTask is idempotent on idempotencyKey within a session', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const a = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+    });
+    const b = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+    });
+    expect(b.taskId).toBe('t-a');
+    expect(b.content).toBe('first');
+    expect(b.version).toBe(a.version);
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toHaveLength(1);
+  });
+
+  it('updatePlanTask advances the per-row version and applies the patch', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+    const r1 = await storage.updatePlanTask({
+      fence: fence(sessionId, version),
+      taskId: 'task-1',
+      ifVersion: 1,
+      patch: { status: 'in_progress', activeForm: 'doing the thing', completedAt: 5000 },
+    });
+    expect(r1.version).toBe(2);
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks[0]).toMatchObject({
+      status: 'in_progress',
+      activeForm: 'doing the thing',
+      completedAt: 5000,
+      version: 2,
+    });
+  });
+
+  it('updatePlanTask rejects a stale per-row version (OCC inside the fence)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+    const { HarnessStoragePlanTaskVersionConflictError } = await import('./base');
+    await expect(
+      storage.updatePlanTask({
+        fence: fence(sessionId, version),
+        taskId: 'task-1',
+        ifVersion: 99,
+        patch: { status: 'completed' },
+      }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+  });
+
+  it('updatePlanTask throws not-found for an unknown task', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const { HarnessStoragePlanTaskNotFoundError } = await import('./base');
+    await expect(
+      storage.updatePlanTask({ fence: fence(sessionId, version), taskId: 'nope', ifVersion: 1, patch: {} }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskNotFoundError);
+  });
+
+  it('the session-owner fence rejects a wrong ownerId', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const { HarnessStorageLeaseConflictError } = await import('./base');
+    await expect(
+      storage.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: sampleTask(sessionId) }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('the session-owner fence rejects a stale session version', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const { HarnessStorageVersionConflictError } = await import('./base');
+    await expect(
+      storage.createPlanTask({ fence: fence(sessionId, version + 5), task: sampleTask(sessionId) }),
+    ).rejects.toBeInstanceOf(HarnessStorageVersionConflictError);
+  });
+
+  it('the session-owner fence throws not-found for an unknown session', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { HarnessStorageSessionNotFoundError } = await import('./base');
+    await expect(
+      storage.createPlanTask({ fence: fence('ghost', 1), task: sampleTask('ghost') }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+  });
+
+  it('listPlanTasks paginates and orders by (parentTaskId, order)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // roots r0,r1 then children of r0 (c1,c0) — expected order: r0,r1,c0,c1
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r1', order: 1 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }),
+    });
+
+    const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+    expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+    // Opaque base64 keyset token (no longer the raw taskId) — same shape as PG/LibSQL.
+    expect(typeof page1.cursor).toBe('string');
+    expect(page1.cursor).not.toBe('r1');
+    const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+    expect(page2.tasks.map(t => t.taskId)).toEqual(['c0', 'c1']);
+    expect(page2.cursor).toBeUndefined();
+  });
+
+  it('listPlanTasks keyset-continues even when the cursor row was deleted between pages', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // Four roots r0..r3 in order.
+    for (let i = 0; i < 4; i++) {
+      await storage.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: `r${i}`, order: i }),
+      });
+    }
+    const page1 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+    expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+
+    // Delete the cursor's own row (r1) before fetching the next page. A keyset
+    // cursor must still continue at r2 — the old findIndex(taskId) cursor would
+    // have returned -1 and silently restarted from the head (r0).
+    await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'r1' });
+    const page2 = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+    expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
+  });
+
+  it('listPlanTasks rejects a malformed/foreign cursor with a clear error', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
+    // Undecodable token and a base64 token of the wrong shape both fail clearly,
+    // rather than silently restarting or comparing against undefined keyset fields.
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: 'not-a-cursor!!' }),
+    ).rejects.toThrow(/Invalid plan-task cursor/);
+    const wrongShape = Buffer.from(JSON.stringify({ foo: 'bar' }), 'utf-8').toString('base64');
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: wrongShape }),
+    ).rejects.toThrow(/malformed keyset payload/);
+    // A non-finite `order` (e.g. a hand-crafted token with 1e309 → Infinity) is the
+    // right type but would corrupt keyset comparison, so it must be rejected too.
+    const nonFinite = Buffer.from('{"p":"","o":1e309,"t":"x"}', 'utf-8').toString('base64');
+    await expect(
+      storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: nonFinite }),
+    ).rejects.toThrow(/malformed keyset payload/);
+  });
+
+  it('listPlanTasks isolates by session', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const a = await setupSession(storage, { id: 'sess-a', threadId: 'thread-a' });
+    const b = await setupSession(storage, { id: 'sess-b', threadId: 'thread-b' });
+    await storage.createPlanTask({
+      fence: fence(a.sessionId, a.version),
+      task: sampleTask(a.sessionId, { taskId: 'ta' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(b.sessionId, b.version),
+      task: sampleTask(b.sessionId, { taskId: 'tb' }),
+    });
+    const listedA = await storage.listPlanTasks({ harnessName: 'default', sessionId: a.sessionId, limit: 10 });
+    expect(listedA.tasks.map(t => t.taskId)).toEqual(['ta']);
+  });
+
+  it('deletePlanTaskSubtree cascades to all descendants (not reparent)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // root -> a -> b ; root -> c ; standalone d
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 'root' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'd', order: 9 }),
+    });
+
+    const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'root' });
+    expect(res.deletedCount).toBe(4); // root,a,b,c
+    const remaining = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(remaining.tasks.map(t => t.taskId)).toEqual(['d']);
+  });
+
+  it('deletePlanTaskSubtree terminates on a parentTaskId cycle (defensive guard)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'x', parentTaskId: 'y' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'y', parentTaskId: 'x' }),
+    });
+    const res = await storage.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'x' });
+    expect(res.deletedCount).toBe(2);
+    const remaining = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(remaining.tasks).toHaveLength(0);
+  });
+
+  it('mutatePlanTasksForSession applies multi-row ops atomically', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+    });
+    await storage.mutatePlanTasksForSession({
+      fence: fence(sessionId, version),
+      ops: [
+        { kind: 'create', task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'p', order: 0 }) },
+        { kind: 'create', task: sampleTask(sessionId, { taskId: 'c2', parentTaskId: 'p', order: 1 }) },
+        { kind: 'update', taskId: 'p', ifVersion: 1, patch: { status: 'in_progress' } },
+      ],
+    });
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks.map(t => t.taskId)).toEqual(['p', 'c1', 'c2']);
+    expect(listed.tasks.find(t => t.taskId === 'p')).toMatchObject({ status: 'in_progress', version: 2 });
+  });
+
+  it('mutatePlanTasksForSession rejects all ops when one op conflicts', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+    });
+    const { HarnessStoragePlanTaskVersionConflictError } = await import('./base');
+    await expect(
+      storage.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [
+          { kind: 'create', task: sampleTask(sessionId, { taskId: 'new', order: 5 }) },
+          { kind: 'update', taskId: 'p', ifVersion: 99, patch: { status: 'completed' } },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+    // Nothing committed — 'new' must not exist.
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks.map(t => t.taskId)).toEqual(['p']);
+  });
+
+  it('loadPlanTaskSubtree returns a bounded next-N subtree honoring depth + status', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // root -> a -> b ; root -> c(completed)
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }),
+    });
+
+    // depth 1 from root: root, a, c (not b)
+    const d1 = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'root',
+      depth: 1,
+      limit: 10,
+    });
+    expect(d1.tasks.map(t => t.taskId)).toEqual(['root', 'a', 'c']);
+    expect(d1.truncated).toBe(false);
+
+    // status filter
+    const completed = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      status: 'completed',
+      limit: 10,
+    });
+    expect(completed.tasks.map(t => t.taskId)).toEqual(['c']);
+
+    // limit truncation
+    const limited = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'root',
+      limit: 2,
+    });
+    expect(limited.tasks).toHaveLength(2);
+    expect(limited.truncated).toBe(true);
+  });
+
+  it('countPlanTasksByStatus returns exact total/byStatus/rootCount (cheap aggregate)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // 2 roots; root 'r0' has 2 children (one completed); 'r1' standalone in_progress.
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'r1', order: 1, status: 'in_progress' }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1, status: 'completed' }),
+    });
+
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts.total).toBe(4);
+    expect(counts.rootCount).toBe(2);
+    expect(counts.byStatus).toEqual({ pending: 2, in_progress: 1, completed: 1 });
+  });
+
+  it('countPlanTasksByStatus counts orphans (unresolvable parent) as roots', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    // 'orphan' points at a parent that does not exist in the session set.
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'root', order: 0 }),
+    });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 0 }),
+    });
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts.total).toBe(2);
+    expect(counts.rootCount).toBe(2);
+  });
+
+  it('round-trips the delegatedSubagentSessionId link (TM-6) through create, list, subtree, and update', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    const created = await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 'd1', delegatedSubagentSessionId: 'sub-abc' }),
+    });
+    expect(created.delegatedSubagentSessionId).toBe('sub-abc');
+    // The durable link survives a list read.
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+    // ...and a bounded subtree read.
+    const sub = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'd1',
+      depth: 0,
+      limit: 10,
+    });
+    expect(sub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+    // Re-delegation updates the link in place.
+    await storage.updatePlanTask({
+      fence: fence(sessionId, version),
+      taskId: 'd1',
+      ifVersion: created.version,
+      patch: { delegatedSubagentSessionId: 'sub-xyz' },
+    });
+    const after = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
+    // The updated link also hydrates through a subtree read (not just list).
+    const afterSub = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'd1', depth: 0, limit: 10 });
+    expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
+  });
+
+  it('countPlanTasksByStatus is empty for a session with no plan tasks', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId } = await setupSession(storage);
+    const counts = await storage.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+    expect(counts).toEqual({ total: 0, byStatus: {}, rootCount: 0 });
+  });
+
+  it('session delete cascades plan tasks (§5.2g)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const { sessionId, version } = await setupSession(storage);
+    await storage.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't1' }) });
+    await storage.createPlanTask({
+      fence: fence(sessionId, version),
+      task: sampleTask(sessionId, { taskId: 't2', parentTaskId: 't1' }),
+    });
+    await storage.deleteSession({ harnessName: 'default', sessionId });
+    const listed = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+    expect(listed.tasks).toHaveLength(0);
+  });
+});

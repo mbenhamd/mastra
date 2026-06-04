@@ -157,6 +157,18 @@ You can also pass `requestContext` as a `Record<string, any>`.
       'Retrieves a Harness v1 client resource by registration name, defaulting to `default` when omitted. Use it to create or load remote sessions, subscribe to session events, and recover durable message or queue results.',
   },
   {
+    name: 'getAgentBuilderActions()',
+    type: 'Promise<Record<string, WorkflowInfo>>',
+    description:
+      'Returns all available Agent Builder actions. See [Agent Builder API](/reference/client-js/agent-builder).',
+  },
+  {
+    name: 'getAgentBuilderAction(actionId)',
+    type: 'AgentBuilder',
+    description:
+      'Retrieves an Agent Builder action by ID. See [Agent Builder API](/reference/client-js/agent-builder).',
+  },
+  {
     name: 'responses',
     type: 'Responses',
     description:

@@ -9,12 +9,18 @@ import type { EventCallback, SubscribeOptions } from '../../events/types';
 import { buildFakeOutput } from '../../harness/v1/__test-utils__/fake-output';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
+import { dispatchDueNotifications } from '../../notifications/dispatcher';
+import { InMemoryNotificationsStorage } from '../../notifications/storage';
+import { createNotificationInboxTool } from '../../notifications/tool';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
+import { MastraCompositeStore } from '../../storage/base';
 import { Agent } from '../agent';
 import {
+  createMessageSignal,
   createSignal,
   dataPartToSignal,
   mastraDBMessageToSignal,
+  resolveDeliveryAttributes,
   signalToDataPartFormat,
   signalToMastraDBMessage,
 } from '../signals';
@@ -63,6 +69,68 @@ class AsyncFanoutPubSub extends PubSub {
 
   async flush(): Promise<void> {
     await this.#inner.flush();
+  }
+}
+
+class AsyncCallbackPubSub extends PubSub {
+  #subscribers = new Map<string, Set<EventCallback>>();
+  #index = 0;
+  #pending = new Set<Promise<void>>();
+
+  async publish(topic: string, event: any): Promise<void> {
+    const subscribers = [...(this.#subscribers.get(topic) ?? [])];
+    const envelope = {
+      ...event,
+      id: `event-${this.#index}`,
+      createdAt: new Date(),
+      index: this.#index++,
+    };
+    const pending = new Promise<void>(resolve => {
+      setTimeout(() => {
+        try {
+          for (const subscriber of subscribers) subscriber(envelope);
+        } finally {
+          resolve();
+        }
+      }, 0);
+    });
+    this.#pending.add(pending);
+    pending.finally(() => this.#pending.delete(pending));
+  }
+
+  async subscribe(topic: string, cb: EventCallback): Promise<void> {
+    const subscribers = this.#subscribers.get(topic) ?? new Set<EventCallback>();
+    subscribers.add(cb);
+    this.#subscribers.set(topic, subscribers);
+  }
+
+  async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
+    this.#subscribers.get(topic)?.delete(cb);
+  }
+
+  async flush(): Promise<void> {
+    await Promise.all([...this.#pending]);
+  }
+}
+
+async function readNextRunWithParts(iterator: AsyncIterator<any>) {
+  let runId: string | undefined;
+  let text = '';
+  const parts: any[] = [];
+
+  while (true) {
+    const next = await iterator.next();
+    if (next.done) return next;
+
+    const part = next.value;
+    parts.push(part);
+    runId ??= part.runId;
+    if (part.type === 'text-delta') {
+      text += part.payload.text;
+    }
+    if (part.type === 'finish' || part.type === 'error' || part.type === 'abort') {
+      return { value: { runId, text, part, parts }, done: false };
+    }
   }
 }
 
@@ -128,6 +196,20 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 500) {
   }
 }
 
+async function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = 500): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 describe('Agent signals', () => {
   beforeEach(() => {
     agentThreadStreamRuntime.resetForTests();
@@ -143,12 +225,16 @@ describe('Agent signals', () => {
       metadata: { source: 'test', signal: { userProvided: true } },
     });
 
-    expect(signal.toLLMMessage()).toBe('Signal contents');
+    expect(signal.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<user priority="high">Signal contents</user>',
+    });
     expect(signal.toDataPart()).toEqual({
       type: 'data-user-message',
       data: {
         id: 'signal-1',
-        type: 'user-message',
+        type: 'user',
+        tagName: 'user',
         contents: 'Signal contents',
         createdAt: '2026-01-01T00:00:00.000Z',
         attributes: { priority: 'high' },
@@ -161,7 +247,8 @@ describe('Agent signals', () => {
     expect(dbMessage.content.metadata).toEqual({
       signal: {
         id: 'signal-1',
-        type: 'user-message',
+        type: 'user',
+        tagName: 'user',
         createdAt: '2026-01-01T00:00:00.000Z',
         contents: 'Signal contents',
         attributes: { priority: 'high' },
@@ -226,10 +313,442 @@ describe('Agent signals', () => {
     expect(mastraDBMessageToSignal(fileSignal.toDBMessage()).contents).toEqual(fileContents);
   });
 
+  it('normalizes message signals and legacy signal types', () => {
+    const messageSignal = createMessageSignal({
+      contents: 'Hello',
+      attributes: { sentFrom: 'test' },
+    });
+    expect(messageSignal.type).toBe('user');
+    expect(messageSignal.tagName).toBe('user');
+    expect(messageSignal.toLLMMessage()).toEqual({ role: 'user', content: '<user sentFrom="test">Hello</user>' });
+
+    const legacyMessage = createSignal({ type: 'user-message', contents: 'Legacy message' });
+    expect(legacyMessage.type).toBe('user');
+    expect(legacyMessage.tagName).toBe('user');
+    expect(legacyMessage.toLLMMessage()).toEqual({ role: 'user', content: 'Legacy message' });
+
+    const legacyReminder = createSignal({ type: 'system-reminder', contents: 'Remember this' });
+    expect(legacyReminder.type).toBe('reactive');
+    expect(legacyReminder.tagName).toBe('system-reminder');
+    expect(legacyReminder.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<system-reminder>Remember this</system-reminder>',
+    });
+
+    const reactiveReminder = createSignal({ type: 'reactive', contents: 'Default reminder tag' });
+    expect(reactiveReminder.type).toBe('reactive');
+    expect(reactiveReminder.tagName).toBe('system-reminder');
+    expect(reactiveReminder.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<system-reminder>Default reminder tag</system-reminder>',
+    });
+
+    const customTaggedReminder = createSignal({
+      type: 'reactive',
+      tagName: 'custom-reminder',
+      contents: 'Custom tag',
+    });
+    expect(customTaggedReminder.type).toBe('reactive');
+    expect(customTaggedReminder.tagName).toBe('custom-reminder');
+    expect(() => createSignal({ type: 'custom-reminder' as any, contents: 'Legacy custom' })).toThrow(
+      'Invalid signal type: custom-reminder',
+    );
+  });
+
+  it('renders user-message attributes inline-wrapped for text and multimodal contents', () => {
+    const stringSignal = createSignal({
+      type: 'user-message',
+      contents: 'Hello',
+      attributes: { messageId: 'm-1', userId: 'u-1' },
+    });
+    expect(stringSignal.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<user messageId="m-1" userId="u-1">Hello</user>',
+    });
+
+    const partsTextSignal = createSignal({
+      type: 'user-message',
+      contents: [{ type: 'text', text: 'Hello again' }],
+      attributes: { messageId: 'm-1b' },
+    });
+    expect(partsTextSignal.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<user messageId="m-1b">Hello again</user>',
+    });
+
+    const fileContents = [
+      { type: 'text' as const, text: 'Look at this' },
+      {
+        type: 'file' as const,
+        data: 'data:image/png;base64,aGVsbG8=',
+        mediaType: 'image/png',
+      },
+    ];
+    const multimodalSignal = createSignal({
+      type: 'user-message',
+      contents: fileContents,
+      attributes: { messageId: 'm-2' },
+    });
+    // Multimodal: text part is inline-wrapped, file part is preserved.
+    const multimodalResult = multimodalSignal.toLLMMessage();
+    expect(multimodalResult.role).toBe('user');
+    expect(multimodalResult.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'text',
+          text: '<user messageId="m-2">Look at this</user>',
+        }),
+        expect.objectContaining({
+          type: 'file',
+          data: 'data:image/png;base64,aGVsbG8=',
+        }),
+      ]),
+    );
+
+    // file-only: no text part exists, so the marker is prepended as a synthetic text part on
+    // the same message so the attributes still surface alongside the file payload.
+    const fileOnlyContents = [
+      { type: 'file' as const, data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+    ];
+    const fileOnlySignal = createSignal({
+      type: 'user-message',
+      contents: fileOnlyContents,
+      attributes: { messageId: 'm-2d' },
+    });
+    const fileOnlyResult = fileOnlySignal.toLLMMessage();
+    expect(fileOnlyResult.role).toBe('user');
+    expect(fileOnlyResult.content).toEqual([
+      expect.objectContaining({ type: 'text', text: '<user messageId="m-2d" />' }),
+      expect.objectContaining({ type: 'file', data: 'data:image/png;base64,aGVsbG8=' }),
+    ]);
+
+    const noAttributeSignal = createSignal({
+      type: 'user-message',
+      contents: 'Plain message',
+    });
+    expect(noAttributeSignal.toLLMMessage()).toEqual({ role: 'user', content: 'Plain message' });
+
+    const onlyNullAttributesSignal = createSignal({
+      type: 'user-message',
+      contents: 'Plain message',
+      attributes: { ignored: null, alsoIgnored: undefined },
+    });
+    expect(onlyNullAttributesSignal.toLLMMessage()).toEqual({ role: 'user', content: 'Plain message' });
+  });
+
+  it('renders system-reminder signals with multimodal contents the same way as user-message attributes', () => {
+    // Text-only system-reminder still wraps even without attributes (the wrapper is the signal).
+    const plainReminder = createSignal({
+      type: 'system-reminder',
+      contents: 'Be concise.',
+    });
+    expect(plainReminder.toLLMMessage()).toEqual({
+      role: 'user',
+      content: '<system-reminder>Be concise.</system-reminder>',
+    });
+
+    // System-reminder with multimodal contents: text part is inline-wrapped with the marker,
+    // file part is preserved alongside it on the same logical turn.
+    const screenshotContents = [
+      { type: 'text' as const, text: 'The user is looking at this screen.' },
+      {
+        type: 'file' as const,
+        data: 'data:image/png;base64,aGVsbG8=',
+        mediaType: 'image/png',
+      },
+    ];
+    const screenshotReminder = createSignal({
+      type: 'system-reminder',
+      contents: screenshotContents,
+      attributes: { kind: 'screenshot' },
+    });
+    const screenshotResult = screenshotReminder.toLLMMessage();
+    expect(screenshotResult.role).toBe('user');
+    expect(screenshotResult.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'text',
+          text: '<system-reminder kind="screenshot">The user is looking at this screen.</system-reminder>',
+        }),
+        expect.objectContaining({
+          type: 'file',
+          data: 'data:image/png;base64,aGVsbG8=',
+        }),
+      ]),
+    );
+
+    // System-reminder with only file parts has no text to inline-wrap, so the marker is
+    // prepended as a synthetic text part on the same message.
+    const fileOnlyReminderContents = [
+      { type: 'file' as const, data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+    ];
+    const fileOnlyReminder = createSignal({
+      type: 'system-reminder',
+      contents: fileOnlyReminderContents,
+      attributes: { kind: 'reference-image' },
+    });
+    const fileOnlyResult = fileOnlyReminder.toLLMMessage();
+    expect(fileOnlyResult.role).toBe('user');
+    expect(fileOnlyResult.content).toEqual([
+      expect.objectContaining({ type: 'text', text: '<system-reminder kind="reference-image" />' }),
+      expect.objectContaining({ type: 'file', data: 'data:image/png;base64,aGVsbG8=' }),
+    ]);
+
+    // System-reminder with mixed text + file parts: the marker is inlined into the very first
+    // text part, subsequent parts pass through untouched on the same logical turn.
+    const mixedReminderContents = [
+      { type: 'text' as const, text: 'Step one of the screen.' },
+      { type: 'text' as const, text: 'Step two has this attachment.' },
+      { type: 'file' as const, data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+    ];
+    const mixedReminder = createSignal({
+      type: 'system-reminder',
+      contents: mixedReminderContents,
+      attributes: { kind: 'walkthrough' },
+    });
+    const mixedResult = mixedReminder.toLLMMessage();
+    expect(mixedResult.content).toEqual([
+      expect.objectContaining({
+        type: 'text',
+        text: '<system-reminder kind="walkthrough">Step one of the screen.</system-reminder>',
+      }),
+      expect.objectContaining({ type: 'text', text: 'Step two has this attachment.' }),
+      expect.objectContaining({ type: 'file', data: 'data:image/png;base64,aGVsbG8=' }),
+    ]);
+  });
+
+  it('persists multimodal signal contents as faithful DB parts so UIs can render them', () => {
+    const fileContents = [
+      { type: 'text' as const, text: 'Look at this' },
+      { type: 'file' as const, data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+    ];
+
+    const userMessage = createSignal({
+      type: 'user-message',
+      contents: fileContents,
+      attributes: { messageId: 'm-1' },
+    });
+    const userDb = userMessage.toDBMessage();
+    expect(userDb.content.parts).toEqual([
+      expect.objectContaining({ type: 'text', text: 'Look at this' }),
+      expect.objectContaining({ type: 'file', data: 'data:image/png;base64,aGVsbG8=' }),
+    ]);
+    // Stash is dropped — metadata.signal carries only envelope fields (id/type/attributes/createdAt).
+    const signalMeta = (userDb.content.metadata as { signal: Record<string, unknown> }).signal;
+    expect(signalMeta).not.toHaveProperty('contents');
+    expect(signalMeta).toMatchObject({ type: 'user', tagName: 'user', attributes: { messageId: 'm-1' } });
+
+    const reminder = createSignal({
+      type: 'system-reminder',
+      contents: fileContents,
+      attributes: { kind: 'screenshot' },
+    });
+    const reminderDb = reminder.toDBMessage();
+    expect(reminderDb.content.parts).toEqual([
+      expect.objectContaining({ type: 'text', text: 'Look at this' }),
+      expect.objectContaining({ type: 'file', data: 'data:image/png;base64,aGVsbG8=' }),
+    ]);
+
+    // Empty contents still produce a single empty text part so consumers that assume non-empty parts stay happy.
+    const emptyReminder = createSignal({ type: 'system-reminder', contents: '' });
+    expect(emptyReminder.toDBMessage().content.parts).toEqual([{ type: 'text', text: '' }]);
+  });
+
+  it('round-trips multimodal non-user-message signals through DB without dropping file parts', () => {
+    const screenshotContents = [
+      { type: 'text' as const, text: 'The user is looking at this screen.' },
+      { type: 'file' as const, data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+    ];
+    const reminder = createSignal({
+      type: 'system-reminder',
+      contents: screenshotContents,
+      attributes: { kind: 'screenshot' },
+    });
+    const rehydrated = mastraDBMessageToSignal(reminder.toDBMessage());
+    expect(rehydrated.type).toBe('reactive');
+    expect(rehydrated.tagName).toBe('system-reminder');
+    expect(rehydrated.contents).toEqual(screenshotContents);
+    expect(rehydrated.attributes).toEqual({ kind: 'screenshot' });
+
+    // dataPart round-trip preserves the multimodal shape too.
+    const fromDataPart = dataPartToSignal(reminder.toDataPart());
+    expect(fromDataPart.contents).toEqual(screenshotContents);
+  });
+
+  it('threads providerOptions through LLM message, DB storage, and rehydration', () => {
+    const providerOptions = {
+      openai: { reasoningEffort: 'high' },
+      anthropic: { cacheControl: { type: 'ephemeral' } },
+    };
+    const signal = createSignal({
+      type: 'user-message',
+      contents: 'hello',
+      providerOptions,
+    });
+
+    // LLM message: providerOptions on the CoreMessage so it flows to the model.
+    const llmMessage = signal.toLLMMessage();
+    expect(llmMessage).toMatchObject({ role: 'user', content: 'hello', providerOptions });
+
+    // DB storage: content.providerMetadata (canonical location, also surfaces to useChat).
+    const db = signal.toDBMessage();
+    expect(db.content.providerMetadata).toEqual(providerOptions);
+
+    // Round-trip: rehydrated signal carries providerOptions and re-emits it.
+    const rehydrated = mastraDBMessageToSignal(db);
+    expect(rehydrated.providerOptions).toEqual(providerOptions);
+    expect(rehydrated.toLLMMessage()).toMatchObject({ providerOptions });
+  });
+
+  it('omits providerOptions on LLM / DB output when not provided', () => {
+    const signal = createSignal({ type: 'user-message', contents: 'hi' });
+    const llmMessage = signal.toLLMMessage();
+    expect((llmMessage as { providerOptions?: unknown }).providerOptions).toBeUndefined();
+    expect(signal.toDBMessage().content.providerMetadata).toBeUndefined();
+  });
+
+  it('threads per-part providerOptions through LLM, DB, and rehydration', () => {
+    const partProviderOptions = { anthropic: { cacheControl: { type: 'ephemeral' } } };
+    const signal = createSignal({
+      type: 'user-message',
+      contents: [
+        { type: 'text', text: 'hello', providerOptions: partProviderOptions },
+        { type: 'file', data: 'AAA=', mediaType: 'image/png' },
+      ],
+    });
+
+    // LLM: parts array carries per-part providerOptions (not collapsed to bare string).
+    const llmMessage = signal.toLLMMessage();
+    expect(llmMessage.role).toBe('user');
+    expect(Array.isArray(llmMessage.content)).toBe(true);
+    const llmParts = llmMessage.content as Array<{ type: string; providerOptions?: unknown }>;
+    expect(llmParts[0]).toMatchObject({ type: 'text', text: 'hello', providerOptions: partProviderOptions });
+    expect(llmParts[1]).toMatchObject({ type: 'file', data: 'AAA=', mediaType: 'image/png' });
+
+    // DB: per-part providerMetadata persisted alongside the storage part.
+    const db = signal.toDBMessage();
+    const textPart = db.content.parts[0] as { type: string; providerMetadata?: unknown };
+    expect(textPart).toMatchObject({ type: 'text', text: 'hello', providerMetadata: partProviderOptions });
+
+    // Round-trip: rehydrated signal restores per-part providerOptions.
+    const rehydrated = mastraDBMessageToSignal(db);
+    const rehydratedContents = rehydrated.contents as Array<{ type: string; providerOptions?: unknown }>;
+    expect(rehydratedContents[0]).toMatchObject({ type: 'text', text: 'hello', providerOptions: partProviderOptions });
+  });
+
+  it('preserves per-part providerOptions on a single-text user-message (no bare-string collapse)', () => {
+    const partProviderOptions = { anthropic: { cacheControl: { type: 'ephemeral' } } };
+    const signal = createSignal({
+      type: 'user-message',
+      contents: [{ type: 'text', text: 'hello', providerOptions: partProviderOptions }],
+    });
+
+    const llmMessage = signal.toLLMMessage();
+    // Must keep parts array — collapsing to a bare string would drop providerOptions.
+    expect(Array.isArray(llmMessage.content)).toBe(true);
+    const llmParts = llmMessage.content as Array<{ type: string; providerOptions?: unknown }>;
+    expect(llmParts[0]).toMatchObject({ type: 'text', text: 'hello', providerOptions: partProviderOptions });
+  });
+
+  describe('legacy metadata.signal.contents rehydration', () => {
+    function buildLegacyDBRow(legacyContents: unknown) {
+      const row = createSignal({
+        id: 'signal-legacy',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        type: 'user-message',
+        contents: 'placeholder',
+      }).toDBMessage();
+      row.content.metadata = {
+        ...row.content.metadata,
+        signal: {
+          ...(row.content.metadata?.signal as Record<string, unknown>),
+          contents: legacyContents,
+        },
+      };
+      return row;
+    }
+
+    it('recovers a bare string stash', () => {
+      const rehydrated = mastraDBMessageToSignal(buildLegacyDBRow('hello world'));
+      expect(rehydrated.contents).toBe('hello world');
+    });
+
+    it('recovers an Array<TextPart | FilePart> stash with mediaType', () => {
+      const rehydrated = mastraDBMessageToSignal(
+        buildLegacyDBRow([
+          { type: 'text', text: 'caption' },
+          { type: 'file', data: 'BASE64', mediaType: 'image/png', filename: 'photo.png' },
+        ]),
+      );
+      expect(rehydrated.contents).toEqual([
+        { type: 'text', text: 'caption' },
+        { type: 'file', data: 'BASE64', mediaType: 'image/png', filename: 'photo.png' },
+      ]);
+    });
+
+    it('recovers a CoreUserMessage wrapper with text-only content', () => {
+      const rehydrated = mastraDBMessageToSignal(buildLegacyDBRow({ role: 'user', content: 'hello world' }));
+      expect(rehydrated.contents).toBe('hello world');
+    });
+
+    it('recovers a CoreUserMessage wrapper with mixed text + image parts', () => {
+      const rehydrated = mastraDBMessageToSignal(
+        buildLegacyDBRow({
+          role: 'user',
+          content: [
+            { type: 'text', text: 'what is this?' },
+            { type: 'image', image: 'BASE64', mediaType: 'image/png' },
+          ],
+        }),
+      );
+      expect(rehydrated.contents).toEqual([
+        { type: 'text', text: 'what is this?' },
+        { type: 'file', data: 'BASE64', mediaType: 'image/png' },
+      ]);
+    });
+
+    it('recovers a CoreUserMessage[] stash from the React hook', () => {
+      const rehydrated = mastraDBMessageToSignal(
+        buildLegacyDBRow([
+          { role: 'user', content: 'first' },
+          { role: 'user', content: [{ type: 'text', text: 'second' }] },
+        ]),
+      );
+      expect(rehydrated.contents).toEqual([
+        { type: 'text', text: 'first' },
+        { type: 'text', text: 'second' },
+      ]);
+    });
+
+    it('falls back to canonical content.parts when the stash is unrecognisable', () => {
+      const row = buildLegacyDBRow({ totally: 'unrelated' });
+      row.content.parts = [{ type: 'text', text: 'from canonical parts' }];
+      const rehydrated = mastraDBMessageToSignal(row);
+      expect(rehydrated.contents).toBe('from canonical parts');
+    });
+
+    it('prefers a valid multimodal stash over flattened-text content.parts (main-era rows)', () => {
+      // Main wrote the full original input to metadata.signal.contents and a flattened text
+      // projection to content.parts. If we preferred parts here we'd silently drop the file
+      // payload on rehydrate.
+      const row = buildLegacyDBRow([
+        { type: 'text', text: 'caption' },
+        { type: 'file', data: 'BASE64', mediaType: 'image/png', filename: 'photo.png' },
+      ]);
+      row.content.parts = [{ type: 'text', text: 'caption' }];
+      const rehydrated = mastraDBMessageToSignal(row);
+      expect(rehydrated.contents).toEqual([
+        { type: 'text', text: 'caption' },
+        { type: 'file', data: 'BASE64', mediaType: 'image/png', filename: 'photo.png' },
+      ]);
+    });
+  });
+
   it('rejects invalid XML names for contextual signal markup', () => {
     expect(() =>
       createSignal({
-        type: 'system reminder',
+        type: 'reactive',
+        tagName: 'system reminder',
         contents: 'invalid tag name',
       }).toLLMMessage(),
     ).toThrow('Invalid signal XML tag name: system reminder');
@@ -268,6 +787,225 @@ describe('Agent signals', () => {
     subscription.unsubscribe();
   });
 
+  it('delivers each thread run to multiple same-runtime subscribers', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'multi-subscriber-thread-agent' } as Agent<any, any, any, any>;
+    const threadId = 'multi-subscriber-thread';
+    const resourceId = 'multi-subscriber-user';
+
+    const registerRun = (runNumber: number) => {
+      const runId = `multi-subscriber-run-${runNumber}`;
+      let finish!: () => void;
+      const finished = new Promise<void>(resolve => {
+        finish = resolve;
+      });
+      const parts = [
+        { type: 'start', runId },
+        { type: 'text-start', runId, payload: { id: `text-${runNumber}` } },
+        { type: 'text-delta', runId, payload: { id: `text-${runNumber}`, text: `response ${runNumber}` } },
+        { type: 'text-end', runId, payload: { id: `text-${runNumber}` } },
+        {
+          type: 'finish',
+          runId,
+          payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+        },
+      ];
+      const fullStream = new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            for (const part of parts) controller.enqueue(part);
+            controller.close();
+            finish();
+          }, 25);
+        },
+      });
+
+      runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'running',
+          fullStream,
+          _waitUntilFinished: () => finished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+      return runId;
+    };
+
+    const firstSubscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const secondSubscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const firstIterator = firstSubscription.stream[Symbol.asyncIterator]();
+    const secondIterator = secondSubscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const firstSubscriberRun1 = readNextRun(firstIterator);
+      const secondSubscriberRun1 = readNextRun(secondIterator);
+      const runId1 = registerRun(1);
+
+      const [run1a, run1b] = await Promise.all([
+        withTimeout(firstSubscriberRun1, 'Timed out waiting for first subscriber to receive run 1'),
+        withTimeout(secondSubscriberRun1, 'Timed out waiting for second subscriber to receive run 1'),
+      ]);
+      expect(run1a.value).toMatchObject({ runId: runId1, text: 'response 1' });
+      expect(run1b.value).toMatchObject({ runId: runId1, text: 'response 1' });
+
+      const firstSubscriberRun2 = readNextRun(firstIterator);
+      const secondSubscriberRun2 = readNextRun(secondIterator);
+      const runId2 = registerRun(2);
+
+      const [run2a, run2b] = await Promise.all([
+        withTimeout(firstSubscriberRun2, 'Timed out waiting for first subscriber to receive run 2'),
+        withTimeout(secondSubscriberRun2, 'Timed out waiting for second subscriber to receive run 2'),
+      ]);
+      expect(run2a.value).toMatchObject({ runId: runId2, text: 'response 2' });
+      expect(run2b.value).toMatchObject({ runId: runId2, text: 'response 2' });
+    } finally {
+      firstSubscription.unsubscribe();
+      secondSubscription.unsubscribe();
+    }
+  });
+
+  it('delivers resumed runs with the same run id to thread subscribers', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'resumed-thread-agent' } as Agent<any, any, any, any>;
+    const threadId = 'resumed-thread';
+    const resourceId = 'resumed-user';
+    const runId = 'resumed-run';
+
+    const createRun = (parts: any[]) => {
+      let finish!: () => void;
+      const finished = new Promise<void>(resolve => {
+        finish = resolve;
+      });
+      const fullStream = new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            for (const part of parts) controller.enqueue(part);
+            controller.close();
+            finish();
+          }, 5);
+        },
+      });
+
+      runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'running',
+          fullStream,
+          _waitUntilFinished: () => finished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+    };
+
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      createRun([
+        { type: 'start', runId },
+        {
+          type: 'tool-call-suspended',
+          runId,
+          payload: { toolCallId: 'tool-call-1', toolName: 'testTool' },
+        },
+      ]);
+
+      await withTimeout(iterator.next(), 'Timed out waiting for initial resumed-run start');
+      const suspended = await withTimeout(iterator.next(), 'Timed out waiting for suspended chunk');
+      expect(suspended.value).toMatchObject({ type: 'tool-call-suspended', runId });
+      await waitForCondition(() => subscription.activeRunId() === null);
+
+      const resumedRun = readNextRun(iterator);
+      createRun([
+        { type: 'start', runId },
+        { type: 'text-start', runId, payload: { id: 'text-1' } },
+        { type: 'text-delta', runId, payload: { id: 'text-1', text: 'approved response' } },
+        { type: 'text-end', runId, payload: { id: 'text-1' } },
+        {
+          type: 'finish',
+          runId,
+          payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+        },
+      ]);
+
+      await expect(withTimeout(resumedRun, 'Timed out waiting for resumed run')).resolves.toMatchObject({
+        value: { runId, text: 'approved response' },
+      });
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
+  it('keeps multicast thread streams alive when one subscriber unsubscribes mid-run', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'subscriber-cancel-agent' } as Agent<any, any, any, any>;
+    const threadId = 'subscriber-cancel-thread';
+    const resourceId = 'subscriber-cancel-user';
+    const runId = 'subscriber-cancel-run';
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    const parts = [
+      { type: 'start', runId },
+      { type: 'text-start', runId, payload: { id: 'text-1' } },
+      { type: 'text-delta', runId, payload: { id: 'text-1', text: 'still running' } },
+      { type: 'text-end', runId, payload: { id: 'text-1' } },
+      {
+        type: 'finish',
+        runId,
+        payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+      },
+    ];
+    const fullStream = new ReadableStream({
+      async start(controller) {
+        for (const part of parts) {
+          await new Promise(resolve => setTimeout(resolve, 5));
+          controller.enqueue(part);
+        }
+        controller.close();
+        finish();
+      },
+    });
+
+    const firstSubscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const secondSubscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const firstIterator = firstSubscription.stream[Symbol.asyncIterator]();
+    const secondIterator = secondSubscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const secondRun = readNextRun(secondIterator);
+      runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'running',
+          fullStream,
+          _waitUntilFinished: () => finished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+
+      const firstPart = await withTimeout(firstIterator.next(), 'Timed out waiting for first subscriber part');
+      expect(firstPart.value).toMatchObject({ type: 'start', runId });
+      await firstIterator.return?.();
+      firstSubscription.unsubscribe();
+
+      await expect(
+        withTimeout(secondRun, 'Timed out waiting for second subscriber to finish run'),
+      ).resolves.toMatchObject({
+        value: { runId, text: 'still running' },
+        done: false,
+      });
+    } finally {
+      firstSubscription.unsubscribe();
+      secondSubscription.unsubscribe();
+    }
+  });
+
   it('starts an idle thread run when a user-message signal is sent', async () => {
     const agent = new Agent({
       id: 'idle-signal-agent',
@@ -299,6 +1037,1221 @@ describe('Agent signals', () => {
     subscription.unsubscribe();
   });
 
+  it('starts an idle thread run when sendMessage is called', async () => {
+    const agent = new Agent({
+      id: 'idle-message-agent',
+      name: 'Idle Message Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('message response'),
+    });
+
+    const subscription = await agent.subscribeToThread({
+      threadId: 'idle-message-thread',
+      resourceId: 'idle-message-user',
+    });
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
+
+    const result = await agent.sendMessage(
+      { contents: 'Hello from sendMessage', attributes: { sentFrom: 'test' } },
+      {
+        resourceId: 'idle-message-user',
+        threadId: 'idle-message-thread',
+        ifIdle: { streamOptions: { memory: { resource: 'idle-message-user', thread: 'idle-message-thread' } } },
+      },
+    );
+
+    const subscribedRun = await nextRun;
+    expect(result).toEqual(expect.objectContaining({ accepted: true, runId: subscribedRun.value.runId }));
+    expect(result.signal).toMatchObject({ type: 'user', tagName: 'user', contents: 'Hello from sendMessage' });
+    const signalPart = subscribedRun.value.parts.find((part: any) => part.type === 'data-user-message');
+    expect(signalPart?.data).toMatchObject({
+      id: result.signal.id,
+      type: 'user',
+      tagName: 'user',
+      contents: 'Hello from sendMessage',
+      attributes: { sentFrom: 'test' },
+    });
+    expect(subscribedRun.value.text).toBe('message response');
+
+    subscription.unsubscribe();
+  });
+
+  it('persists external state signals with cache-key tracking', async () => {
+    const memory = new MockMemory();
+    await memory.createThread({ threadId: 'state-thread', resourceId: 'state-user' });
+    const agent = new Agent({
+      id: 'state-agent',
+      name: 'State Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('state response'),
+      memory,
+    });
+
+    const result = await agent.sendStateSignal(
+      {
+        id: 'browser',
+        cacheKey: 'browser:v1',
+        mode: 'snapshot',
+        contents: 'Browser is open on https://example.com',
+        value: { activeUrl: 'https://example.com' },
+      },
+      { resourceId: 'state-user', threadId: 'state-thread', ifIdle: { behavior: 'persist' } },
+    );
+    expect(result.accepted).toBe(true);
+    expect(result.skipped).not.toBe(true);
+    expect(result.signal).toBeDefined();
+
+    expect(result.signal).toMatchObject({
+      type: 'state',
+      tagName: 'state',
+      metadata: expect.objectContaining({
+        state: expect.objectContaining({ id: 'browser', cacheKey: 'browser:v1', mode: 'snapshot', version: 1 }),
+        value: { activeUrl: 'https://example.com' },
+      }),
+    });
+    await expect(
+      agent.sendStateSignal(
+        { id: 'browser', cacheKey: 'browser:v1', contents: 'unchanged' },
+        { resourceId: 'state-user', threadId: 'state-thread', ifIdle: { behavior: 'persist' } },
+      ),
+    ).resolves.toEqual({ accepted: true, skipped: true, reason: 'unchanged' });
+    const thread = await memory.getThreadById({ threadId: 'state-thread' });
+    expect(thread?.metadata?.mastra).toEqual(
+      expect.objectContaining({
+        stateSignals: expect.objectContaining({
+          browser: expect.objectContaining({
+            currentCacheKey: 'browser:v1',
+            version: 1,
+            lastSnapshotSignalId: result.signal!.id,
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('delivers medium-priority notification records while idle', async () => {
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'notification-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'notification-agent',
+      name: 'Notification Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('notification response'),
+    });
+    new Mastra({ agents: { notificationAgent: agent }, storage, logger: false });
+
+    const subscription = await agent.subscribeToThread({
+      threadId: 'notification-thread',
+      resourceId: 'notification-user',
+    });
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
+
+    const result = await agent.sendNotificationSignal(
+      {
+        source: 'github',
+        kind: 'ci-status',
+        priority: 'medium',
+        summary: 'CI failed on main',
+        dedupeKey: 'main-ci',
+      },
+      {
+        resourceId: 'notification-user',
+        threadId: 'notification-thread',
+        ifIdle: { streamOptions: { memory: { resource: 'notification-user', thread: 'notification-thread' } } },
+      },
+    );
+
+    const subscribedRun = await nextRun;
+    expect(result).toEqual(expect.objectContaining({ accepted: true, runId: subscribedRun.value.runId }));
+    expect(result.decision).toMatchObject({ action: 'deliver' });
+    expect(result.record).toMatchObject({
+      agentId: 'notification-agent',
+      resourceId: 'notification-user',
+      threadId: 'notification-thread',
+      status: 'delivered',
+      deliveredSignalId: result.signal?.id,
+    });
+    const signalPart = subscribedRun.value.parts.find((part: any) => part.type === 'data-signal');
+    expect(signalPart?.data).toMatchObject({
+      id: result.signal?.id,
+      type: 'notification',
+      tagName: 'notification',
+      contents: 'CI failed on main',
+      attributes: { source: 'github', kind: 'ci-status', priority: 'medium', status: 'delivered' },
+    });
+    await expect(
+      notifications.getNotification({ threadId: 'notification-thread', id: result.record.id }),
+    ).resolves.toMatchObject({ status: 'delivered', deliveredSignalId: result.signal?.id });
+
+    subscription.unsubscribe();
+  });
+
+  it('keeps immediate notification records pending when runtime rejects delivery', async () => {
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'rejected-notification-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'rejected-notification-agent',
+      name: 'Rejected Notification Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('unused'),
+    });
+    new Mastra({ agents: { rejectedNotificationAgent: agent }, storage, logger: false });
+    const sendSignal = vi.spyOn(agentThreadStreamRuntime, 'sendSignal').mockReturnValue({
+      accepted: false,
+      runId: 'run-1',
+      signal: createSignal({ type: 'notification', tagName: 'notification', contents: 'Rejected' }),
+    } as any);
+
+    try {
+      const result = await agent.sendNotificationSignal(
+        { source: 'github', kind: 'ci-status', priority: 'medium', summary: 'Rejected notification' },
+        { resourceId: 'notification-user', threadId: 'notification-thread' },
+      );
+
+      expect(result.accepted).toBe(false);
+      expect(result.record).toMatchObject({
+        status: 'pending',
+        deliveryAttempts: 1,
+        lastDeliveryError: 'Notification signal was rejected',
+      });
+      expect(result.record.deliveredSignalId).toBeUndefined();
+      const stored = await notifications.getNotification({ threadId: 'notification-thread', id: result.record.id });
+      expect(stored).toMatchObject({ status: 'pending', deliveryAttempts: 1 });
+      expect(stored?.deliveredSignalId).toBeUndefined();
+    } finally {
+      sendSignal.mockRestore();
+    }
+  });
+
+  it('batches active high notifications for full delivery and active medium or low notifications for summaries', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({
+      id: 'active-priority-notification-storage',
+      domains: { notifications },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        streamCount += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({ type: 'text-start', id: 'text-1' });
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta: 'active response' });
+              controller.enqueue({ type: 'text-end', id: 'text-1' });
+              await firstFinished;
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'active-priority-notification-agent',
+      name: 'Active Priority Notification Agent',
+      instructions: 'Test',
+      model,
+    });
+    new Mastra({ agents: { activePriorityNotificationAgent: agent }, storage, logger: false });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'active-priority-notification-thread',
+      resourceId: 'active-priority-notification-user',
+    });
+
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'active-priority-notification-thread', resource: 'active-priority-notification-user' },
+    });
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+
+    const high = await agent.sendNotificationSignal(
+      { source: 'github', kind: 'ci-status', priority: 'high', summary: 'CI failed' },
+      { resourceId: 'active-priority-notification-user', threadId: 'active-priority-notification-thread' },
+    );
+    const medium = await agent.sendNotificationSignal(
+      { source: 'slack', kind: 'mention', priority: 'medium', summary: 'Jane mentioned you' },
+      { resourceId: 'active-priority-notification-user', threadId: 'active-priority-notification-thread' },
+    );
+    const low = await agent.sendNotificationSignal(
+      { source: 'calendar', kind: 'event-reminder', priority: 'low', summary: 'Standup starts soon' },
+      { resourceId: 'active-priority-notification-user', threadId: 'active-priority-notification-thread' },
+    );
+
+    await nextTick();
+    expect(streamCount).toBe(1);
+    expect(high.signal).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    expect(high.decision).toMatchObject({ action: 'summarize', reason: 'active-high-summary-then-full' });
+    expect(high.record).toMatchObject({
+      status: 'pending',
+      deliveryReason: 'active-high-summary-then-full',
+      summarySignalId: high.signal?.id,
+    });
+    expect(high.record.summaryAt).toBeUndefined();
+    expect(high.record.deliverAt).toBeInstanceOf(Date);
+    expect(medium.signal).toBeUndefined();
+    expect(medium.decision).toMatchObject({ action: 'summarize', reason: 'active-batch-summary' });
+    expect(medium.record).toMatchObject({ status: 'pending', deliveryReason: 'active-batch-summary' });
+    expect(medium.record.summaryAt).toBeInstanceOf(Date);
+    expect(low.signal).toBeUndefined();
+    expect(low.decision).toMatchObject({ action: 'summarize', reason: 'active-batch-summary' });
+    expect(low.record).toMatchObject({ status: 'pending', deliveryReason: 'active-batch-summary' });
+    expect(low.record.summaryAt).toBeInstanceOf(Date);
+
+    releaseFirst();
+    await expect(stream.text).resolves.toBe('active response');
+    expect(streamCount).toBe(1);
+    subscription.unsubscribe();
+  });
+
+  it('summarizes active high-priority notifications immediately, then delivers full notifications when idle', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'high-active-integration-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'high-active-integration-agent',
+      name: 'High Active Integration Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          const responseText = `response ${streamCount}`;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: new ReadableStream({
+              async start(controller) {
+                controller.enqueue({ type: 'stream-start', warnings: [] });
+                controller.enqueue({ type: 'text-start', id: 'text-1' });
+                controller.enqueue({ type: 'text-delta', id: 'text-1', delta: responseText });
+                controller.enqueue({ type: 'text-end', id: 'text-1' });
+                if (streamCount === 1) {
+                  await firstFinished;
+                }
+                controller.enqueue({
+                  type: 'finish',
+                  finishReason: 'stop',
+                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                });
+                controller.close();
+              },
+            }),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { highActiveIntegrationAgent: agent }, storage, logger: false });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'high-active-thread',
+      resourceId: 'high-active-user',
+    });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const firstRun = readNextRunWithParts(iterator);
+
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'high-active-thread', resource: 'high-active-user' },
+    });
+    const streamText = stream.text;
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+
+    const result = await agent.sendNotificationSignal(
+      { source: 'github', kind: 'ci-status', priority: 'high', summary: 'CI failed on main' },
+      { resourceId: 'high-active-user', threadId: 'high-active-thread' },
+    );
+
+    expect(result.signal).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    expect(result.decision).toMatchObject({ action: 'summarize', reason: 'active-high-summary-then-full' });
+    expect(result.record).toMatchObject({
+      status: 'pending',
+      summarySignalId: result.signal?.id,
+      deliveryReason: 'active-high-summary-then-full',
+    });
+    expect(result.record.summaryAt).toBeUndefined();
+    expect(result.record.deliverAt).toBeInstanceOf(Date);
+
+    releaseFirst();
+    const subscribedSummary = await withTimeout(firstRun, 'Timed out waiting for high-priority summary signal');
+    const summaryPart = subscribedSummary.value.parts.find((part: any) => part.type === 'data-signal');
+    expect(summaryPart?.data).toMatchObject({
+      id: result.signal?.id,
+      type: 'notification',
+      tagName: 'notification-summary',
+      contents: 'github: 1',
+      attributes: { pending: 1 },
+    });
+    expect(streamCount).toBe(1);
+    await expect(
+      notifications.getNotification({ threadId: 'high-active-thread', id: result.record.id }),
+    ).resolves.toMatchObject({
+      status: 'pending',
+      summarySignalId: result.signal?.id,
+      summaryAt: undefined,
+      deliverAt: result.record.deliverAt,
+    });
+
+    const deliveryRun = readNextRunWithParts(iterator);
+    const dispatchResult = await dispatchDueNotifications({ mastra, storage: notifications, now: new Date() });
+    const subscribedDelivery = await withTimeout(deliveryRun, 'Timed out waiting for full high-priority delivery');
+    const deliveryPart = subscribedDelivery.value.parts.find((part: any) => part.type === 'data-signal');
+
+    expect(dispatchResult.failed).toEqual([]);
+    expect(dispatchResult.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification' });
+    expect(deliveryPart?.data).toMatchObject({
+      id: dispatchResult.signals[0]?.id,
+      type: 'notification',
+      tagName: 'notification',
+      contents: 'CI failed on main',
+      attributes: { source: 'github', kind: 'ci-status', priority: 'high', status: 'delivered' },
+    });
+    await expect(
+      notifications.getNotification({ threadId: 'high-active-thread', id: result.record.id }),
+    ).resolves.toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: dispatchResult.signals[0]?.id,
+    });
+    await streamText;
+
+    subscription.unsubscribe();
+  });
+
+  it('dispatches medium-priority active summaries through agent subscriptions without marking records delivered', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'medium-active-dispatch-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'medium-active-dispatch-agent',
+      name: 'Medium Active Dispatch Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          const responseText = `medium response ${streamCount}`;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: new ReadableStream({
+              async start(controller) {
+                controller.enqueue({ type: 'stream-start', warnings: [] });
+                controller.enqueue({ type: 'text-start', id: 'text-1' });
+                controller.enqueue({ type: 'text-delta', id: 'text-1', delta: responseText });
+                controller.enqueue({ type: 'text-end', id: 'text-1' });
+                if (streamCount === 1) await firstFinished;
+                controller.enqueue({
+                  type: 'finish',
+                  finishReason: 'stop',
+                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                });
+                controller.close();
+              },
+            }),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { mediumActiveDispatchAgent: agent }, storage, logger: false });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'medium-active-thread',
+      resourceId: 'medium-active-user',
+    });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const firstRun = readNextRunWithParts(iterator);
+
+    await notifications.createNotification({
+      id: 'medium-active-notification',
+      agentId: 'medium-active-dispatch-agent',
+      resourceId: 'medium-active-user',
+      threadId: 'medium-active-thread',
+      source: 'slack',
+      kind: 'mention',
+      priority: 'medium',
+      summary: 'Jane mentioned you',
+      summaryAt: new Date('2026-05-30T12:00:00Z'),
+    });
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'medium-active-thread', resource: 'medium-active-user' },
+    });
+    const streamText = stream.text;
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+
+    const dispatchResult = await dispatchDueNotifications({
+      mastra,
+      storage: notifications,
+      now: new Date('2026-05-30T12:00:01Z'),
+    });
+    expect(dispatchResult.failed).toEqual([]);
+    expect(dispatchResult.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+
+    releaseFirst();
+    const subscribedSummary = await withTimeout(firstRun, 'Timed out waiting for medium active summary signal');
+    const summaryPart = subscribedSummary.value.parts.find((part: any) => part.type === 'data-signal');
+    expect(summaryPart?.data).toMatchObject({
+      id: dispatchResult.signals[0]?.id,
+      type: 'notification',
+      tagName: 'notification-summary',
+      contents: 'slack: 1',
+      attributes: { pending: 1 },
+    });
+    expect(streamCount).toBe(1);
+    await expect(
+      notifications.getNotification({ threadId: 'medium-active-thread', id: 'medium-active-notification' }),
+    ).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      summarySignalId: dispatchResult.signals[0]?.id,
+    });
+    await streamText;
+
+    subscription.unsubscribe();
+  });
+
+  it('saves and dispatches low-priority idle notification summaries through agent subscriptions without starting a run', async () => {
+    let streamCount = 0;
+    const pubsub = new AsyncCallbackPubSub();
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'low-priority-notification-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'low-priority-notification-agent',
+      name: 'Low Priority Notification Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }]),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { lowPriorityNotificationAgent: agent }, storage, logger: false, pubsub });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'notification-thread',
+      resourceId: 'notification-user',
+    });
+
+    const result = await agent.sendNotificationSignal(
+      { source: 'mastracode', kind: 'manual', priority: 'low', summary: 'Read when you have time' },
+      { resourceId: 'notification-user', threadId: 'notification-thread' },
+    );
+
+    await nextTick();
+    expect(streamCount).toBe(0);
+    expect(result.signal).toBeUndefined();
+    expect(result).toMatchObject({
+      accepted: true,
+      decision: { action: 'summarize', reason: 'idle-low-summary' },
+      record: { status: 'pending', deliveryReason: 'idle-low-summary' },
+    });
+    expect(result.record.deliverAt).toBeUndefined();
+    expect(result.record.summaryAt).toBeInstanceOf(Date);
+
+    const dispatchNow = new Date((result.record.summaryAt?.getTime() ?? Date.now()) + 1);
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
+    const dispatchResult = await dispatchDueNotifications({ mastra, storage: notifications, now: dispatchNow });
+    const subscribedRun = await withTimeout(
+      nextRun,
+      'Timed out waiting for low-priority notification summary broadcast',
+    );
+
+    expect(dispatchResult.failed).toEqual([]);
+    expect(dispatchResult.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    expect(streamCount).toBe(0);
+    const signalPart = subscribedRun.value.parts.find((part: any) => part.type === 'data-signal');
+    expect(signalPart?.data).toMatchObject({
+      id: dispatchResult.signals[0]?.id,
+      type: 'notification',
+      tagName: 'notification-summary',
+      contents: 'mastracode: 1',
+      attributes: { pending: 1 },
+    });
+    await expect(
+      notifications.getNotification({ threadId: 'notification-thread', id: result.record.id }),
+    ).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      summarySignalId: dispatchResult.signals[0]?.id,
+    });
+
+    subscription.unsubscribe();
+  });
+
+  it('notification inbox read injects a real notification signal through agent subscriptions', async () => {
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'inbox-read-delivery-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'inbox-read-delivery-agent',
+      name: 'Inbox Read Delivery Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+            ]),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { inboxReadDeliveryAgent: agent }, storage, logger: false });
+    const tool = createNotificationInboxTool({ storage: notifications });
+    await notifications.createNotification({
+      id: 'inbox-read-notification',
+      agentId: 'inbox-read-delivery-agent',
+      resourceId: 'inbox-read-user',
+      threadId: 'inbox-read-thread',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'medium',
+      summary: 'CI failed on main',
+    });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'inbox-read-thread',
+      resourceId: 'inbox-read-user',
+    });
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
+
+    const result = await tool.execute?.({ action: 'read', id: 'inbox-read-notification' }, {
+      agent: { agentId: 'inbox-read-delivery-agent', threadId: 'inbox-read-thread', resourceId: 'inbox-read-user' },
+      mastra,
+    } as any);
+    const subscribedRun = await withTimeout(nextRun, 'Timed out waiting for inbox read notification delivery');
+    const signalPart = subscribedRun.value.parts.find((part: any) => part.type === 'data-signal');
+
+    expect(result).toMatchObject({ message: '1 notification will now be delivered.', delivered: 1 });
+    expect(signalPart?.data).toMatchObject({
+      type: 'notification',
+      tagName: 'notification',
+      contents: 'CI failed on main',
+      attributes: { source: 'github', kind: 'ci-status', priority: 'medium', status: 'delivered' },
+    });
+    expect(streamCount).toBe(1);
+    await expect(
+      notifications.getNotification({ threadId: 'inbox-read-thread', id: 'inbox-read-notification' }),
+    ).resolves.toMatchObject({
+      status: 'seen',
+      deliveredSignalId: signalPart?.data.id,
+    });
+
+    subscription.unsubscribe();
+  });
+
+  it('notification inbox read marks already-delivered notifications seen without injecting another signal', async () => {
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({
+      id: 'inbox-read-already-delivered-storage',
+      domains: { notifications },
+    });
+    const agent = new Agent({
+      id: 'inbox-read-already-delivered-agent',
+      name: 'Inbox Read Already Delivered Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }]),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { inboxReadAlreadyDeliveredAgent: agent }, storage, logger: false });
+    const tool = createNotificationInboxTool({ storage: notifications });
+    await notifications.createNotification({
+      id: 'already-delivered-notification',
+      agentId: 'inbox-read-already-delivered-agent',
+      resourceId: 'already-delivered-user',
+      threadId: 'already-delivered-thread',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed earlier',
+    });
+    await notifications.updateNotification({
+      threadId: 'already-delivered-thread',
+      id: 'already-delivered-notification',
+      status: 'delivered',
+      deliveredSignalId: 'existing-signal-id',
+    });
+
+    const result = await tool.execute?.({ action: 'read', id: 'already-delivered-notification' }, {
+      agent: {
+        agentId: 'inbox-read-already-delivered-agent',
+        threadId: 'already-delivered-thread',
+        resourceId: 'already-delivered-user',
+      },
+      mastra,
+    } as any);
+
+    expect(result).toMatchObject({ delivered: 0, markedSeen: 1, message: 'No unread notifications needed delivery.' });
+    expect(streamCount).toBe(0);
+    await expect(
+      notifications.getNotification({ threadId: 'already-delivered-thread', id: 'already-delivered-notification' }),
+    ).resolves.toMatchObject({
+      status: 'seen',
+      deliveredSignalId: 'existing-signal-id',
+    });
+  });
+
+  it('dispatches low-priority idle notification summaries without subscribers', async () => {
+    let streamCount = 0;
+    const pubsub = new AsyncCallbackPubSub();
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'no-subscriber-notification-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'no-subscriber-notification-agent',
+      name: 'No Subscriber Notification Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }]),
+          };
+        },
+      }),
+    });
+    const mastra = new Mastra({ agents: { noSubscriberNotificationAgent: agent }, storage, logger: false, pubsub });
+
+    const result = await agent.sendNotificationSignal(
+      { source: 'mastracode', kind: 'manual', priority: 'low', summary: 'No one is watching' },
+      { resourceId: 'notification-user', threadId: 'notification-thread' },
+    );
+    const dispatchNow = new Date((result.record.summaryAt?.getTime() ?? Date.now()) + 1);
+    const dispatchResult = await withTimeout(
+      dispatchDueNotifications({ mastra, storage: notifications, now: dispatchNow }),
+      'Timed out dispatching low-priority notification summary without subscribers',
+    );
+
+    expect(dispatchResult.failed).toEqual([]);
+    expect(dispatchResult.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    expect(streamCount).toBe(0);
+    await expect(
+      notifications.getNotification({ threadId: 'notification-thread', id: result.record.id }),
+    ).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      summarySignalId: dispatchResult.signals[0]?.id,
+    });
+  });
+
+  it('defers notification records without starting an idle run', async () => {
+    let streamCount = 0;
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'deferred-notification-storage', domains: { notifications } });
+    const deliverAt = new Date('2026-05-30T12:00:00Z');
+    const agent = new Agent({
+      id: 'deferred-notification-agent',
+      name: 'Deferred Notification Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }]),
+          };
+        },
+      }),
+      notifications: {
+        deliveryPolicy: {
+          decide: () => ({ action: 'defer', deliverAt, reason: 'after-hours' }),
+        },
+      },
+    });
+    new Mastra({ agents: { deferredNotificationAgent: agent }, storage, logger: false });
+
+    const result = await agent.sendNotificationSignal(
+      {
+        source: 'calendar',
+        kind: 'event-reminder',
+        summary: 'Planning starts tomorrow',
+      },
+      { resourceId: 'notification-user', threadId: 'notification-thread' },
+    );
+
+    await nextTick();
+    expect(streamCount).toBe(0);
+    expect(result).toMatchObject({
+      accepted: true,
+      decision: { action: 'defer', reason: 'after-hours' },
+      record: { status: 'pending', deliveryReason: 'after-hours' },
+    });
+    expect(result.signal).toBeUndefined();
+    expect(result.record.deliverAt?.toISOString()).toBe(deliverAt.toISOString());
+  });
+
+  it('coalesces pending notification records through sendNotificationSignal', async () => {
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({ id: 'coalesced-notification-storage', domains: { notifications } });
+    const agent = new Agent({
+      id: 'coalesced-notification-agent',
+      name: 'Coalesced Notification Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('notification response'),
+      notifications: {
+        deliveryPolicy: {
+          default: { action: 'summarize', summaryAt: new Date('2026-05-30T12:00:00Z') },
+        },
+      },
+    });
+    new Mastra({ agents: { coalescedNotificationAgent: agent }, storage, logger: false });
+
+    const first = await agent.sendNotificationSignal(
+      {
+        source: 'github',
+        kind: 'ci-status',
+        summary: 'CI failed: one test',
+        dedupeKey: 'main-ci',
+      },
+      { resourceId: 'notification-user', threadId: 'notification-thread' },
+    );
+    const second = await agent.sendNotificationSignal(
+      {
+        source: 'github',
+        kind: 'ci-status',
+        summary: 'CI failed: three tests',
+        dedupeKey: 'main-ci',
+      },
+      { resourceId: 'notification-user', threadId: 'notification-thread' },
+    );
+
+    expect(second.record.id).toBe(first.record.id);
+    expect(second.record).toMatchObject({ status: 'pending', summary: 'CI failed: three tests', coalescedCount: 2 });
+    await expect(notifications.listNotifications({ threadId: 'notification-thread' })).resolves.toHaveLength(1);
+  });
+
+  it('throws a clear error when notification storage is missing', async () => {
+    const agent = new Agent({
+      id: 'missing-notification-storage-agent',
+      name: 'Missing Notification Storage Agent',
+      instructions: 'Test',
+      model: createTextStreamModel('notification response'),
+    });
+
+    await expect(
+      agent.sendNotificationSignal(
+        { source: 'github', kind: 'ci-status', summary: 'CI failed' },
+        { resourceId: 'notification-user', threadId: 'notification-thread' },
+      ),
+    ).rejects.toThrow('sendNotificationSignal requires a notifications storage domain');
+  });
+
+  it('delivers sendMessage into an active same-agent run', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+    const prompts: any[][] = [];
+    const model = new MockLanguageModelV2({
+      doStream: async ({ prompt }) => {
+        streamCount += 1;
+        prompts.push(prompt);
+        const responseText = streamCount === 1 ? 'first response' : 'message response';
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'response-metadata',
+                id: `send-message-${streamCount}`,
+                modelId: 'mock-model-id',
+                timestamp: new Date(0),
+              });
+              controller.enqueue({ type: 'text-start', id: 'text-1' });
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta: responseText });
+              controller.enqueue({ type: 'text-end', id: 'text-1' });
+              if (streamCount === 1) {
+                await firstFinished;
+              }
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+    const agent = new Agent({ id: 'active-message-agent', name: 'Active Message Agent', instructions: 'Test', model });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'active-message-thread',
+      resourceId: 'active-message-user',
+    });
+
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'active-message-thread', resource: 'active-message-user' },
+    });
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+    const result = agent.sendMessage('Hello while active', {
+      resourceId: 'active-message-user',
+      threadId: 'active-message-thread',
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+    releaseFirst();
+    await expect(stream.text).resolves.toBe('first responsemessage response');
+    expect(streamCount).toBe(2);
+    expect(JSON.stringify(prompts[1])).toContain('Hello while active');
+
+    subscription.unsubscribe();
+  });
+
+  it('queues sendMessage behind a suspended same-agent approval run', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = {
+      id: 'suspended-message-agent',
+      stream: vi.fn(),
+    } as unknown as Agent<any, any, any, any>;
+    const runId = 'suspended-message-run';
+    const threadId = 'suspended-message-thread';
+    const resourceId = 'suspended-message-user';
+    let finishRun!: () => void;
+    const finished = new Promise<void>(resolve => {
+      finishRun = resolve;
+    });
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'suspended',
+          fullStream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'start', runId });
+              controller.enqueue({
+                type: 'tool-call-approval',
+                runId,
+                payload: { toolCallId: 'tool-call-1', toolName: 'testTool' },
+              });
+            },
+          }),
+          _waitUntilFinished: () => finished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+
+      await withTimeout(iterator.next(), 'Timed out waiting for approval run start');
+      await withTimeout(iterator.next(), 'Timed out waiting for approval chunk');
+      expect(runtime.getThreadState({ resourceId, threadId })).toBe('active');
+
+      const result = runtime.sendMessage(agent, 'Queued behind approval', { resourceId, threadId });
+
+      expect(result).toEqual(expect.objectContaining({ accepted: true, runId }));
+      expect((agent as any).stream).not.toHaveBeenCalled();
+      const [signal] = runtime.drainPendingSignals(runId);
+      expect(signal).toMatchObject({ type: 'user', contents: 'Queued behind approval' });
+    } finally {
+      finishRun();
+      subscription.unsubscribe();
+    }
+  });
+
+  it('re-registers an approval-suspended run on resume without rejecting the retained record', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const agent = { id: 'approval-resume-agent' } as Agent<any, any, any, any>;
+    const threadId = 'approval-resume-thread';
+    const resourceId = 'approval-resume-user';
+    const runId = 'approval-resume-run';
+
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      // Register the suspended run that emits a tool-call-approval part. The
+      // completion finalizer surfaces run-suspended and retains its records so
+      // the thread stays blocked awaiting approval.
+      let finishSuspended!: () => void;
+      const suspendedFinished = new Promise<void>(resolve => {
+        finishSuspended = resolve;
+      });
+      const suspendedCompletion = runtime.registerRun(
+        agent,
+        {
+          runId,
+          status: 'suspended',
+          fullStream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'start', runId });
+              controller.enqueue({
+                type: 'tool-call-approval',
+                runId,
+                payload: { toolCallId: 'tool-call-1', toolName: 'testTool' },
+              });
+              controller.close();
+            },
+          }),
+          _waitUntilFinished: () => suspendedFinished,
+        } as any,
+        { memory: { thread: threadId, resource: resourceId } } as any,
+      );
+
+      await withTimeout(iterator.next(), 'Timed out waiting for approval run start');
+      await withTimeout(iterator.next(), 'Timed out waiting for approval chunk');
+      // Drive and await the finalizer so run-suspended has propagated to the
+      // subscriber; the approval marker must keep the thread blocked (active).
+      finishSuspended();
+      await withTimeout(
+        suspendedCompletion ?? Promise.resolve(),
+        'Timed out waiting for approval-suspended finalizer',
+      );
+      await nextTick();
+      expect(runtime.getThreadState({ resourceId, threadId })).toBe('active');
+
+      // The resume reuses the same runId. Without the fix this throws
+      // "already registered" / "already reserved" and the resume wedges.
+      const resumedRun = readNextRun(iterator);
+      let finishResumed!: () => void;
+      const resumedFinished = new Promise<void>(resolve => {
+        finishResumed = resolve;
+      });
+      expect(() =>
+        runtime.registerRun(
+          agent,
+          {
+            runId,
+            status: 'running',
+            fullStream: new ReadableStream({
+              start(controller) {
+                setTimeout(() => {
+                  controller.enqueue({ type: 'start', runId });
+                  controller.enqueue({ type: 'text-start', runId, payload: { id: 'text-1' } });
+                  controller.enqueue({
+                    type: 'text-delta',
+                    runId,
+                    payload: { id: 'text-1', text: 'approved response' },
+                  });
+                  controller.enqueue({ type: 'text-end', runId, payload: { id: 'text-1' } });
+                  controller.enqueue({
+                    type: 'finish',
+                    runId,
+                    payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+                  });
+                  controller.close();
+                  finishResumed();
+                }, 5);
+              },
+            }),
+            _waitUntilFinished: () => resumedFinished,
+          } as any,
+          { memory: { thread: threadId, resource: resourceId } } as any,
+        ),
+      ).not.toThrow();
+
+      await expect(withTimeout(resumedRun, 'Timed out waiting for resumed run')).resolves.toMatchObject({
+        value: { runId, text: 'approved response' },
+      });
+    } finally {
+      subscription.unsubscribe();
+    }
+  });
+
+  it('queues queueMessage until the active run completes', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+    const prompts: any[][] = [];
+    const model = new MockLanguageModelV2({
+      doStream: async ({ prompt }) => {
+        streamCount += 1;
+        prompts.push(prompt);
+        const responseText = streamCount === 1 ? 'first response' : 'queued response';
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'response-metadata',
+                id: `queue-message-${streamCount}`,
+                modelId: 'mock-model-id',
+                timestamp: new Date(0),
+              });
+              controller.enqueue({ type: 'text-start', id: 'text-1' });
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta: responseText });
+              controller.enqueue({ type: 'text-end', id: 'text-1' });
+              if (streamCount === 1) {
+                await firstFinished;
+              }
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+    const agent = new Agent({ id: 'queue-message-agent', name: 'Queue Message Agent', instructions: 'Test', model });
+    const subscription = await agent.subscribeToThread({
+      threadId: 'queue-message-thread',
+      resourceId: 'queue-message-user',
+    });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const firstRun = readNextRunWithParts(iterator);
+
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'queue-message-thread', resource: 'queue-message-user' },
+    });
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+    const result = agent.queueMessage('Queued follow-up', {
+      resourceId: 'queue-message-user',
+      threadId: 'queue-message-thread',
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(result.runId).not.toBe(stream.runId);
+    await nextTick();
+    expect(streamCount).toBe(1);
+
+    releaseFirst();
+    await expect(stream.text).resolves.toBe('first response');
+    await firstRun;
+    const secondRun = await readNextRunWithParts(iterator);
+    expect(secondRun.value.runId).toBe(result.runId);
+    expect(secondRun.value.text).toBe('queued response');
+    expect(streamCount).toBe(2);
+    expect(JSON.stringify(prompts[1])).toContain('Queued follow-up');
+
+    subscription.unsubscribe();
+  });
+
+  it('fans out sequential idle signal runs to many same-thread subscribers', async () => {
+    const resourceId = 'share-resource';
+    const threadId = 'share-thread';
+    const subscriberCount = 100;
+    const runCount = 5;
+    let streamCount = 0;
+    const agent = new Agent({
+      id: 'share-signal-agent',
+      name: 'Share Signal Agent',
+      instructions: 'Test',
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          streamCount += 1;
+          const text = `signal response ${streamCount}`;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: new ReadableStream({
+              async start(controller) {
+                const parts = [
+                  { type: 'stream-start', warnings: [] },
+                  {
+                    type: 'response-metadata',
+                    id: `id-${streamCount}`,
+                    modelId: 'mock-model-id',
+                    timestamp: new Date(0),
+                  },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: text },
+                  { type: 'text-end', id: 'text-1' },
+                  {
+                    type: 'finish',
+                    finishReason: 'stop',
+                    usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                  },
+                ] as any[];
+                for (const part of parts) {
+                  await nextTick();
+                  controller.enqueue(part);
+                }
+                controller.close();
+              },
+            }),
+          };
+        },
+      }),
+    });
+
+    const subscriptions = await Promise.all(
+      Array.from({ length: subscriberCount }, () => agent.subscribeToThread({ threadId, resourceId })),
+    );
+    const iterators = subscriptions.map(subscription => subscription.stream[Symbol.asyncIterator]());
+
+    try {
+      for (let runIndex = 1; runIndex <= runCount; runIndex += 1) {
+        const nextRuns = iterators.map(iterator => readNextRunWithParts(iterator));
+        const contents = `Hello from signal ${runIndex}`;
+
+        const signalResult = await agent.sendSignal(
+          { type: 'user-message', contents },
+          { resourceId, threadId, ifIdle: { streamOptions: { memory: { resource: resourceId, thread: threadId } } } },
+        );
+
+        const runs = await withTimeout(
+          Promise.all(nextRuns),
+          `Timed out waiting for ${subscriberCount} subscribers to receive idle signal run ${runIndex}`,
+        );
+        const [firstRun] = runs;
+
+        expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: firstRun.value.runId }));
+        expect(firstRun.value.text).toBe(`signal response ${runIndex}`);
+
+        for (const run of runs) {
+          expect(run.value.runId).toBe(firstRun.value.runId);
+          expect(run.value.text).toBe(`signal response ${runIndex}`);
+          const signalPart = run.value.parts.find((part: any) => part.type === 'data-user-message');
+          expect(signalPart?.data).toMatchObject({
+            id: signalResult.signal.id,
+            contents,
+            acceptedAt: signalResult.signal.acceptedAt?.toISOString(),
+          });
+          expect(signalPart?.data.createdAt).toBeDefined();
+          expect(signalPart?.transient).toBe(true);
+        }
+      }
+
+      expect(streamCount).toBe(runCount);
+    } finally {
+      for (const subscription of subscriptions) {
+        subscription.unsubscribe();
+      }
+    }
+  });
+
   it('starts an idle thread run by default when a thread-targeted signal is sent', async () => {
     const agent = new Agent({
       id: 'idle-signal-without-options-agent',
@@ -313,6 +2266,34 @@ describe('Agent signals', () => {
     );
 
     expect(result).toEqual(expect.objectContaining({ accepted: true }));
+  });
+
+  it('reports the reserved runId as active before registerRun populates the stream record', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const threadId = 'reservation-gap-thread';
+    const resourceId = 'reservation-gap-user';
+
+    // agent.stream is awaited inside the idle-wake path before registerRun fires. Returning
+    // a never-resolving promise pins the runtime in the gap where sendSignal has reserved
+    // activeThreadRunIds + threadKeysByRunId but threadRunsById is still empty.
+    const agent = {
+      id: 'reservation-gap-agent',
+      stream: () => new Promise(() => {}),
+    } as unknown as Agent<any, any, any, any>;
+
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId });
+    expect(subscription.activeRunId()).toBeNull();
+
+    const result = runtime.sendSignal(agent, createSignal({ type: 'user-message', contents: 'hello' }), {
+      resourceId,
+      threadId,
+      ifIdle: { streamOptions: { memory: { resource: resourceId, thread: threadId } } as any },
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(subscription.activeRunId()).toBe(result.runId);
+
+    subscription.unsubscribe();
   });
 
   it('persists an idle signal without waking the agent when idle behavior is persist', async () => {
@@ -336,16 +2317,40 @@ describe('Agent signals', () => {
       memory,
     });
 
-    const result = agent.sendSignal(
-      { type: 'user-message', contents: 'persist without waking' },
-      { resourceId: 'idle-persist-user', threadId: 'idle-persist-thread', ifIdle: { behavior: 'persist' } },
-    );
-    await expect(result.persisted).resolves.toBeUndefined();
+    const subscription = await agent.subscribeToThread({
+      resourceId: 'idle-persist-user',
+      threadId: 'idle-persist-thread',
+    });
+    const nextRun = readNextRunWithParts(subscription.stream[Symbol.asyncIterator]());
 
-    const recalled = await memory.recall({ threadId: 'idle-persist-thread', resourceId: 'idle-persist-user' });
-    expect(streamCount).toBe(0);
-    expect(recalled.messages).toHaveLength(1);
-    expect(recalled.messages[0]?.content.metadata?.signal).toMatchObject({ contents: 'persist without waking' });
+    try {
+      const result = agent.sendSignal(
+        { type: 'user-message', contents: 'persist without waking' },
+        { resourceId: 'idle-persist-user', threadId: 'idle-persist-thread', ifIdle: { behavior: 'persist' } },
+      );
+      await expect(result.persisted).resolves.toBeUndefined();
+
+      const subscribedRun = await withTimeout(nextRun, 'Timed out waiting for persisted signal broadcast');
+      expect(subscribedRun.value.parts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'data-user-message',
+            data: expect.objectContaining({ contents: 'persist without waking' }),
+          }),
+        ]),
+      );
+
+      const recalled = await memory.recall({ threadId: 'idle-persist-thread', resourceId: 'idle-persist-user' });
+      expect(streamCount).toBe(0);
+      expect(recalled.messages).toHaveLength(1);
+      // Stash dropped; payload lives in content.parts now.
+      expect(recalled.messages[0]?.content.metadata?.signal).toMatchObject({ type: 'user', tagName: 'user' });
+      expect(recalled.messages[0]?.content.parts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: 'text', text: 'persist without waking' })]),
+      );
+    } finally {
+      subscription.unsubscribe();
+    }
   });
 
   it('discards an active signal when active behavior is discard', async () => {
@@ -460,7 +2465,7 @@ describe('Agent signals', () => {
 
     const result = senderRuntime.sendSignal(
       sender,
-      { type: 'user-message', contents: [{ role: 'user', content: 'remote follow-up' }] },
+      { type: 'user-message', contents: 'remote follow-up' },
       { resourceId: 'remote-resource', threadId: 'remote-thread' },
       pubsub,
     );
@@ -4576,5 +6581,136 @@ describe('Agent signals', () => {
           ),
       ),
     ).toBe(true);
+  });
+
+  describe('delivery option attributes', () => {
+    it('resolveDeliveryAttributes merges option attributes into signal attributes', () => {
+      const signal = createSignal({
+        type: 'user-message',
+        contents: 'hello',
+        attributes: { existing: 'yes' },
+      });
+
+      const resolved = resolveDeliveryAttributes(signal, { delivery: 'while-active' });
+      expect(resolved.attributes).toEqual({ existing: 'yes', delivery: 'while-active' });
+    });
+
+    it('resolveDeliveryAttributes returns same signal when no option attributes are selected', () => {
+      const signal = createSignal({
+        type: 'user-message',
+        contents: 'hello',
+      });
+
+      const resolved = resolveDeliveryAttributes(signal, undefined);
+      expect(resolved).toBe(signal);
+    });
+
+    it('resolved delivery attributes appear in toLLMMessage XML', () => {
+      const signal = createSignal({
+        type: 'user-message',
+        contents: 'fix the bug',
+      });
+
+      const resolved = resolveDeliveryAttributes(signal, { delivery: 'while-active' });
+      expect(resolved.toLLMMessage()).toEqual({
+        role: 'user',
+        content: '<user delivery="while-active">fix the bug</user>',
+      });
+    });
+
+    it('resolved delivery attributes appear in toDBMessage and toDataPart', () => {
+      const signal = createSignal({
+        type: 'user-message',
+        contents: 'fix the bug',
+      });
+
+      const resolved = resolveDeliveryAttributes(signal, { delivery: 'while-active' });
+      const db = resolved.toDBMessage({ threadId: 't', resourceId: 'r' });
+      expect((db.content.metadata!.signal as Record<string, unknown>).attributes).toEqual({
+        delivery: 'while-active',
+      });
+
+      const dataPart = resolved.toDataPart();
+      expect(dataPart.data.attributes).toEqual({ delivery: 'while-active' });
+    });
+
+    it('thread-stream-runtime resolves ifActive.attributes as while-active on active signal delivery', () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const pubsub = new EventEmitterPubSub();
+      const agent = { id: 'delivery-active-agent' } as any;
+
+      // Prepare and register a run that is still "running" so the thread is active.
+      const options = runtime.prepareRunOptions(
+        {
+          runId: 'active-run',
+          memory: { thread: 'delivery-thread', resource: 'delivery-resource' },
+        } as any,
+        pubsub,
+      );
+      runtime.registerRun(
+        agent,
+        {
+          runId: 'active-run',
+          status: 'running',
+          _waitUntilFinished: () => new Promise<any>(() => {}),
+        } as any,
+        options,
+        pubsub,
+      );
+
+      // Send a signal while the run is still active.
+      const result = runtime.sendSignal(
+        agent,
+        {
+          type: 'user-message',
+          contents: 'while-active test',
+        },
+        {
+          resourceId: 'delivery-resource',
+          threadId: 'delivery-thread',
+          ifActive: { attributes: { delivery: 'while-active' } },
+          ifIdle: {
+            attributes: { delivery: 'message' },
+            streamOptions: {
+              memory: { thread: 'delivery-thread', resource: 'delivery-resource' },
+            },
+          },
+        },
+        pubsub,
+      );
+
+      // Active run → ifActive.attributes → delivery: 'while-active'
+      expect(result.signal.attributes).toEqual({ delivery: 'while-active' });
+    });
+
+    it('thread-stream-runtime resolves ifIdle.attributes as message on idle signal delivery', () => {
+      const runtime = new AgentThreadStreamRuntime();
+      const pubsub = new EventEmitterPubSub();
+      const agent = { id: 'delivery-idle-agent', stream: () => new Promise(() => {}) } as any;
+
+      // No run registered → thread is idle.
+      const result = runtime.sendSignal(
+        agent,
+        {
+          type: 'user-message',
+          contents: 'idle test',
+        },
+        {
+          resourceId: 'idle-resource',
+          threadId: 'idle-thread',
+          ifActive: { attributes: { delivery: 'while-active' } },
+          ifIdle: {
+            attributes: { delivery: 'message' },
+            streamOptions: {
+              memory: { thread: 'idle-thread', resource: 'idle-resource' },
+            },
+          },
+        },
+        pubsub,
+      );
+
+      // No active run → ifIdle.attributes → delivery: 'message'
+      expect(result.signal.attributes).toEqual({ delivery: 'message' });
+    });
   });
 });

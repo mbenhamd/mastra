@@ -8,7 +8,7 @@ import type { InMemoryTaskStore } from '../../a2a/store';
 import type { HarnessRouteAuthConfig } from '../../auth/helpers';
 import type { OpenAPIRoute } from '../openapi-utils';
 import { A2A_ROUTES } from './a2a';
-import type { AGENT_BUILDER_ROUTES } from './agent-builder';
+import { AGENT_BUILDER_ROUTES } from './agent-builder';
 import { AGENTS_ROUTES } from './agents';
 import type { AgentRoutes } from './agents';
 import { AUTH_ROUTES } from './auth';
@@ -58,6 +58,20 @@ export type ServerContext = {
   routePrefix?: string;
   /** Adapter-normalized request header lookup. */
   getHeader?: (name: string) => string | undefined;
+  /**
+   * Adapter-normalized enumeration of every request header (lower-cased names).
+   * `getHeader` is per-name only; routes that must verify a provider signature over
+   * the full header set (e.g. channel webhooks) need every header, so this exposes
+   * them transport-neutrally rather than leaking a transport `Request` object.
+   */
+  getHeaders?: () => Record<string, string | string[]>;
+  /**
+   * Unparsed request body bytes/text, captured by the adapter BEFORE any
+   * JSON/form parse. Required for HMAC-over-exact-bytes provider signature
+   * verification (the parsed `requestBody` re-serializes differently and is
+   * useless for signatures). Undefined when the adapter could not capture it.
+   */
+  rawBody?: Uint8Array | string;
   /** Adapter-validated request body before body fields are flattened into handler params. */
   requestBody?: unknown;
   /** Adapter-validated path params before body fields are flattened into handler params. */
@@ -128,6 +142,7 @@ export type ServerRoute<
   path: TPath;
   responseType: TResponseType;
   streamFormat?: 'sse' | 'stream'; // Only used when responseType is 'stream', defaults to 'stream'
+  sseFlushOnConnect?: boolean;
   // Method signature is bivariant in params, allowing heterogeneous route arrays
   // while still preserving specific param types on individual routes.
   handler(params: TParams & ServerContext): ReturnType<ServerRouteHandler<TParams, TResponse, TResponseType>>;
@@ -137,6 +152,16 @@ export type ServerRoute<
   responseSchema?: z.ZodSchema;
   openapi?: OpenAPIRoute; // Auto-generated OpenAPI spec for this route
   maxBodySize?: number; // Optional route-specific body size limit in bytes
+  /**
+   * When true, the adapter captures the raw request body bytes but does NOT
+   * JSON/multipart-parse them and does NOT reject on a parse failure. Use for
+   * routes whose handler/adapter must verify a provider signature over the exact
+   * bytes (e.g. channel webhooks): a signed payload that is not strict JSON (yet
+   * carries `content-type: application/json`) would otherwise be rejected with a
+   * 400 before the signature is checked. Parsing/verification is deferred to the
+   * route's adapter on the captured `rawBody`. Defaults to normal parse behavior.
+   */
+  skipBodyParse?: boolean;
   deprecated?: boolean; // Flag for deprecated routes (used for route parity, skipped in tests)
   /**
    * Permission required to access this route (EE feature).
@@ -196,6 +221,7 @@ export const SERVER_ROUTES: readonly ServerRoute[] = [
   ...DATASETS_ROUTES,
   ...BACKGROUND_TASK_ROUTES,
   ...EDITOR_BUILDER_ROUTES,
+  ...AGENT_BUILDER_ROUTES,
   ...SCHEDULES_ROUTES,
   ...CHANNELS_ROUTES,
 ];

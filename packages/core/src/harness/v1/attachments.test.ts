@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 
 import { describe, expect, it } from 'vitest';
 
-import { setupHarness } from './__test-utils__';
+import { MessageList } from '../../agent/message-list';
+import { extractSignalContents, setupHarness } from './__test-utils__';
 import {
   HarnessAttachmentInUseError,
   HarnessAttachmentUnavailableError,
@@ -73,6 +74,32 @@ describe('Harness.attachments', () => {
         attachmentId: result.attachmentId,
       }),
     ).resolves.toBeNull();
+  });
+
+  it('emits session-scoped attachment_uploaded and attachment_deleted (§10.2)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const events: Array<{ type: string; attachmentId?: string; name?: string; mimeType?: string; bytes?: number }> = [];
+    session.subscribe(e => events.push(e as never));
+
+    const result = await harness.attachments.upload({
+      sessionId: session.id,
+      data: Buffer.from('hello attachment'),
+      filename: 'note.txt',
+      contentType: 'text/plain',
+    });
+
+    expect(events.find(e => e.type === 'attachment_uploaded')).toMatchObject({
+      attachmentId: result.attachmentId,
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      bytes: result.bytes,
+    });
+
+    await harness.attachments.delete({ attachmentId: result.attachmentId, sessionId: session.id });
+    expect(events.find(e => e.type === 'attachment_deleted')).toMatchObject({
+      attachmentId: result.attachmentId,
+    });
   });
 
   it('reuses matching internal URL attachment ids without overwriting existing bytes', async () => {
@@ -271,6 +298,89 @@ describe('Harness.attachments', () => {
     ).rejects.toBeInstanceOf(HarnessAttachmentInUseError);
   });
 
+  it('dispatches a queued turn with attachments as a structured user message carrying the file part', async () => {
+    // §13.7/§14.2: a direct `queue({ content, attachments })` turn forwards the
+    // attachment bytes to the model as file/image parts (not just the dedup
+    // identity). The non-channel analogue of the channel signal-delivery dispatch
+    // shape — characterizes the queue-drain dispatch shape.
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const result = await harness.attachments.upload({
+      sessionId: session.id,
+      data: new TextEncoder().encode('attachment-bytes'),
+      filename: 'note.txt',
+      contentType: 'text/plain',
+    });
+
+    await session.queue({ content: 'see attached', attachments: [result] });
+
+    expect(agent.streamCalls).toHaveLength(1);
+    const dispatched = extractSignalContents(agent.streamCalls[0]?.messages) as {
+      role?: string;
+      content?: Array<{ type: string; mediaType?: string; filename?: string }>;
+    };
+    expect(dispatched.role).toBe('user');
+    expect(dispatched.content?.some(p => p.type === 'text')).toBe(true);
+    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+  });
+
+  it('dispatches an image/png attachment whose bytes survive a real MessageList conversion', async () => {
+    // §13.7/§14.2 + regression guard: an inline image attachment must reach the
+    // model with its decoded bytes intact. The earlier image special-case built
+    // `{ type: 'image', data: base64, mimeType }`, but the AI SDK v5 image part
+    // keys on `image`/`mediaType` — so `convertImageFilePart` read `part.image`
+    // (undefined) and produced `data:image/png;base64,undefined`, silently
+    // dropping the bytes. The text-only dispatch tests above never caught it
+    // because the mock agent captures raw `streamCalls` without routing through
+    // MessageList. This test feeds the actual dispatched contents into a real
+    // MessageList and asserts the prompt carries the original bytes.
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const pngBytes = new TextEncoder().encode('PNGDATA');
+    const result = await harness.attachments.upload({
+      sessionId: session.id,
+      data: pngBytes,
+      filename: 'pic.png',
+      contentType: 'image/png',
+    });
+
+    await session.queue({ content: 'look at this image', attachments: [result] });
+
+    expect(agent.streamCalls).toHaveLength(1);
+    const dispatched = extractSignalContents(agent.streamCalls[0]?.messages);
+
+    // Route the dispatched contents through the real MessageList -> LLM prompt
+    // conversion (the path `signalToLLMMessage` feeds for user-message signals).
+    const list = new MessageList();
+    list.add(dispatched as Parameters<MessageList['add']>[0], 'input');
+    const prompt = await list.get.all.aiV5.llmPrompt();
+
+    const filePart = prompt
+      .flatMap(message => (Array.isArray(message.content) ? message.content : []))
+      .find(part => part.type === 'file');
+    expect(filePart).toBeDefined();
+    expect(filePart?.mediaType).toBe('image/png');
+    // The decoded bytes must be the original PNG bytes, NOT `base64,undefined`.
+    const decoded =
+      filePart?.data instanceof Uint8Array
+        ? Buffer.from(filePart.data).toString()
+        : Buffer.from(String(filePart?.data), 'base64').toString();
+    expect(decoded).toBe('PNGDATA');
+  });
+
+  it('dispatches a queued turn with NO attachments as a bare string (unchanged)', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    await session.queue({ content: 'plain text turn' });
+
+    expect(agent.streamCalls).toHaveLength(1);
+    expect(extractSignalContents(agent.streamCalls[0]?.messages)).toBe('plain text turn');
+  });
+
   it('freezes element attachment descriptors into queued refs and guarded delete', async () => {
     const { harness, storage, agent } = setupHarness();
     let releaseManual!: () => void;
@@ -398,5 +508,48 @@ describe('Harness.attachments', () => {
     await expect(
       storage.listAttachmentReferences({ sessionId: session.id, attachmentId: second.attachmentId }),
     ).resolves.toEqual([]);
+  });
+});
+
+describe('Session flat attachment accessors (§4.2e)', () => {
+  it('uploadAttachment maps the raw-bytes form onto a file upload, reports progress, returns the id', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const data = Buffer.from('flat upload bytes');
+    let progress: [number, number] | undefined;
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'flat.txt',
+      mimeType: 'text/plain',
+      data,
+      onProgress: (loaded, total) => {
+        progress = [loaded, total];
+      },
+    });
+
+    expect(attachmentId).toBeTruthy();
+    expect(progress).toEqual([data.byteLength, data.byteLength]);
+
+    const record = await storage.getAttachmentRecord({ sessionId: session.id, attachmentId });
+    expect(record).toMatchObject({
+      ownerSessionId: session.id,
+      name: 'flat.txt',
+      mimeType: 'text/plain',
+      bytes: data.length,
+    });
+  });
+
+  it('deleteAttachment removes a session-scoped attachment by id', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'gone.txt',
+      mimeType: 'text/plain',
+      data: Buffer.from('temporary'),
+    });
+    await session.deleteAttachment({ attachmentId });
+
+    await expect(storage.getAttachmentRecord({ sessionId: session.id, attachmentId })).resolves.toBeNull();
   });
 });

@@ -161,6 +161,37 @@ describe('Session.getQueueDepth()', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getCurrentRunId() / getCurrentTraceId()
+// ---------------------------------------------------------------------------
+
+describe('Session.getCurrentRunId() / getCurrentTraceId()', () => {
+  it('return null on a fresh idle session', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'r', threadId: { fresh: true } });
+    expect(session.getCurrentRunId()).toBeNull();
+    expect(session.getCurrentTraceId()).toBeNull();
+  });
+
+  it('return null after a completed turn (live run marker cleared on _endTurn)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'r', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    expect(session.getCurrentRunId()).toBeNull();
+    expect(session.getCurrentTraceId()).toBeNull();
+  });
+
+  it('reflect the live run markers while a run is active', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'r', threadId: { fresh: true } });
+    const internals = session as unknown as { _currentRunId?: string; _currentTraceId?: string };
+    internals._currentRunId = 'run-x';
+    internals._currentTraceId = 'trace-x';
+    expect(session.getCurrentRunId()).toBe('run-x');
+    expect(session.getCurrentTraceId()).toBe('trace-x');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isBusy()
 // ---------------------------------------------------------------------------
 

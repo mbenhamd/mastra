@@ -1,5 +1,6 @@
 import type { ChannelProvider } from '../../channels';
 import type { Mastra } from '../../mastra';
+import { canonicalJson } from './canonical-json';
 import { HarnessConfigError } from './errors';
 import type { HarnessChannelBinding, HarnessChannelConfig } from './types';
 
@@ -128,7 +129,11 @@ export class HarnessChannelRegistry {
 
       const bindingId = registration.config.bindingId ?? registration.channelId;
       const callbackTarget = registration.config.callbackTarget ?? registration.channelId;
-      const callbackKey = `${registration.providerId}\0${platform}\0${callbackTarget}`;
+      // providerId/platform/callbackTarget are only constrained to be non-empty
+      // strings (not durable components), so they may carry arbitrary bytes incl.
+      // the historical '\0' separator. canonicalJson JSON-escapes every byte so
+      // distinct (providerId, platform, callbackTarget) tuples never collide.
+      const callbackKey = canonicalJson([registration.providerId, platform, callbackTarget]);
       const existing = callbackTargets.get(callbackKey);
       if (existing) {
         throw new HarnessConfigError(

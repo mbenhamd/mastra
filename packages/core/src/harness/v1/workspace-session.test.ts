@@ -171,8 +171,8 @@ describe('Subagent workspace inheritance — config validation', () => {
 });
 
 describe('Workspace lifecycle events', () => {
-  it('emits workspace_status_changed transitions for shared lazy resolution', async () => {
-    const events: any[] = [];
+  it('resolves a shared lazy workspace without emitting public workspace events (§2.7/§10.2)', async () => {
+    const eventTypes: string[] = [];
     const harness = new Harness(
       baseConfig({
         workspace: {
@@ -181,15 +181,77 @@ describe('Workspace lifecycle events', () => {
         },
       }),
     );
-    harness.subscribe(ev => {
-      if (ev.type === 'workspace_status_changed') events.push(ev);
-    });
+    harness.subscribe(ev => eventTypes.push((ev as { type: string }).type));
 
     const s = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    await s.getWorkspace();
+    // Behavioral readiness: lazy resolution succeeds and yields a usable workspace.
+    const ws = await s.getWorkspace();
+    expect(ws).toBeDefined();
 
-    const statuses = events.map(e => e.status);
-    expect(statuses).toContain('initializing');
-    expect(statuses).toContain('ready');
+    // §10.2: workspace lifecycle status is not a public HarnessEventV1 event.
+    expect(eventTypes).not.toContain('workspace_status_changed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §4.2e / §2.7 — the workspace is the durable world tied to SESSION/RESOURCE
+// ownership; it is DECOUPLED from the mode. A mode controls agent / prompt /
+// tools / permissions, never the workspace. These lock that invariant so a
+// future mode change cannot start re-keying or re-creating the workspace.
+// ---------------------------------------------------------------------------
+
+describe('workspace ownership is decoupled from mode (§4.2e / §2.7)', () => {
+  it('per-session: switchMode keeps the SAME workspace instance (not re-created)', async () => {
+    const provider = resumableProvider({ providerId: 'p' });
+    const harness = new Harness(baseConfig({ workspace: { kind: 'per-session' as const, provider } }));
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const before = await session.getWorkspace();
+      expect(before).toBeDefined();
+      expect(session.getCurrentModeId()).toBe('m');
+
+      await session.switchMode({ mode: 'm2' });
+      expect(session.getCurrentModeId()).toBe('m2'); // the mode genuinely changed
+
+      const after = await session.getWorkspace();
+      // Same durable workspace instance across the mode switch — switchMode does
+      // not release or re-provision it; the registry keys by sessionId, never by
+      // modeId (see workspace-registry.ts), so the mode change cannot touch it.
+      expect(after).toBe(before);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('per-resource: switchMode keeps the SAME workspace instance', async () => {
+    const harness = new Harness(
+      baseConfig({ workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('per-res')) } }),
+    );
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const before = await session.getWorkspace();
+      expect(before).toBeDefined();
+      await session.switchMode({ mode: 'm2' });
+      const after = await session.getWorkspace();
+      expect(after).toBe(before);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('two sessions for the SAME resource share one per-resource workspace regardless of their modes', async () => {
+    const harness = new Harness(
+      baseConfig({ workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('shared-res')) } }),
+    );
+    // Same resource, genuinely different modes.
+    const sA = await harness.session({ resourceId: 'shared', threadId: { fresh: true } });
+    const sB = await harness.session({ resourceId: 'shared', threadId: { fresh: true }, modeId: 'm2' });
+    try {
+      expect(sA.getCurrentModeId()).toBe('m');
+      expect(sB.getCurrentModeId()).toBe('m2');
+      expect(await sA.getWorkspace()).toBe(await sB.getWorkspace()); // ownership = resource, not mode
+    } finally {
+      await harness.shutdown();
+    }
   });
 });

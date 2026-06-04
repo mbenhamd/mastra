@@ -7,7 +7,7 @@ import {
   HarnessAttachmentInUseError,
   HarnessAttachmentUnavailableError,
   HarnessInboxResponseConflictError,
-  HarnessRuntimeDependencyDriftError,
+  HarnessRuntimeDriftError,
 } from '@mastra/core/harness/v1';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
 import { describe, expect, it, vi } from 'vitest';
@@ -39,6 +39,7 @@ import {
   PATCH_HARNESS_STATE_ROUTE,
   PAUSE_HARNESS_GOAL_ROUTE,
   POST_HARNESS_ATTACHMENT_ROUTE,
+  POST_HARNESS_CHANNEL_INBOUND_ROUTE,
   POST_HARNESS_MESSAGE_ROUTE,
   POST_HARNESS_QUEUE_ROUTE,
   PUT_HARNESS_GOAL_ROUTE,
@@ -188,6 +189,10 @@ describe('Harness server routes', () => {
     expect(GET_HARNESS_SESSION_ROUTE.harnessAuth).toEqual({ clientRoute: true });
     expect(GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE.requiresAuth).toBe(true);
     expect(GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE.harnessAuth).toEqual({ clientRoute: true });
+    // Channel webhook ingress is intentionally public: the channel adapter owns the
+    // provider signature-auth boundary, so the server auth middleware is bypassed.
+    expect(HARNESS_ROUTES).toContain(POST_HARNESS_CHANNEL_INBOUND_ROUTE);
+    expect(POST_HARNESS_CHANNEL_INBOUND_ROUTE.requiresAuth).toBe(false);
     expect(POST_HARNESS_ATTACHMENT_ROUTE.requiresAuth).toBe(true);
     expect(POST_HARNESS_ATTACHMENT_ROUTE.harnessAuth).toEqual({ clientRoute: true });
     expect(DELETE_HARNESS_ATTACHMENT_ROUTE.requiresAuth).toBe(true);
@@ -668,7 +673,8 @@ describe('Harness server routes', () => {
           receivedAt: 1000,
           updatedAt: 1100,
           lease: { attempts: 2, nextAttemptAt: 2000 },
-          lastError: { code: 'worker_unavailable', retryable: true },
+          // §13.3f.1: bare row code projected to the namespaced wire code.
+          lastError: { code: 'harness.worker_unavailable', retryable: true },
         },
       ],
       actionTokens: [],
@@ -834,6 +840,281 @@ describe('Harness server routes', () => {
       501,
       'harness.channel_diagnostics_unsupported',
     );
+  });
+
+  // C4c: thin transport mapper over harness.handleChannelInboundRequest. The core
+  // bridge owns registry resolution, provider verification, the §13.6 readiness gate,
+  // and durable admission and returns a transport-neutral HarnessChannelInboundResult;
+  // these tests assert the route maps each result kind to the right HTTP status + body.
+  it('maps a record-only ACK ok result to a 202 inbound response', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-1',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const harness = { handleChannelInboundRequest };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (header: string) => (header === 'content-type' ? 'application/json' : undefined),
+      }),
+    );
+
+    expect(mastra.getHarness).toHaveBeenCalledWith('code');
+    expect(handleChannelInboundRequest).toHaveBeenCalledTimes(1);
+    const [channelId, transportRequest] = handleChannelInboundRequest.mock.calls[0]!;
+    expect(channelId).toBe('support');
+    expect(transportRequest).toMatchObject({
+      method: 'POST',
+      path: '/harness/code/channels/support/inbound',
+      headers: { 'content-type': 'application/json' },
+      body: { content: 'hi' },
+    });
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({
+      inboxItemId: 'inbox-1',
+      status: 'received',
+      duplicate: false,
+    });
+  });
+
+  it('maps a fully-admitted ok result to a 200 inbound response with session and queue ids', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 200 as const,
+      inboxItemId: 'inbox-2',
+      status: 'queued' as const,
+      duplicate: false,
+      sessionId: 'chs:session-2',
+      queuedItemId: 'queued-2',
+    }));
+    const harness = { handleChannelInboundRequest };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      inboxItemId: 'inbox-2',
+      status: 'queued',
+      duplicate: false,
+      sessionId: 'chs:session-2',
+      queuedItemId: 'queued-2',
+    });
+  });
+
+  it('rejects with 415 when content-type is absent (no allowed webhook type)', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-3',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const harness = { handleChannelInboundRequest };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({ mastra, name: 'code', channelId: 'support', requestBody: { content: 'hi' } }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: 'harness.bad_request' });
+  });
+
+  it('rejects with 415 for a disallowed content-type before reaching the bridge', async () => {
+    const handleChannelInboundRequest = vi.fn();
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'text/plain' : undefined),
+      }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+  });
+
+  it('forwards the FULL request header set (lower-cased) and rawBody to the bridge', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-h',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+    const rawBody = new TextEncoder().encode(JSON.stringify({ content: 'hi' }));
+
+    await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+        getHeaders: () => ({
+          'Content-Type': 'application/json',
+          'X-Slack-Signature': 'v0=abc',
+          'X-Slack-Request-Timestamp': '1700000000',
+        }),
+        rawBody,
+      }),
+    );
+
+    const [, transportRequest] = handleChannelInboundRequest.mock.calls[0]!;
+    const forwarded = transportRequest as { headers: Record<string, unknown>; rawBody?: unknown };
+    expect(forwarded.headers).toEqual({
+      'content-type': 'application/json',
+      'x-slack-signature': 'v0=abc',
+      'x-slack-request-timestamp': '1700000000',
+    });
+    expect(forwarded.rawBody).toBe(rawBody);
+  });
+
+  it('rejects with 413 when rawBody exceeds the per-route size cap', async () => {
+    const handleChannelInboundRequest = vi.fn();
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+    // 1 byte over the 1 MiB cap.
+    const oversized = new Uint8Array(1024 * 1024 + 1);
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: {},
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+        rawBody: oversized,
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(handleChannelInboundRequest).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: 'harness.bad_request' });
+  });
+
+  it('falls back to forwarding only content-type when getHeaders is unavailable', async () => {
+    const handleChannelInboundRequest = vi.fn(async () => ({
+      kind: 'ok' as const,
+      ackStatus: 202 as const,
+      inboxItemId: 'inbox-fb',
+      status: 'received' as const,
+      duplicate: false,
+    }));
+    const mastra = { getHarness: vi.fn(() => ({ handleChannelInboundRequest })) };
+
+    await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
+    );
+
+    const [, transportRequest] = handleChannelInboundRequest.mock.calls[0]!;
+    expect((transportRequest as { headers: Record<string, unknown> }).headers).toEqual({
+      'content-type': 'application/json',
+    });
+  });
+
+  it.each([
+    {
+      label: '404 not_found for an unregistered channel',
+      result: {
+        kind: 'not_found' as const,
+        httpStatus: 404 as const,
+        error: { code: 'harness.not_found', message: 'channel "nope" is not registered' },
+      },
+      status: 404,
+      code: 'harness.not_found',
+    },
+    {
+      label: '401 verify_failed when the provider signature is rejected',
+      result: {
+        kind: 'verify_failed' as const,
+        httpStatus: 401 as const,
+        error: { code: 'harness.permission_denied', message: 'verification failed' },
+      },
+      status: 401,
+      code: 'harness.permission_denied',
+    },
+    {
+      label: '400 verify_failed when the adapter cannot verify inbound',
+      result: {
+        kind: 'verify_failed' as const,
+        httpStatus: 400 as const,
+        error: { code: 'harness.bad_request', message: 'no inbound verification' },
+      },
+      status: 400,
+      code: 'harness.bad_request',
+    },
+    {
+      label: '503 not_ready when the ingress worker is unavailable',
+      result: {
+        kind: 'not_ready' as const,
+        httpStatus: 503 as const,
+        error: {
+          code: 'harness.worker_unavailable',
+          message: 'worker unavailable',
+          retryable: true,
+          details: { reason: 'worker_not_started' },
+        },
+      },
+      status: 503,
+      code: 'harness.worker_unavailable',
+    },
+    {
+      label: '409 conflict for an idempotency-key payload conflict',
+      result: {
+        kind: 'conflict' as const,
+        httpStatus: 409 as const,
+        error: { code: 'harness.channel_action_conflict', message: 'payload conflict' },
+      },
+      status: 409,
+      code: 'harness.channel_action_conflict',
+    },
+  ])('maps $label to the §13.3 error envelope', async ({ result, status, code }) => {
+    const harness = { handleChannelInboundRequest: vi.fn(async () => result) };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await POST_HARNESS_CHANNEL_INBOUND_ROUTE.handler(
+      makeParams({
+        mastra,
+        name: 'code',
+        channelId: 'support',
+        requestBody: { content: 'hi' },
+        getHeader: (h: string) => (h === 'content-type' ? 'application/json' : undefined),
+      }),
+    );
+
+    expect(response.status).toBe(status);
+    const body = (await response.json()) as { code: string; details?: unknown; retryable?: boolean };
+    expect(body.code).toBe(code);
+    expect(body).toMatchObject(result.error);
   });
 
   it('reads session state with a session ETag', async () => {
@@ -1818,6 +2099,71 @@ describe('Harness server routes', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('emits periodic keep-alive comment frames on an idle live stream', async () => {
+    const session = {
+      subscribe: vi.fn(() => vi.fn()),
+      getEventReplayState: vi.fn(),
+      listEventsAfter: vi.fn(),
+    };
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord()),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+
+    const response = await GET_HARNESS_SESSION_EVENTS_ROUTE.handler(
+      // Tiny heartbeat cadence keeps the test deterministic without fake timers.
+      makeParams({ mastra, name: 'code', sessionId: 'session-1', heartbeatIntervalMs: 1 }),
+    );
+
+    const reader = response.body!.getReader();
+    // First read drains any pending frames and lets the ReadableStream `start()`
+    // finish so the heartbeat interval is armed; the next read observes a tick.
+    const chunk = await reader.read();
+    await reader.cancel();
+    const text = new TextDecoder().decode(chunk.value);
+    expect(text).toContain(': keep-alive');
+  });
+
+  it('stops the keep-alive heartbeat and unsubscribes when the request aborts', async () => {
+    const unsubscribe = vi.fn();
+    const session = {
+      subscribe: vi.fn(() => unsubscribe),
+      getEventReplayState: vi.fn(),
+      listEventsAfter: vi.fn(),
+    };
+    const harness = {
+      loadSession: vi.fn(async () => makeRecord()),
+      session: vi.fn(async () => session),
+    };
+    const mastra = { getHarness: vi.fn(() => harness) };
+    const controller = new AbortController();
+
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      const response = await GET_HARNESS_SESSION_EVENTS_ROUTE.handler(
+        makeParams({
+          mastra,
+          name: 'code',
+          sessionId: 'session-1',
+          abortSignal: controller.signal,
+          heartbeatIntervalMs: 1000,
+        }),
+      );
+
+      const reader = response.body!.getReader();
+      // Let `start()` finish so the heartbeat interval is registered before aborting.
+      await reader.read();
+      controller.abort();
+      await reader.read().catch(() => undefined);
+
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalled();
+    } finally {
+      clearSpy.mockRestore();
+    }
+  });
+
   it('serializes live Harness SSE events with the replay-safe JSON projection', async () => {
     class Box {
       constructor(readonly value: string) {}
@@ -2455,12 +2801,10 @@ describe('Harness server routes', () => {
   it('maps runtime dependency drift to the wire error code', async () => {
     const session = {
       respondToQuestion: vi.fn(async () => {
-        throw new HarnessRuntimeDependencyDriftError(
-          'workspace_provider',
-          'unconfigured',
-          'was recorded, but the current workspace dependency is "workspace-now-configured"',
-          'pending question resume',
-        );
+        throw new HarnessRuntimeDriftError({
+          driftedRefs: [{ kind: 'workspace_provider', ref: 'unconfigured' }],
+          context: 'pending question resume',
+        });
       }),
     };
     const harness = { session: vi.fn(async () => session) };
@@ -2481,14 +2825,11 @@ describe('Harness server routes', () => {
         }),
       ),
       409,
-      'harness.runtime_dependency_drifted',
+      'harness.runtime_drift',
     );
     expect(body).toMatchObject({
       details: {
-        dependencyKind: 'workspace_provider',
-        dependencyId: 'unconfigured',
-        reason: 'was recorded, but the current workspace dependency is "workspace-now-configured"',
-        context: 'pending question resume',
+        driftedRefs: [{ kind: 'workspace_provider', ref: 'unconfigured' }],
       },
     });
   });

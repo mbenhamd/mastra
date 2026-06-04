@@ -8,6 +8,7 @@ import {
   HarnessStorageChannelActionClaimConflictError,
   HarnessStorageChannelActionReceiptTransitionError,
   HarnessStorageChannelActionTokenConflictError,
+  HarnessStorageChannelBindingConflictError,
   HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelInboxTransitionError,
   HarnessStorageChannelOutboxClaimConflictError,
@@ -15,6 +16,9 @@ import {
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
+  HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
   HarnessStorageVersionConflictError,
@@ -25,16 +29,24 @@ import {
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
   TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
+  TABLE_HARNESS_CHANNEL_BINDINGS,
   TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_MESSAGE_RESULTS,
   TABLE_HARNESS_OPERATION_TOMBSTONES,
+  TABLE_HARNESS_PLAN_TASKS,
+  TABLE_HARNESS_RUN_SUMMARIES,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
   TABLE_HARNESS_WAKEUPS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
   TABLE_SCHEMAS,
+  applyPlanTaskPatch,
+  decodePlanTaskCursor,
+  encodePlanTaskCursor,
+  walkPlanTaskSubtree,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
@@ -46,6 +58,7 @@ import type {
   AttachmentSemanticMetadata,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelDiagnosticsRows,
   ChannelInboxItem,
   ChannelOutboxItem,
@@ -57,10 +70,33 @@ import type {
   CreateOrLoadChannelActionTokenResult,
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
+  CountPlanTasksByStatusInput,
+  CreatePlanTaskInput,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  HarnessPlanTaskStatus,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
+  MutatePlanTasksForSessionInput,
+  PlanTaskMutationOp,
+  PlanTaskSessionFence,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   DeleteSessionOptions,
   HarnessWakeupItem,
+  HarnessProviderCallbackBinding,
   HarnessSessionEventRecord,
   HarnessSessionEventReplayState,
+  ListActiveChannelBindingsResult,
   ListActiveSessionsByThreadInput,
   ListChannelDiagnosticsInput,
   ListSessionsByThreadInput,
@@ -70,9 +106,13 @@ import type {
   JsonValue,
   OperationAdmissionEvidence,
   OperationAdmissionTombstone,
+  ProviderCallbackSelectorKind,
   QueueAdmissionReceipt,
   ReleaseSessionLeaseInput,
   RenewSessionLeaseInput,
+  RenewSessionLeaseSubtreeInput,
+  ResolveChannelBindingResult,
+  ResolveProviderCallbackBindingResult,
   SaveAttachmentReferenceInput,
   SaveAttachmentInput,
   SaveAttachmentResult,
@@ -81,6 +121,7 @@ import type {
   SessionLeaseResult,
   SessionRecord,
   SessionSummary,
+  SubtreeSessionLeaseResult,
   ThreadDeleteFenceLease,
   WithThreadDeleteFenceInput,
   WorkspaceActionJournalEntry,
@@ -105,12 +146,16 @@ const HARNESS_TABLE_NAMES = [
   TABLE_HARNESS_OPERATION_TOMBSTONES,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_THREAD_DELETE_FENCES,
+  TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_CHANNEL_INBOX,
   TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
   TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
   TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_WAKEUPS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
+  TABLE_HARNESS_PLAN_TASKS,
+  TABLE_HARNESS_RUN_SUMMARIES,
 ] as const;
 
 class PgHarnessClient {
@@ -255,9 +300,42 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       where: '"closed_at" IS NULL',
     },
     {
+      // §5.8 subtree-lease renewal (renewSessionLeaseSubtree recursive CTE) and
+      // listSessions({ parentSessionId }) filter `harness_name + parent_session_id`;
+      // without this index each recursion level / listing seq-scans the sessions table.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_sessions_parent'),
+      table: TABLE_HARNESS_SESSIONS,
+      columns: ['harness_name', 'parent_session_id'],
+    },
+    {
       name: harnessIndexName(schemaPrefix, 'idx_harness_session_events_replay'),
       table: TABLE_HARNESS_SESSION_EVENTS,
       columns: ['harness_name', 'session_id', 'resource_id', 'thread_id', 'epoch', 'sequence'],
+    },
+    {
+      // §4.2f idempotency: loadMessageResultEvidence + compactOperationResultEvidence
+      // look up retained signal-result evidence by (session tuple + signal_id) on the
+      // message-admission path; without this index each admission seq-scans the table.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_message_results_lookup'),
+      table: TABLE_HARNESS_MESSAGE_RESULTS,
+      columns: ['harness_name', 'session_id', 'resource_id', 'thread_id', 'signal_id'],
+    },
+    {
+      // resolveOperationAdmissionEvidence (signal branch) probes message_results by
+      // (session scope + admission_id) on every signal admission — a distinct hot path
+      // from the signal_id lookup; thread_id is optional so it stays residual.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_message_results_admission'),
+      table: TABLE_HARNESS_MESSAGE_RESULTS,
+      columns: ['harness_name', 'session_id', 'resource_id', 'admission_id'],
+    },
+    {
+      // §5.1d idempotency: resolveOperationAdmissionEvidence checks the tombstone by
+      // (session scope + kind + admission_id) on EVERY message/queue admission; the
+      // (harness_name, session_id, resource_id, kind) prefix also serves the
+      // signal_id / queued_item_id tombstone lookups and the per-session delete.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_tombstones_lookup'),
+      table: TABLE_HARNESS_OPERATION_TOMBSTONES,
+      columns: ['harness_name', 'session_id', 'resource_id', 'kind', 'admission_id'],
     },
     {
       name: harnessIndexName(schemaPrefix, 'idx_harness_workspace_actions_session'),
@@ -279,6 +357,74 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       name: harnessIndexName(schemaPrefix, 'idx_harness_channel_inbox_claim'),
       table: TABLE_HARNESS_CHANNEL_INBOX,
       columns: ['harness_name', 'channel_id', 'status', 'next_attempt_at', 'claim_expires_at', 'received_at'],
+    },
+    {
+      // §5.2h / §14.1: at most one ACTIVE binding per platform-conversation tuple. A
+      // missing optional external id is stored as a non-null out-of-band sentinel
+      // (CHANNEL_BINDING_EXTERNAL_ID_SENTINEL), so this partial-unique index enforces
+      // the invariant without depending on SQL NULL uniqueness semantics. Mirrors the
+      // LibSQL sibling's active-tuple index.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_bindings_active_tuple'),
+      table: TABLE_HARNESS_CHANNEL_BINDINGS,
+      columns: [
+        'harness_name',
+        'channel_id',
+        'platform',
+        'external_tenant_id',
+        'external_channel_id',
+        'external_thread_id',
+      ],
+      unique: true,
+      where: `"status" = 'active'`,
+    },
+    {
+      // loadChannelBindingByExternal / resolveChannelBinding probe the active row for a
+      // tuple; resolveChannelBinding also scans every binding (active or fenced) for the
+      // tuple to compute the monotonic max generation.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_bindings_tuple'),
+      table: TABLE_HARNESS_CHANNEL_BINDINGS,
+      columns: [
+        'harness_name',
+        'channel_id',
+        'platform',
+        'external_tenant_id',
+        'external_channel_id',
+        'external_thread_id',
+      ],
+    },
+    {
+      // listChannelBindingsForSession + the deleteSessions cleanup filter by session.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_bindings_session'),
+      table: TABLE_HARNESS_CHANNEL_BINDINGS,
+      columns: ['harness_name', 'session_id'],
+    },
+    {
+      // §14.8 listActiveChannelBindingsForScope ordering: active rows for a harness
+      // (optionally a channel) ranked by activity then binding id. Mirrors the LibSQL
+      // sibling's idx_harness_channel_bindings_scope (status in the key, not partial).
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_bindings_scope'),
+      table: TABLE_HARNESS_CHANNEL_BINDINGS,
+      columns: ['harness_name', 'channel_id', 'status', 'last_outbound_at', 'last_inbound_at', 'id'],
+    },
+    {
+      // §5.1i: at most one ACTIVE provider-callback binding per
+      // (provider_id, selector_kind, selector_value). The partial-unique index
+      // enforces the invariant; replacements mark the prior row `replaced` rather
+      // than leaving two active owners. Mirrors the LibSQL sibling's
+      // idx_harness_provider_callback_active_selector.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_provider_callback_active_selector'),
+      table: TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
+      columns: ['provider_id', 'selector_kind', 'selector_value'],
+      unique: true,
+      where: `"status" = 'active'`,
+    },
+    {
+      // resolveProviderCallbackBinding / markProviderCallbackBindingStatus probe the
+      // active row for a selector, and the status filter also serves history lookups
+      // for a selector. Mirrors idx_harness_provider_callback_selector_status.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_provider_callback_selector_status'),
+      table: TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
+      columns: ['provider_id', 'selector_kind', 'selector_value', 'status'],
     },
     {
       name: harnessIndexName(schemaPrefix, 'idx_harness_channel_action_tokens_transport'),
@@ -352,6 +498,20 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       table: TABLE_HARNESS_WAKEUPS,
       columns: ['harness_name', 'source', 'status', 'due_at', 'next_attempt_at', 'claim_expires_at'],
     },
+    {
+      // §5.1k: listPlanTasks orders by (parentTaskId, order) within a session;
+      // loadPlanTaskSubtree + deletePlanTaskSubtree walk parent_task_id. This
+      // index serves the ordered listing and the recursive subtree walk.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_plan_tasks_order'),
+      table: TABLE_HARNESS_PLAN_TASKS,
+      columns: ['harness_name', 'session_id', 'parent_task_id', 'order'],
+    },
+    {
+      // createPlanTask idempotency lookup by (session, idempotency_key).
+      name: harnessIndexName(schemaPrefix, 'idx_harness_plan_tasks_idempotency'),
+      table: TABLE_HARNESS_PLAN_TASKS,
+      columns: ['harness_name', 'session_id', 'idempotency_key'],
+    },
   ];
 }
 
@@ -385,7 +545,11 @@ export class HarnessPG extends HarnessStorage {
   #indexes?: CreateIndexOptions[];
   #sessionEventsReady: Promise<void> | undefined;
   #workspaceActionsReady: Promise<void> | undefined;
+  #planTasksReady: Promise<void> | undefined;
+  #runSummariesReady: Promise<void> | undefined;
   #compactionLocks = new Map<string, Promise<void>>();
+  #channelBindingIndexesReady: Promise<void> | undefined;
+  #providerCallbackBindingIndexesReady: Promise<void> | undefined;
   #channelInboxIndexesReady: Promise<void> | undefined;
   #channelActionIndexesReady: Promise<void> | undefined;
   #channelOutboxIndexesReady: Promise<void> | undefined;
@@ -400,12 +564,16 @@ export class HarnessPG extends HarnessStorage {
     TABLE_HARNESS_OPERATION_TOMBSTONES,
     TABLE_HARNESS_SESSION_EVENTS,
     TABLE_HARNESS_THREAD_DELETE_FENCES,
+    TABLE_HARNESS_CHANNEL_BINDINGS,
+    TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
     TABLE_HARNESS_CHANNEL_INBOX,
     TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
     TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
     TABLE_HARNESS_CHANNEL_OUTBOX,
     TABLE_HARNESS_WAKEUPS,
     TABLE_HARNESS_WORKSPACE_ACTIONS,
+    TABLE_HARNESS_PLAN_TASKS,
+    TABLE_HARNESS_RUN_SUMMARIES,
   ] as const;
 
   constructor(config: PgDomainConfig & { harnessName?: string }) {
@@ -480,16 +648,22 @@ export class HarnessPG extends HarnessStorage {
       schema: TABLE_SCHEMAS[TABLE_HARNESS_THREAD_DELETE_FENCES],
       compositePrimaryKey: threadDeleteFencesConfig?.compositePrimaryKey,
     });
+    await this.#ensureChannelBindingsTable();
+    await this.#ensureProviderCallbackBindingsTable();
     await this.#ensureChannelInboxTable();
     await this.#ensureChannelActionTables();
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
+    await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     await this.#db.alterTable({
       tableName: TABLE_HARNESS_SESSIONS,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_SESSIONS],
       ifNotExists: [
         'harness_name',
         'subagent_depth',
+        'subagent_type_id',
+        'subagent_tool_allowlist_scoped',
         'queue_admission_receipts',
         'inbox_response_receipts',
         'closing_at',
@@ -558,17 +732,25 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureSessionEventsTable();
     await this.#ensureWorkspaceActionsTable();
     await this.#ensureThreadDeleteFencesTable();
+    await this.#ensureChannelBindingsTable();
+    await this.#ensureProviderCallbackBindingsTable();
     await this.#ensureChannelInboxTable();
     await this.#ensureChannelActionTables();
     await this.#ensureChannelOutboxTable();
     await this.#ensureWakeupTable();
+    await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     this.#localThreadDeleteFences.clear();
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_RUN_SUMMARIES}`);
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENT_REFERENCES}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_ATTACHMENTS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_MESSAGE_RESULTS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_SESSION_EVENTS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_WORKSPACE_ACTIONS}`);
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}`);
+    await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_CHANNEL_INBOX}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}`);
     await this.#client.execute(`DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}`);
@@ -608,9 +790,14 @@ export class HarnessPG extends HarnessStorage {
     harnessName?: string;
   }): Promise<SessionRecord | null> {
     const namespace = this.#resolveHarnessName(harnessName);
+    // §5.2a/§5.3/§5.5: return the current owner INCLUDING Closed (reopen
+    // candidate) and Closing records. A `closed_at IS NULL` filter here would
+    // hide a closed owner so `harness.session({ threadId, resourceId })` would
+    // mint a second active record on the same thread instead of reopening the
+    // closed one — diverging from InMemory and violating the storage contract.
     const result = await this.#client.execute({
       sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS}
-            WHERE harness_name = ? AND thread_id = ? AND resource_id = ? AND closed_at IS NULL
+            WHERE harness_name = ? AND thread_id = ? AND resource_id = ?
             ORDER BY last_activity_at DESC
             LIMIT 1`,
       args: [namespace, threadId, resourceId],
@@ -1056,9 +1243,15 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessStorageThreadDeleteFenceConflictError(record.threadId);
       }
 
+      // §5.3/§5.5: the current owner for this (harness, resource, thread)
+      // INCLUDES Closed (reopenable) and Closing records — the caller reopens a
+      // closed owner or fails new work on a closing one rather than minting a
+      // second active record behind it. Filtering `closed_at IS NULL` here would
+      // skip a closed owner and INSERT a fresh active row, diverging from
+      // InMemory and orphaning the closed owner.
       const active = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_SESSIONS}
-              WHERE harness_name = ? AND resource_id = ? AND thread_id = ? AND closed_at IS NULL
+              WHERE harness_name = ? AND resource_id = ? AND thread_id = ?
               ORDER BY last_activity_at DESC
               LIMIT 1`,
         args: [harnessName, record.resourceId, record.threadId],
@@ -1079,7 +1272,7 @@ export class HarnessPG extends HarnessStorage {
 
       if (record.parentSessionId !== undefined) {
         const parent = await tx.execute({
-          sql: `SELECT resource_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
+          sql: `SELECT resource_id, closed_at, closing_at, close_deadline_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id = ?
                 LIMIT 1`,
           args: [harnessName, record.parentSessionId],
@@ -1092,7 +1285,15 @@ export class HarnessPG extends HarnessStorage {
           throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closed');
         }
         if (parentRow.closing_at != null) {
-          throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closing');
+          // §4.5b: carry the parent's closing window so the caller can build a
+          // spec-accurate HarnessSessionClosingError instead of fabricating a
+          // `Date.now()` window (InMemory passes these timestamps too).
+          throw new HarnessStorageParentSessionUnavailableError(
+            record.parentSessionId,
+            'closing',
+            parentRow.closing_at != null ? Number(parentRow.closing_at) : undefined,
+            parentRow.close_deadline_at != null ? Number(parentRow.close_deadline_at) : undefined,
+          );
         }
       }
 
@@ -1165,6 +1366,8 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureOperationTombstonesTable();
     await this.#ensureSessionEventsTable();
     await this.#ensureWorkspaceActionsTable();
+    await this.#ensureChannelBindingsTable();
+    await this.#ensurePlanTasksTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,
@@ -1229,6 +1432,22 @@ export class HarnessPG extends HarnessStorage {
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_WORKSPACE_ACTIONS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // §14.1: channel bindings are session-scoped. A deleted session must not
+        // leave a binding behind, or it would still win loadChannelBindingByExternal
+        // / resolveChannelBinding and block rebinding that conversation to a
+        // replacement session (mirrors the in-memory cleanupDeletedSession sweep).
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // §5.2g: cascade the whole plan-task tree owned by this session (every
+        // node — all rows share session_id, so descendants are covered).
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });
@@ -1332,6 +1551,96 @@ export class HarnessPG extends HarnessStorage {
     }
 
     return { version: Number(result.rows[0]!.version), expiresAt };
+  }
+
+  async renewSessionLeaseSubtree({
+    rootSessionId,
+    ownerId,
+    ttlMs,
+    harnessName,
+  }: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
+    const namespace = this.#resolveHarnessName(harnessName);
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
+
+    // §5.8 atomic subtree renewal: one transaction locks the root, gathers every
+    // ACTIVE (non-closed) descendant under one owner, then renews root + descendants
+    // to one capped expiry — all-or-nothing, so a foreign-owned descendant fences
+    // the whole pass (no parent-only partial commit). The final UPDATE is guarded by
+    // `owner_id = ?` and an affected-count check, so a concurrent ownership change
+    // slipping in under READ COMMITTED fails the renewal closed rather than committing
+    // a partial subtree.
+    const tx = await this.#client.transaction('write');
+    try {
+      const rootResult = await tx.execute({
+        sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+              WHERE harness_name = ? AND id = ?
+              FOR UPDATE`,
+        args: [namespace, rootSessionId],
+      });
+      const rootRow = rootResult.rows[0] as Record<string, unknown> | undefined;
+      if (!rootRow) throw new HarnessStorageSessionNotFoundError(rootSessionId);
+      const rootOwner = (rootRow.owner_id ?? null) as string | null;
+      const rootExpires = rootRow.lease_expires_at == null ? undefined : Number(rootRow.lease_expires_at);
+      if (rootOwner !== ownerId || rootExpires === undefined || rootExpires <= now) {
+        throw new HarnessStorageLeaseConflictError(rootSessionId, rootOwner ?? '<unowned>', rootExpires ?? 0);
+      }
+
+      // Walk parentSessionId via a recursive CTE.
+      const descendantsResult = await tx.execute({
+        // UNION (not UNION ALL) row-dedupes the frontier so a parent_session_id
+        // cycle (the storage boundary does not hard-enforce parentage immutability)
+        // terminates instead of recursing until the engine's depth cap. Mirrors the
+        // visited-set guard the in-memory adapter uses.
+        sql: `WITH RECURSIVE subtree(id, owner_id, closed_at, closing_at) AS (
+                SELECT id, owner_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
+                WHERE harness_name = ? AND parent_session_id = ?
+                UNION
+                SELECT s.id, s.owner_id, s.closed_at, s.closing_at FROM ${TABLE_HARNESS_SESSIONS} s
+                JOIN subtree ON s.parent_session_id = subtree.id
+                WHERE s.harness_name = ?
+              )
+              SELECT id, owner_id FROM subtree WHERE closed_at IS NULL AND closing_at IS NULL`,
+        args: [namespace, rootSessionId, namespace],
+      });
+
+      const descendantIds: string[] = [];
+      for (const row of descendantsResult.rows as Record<string, unknown>[]) {
+        const childId = row.id as string;
+        const childOwner = (row.owner_id ?? null) as string | null;
+        if (childOwner !== ownerId) {
+          throw new HarnessStorageLeaseConflictError(childId, childOwner ?? '<unowned>', 0);
+        }
+        descendantIds.push(childId);
+      }
+
+      const allIds = [rootSessionId, ...descendantIds];
+      const updateResult = await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+              SET lease_expires_at = ?
+              WHERE harness_name = ? AND owner_id = ?
+                AND closed_at IS NULL
+                AND id IN (${allIds.map(() => '?').join(', ')})`,
+        args: [expiresAt, namespace, ownerId, ...allIds],
+      });
+      if (updateResult.rowsAffected !== allIds.length) {
+        // A concurrent ownership change OR a hard CLOSE (closed_at written) slipped
+        // in between the read and the write — fail closed, renewing NOTHING (the
+        // rollback discards any partial update). A CLOSED row holds no live lease
+        // (§5.8) so it is excluded here and trips this guard. The guard does NOT
+        // exclude `closing` rows: the close-drain path keeps renewing a CLOSING
+        // ROOT's lease while it waits (harness `_renewLiveSessionLeaseSubtree`
+        // renews `live` OR `closing` roots), and closing DESCENDANTS are already
+        // dropped from `allIds` by the recursive-CTE selector above.
+        throw new HarnessStorageLeaseConflictError(rootSessionId, ownerId, expiresAt);
+      }
+
+      await tx.commit();
+      return { version: Number(rootRow.version), expiresAt, renewedDescendantCount: descendantIds.length };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {
@@ -1624,7 +1933,7 @@ export class HarnessPG extends HarnessStorage {
     const result = await this.#client.execute({
       sql: `SELECT * FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}
             WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              AND kind = 'message' AND signal_id = ?
+              AND kind IN ('signal', 'message') AND signal_id = ?
             LIMIT 1`,
       args: [namespace, sessionId, resourceId, threadId, signalId],
     });
@@ -1659,7 +1968,7 @@ export class HarnessPG extends HarnessStorage {
         if (!sameMessageEvidenceIdentity(current, namespacedRecord)) {
           throw new HarnessStorageAdmissionConflictError(
             namespacedRecord.sessionId,
-            'message',
+            'signal',
             namespacedRecord.admissionId ?? namespacedRecord.signalId,
           );
         }
@@ -1728,7 +2037,7 @@ export class HarnessPG extends HarnessStorage {
         }
         throw new HarnessStorageAdmissionConflictError(
           namespacedRecord.sessionId,
-          'message',
+          'signal',
           namespacedRecord.admissionId ?? namespacedRecord.signalId,
         );
       }
@@ -1806,35 +2115,33 @@ export class HarnessPG extends HarnessStorage {
   }): Promise<HarnessSessionEventReplayState | null> {
     const namespace = this.#resolveHarnessName(harnessName);
     await this.#ensureSessionEventsTable();
+    // §10.5 live-replay: the SSE cursor contract is anchored to the CURRENT
+    // in-memory Session instance's epoch, which storage cannot observe. When the
+    // ledger holds more than one epoch (every rehydrate after eviction mints a
+    // fresh epoch and still appends lifecycle events), the replay state is
+    // ambiguous, so we collapse to `null`. The server then returns 412 for the
+    // stale cursor and the client recovers via the §10.5 snapshot path. Durable
+    // SSE replay across restarts/evictions is explicitly NOT a v1 goal, and a
+    // newest-by-`stored_at` projection would (a) diverge from the authoritative
+    // in-memory adapter, which returns `null` for any multi-epoch ledger, and
+    // (b) misidentify the current epoch whenever the prior epoch's last event
+    // and the fresh epoch's seq-0 event share a `stored_at` millisecond.
     const bounds = await this.#client.execute({
       sql: `SELECT
-              oldest.epoch AS oldest_epoch,
-              oldest.sequence AS oldest_sequence,
-              newest.epoch AS newest_epoch,
-              newest.sequence AS newest_sequence
-            FROM (
-              SELECT epoch, sequence
-              FROM ${TABLE_HARNESS_SESSION_EVENTS}
-              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              ORDER BY epoch ASC, sequence ASC
-              LIMIT 1
-            ) AS oldest
-            CROSS JOIN (
-              SELECT epoch, sequence
-              FROM ${TABLE_HARNESS_SESSION_EVENTS}
-              WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              ORDER BY epoch DESC, sequence DESC
-              LIMIT 1
-            ) AS newest`,
-      args: [namespace, sessionId, resourceId, threadId, namespace, sessionId, resourceId, threadId],
+              COUNT(DISTINCT epoch) AS epoch_count,
+              MIN(epoch) AS epoch,
+              MIN(sequence) AS oldest_sequence,
+              MAX(sequence) AS newest_sequence
+            FROM ${TABLE_HARNESS_SESSION_EVENTS}
+            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
+      args: [namespace, sessionId, resourceId, threadId],
     });
     const row = bounds.rows[0];
-    if (!row || row.oldest_epoch == null || row.newest_epoch == null) return null;
+    if (!row || row.epoch_count == null || Number(row.epoch_count) !== 1) return null;
     if (row.oldest_sequence == null || row.newest_sequence == null) return null;
-    if (String(row.oldest_epoch) !== String(row.newest_epoch)) return null;
 
     return {
-      epoch: String(row.newest_epoch),
+      epoch: String(row.epoch),
       oldestSequence: Number(row.oldest_sequence),
       newestSequence: Number(row.newest_sequence),
     };
@@ -1983,6 +2290,380 @@ export class HarnessPG extends HarnessStorage {
     return result.rows.map(row => rowToWorkspaceActionJournalEntry(row as Record<string, unknown>));
   }
 
+  // -------------------------------------------------------------------------
+  // Plan tasks (§5.1k) — session-owner-fenced model-authored task tree.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Assert the session-owner fence inside `tx`: the owning session row is locked
+   * FOR UPDATE, must be held by `ownerId` under an unexpired lease, and must have
+   * `version` matching `ifSessionVersion`. Returns the resolved namespace.
+   */
+  async #assertPlanTaskFence(tx: PgHarnessClient, fence: PlanTaskSessionFence): Promise<string> {
+    const namespace = this.#resolveHarnessName(fence.harnessName);
+    const res = await tx.execute({
+      sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ?
+            FOR UPDATE`,
+      args: [namespace, fence.sessionId],
+    });
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (!row) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
+    const ownerId = (row.owner_id ?? undefined) as string | undefined;
+    const leaseExpiresAt = row.lease_expires_at == null ? undefined : Number(row.lease_expires_at);
+    const now = Date.now();
+    // Lease check first — mirrors saveSession. An expired lease is no holder.
+    const leaseHeld = ownerId !== undefined && leaseExpiresAt !== undefined && leaseExpiresAt > now;
+    if (leaseHeld && ownerId !== fence.ownerId) {
+      throw new HarnessStorageLeaseConflictError(fence.sessionId, ownerId, leaseExpiresAt ?? 0);
+    }
+    const version = Number(row.version);
+    if (version !== fence.ifSessionVersion) {
+      throw new HarnessStorageVersionConflictError(fence.sessionId, fence.ifSessionVersion, version);
+    }
+    return namespace;
+  }
+
+  async createPlanTask({ fence, task }: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const stored = await this.#insertPlanTask(tx, namespace, fence.sessionId, task);
+      await tx.commit();
+      return stored;
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #insertPlanTask(
+    tx: PgHarnessClient,
+    namespace: string,
+    sessionId: string,
+    task: HarnessPlanTask,
+  ): Promise<HarnessPlanTask> {
+    if (task.idempotencyKey !== undefined) {
+      const existing = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+              WHERE harness_name = ? AND session_id = ? AND idempotency_key = ?
+              LIMIT 1`,
+        args: [namespace, sessionId, task.idempotencyKey],
+      });
+      if (existing.rows[0]) return rowToPlanTask(existing.rows[0] as Record<string, unknown>);
+    }
+    const now = Date.now();
+    const stored: HarnessPlanTask = {
+      ...task,
+      harnessName: namespace,
+      sessionId,
+      createdAt: task.createdAt ?? now,
+      updatedAt: now,
+      version: 1,
+    };
+    const cols = planTaskColumnValues(stored);
+    await tx.execute({
+      sql: `INSERT INTO ${TABLE_HARNESS_PLAN_TASKS} (${cols.names.join(', ')})
+            VALUES (${cols.names.map(() => '?').join(', ')})`,
+      args: cols.values,
+    });
+    return stored;
+  }
+
+  async updatePlanTask({ fence, taskId, ifVersion, patch }: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const version = await this.#updatePlanTaskRow(tx, namespace, fence.sessionId, taskId, ifVersion, patch);
+      await tx.commit();
+      return { version };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #updatePlanTaskRow(
+    tx: PgHarnessClient,
+    namespace: string,
+    sessionId: string,
+    taskId: string,
+    ifVersion: number,
+    patch: UpdatePlanTaskInput['patch'],
+  ): Promise<number> {
+    const res = await tx.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ? AND task_id = ?
+            FOR UPDATE`,
+      args: [namespace, sessionId, taskId],
+    });
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (!row) throw new HarnessStoragePlanTaskNotFoundError(sessionId, taskId);
+    const existing = rowToPlanTask(row);
+    if (existing.version !== ifVersion) {
+      throw new HarnessStoragePlanTaskVersionConflictError(taskId, ifVersion, existing.version);
+    }
+    const next = applyPlanTaskPatch(existing, patch, ifVersion + 1);
+    const cols = planTaskColumnValues(next);
+    const updatable = cols.names.filter(n => n !== 'harness_name' && n !== 'session_id' && n !== 'task_id');
+    const setClause = updatable.map(n => `${n} = ?`).join(', ');
+    const setValues = updatable.map(n => cols.values[cols.names.indexOf(n)]);
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_PLAN_TASKS}
+            SET ${setClause}
+            WHERE harness_name = ? AND session_id = ? AND task_id = ?`,
+      args: [...setValues, namespace, sessionId, taskId],
+    });
+    return next.version;
+  }
+
+  async deletePlanTaskSubtree({ fence, rootTaskId }: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      const deletedCount = await this.#deletePlanTaskSubtreeRows(tx, namespace, fence.sessionId, rootTaskId);
+      await tx.commit();
+      return { deletedCount };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #deletePlanTaskSubtreeRows(
+    tx: PgHarnessClient,
+    namespace: string,
+    sessionId: string,
+    rootTaskId: string,
+  ): Promise<number> {
+    // §5.1k: walk parent_task_id with a recursive CTE; UNION (not UNION ALL)
+    // row-dedupes so a parent_task_id cycle terminates (cycle PREVENTION is TM-4,
+    // this is the defensive runtime guard). Delete the root + every descendant.
+    const result = await tx.execute({
+      sql: `WITH RECURSIVE subtree(task_id) AS (
+              SELECT task_id FROM ${TABLE_HARNESS_PLAN_TASKS}
+              WHERE harness_name = ? AND session_id = ? AND task_id = ?
+              UNION
+              SELECT t.task_id FROM ${TABLE_HARNESS_PLAN_TASKS} t
+              JOIN subtree ON t.parent_task_id = subtree.task_id
+              WHERE t.harness_name = ? AND t.session_id = ?
+            )
+            DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+              AND task_id IN (SELECT task_id FROM subtree)`,
+      args: [namespace, sessionId, rootTaskId, namespace, sessionId, namespace, sessionId],
+    });
+    return result.rowsAffected;
+  }
+
+  async mutatePlanTasksForSession({ fence, ops }: MutatePlanTasksForSessionInput): Promise<void> {
+    await this.#ensurePlanTasksTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const namespace = await this.#assertPlanTaskFence(tx, fence);
+      for (const op of ops) {
+        await this.#applyPlanTaskOp(tx, namespace, fence.sessionId, op);
+      }
+      await tx.commit();
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async #applyPlanTaskOp(
+    tx: PgHarnessClient,
+    namespace: string,
+    sessionId: string,
+    op: PlanTaskMutationOp,
+  ): Promise<void> {
+    if (op.kind === 'create') {
+      await this.#insertPlanTask(tx, namespace, sessionId, op.task);
+      return;
+    }
+    if (op.kind === 'update') {
+      await this.#updatePlanTaskRow(tx, namespace, sessionId, op.taskId, op.ifVersion, op.patch);
+      return;
+    }
+    await this.#deletePlanTaskSubtreeRows(tx, namespace, sessionId, op.rootTaskId);
+  }
+
+  async listPlanTasks({ harnessName, sessionId, limit, cursor }: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    if (limit <= 0) return { tasks: [] };
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    // Keyset cursor on the (parent_task_id, "order", task_id) sort key.
+    const conditions = ['harness_name = ?', 'session_id = ?'];
+    const args: QueryValues = [namespace, sessionId];
+    if (cursor !== undefined) {
+      const c = decodePlanTaskCursor(cursor);
+      conditions.push(
+        `(COALESCE(parent_task_id, '') > ? OR (COALESCE(parent_task_id, '') = ? AND ("order" > ? OR ("order" = ? AND task_id > ?))))`,
+      );
+      args.push(c.parent, c.parent, c.order, c.order, c.taskId);
+    }
+    // Fetch limit+1 so a cursor is emitted only when a further row actually
+    // exists (matching the in-memory adapter's `nextIndex < total` semantics).
+    args.push(limit + 1);
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY COALESCE(parent_task_id, '') ASC, "order" ASC, task_id ASC
+            LIMIT ?`,
+      args,
+    });
+    const fetched = result.rows.map(row => rowToPlanTask(row as Record<string, unknown>));
+    const hasMore = fetched.length > limit;
+    const tasks = hasMore ? fetched.slice(0, limit) : fetched;
+    const out: ListPlanTasksResult = { tasks };
+    if (hasMore && tasks.length > 0) {
+      out.cursor = encodePlanTaskCursor(tasks[tasks.length - 1]!);
+    }
+    return out;
+  }
+
+  async loadPlanTaskSubtree({
+    harnessName,
+    sessionId,
+    rootTaskId,
+    depth,
+    status,
+    limit,
+  }: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    // Materialize the whole session tree (bounded by session ownership), then do
+    // the depth-first preorder walk in-process — the same shape as the in-memory
+    // adapter, so depth/status/limit semantics match exactly across adapters.
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+            ORDER BY COALESCE(parent_task_id, '') ASC, "order" ASC, task_id ASC`,
+      args: [namespace, sessionId],
+    });
+    const tasks = result.rows.map(row => rowToPlanTask(row as Record<string, unknown>));
+    return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
+  }
+
+  async countPlanTasksByStatus({ harnessName, sessionId }: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
+    await this.#ensurePlanTasksTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    // Exact aggregate, NOT a row load: one COUNT(*) GROUP BY status pass over the
+    // session's tasks. The roots count (parent NULL or unresolvable) comes from a
+    // single anti-join, matching `computePlanTaskSummary`'s root rule.
+    const grouped = await this.#client.execute({
+      sql: `SELECT status, COUNT(*)::bigint AS n
+            FROM ${TABLE_HARNESS_PLAN_TASKS}
+            WHERE harness_name = ? AND session_id = ?
+            GROUP BY status`,
+      args: [namespace, sessionId],
+    });
+    const rootsResult = await this.#client.execute({
+      sql: `SELECT COUNT(*)::bigint AS n
+            FROM ${TABLE_HARNESS_PLAN_TASKS} t
+            WHERE t.harness_name = ? AND t.session_id = ?
+              AND (t.parent_task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1 FROM ${TABLE_HARNESS_PLAN_TASKS} p
+                     WHERE p.harness_name = t.harness_name
+                       AND p.session_id = t.session_id
+                       AND p.task_id = t.parent_task_id))`,
+      args: [namespace, sessionId],
+    });
+    const byStatus: Partial<Record<HarnessPlanTaskStatus, number>> = {};
+    let total = 0;
+    for (const row of grouped.rows as Array<{ status: string; n: unknown }>) {
+      const n = Number(row.n);
+      byStatus[row.status as HarnessPlanTaskStatus] = n;
+      total += n;
+    }
+    const rootCount = Number((rootsResult.rows[0] as { n: unknown } | undefined)?.n ?? 0);
+    return { total, byStatus, rootCount };
+  }
+
+  // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2)
+  // -------------------------------------------------------------------------
+
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(summary.harnessName);
+    const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
+    const cols = runSummaryColumnValues(stored);
+    // First-terminal-wins idempotency: a later write for the same (harness, run)
+    // is a no-op.
+    await this.#client.execute({
+      sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
+            VALUES (${cols.names.map(() => '?').join(', ')})
+            ON CONFLICT (harness_name, run_id) DO NOTHING`,
+      args: cols.values,
+    });
+    // Return the authoritative stored row (the existing one on a no-op).
+    const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });
+    return existing ?? stored;
+  }
+
+  async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const res = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES} WHERE harness_name = ? AND run_id = ? LIMIT 1`,
+      args: [namespace, runId],
+    });
+    return res.rows[0] ? rowToRunSummary(res.rows[0] as Record<string, unknown>) : null;
+  }
+
+  async listRunSummaries({
+    harnessName,
+    sessionId,
+    resourceId,
+    limit,
+    beforeCompletedAt,
+    beforeRunId,
+  }: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    await this.#ensureRunSummariesTable();
+    const namespace = this.#resolveHarnessName(harnessName);
+    const cap = limit ?? 50;
+    const where: string[] = ['harness_name = ?', 'session_id = ?'];
+    const args: QueryValues = [namespace, sessionId];
+    if (resourceId !== undefined) {
+      where.push('resource_id = ?');
+      args.push(resourceId);
+    }
+    if (beforeCompletedAt !== undefined) {
+      // Composite keyset for the (completed_at DESC, run_id DESC) order so
+      // same-timestamp rows at a page boundary are not skipped.
+      if (beforeRunId !== undefined) {
+        where.push('(completed_at < ? OR (completed_at = ? AND run_id < ?))');
+        args.push(beforeCompletedAt, beforeCompletedAt, beforeRunId);
+      } else {
+        where.push('completed_at < ?');
+        args.push(beforeCompletedAt);
+      }
+    }
+    // Fetch one extra row to detect whether more pages remain.
+    args.push(cap + 1);
+    const res = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES}
+            WHERE ${where.join(' AND ')}
+            ORDER BY completed_at DESC, run_id DESC
+            LIMIT ?`,
+      args,
+    });
+    const all = (res.rows as Record<string, unknown>[]).map(rowToRunSummary);
+    const page = all.slice(0, cap);
+    const result: ListRunSummariesResult = { summaries: page };
+    if (all.length > cap) {
+      const last = page[page.length - 1]!;
+      result.nextBeforeCompletedAt = last.completedAt;
+      result.nextBeforeRunId = last.runId;
+    }
+    return result;
+  }
+
   async resolveOperationAdmissionEvidence({
     harnessName,
     sessionId,
@@ -1996,7 +2677,7 @@ export class HarnessPG extends HarnessStorage {
     sessionId: string;
     resourceId: string;
     threadId?: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     admissionId: string;
     attemptedAdmissionHash: string;
   }): Promise<{
@@ -2005,8 +2686,8 @@ export class HarnessPG extends HarnessStorage {
     storedAdmissionHash?: string;
   }> {
     const namespace = this.#resolveHarnessName(harnessName);
-    if (kind === 'message') await this.#ensureMessageResultsTable();
-    if (kind === 'message') {
+    if (kind === 'signal') await this.#ensureMessageResultsTable();
+    if (kind === 'signal') {
       const filters = ['harness_name = ?', 'session_id = ?', 'resource_id = ?', 'admission_id = ?'];
       const args = [namespace, sessionId, resourceId, admissionId];
       if (threadId !== undefined) {
@@ -2045,8 +2726,14 @@ export class HarnessPG extends HarnessStorage {
       }
     }
 
-    const tombstoneFilters = ['harness_name = ?', 'session_id = ?', 'resource_id = ?', 'kind = ?', 'admission_id = ?'];
-    const tombstoneArgs = [namespace, sessionId, resourceId, kind, admissionId];
+    // §5.1d: legacy tombstones persisted under kind 'message' must still be
+    // discoverable for signal idempotency (rowToTombstone normalizes them on read).
+    const kindFilter = kind === 'signal' ? "kind IN ('signal', 'message')" : 'kind = ?';
+    const tombstoneFilters = ['harness_name = ?', 'session_id = ?', 'resource_id = ?', kindFilter, 'admission_id = ?'];
+    const tombstoneArgs =
+      kind === 'signal'
+        ? [namespace, sessionId, resourceId, admissionId]
+        : [namespace, sessionId, resourceId, kind, admissionId];
     if (threadId !== undefined) {
       tombstoneFilters.splice(3, 0, 'thread_id = ?');
       tombstoneArgs.splice(3, 0, threadId);
@@ -2134,13 +2821,13 @@ export class HarnessPG extends HarnessStorage {
     harnessName?: string;
     sessionId: string;
     resourceId: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     signalId?: string;
     queuedItemId?: string;
     now: number;
   }): Promise<OperationAdmissionTombstone | null> {
     const namespace = this.#resolveHarnessName(harnessName);
-    if (kind === 'message') {
+    if (kind === 'signal') {
       await this.#ensureMessageResultsTable();
       const result = await this.#client.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS}
@@ -2154,7 +2841,7 @@ export class HarnessPG extends HarnessStorage {
       const retained = rowToMessageResultEvidence(row as Record<string, unknown>);
       if (retained.status === 'pending') return null;
       const tombstone: OperationAdmissionTombstone = {
-        kind: 'message',
+        kind: 'signal',
         harnessName: namespace,
         sessionId,
         resourceId,
@@ -2266,6 +2953,663 @@ export class HarnessPG extends HarnessStorage {
             WHERE ${where}`,
       args,
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Provider-callback bindings (§5.1i)
+  // -------------------------------------------------------------------------
+
+  async resolveProviderCallbackBinding(
+    record: HarnessProviderCallbackBinding,
+    opts?: { replaceBindingId?: string },
+  ): Promise<ResolveProviderCallbackBindingResult> {
+    await this.#ensureProviderCallbackBindingsTable();
+    const incoming: HarnessProviderCallbackBinding = {
+      ...record,
+      harnessName: this.#resolveHarnessName(record.harnessName),
+    };
+    assertValidProviderCallbackBindingState(incoming);
+    const tx = await this.#client.transaction('write');
+    try {
+      const active = await this.#loadActiveProviderCallbackBindingBySelectorWithClient(tx, {
+        providerId: incoming.providerId,
+        selectorKind: incoming.selectorKind,
+        selectorValue: incoming.selectorValue,
+      });
+
+      if (opts?.replaceBindingId !== undefined) {
+        if (opts.replaceBindingId === incoming.id) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            incoming.id,
+            incoming.status,
+            'replaced',
+            'replacement target must be different from the incoming binding',
+          );
+        }
+        if (incoming.status !== 'active') {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            incoming.id,
+            incoming.status,
+            'active',
+            'replacement binding must be active',
+          );
+        }
+        const existingById = await this.#loadProviderCallbackBindingByIdWithClient(tx, incoming.id);
+        if (existingById && !providerCallbackBindingsEqual(existingById, incoming)) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            incoming.id,
+            existingById.status,
+            incoming.status,
+            'id is already owned by another provider callback binding',
+          );
+        }
+        const previous = await this.#loadProviderCallbackBindingByIdWithClient(tx, opts.replaceBindingId);
+        if (
+          previous?.status === 'replaced' &&
+          previous.replacedByBindingId === incoming.id &&
+          existingById &&
+          providerCallbackBindingsEqual(existingById, incoming)
+        ) {
+          await tx.commit();
+          return {
+            binding: existingById,
+            duplicate: true,
+            conflict: false,
+            replacedBindingId: previous.id,
+          };
+        }
+        if (existingById && providerCallbackBindingsEqual(existingById, incoming)) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            incoming.id,
+            existingById.status,
+            incoming.status,
+            'id is already owned and replacement target has not transitioned',
+          );
+        }
+        if (
+          !previous ||
+          previous.status !== 'active' ||
+          previous.providerId !== incoming.providerId ||
+          previous.selectorKind !== incoming.selectorKind ||
+          previous.selectorValue !== incoming.selectorValue
+        ) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            opts.replaceBindingId,
+            previous?.status,
+            'replaced',
+            'replacement target is missing, inactive, or owns a different selector',
+          );
+        }
+        if (active && active.id !== previous.id) {
+          if (existingById && providerCallbackBindingsEqual(existingById, incoming)) {
+            await tx.commit();
+            return { binding: existingById, duplicate: true, conflict: false, replacedBindingId: previous.id };
+          }
+          await tx.commit();
+          return { binding: active, duplicate: true, conflict: true };
+        }
+        const replacedAt = incoming.createdAt;
+        const replaceResult = await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+                SET status = 'replaced', replaced_at = ?, replaced_by_binding_id = ?, updated_at = ?
+                WHERE id = ? AND status = 'active'`,
+          args: [replacedAt, incoming.id, replacedAt, previous.id],
+        });
+        if (replaceResult.rowsAffected === 0) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            previous.id,
+            previous.status,
+            'replaced',
+            'replacement target changed before it could be replaced',
+          );
+        }
+        await tx.execute(providerCallbackBindingInsertStatement(incoming));
+        await tx.commit();
+        return { binding: incoming, duplicate: false, conflict: false, replacedBindingId: previous.id };
+      }
+
+      if (active) {
+        await tx.commit();
+        return {
+          binding: active,
+          duplicate: true,
+          conflict: !sameProviderCallbackBindingTarget(active, incoming),
+        };
+      }
+      const existingById = await this.#loadProviderCallbackBindingByIdWithClient(tx, incoming.id);
+      if (existingById) {
+        if (providerCallbackBindingsEqual(existingById, incoming)) {
+          await tx.commit();
+          return { binding: existingById, duplicate: true, conflict: false };
+        }
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          incoming.id,
+          existingById.status,
+          incoming.status,
+          'id is already owned by another provider callback binding',
+        );
+      }
+      await tx.execute(providerCallbackBindingInsertStatement(incoming));
+      await tx.commit();
+      return { binding: incoming, duplicate: false, conflict: false };
+    } catch (error) {
+      if (!tx.closed) await tx.rollback();
+      if (isUniqueConstraintError(error)) {
+        return this.#resolveProviderCallbackBindingUniqueConflict(incoming, opts);
+      }
+      throw error;
+    }
+  }
+
+  async loadProviderCallbackBindingBySelector(opts: {
+    providerId: string;
+    selectorKind: ProviderCallbackSelectorKind;
+    selectorValue: string;
+  }): Promise<HarnessProviderCallbackBinding | null> {
+    await this.#ensureProviderCallbackBindingsTable();
+    return this.#loadActiveProviderCallbackBindingBySelectorWithClient(this.#client, opts);
+  }
+
+  async markProviderCallbackBindingStatus(opts: {
+    bindingId: string;
+    status: Extract<HarnessProviderCallbackBinding['status'], 'active' | 'disabled' | 'undeliverable'>;
+    updatedAt?: number;
+    lastError?: HarnessProviderCallbackBinding['lastError'];
+  }): Promise<HarnessProviderCallbackBinding> {
+    await this.#ensureProviderCallbackBindingsTable();
+    const tx = await this.#client.transaction('write');
+    try {
+      const current = await this.#loadProviderCallbackBindingByIdWithClient(tx, opts.bindingId);
+      if (!current) {
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          opts.bindingId,
+          undefined,
+          opts.status,
+          'binding was not found',
+        );
+      }
+      if (current.status === 'replaced') {
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          current.id,
+          current.status,
+          opts.status,
+          'replaced bindings are terminal',
+        );
+      }
+      const active = await this.#loadActiveProviderCallbackBindingBySelectorWithClient(tx, {
+        providerId: current.providerId,
+        selectorKind: current.selectorKind,
+        selectorValue: current.selectorValue,
+      });
+      if (opts.status === 'active' && active && active.id !== current.id) {
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          current.id,
+          current.status,
+          opts.status,
+          'another active binding owns this selector',
+        );
+      }
+      const updatedAt = opts.updatedAt ?? Date.now();
+      const next: HarnessProviderCallbackBinding = {
+        ...current,
+        status: opts.status,
+        updatedAt,
+        lastError: opts.lastError,
+      };
+      assertValidProviderCallbackBindingState(next);
+      const values = providerCallbackBindingColumnValues(next);
+      const currentValues = providerCallbackBindingColumnValues(current);
+      const expectedNames = currentValues.names.filter(name => name !== 'id');
+      // `IS ?` is rewritten to `IS NOT DISTINCT FROM ?` by preparePgHarnessSql so the
+      // optimistic-CAS predicate treats SQL NULLs as comparable, matching the LibSQL
+      // sibling's `IS ?` semantics.
+      const updateResult = await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+              SET ${values.names
+                .filter(name => name !== 'id')
+                .map(name => `${name} = ?`)
+                .join(', ')}
+              WHERE id = ? AND ${expectedNames.map(name => `${name} IS ?`).join(' AND ')}`,
+        args: [...values.values.slice(1), next.id, ...currentValues.values.slice(1)],
+      });
+      if (updateResult.rowsAffected === 0) {
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          current.id,
+          current.status,
+          opts.status,
+          'binding changed before status update could be applied',
+        );
+      }
+      await tx.commit();
+      return next;
+    } catch (error) {
+      if (!tx.closed) await tx.rollback();
+      if (isUniqueConstraintError(error)) {
+        return this.#resolveProviderCallbackBindingStatusUniqueConflict(opts);
+      }
+      throw error;
+    }
+  }
+
+  async #loadProviderCallbackBindingByIdWithClient(
+    client: PgHarnessClient,
+    id: string,
+  ): Promise<HarnessProviderCallbackBinding | null> {
+    const result = await client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+            WHERE id = ?
+            LIMIT 1`,
+      args: [id],
+    });
+    const row = result.rows[0];
+    return row ? rowToProviderCallbackBinding(row as Record<string, unknown>) : null;
+  }
+
+  async #loadActiveProviderCallbackBindingBySelectorWithClient(
+    client: PgHarnessClient,
+    opts: {
+      providerId: string;
+      selectorKind: ProviderCallbackSelectorKind;
+      selectorValue: string;
+    },
+  ): Promise<HarnessProviderCallbackBinding | null> {
+    const result = await client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+            WHERE provider_id = ? AND selector_kind = ? AND selector_value = ? AND status = 'active'
+            LIMIT 1`,
+      args: [opts.providerId, opts.selectorKind, opts.selectorValue],
+    });
+    const row = result.rows[0];
+    return row ? rowToProviderCallbackBinding(row as Record<string, unknown>) : null;
+  }
+
+  async #resolveProviderCallbackBindingUniqueConflict(
+    incoming: HarnessProviderCallbackBinding,
+    opts?: { replaceBindingId?: string },
+  ): Promise<ResolveProviderCallbackBindingResult> {
+    const [active, existingById] = await Promise.all([
+      this.#loadActiveProviderCallbackBindingBySelectorWithClient(this.#client, {
+        providerId: incoming.providerId,
+        selectorKind: incoming.selectorKind,
+        selectorValue: incoming.selectorValue,
+      }),
+      this.#loadProviderCallbackBindingByIdWithClient(this.#client, incoming.id),
+    ]);
+
+    if (existingById) {
+      if (!providerCallbackBindingsEqual(existingById, incoming)) {
+        throw new HarnessStorageProviderCallbackBindingTransitionError(
+          incoming.id,
+          existingById.status,
+          incoming.status,
+          'id is already owned by another provider callback binding',
+        );
+      }
+      if (opts?.replaceBindingId !== undefined) {
+        const previous = await this.#loadProviderCallbackBindingByIdWithClient(this.#client, opts.replaceBindingId);
+        if (previous?.status !== 'replaced' || previous.replacedByBindingId !== existingById.id) {
+          throw new HarnessStorageProviderCallbackBindingTransitionError(
+            incoming.id,
+            existingById.status,
+            incoming.status,
+            'id is already owned and replacement target has not transitioned',
+          );
+        }
+        return {
+          binding: existingById,
+          duplicate: true,
+          conflict: false,
+          replacedBindingId: previous.id,
+        };
+      }
+      return { binding: existingById, duplicate: true, conflict: false };
+    }
+
+    if (active) {
+      return {
+        binding: active,
+        duplicate: true,
+        conflict: !sameProviderCallbackBindingTarget(active, incoming),
+      };
+    }
+
+    throw new HarnessStorageProviderCallbackBindingTransitionError(
+      incoming.id,
+      undefined,
+      incoming.status,
+      'unique constraint conflict could not be resolved after provider callback binding insert',
+    );
+  }
+
+  async #resolveProviderCallbackBindingStatusUniqueConflict(opts: {
+    bindingId: string;
+    status: Extract<HarnessProviderCallbackBinding['status'], 'active' | 'disabled' | 'undeliverable'>;
+    updatedAt?: number;
+    lastError?: HarnessProviderCallbackBinding['lastError'];
+  }): Promise<HarnessProviderCallbackBinding> {
+    const current = await this.#loadProviderCallbackBindingByIdWithClient(this.#client, opts.bindingId);
+    if (!current) {
+      throw new HarnessStorageProviderCallbackBindingTransitionError(
+        opts.bindingId,
+        undefined,
+        opts.status,
+        'binding was not found',
+      );
+    }
+    const active = await this.#loadActiveProviderCallbackBindingBySelectorWithClient(this.#client, {
+      providerId: current.providerId,
+      selectorKind: current.selectorKind,
+      selectorValue: current.selectorValue,
+    });
+    if (opts.status === 'active' && active && active.id !== current.id) {
+      throw new HarnessStorageProviderCallbackBindingTransitionError(
+        current.id,
+        current.status,
+        opts.status,
+        'another active binding owns this selector',
+      );
+    }
+    if (
+      current.status === opts.status &&
+      (opts.lastError === undefined || stableJsonString(current.lastError) === stableJsonString(opts.lastError))
+    ) {
+      return current;
+    }
+    throw new HarnessStorageProviderCallbackBindingTransitionError(
+      current.id,
+      current.status,
+      opts.status,
+      'unique constraint conflict could not be resolved after provider callback binding status update',
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Channel bindings (§5.1h / §14.1)
+  // -------------------------------------------------------------------------
+
+  async saveChannelBinding(record: ChannelBinding): Promise<void> {
+    await this.#ensureChannelBindingsTable();
+    const namespaced: ChannelBinding = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
+    // §5.2h: active rows are unique per conversation tuple. Updating the same
+    // binding id, or writing a non-active row, is always allowed; only a write
+    // that would create a SECOND active binding for the tuple is rejected. The
+    // partial-unique index enforces this — but it would also fire for the no-op
+    // self-update of an already-active row, so the upsert keys on id (primary key)
+    // and the unique-conflict path below distinguishes "another id holds it".
+    try {
+      await this.#client.execute(channelBindingUpsertStatement(namespaced));
+    } catch (err) {
+      if (!isUniqueConstraintError(err)) throw err;
+      const heldBy = await this.#loadActiveChannelBindingIdByTuple(namespaced);
+      // The conflict can only come from the active-tuple index; if the holder is
+      // (improbably) this same id, the row was concurrently rewritten — surface
+      // the holder we observed (falling back to this id) rather than masking it.
+      throw new HarnessStorageChannelBindingConflictError(
+        namespaced.channelId,
+        namespaced.externalThreadId,
+        heldBy ?? namespaced.id,
+      );
+    }
+  }
+
+  async touchChannelBindingInbound(opts: {
+    harnessName?: string;
+    bindingId: string;
+    at: number;
+  }): Promise<ChannelBinding | null> {
+    await this.#ensureChannelBindingsTable();
+    const namespace = this.#resolveHarnessName(opts.harnessName);
+    // §14.1 forward-only: advance the activity markers monotonically with GREATEST so
+    // a delayed or concurrent older same-binding ingress can never regress a newer
+    // marker. Returns the merged row, or null when the binding no longer exists.
+    const result = await this.#client.execute({
+      sql: `UPDATE ${TABLE_HARNESS_CHANNEL_BINDINGS}
+            SET last_inbound_at = GREATEST(COALESCE(last_inbound_at, 0), ?),
+                updated_at = GREATEST(updated_at, ?)
+            WHERE harness_name = ? AND id = ?`,
+      args: [opts.at, opts.at, namespace, opts.bindingId],
+    });
+    if (result.rowsAffected === 0) return null;
+    return this.#loadChannelBindingByIdInNamespace(opts.bindingId, namespace);
+  }
+
+  async loadChannelBinding(opts: { bindingId: string }): Promise<ChannelBinding | null> {
+    await this.#ensureChannelBindingsTable();
+    return this.#loadChannelBindingByIdInNamespace(opts.bindingId, this.#resolveHarnessName());
+  }
+
+  async loadChannelBindingByExternal(opts: {
+    harnessName: string;
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  }): Promise<ChannelBinding | null> {
+    await this.#ensureChannelBindingsTable();
+    return this.#loadActiveChannelBindingByTuple(this.#client, {
+      harnessName: this.#resolveHarnessName(opts.harnessName),
+      channelId: opts.channelId,
+      platform: opts.platform,
+      externalTenantId: opts.externalTenantId,
+      externalChannelId: opts.externalChannelId,
+      externalThreadId: opts.externalThreadId,
+    });
+  }
+
+  async resolveChannelBinding(opts: {
+    candidate: ChannelBinding;
+    replaceBindingId?: string;
+  }): Promise<ResolveChannelBindingResult> {
+    await this.#ensureChannelBindingsTable();
+    const ns = this.#resolveHarnessName(opts.candidate.harnessName);
+    const candidate: ChannelBinding = { ...opts.candidate, harnessName: ns };
+    const tuple = {
+      harnessName: ns,
+      channelId: candidate.channelId,
+      platform: candidate.platform,
+      externalTenantId: candidate.externalTenantId,
+      externalChannelId: candidate.externalChannelId,
+      externalThreadId: candidate.externalThreadId,
+    };
+    const tx = await this.#client.transaction('write');
+    try {
+      // The tuple's current active binding is authoritative for the §14.1
+      // one-active-per-tuple invariant (regardless of the caller-supplied
+      // replaceBindingId, which is only a hint about the prior generation).
+      const existingActive = await this.#loadActiveChannelBindingByTuple(tx, tuple);
+      // Generation is storage-managed and monotonic per tuple: a new binding never
+      // regresses below the max generation any binding for this tuple has ever held.
+      const maxTupleGeneration = await this.#maxChannelBindingGenerationForTuple(tx, tuple);
+
+      if (opts.replaceBindingId !== undefined) {
+        // §14.1 replacement: fence the tuple's existing active binding(s) to
+        // `replaced` (never an unrelated conversation named by a stale id) and
+        // commit the candidate with an incremented generation. Exactly one active
+        // binding remains for the tuple.
+        const fenceIds = new Set<string>([opts.replaceBindingId, ...(existingActive ? [existingActive.id] : [])]);
+        for (const id of fenceIds) {
+          const prior = await this.#loadChannelBindingByIdWithClient(tx, id, ns);
+          if (prior !== null && prior.status === 'active' && channelBindingTupleMatches(prior, tuple)) {
+            await tx.execute({
+              sql: `UPDATE ${TABLE_HARNESS_CHANNEL_BINDINGS}
+                    SET status = 'replaced', replaced_by_binding_id = ?, updated_at = ?
+                    WHERE harness_name = ? AND id = ? AND status = 'active'`,
+              args: [candidate.id, candidate.updatedAt, ns, prior.id],
+            });
+          }
+        }
+        const committed: ChannelBinding = {
+          ...candidate,
+          harnessName: ns,
+          status: 'active',
+          generation: maxTupleGeneration + 1,
+        };
+        await tx.execute(channelBindingUpsertStatement(committed));
+        await tx.commit();
+        return {
+          binding: committed,
+          created: true,
+          ...(existingActive !== null ? { replacedBindingId: existingActive.id } : {}),
+        };
+      }
+
+      // No replacement: an existing active binding for the tuple wins (idempotent
+      // resolution); otherwise commit the candidate as the new active binding.
+      if (existingActive !== null) {
+        await tx.commit();
+        return { binding: existingActive, created: false };
+      }
+      const committed: ChannelBinding = {
+        ...candidate,
+        harnessName: ns,
+        status: 'active',
+        generation: maxTupleGeneration + 1,
+      };
+      await tx.execute(channelBindingUpsertStatement(committed));
+      await tx.commit();
+      return { binding: committed, created: true };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
+  async listChannelBindingsForSession(opts: { sessionId: string }): Promise<ChannelBinding[]> {
+    await this.#ensureChannelBindingsTable();
+    const ns = this.#resolveHarnessName();
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+            WHERE harness_name = ? AND session_id = ?
+            ORDER BY id ASC`,
+      args: [ns, opts.sessionId],
+    });
+    return result.rows.map(row => rowToChannelBinding(row as Record<string, unknown>));
+  }
+
+  async listActiveChannelBindingsForScope(opts: {
+    harnessName: string;
+    channelId?: string;
+    limit: number;
+    cursor?: string;
+  }): Promise<ListActiveChannelBindingsResult> {
+    await this.#ensureChannelBindingsTable();
+    const ns = this.#resolveHarnessName(opts.harnessName);
+    const filters = ['harness_name = ?', `status = 'active'`];
+    const args: (string | number)[] = [ns];
+    if (opts.channelId !== undefined) {
+      filters.push('channel_id = ?');
+      args.push(opts.channelId);
+    }
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+            WHERE ${filters.join(' AND ')}`,
+      args,
+    });
+    const all = result.rows.map(row => rowToChannelBinding(row as Record<string, unknown>));
+    // §14.8 binding ordering: (lastOutboundAt DESC, bindingId DESC), using
+    // lastInboundAt when no outbound time exists. Sorted in memory so the cursor
+    // semantics match the in-memory adapter exactly (stable end-of-set on a stale
+    // cursor rather than restarting page 1).
+    const activityAt = (b: ChannelBinding): number => b.lastOutboundAt ?? b.lastInboundAt ?? 0;
+    all.sort((a, b) => activityAt(b) - activityAt(a) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    let start = 0;
+    if (opts.cursor !== undefined) {
+      const idx = all.findIndex(b => b.id === opts.cursor);
+      start = idx === -1 ? all.length : idx + 1;
+    }
+    const page = all.slice(start, start + opts.limit);
+    const hasMore = start + opts.limit < all.length;
+    const nextCursor = hasMore ? page[page.length - 1]?.id : undefined;
+    return { bindings: page, ...(nextCursor !== undefined ? { nextCursor } : {}) };
+  }
+
+  async deleteChannelBinding(opts: { bindingId: string }): Promise<void> {
+    await this.#ensureChannelBindingsTable();
+    await this.#client.execute({
+      sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_BINDINGS} WHERE harness_name = ? AND id = ?`,
+      args: [this.#resolveHarnessName(), opts.bindingId],
+    });
+  }
+
+  async #loadChannelBindingByIdInNamespace(bindingId: string, namespace: string): Promise<ChannelBinding | null> {
+    return this.#loadChannelBindingByIdWithClient(this.#client, bindingId, namespace);
+  }
+
+  async #loadChannelBindingByIdWithClient(
+    client: PgHarnessClient,
+    bindingId: string,
+    namespace: string,
+  ): Promise<ChannelBinding | null> {
+    const result = await client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_CHANNEL_BINDINGS} WHERE harness_name = ? AND id = ? LIMIT 1`,
+      args: [namespace, bindingId],
+    });
+    const row = result.rows[0];
+    return row ? rowToChannelBinding(row as Record<string, unknown>) : null;
+  }
+
+  async #loadActiveChannelBindingByTuple(
+    client: PgHarnessClient,
+    tuple: {
+      harnessName: string;
+      channelId: string;
+      platform: string;
+      externalTenantId?: string;
+      externalChannelId?: string;
+      externalThreadId: string;
+    },
+  ): Promise<ChannelBinding | null> {
+    const result = await client.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+            WHERE harness_name = ? AND status = 'active'
+              AND channel_id = ? AND platform = ?
+              AND external_tenant_id = ? AND external_channel_id = ? AND external_thread_id = ?
+            LIMIT 1`,
+      args: [
+        tuple.harnessName,
+        tuple.channelId,
+        tuple.platform,
+        normalizeChannelBindingExternalId(tuple.externalTenantId),
+        normalizeChannelBindingExternalId(tuple.externalChannelId),
+        tuple.externalThreadId,
+      ],
+    });
+    const row = result.rows[0];
+    return row ? rowToChannelBinding(row as Record<string, unknown>) : null;
+  }
+
+  async #loadActiveChannelBindingIdByTuple(binding: ChannelBinding): Promise<string | undefined> {
+    const active = await this.#loadActiveChannelBindingByTuple(this.#client, binding);
+    return active?.id;
+  }
+
+  async #maxChannelBindingGenerationForTuple(
+    client: PgHarnessClient,
+    tuple: {
+      harnessName: string;
+      channelId: string;
+      platform: string;
+      externalTenantId?: string;
+      externalChannelId?: string;
+      externalThreadId: string;
+    },
+  ): Promise<number> {
+    const result = await client.execute({
+      sql: `SELECT MAX(generation) AS max_generation FROM ${TABLE_HARNESS_CHANNEL_BINDINGS}
+            WHERE harness_name = ? AND channel_id = ? AND platform = ?
+              AND external_tenant_id = ? AND external_channel_id = ? AND external_thread_id = ?`,
+      args: [
+        tuple.harnessName,
+        tuple.channelId,
+        tuple.platform,
+        normalizeChannelBindingExternalId(tuple.externalTenantId),
+        normalizeChannelBindingExternalId(tuple.externalChannelId),
+        tuple.externalThreadId,
+      ],
+    });
+    const value = result.rows[0]?.max_generation;
+    return value == null ? 0 : Number(value);
   }
 
   // -------------------------------------------------------------------------
@@ -3808,6 +5152,51 @@ export class HarnessPG extends HarnessStorage {
     return this.#workspaceActionsReady;
   }
 
+  async #ensurePlanTasksTable(): Promise<void> {
+    if (this.#planTasksReady !== undefined) {
+      return this.#planTasksReady;
+    }
+    this.#planTasksReady = (async () => {
+      const planTasksConfig = TABLE_CONFIGS[TABLE_HARNESS_PLAN_TASKS];
+      await this.#db.createTable({
+        tableName: TABLE_HARNESS_PLAN_TASKS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+        compositePrimaryKey: planTasksConfig?.compositePrimaryKey,
+      });
+      // Migrate columns added after the table's first creation onto existing
+      // deployments (createTable is CREATE TABLE IF NOT EXISTS and never alters).
+      await this.#db.alterTable({
+        tableName: TABLE_HARNESS_PLAN_TASKS,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+        ifNotExists: ['delegated_subagent_type_id', 'started_at'],
+      });
+      await this.#createDefaultIndexes(['idx_harness_plan_tasks_order']);
+      await this.#createDefaultIndexes(['idx_harness_plan_tasks_idempotency']);
+    })().catch(error => {
+      this.#planTasksReady = undefined;
+      throw error;
+    });
+    return this.#planTasksReady;
+  }
+
+  async #ensureRunSummariesTable(): Promise<void> {
+    if (this.#runSummariesReady !== undefined) {
+      return this.#runSummariesReady;
+    }
+    this.#runSummariesReady = (async () => {
+      const config = TABLE_CONFIGS[TABLE_HARNESS_RUN_SUMMARIES];
+      await this.#db.createTable({
+        tableName: TABLE_HARNESS_RUN_SUMMARIES,
+        schema: TABLE_SCHEMAS[TABLE_HARNESS_RUN_SUMMARIES],
+        compositePrimaryKey: config?.compositePrimaryKey,
+      });
+    })().catch(error => {
+      this.#runSummariesReady = undefined;
+      throw error;
+    });
+    return this.#runSummariesReady;
+  }
+
   async #ensureThreadDeleteFencesTable(): Promise<void> {
     const threadDeleteFencesConfig = TABLE_CONFIGS[TABLE_HARNESS_THREAD_DELETE_FENCES];
     await this.#db.createTable({
@@ -3820,6 +5209,64 @@ export class HarnessPG extends HarnessStorage {
       schema: TABLE_SCHEMAS[TABLE_HARNESS_THREAD_DELETE_FENCES],
       ifNotExists: ['lease_id'],
     });
+  }
+
+  async #ensureChannelBindingsTable(): Promise<void> {
+    const bindingsConfig = TABLE_CONFIGS[TABLE_HARNESS_CHANNEL_BINDINGS];
+    await this.#db.createTable({
+      tableName: TABLE_HARNESS_CHANNEL_BINDINGS,
+      schema: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_BINDINGS],
+      compositePrimaryKey: bindingsConfig?.compositePrimaryKey,
+    });
+    await this.#ensureChannelBindingIndexes();
+  }
+
+  async #ensureChannelBindingIndexes(): Promise<void> {
+    if (this.#channelBindingIndexesReady !== undefined) {
+      return this.#channelBindingIndexesReady;
+    }
+    this.#channelBindingIndexesReady = this.#createChannelBindingIndexes().catch(error => {
+      this.#channelBindingIndexesReady = undefined;
+      throw error;
+    });
+    return this.#channelBindingIndexesReady;
+  }
+
+  async #createChannelBindingIndexes(): Promise<void> {
+    await this.#createDefaultIndexes([
+      'idx_harness_channel_bindings_active_tuple',
+      'idx_harness_channel_bindings_tuple',
+      'idx_harness_channel_bindings_session',
+      'idx_harness_channel_bindings_scope',
+    ]);
+  }
+
+  async #ensureProviderCallbackBindingsTable(): Promise<void> {
+    const config = TABLE_CONFIGS[TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS];
+    await this.#db.createTable({
+      tableName: TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
+      schema: TABLE_SCHEMAS[TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS],
+      compositePrimaryKey: config?.compositePrimaryKey,
+    });
+    await this.#ensureProviderCallbackBindingIndexes();
+  }
+
+  async #ensureProviderCallbackBindingIndexes(): Promise<void> {
+    if (this.#providerCallbackBindingIndexesReady !== undefined) {
+      return this.#providerCallbackBindingIndexesReady;
+    }
+    this.#providerCallbackBindingIndexesReady = this.#createProviderCallbackBindingIndexes().catch(error => {
+      this.#providerCallbackBindingIndexesReady = undefined;
+      throw error;
+    });
+    return this.#providerCallbackBindingIndexesReady;
+  }
+
+  async #createProviderCallbackBindingIndexes(): Promise<void> {
+    await this.#createDefaultIndexes([
+      'idx_harness_provider_callback_active_selector',
+      'idx_harness_provider_callback_selector_status',
+    ]);
   }
 
   async #ensureChannelInboxTable(): Promise<void> {
@@ -4039,6 +5486,8 @@ const SESSION_COLUMN_NAMES = [
   'parent_session_id',
   'origin',
   'subagent_depth',
+  'subagent_type_id',
+  'subagent_tool_allowlist_scoped',
   'owns_thread',
   'mode_id',
   'model_id',
@@ -4073,6 +5522,8 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     record.parentSessionId ?? null,
     record.origin,
     record.subagentDepth ?? null,
+    record.subagentTypeId ?? null,
+    record.subagentToolAllowlistScoped ?? null,
     record.ownsThread,
     record.modeId,
     record.modelId,
@@ -4098,6 +5549,286 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     record.leaseExpiresAt ?? null,
   ];
   return { names: [...SESSION_COLUMN_NAMES], values };
+}
+
+const CHANNEL_BINDING_COLUMN_NAMES = [
+  'id',
+  'harness_name',
+  'channel_id',
+  'provider_id',
+  'status',
+  'platform',
+  'external_tenant_id',
+  'external_channel_id',
+  'external_thread_id',
+  'resource_id',
+  'thread_id',
+  'session_id',
+  'mode',
+  'generation',
+  'created_at',
+  'updated_at',
+  'last_inbound_at',
+  'last_outbound_at',
+  'closed_at',
+  'closed_reason',
+  'replaced_by_binding_id',
+  'undeliverable_reason',
+] as const;
+
+// §14.1: a missing optional external ID is persisted as this non-null sentinel so
+// the partial-unique ACTIVE-tuple index never depends on SQL NULL uniqueness
+// semantics. The U+001F (Unit Separator) prefix is a C0 control character no
+// provider emits in a real external id (including a literal single space), so the
+// by-external lookup and active-tuple uniqueness stay correct. NUL (U+0000) is
+// deliberately avoided so the value round-trips through both PG and the LibSQL
+// driver (which rejects NUL bytes in string args). Mirrors the in-memory adapters
+// shared CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (the single source of truth in
+// @mastra/core) and the LibSQL sibling — keep the value in exact sync so the
+// persisted encoding matches the harness channel id-derivation.
+const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
+
+function normalizeChannelBindingExternalId(value: string | undefined): string {
+  return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
+}
+
+function denormalizeChannelBindingExternalId(value: string): string | undefined {
+  return value === CHANNEL_BINDING_EXTERNAL_ID_SENTINEL ? undefined : value;
+}
+
+/** True when a binding addresses the same platform-conversation tuple (§14.1). */
+function channelBindingTupleMatches(
+  a: ChannelBinding,
+  b: {
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  },
+): boolean {
+  return (
+    a.channelId === b.channelId &&
+    a.platform === b.platform &&
+    normalizeChannelBindingExternalId(a.externalTenantId) === normalizeChannelBindingExternalId(b.externalTenantId) &&
+    normalizeChannelBindingExternalId(a.externalChannelId) === normalizeChannelBindingExternalId(b.externalChannelId) &&
+    a.externalThreadId === b.externalThreadId
+  );
+}
+
+function channelBindingColumnValues(record: ChannelBinding): { names: string[]; values: any[] } {
+  return {
+    names: [...CHANNEL_BINDING_COLUMN_NAMES],
+    values: [
+      record.id,
+      record.harnessName,
+      record.channelId,
+      record.providerId,
+      record.status,
+      record.platform,
+      normalizeChannelBindingExternalId(record.externalTenantId),
+      normalizeChannelBindingExternalId(record.externalChannelId),
+      record.externalThreadId,
+      record.resourceId,
+      record.threadId,
+      record.sessionId,
+      record.mode,
+      record.generation,
+      record.createdAt,
+      record.updatedAt,
+      record.lastInboundAt ?? null,
+      record.lastOutboundAt ?? null,
+      record.closedAt ?? null,
+      record.closedReason ?? null,
+      record.replacedByBindingId ?? null,
+      record.undeliverableReason ?? null,
+    ],
+  };
+}
+
+function channelBindingUpsertStatement(record: ChannelBinding): { sql: string; args: any[] } {
+  const cols = channelBindingColumnValues(record);
+  // Keyed on the `id` primary key: re-saving the same binding id is an in-place
+  // update (the active-tuple uniqueness invariant is enforced by the partial-unique
+  // index, which fires only when a DIFFERENT id would hold a second active row).
+  const assignments = cols.names.filter(name => name !== 'id').map(name => `${name} = excluded.${name}`);
+  return {
+    sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_BINDINGS}
+          (${cols.names.join(', ')})
+          VALUES (${cols.names.map(() => '?').join(', ')})
+          ON CONFLICT (id) DO UPDATE SET ${assignments.join(', ')}`,
+    args: cols.values,
+  };
+}
+
+function rowToChannelBinding(row: Record<string, unknown>): ChannelBinding {
+  return {
+    id: String(row.id),
+    harnessName: String(row.harness_name),
+    channelId: String(row.channel_id),
+    providerId: String(row.provider_id),
+    status: String(row.status) as ChannelBinding['status'],
+    platform: String(row.platform),
+    externalTenantId: denormalizeChannelBindingExternalId(String(row.external_tenant_id)),
+    externalChannelId: denormalizeChannelBindingExternalId(String(row.external_channel_id)),
+    externalThreadId: String(row.external_thread_id),
+    resourceId: String(row.resource_id),
+    threadId: String(row.thread_id),
+    sessionId: String(row.session_id),
+    mode: String(row.mode) as ChannelBinding['mode'],
+    generation: Number(row.generation),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    lastInboundAt: row.last_inbound_at == null ? undefined : Number(row.last_inbound_at),
+    lastOutboundAt: row.last_outbound_at == null ? undefined : Number(row.last_outbound_at),
+    closedAt: row.closed_at == null ? undefined : Number(row.closed_at),
+    closedReason: row.closed_reason == null ? undefined : (String(row.closed_reason) as ChannelBinding['closedReason']),
+    replacedByBindingId: row.replaced_by_binding_id == null ? undefined : String(row.replaced_by_binding_id),
+    undeliverableReason: row.undeliverable_reason == null ? undefined : String(row.undeliverable_reason),
+  };
+}
+
+const PROVIDER_CALLBACK_BINDING_COLUMN_NAMES = [
+  'id',
+  'provider_id',
+  'selector_kind',
+  'selector_value',
+  'harness_name',
+  'channel_id',
+  'origin',
+  'status',
+  'created_at',
+  'updated_at',
+  'replaced_at',
+  'replaced_by_binding_id',
+  'last_error',
+] as const;
+
+function providerCallbackBindingColumnValues(record: HarnessProviderCallbackBinding): {
+  names: string[];
+  values: any[];
+} {
+  return {
+    names: [...PROVIDER_CALLBACK_BINDING_COLUMN_NAMES],
+    values: [
+      record.id,
+      record.providerId,
+      record.selectorKind,
+      record.selectorValue,
+      record.harnessName,
+      record.channelId,
+      JSON.stringify(record.origin),
+      record.status,
+      record.createdAt,
+      record.updatedAt,
+      record.replacedAt ?? null,
+      record.replacedByBindingId ?? null,
+      record.lastError ? JSON.stringify(record.lastError) : null,
+    ],
+  };
+}
+
+function providerCallbackBindingInsertStatement(record: HarnessProviderCallbackBinding): { sql: string; args: any[] } {
+  const cols = providerCallbackBindingColumnValues(record);
+  return {
+    sql: `INSERT INTO ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+          (${cols.names.join(', ')})
+          VALUES (${cols.names.map(() => '?').join(', ')})`,
+    args: cols.values,
+  };
+}
+
+function rowToProviderCallbackBinding(row: Record<string, unknown>): HarnessProviderCallbackBinding {
+  return {
+    id: String(row.id),
+    providerId: String(row.provider_id),
+    selectorKind: String(row.selector_kind) as ProviderCallbackSelectorKind,
+    selectorValue: String(row.selector_value),
+    harnessName: String(row.harness_name),
+    channelId: String(row.channel_id),
+    origin: parseJson(row.origin) as JsonValue,
+    status: String(row.status) as HarnessProviderCallbackBinding['status'],
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    replacedAt: row.replaced_at == null ? undefined : Number(row.replaced_at),
+    replacedByBindingId: row.replaced_by_binding_id == null ? undefined : String(row.replaced_by_binding_id),
+    lastError:
+      row.last_error == null ? undefined : (parseJson(row.last_error) as HarnessProviderCallbackBinding['lastError']),
+  };
+}
+
+function providerCallbackBindingsEqual(a: HarnessProviderCallbackBinding, b: HarnessProviderCallbackBinding): boolean {
+  return (
+    stableJsonString(providerCallbackBindingComparableValues(a)) ===
+    stableJsonString(providerCallbackBindingComparableValues(b))
+  );
+}
+
+function sameProviderCallbackBindingTarget(
+  a: HarnessProviderCallbackBinding,
+  b: HarnessProviderCallbackBinding,
+): boolean {
+  return (
+    a.harnessName === b.harnessName &&
+    a.channelId === b.channelId &&
+    stableJsonString(a.origin) === stableJsonString(b.origin)
+  );
+}
+
+function providerCallbackBindingComparableValues(record: HarnessProviderCallbackBinding): unknown[] {
+  return [
+    record.id,
+    record.providerId,
+    record.selectorKind,
+    record.selectorValue,
+    record.harnessName,
+    record.channelId,
+    stableJsonString(record.origin),
+    record.status,
+    record.createdAt,
+    record.updatedAt,
+    record.replacedAt,
+    record.replacedByBindingId,
+    record.lastError ? stableJsonString(record.lastError) : undefined,
+  ];
+}
+
+function assertValidProviderCallbackBindingState(record: HarnessProviderCallbackBinding): void {
+  if (!['installation', 'route-key', 'external-tenant'].includes(record.selectorKind)) {
+    throw new HarnessStorageProviderCallbackBindingTransitionError(
+      record.id,
+      undefined,
+      record.status,
+      `invalid selector kind "${record.selectorKind}"`,
+    );
+  }
+  if (!['active', 'disabled', 'undeliverable', 'replaced'].includes(record.status)) {
+    throw new HarnessStorageProviderCallbackBindingTransitionError(
+      record.id,
+      undefined,
+      record.status,
+      `invalid status "${record.status}"`,
+    );
+  }
+  if (record.status === 'replaced') {
+    if (record.replacedAt === undefined || record.replacedByBindingId === undefined) {
+      throw new HarnessStorageProviderCallbackBindingTransitionError(
+        record.id,
+        undefined,
+        record.status,
+        'replaced bindings require replacedAt and replacedByBindingId',
+      );
+    }
+    return;
+  }
+  if (record.replacedAt !== undefined || record.replacedByBindingId !== undefined) {
+    throw new HarnessStorageProviderCallbackBindingTransitionError(
+      record.id,
+      undefined,
+      record.status,
+      'non-replaced bindings cannot carry replacement metadata',
+    );
+  }
 }
 
 const CHANNEL_INBOX_COLUMN_NAMES = [
@@ -4135,6 +5866,7 @@ const CHANNEL_INBOX_COLUMN_NAMES = [
   'request_context',
   'content',
   'attachments',
+  'raw_files',
   'last_error',
 ] as const;
 
@@ -4174,6 +5906,7 @@ function channelInboxColumnValues(record: ChannelInboxItem): { names: string[]; 
     JSON.stringify(record.requestContext),
     record.content,
     JSON.stringify(record.attachments),
+    record.rawFiles ? JSON.stringify(record.rawFiles) : null,
     record.lastError ? JSON.stringify(record.lastError) : null,
   ];
   return { names: [...CHANNEL_INBOX_COLUMN_NAMES], values };
@@ -4215,6 +5948,7 @@ function rowToChannelInboxItem(row: Record<string, unknown>): ChannelInboxItem {
     requestContext: parseJson(row.request_context) ?? {},
     content: String(row.content),
     attachments: parseJson(row.attachments) ?? [],
+    rawFiles: parseJson(row.raw_files) ?? undefined,
     lastError: parseJson(row.last_error) ?? undefined,
   };
 }
@@ -4652,6 +6386,9 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     parentSessionId: row.parent_session_id != null ? String(row.parent_session_id) : undefined,
     origin: String(row.origin) as SessionRecord['origin'],
     subagentDepth: row.subagent_depth != null ? Number(row.subagent_depth) : undefined,
+    subagentTypeId: row.subagent_type_id != null ? String(row.subagent_type_id) : undefined,
+    subagentToolAllowlistScoped:
+      row.subagent_tool_allowlist_scoped == null ? undefined : Boolean(row.subagent_tool_allowlist_scoped),
     ownsThread: Number(row.owns_thread) === 1,
     modeId: String(row.mode_id),
     modelId: String(row.model_id),
@@ -4808,7 +6545,9 @@ function rowToAttachmentReference(row: Record<string, unknown>): AttachmentRefer
 
 function rowToTombstone(row: Record<string, unknown>): OperationAdmissionTombstone {
   return {
-    kind: String(row.kind) as OperationAdmissionTombstone['kind'],
+    // §5.1d: normalize the legacy pre-spec `'message'` operation-kind token to
+    // `'signal'` on read, per the HarnessOperationKind contract for durable backends.
+    kind: (String(row.kind) === 'message' ? 'signal' : String(row.kind)) as OperationAdmissionTombstone['kind'],
     harnessName: String(row.harness_name),
     sessionId: String(row.session_id),
     resourceId: String(row.resource_id),
@@ -4874,6 +6613,171 @@ function assertWorkspaceActionKindMatches(record: WorkspaceActionJournalEntry): 
       throw new Error(`Workspace action journal kind mismatch: ${String(actionKind)} != ${record.actionKind}`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-task helpers (§5.1k)
+// ---------------------------------------------------------------------------
+
+function rowToPlanTask(row: Record<string, unknown>): HarnessPlanTask {
+  const task: HarnessPlanTask = {
+    taskId: String(row.task_id),
+    harnessName: String(row.harness_name),
+    sessionId: String(row.session_id),
+    resourceId: String(row.resource_id),
+    threadId: String(row.thread_id),
+    order: Number(row.order),
+    status: String(row.status) as HarnessPlanTask['status'],
+    statusSource: String(row.status_source) as HarnessPlanTask['statusSource'],
+    content: String(row.content),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    version: Number(row.version),
+  };
+  if (row.idempotency_key != null) task.idempotencyKey = String(row.idempotency_key);
+  if (row.parent_task_id != null) task.parentTaskId = String(row.parent_task_id);
+  if (row.active_form != null) task.activeForm = String(row.active_form);
+  if (row.priority != null) task.priority = Number(row.priority);
+  if (row.blocked_by != null) task.blockedBy = (parseJson(row.blocked_by) ?? []) as string[];
+  if (row.origin != null) task.origin = String(row.origin);
+  if (row.delegated_subagent_session_id != null) {
+    task.delegatedSubagentSessionId = String(row.delegated_subagent_session_id);
+  }
+  if (row.delegated_subagent_type_id != null) {
+    task.delegatedSubagentTypeId = String(row.delegated_subagent_type_id);
+  }
+  if (row.metadata != null) task.metadata = parseJson(row.metadata) as JsonValue;
+  if (row.started_at != null) task.startedAt = Number(row.started_at);
+  if (row.completed_at != null) task.completedAt = Number(row.completed_at);
+  return task;
+}
+
+function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values: QueryValues } {
+  const names = [
+    'harness_name',
+    'session_id',
+    'task_id',
+    'idempotency_key',
+    'resource_id',
+    'thread_id',
+    'parent_task_id',
+    '"order"',
+    'status',
+    'status_source',
+    'content',
+    'active_form',
+    'priority',
+    'blocked_by',
+    'origin',
+    'delegated_subagent_session_id',
+    'delegated_subagent_type_id',
+    'metadata',
+    'created_at',
+    'updated_at',
+    'started_at',
+    'completed_at',
+    'version',
+  ];
+  const values: QueryValues = [
+    task.harnessName,
+    task.sessionId,
+    task.taskId,
+    task.idempotencyKey ?? null,
+    task.resourceId,
+    task.threadId,
+    task.parentTaskId ?? null,
+    task.order,
+    task.status,
+    task.statusSource,
+    task.content,
+    task.activeForm ?? null,
+    task.priority ?? null,
+    task.blockedBy === undefined ? null : JSON.stringify(task.blockedBy),
+    task.origin ?? null,
+    task.delegatedSubagentSessionId ?? null,
+    task.delegatedSubagentTypeId ?? null,
+    task.metadata === undefined ? null : JSON.stringify(task.metadata),
+    task.createdAt,
+    task.updatedAt,
+    task.startedAt ?? null,
+    task.completedAt ?? null,
+    task.version,
+  ];
+  return { names, values };
+}
+
+function rowToRunSummary(row: Record<string, unknown>): HarnessRunSummary {
+  const summary: HarnessRunSummary = {
+    harnessName: String(row.harness_name),
+    runId: String(row.run_id),
+    sessionId: String(row.session_id),
+    resourceId: String(row.resource_id),
+    threadId: String(row.thread_id),
+    agentId: String(row.agent_id),
+    modeId: String(row.mode_id),
+    modelId: String(row.model_id),
+    status: String(row.status) as HarnessRunSummary['status'],
+    finishReason: String(row.finish_reason),
+    reconstructed: row.reconstructed === true || row.reconstructed === 1 || row.reconstructed === '1',
+    completedAt: Number(row.completed_at),
+    usage: (parseJson(row.usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }) as HarnessRunSummary['usage'],
+    createdAt: Number(row.created_at),
+  };
+  if (row.parent_session_id != null) summary.parentSessionId = String(row.parent_session_id);
+  if (row.trace_id != null) summary.traceId = String(row.trace_id);
+  if (row.operation_kind != null) summary.operationKind = String(row.operation_kind) as HarnessRunSummary['operationKind'];
+  if (row.started_at != null) summary.startedAt = Number(row.started_at);
+  if (row.duration_ms != null) summary.durationMs = Number(row.duration_ms);
+  if (row.tool_rollup != null) summary.toolRollup = parseJson(row.tool_rollup) as HarnessRunSummary['toolRollup'];
+  return summary;
+}
+
+function runSummaryColumnValues(summary: HarnessRunSummary): { names: string[]; values: QueryValues } {
+  const names = [
+    'harness_name',
+    'run_id',
+    'session_id',
+    'resource_id',
+    'thread_id',
+    'parent_session_id',
+    'agent_id',
+    'mode_id',
+    'model_id',
+    'trace_id',
+    'operation_kind',
+    'status',
+    'finish_reason',
+    'reconstructed',
+    'started_at',
+    'completed_at',
+    'duration_ms',
+    'usage',
+    'tool_rollup',
+    'created_at',
+  ];
+  const values: QueryValues = [
+    summary.harnessName,
+    summary.runId,
+    summary.sessionId,
+    summary.resourceId,
+    summary.threadId,
+    summary.parentSessionId ?? null,
+    summary.agentId,
+    summary.modeId,
+    summary.modelId,
+    summary.traceId ?? null,
+    summary.operationKind ?? null,
+    summary.status,
+    summary.finishReason,
+    summary.reconstructed,
+    summary.startedAt ?? null,
+    summary.completedAt,
+    summary.durationMs ?? null,
+    JSON.stringify(summary.usage),
+    summary.toolRollup === undefined ? null : JSON.stringify(summary.toolRollup),
+    summary.createdAt,
+  ];
+  return { names, values };
 }
 
 function assertWorkspaceActionTraceScope(record: WorkspaceActionJournalEntry): void {
@@ -4964,7 +6868,7 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
 }
 
 function tombstoneId(record: OperationAdmissionTombstone): string {
-  const publicId = record.kind === 'message' ? record.signalId : record.queuedItemId;
+  const publicId = record.kind === 'signal' ? record.signalId : record.queuedItemId;
   return stableHarnessRowId([
     record.harnessName,
     record.sessionId,
@@ -5130,7 +7034,7 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   if (
     record.status === 'admitted' &&
     (record.delivery === undefined ||
-      (record.delivery !== 'message' && record.delivery !== 'queue') ||
+      (record.delivery !== 'signal' && record.delivery !== 'queue') ||
       record.admittedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
@@ -5142,13 +7046,13 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   }
   if (
     record.status === 'accepted' &&
-    (record.delivery !== 'message' || !record.runId || !record.signalId || record.acceptedAt == null)
+    (record.delivery !== 'signal' || !record.runId || !record.signalId || record.acceptedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
       record.id,
       currentStatus,
       record.status,
-      'accepted rows require message delivery, runId, signalId, and acceptedAt',
+      'accepted rows require signal delivery, runId, signalId, and acceptedAt',
     );
   }
   if (record.status === 'queued' && (record.delivery !== 'queue' || !record.queuedItemId || record.queuedAt == null)) {
@@ -5781,6 +7685,7 @@ function channelInboxComparableValues(record: ChannelInboxItem): unknown[] {
     stableJsonString(record.requestContext),
     record.content,
     stableJsonString(record.attachments),
+    record.rawFiles ? stableJsonString(record.rawFiles) : undefined,
     record.lastError ? stableJsonString(record.lastError) : undefined,
   ];
 }

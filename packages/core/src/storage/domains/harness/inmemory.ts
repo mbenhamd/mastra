@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { InMemoryDB } from '../inmemory-db';
 import {
+  CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
   HarnessStorage,
   HarnessStorageAdmissionConflictError,
   HarnessStorageAttachmentInUseError,
@@ -9,6 +10,7 @@ import {
   HarnessStorageChannelActionClaimConflictError,
   HarnessStorageChannelActionReceiptTransitionError,
   HarnessStorageChannelActionTokenConflictError,
+  HarnessStorageChannelBindingConflictError,
   HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelInboxTransitionError,
   HarnessStorageChannelOutboxClaimConflictError,
@@ -16,6 +18,8 @@ import {
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageParentSessionUnavailableError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
   HarnessStorageProviderCallbackBindingTransitionError,
   HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
@@ -24,6 +28,14 @@ import {
   HarnessStorageWakeupTransitionError,
 } from './base';
 import type { WriteMessageResultEvidenceResult } from './base';
+import {
+  applyPlanTaskPatch,
+  comparePlanTaskOrder,
+  decodePlanTaskCursor,
+  encodePlanTaskCursor,
+  planTaskAfterCursor,
+  walkPlanTaskSubtree,
+} from './plan-task-helpers';
 import type {
   AcquireSessionLeaseInput,
   AgentSignalResultEvidence,
@@ -34,6 +46,9 @@ import type {
   AttachmentSemanticMetadata,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
+  ResolveChannelBindingResult,
+  ListActiveChannelBindingsResult,
   ChannelDiagnosticsRows,
   ChannelInboxItem,
   ChannelOutboxItem,
@@ -45,6 +60,27 @@ import type {
   CreateOrLoadChannelInboxItemResult,
   CreateOrLoadHarnessWakeupItemResult,
   CreateOrLoadActiveSessionResult,
+  CountPlanTasksByStatusInput,
+  CreatePlanTaskInput,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  HarnessPlanTaskStatus,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
+  MutatePlanTasksForSessionInput,
+  PlanTaskMutationOp,
+  PlanTaskSessionFence,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   DeleteSessionOptions,
   HarnessSessionEventRecord,
   HarnessSessionEventReplayState,
@@ -63,6 +99,7 @@ import type {
   QueueAdmissionReceipt,
   ReleaseSessionLeaseInput,
   RenewSessionLeaseInput,
+  RenewSessionLeaseSubtreeInput,
   ResolveProviderCallbackBindingResult,
   SaveAttachmentReferenceInput,
   SaveAttachmentInput,
@@ -70,6 +107,7 @@ import type {
   SaveSessionOptions,
   SaveSessionResult,
   SessionLeaseResult,
+  SubtreeSessionLeaseResult,
   SessionRecord,
   SessionSummary,
   ThreadDeleteFenceLease,
@@ -128,7 +166,8 @@ export class InMemoryHarness extends HarnessStorage {
     for (const record of this.db.harnessSessions.values()) {
       if (record.harnessName !== namespace) continue;
       if (record.threadId !== threadId || record.resourceId !== resourceId) continue;
-      if (record.closedAt !== undefined) continue;
+      // §5.2a/§5.5: return the current owner including Closed (reopen candidate)
+      // and Closing records; deleted records are already removed from the map.
       if (candidate === null || record.lastActivityAt > candidate.lastActivityAt) {
         candidate = record;
       }
@@ -340,7 +379,10 @@ export class InMemoryHarness extends HarnessStorage {
     for (const existing of this.db.harnessSessions.values()) {
       if (existing.harnessName !== namespace) continue;
       if (existing.resourceId !== record.resourceId || existing.threadId !== record.threadId) continue;
-      if (existing.closedAt !== undefined) continue;
+      // §5.3/§5.5: a Closed (reopenable) or Closing current owner still occupies
+      // the (harnessName, resourceId, threadId) key. Return it as the current
+      // owner so the caller reopens it (closed) or fails new work (closing)
+      // rather than creating a second active owner behind it.
       return {
         record: cloneSessionRecord(existing),
         created: false,
@@ -360,7 +402,12 @@ export class InMemoryHarness extends HarnessStorage {
         throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closed');
       }
       if (parent.closingAt !== undefined) {
-        throw new HarnessStorageParentSessionUnavailableError(record.parentSessionId, 'closing');
+        throw new HarnessStorageParentSessionUnavailableError(
+          record.parentSessionId,
+          'closing',
+          parent.closingAt,
+          parent.closeDeadlineAt,
+        );
       }
     }
 
@@ -445,6 +492,23 @@ export class InMemoryHarness extends HarnessStorage {
         this.db.harnessWorkspaceActionJournal.delete(key);
       }
     }
+    // §14.1: channel bindings are session-scoped. A deleted session must not leave
+    // a binding behind, or it would still win loadChannelBindingByExternal /
+    // resolveChannelBinding and block rebinding that conversation to a replacement
+    // session. (PG/LibSQL binding storage — PF-824 — must mirror this on delete.)
+    for (const [key, binding] of this.db.harnessChannelBindings) {
+      if (binding.harnessName === namespace && binding.sessionId === sessionId) {
+        this.db.harnessChannelBindings.delete(key);
+      }
+    }
+    // §5.2g: the whole plan-task tree owned by this session is cascade-deleted
+    // (every node — listed by session, so descendants are covered regardless of
+    // tree shape). PG/LibSQL mirror this on session delete.
+    for (const [key, task] of this.db.harnessPlanTasks) {
+      if (task.harnessName === namespace && task.sessionId === sessionId) {
+        this.db.harnessPlanTasks.delete(key);
+      }
+    }
     const refPrefix = `${namespace}\u0000${sessionId}\u0000`;
     for (const key of this.db.harnessAttachmentReferences.keys()) {
       if (key.startsWith(refPrefix)) {
@@ -512,6 +576,68 @@ export class InMemoryHarness extends HarnessStorage {
     const updated: SessionRecord = { ...existing, leaseExpiresAt: expiresAt };
     this.db.harnessSessions.set(sessionKey(namespace, sessionId), cloneSessionRecord(updated));
     return { version: existing.version, expiresAt };
+  }
+
+  async renewSessionLeaseSubtree({
+    rootSessionId,
+    ownerId,
+    ttlMs,
+    harnessName,
+  }: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const root = this.db.harnessSessions.get(sessionKey(namespace, rootSessionId));
+    if (!root) throw new HarnessStorageSessionNotFoundError(rootSessionId);
+
+    const now = Date.now();
+    const rootValid = root.ownerId === ownerId && root.leaseExpiresAt !== undefined && root.leaseExpiresAt > now;
+    if (!rootValid) {
+      throw new HarnessStorageLeaseConflictError(rootSessionId, root.ownerId ?? '<unowned>', root.leaseExpiresAt ?? 0);
+    }
+
+    // Collect every ACTIVE (non-closed) descendant by walking parentSessionId
+    // within this namespace. Closed descendants hold no live lease and are
+    // skipped. The whole pass is validate-first so a single bad descendant
+    // renews NOTHING (§5.8 all-or-nothing — no parent-only success).
+    const childrenByParent = new Map<string, SessionRecord[]>();
+    for (const record of this.db.harnessSessions.values()) {
+      if (record.harnessName !== namespace) continue;
+      if (record.parentSessionId === undefined) continue;
+      const siblings = childrenByParent.get(record.parentSessionId) ?? [];
+      siblings.push(record);
+      childrenByParent.set(record.parentSessionId, siblings);
+    }
+    const descendants: SessionRecord[] = [];
+    const queue = [rootSessionId];
+    const visited = new Set<string>([rootSessionId]);
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      for (const child of childrenByParent.get(parentId) ?? []) {
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
+        queue.push(child.id);
+        if (child.closedAt !== undefined || child.closingAt !== undefined) continue; // closed/closing → no live lease
+        // A descendant owned by a different instance means the subtree was
+        // split — fence rather than silently renew a foreign lease.
+        if (child.ownerId !== ownerId) {
+          throw new HarnessStorageLeaseConflictError(child.id, child.ownerId ?? '<unowned>', child.leaseExpiresAt ?? 0);
+        }
+        descendants.push(child);
+      }
+    }
+
+    // Linearized commit: root + every active descendant capped at one expiry.
+    const expiresAt = now + ttlMs;
+    this.db.harnessSessions.set(
+      sessionKey(namespace, rootSessionId),
+      cloneSessionRecord({ ...root, leaseExpiresAt: expiresAt }),
+    );
+    for (const descendant of descendants) {
+      this.db.harnessSessions.set(
+        sessionKey(namespace, descendant.id),
+        cloneSessionRecord({ ...descendant, leaseExpiresAt: expiresAt }),
+      );
+    }
+    return { version: root.version, expiresAt, renewedDescendantCount: descendants.length };
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {
@@ -711,7 +837,7 @@ export class InMemoryHarness extends HarnessStorage {
     const tombstone = this.findTombstone(
       t =>
         t.harnessName === namespace &&
-        t.kind === 'message' &&
+        t.kind === 'signal' &&
         t.sessionId === sessionId &&
         t.resourceId === resourceId &&
         t.threadId === threadId &&
@@ -730,7 +856,7 @@ export class InMemoryHarness extends HarnessStorage {
     if (existing && !sameMessageEvidenceIdentity(existing, namespacedRecord)) {
       throw new HarnessStorageAdmissionConflictError(
         namespacedRecord.sessionId,
-        'message',
+        'signal',
         namespacedRecord.admissionId ?? namespacedRecord.signalId,
       );
     }
@@ -785,7 +911,7 @@ export class InMemoryHarness extends HarnessStorage {
     sessionId: string;
     resourceId: string;
     threadId?: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     admissionId: string;
     attemptedAdmissionHash: string;
   }): Promise<{
@@ -794,7 +920,7 @@ export class InMemoryHarness extends HarnessStorage {
     storedAdmissionHash?: string;
   }> {
     const namespace = resolveHarnessName(harnessName, this.harnessName);
-    if (kind === 'message') {
+    if (kind === 'signal') {
       for (const evidence of this.db.harnessMessageResultEvidence.values()) {
         if (
           evidence.harnessName !== namespace ||
@@ -870,18 +996,18 @@ export class InMemoryHarness extends HarnessStorage {
     harnessName?: string;
     sessionId: string;
     resourceId: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     signalId?: string;
     queuedItemId?: string;
     now: number;
   }): Promise<OperationAdmissionTombstone | null> {
     const namespace = resolveHarnessName(harnessName, this.harnessName);
-    if (kind === 'message') {
+    if (kind === 'signal') {
       const key = signalId ? messageEvidenceKey(namespace, sessionId, signalId) : undefined;
       const retained = key ? this.db.harnessMessageResultEvidence.get(key) : undefined;
       if (!retained || retained.resourceId !== resourceId || retained.status === 'pending') return null;
       const tombstone: OperationAdmissionTombstone = {
-        kind: 'message',
+        kind: 'signal',
         harnessName: namespace,
         sessionId,
         resourceId,
@@ -1279,6 +1405,218 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   // -------------------------------------------------------------------------
+  // Channel bindings (§5.1h / §14.1)
+  // -------------------------------------------------------------------------
+
+  async saveChannelBinding(record: ChannelBinding): Promise<void> {
+    const namespaced = { ...record, harnessName: resolveHarnessName(record.harnessName, this.harnessName) };
+    // §5.2h: active rows are unique at storage level. Reject a write that would
+    // create a SECOND active binding for the same conversation tuple (updating
+    // the same binding id, or writing a non-active row, is always allowed). The
+    // invariant-preserving create/replace path is `resolveChannelBinding`.
+    if (namespaced.status === 'active') {
+      for (const existing of this.db.harnessChannelBindings.values()) {
+        if (
+          existing.id !== namespaced.id &&
+          existing.harnessName === namespaced.harnessName &&
+          existing.status === 'active' &&
+          channelBindingTupleMatches(existing, namespaced)
+        ) {
+          throw new HarnessStorageChannelBindingConflictError(
+            namespaced.channelId,
+            namespaced.externalThreadId,
+            existing.id,
+          );
+        }
+      }
+    }
+    this.db.harnessChannelBindings.set(channelBindingKey(namespaced.harnessName, namespaced.id), cloneJson(namespaced));
+  }
+
+  async touchChannelBindingInbound(opts: {
+    harnessName?: string;
+    bindingId: string;
+    at: number;
+  }): Promise<ChannelBinding | null> {
+    const ns = resolveHarnessName(opts.harnessName, this.harnessName);
+    const key = channelBindingKey(ns, opts.bindingId);
+    const found = this.db.harnessChannelBindings.get(key);
+    if (!found || found.harnessName !== ns) return null;
+    // §14.1 forward-only: advance the activity markers monotonically against the
+    // authoritative current row (read + merge + write with no intervening await),
+    // so a delayed/older or concurrent same-binding ingress can never clobber a
+    // newer marker.
+    const nextInbound = Math.max(found.lastInboundAt ?? 0, opts.at);
+    const nextUpdated = Math.max(found.updatedAt, opts.at);
+    if (nextInbound === (found.lastInboundAt ?? 0) && nextUpdated === found.updatedAt) {
+      return cloneJson(found); // no forward movement — skip the write
+    }
+    const merged: ChannelBinding = { ...found, lastInboundAt: nextInbound, updatedAt: nextUpdated };
+    this.db.harnessChannelBindings.set(key, cloneJson(merged));
+    return cloneJson(merged);
+  }
+
+  async loadChannelBinding(opts: { bindingId: string }): Promise<ChannelBinding | null> {
+    const ns = resolveHarnessName(undefined, this.harnessName);
+    const found = this.db.harnessChannelBindings.get(channelBindingKey(ns, opts.bindingId));
+    return found && found.harnessName === ns ? cloneJson(found) : null;
+  }
+
+  async loadChannelBindingByExternal(opts: {
+    harnessName: string;
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  }): Promise<ChannelBinding | null> {
+    const ns = resolveHarnessName(opts.harnessName, this.harnessName);
+    for (const binding of this.db.harnessChannelBindings.values()) {
+      if (
+        binding.harnessName === ns &&
+        binding.status === 'active' &&
+        binding.channelId === opts.channelId &&
+        binding.platform === opts.platform &&
+        normalizeExternalId(binding.externalTenantId) === normalizeExternalId(opts.externalTenantId) &&
+        normalizeExternalId(binding.externalChannelId) === normalizeExternalId(opts.externalChannelId) &&
+        binding.externalThreadId === opts.externalThreadId
+      ) {
+        return cloneJson(binding);
+      }
+    }
+    return null;
+  }
+
+  async resolveChannelBinding(opts: {
+    candidate: ChannelBinding;
+    replaceBindingId?: string;
+  }): Promise<ResolveChannelBindingResult> {
+    const ns = resolveHarnessName(opts.candidate.harnessName, this.harnessName);
+    const candidate = opts.candidate;
+    const sameTuple = (b: ChannelBinding): boolean =>
+      b.harnessName === ns &&
+      b.channelId === candidate.channelId &&
+      b.platform === candidate.platform &&
+      normalizeExternalId(b.externalTenantId) === normalizeExternalId(candidate.externalTenantId) &&
+      normalizeExternalId(b.externalChannelId) === normalizeExternalId(candidate.externalChannelId) &&
+      b.externalThreadId === candidate.externalThreadId;
+    // The tuple's current active binding is authoritative for the §14.1
+    // one-active-per-tuple invariant (regardless of the caller-supplied
+    // replaceBindingId, which is only a hint about the prior generation).
+    const existingActive = await this.loadChannelBindingByExternal({
+      harnessName: ns,
+      channelId: candidate.channelId,
+      platform: candidate.platform,
+      ...(candidate.externalTenantId !== undefined ? { externalTenantId: candidate.externalTenantId } : {}),
+      ...(candidate.externalChannelId !== undefined ? { externalChannelId: candidate.externalChannelId } : {}),
+      externalThreadId: candidate.externalThreadId,
+    });
+
+    // Generation is storage-managed and monotonic per tuple ("starts at 1;
+    // increments on replacement"): a new binding never regresses below the max
+    // generation any binding for this tuple has ever held (active or fenced).
+    let maxTupleGeneration = 0;
+    for (const b of this.db.harnessChannelBindings.values()) {
+      if (sameTuple(b)) maxTupleGeneration = Math.max(maxTupleGeneration, b.generation);
+    }
+
+    if (opts.replaceBindingId !== undefined) {
+      // §14.1 replacement: fence the tuple's existing active binding to
+      // `replaced` (never an unrelated conversation named by a stale id) and
+      // commit the candidate with an incremented generation. Exactly one active
+      // binding remains for the tuple.
+      const fenceIds = new Set<string>([opts.replaceBindingId, ...(existingActive ? [existingActive.id] : [])]);
+      for (const id of fenceIds) {
+        const prior = this.db.harnessChannelBindings.get(channelBindingKey(ns, id));
+        if (prior !== undefined && prior.status === 'active' && sameTuple(prior)) {
+          this.db.harnessChannelBindings.set(
+            channelBindingKey(ns, prior.id),
+            cloneJson({
+              ...prior,
+              status: 'replaced' as const,
+              replacedByBindingId: candidate.id,
+              updatedAt: candidate.updatedAt,
+            }),
+          );
+        }
+      }
+      const committed: ChannelBinding = {
+        ...candidate,
+        harnessName: ns,
+        status: 'active',
+        generation: maxTupleGeneration + 1,
+      };
+      this.db.harnessChannelBindings.set(channelBindingKey(ns, committed.id), cloneJson(committed));
+      return {
+        binding: cloneJson(committed),
+        created: true,
+        ...(existingActive !== null ? { replacedBindingId: existingActive.id } : {}),
+      };
+    }
+
+    // No replacement: an existing active binding for the tuple wins (idempotent
+    // resolution); otherwise commit the candidate as the new active binding.
+    if (existingActive !== null) return { binding: existingActive, created: false };
+    const committed: ChannelBinding = {
+      ...candidate,
+      harnessName: ns,
+      status: 'active',
+      generation: maxTupleGeneration + 1,
+    };
+    this.db.harnessChannelBindings.set(channelBindingKey(ns, committed.id), cloneJson(committed));
+    return { binding: cloneJson(committed), created: true };
+  }
+
+  async listChannelBindingsForSession(opts: { sessionId: string }): Promise<ChannelBinding[]> {
+    const ns = resolveHarnessName(undefined, this.harnessName);
+    const out: ChannelBinding[] = [];
+    for (const binding of this.db.harnessChannelBindings.values()) {
+      if (binding.harnessName === ns && binding.sessionId === opts.sessionId) out.push(cloneJson(binding));
+    }
+    out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return out;
+  }
+
+  async listActiveChannelBindingsForScope(opts: {
+    harnessName: string;
+    channelId?: string;
+    limit: number;
+    cursor?: string;
+  }): Promise<ListActiveChannelBindingsResult> {
+    const ns = resolveHarnessName(opts.harnessName, this.harnessName);
+    const all: ChannelBinding[] = [];
+    for (const binding of this.db.harnessChannelBindings.values()) {
+      if (
+        binding.harnessName === ns &&
+        binding.status === 'active' &&
+        (opts.channelId === undefined || binding.channelId === opts.channelId)
+      ) {
+        all.push(binding);
+      }
+    }
+    // §14.8 binding ordering: (lastOutboundAt DESC, bindingId DESC), using
+    // lastInboundAt when no outbound time exists.
+    const activityAt = (b: ChannelBinding): number => b.lastOutboundAt ?? b.lastInboundAt ?? 0;
+    all.sort((a, b) => activityAt(b) - activityAt(a) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    let start = 0;
+    if (opts.cursor !== undefined) {
+      const idx = all.findIndex(b => b.id === opts.cursor);
+      // An unknown/stale cursor must not silently restart at page 1 (which would
+      // duplicate already-seen rows); treat it as the end of the result set.
+      start = idx === -1 ? all.length : idx + 1;
+    }
+    const page = all.slice(start, start + opts.limit);
+    const hasMore = start + opts.limit < all.length;
+    const nextCursor = hasMore ? page[page.length - 1]?.id : undefined;
+    return { bindings: page.map(cloneJson), ...(nextCursor !== undefined ? { nextCursor } : {}) };
+  }
+
+  async deleteChannelBinding(opts: { bindingId: string }): Promise<void> {
+    const ns = resolveHarnessName(undefined, this.harnessName);
+    this.db.harnessChannelBindings.delete(channelBindingKey(ns, opts.bindingId));
+  }
+
+  // -------------------------------------------------------------------------
   // Channel inbox ledger
   // -------------------------------------------------------------------------
 
@@ -1447,7 +1785,17 @@ export class InMemoryHarness extends HarnessStorage {
     ) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
     }
-    const next = { ...record, harnessName: namespace };
+    // Claim-field contract: a KEEP-claim write (record still carries `claimId`)
+    // must NOT let the caller's possibly-stale `claimExpiresAt` roll back a
+    // concurrent `renewChannelInboxClaim` heartbeat — the live expiry is
+    // storage-owned, so preserve `current.claimId`/`claimExpiresAt`. A RELEASE
+    // write (record clears `claimId`) is the explicit "drop the claim" signal
+    // (e.g. a worker failing a row so it reclaims at `nextAttemptAt`) and is
+    // honored as-is.
+    const next =
+      record.claimId === undefined
+        ? { ...record, harnessName: namespace }
+        : { ...record, harnessName: namespace, claimId: current.claimId, claimExpiresAt: current.claimExpiresAt };
     assertLegalChannelInboxUpdate(current, next);
     this.db.harnessChannelInbox.set(channelInboxKey(namespace, record.id), cloneJson(next));
   }
@@ -1737,7 +2085,16 @@ export class InMemoryHarness extends HarnessStorage {
     ) {
       throw new HarnessStorageChannelActionClaimConflictError(record.id, opts.claimId);
     }
-    const next = { ...record, harnessName: namespace };
+    // Claim-field contract (mirrors updateChannelInboxItem): a KEEP-claim write
+    // (record still carries `claimId`) must NOT let the caller's possibly-stale
+    // `claimExpiresAt` roll back a concurrent `renewChannelActionReceiptClaim`
+    // heartbeat — the live expiry is storage-owned, so preserve
+    // `current.claimId`/`claimExpiresAt`. A RELEASE write (record clears `claimId`)
+    // is the explicit "drop the claim" signal and is honored as-is.
+    const next =
+      record.claimId === undefined
+        ? { ...record, harnessName: namespace }
+        : { ...record, harnessName: namespace, claimId: current.claimId, claimExpiresAt: current.claimExpiresAt };
     assertLegalChannelActionReceiptUpdate(current, next);
     this.db.harnessChannelActionReceipts.set(channelActionReceiptKey(namespace, record.id), cloneJson(next));
   }
@@ -2410,6 +2767,297 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   // -------------------------------------------------------------------------
+  // Plan tasks (§5.1k) — durable, arbitrary-depth, model-authored task tree.
+  // All mutators are session-owner-fenced (§5.8): the SESSION is the serialized
+  // writer, so writes fence on the session's lease + version, not bare per-row
+  // OCC. The per-row `version` is the field-write OCC token inside that fence.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verify the session-owner fence: the owning SessionRecord must exist, still be
+   * held by `ownerId` under an unexpired lease, and have `version` matching
+   * `ifSessionVersion`. Returns the resolved namespace.
+   */
+  private assertPlanTaskFence(fence: PlanTaskSessionFence): string {
+    const namespace = resolveHarnessName(fence.harnessName, this.harnessName);
+    const session = this.db.harnessSessions.get(sessionKey(namespace, fence.sessionId));
+    if (!session) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
+    // Lease check first — mirrors saveSession (the lease is the ownership token).
+    assertLeaseHolder(session, fence.ownerId);
+    if (session.version !== fence.ifSessionVersion) {
+      throw new HarnessStorageVersionConflictError(fence.sessionId, fence.ifSessionVersion, session.version);
+    }
+    return namespace;
+  }
+
+  async createPlanTask({ fence, task }: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    const namespace = this.assertPlanTaskFence(fence);
+    // Idempotent retry: an existing task with the same idempotencyKey in this
+    // session returns unchanged (§5.1k).
+    if (task.idempotencyKey !== undefined) {
+      for (const existing of this.db.harnessPlanTasks.values()) {
+        if (
+          existing.harnessName === namespace &&
+          existing.sessionId === fence.sessionId &&
+          existing.idempotencyKey === task.idempotencyKey
+        ) {
+          return clonePlanTask(existing);
+        }
+      }
+    }
+    const now = Date.now();
+    const stored: HarnessPlanTask = normalizePlanTask({
+      ...task,
+      harnessName: namespace,
+      sessionId: fence.sessionId,
+      createdAt: task.createdAt ?? now,
+      updatedAt: now,
+      version: 1,
+    });
+    this.db.harnessPlanTasks.set(planTaskKey(namespace, fence.sessionId, stored.taskId), clonePlanTask(stored));
+    return clonePlanTask(stored);
+  }
+
+  async updatePlanTask({ fence, taskId, ifVersion, patch }: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    const namespace = this.assertPlanTaskFence(fence);
+    const key = planTaskKey(namespace, fence.sessionId, taskId);
+    const existing = this.db.harnessPlanTasks.get(key);
+    if (!existing) throw new HarnessStoragePlanTaskNotFoundError(fence.sessionId, taskId);
+    if (existing.version !== ifVersion) {
+      throw new HarnessStoragePlanTaskVersionConflictError(taskId, ifVersion, existing.version);
+    }
+    const next = applyPlanTaskPatch(existing, patch, ifVersion + 1);
+    this.db.harnessPlanTasks.set(key, clonePlanTask(next));
+    return { version: next.version };
+  }
+
+  async deletePlanTaskSubtree({ fence, rootTaskId }: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    const namespace = this.assertPlanTaskFence(fence);
+    const ids = this.collectPlanTaskSubtreeIds(namespace, fence.sessionId, rootTaskId);
+    let deletedCount = 0;
+    for (const id of ids) {
+      if (this.db.harnessPlanTasks.delete(planTaskKey(namespace, fence.sessionId, id))) deletedCount++;
+    }
+    return { deletedCount };
+  }
+
+  async mutatePlanTasksForSession({ fence, ops }: MutatePlanTasksForSessionInput): Promise<void> {
+    const namespace = this.assertPlanTaskFence(fence);
+    // Transaction-shaped: validate + stage every op against a working copy, then
+    // commit all-or-nothing. A single rejected op throws before any row changes.
+    const working = new Map<string, HarnessPlanTask>();
+    for (const [key, value] of this.db.harnessPlanTasks) {
+      if (value.harnessName === namespace && value.sessionId === fence.sessionId) {
+        working.set(value.taskId, clonePlanTask(value));
+      }
+      void key;
+    }
+    const now = Date.now();
+    for (const op of ops) {
+      this.stagePlanTaskOp(working, namespace, fence.sessionId, op, now);
+    }
+    // Commit: replace this session's rows with the working set.
+    for (const value of [...this.db.harnessPlanTasks.values()]) {
+      if (value.harnessName === namespace && value.sessionId === fence.sessionId) {
+        this.db.harnessPlanTasks.delete(planTaskKey(namespace, fence.sessionId, value.taskId));
+      }
+    }
+    for (const task of working.values()) {
+      this.db.harnessPlanTasks.set(planTaskKey(namespace, fence.sessionId, task.taskId), clonePlanTask(task));
+    }
+  }
+
+  private stagePlanTaskOp(
+    working: Map<string, HarnessPlanTask>,
+    namespace: string,
+    sessionId: string,
+    op: PlanTaskMutationOp,
+    now: number,
+  ): void {
+    if (op.kind === 'create') {
+      if (op.task.idempotencyKey !== undefined) {
+        for (const existing of working.values()) {
+          if (existing.idempotencyKey === op.task.idempotencyKey) return; // idempotent no-op
+        }
+      }
+      const stored = normalizePlanTask({
+        ...op.task,
+        harnessName: namespace,
+        sessionId,
+        createdAt: op.task.createdAt ?? now,
+        updatedAt: now,
+        version: 1,
+      });
+      working.set(stored.taskId, stored);
+      return;
+    }
+    if (op.kind === 'update') {
+      const existing = working.get(op.taskId);
+      if (!existing) throw new HarnessStoragePlanTaskNotFoundError(sessionId, op.taskId);
+      if (existing.version !== op.ifVersion) {
+        throw new HarnessStoragePlanTaskVersionConflictError(op.taskId, op.ifVersion, existing.version);
+      }
+      working.set(op.taskId, applyPlanTaskPatch(existing, op.patch, op.ifVersion + 1));
+      return;
+    }
+    // deleteSubtree
+    const ids = collectSubtreeIdsFromMap(working, op.rootTaskId);
+    for (const id of ids) working.delete(id);
+  }
+
+  /**
+   * BFS the subtree rooted at `rootTaskId` (inclusive) within this session,
+   * walking parentTaskId. A visited set defensively guards a parentTaskId cycle
+   * even though full cycle PREVENTION is TM-4.
+   */
+  private collectPlanTaskSubtreeIds(namespace: string, sessionId: string, rootTaskId: string): string[] {
+    const childrenByParent = new Map<string, string[]>();
+    let rootExists = false;
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      if (task.taskId === rootTaskId) rootExists = true;
+      if (task.parentTaskId !== undefined) {
+        const siblings = childrenByParent.get(task.parentTaskId) ?? [];
+        siblings.push(task.taskId);
+        childrenByParent.set(task.parentTaskId, siblings);
+      }
+    }
+    if (!rootExists) return [];
+    const result: string[] = [];
+    const queue = [rootTaskId];
+    const visited = new Set<string>([rootTaskId]);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      result.push(id);
+      for (const child of childrenByParent.get(id) ?? []) {
+        if (visited.has(child)) continue;
+        visited.add(child);
+        queue.push(child);
+      }
+    }
+    return result;
+  }
+
+  async listPlanTasks({ harnessName, sessionId, limit, cursor }: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    if (limit <= 0) return { tasks: [] };
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const matched: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      matched.push(task);
+    }
+    matched.sort(comparePlanTaskOrder);
+    // Keyset cursor on the (parentTaskId, order, taskId) sort key — identical token
+    // + continuation semantics to PG/LibSQL (a deleted cursor row still continues
+    // from its sort position instead of silently restarting from the head).
+    const after = cursor === undefined ? matched : matched.filter(t => planTaskAfterCursor(t, decodePlanTaskCursor(cursor)));
+    const page = after.slice(0, limit);
+    const result: ListPlanTasksResult = { tasks: page.map(clonePlanTask) };
+    if (after.length > limit && page.length > 0) {
+      result.cursor = encodePlanTaskCursor(page[page.length - 1]!);
+    }
+    return result;
+  }
+
+  async loadPlanTaskSubtree({
+    harnessName,
+    sessionId,
+    rootTaskId,
+    depth,
+    status,
+    limit,
+  }: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const tasks: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      tasks.push(task);
+    }
+    // Shared walk (§5.1k) keeps depth/status/limit semantics identical across adapters.
+    return walkPlanTaskSubtree(tasks, { rootTaskId, depth, status, limit });
+  }
+
+  async countPlanTasksByStatus({ harnessName, sessionId }: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const ids = new Set<string>();
+    const session: HarnessPlanTask[] = [];
+    for (const task of this.db.harnessPlanTasks.values()) {
+      if (task.harnessName !== namespace || task.sessionId !== sessionId) continue;
+      ids.add(task.taskId);
+      session.push(task);
+    }
+    const byStatus: Partial<Record<HarnessPlanTaskStatus, number>> = {};
+    let rootCount = 0;
+    for (const task of session) {
+      byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
+      // A root is a node with no parent OR whose parent is not in the set (orphan),
+      // matching `computePlanTaskSummary`'s `indexPlanTasks` root rule exactly.
+      if (task.parentTaskId === undefined || !ids.has(task.parentTaskId)) rootCount += 1;
+    }
+    return { total: session.length, byStatus, rootCount };
+  }
+
+  // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2)
+  // -------------------------------------------------------------------------
+
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    const namespace = resolveHarnessName(summary.harnessName, this.harnessName);
+    const key = `${namespace}::${summary.runId}`;
+    const existing = this.db.harnessRunSummaries.get(key);
+    // Idempotent: first terminal wins; a later write is a no-op.
+    if (existing) return cloneJson(existing);
+    const stored: HarnessRunSummary = cloneJson({ ...summary, harnessName: namespace });
+    this.db.harnessRunSummaries.set(key, stored);
+    return cloneJson(stored);
+  }
+
+  async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    const found = this.db.harnessRunSummaries.get(`${namespace}::${runId}`);
+    return found ? cloneJson(found) : null;
+  }
+
+  async listRunSummaries({
+    harnessName,
+    sessionId,
+    resourceId,
+    limit,
+    beforeCompletedAt,
+    beforeRunId,
+  }: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    const namespace = resolveHarnessName(harnessName, this.harnessName);
+    // Composite keyset: a row is "before" the cursor when its completedAt is
+    // strictly less, OR equal with a strictly-lesser runId (matches the
+    // (completedAt DESC, runId DESC) order) — so same-timestamp rows at a page
+    // boundary are neither skipped nor duplicated.
+    const beforeCursor = (s: HarnessRunSummary): boolean => {
+      if (beforeCompletedAt === undefined) return true;
+      if (s.completedAt < beforeCompletedAt) return true;
+      if (s.completedAt === beforeCompletedAt && beforeRunId !== undefined) return s.runId < beforeRunId;
+      return false;
+    };
+    const rows = [...this.db.harnessRunSummaries.values()].filter(
+      s =>
+        s.harnessName === namespace &&
+        s.sessionId === sessionId &&
+        (resourceId === undefined || s.resourceId === resourceId) &&
+        beforeCursor(s),
+    );
+    // Newest first; ties broken by runId descending for a stable keyset order.
+    rows.sort((a, b) => (b.completedAt - a.completedAt) || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0));
+    const cap = limit ?? 50;
+    const page = rows.slice(0, cap);
+    const result: ListRunSummariesResult = { summaries: page.map(cloneJson) };
+    if (rows.length > cap) {
+      const last = page[page.length - 1]!;
+      result.nextBeforeCompletedAt = last.completedAt;
+      result.nextBeforeRunId = last.runId;
+    }
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
   // Test-only
   // -------------------------------------------------------------------------
 
@@ -2428,6 +3076,8 @@ export class InMemoryHarness extends HarnessStorage {
     this.db.harnessChannelActionReceipts.clear();
     this.db.harnessChannelOutbox.clear();
     this.db.harnessWakeupItems.clear();
+    this.db.harnessPlanTasks.clear();
+    this.db.harnessRunSummaries.clear();
     this.db.harnessThreadDeleteFences.clear();
   }
 }
@@ -2459,7 +3109,7 @@ function splitAttachmentKey(key: string): [string, string, string] {
 }
 
 function tombstoneKey(record: OperationAdmissionTombstone): string {
-  const publicId = record.kind === 'message' ? record.signalId : record.queuedItemId;
+  const publicId = record.kind === 'signal' ? record.signalId : record.queuedItemId;
   return `${record.harnessName}\u0000${record.sessionId}\u0000${record.kind}\u0000${publicId ?? record.admissionId ?? record.compactedAt}`;
 }
 
@@ -2475,6 +3125,33 @@ function sessionEventKey(
 
 function workspaceActionJournalKey(harnessName: string, sessionId: string, id: string): string {
   return `${harnessName}\u0000${sessionId}\u0000${id}`;
+}
+
+function channelBindingKey(_harnessName: string, bindingId: string): string {
+  return bindingId;
+}
+
+// §14.1: missing optional external IDs normalise to the shared
+// CHANNEL_BINDING_EXTERNAL_ID_SENTINEL (defined in ./base) for tuple uniqueness
+// (storage must not rely on SQL NULL uniqueness semantics). Sharing the constant
+// keeps the storage tuple key aligned with the harness-level idempotency/thread-id
+// derivation.
+function normalizeExternalId(value: string | undefined): string {
+  return value ?? CHANNEL_BINDING_EXTERNAL_ID_SENTINEL;
+}
+
+/** True when a binding addresses the same platform-conversation tuple as `b` (§14.1). */
+function channelBindingTupleMatches(
+  a: ChannelBinding,
+  b: { channelId: string; platform: string; externalTenantId?: string; externalChannelId?: string; externalThreadId: string },
+): boolean {
+  return (
+    a.channelId === b.channelId &&
+    a.platform === b.platform &&
+    normalizeExternalId(a.externalTenantId) === normalizeExternalId(b.externalTenantId) &&
+    normalizeExternalId(a.externalChannelId) === normalizeExternalId(b.externalChannelId) &&
+    a.externalThreadId === b.externalThreadId
+  );
 }
 
 function channelInboxKey(_harnessName: string, inboxItemId: string): string {
@@ -2499,6 +3176,78 @@ function harnessWakeupKey(_harnessName: string, wakeupItemId: string): string {
 
 function resolveHarnessName(input: string | undefined, fallback: string): string {
   return input ?? fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Plan-task helpers (§5.1k)
+// ---------------------------------------------------------------------------
+
+function planTaskKey(harnessName: string, sessionId: string, taskId: string): string {
+  return `${harnessName} ${sessionId} ${taskId}`;
+}
+
+function clonePlanTask(task: HarnessPlanTask): HarnessPlanTask {
+  return cloneJson(task);
+}
+
+/** Drop `undefined` optional fields so stored rows stay shape-stable. */
+function normalizePlanTask(task: HarnessPlanTask): HarnessPlanTask {
+  const next: HarnessPlanTask = {
+    taskId: task.taskId,
+    harnessName: task.harnessName,
+    sessionId: task.sessionId,
+    resourceId: task.resourceId,
+    threadId: task.threadId,
+    order: task.order,
+    status: task.status,
+    statusSource: task.statusSource,
+    content: task.content,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    version: task.version,
+  };
+  if (task.idempotencyKey !== undefined) next.idempotencyKey = task.idempotencyKey;
+  if (task.parentTaskId !== undefined) next.parentTaskId = task.parentTaskId;
+  if (task.activeForm !== undefined) next.activeForm = task.activeForm;
+  if (task.priority !== undefined) next.priority = task.priority;
+  if (task.blockedBy !== undefined) next.blockedBy = [...task.blockedBy];
+  if (task.origin !== undefined) next.origin = task.origin;
+  if (task.delegatedSubagentSessionId !== undefined) {
+    next.delegatedSubagentSessionId = task.delegatedSubagentSessionId;
+  }
+  if (task.delegatedSubagentTypeId !== undefined) {
+    next.delegatedSubagentTypeId = task.delegatedSubagentTypeId;
+  }
+  if (task.metadata !== undefined) next.metadata = cloneJson(task.metadata);
+  if (task.startedAt !== undefined) next.startedAt = task.startedAt;
+  if (task.completedAt !== undefined) next.completedAt = task.completedAt;
+  return next;
+}
+
+/** BFS subtree id collection over an in-memory working map (cycle-guarded). */
+function collectSubtreeIdsFromMap(working: Map<string, HarnessPlanTask>, rootTaskId: string): string[] {
+  if (!working.has(rootTaskId)) return [];
+  const childrenByParent = new Map<string, string[]>();
+  for (const task of working.values()) {
+    if (task.parentTaskId !== undefined) {
+      const siblings = childrenByParent.get(task.parentTaskId) ?? [];
+      siblings.push(task.taskId);
+      childrenByParent.set(task.parentTaskId, siblings);
+    }
+  }
+  const result: string[] = [];
+  const queue = [rootTaskId];
+  const visited = new Set<string>([rootTaskId]);
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    result.push(id);
+    for (const child of childrenByParent.get(id) ?? []) {
+      if (visited.has(child)) continue;
+      visited.add(child);
+      queue.push(child);
+    }
+  }
+  return result;
 }
 
 function cloneSessionRecord(record: SessionRecord): SessionRecord {
@@ -2659,7 +3408,7 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   if (
     record.status === 'admitted' &&
     (record.delivery === undefined ||
-      (record.delivery !== 'message' && record.delivery !== 'queue') ||
+      (record.delivery !== 'signal' && record.delivery !== 'queue') ||
       record.admittedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
@@ -2671,13 +3420,13 @@ function assertValidChannelInboxState(record: ChannelInboxItem, currentStatus?: 
   }
   if (
     record.status === 'accepted' &&
-    (record.delivery !== 'message' || !record.runId || !record.signalId || record.acceptedAt == null)
+    (record.delivery !== 'signal' || !record.runId || !record.signalId || record.acceptedAt == null)
   ) {
     throw new HarnessStorageChannelInboxTransitionError(
       record.id,
       currentStatus,
       record.status,
-      'accepted rows require message delivery, runId, signalId, and acceptedAt',
+      'accepted rows require signal delivery, runId, signalId, and acceptedAt',
     );
   }
   if (record.status === 'queued' && (record.delivery !== 'queue' || !record.queuedItemId || record.queuedAt == null)) {
@@ -3314,6 +4063,7 @@ function channelInboxComparableValues(record: ChannelInboxItem): unknown[] {
     stableJsonString(record.requestContext),
     record.content,
     stableJsonString(record.attachments),
+    record.rawFiles ? stableJsonString(record.rawFiles) : undefined,
     record.lastError ? stableJsonString(record.lastError) : undefined,
   ];
 }

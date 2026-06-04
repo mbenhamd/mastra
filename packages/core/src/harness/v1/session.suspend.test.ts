@@ -182,6 +182,105 @@ describe('Session — suspend capture on message()', () => {
     expect(session.getDisplayState().pending?.kind).toBe('tool-approval');
   });
 
+  it('signal(): a suspended owned turn is parked, not settled — no signal_completed, evidence stays pending (§4.2f/§10.2)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-S',
+      suspendPayload: { toolCallId: 'tc-s', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+
+    const handle = await session.signal({ content: 'do it' });
+    const result = await handle.result;
+    expect(result.finishReason).toBe('suspended');
+
+    // §10.2 — a parked turn is not answered, so the operation does not settle.
+    expect(events.some(e => e.type === 'signal_completed')).toBe(false);
+    expect(events.some(e => e.type === 'signal_failed')).toBe(false);
+
+    // §4.2f — durable per-signalId evidence stays `pending` until resume
+    // terminalizes (the accept-time pending write is the durable barrier).
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('pending');
+  });
+
+  it('signal(): terminal resume of a suspended owned turn settles signal_completed + durable evidence (§4.2f/§10.2)', async () => {
+    const { harness, agent } = setup();
+    // 1) initial owned turn suspends
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-RS',
+      suspendPayload: { toolCallId: 'tc-rs', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    // 2) resume terminalizes (no further suspend)
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-RS', text: 'done' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const handle = await session.signal({ content: 'do it' });
+    const suspended = await handle.result;
+    expect(suspended.finishReason).toBe('suspended');
+
+    // Evidence is parked while suspended (companion to the test above).
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+    expect((session.getRecord().pendingResume as { originSignalId?: string }).originSignalId).toBe(handle.id);
+
+    // Now approve the tool → resume runs to a terminal (non-suspended) finish.
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+    await session.respondToToolApproval({ approved: true });
+
+    // §4.2f — the terminal resume IS this signal's answer: it settles the
+    // durable per-signalId evidence and projects signal_completed (not just
+    // agent_end), so a suspended owned signal does not stay pending forever.
+    await waitFor(
+      () => events.some(e => e.type === 'signal_completed'),
+      'signal_completed after terminal resume',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+    expect(session.getRecord().pendingResume).toBeUndefined();
+  });
+
+  it('signal(): failed resume of a suspended owned turn settles signal_failed (§4.2f)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-RF',
+      suspendPayload: { toolCallId: 'tc-rf', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const handle = await session.signal({ content: 'do it' });
+    await handle.result;
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'pendingResume captured for suspended signal',
+    );
+
+    // No further run enqueued → resumeStream throws → terminal failure.
+    const events: { type: string }[] = [];
+    session.subscribe(e => events.push(e));
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+
+    await waitFor(
+      () => events.some(e => e.type === 'signal_failed'),
+      'signal_failed after failed resume',
+    );
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('failed');
+  });
+
   it('classifies as "tool-suspension" when the chunk carries a suspendPayload field', async () => {
     const { harness, agent } = setup();
     agent.enqueueRun({
@@ -338,6 +437,48 @@ describe('Session — suspend capture on message()', () => {
       options: [{ label: 'yes' }],
       selectionMode: 'single_select',
     });
+  });
+
+  it('§4.2e: a pre-registered question pending carries the active turn yolo (so resume keeps auto-granting)', async () => {
+    // Regression for the yolo-lost-on-pre-registered-pending bug: registerQuestion
+    // writes the pending BEFORE suspend capture, and capture early-returns on the
+    // matching run/toolCallId, so yolo must be stamped on the registered pending.
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // Arm the turn yolo as the queued-drain / resume paths do.
+    (session as any)._currentTurnYolo = true;
+    await (session as any)._registerQuestion({
+      questionId: 'tc-yolo-q',
+      question: 'proceed?',
+      runId: 'run-yolo-q',
+      toolCallId: 'tc-yolo-q',
+    });
+    await (session as any)._maybeCaptureSuspend({
+      runId: 'run-yolo-q',
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-yolo-q', toolName: 'ask_user', args: { question: 'proceed?' } },
+    });
+    expect(session.getRecord().pendingResume?.yolo).toBe(true);
+  });
+
+  it('§4.2e: a non-yolo turn does NOT stamp yolo on a pre-registered question pending', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // _currentTurnYolo defaults false; do not arm it.
+    await (session as any)._registerQuestion({
+      questionId: 'tc-plain-q',
+      question: 'proceed?',
+      runId: 'run-plain-q',
+      toolCallId: 'tc-plain-q',
+    });
+    await (session as any)._maybeCaptureSuspend({
+      runId: 'run-plain-q',
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-plain-q', toolName: 'ask_user', args: { question: 'proceed?' } },
+    });
+    expect(session.getRecord().pendingResume?.yolo).toBeUndefined();
   });
 
   it('keeps a registered question when suspend capture reports a generic tool suspension', async () => {
@@ -589,12 +730,12 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ sessionId });
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toMatchObject({ code: 'harness.runtime_dependency_drifted' });
+    ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       status: 'failed',
-      error: { code: 'harness.runtime_dependency_drifted' },
+      error: { code: 'harness.runtime_drift' },
     });
     expect(session.getRecord().pendingResume).toMatchObject({ runId: 'run-Q' });
     expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
@@ -657,14 +798,14 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ sessionId });
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q-generation', responseId: 'answer-generation', answer: 'red' }),
-    ).rejects.toMatchObject({ code: 'harness.runtime_dependency_drifted' });
+    ).rejects.toMatchObject({ code: 'harness.runtime_drift' });
 
     expect(agent.resumeCalls).toHaveLength(0);
     expect(session.getRecord().inboxResponseReceipts?.['answer-generation']).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
-        message: expect.stringContaining('runtime_compatibility_generation "generation-a"'),
+        code: 'harness.runtime_drift',
+        message: expect.stringContaining('recorded generation "generation-a"'),
       },
     });
     expect(session.getRecord().pendingResume).toMatchObject({ runId: 'run-Q-generation' });
@@ -913,20 +1054,150 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.message({ content: 'go' });
 
-    await expect(
-      session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toThrow('FakeAgent: no run enqueued for resumeStream()');
+    // §13.3f.1: respondTo* is a public §4.2b boundary, so a raw resumeStream
+    // failure is REDACTED on the in-process rejection too — generic
+    // `harness.internal` message, with the raw "FakeAgent: …" text preserved
+    // local-only on `.cause`.
+    const firstThrown = await session
+      .respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect((firstThrown as Error).name).toBe('HarnessExecutionError');
+    expect((firstThrown as Error).message).toBe('An internal harness error occurred');
+    expect(((firstThrown as { cause?: Error }).cause as Error).message).toBe(
+      'FakeAgent: no run enqueued for resumeStream()',
+    );
 
+    // §13.3f.1: the durable failure receipt is a public projection surface — a
+    // raw (non-namespaced) agent Error redacts to `harness.internal` with a
+    // generic message; the raw text must not be persisted onto the receipt.
     expect(session.getRecord().inboxResponseReceipts?.['answer-1']).toMatchObject({
       itemId: 'question:tc-Q',
       status: 'failed',
       retryable: false,
-      error: expect.objectContaining({ message: 'FakeAgent: no run enqueued for resumeStream()' }),
+      error: { code: 'harness.internal', message: 'An internal harness error occurred' },
     });
+    // The idempotent retry replays the stored failure receipt (it does NOT
+    // re-invoke the agent), so it re-throws the receipt's redacted public
+    // projection — the generic `harness.internal` message — not the original
+    // raw agent text. resumeStream is not called a second time.
     await expect(
       session.respondToQuestion({ itemId: 'question:tc-Q', responseId: 'answer-1', answer: 'red' }),
-    ).rejects.toThrow('FakeAgent: no run enqueued for resumeStream()');
+    ).rejects.toThrow('An internal harness error occurred');
     expect(agent.resumeCalls).toHaveLength(1);
+  });
+
+  it('reverts the at-least-once marker to a retryable waiting state when an in-process resume throws (F2)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-RT',
+      suspendPayload: { toolCallId: 'tc-RT', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    // First resume: no run enqueued → resumeStream throws (in-process failure).
+    // The marker (`resumedAt`) was stamped under the lease before the agent
+    // call; the in-process catch must revert it so the suspension is
+    // immediately retryable instead of stuck "resuming".
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+    expect(agent.resumeCalls).toHaveLength(1);
+
+    // No `resumedAt` orphan; suspension is back to `waiting`, not `resuming`.
+    const pending = session.getRecord().pendingResume;
+    expect(pending).toBeDefined();
+    expect(pending!.resumedAt).toBeUndefined();
+    // §5.1b currentRun projection: a suspended run with the marker cleared
+    // reads `waiting`, not `resuming`.
+    expect(session.getDisplayState().currentRun?.status).toBe('waiting');
+
+    // An immediate retry is allowed (does NOT hit "awaiting agent confirmation")
+    // and re-invokes the agent. This time the run succeeds and clears pending.
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-RT', text: 'done' });
+    const result = await session.respondToToolApproval({ approved: true });
+    expect(result.finishReason).toBe('stop');
+    expect(agent.resumeCalls).toHaveLength(2);
+    expect(session.getRecord().pendingResume).toBeUndefined();
+  });
+
+  it('a failed in-process resume does not permanently park the queue (F2 liveness)', async () => {
+    const { harness, agent } = setup();
+    // Queue two turns: the first suspends; the second waits behind the
+    // suspension. A failed resume of the first must not park the drain forever.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-Q1',
+      suspendPayload: { toolCallId: 'tc-Q1', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const first = session.queue({ content: 'first' });
+    void first.catch(() => {});
+    // Yield so the drain starts the first item and it parks on the suspension.
+    await waitFor(
+      () => session.getRecord().pendingResume !== undefined,
+      'first queued turn suspended',
+    );
+    const second = session.queue({ content: 'second' });
+    void second.catch(() => {});
+
+    // Resume fails in-process (no run enqueued for resumeStream).
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+
+    // Marker reverted → suspension retryable, queue not permanently parked.
+    expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
+
+    // Retry succeeds: the first queued turn completes, then the drain advances
+    // to the second item (proves the queue self-healed, not stuck behind a
+    // stale `resumedAt`).
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q1', text: 'first done' });
+    agent.enqueueRun({ finishReason: 'stop', runId: 'run-Q2', text: 'second done' });
+    await session.respondToToolApproval({ approved: true });
+    await first;
+
+    const secondResult = await second;
+    expect(secondResult.finishReason).toBe('stop');
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(session.getQueueDepth()).toBe(0);
+  });
+
+  it('a failed resume followed by close shuts down cleanly with no stuck in-flight turn (F4)', async () => {
+    // Small closeTimeoutMs so the parked-suspension close path force-closes
+    // promptly instead of waiting the default 30s product deadline.
+    const agent = new FakeAgent();
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, closeTimeoutMs: 1 },
+    });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-C',
+      suspendPayload: { toolCallId: 'tc-C', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    // Resume fails in-process (no run enqueued for resumeStream). The marker is
+    // reverted in-process (the session is still live here), so the original
+    // resume error surfaces and the turn ends without leaving an in-flight run.
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+    expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
+    expect(session.isRunning()).toBe(false);
+
+    // Closing a session parked on a suspension force-closes after the deadline;
+    // it completes cleanly (no stuck in-flight turn, no orphaned resume marker
+    // — the revert never masked the resume error nor wedged shutdown).
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(session.isClosed).toBe(true);
+    expect(session.isRunning()).toBe(false);
   });
 
   it('clears a stale non-queued pending response without replaying resumeStream', async () => {

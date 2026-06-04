@@ -1,4 +1,4 @@
-import { TABLE_WORKFLOW_SNAPSHOT } from '../../constants';
+import { TABLE_NOTIFICATIONS, TABLE_WORKFLOW_SNAPSHOT } from '../../constants';
 import type { TABLE_NAMES, TABLE_OBSERVATIONAL_MEMORY } from '../../constants';
 import type { StorageColumn } from '../../types';
 import { StoreOperations } from './base';
@@ -54,12 +54,17 @@ export class StoreOperationsInMemory extends StoreOperations {
       mastra_harness_session_events: new Map(),
       mastra_harness_thread_delete_fences: new Map(),
       mastra_harness_channel_inbox: new Map(),
+      mastra_harness_channel_bindings: new Map(),
       mastra_harness_channel_action_tokens: new Map(),
       mastra_harness_channel_action_receipts: new Map(),
       mastra_harness_channel_outbox: new Map(),
       mastra_harness_provider_callback_bindings: new Map(),
       mastra_harness_wakeups: new Map(),
       mastra_harness_workspace_actions: new Map(),
+      mastra_harness_plan_tasks: new Map(),
+      mastra_harness_run_summaries: new Map(),
+      mastra_tool_provider_connections: new Map(),
+      mastra_notifications: new Map(),
     };
   }
 
@@ -70,7 +75,9 @@ export class StoreOperationsInMemory extends StoreOperations {
   async insert({ tableName, record }: { tableName: TABLE_NAMES; record: Record<string, any> }): Promise<void> {
     const table = this.data[tableName];
     let key = record.id;
-    if ([TABLE_WORKFLOW_SNAPSHOT].includes(tableName) && !record.id && record.run_id) {
+    if (tableName === TABLE_NOTIFICATIONS && record.threadId && record.id) {
+      key = `${record.threadId}\0${record.id}`;
+    } else if ([TABLE_WORKFLOW_SNAPSHOT].includes(tableName) && !record.id && record.run_id) {
       key = record.workflow_name ? `${record.workflow_name}-${record.run_id}` : record.run_id;
       record.id = key;
     } else if (!record.id) {
@@ -84,7 +91,9 @@ export class StoreOperationsInMemory extends StoreOperations {
     const table = this.data[tableName];
     for (const record of records) {
       let key = record.id;
-      if ([TABLE_WORKFLOW_SNAPSHOT].includes(tableName) && !record.id && record.run_id) {
+      if (tableName === TABLE_NOTIFICATIONS && record.threadId && record.id) {
+        key = `${record.threadId}\0${record.id}`;
+      } else if ([TABLE_WORKFLOW_SNAPSHOT].includes(tableName) && !record.id && record.run_id) {
         key = record.run_id;
         record.id = key;
       } else if (!record.id) {

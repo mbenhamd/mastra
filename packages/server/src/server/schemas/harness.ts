@@ -46,6 +46,10 @@ export const harnessQueueResultPathParams = harnessSessionPathParams.extend({
   queuedItemId: z.string().min(1).describe('Queued item id'),
 });
 
+export const harnessChannelInboundPathParams = harnessNamePathParams.extend({
+  channelId: z.string().min(1).describe('Registered channel id'),
+});
+
 export const listHarnessSessionsQuerySchema = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
@@ -288,7 +292,9 @@ const channelInboxDiagnosticSchema = z
     signalId: z.string().optional(),
     queuedItemId: z.string().optional(),
     externalMessageId: z.string(),
-    delivery: z.enum(['message', 'queue']).optional(),
+    // Mirrors core's channel-ledger `delivery?: 'signal' | 'queue'` (PF-764 #2
+    // renamed pre-spec 'message' to 'signal'; this schema lagged the producer).
+    delivery: z.enum(['signal', 'queue']).optional(),
     mode: z.string().optional(),
     model: z.string().optional(),
     receivedAt: z.number(),

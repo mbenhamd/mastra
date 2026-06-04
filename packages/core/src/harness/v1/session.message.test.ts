@@ -13,12 +13,19 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Agent } from '../../agent';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { HarnessStorageAdmissionConflictError } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { buildFakeOutput, extractSignalContents } from './__test-utils__/fake-output';
-import { HarnessAdmissionConflictError, HarnessValidationError } from './errors';
+import {
+  HarnessAbortedError,
+  HarnessAdmissionConflictError,
+  HarnessBusyError,
+  HarnessOutputGenerationError,
+  HarnessValidationError,
+} from './errors';
 import { Harness } from './harness';
 
 // ---------------------------------------------------------------------------
@@ -188,7 +195,7 @@ function legacyMessageAdmissionHash(opts: {
   return createHash('sha256')
     .update(
       canonicalJsonForTest({
-        kind: 'message',
+        kind: 'signal',
         content: opts.content,
         mode: opts.modeId,
         model: opts.modelId,
@@ -284,7 +291,47 @@ describe('Session.message() — default path', () => {
     expect(turnSignal.aborted).toBe(false);
     ac.abort('caller-cancelled');
     expect(turnSignal.aborted).toBe(true);
-    expect((turnSignal as { reason?: unknown }).reason).toBe('caller-cancelled');
+    // §6.2: an external raw-string caller abort is normalized to a typed
+    // HarnessAbortedError('agent_aborted') — the caller string is not a structured reason.
+    expect((turnSignal as { reason?: unknown }).reason).toBeInstanceOf(HarnessAbortedError);
+    expect((turnSignal as { reason?: HarnessAbortedError }).reason).toMatchObject({ reason: 'agent_aborted' });
+
+    agent.releaseStream?.();
+    await pending.catch(() => undefined);
+  });
+
+  it('maps a parent run abort propagated via the caller signal to child-local parent_aborted (§6.2)', async () => {
+    const agent = new LiveStreamFakeAgent('default');
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const parent = await harness.session({ resourceId: 'u-shared', threadId: { fresh: true } });
+    // A subagent shares the parent's resource; built-in subagents are started with
+    // the parent tool's abort signal (spawn-subagent-tool), modelled here directly.
+    const child = await harness.session({
+      resourceId: 'u-shared',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+    });
+    const parentTurn = new AbortController();
+    const pending = child.message({ content: 'child work', abortSignal: parentTurn.signal, stream: true });
+    await vi.waitFor(() => expect(agent.calls).toHaveLength(1));
+
+    const childTurnSignal = agent.calls[0]!.options.abortSignal as AbortSignal;
+    // The parent run aborts with its own typed HarnessAbortedError; the child must
+    // re-label it as parent_aborted carrying the parent session id.
+    parentTurn.abort(new HarnessAbortedError(parent.id, 'agent_aborted'));
+    expect(childTurnSignal.aborted).toBe(true);
+    expect((childTurnSignal as { reason?: unknown }).reason).toBeInstanceOf(HarnessAbortedError);
+    expect((childTurnSignal as { reason?: HarnessAbortedError }).reason).toMatchObject({
+      reason: 'parent_aborted',
+      sessionId: child.id,
+      parentSessionId: parent.id,
+    });
 
     agent.releaseStream?.();
     await pending.catch(() => undefined);
@@ -471,7 +518,7 @@ describe('Session.message() — default path', () => {
     const resolveOperationAdmissionEvidence = storage.resolveOperationAdmissionEvidence.bind(storage);
     let skippedFirstLookup = false;
     storage.resolveOperationAdmissionEvidence = async opts => {
-      if (!skippedFirstLookup && opts.kind === 'message' && opts.admissionId === 'admit-race-completed') {
+      if (!skippedFirstLookup && opts.kind === 'signal' && opts.admissionId === 'admit-race-completed') {
         skippedFirstLookup = true;
         return { status: 'none' };
       }
@@ -654,7 +701,7 @@ describe('Session.message() — default path', () => {
       return writeMessageResultEvidence(record);
     };
     storage.resolveOperationAdmissionEvidence = async opts => {
-      if (raced && opts.kind === 'message' && opts.admissionId === 'exact-race') {
+      if (raced && opts.kind === 'signal' && opts.admissionId === 'exact-race') {
         return { status: 'none' };
       }
       return resolveOperationAdmissionEvidence(opts);
@@ -719,9 +766,19 @@ describe('Session.message() — default path', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    await expect(session.message({ content: 'hi', admissionId: 'admission-1' })).rejects.toThrow(
-      'completed evidence unavailable',
+    // §13.3f.1: `message()` is a public §4.2b boundary, so a raw storage
+    // failure is REDACTED on the in-process rejection — `.message` is the
+    // generic `harness.internal` text and the raw original is preserved
+    // local-only on `.cause`. (The behavior under test is that a *completed*
+    // evidence write failure is NOT converted into `failed` evidence; see the
+    // `storage.writes` assertions below.)
+    const thrown = await session.message({ content: 'hi', admissionId: 'admission-1' }).then(
+      () => undefined,
+      (e: unknown) => e,
     );
+    expect((thrown as Error).name).toBe('HarnessExecutionError');
+    expect((thrown as Error).message).toBe('An internal harness error occurred');
+    expect(((thrown as { cause?: Error }).cause as Error).message).toBe('completed evidence unavailable');
 
     expect(storage.writes).toContain('completed');
     expect(storage.writes).not.toContain('failed');
@@ -754,9 +811,22 @@ describe('Session.message() — default path', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
     try {
-      await expect(
-        session.message({ content: 'go', admissionId: 'stream-pending-failure', stream: true }),
-      ).rejects.toThrow('post-dispatch pending evidence unavailable');
+      // §13.3f.1: `message({ stream: true })` is a public §4.2b boundary. The
+      // post-dispatch pending-evidence write fails with a RAW storage error;
+      // the in-process rejection is REDACTED to the generic `harness.internal`
+      // shape with the raw original preserved local-only on `.cause`. (The
+      // durable `failed` evidence below still records the projected error.)
+      const streamThrown = await session
+        .message({ content: 'go', admissionId: 'stream-pending-failure', stream: true })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect((streamThrown as Error).name).toBe('HarnessExecutionError');
+      expect((streamThrown as Error).message).toBe('An internal harness error occurred');
+      expect(((streamThrown as { cause?: Error }).cause as Error).message).toBe(
+        'post-dispatch pending evidence unavailable',
+      );
 
       expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
       await nextTick();
@@ -870,7 +940,15 @@ describe('Session.message() — default path', () => {
       expect(outcome).toBeDefined();
       expect(outcome!.ok).toBe(false);
       if (!outcome!.ok) {
-        expect(outcome!.err).toMatchObject({ message: 'post-dispatch pending evidence unavailable' });
+        // §13.3f.1: the public `message({ stream: true })` rejection is REDACTED —
+        // generic `harness.internal` message with the raw original on `.cause`.
+        // The point under test is that this rejection lands BEFORE the failed
+        // evidence write finishes, which the redaction does not change.
+        expect((outcome!.err as Error).name).toBe('HarnessExecutionError');
+        expect((outcome!.err as Error).message).toBe('An internal harness error occurred');
+        expect(((outcome!.err as { cause?: Error }).cause as Error).message).toBe(
+          'post-dispatch pending evidence unavailable',
+        );
       }
       expect(agent.calls[0]!.options.abortSignal.aborted).toBe(true);
 
@@ -1169,6 +1247,123 @@ describe('Session.message() — structured + sync path', () => {
       session.message({ content: 'compute', admissionId: 'admission-1', output: Schema, sync: true } as any),
     ).rejects.toBeInstanceOf(HarnessValidationError);
   });
+
+  it('fails fast with HarnessBusyError when the session is busy (§3 / §4.4a)', async () => {
+    const { harness, agent } = setup();
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+    };
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    // Park a turn so a pending interaction keeps the session busy (don't await —
+    // a parked turn resolves only after resume).
+    const parked = session.message({ content: 'park' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(session.isBusy()).toBe(true);
+
+    await expect(session.message({ content: 'now', output: Schema, sync: true })).rejects.toBeInstanceOf(
+      HarnessBusyError,
+    );
+
+    void parked.catch(() => {});
+  });
+
+  it('throws HarnessOutputGenerationError(structured_output_missing_object) when the model produces no object (§4.5)', async () => {
+    const { harness, agent } = setup();
+    agent.fullOutput = { ...agent.fullOutput, finishReason: 'stop', object: undefined, tripwire: undefined };
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: any[] = [];
+    const off = session.subscribe(e => events.push(e));
+
+    await expect(session.message({ content: 'compute', output: Schema, sync: true })).rejects.toMatchObject({
+      name: 'HarnessOutputGenerationError',
+      code: 'harness.output_generation_failed',
+      reason: 'structured_output_missing_object',
+      sessionId: session.id,
+      runId: 'fake-run',
+    });
+    off();
+
+    // The run consumed tokens even though it failed — accounting is not dropped.
+    expect(session.getTokenUsage()).toMatchObject({ promptTokens: 1, completionTokens: 2, totalTokens: 3 });
+
+    // §10.2: the failed turn surfaces an `error` agent_end carrying the run's
+    // actual usage (not zero), since `full` was observed before the failure.
+    const agentEnd = events.find(e => e.type === 'agent_end');
+    expect(agentEnd).toMatchObject({
+      finishReason: 'error',
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+    });
+    expect(events.some(e => e.type === 'agent_start')).toBe(true);
+  });
+
+  it('throws HarnessOutputGenerationError(tripwire) when an output processor rejects the response (§4.5)', async () => {
+    const { harness, agent } = setup();
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      finishReason: 'other',
+      object: undefined,
+      tripwire: { reason: 'Content validation failed', processorId: 'guard' },
+    };
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.message({ content: 'compute', output: Schema, sync: true })).rejects.toMatchObject({
+      name: 'HarnessOutputGenerationError',
+      reason: 'tripwire',
+      sessionId: session.id,
+    });
+  });
+
+  it('wraps an opaque generate failure as HarnessOutputGenerationError(model_error) and preserves the cause (§4.5)', async () => {
+    const { harness, agent } = setup();
+    const boom = new Error('model exploded');
+    vi.spyOn(agent, 'generate').mockRejectedValue(boom);
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const rejection = await session
+      .message({ content: 'compute', output: Schema, sync: true })
+      .then(() => undefined)
+      .catch((err: unknown) => err);
+
+    expect(rejection).toBeInstanceOf(HarnessOutputGenerationError);
+    expect(rejection).toMatchObject({ reason: 'model_error', sessionId: session.id });
+    expect((rejection as HarnessOutputGenerationError).cause).toBe(boom);
+  });
+
+  it('classifies a structured-output schema validation MastraError as structured_output_validation_failed (§4.5)', async () => {
+    const { harness, agent } = setup();
+    // Mirror the agent layer: schema validation surfaces a MastraError with this
+    // stable id, which agent.generate() throws (stream/base/output-format-handlers.ts).
+    const validationError = new MastraError({
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.SYSTEM,
+      id: 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED',
+      text: 'Structured output validation failed: - answer: Required',
+    });
+    vi.spyOn(agent, 'generate').mockRejectedValue(validationError);
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const rejection = await session
+      .message({ content: 'compute', output: Schema, sync: true })
+      .then(() => undefined)
+      .catch((err: unknown) => err);
+
+    expect(rejection).toBeInstanceOf(HarnessOutputGenerationError);
+    expect(rejection).toMatchObject({ reason: 'structured_output_validation_failed', sessionId: session.id });
+    expect((rejection as HarnessOutputGenerationError).cause).toBe(validationError);
+  });
+
+  it('passes a harness-domain generate failure through untouched (not wrapped as model_error) (§4.5)', async () => {
+    const { harness, agent } = setup();
+    const domainErr = new HarnessValidationError('output', 'unsupported schema');
+    vi.spyOn(agent, 'generate').mockRejectedValue(domainErr);
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await expect(session.message({ content: 'compute', output: Schema, sync: true })).rejects.toBe(domainErr);
+  });
 });
 
 describe('Session.message() — per-turn overrides', () => {
@@ -1204,7 +1399,10 @@ describe('Session.message() — per-turn overrides', () => {
 
     const tools = { extra: { id: 'extra' } as any };
     await session.message({ content: 'hi', additionalTools: tools });
-    expect(agent.calls[0]!.options.toolsets).toEqual({ 'call:additional': tools });
+    // Per-call additionalTools land under `call:additional`. The always-on
+    // `harness:builtin` toolset (plan-task tools, §6.4) is also present.
+    expect(agent.calls[0]!.options.toolsets['call:additional']).toEqual(tools);
+    expect(agent.calls[0]!.options.toolsets['harness:builtin']).toBeDefined();
   });
 });
 

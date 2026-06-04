@@ -23,6 +23,7 @@ import type {
   AttachmentSource,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelDeliverySemantics,
   ChannelInboxItem,
   ChannelOutboxEnqueueOptions,
@@ -32,13 +33,14 @@ import type {
   HarnessAttachmentKind,
   HarnessPrimitiveType,
   PersistedRequestContextInput,
-  HarnessRowErrorCode,
   HarnessStorage,
   JsonValue,
+  PermissionRules,
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 import type { Workspace } from '../../workspace';
+import type { RequestContextInput } from './request-context-input';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,40 @@ export interface HarnessMode {
    * mode change. Must reference another mode's `id`.
    */
   transitionsTo?: string;
+
+  /**
+   * Base permission policy this mode establishes (§4.2e). When set, ENTERING the
+   * mode — session create, `switchMode`, or a plan-approval `transitionsTo` flip —
+   * seeds the session's `permissionRules` with a copy of this policy: the mode
+   * owns the base. Runtime `session.permissions.setPolicy()` and grants overlay it
+   * until the next mode entry re-establishes the base. Modes that omit this field
+   * leave the session's existing rules untouched (opt-in, backward compatible).
+   *
+   * This governs the permission GATE (allow/ask/deny at call time). It is
+   * orthogonal to the workspace, which stays owned by the session/resource.
+   */
+  permissions?: PermissionRules;
+
+  /**
+   * Optional workspace tool profile: the workspace tool CATEGORIES
+   * (`read` / `edit` / `execute`) this mode EXPOSES on the HARNESS-CONTROLLED tool
+   * surface — `mode.tools`, `mode.additionalTools`, and per-call `additionalTools`.
+   * A tool in those toolsets whose resolved category (via
+   * `HarnessConfig.toolCategoryResolver`) is a workspace category NOT listed in
+   * `expose` is withheld from the model; `mcp` / `other` / uncategorized tools and
+   * the harness built-ins pass through. Without a `toolCategoryResolver` nothing is
+   * filtered.
+   *
+   * SCOPE: this filters only what the harness injects via toolsets. The backing
+   * agent's OWN tools and provider-supplied workspace tools are assembled by the
+   * agent downstream and are governed by the permission policy (`permissions`
+   * above — e.g. a category `deny`), not by this exposure profile.
+   *
+   * This never touches the workspace itself. The durable world (files, sandbox,
+   * browser, provider resume state) stays tied to the session/resource ownership
+   * model and is unchanged across mode switches.
+   */
+  workspaceTools?: { expose: ToolCategory[] };
 
   /**
    * Arbitrary user-defined metadata. Pass-through only — the harness
@@ -177,7 +213,12 @@ export type ModelAuthStatus = 'authenticated' | 'needs_auth' | 'unknown';
 
 export type ChannelConversationKind = 'dm' | 'group-dm' | 'channel' | 'thread';
 export type ChannelIngressTrigger = 'message' | 'mention' | 'subscribed-message' | 'command';
-export type ChannelIngressDelivery = 'message' | 'queue';
+// §14.2 ingress delivery mode. `signal` interleaves the inbound into an active
+// run (or wakes a fresh one) sharing the run terminal (§21); `queue` appends a
+// sequential durable turn boundary. The canonical token is `signal` — it matches
+// the §14 spec surface (ChannelIngressOptions/Result) and the
+// `channel_ingress_admitted` event — superseding the earlier `message` spelling.
+export type ChannelIngressDelivery = 'signal' | 'queue';
 export type ChannelBindingMode = 'per-user-resource' | 'shared-resource' | 'thread-resource' | 'custom';
 
 export interface HarnessChannelTransportRequest {
@@ -234,6 +275,34 @@ export interface ChannelIngressContext extends ChannelIngressEnvelope {
   channelId: string;
   providerId: string;
 }
+
+/**
+ * §13.2/§14.2: transport-neutral result of `harness.handleChannelInboundRequest`.
+ * The core bridge owns registry resolution, provider verification, the §13.6
+ * readiness gate, and durable admission; the @mastra/server route is a thin
+ * transport mapper that turns this into an HTTP response/error envelope.
+ *
+ * On `kind: 'ok'`, `ackStatus` is the success HTTP status — `202` for a record-only
+ * ACK (the durable `received` row exists; a recovery worker finishes admission),
+ * `200` once admission reached `queued`/`accepted` or for an idempotent duplicate.
+ * Failure variants carry the HTTP status and the §13.3 error envelope shape.
+ */
+export type HarnessChannelInboundResult =
+  | {
+      kind: 'ok';
+      ackStatus: 200 | 202;
+      inboxItemId: string;
+      status: ChannelInboxItem['status'];
+      duplicate: boolean;
+      binding?: ChannelBinding;
+      sessionId?: string;
+      queuedItemId?: string;
+    }
+  | {
+      kind: 'not_found' | 'verify_failed' | 'not_ready' | 'conflict';
+      httpStatus: 400 | 401 | 404 | 409 | 503;
+      error: { code: string; message: string; details?: Record<string, unknown>; retryable?: boolean };
+    };
 
 export interface HarnessChannelDeliveryContext extends Omit<HarnessChannelRouteContext, 'route'> {
   binding: HarnessChannelBinding;
@@ -358,7 +427,14 @@ export interface HarnessChannelDiagnosticsOptions {
 }
 
 export interface HarnessChannelDiagnosticError {
-  code: HarnessRowErrorCode;
+  /**
+   * Namespaced `harness.*` wire code (§13.3f.1). The bare `HarnessRowErrorCode`
+   * stored on the row is projected to this public form before it crosses the
+   * wire; `reason` carries the originating bare code when several collapse onto
+   * one envelope.
+   */
+  code: string;
+  reason?: string;
   retryable?: boolean;
 }
 
@@ -490,6 +566,15 @@ export interface HarnessFileConfig {
   stagedAttachmentRetentionMs?: number;
   allowPrivateNetworkUrls?: boolean;
   allowedUrlMimeTypes?: readonly string[];
+  /**
+   * Maximum JSON-serialized byte size for a single emitted tool-event payload
+   * (`tool_start.input`, `tool_end.output`, approval/suspension data). A payload
+   * exceeding this is replaced AT EMIT by the stable oversized-payload sentinel
+   * so the durable event ledger and the live wire stay bounded while live and
+   * replay remain identical. Defaults high enough that normal model-generated
+   * tool results are untouched. Must be a non-negative integer.
+   */
+  maxEventPayloadBytes?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +856,13 @@ export interface UseSkillOptions {
    * exactly as {@link Session.signal}'s `modelOverride`.
    */
   modelOverride?: string;
+
+  /**
+   * Caller-supplied request context for the skill run (§4.4c). Only `app` may
+   * be set (see {@link MessageOverrides.requestContext}); other keys are
+   * rejected before the skill turn starts.
+   */
+  requestContext?: RequestContextInput;
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +949,7 @@ export interface HarnessConfigCommon {
    * change is incompatible with non-terminal persisted work.
    *
    * When set, recoverable work snapshots the token and later fails closed with
-   * `harness.runtime_dependency_drifted` if replay/resume observes a different
+   * `harness.runtime_drift` if replay/resume observes a different
    * current token, including when a previously configured token is later unset.
    * Legacy rows without a snapshot continue ID-only validation.
    */
@@ -915,6 +1007,23 @@ export interface HarnessConfigCommon {
     storage?: HarnessStorage;
 
     /**
+     * Persist the high-volume transient streaming events (`text_delta`,
+     * `subagent_text_delta`) to the durable session-event log. Defaults to
+     * `true` (every emitted event is persisted, backing storage-based SSE
+     * `Last-Event-ID` replay). Set `false` to skip persisting these per-token
+     * deltas — a large write reduction for streaming-heavy workloads (a 2000-token
+     * response drops ~2000 `appendSessionEvent` writes). §10.5: durable
+     * `text_delta` replay across restarts is explicitly NOT a goal and the
+     * cold-start snapshot does not synthesize missed deltas, so this is
+     * spec-aligned. With it off, a reconnect whose `Last-Event-ID` precedes a
+     * skipped delta gets a 412 `unreplayable_gap` and recovers via the session
+     * snapshot + message log (the §10.5-sanctioned path); live subscribers still
+     * receive every delta in real time. Recommended `false` when the UI reads
+     * from a separate read-model (e.g. Convex) rather than the harness SSE stream.
+     */
+    persistTransientStreamingEvents?: boolean;
+
+    /**
      * Maximum number of items allowed to wait in `pendingQueue` per session.
      * `session.queue(...)` rejects with `HarnessQueueFullError` when full.
      * Capacity check + durable append are atomic per session. Defaults to 100.
@@ -938,6 +1047,44 @@ export interface HarnessConfigCommon {
      * Must be a positive integer. Defaults to 30_000 ms (30s).
      */
     closeTimeoutMs?: number;
+
+    /**
+     * Behavior when `harness.session(...)` needs the write lease but another
+     * owner holds an unexpired lease (§5.8):
+     * - `'fail'` (default): reject immediately with `HarnessSessionLockedError`.
+     * - `'wait'`: block up to `lockWaitMs`, re-acquiring once the held lease
+     *   expires; throw `HarnessSessionLockedError` only if the wait elapses.
+     *   Recommended for SSE/browser-reconnect shapes where the previous lease
+     *   has not yet TTL'd out.
+     * - `'steal'`: reserved for a future operator fence; not yet implemented and
+     *   currently rejected at construction with `HarnessConfigError`.
+     */
+    lockMode?: 'fail' | 'wait';
+
+    /** Session write-lease TTL in ms (§5.8). Defaults to 30_000 (30s). */
+    lockTtlMs?: number;
+
+    /** Keep-alive renewal interval in ms (§5.8). Defaults to 10_000 (10s). */
+    lockRenewMs?: number;
+
+    /** Max ms `lockMode: 'wait'` blocks before failing closed. Defaults to 5_000. */
+    lockWaitMs?: number;
+
+    /**
+     * Cap on hydrated (live) sessions per harness instance (§5.4). Hydrating or
+     * creating another session past the cap pressure-evicts the
+     * least-recently-active unpinned session; if every live session is pinned
+     * (parked on a pending interaction), `harness.session(...)` rejects with
+     * `HarnessLiveSessionLimitError`. Defaults to `Infinity` (no cap).
+     */
+    maxLive?: number;
+
+    /**
+     * Auto-evict a live session after this many ms with no activity (§5.4).
+     * Skipped while a session has a pending approval/suspension/question/plan.
+     * Defaults to 2 hours.
+     */
+    idleTimeoutMs?: number;
   };
 
   /**
@@ -961,9 +1108,16 @@ export interface HarnessConfigCommon {
    * a session at depth equal to or greater than `maxDepth` returns a tool
    * error containing `HarnessSubagentDepthExceededError`. Default: `1`
    * (the top-level session can spawn one level of subagents).
+   *
+   * `maxConcurrent` caps how many `spawn_subagent` subagents a single parent
+   * session may run AT ONCE (backpressure). A spawn while that many are already
+   * in flight returns a tool error (`HarnessSubagentConcurrencyLimitError`)
+   * instead of unbounded child-session creation. Omitted ⇒ no per-parent limit
+   * (still bounded harness-wide by `sessions.maxLive`).
    */
   subagents?: {
     maxDepth?: number;
+    maxConcurrent?: number;
     types: Record<string, SubagentDefinition>;
   };
 
@@ -1082,11 +1236,55 @@ export interface HarnessConfigCommon {
    */
   workspace?: HarnessWorkspaceConfig;
 
-  // Remaining fields (files, intervals, observationalMemory) land here as we
-  // wire them up.
+  /**
+   * §9.2 Observational Memory. JSON-safe resolved defaults for OM in this
+   * harness; per-session model overrides live on `SessionRecord.observationalMemory`
+   * and are surfaced via `session.om.*`. `true` enables OM with defaults, `false`
+   * (or omitted) disables it. Raw observation rows remain advisory MemoryStorage
+   * data outside the session lease/CAS boundary (§5.2).
+   */
+  observationalMemory?: ObservationalMemoryConfig;
+
+  // Remaining fields (files, intervals) land here as we wire them up.
 
   [key: string]: unknown;
 }
+
+/**
+ * §9.2 — JSON-safe Observational Memory configuration. A harness-local subset of
+ * the memory-package OM options: it carries only serializable resolved defaults +
+ * scope, never live model objects, storage handles, functions, or processor
+ * internals. `processorOptions` is an opaque adapter-owned bag (JSON only).
+ */
+export type ObservationalMemoryConfig =
+  | boolean
+  | {
+      /** `false` disables OM; omitted means enabled when the object form is present. */
+      enabled?: boolean;
+      /**
+       * Creation-time lookup scope for OM records. Defaults to `'thread'`.
+       * `'resource'` is an explicit privacy/authorization choice — snapshots may
+       * summarize other threads for the same authenticated resource. Existing
+       * sessions never change scope implicitly.
+       */
+      scope?: 'thread' | 'resource';
+      /** Default model id for BOTH observer and reflector. */
+      model?: string;
+      observation?: {
+        /** Observer model id (overrides `model`). */
+        model?: string;
+        /** Observation trigger threshold (message tokens). */
+        messageTokens?: number;
+      };
+      reflection?: {
+        /** Reflector model id (overrides `model`). */
+        model?: string;
+        /** Reflection trigger threshold (observation tokens). */
+        observationTokens?: number;
+      };
+      /** Opaque adapter-owned OM processor options (JSON-safe only). */
+      processorOptions?: Record<string, JsonValue>;
+    };
 
 /**
  * Discriminated union of workspace configurations (§2.7).
@@ -1121,12 +1319,21 @@ export type HarnessWorkspaceConfig =
  * `subagent_*` events.
  */
 export interface SubagentDefinition {
-  /** Backing agent id. Must reference a key in `HarnessConfig.agents`. */
+  /**
+   * Backing agent id. Must reference a key in `HarnessConfig.agents`.
+   *
+   * NOTE: the subagent session resolves its running agent from its MODE
+   * (`mode.agentId`), not from this field directly. When `modeId` is set, it MUST
+   * be backed by this same `agentId` (validated at construction). When `modeId` is
+   * unset the subagent inherits the PARENT's mode — and therefore the parent
+   * mode's agent — so this field is advisory in that case.
+   */
   agentId: string;
 
   /**
-   * Mode the subagent's session runs in. Resolves in `HarnessConfig.modes`.
-   * If unset, the subagent inherits the parent's mode.
+   * Mode the subagent's session runs in. Resolves in `HarnessConfig.modes`; its
+   * `agentId` must equal this type's `agentId`. If unset, the subagent inherits
+   * the parent's current mode (and thus that mode's agent).
    */
   modeId?: string;
 
@@ -1144,17 +1351,46 @@ export interface SubagentDefinition {
   defaultModelId?: string;
 
   /**
-   * Tool surface override for this subagent type. When set, the subagent
-   * runs with exactly these tools (replaces the backing agent's tools).
-   * Mutually exclusive with the mode's own `tools` overlay — caller wins.
+   * Extra tools layered onto this subagent type's surface, on top of its mode's
+   * tools + the harness built-ins (subject to the same workspace-tool profile and
+   * permission gate as any other tool). To strictly CONSTRAIN a subagent to a
+   * minimal surface, also bind it to a `modeId` whose mode carries that surface
+   * and/or use the mode's `permissions` gate — this field augments, it does not
+   * hide the backing agent's own tools (which the agent assembles downstream).
+   *
+   * DURABILITY: this override is applied to the live child session in-memory and
+   * is not stored on the child record. For a DELEGATED subagent (`task_delegate`)
+   * it IS restored on reattach: the subagent type id is persisted on the plan-task
+   * delegation link (`delegatedSubagentTypeId`) and the reattach reconcile
+   * re-resolves this definition (`tools` + `workspace`) onto the reloaded child. A
+   * `spawn_subagent` child is transient (runs inline, auto-closed) and is not
+   * reattached, so its override lives only for that in-process run.
    */
   tools?: ToolsInput;
 
   /**
-   * Workspace ownership model for the subagent session. `'inherit'` reuses
-   * the parent's workspace; `'fresh'` provisions a new one. Default:
-   * `'inherit'`. Workspace plumbing lands in a later slice — the field is
-   * accepted now so configs don't need to change later.
+   * §SA/M4 — hard capability scope for this subagent: when set, the subagent may
+   * call ONLY the model-visible tools whose final exposed NAME is in this list.
+   * Enforced at the §4.2e pre-exposure gate (a non-listed tool is removed before
+   * the model call AND hard-denied at action time), so it constrains the agent's
+   * own tools + MCP tools + the per-turn surface — unlike `tools`, which only
+   * augments. HITL/local builtins (ask_user, submit_plan, plan-task tools) are
+   * always available; `spawn_subagent` and `task_delegate` are NOT auto-kept — to
+   * let a scoped subagent spawn/delegate, list them explicitly (prevents a
+   * restricted subagent from escalating via a broader child). Entries are final
+   * exposed names (after the agent's name normalization); it is a name allowlist,
+   * not a provider/server-identity scope. Restored on a delegated subagent's
+   * reattach via `delegatedSubagentTypeId`, like `tools`/`workspace`.
+   */
+  toolAllowlist?: string[];
+
+  /**
+   * Workspace ownership model for the subagent session. `'inherit'` (default)
+   * shares the parent's workspace via a refcount on the same registry entry;
+   * `'fresh'` provisions the subagent its own per-session workspace (only valid
+   * under `workspace.kind: 'per-session'`, validated at construction). This
+   * controls FILESYSTEM/sandbox ownership only — it does not reset the
+   * subagent's mode, tools, or permissions.
    */
   workspace?: 'inherit' | 'fresh';
 }
@@ -1200,6 +1436,14 @@ interface SessionResolveCommon {
    * should leave this unset; it defaults to `0`.
    */
   subagentDepth?: number;
+
+  /**
+   * @internal — the `subagents.types` key this child is spawned/delegated under
+   * (M4). Persisted on the child `SessionRecord` so its per-subagent overrides
+   * (tools / workspace / toolAllowlist) survive a direct-by-id hydrate, not only
+   * the parent's delegation-reattach. Top-level callers leave this unset.
+   */
+  subagentTypeId?: string;
 }
 
 export interface SessionResolveByThread extends SessionResolveCommon {
@@ -1225,22 +1469,7 @@ export interface SessionResolveByIdScoped extends SessionResolveCommon {
   threadId?: never;
 }
 
-/**
- * Resource-only resolution: hydrate the most-recent active session for
- * `resourceId`, or create a fresh thread + session if none exists. Useful
- * for single-user CLIs that just want "give me a session for this user".
- */
-export interface SessionResolveByResource extends SessionResolveCommon {
-  resourceId: string;
-  threadId?: never;
-  sessionId?: never;
-}
-
-export type SessionResolveOptions =
-  | SessionResolveByThread
-  | SessionResolveById
-  | SessionResolveByIdScoped
-  | SessionResolveByResource;
+export type SessionResolveOptions = SessionResolveByThread | SessionResolveById | SessionResolveByIdScoped;
 
 // ---------------------------------------------------------------------------
 // Sub-namespace option shapes for the Harness class.
@@ -1315,15 +1544,6 @@ export interface ThreadCloneOptions {
   metadata?: Record<string, unknown>;
   /** Forwarded to the storage adapter for message-copy filtering. */
   messageLimit?: number;
-}
-
-export interface ThreadSelectOrCreateOptions {
-  resourceId: string;
-  /** If supplied and owned by `resourceId`, returned as-is. Otherwise create. */
-  threadId?: string;
-  /** Used only when creating. */
-  title?: string;
-  metadata?: Record<string, unknown>;
 }
 
 export interface ThreadDeleteOptions {
@@ -1449,6 +1669,16 @@ export interface MessageOverrides {
    * `HarnessMode.additionalTools` semantics.
    */
   additionalTools?: ToolsInput;
+
+  /**
+   * Caller-supplied request context for this turn (§4.4c). Only `app` — a
+   * canonical-JSON application metadata bag surfaced to tools as
+   * `HarnessRequestContext.app` — may be set; any other top-level key is
+   * rejected with `HarnessValidationError` before admission. Replaced per
+   * turn, never merged. Rejected when the turn would interleave into an
+   * already-active run (it could not become tool-visible there).
+   */
+  requestContext?: RequestContextInput;
 }
 
 /**
@@ -1531,6 +1761,11 @@ export interface QueueAdmissionResult {
 export interface InboxResponseOptions {
   itemId?: string;
   responseId?: string;
+  // NOTE (§4.4c): inbox responses are also a fresh entry point that may carry a
+  // caller `requestContext.app`. Wiring it correctly requires including the
+  // normalized DTO in the response-admission hash (so duplicate `responseId`s
+  // with different `app` do not alias) without plumbing it into the resumed run
+  // — deferred to a dedicated follow-up so it is not left accept-but-ignore here.
 }
 
 export interface InboxResponseResult {
@@ -1565,11 +1800,23 @@ export interface QueueOverrides {
   /** Override the active mode for this queued turn. Must be a known mode id. */
   mode?: string;
   /**
-   * If `true`, auto-grant any tool-approval interrupts raised during this
-   * queued turn. Mirrors `HarnessOverrides.yolo`. Persisted on the queued
-   * item so it survives crash replay.
+   * If `true`, clear the POLICY-level approval reason for this queued turn — an
+   * effective `ask` from the §4.2e permission gate, the same reason a session
+   * grant clears. It suppresses ONLY that `policy` reason: a tool-owned approval
+   * (a tool's static `requireApproval` or its `needsApprovalFn`) still suspends,
+   * and a `deny` is still a hard block. Persisted on the queued item so it
+   * survives crash replay (and carried across suspend → resume).
    */
   yolo?: boolean;
+
+  /**
+   * Caller-supplied request context for this queued turn (§4.4c). Only `app`
+   * may be set (see {@link MessageOverrides.requestContext}); other keys are
+   * rejected before admission. The normalized `app` bag is persisted on the
+   * queued item and rebuilt at drain time, so recovered items use the
+   * persisted value — never a fresh caller value.
+   */
+  requestContext?: RequestContextInput;
 }
 
 /** Options accepted by `Session.queue(...)`. */
@@ -1651,6 +1898,15 @@ export interface SessionSignalOptions {
    * its own abort controller).
    */
   abortSignal?: AbortSignal;
+
+  /**
+   * Caller-supplied request context for the run this signal wakes (§4.4c).
+   * Only `app` may be set (see {@link MessageOverrides.requestContext}); other
+   * keys are rejected before admission. Like `abortSignal`, it applies only
+   * when the signal wakes a fresh idle run; supplying it on an active-delivery
+   * signal is rejected, since it could not reach the in-flight run's tools.
+   */
+  requestContext?: RequestContextInput;
 }
 
 /** Result returned by `Session.signal(...)` (resolved on the first await tick). */
@@ -1769,6 +2025,18 @@ export interface RegisterSandboxAccessParams {
 }
 
 /**
+ * §6.1: tool-authored custom event input for `ctx.emitCustomEvent`. The harness
+ * validates `type` and fills event/session identity (`id`, `sessionId`,
+ * `timestamp`, `runId`) before dispatching the resulting `CustomEvent` (§10.2).
+ * `type` must use a dotted custom prefix (e.g. `myorg.tool.progress`) and must
+ * not collide with a reserved built-in family.
+ */
+export interface HarnessCustomEventInput {
+  type: string;
+  payload?: JsonValue;
+}
+
+/**
  * Harness-specific context surfaced on the agent's `RequestContext` under
  * the `'harness'` key. See spec §6 for the full contract.
  *
@@ -1777,8 +2045,17 @@ export interface RegisterSandboxAccessParams {
  * For a subagent: depth ≥ 1, `source: 'subagent'`, parent linkage populated.
  */
 export interface HarnessRequestContext<TState = unknown> {
-  /** Harness instance id. Useful for log correlation across processes. */
-  harnessId: string;
+  /**
+   * §6.1: stable harness NAMESPACE (the registered harness name) — identical
+   * across processes and sessions for the same logical harness. Use this for
+   * durable identity decisions.
+   */
+  harnessName: string;
+  /**
+   * §6.1: per-PROCESS harness instance id — useful for log correlation across a
+   * single running process. Distinct from {@link harnessName} (the stable namespace).
+   */
+  harnessInstanceId: string;
   /** The session this tool invocation runs against. Stable for the call's lifetime. */
   sessionId: string;
   /** The thread the session is bound to. Stable for the call's lifetime. */
@@ -1814,6 +2091,14 @@ export interface HarnessRequestContext<TState = unknown> {
   /** Register a pending sandbox-access approval. */
   registerSandboxAccess?: (params: RegisterSandboxAccessParams) => Promise<void>;
   /**
+   * §6.1/§6.3/§10.2: emit a tool-authored custom event to this session's
+   * subscribers. The harness validates `type` (dotted custom prefix, not a
+   * reserved built-in family) and the payload (JSON-serializable), then stamps
+   * event + session identity before dispatch. Throws `HarnessValidationError` at
+   * call time on a reserved/invalid type or non-serializable payload.
+   */
+  emitCustomEvent: (event: HarnessCustomEventInput) => void;
+  /**
    * Extend the current session lease before work that may exceed the default
    * lease TTL or block the event loop long enough for the heartbeat to miss.
    */
@@ -1837,9 +2122,32 @@ export interface HarnessRequestContext<TState = unknown> {
   /**
    * Workspace handle (§6.1). Only present when the harness is configured
    * with a workspace and the session has resolved (or can lazily resolve)
-   * one. Tools should null-check before use.
+   * one. Tools should null-check before use. Equivalent to `getWorkspace()`.
    */
   workspace?: Workspace;
+
+  /**
+   * §6.1 workspace access. `getWorkspace()` and `workspace` are NON-materializing
+   * reads (return the cached handle or `undefined`, never a cold start);
+   * `resolveWorkspace()` is the explicit async materialize/resume path. A turn
+   * whose tools never need the filesystem can avoid cloud-sandbox cold starts by
+   * not calling `resolveWorkspace()`. `hasWorkspace()` reports configuration;
+   * `isWorkspaceReady()` reports whether a handle is already warm.
+   */
+  hasWorkspace: () => boolean;
+  isWorkspaceReady: () => boolean;
+  getWorkspace: () => Workspace | undefined;
+  resolveWorkspace: () => Promise<Workspace>;
+
+  /**
+   * §6.1 / §5.1b.4 / §5.6 / §10.6 bounded, redacted activity timeline — a
+   * READ-TIME projection over this session's durable thread/message log, goal,
+   * and pending inbox (plus descendant subagent entries under
+   * `includeDescendants`). Never settles promises, proves delivery, claims rows,
+   * or mutates state. The lower-durability source kinds (operation-result /
+   * durable-work / channel / file-reference) are not emitted yet.
+   */
+  getActivityTimeline: (opts?: ActivityTimelineOptions) => Promise<SessionActivityTimeline>;
 
   /**
    * Invoke a skill programmatically from inside a tool. Delegates to
@@ -1869,4 +2177,103 @@ export interface GoalOptions {
   judgeModel?: string;
   maxTurns?: number;
   kickoff?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// §5.1b.4 / §5.6 / §10.6 — activity timeline read model.
+//
+// `SessionActivityTimeline` is a bounded, redacted UX projection assembled at
+// READ TIME from existing durable authorities (the thread/message log,
+// structured tool_call/tool_result parts, session-owned goal + pending inbox,
+// and — under `includeDescendants` — descendant subagent summaries). It is NOT a
+// persisted record, durable event stream, or generic activity ledger, never
+// settles SDK promises / proves delivery / claims rows / mutates storage, and
+// omits raw payloads, request context, token strings, hashes, and unredacted
+// errors. Ordering is `(occurredAt ASC, sessionId ASC, entryId ASC)`; the cursor
+// is a forward seek over that key plus the addressed session + `includeDescendants`
+// scope (a cursor from one scope rejects for the other). See HARNESS_V1_SPEC.md
+// §5.1b.4 + the §9 session-snapshot read-time-model rules.
+// ---------------------------------------------------------------------------
+
+export interface ActivityTimelineOptions {
+  cursor?: string;
+  limit?: number;
+  /** When true, include descendant subagent entries per the §5.6 / §10.6 ownership rules. */
+  includeDescendants?: boolean;
+}
+
+export type ActivityTimelineEntryKind =
+  | 'message'
+  | 'message-tool-call'
+  | 'message-tool-result'
+  | 'operation-result'
+  | 'pending-inbox'
+  | 'goal'
+  | 'durable-work'
+  | 'channel'
+  | 'subagent'
+  | 'file-reference';
+
+export type ActivityTimelineSourceKind =
+  | 'thread-message'
+  | 'message-part'
+  | 'result-lookup'
+  | 'session-snapshot'
+  | 'pending-inbox'
+  | 'subagent-session'
+  | 'durable-work-summary'
+  | 'channel-diagnostics'
+  | 'workspace-projection'
+  | 'application-datastore';
+
+export interface ActivityTimelineSourceRef {
+  kind: ActivityTimelineSourceKind;
+  id: string;
+  route?: 'thread-messages' | 'signal-result' | 'queue-result' | 'subagent-inbox' | 'channel-diagnostics';
+}
+
+export interface ActivityTimelineActor {
+  kind: 'user' | 'assistant' | 'system' | 'tool' | 'channel' | 'goal' | 'subagent' | 'harness';
+  label?: string;
+  channelId?: string;
+  providerId?: string;
+}
+
+export interface ActivityTimelineEntry {
+  /**
+   * Deterministic, source-derived id (e.g. `message:<sessionId>:<messageId>` or
+   * `message-tool-call:<sessionId>:<messageId>:<partIndex>`). Stable for UI
+   * de-dupe while the source evidence exists; NOT an SSE id or read cursor.
+   */
+  entryId: string;
+  kind: ActivityTimelineEntryKind;
+  sessionId: string;
+  threadId: string;
+  occurredAt: number;
+  updatedAt?: number;
+  runId?: string;
+  signalId?: string;
+  queuedItemId?: string;
+  toolCallId?: string;
+  subagentSessionId?: string;
+  parentSessionId?: string;
+  parentEntryId?: string;
+  depth?: number;
+  actor?: ActivityTimelineActor;
+  sourceDurability: 'durable' | 'retention-bound' | 'best-effort' | 'live-only';
+  sourceRefs: ActivityTimelineSourceRef[];
+  title: string;
+  summary?: string;
+  /** Redacted, display-oriented JSON only — never raw payloads/args/results. */
+  payload?: JsonValue;
+}
+
+export interface SessionActivityTimeline {
+  sessionId: string;
+  threadId: string;
+  generatedAt: number;
+  includeDescendants: boolean;
+  entries: ActivityTimelineEntry[];
+  nextCursor?: string;
+  truncated: boolean;
 }

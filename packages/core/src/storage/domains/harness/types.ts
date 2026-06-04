@@ -140,7 +140,15 @@ export interface QueuedItem {
  * amount of UX surface so a fresh subscriber can render the prompt without
  * re-fetching the snapshot.
  *
- * See HARNESS_V1_SPEC.md §5.1 ("Persistence shapes — `pendingResume`").
+ * §5.1f models pending interactions as four separate typed fields
+ * (`pendingApproval`/`pendingSuspension`/`pendingQuestion`/`pendingPlan`). This
+ * implementation deliberately uses ONE unified `pendingResume` field
+ * discriminated by `kind` (see §5.1f "Implementation note"): a single field
+ * structurally guarantees the §5.1f one-pending-interaction-per-run slot
+ * invariant (two simultaneous pendings are unrepresentable, not merely
+ * disallowed), and it carries the `sandbox-access` kind that the four-field
+ * shape has no slot for. The four spec interfaces are the per-`kind` payload
+ * contracts surfaced through `payload` / the display projection.
  */
 export interface PendingResume {
   kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
@@ -155,14 +163,40 @@ export interface PendingResume {
   requestedAt: number;
   /** Present when this pending resume belongs to a queued turn. */
   queuedItemId?: string;
+  /**
+   * Present when this pending resume belongs to an owned `signal()` turn whose
+   * durable per-`signalId` result evidence is left `pending` while suspended.
+   * On terminal (non-suspended) resume the harness settles this signal's
+   * evidence and projects `signal_completed`/`signal_failed` (§4.2f) so a
+   * suspended owned signal does not stay pending forever.
+   */
+  originSignalId?: string;
   /** Mode whose backing agent produced this pending resume. */
   modeId?: string;
+  /**
+   * Per-turn `yolo` carried forward across suspend → resume so a queued turn
+   * that requested auto-grant (`QueueOverrides.yolo`) keeps auto-granting
+   * tool-approval interrupts on the resumed run too. `deny` is still a hard
+   * block; `yolo` never bypasses it. Absent ⇒ no auto-grant on resume.
+   */
+  yolo?: boolean;
   /**
    * Runtime identities captured when this work was admitted. Recovery uses
    * these stable ids to fail closed if the process restarts with a different
    * execution surface.
    */
   runtimeDependencies?: HarnessRuntimeDependencyRefs;
+  /**
+   * §5.1 caller request context (the `app` metadata bag + trusted `channel`
+   * projection) captured from the turn that SUSPENDED, so a `respondTo*` resume
+   * rebuilds the SAME app bag the suspended run carried — mirroring how
+   * `QueuedItem.requestContext` is threaded back in on queue drain. This is the
+   * ORIGINAL turn's context, never the responder's. Absent on legacy rows ⇒
+   * resume rebuilds with no caller app bag (prior behaviour). Storage-internal:
+   * stripped from the public `SessionDisplayPending` / `PendingInteraction`
+   * projections alongside `runtimeDependencies`.
+   */
+  requestContext?: PersistedRequestContextInput;
   /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
@@ -177,6 +211,8 @@ export interface PendingResume {
     // tool-approval
     toolCategory?: string;
     input?: unknown;
+    /** Reasons a conditional approval predicate surfaced (§10.2 `approvalReasons`). */
+    approvalReasons?: string[];
     // tool-suspension
     suspendData?: unknown;
     // question
@@ -313,6 +349,33 @@ export interface SessionRecord {
   subagentDepth?: number;
 
   /**
+   * The `subagents.types` key this session was spawned/delegated under, when it
+   * is a subagent child (M4). Persisted so a child hydrated DIRECTLY by id — not
+   * only via the parent's delegation-reattach — can re-resolve its
+   * `SubagentDefinition` and restore the per-subagent overrides (`tools`,
+   * `workspace`, and the `toolAllowlist` HARD capability scope) before any turn
+   * or queue drain. Without this a restored/other-instance hydrate of a durable
+   * delegated child would run fail-OPEN (its allowlist lost). Absent on
+   * top-level sessions and on records persisted before this field landed.
+   */
+  subagentTypeId?: string;
+
+  /**
+   * True when this subagent child was created with a `toolAllowlist` (a HARD
+   * capability scope), persisted so hydrate can FAIL CLOSED rather than fail
+   * OPEN on config drift (M4): if `subagentTypeId`'s definition was DELETED from
+   * config while this child persists, the allowlist cannot be re-resolved — but
+   * because this flag records that the child WAS scoped, hydrate restores an
+   * empty allowlist (deny every non-builtin tool) instead of leaving it unset.
+   * Distinguishes a deleted-scoped child from a legitimately-unscoped one (which
+   * leaves the flag false/absent and is correctly left unrestricted). Absent on
+   * records persisted before this field landed — such a legacy scoped child
+   * whose type is later deleted is indistinguishable from an unscoped one and
+   * cannot fail closed; newly created scoped subagents always carry the flag.
+   */
+  subagentToolAllowlistScoped?: boolean;
+
+  /**
    * True when the session was created with `threadId: { fresh: true }` and
    * therefore owns the underlying thread under `MemoryStorage`. Read by the
    * harness layer on cascade-delete to decide whether to tear the thread
@@ -328,6 +391,16 @@ export interface SessionRecord {
   // Permissions
   permissionRules: PermissionRules;
   sessionGrants: SessionGrants;
+  /**
+   * §4.2e seed provenance: the stable hash of the `permissionRules` last SEEDED
+   * by a mode entry (create / switchMode / plan-approval transition). Runtime
+   * `setPolicy`/grant mutators do NOT update it, so `hash(permissionRules) ===
+   * permissionRulesSeedHash` means "untouched since seed". On rehydrate the
+   * harness uses this to re-seed an UNTOUCHED session when the mode's declared
+   * permissions changed since it was persisted, while leaving runtime-overlaid
+   * sessions alone. Absent on legacy records ⇒ no reconcile (leave as-is).
+   */
+  permissionRulesSeedHash?: string;
 
   // Counters
   tokenUsage: TokenUsage;
@@ -336,13 +409,29 @@ export interface SessionRecord {
   // At most one outstanding agent suspension per session (see PendingResume).
   pendingQueue: QueuedItem[];
   pendingResume?: PendingResume;
+  /**
+   * Narrow durable operational projection of the session's currently active or
+   * recently interrupted run (§5.1a.2 / §5.1e). Not an admission ledger, event
+   * log, outbox receipt, or replacement for agent/workflow run storage. Carries
+   * the stable runtime identities used for fail-closed hydration repair after a
+   * restart so a run is never silently resumed against a drifted tool/model/
+   * workspace surface.
+   */
+  currentRun?: HarnessRunOperationalState;
   queueAdmissionReceipts?: Record<string, QueueAdmissionReceipt>;
   inboxResponseReceipts?: Record<string, InboxResponseReceipt>;
 
-  // Observational memory config (per-session override)
+  // Observational memory config — JSON-safe resolved defaults + per-session model
+  // overrides used to rebuild the OM wrapper after hydration (§5.1a). Never stores
+  // active observations, buffered chunks/reflections, history generations, raw
+  // config blobs, provider clients, functions, or processor locks — those remain
+  // advisory MemoryStorage rows outside the session lease/CAS boundary.
   observationalMemory?: {
+    scope?: 'thread' | 'resource';
     observerModelId?: string;
     reflectorModelId?: string;
+    observationThreshold?: number;
+    reflectionThreshold?: number;
   };
 
   // Active goal
@@ -382,6 +471,180 @@ export interface SessionRecord {
   };
 }
 
+/** §5.1e — lifecycle status of a `HarnessRunOperationalState`. */
+export type HarnessRunStatus =
+  | 'starting'
+  | 'running'
+  | 'waiting'
+  | 'resuming'
+  | 'completed'
+  | 'failed'
+  | 'interrupted';
+
+/** §5.1e — which entry-point operation a run is executing. */
+export type HarnessRunOperationRef =
+  | { kind: 'signal'; admissionId?: string; admissionHash?: string; signalId?: string; channelInboxItemId?: string }
+  | {
+      kind: 'queue';
+      queuedItemId: string;
+      admissionId?: string;
+      admissionHash?: string;
+      signalId?: string;
+      channelInboxItemId?: string;
+    }
+  | { kind: 'sync-generate'; operationId: string }
+  | { kind: 'use-skill'; skillName: string; admissionId?: string; admissionHash?: string; signalId?: string }
+  | { kind: 'inbox-response'; itemId: string; responseId: string; actionReceiptId?: string; resumeAttemptId: string };
+
+/**
+ * §5.1e — durable operational state for the session's current/most-recent run. Holds the stable
+ * runtime identities (registry/config IDs only — never live closures or client objects) needed to
+ * rehydrate or FAIL CLOSED after restart. Persisted at run-start and on each lifecycle transition.
+ */
+export interface HarnessRunOperationalState {
+  runId: string;
+  /** Mirrors the owning SessionRecord namespace; a mismatch is corrupt state, not a retargeting hint. */
+  harnessName: string;
+  traceId?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  /** Resolved from the effective mode's `HarnessMode.agentId` at run start, persisted with mode/model. */
+  agentId: string;
+  /** Stable tool registry/config IDs only — not names, schemas, toolset objects, or client callbacks. */
+  toolIds?: string[];
+  /** Stable MCP binding/server IDs only — not transport sessions, subscriptions, or callbacks. */
+  mcpBindingIds?: string[];
+  workspaceProviderId?: string;
+  /**
+   * Snapshot of `HarnessConfig.runtimeCompatibilityGeneration` at run start. When present on a
+   * non-terminal `currentRun`, hydration requires the current config's generation to match exactly;
+   * a mismatch means the runtime-dependency surface drifted and the harness fails closed. Absence
+   * falls back to ID-only validation.
+   */
+  runtimeCompatibilityGeneration?: string;
+  /**
+   * `true` when the run admitted a per-run executable tool surface that cannot be reconstructed from
+   * stable persisted tool identities (e.g. `signal({ addTools })` / `useSkill({ addTools })` /
+   * closure-backed extraTools). Those implementations are process-local closures that never persist,
+   * so on hydration the harness fails closed for any non-terminal run carrying this flag (§5.7/§6.2).
+   * Per-run; subagent runs do not inherit a parent's value.
+   */
+  nonRehydratableToolSurface?: boolean;
+  requestContext?: PersistedRequestContextInput;
+  operation: HarnessRunOperationRef;
+  modeId: string;
+  modelId: string;
+  yolo?: boolean;
+  /**
+   * Pending item ids duplicated only for quick inspection after hydration. The authoritative
+   * payloads remain the canonical `pendingResume`/pending fields; hydration rebuilds this array from
+   * those — extra, missing, or wrong-kind entries do not authorize a pending item.
+   */
+  pendingItems?: Array<{
+    itemId: string;
+    kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
+    requestedAt: number;
+  }>;
+  status: HarnessRunStatus;
+  startedAt: number;
+  updatedAt: number;
+  terminalAt?: number;
+  finishReason?: string;
+  error?: { code: HarnessRowErrorCode; message: string };
+}
+
+// ---------------------------------------------------------------------------
+// Span-summary (S3/S4/O1/O2/O6) — durable per-run history.
+//
+// One row per COMPLETED run, written once (first terminal wins) at the run's
+// non-suspended terminal. This is analytics HISTORY — distinct from the
+// single-run, fail-closed `HarnessRunOperationalState` recovery lane and never
+// overwritten in place. Token usage is stored RAW; cost is a consumer concern
+// (Doxa prices usage + modelId). PII-light: NO tool inputs/outputs are stored,
+// only counts/durations.
+// ---------------------------------------------------------------------------
+
+/** Terminal disposition of a run in the durable summary. */
+export type HarnessRunSummaryStatus = 'completed' | 'failed' | 'interrupted';
+
+/** Compact per-run tool aggregate stored on a run summary (bounded by distinct tool names; no per-call payloads). */
+export interface HarnessRunSummaryToolRollup {
+  count: number;
+  errors: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+  perTool: Record<string, { count: number; errors: number; totalDurationMs: number }>;
+}
+
+/** Durable summary of one completed run (span-summary O1/O2). */
+export interface HarnessRunSummary {
+  harnessName: string;
+  runId: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  /** The driving operation's kind, when known (signal/queue/sync-generate/use-skill/inbox-response). */
+  operationKind?: HarnessRunOperationRef['kind'];
+  status: HarnessRunSummaryStatus;
+  finishReason: string;
+  /**
+   * `true` when the run's start was lost to a process restart: `startedAt`,
+   * `durationMs`, and `toolRollup` are then absent (not falsely precise), while
+   * usage + identity + finishReason are still recorded.
+   */
+  reconstructed: boolean;
+  startedAt?: number;
+  completedAt: number;
+  durationMs?: number;
+  usage: TokenUsage;
+  toolRollup?: HarnessRunSummaryToolRollup;
+  /** When the summary was finalized (the run's terminal time; set by the writer, equals `completedAt`). */
+  createdAt: number;
+}
+
+/** Save one run summary (span-summary). Idempotent: the FIRST terminal for a runId wins; later writes are no-ops. */
+export interface SaveRunSummaryInput {
+  summary: HarnessRunSummary;
+}
+
+export interface LoadRunSummaryInput {
+  harnessName?: string;
+  runId: string;
+}
+
+/**
+ * List a session's completed-run summaries, newest first, ordered by
+ * `(completedAt DESC, runId DESC)`. The keyset cursor is COMPOSITE
+ * (`beforeCompletedAt` + `beforeRunId`) so rows that share a `completedAt`
+ * across a page boundary are neither skipped nor duplicated. Pass BOTH cursor
+ * fields from the previous result's `next*` to fetch the next page.
+ */
+export interface ListRunSummariesInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId?: string;
+  limit?: number;
+  /** Composite keyset cursor (completedAt component). Pair with `beforeRunId`. */
+  beforeCompletedAt?: number;
+  /** Composite keyset cursor (runId tiebreaker for rows sharing `beforeCompletedAt`). */
+  beforeRunId?: string;
+}
+
+export interface ListRunSummariesResult {
+  summaries: HarnessRunSummary[];
+  /** Present when more rows may exist; pass with `nextBeforeRunId` as the next call's cursor. */
+  nextBeforeCompletedAt?: number;
+  /** Composite cursor tiebreaker for the next page. */
+  nextBeforeRunId?: string;
+}
+
 /**
  * Lightweight projection of `SessionRecord`, used by `listSessions(...)`.
  */
@@ -415,7 +678,11 @@ export interface DeleteSessionOptions {
   requireClosed?: boolean;
 }
 
-export type HarnessOperationKind = 'message' | 'queue';
+// §5.1d / §10-queue-admission-and-tombstones: the durable operation-kind token
+// is `'signal' | 'queue'`. (`'message'` was pre-spec drift.) Durable backends
+// that persist legacy `'message'` rows must normalize them to `'signal'` on
+// read; the in-memory backend creates rows in-process so it has no legacy data.
+export type HarnessOperationKind = 'signal' | 'queue';
 
 export interface HarnessStoredPublicError {
   code: string;
@@ -494,9 +761,10 @@ export interface HarnessRuntimeDependencyRefs {
   modelId?: string;
   /**
    * Provider-backed workspaces persist the configured provider id. Shared
-   * workspaces have no durable provider id, so new work records a process-
-   * scoped shared sentinel and fails closed after restart. Explicitly null
-   * means no workspace was configured at admission. Undefined means legacy
+   * workspaces have no durable provider id, so they record the restart-stable
+   * constant `'shared'` (PF-818) — a workspace-KIND change still drifts, but a
+   * process restart of the same shared runtime does not fail closed. Explicitly
+   * null means no workspace was configured at admission. Undefined means legacy
    * evidence that predates runtime dependency capture.
    */
   workspaceProviderId?: string | null;
@@ -636,31 +904,48 @@ export type HarnessRowErrorCode =
   | 'queue_full'
   | 'override_conflict'
   | 'channel_binding_closed'
+  | 'platform_unlinked'
+  | 'operator_closed'
   | 'channel_payload_conflict'
   | 'delivery_operation_unavailable'
   | 'provider_payload_invalid'
   | 'worker_unavailable'
   | 'unknown';
 
+/**
+ * §14.3 base channel request-context fields. Descriptive metadata copied from the verified ingress
+ * envelope + resolved binding; never overrides Harness identity. Persisted so the §14.1 recovery
+ * worker can reconstruct the `ChannelIngressContext` and re-run `ingress.resolveResource` for a
+ * 'received' row whose original envelope is gone (`conversationKind`/`trigger` are the policy input).
+ */
+interface BaseChannelRequestContext {
+  harnessName: string;
+  channelId: string;
+  providerId: string;
+  platform: string;
+  conversationKind?: 'dm' | 'group-dm' | 'channel' | 'thread';
+  trigger?: 'message' | 'mention' | 'subscribed-message' | 'command';
+  externalTenantId?: string;
+  externalChannelId?: string;
+  externalThreadId: string;
+  replyToMessageId?: string;
+  /** Platform actor; `externalUserId` is the platform id, `linkedResourceId` is set only after app-level identity linking. */
+  actor?: { externalUserId: string; displayName?: string; linkedResourceId?: string };
+  /** Structured delivery capabilities of the channel surface (§14.3). */
+  capabilities?: { markdown?: boolean; buttons?: boolean; files?: boolean; edits?: boolean; reactions?: boolean };
+}
+
+/**
+ * §14.3 channel request context (tool-visible via §6.1). Inbound turns carry a verified
+ * `externalMessageId`; binding-backed (scheduled/proactive) turns carry a required `bindingId` and
+ * no inbound message id.
+ */
+export type ChannelRequestContext =
+  | (BaseChannelRequestContext & { origin: 'inbound'; bindingId?: string; externalMessageId: string })
+  | (BaseChannelRequestContext & { origin: 'scheduled' | 'proactive'; bindingId: string; externalMessageId?: never });
+
 export interface PersistedRequestContextInput {
-  channel?: {
-    origin: 'inbound' | 'binding';
-    harnessName: string;
-    channelId: string;
-    providerId: string;
-    platform: string;
-    externalThreadId: string;
-    externalMessageId?: string;
-    bindingId?: string;
-    externalTenantId?: string;
-    externalChannelId?: string;
-    actor?: {
-      platformUserId: string;
-      displayName?: string;
-      metadata?: Record<string, JsonValue>;
-    };
-    capabilities?: Record<string, JsonValue>;
-  };
+  channel?: ChannelRequestContext;
   metadata?: Record<string, JsonValue>;
 }
 
@@ -689,6 +974,56 @@ export interface ResolveProviderCallbackBindingResult {
   replacedBindingId?: string;
 }
 
+/**
+ * §5.1h durable per-conversation binding between a platform conversation and a
+ * Harness session. Distinct from the in-memory registry `HarnessChannelBinding`
+ * (config-time route identity); this is the durable bridge row that anchors a
+ * binding generation for ingress/outbox work. There is at most one `active`
+ * binding per `(harnessName, channelId, platform, externalTenantId,
+ * externalChannelId, externalThreadId)` tuple; replacements mark the prior row
+ * `replaced` rather than creating two active owners (§14.1).
+ */
+export interface ChannelBinding {
+  id: string;
+  harnessName: string;
+  channelId: string;
+  providerId: string;
+  status: 'active' | 'replaced' | 'closed' | 'undeliverable';
+  platform: string;
+  externalTenantId?: string;
+  externalChannelId?: string;
+  externalThreadId: string;
+  resourceId: string;
+  threadId: string;
+  sessionId: string;
+  // Resource-resolution mode (NOT platform conversation kind). The registry's
+  // 4-value HarnessChannelBinding mode is a separate config concept.
+  mode: 'per-user-resource' | 'thread-resource' | 'shared-resource';
+  generation: number; // starts at 1; increments on replacement
+  createdAt: number;
+  updatedAt: number;
+  lastInboundAt?: number;
+  lastOutboundAt?: number;
+  closedAt?: number;
+  closedReason?: Extract<
+    HarnessRowErrorCode,
+    'session_closed' | 'session_deleted' | 'platform_unlinked' | 'operator_closed'
+  >;
+  replacedByBindingId?: string;
+  undeliverableReason?: string;
+}
+
+export interface ResolveChannelBindingResult {
+  binding: ChannelBinding;
+  created: boolean;
+  replacedBindingId?: string;
+}
+
+export interface ListActiveChannelBindingsResult {
+  bindings: ChannelBinding[];
+  nextCursor?: string;
+}
+
 export interface ChannelInboxItem {
   id: string;
   harnessName: string;
@@ -714,7 +1049,10 @@ export interface ChannelInboxItem {
   deadAt?: number;
   updatedAt: number;
   status: 'received' | 'admitted' | 'accepted' | 'queued' | 'failed' | 'dead';
-  delivery?: 'message' | 'queue';
+  // §14.2 chosen delivery mode, persisted before runtime admission so recovery
+  // replays the SAME mode. Canonical tokens are `signal` / `queue` (the earlier
+  // `message` spelling is superseded; see ChannelIngressDelivery).
+  delivery?: 'signal' | 'queue';
   mode?: string;
   model?: string;
   attempts: number;
@@ -724,7 +1062,47 @@ export interface ChannelInboxItem {
   requestContext: PersistedRequestContextInput;
   content: string;
   attachments: PersistedAttachment[];
+  /**
+   * §14.2 record-only durability: the RAW inbound provider attachment refs as
+   * received at record time, BEFORE the row resolves a session and normalizes
+   * them into Harness-owned {@link PersistedAttachment}s. A route that records the
+   * `received` row and ACKs before admission cannot yet scope the bytes to a
+   * session, so `attachments` is `[]` on that row. Persisting the raw refs lets
+   * FROM-SCRATCH recovery re-populate the ingress context and normalize the SAME
+   * attachments the live path would have — otherwise a record-only crash recovers
+   * with ZERO attachments and a different admissionHash. Cleared once the row is
+   * admitted (`attachments` then carries the durable refs). Structurally the
+   * `ChannelIngressContext.files` (`AttachmentRef`) JSON shape; mirrored here so
+   * the storage domain stays decoupled from `harness/v1`.
+   */
+  rawFiles?: ChannelInboxRawFile[];
   lastError?: { code: HarnessRowErrorCode; message: string; retryable?: boolean };
+}
+
+/**
+ * Raw inbound provider attachment ref persisted on a `received` channel inbox
+ * row for record-only recovery. Mirrors `harness/v1`'s `AttachmentRef` JSON
+ * shape (the storage domain must not import `harness/v1`). Only `attachmentId`
+ * and `resourceId` are guaranteed; the rest are optional provider metadata that
+ * survive a round-trip so recovery normalizes byte-for-byte what the live path
+ * received.
+ */
+export interface ChannelInboxRawFile {
+  attachmentId: string;
+  resourceId: string;
+  ownerSessionId?: string;
+  bytes?: number;
+  sha256?: string;
+  source?: AttachmentSource;
+  kind?: HarnessAttachmentKind;
+  name?: string;
+  mimeType?: string;
+  primitiveType?: HarnessPrimitiveType;
+  elementType?: string;
+  renderer?: AttachmentRendererDescriptor;
+  schemaId?: string;
+  metadata?: Record<string, JsonValue>;
+  object?: AttachmentObjectPointer;
 }
 
 export interface ChannelInboxInitialClaim {
@@ -1166,11 +1544,39 @@ export interface ReleaseSessionLeaseInput {
   ownerId: string;
 }
 
+/**
+ * Renew the parent/root lease AND every active descendant lease entry under it
+ * on a single storage-linearized cycle (§5.8). Subagent/child sessions have no
+ * separately-renewable lease — they share the parent/root owner — so the live
+ * owner extends the whole subtree through this one call, capping each
+ * descendant's expiry at the new parent expiry.
+ */
+export interface RenewSessionLeaseSubtreeInput {
+  harnessName?: string;
+  rootSessionId: string;
+  ownerId: string;
+  ttlMs: number;
+}
+
 export interface SessionLeaseResult {
   /** Record version observed at lease time — caller passes this to `saveSession`. */
   version: number;
   /** Epoch ms when the lease expires if not renewed. */
   expiresAt: number;
+}
+
+export interface SubtreeSessionLeaseResult extends SessionLeaseResult {
+  /**
+   * Number of active descendant lease entries renewed alongside the root in the
+   * same atomic cycle. The renewal is committed in ONE storage-linearized pass,
+   * so it never returns a parent-only partial success (§5.8). If an active
+   * descendant has been claimed by a DIFFERENT instance (ownerId moved), the
+   * subtree was split: the call throws `HarnessStorageLeaseConflictError` and
+   * renews nothing, leaving the owner to fence itself. A same-owner descendant
+   * whose mirror lapsed is re-adopted to the capped expiry — that IS the §5.8
+   * repair (re-running subtree renewal extends a lagging mirror), not a fence.
+   */
+  renewedDescendantCount: number;
 }
 
 export interface SaveAttachmentInput {
@@ -1210,4 +1616,250 @@ export interface SaveAttachmentReferenceInput extends AttachmentReference {
   /** Session that owns the referenced attachment bytes. */
   sessionId: string;
   attachmentId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Plan tasks (HARNESS_V1_SPEC.md §5.1k / §4.8f)
+//
+// `HarnessPlanTask` is the durable, arbitrary-depth, MODEL-AUTHORED agent
+// task/todo TREE. It is distinct from the runtime work-unit `HarnessTask` in
+// contracts.ts (which is unrelated and unchanged). Plan tasks are session-owned
+// and isolated by `(harnessName, sessionId)`; every mutation flows through the
+// live `Session` under its lease, so the storage mutators are
+// session-owner-fenced (§5.6 / §5.8). Status ROLLUP, `blockedBy` cycle checks,
+// the plan tool (§6.4), and the `plan_task_*` custom event (§10.3) are DEFERRED
+// to TM-3 / TM-4 / TM-5; TM-2 ships only the durable storage layer.
+// ---------------------------------------------------------------------------
+
+export type HarnessPlanTaskStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'blocked'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+/**
+ * Whether the current `status` was written by an explicit caller/model action
+ * or DERIVED by the harness from child rollup. Rollup is DEFERRED to TM-4 — until
+ * then every write is `'explicit'`.
+ */
+export type HarnessPlanTaskStatusSource = 'explicit' | 'derived';
+
+/**
+ * Durable model-authored plan-tree node (§5.1k). Adjacency-list edge via
+ * `parentTaskId` gives arbitrary depth; `order` sorts siblings. The per-row
+ * `version` is the field-write OCC token, mutated only under the session-owner
+ * fence (§5.8) — NOT an independent cross-process authority.
+ */
+export interface HarnessPlanTask {
+  /** Generated stable id (never the model's free-text title). */
+  taskId: string;
+  /** Optional idempotency key so a retried create resolves to the same row. */
+  idempotencyKey?: string;
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /** Adjacency-list edge to the parent node; absent for roots. */
+  parentTaskId?: string;
+  /** Sibling ordering within one parent (and among roots). */
+  order: number;
+  status: HarnessPlanTaskStatus;
+  statusSource: HarnessPlanTaskStatusSource;
+  /** Imperative task title. */
+  content: string;
+  /** Present-continuous label shown while in progress. */
+  activeForm?: string;
+  priority?: number;
+  /**
+   * Stored as data only in TM-2. Cycle-checking + rollup that consume
+   * `blockedBy` are DEFERRED to TM-4.
+   */
+  blockedBy?: string[];
+  origin?: string;
+  /** Subagent session id this task was delegated to (TM-6). */
+  delegatedSubagentSessionId?: string;
+  /**
+   * Subagent TYPE id of the delegation (§9). Persisted with the session id so a
+   * delegated subagent reattached after rehydrate can re-resolve its
+   * `SubagentDefinition` and restore the `tools` / `workspace` overrides (which
+   * are applied to the live child in-memory and not otherwise durable).
+   */
+  delegatedSubagentTypeId?: string;
+  metadata?: JsonValue;
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Wall-clock time the task FIRST transitioned to `in_progress` (span-summary
+   * O7). Set once (preserved across later status oscillation) so a consumer can
+   * compute work duration as `completedAt - startedAt`. Absent until the task
+   * has started and on rows persisted before this field landed.
+   */
+  startedAt?: number;
+  completedAt?: number;
+  /** Per-row OCC token, advanced on each `updatePlanTask` under the fence. */
+  version: number;
+}
+
+/**
+ * Session-owner fence shared by every plan-task mutator (§5.6 / §5.8). The
+ * adapter verifies, against the owning `SessionRecord`, that `ownerId` still
+ * holds the unexpired lease and that the session's `version` matches
+ * `ifSessionVersion` before any plan-task row changes — mirroring how
+ * `saveSession` fences. The SESSION is the serialized writer, so plan-task
+ * writes fence on the session's lease + version, not bare per-row OCC.
+ */
+export interface PlanTaskSessionFence {
+  harnessName?: string;
+  sessionId: string;
+  ownerId: string;
+  /** Expected current `SessionRecord.version`. */
+  ifSessionVersion: number;
+}
+
+/** Create one plan-task node. */
+export interface CreatePlanTaskInput {
+  fence: PlanTaskSessionFence;
+  /**
+   * The node to insert. `version`, `createdAt`, and `updatedAt` are adapter-set
+   * on insert (callers may pass them; adapters normalize). `taskId` must be
+   * caller-supplied (stable id). When `idempotencyKey` matches an existing
+   * task in the same session, the existing row is returned unchanged.
+   */
+  task: HarnessPlanTask;
+}
+
+/**
+ * Partial field write of a plan task by `taskId`, guarded by per-row OCC
+ * (`ifVersion`) INSIDE the session-owner fence. Only the provided fields are
+ * written; omitted fields are unchanged. Pass a field explicitly to `null`-able
+ * clearing via the dedicated optional booleans where a field is optional.
+ */
+export interface UpdatePlanTaskInput {
+  fence: PlanTaskSessionFence;
+  taskId: string;
+  /** Per-row OCC token observed on read. */
+  ifVersion: number;
+  patch: {
+    parentTaskId?: string;
+    clearParentTaskId?: boolean;
+    order?: number;
+    status?: HarnessPlanTaskStatus;
+    statusSource?: HarnessPlanTaskStatusSource;
+    content?: string;
+    activeForm?: string;
+    clearActiveForm?: boolean;
+    priority?: number;
+    clearPriority?: boolean;
+    blockedBy?: string[];
+    clearBlockedBy?: boolean;
+    origin?: string;
+    delegatedSubagentSessionId?: string;
+    delegatedSubagentTypeId?: string;
+    metadata?: JsonValue;
+    clearMetadata?: boolean;
+    startedAt?: number;
+    completedAt?: number;
+    clearCompletedAt?: boolean;
+  };
+}
+
+export interface UpdatePlanTaskResult {
+  /** New per-row version after the write — `ifVersion + 1`. */
+  version: number;
+}
+
+/** Cascade-delete a task plus every descendant (NOT reparent-to-root). */
+export interface DeletePlanTaskSubtreeInput {
+  fence: PlanTaskSessionFence;
+  rootTaskId: string;
+}
+
+export interface DeletePlanTaskSubtreeResult {
+  /** Number of plan-task rows removed (root + descendants). */
+  deletedCount: number;
+}
+
+/**
+ * One operation in a transaction-shaped multi-row mutation. Used by
+ * decompose/reparent in TM-3 / TM-4. All ops apply under one adapter boundary
+ * or none do.
+ */
+export type PlanTaskMutationOp =
+  | { kind: 'create'; task: HarnessPlanTask }
+  | {
+      kind: 'update';
+      taskId: string;
+      ifVersion: number;
+      patch: UpdatePlanTaskInput['patch'];
+    }
+  | { kind: 'deleteSubtree'; rootTaskId: string };
+
+export interface MutatePlanTasksForSessionInput {
+  fence: PlanTaskSessionFence;
+  ops: PlanTaskMutationOp[];
+}
+
+export interface ListPlanTasksInput {
+  harnessName?: string;
+  sessionId: string;
+  /** Page size. */
+  limit: number;
+  /** Opaque cursor returned by the previous page. */
+  cursor?: string;
+}
+
+export interface ListPlanTasksResult {
+  tasks: HarnessPlanTask[];
+  /** Present when more rows remain; pass to the next `listPlanTasks` call. */
+  cursor?: string;
+}
+
+/**
+ * The anti-forgetting bounded read: returns the next-N nodes of the subtree
+ * under `rootTaskId` (or the whole forest's roots-down when omitted), bounded
+ * by `depth` and optionally filtered by `status`. Always capped by `limit`.
+ */
+export interface LoadPlanTaskSubtreeInput {
+  harnessName?: string;
+  sessionId: string;
+  /** Root to walk from; omit to walk from session roots (no parent). */
+  rootTaskId?: string;
+  /**
+   * Max depth relative to the root (0 = just the root node / the roots when
+   * `rootTaskId` is omitted). Unbounded when omitted.
+   */
+  depth?: number;
+  /** Restrict to nodes with this status. */
+  status?: HarnessPlanTaskStatus;
+  /** Hard cap on returned nodes (the bounded next-N). */
+  limit: number;
+}
+
+export interface LoadPlanTaskSubtreeResult {
+  tasks: HarnessPlanTask[];
+  /** True when the bound (`limit`/`depth`) clipped the subtree. */
+  truncated: boolean;
+}
+
+/**
+ * Cheap whole-tree aggregate for the bounded display-state summary (§5.1k /
+ * TM-5). A `COUNT(*) GROUP BY status` over the session's plan tasks — never a
+ * full-row load — so the display summary's `total`/`byStatus`/`rootCount` stay
+ * EXACT regardless of tree size (a bounded single-page read would undercount a
+ * tree larger than the page).
+ */
+export interface CountPlanTasksByStatusInput {
+  harnessName?: string;
+  sessionId: string;
+}
+
+export interface PlanTaskCountSummary {
+  /** Total number of plan-task nodes in the session tree. */
+  total: number;
+  /** Count of nodes in each status (only present statuses appear). */
+  byStatus: Partial<Record<HarnessPlanTaskStatus, number>>;
+  /** Number of root nodes (parent_task_id NULL or not resolvable in the set). */
+  rootCount: number;
 }

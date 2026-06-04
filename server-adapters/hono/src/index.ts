@@ -8,6 +8,7 @@ import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-ada
 import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
+  isZodError,
   normalizeQueryParams,
   redactSensitiveQueryParams,
   redactStreamChunk,
@@ -16,7 +17,6 @@ import { toReqRes, toFetchResponse } from 'fetch-to-node';
 import type { Context, HonoRequest, MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { stream } from 'hono/streaming';
-import { ZodError } from 'zod';
 export { createAuthMiddleware } from './auth-middleware';
 export type { HonoAuthMiddlewareOptions } from './auth-middleware';
 // Browser stream setup (Hono-specific WebSocket implementation)
@@ -73,6 +73,19 @@ export interface HonoApp {
 }
 
 export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context> {
+  /**
+   * Registered route patterns (keyed by the pattern hono registers,
+   * `${prefix}${route.path}`, e.g. `/harness/:name/...`) that opted out of body
+   * parsing via `route.skipBodyParse`. The global context middleware
+   * (`app.use('*')`) cannot see the resolved ServerRoute, so it identifies a
+   * skip-body-parse route by enumerating `c.req.matchedRoutes`. Note: it must NOT
+   * use `c.req.routePath` here — inside an `app.use('*')` middleware that resolves
+   * to the middleware's own pattern (`/*`), never the matched route, so a
+   * `routePath` lookup would silently miss and pre-parse the body anyway. Mirrors
+   * the `customRouteAuthConfig` map pattern. Populated in `registerRoute`.
+   */
+  private skipBodyParseRoutes = new Set<string>();
+
   createContextMiddleware(): MiddlewareHandler {
     return async (c, next) => {
       // Patch req.json() to prevent "Body is unusable" errors when the body is read multiple times
@@ -96,8 +109,18 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
       let bodyRequestContext: Record<string, any> | undefined;
       let paramsRequestContext: Record<string, any> | undefined;
 
-      // Parse request context from request body (POST/PUT)
-      if (c.req.method === 'POST' || c.req.method === 'PUT') {
+      // Parse request context from request body (POST/PUT).
+      // Skip routes that opted out of body parsing (skipBodyParse): a provider
+      // webhook never carries a Mastra `requestContext` in its body, so this
+      // pre-parse is inert for it, and skipping it avoids buffering + JSON-parsing
+      // the body of a signature-verifying route BEFORE the per-route bodyLimit cap
+      // runs. We cannot use `c.req.routePath` here: inside this `app.use('*')`
+      // middleware it resolves to the middleware's own pattern (`/*`), never the
+      // matched route, so a `routePath` lookup would always miss. `c.req.matchedRoutes`
+      // does carry the resolved route pattern(s), keyed identically to the entries
+      // registered in `skipBodyParseRoutes` (`${prefix}${route.path}`).
+      const skipBodyParse = c.req.matchedRoutes.some(r => this.skipBodyParseRoutes.has(r.path));
+      if (!skipBodyParse && (c.req.method === 'POST' || c.req.method === 'PUT')) {
         const contentType = c.req.header('content-type');
         const contentLength = c.req.header('content-length');
         // Only parse if content-type is JSON and body is not empty
@@ -169,6 +192,10 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     return stream(
       res,
       async stream => {
+        if (streamFormat === 'sse' && route.sseFlushOnConnect) {
+          await stream.write(': connected\n\n');
+        }
+
         const readableStream = result instanceof ReadableStream ? result : result.fullStream;
         const reader = readableStream.getReader();
 
@@ -182,6 +209,11 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             if (done) break;
 
             if (value) {
+              if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+                await stream.write(value);
+                continue;
+              }
+
               // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
               const shouldRedact = this.streamOptions?.redact ?? true;
               const outputValue = shouldRedact ? redactStreamChunk(value) : value;
@@ -218,9 +250,29 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     const queryParams = normalizeQueryParams(request.queries());
     let body: unknown;
     let bodyParseError: { message: string } | undefined;
+    let rawBody: Uint8Array | string | undefined;
 
     if (route.method === 'POST' || route.method === 'PUT' || route.method === 'PATCH' || route.method === 'DELETE') {
       const contentType = request.header('content-type') || '';
+
+      // Routes that verify a provider signature over the EXACT bytes (e.g. channel
+      // webhooks) opt out of parsing AND need the unparsed body. Capture `rawBody`
+      // ONLY for these routes: cloning + buffering the whole body on every write
+      // request would be a needless allocation for normal parsed routes (no other
+      // route consumes `ctx.rawBody`). A signed payload that is not strict JSON
+      // would otherwise be rejected with a 400 (bodyParseError) before the signature
+      // is checked, so leave `body`/`bodyParseError` undefined; the adapter forwards
+      // `rawBody` and the handler/adapter parses + verifies from it.
+      if (route.skipBodyParse) {
+        try {
+          rawBody = new Uint8Array(await request.raw.clone().arrayBuffer());
+        } catch {
+          // Best-effort: an unreadable/already-consumed stream just leaves rawBody
+          // undefined; signature-verifying handlers treat that as unverifiable.
+          rawBody = undefined;
+        }
+        return { urlParams, queryParams, body, bodyParseError, rawBody };
+      }
 
       if (contentType.includes('multipart/form-data')) {
         try {
@@ -261,7 +313,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         // Empty body is ok - body remains undefined
       }
     }
-    return { urlParams, queryParams, body, bodyParseError };
+    return { urlParams, queryParams, body, bodyParseError, rawBody };
   }
 
   /**
@@ -375,20 +427,35 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     // Default prefix to this.prefix if not provided, or empty string
     const prefix = prefixParam ?? this.prefix ?? '';
 
-    // Determine if body limits should be applied
-    const shouldApplyBodyLimit = this.bodyLimitOptions && ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
+    // Record skip-body-parse routes so the global context middleware (which only
+    // sees `c`, not the resolved route) can identify them by enumerating
+    // `c.req.matchedRoutes` and avoid pre-parsing the body of a signature-verifying
+    // route. The key matches the pattern hono registers below
+    // (`${prefix}${route.path}`); the middleware must NOT use `c.req.routePath`,
+    // which inside an `app.use('*')` middleware is the middleware's own `/*` pattern.
+    if (route.skipBodyParse) {
+      this.skipBodyParseRoutes.add(`${prefix}${route.path}`);
+    }
 
-    // Get the body size limit for this route (route-specific or default)
+    // Resolve the body size cap for this route: a route-specific cap takes
+    // precedence over the adapter-wide default. Honoring `route.maxBodySize`
+    // independently of `this.bodyLimitOptions` means a route that declares its own
+    // cap (e.g. the channel webhook's 1 MiB) gets a real pre-buffer 413 even when
+    // the adapter was constructed without global bodyLimitOptions (embedders/tests).
+    const isBodyBearingMethod = ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
     const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
 
     // Build middleware array
     const middlewares: MiddlewareHandler[] = [];
 
-    if (shouldApplyBodyLimit && maxSize && this.bodyLimitOptions) {
+    if (isBodyBearingMethod && maxSize) {
       middlewares.push(
         bodyLimit({
           maxSize,
-          onError: this.bodyLimitOptions.onError as any,
+          // hono's bodyLimit defaults to throwing HTTPException(413) when no
+          // onError is supplied; pass the adapter-wide handler through when set so
+          // routes that relied on a custom onError keep it.
+          onError: this.bodyLimitOptions?.onError as any,
         }),
       );
     }
@@ -442,7 +509,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             this.mastra.getLogger()?.error('Error parsing query params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'query');
               return c.json(body as any, status as any);
             }
@@ -463,7 +530,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             this.mastra.getLogger()?.error('Error parsing body', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'body');
               return c.json(body as any, status as any);
             }
@@ -485,7 +552,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             this.mastra.getLogger()?.error('Error parsing path params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'path');
               return c.json(body as any, status as any);
             }
@@ -510,6 +577,8 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           abortSignal: c.get('abortSignal'),
           routePrefix: prefix,
           getHeader: (name: string) => c.req.header(name),
+          getHeaders: () => Object.fromEntries(c.req.raw.headers),
+          rawBody: params.rawBody,
           requestBody: params.body,
           requestPathParams: params.urlParams,
           request: c.req.raw, // Standard Request object with headers/cookies

@@ -11,7 +11,7 @@ import { toStandardSchema, standardSchemaToJSONSchema } from '../../../schema';
 import { safeEnqueue } from '../../../stream/base';
 import { ChunkFrom } from '../../../stream/types';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
-import { resolveToolRequiresApproval } from '../../../tools/approval';
+import { resolveToolApprovalRequirement } from '../../../tools/approval';
 import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
@@ -20,13 +20,14 @@ import {
   withToolPayloadTransformProviderMetadata,
 } from '../../../tools/payload-transform';
 import { findProviderToolByName } from '../../../tools/provider-tool-utils';
-import type { MastraToolInvocationOptions } from '../../../tools/types';
+import type { MastraToolInvocationOptions, RequireToolApproval } from '../../../tools/types';
 import { ensureSerializable } from '../../../utils';
 import type { SuspendOptions } from '../../../workflows/step';
 import { createStep } from '../../../workflows/workflow';
 import type { OuterLLMRun } from '../../types';
 import { ToolNotFoundError } from '../errors';
 import { toolCallInputSchema, toolCallOutputSchema } from '../schema';
+import { notifyToolDenied } from './tool-permission-notify';
 
 type AddToolMetadataOptions = {
   toolCallId: string;
@@ -481,15 +482,61 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           await removeToolMetadata(inputData.toolName, 'approval');
         }
 
-        const toolRequiresApproval = await resolveToolRequiresApproval({
+        // Per-tool permission policy gate (§4.2e). A caller (e.g. the harness)
+        // may thread a resolver on the request context that returns
+        // 'allow' | 'ask' | 'deny' for a tool name. `deny` blocks the call with a
+        // non-aborting result the model can react to; `ask` forces approval (it is
+        // OR'd with tool-owned/global approval, never suppressing them); `allow`
+        // defers entirely to the tool's own approval config.
+        const toolPermissionPolicy = (
+          requestContext.get('__mastra_toolPermissionPolicy') as
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined
+        )?.(inputData.toolName);
+        if (toolPermissionPolicy === 'deny') {
+          // §O4 — surface WHY a tool was blocked (action-time deny is otherwise
+          // opaque: only a generic result reaches the model). Optional, sync,
+          // fire-and-forget, isolated; a non-harness caller threads no callback.
+          notifyToolDenied(requestContext, {
+            toolName: inputData.toolName,
+            stage: 'action',
+            toolCallId: inputData.toolCallId,
+          });
+          return {
+            ...inputData,
+            result: `Tool "${inputData.toolName}" was denied by the session permission policy.`,
+          };
+        }
+
+        // §4.2e per-turn `yolo`: a caller (the harness queued-turn drain) may thread
+        // `__mastra_yoloAutoApprove` to clear the POLICY-level approval reason — i.e.
+        // an effective `ask` from the permission gate. Per spec it suppresses ONLY the
+        // `policy` reason; it NEVER suppresses a tool-owned reason (a tool's static
+        // `requireApproval` / its `needsApprovalFn` callback), and (since `deny`
+        // already returned above) it can never run a denied tool. Mirrors how a grant
+        // clears the policy ask at the resolver — yolo does it per-run here.
+        const yoloAutoApprove = requestContext.get('__mastra_yoloAutoApprove') === true;
+
+        const approvalRequirement = await resolveToolApprovalRequirement({
           tool,
           args,
-          requireToolApproval: Boolean(requireToolApproval),
+          // #17337 — pass through unboxed: the global may be a per-call FUNCTION
+          // policy; resolveToolApprovalRequirement evaluates it (fail-safe true).
+          requireToolApproval: requireToolApproval as RequireToolApproval | undefined,
           requestContext,
           workspace: _internal?.stepWorkspace,
           logger,
           toolName: inputData.toolName,
         });
+        // §4.2e additive reasons: tool-owned reasons (tool-config / tool-fn) from
+        // the requirement, plus a `policy` reason when the session permission gate
+        // forces `ask` AND per-run `yolo` did not clear it. Surfaced on the approval
+        // chunk + suspend payload so the pending approval can show WHY (matches the
+        // durable agent path). Tool-owned reasons survive yolo.
+        const policyAsk = toolPermissionPolicy === 'ask' && !yoloAutoApprove;
+        const approvalReasons: string[] = [...approvalRequirement.reasons];
+        if (policyAsk) approvalReasons.push('policy');
+        const toolRequiresApproval = approvalRequirement.required || policyAsk;
 
         // Schema for tool call approval - used for both streaming and metadata
         const approvalSchema = toStandardSchema(
@@ -514,6 +561,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolName: inputData.toolName,
                   args: inputData.args,
                   resumeSchema: JSON.stringify(standardSchemaToJSONSchema(approvalSchema)),
+                  ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
               },
               'approval',
@@ -539,6 +587,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolCallId: inputData.toolCallId,
                   toolName: inputData.toolName,
                   args: inputData.args,
+                  ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
                 __streamState: streamState.serialize(),
               },

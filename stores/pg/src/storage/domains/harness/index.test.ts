@@ -4,11 +4,24 @@ import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
   HarnessStorageAttachmentInUseError,
   HarnessStorageAttachmentUnavailableError,
+  HarnessStorageChannelBindingConflictError,
+  HarnessStorageLeaseConflictError,
+  HarnessStoragePlanTaskNotFoundError,
+  HarnessStoragePlanTaskVersionConflictError,
+  HarnessStorageProviderCallbackBindingTransitionError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageThreadDeleteFenceConflictError,
+  HarnessStorageVersionConflictError,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_WORKSPACE_ACTIONS,
 } from '@mastra/core/storage';
-import type { WorkspaceActionJournalEntry } from '@mastra/core/storage';
+import type {
+  ChannelBinding,
+  HarnessPlanTask,
+  HarnessProviderCallbackBinding,
+  WorkspaceActionJournalEntry,
+} from '@mastra/core/storage';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 
 import { exportSchemas, HarnessPG, PostgresStore } from '../..';
@@ -42,6 +55,10 @@ describe('HarnessPG', () => {
     expect(ddl).toContain(TABLE_HARNESS_SESSION_EVENTS);
     expect(ddl).toContain(TABLE_HARNESS_WORKSPACE_ACTIONS);
     expect(ddl).toContain('idx_harness_sessions_active_key');
+    expect(ddl).toContain('idx_harness_sessions_parent');
+    expect(ddl).toContain('idx_harness_message_results_lookup');
+    expect(ddl).toContain('idx_harness_message_results_admission');
+    expect(ddl).toContain('idx_harness_tombstones_lookup');
     expect(ddl).toContain('idx_harness_session_events_replay');
     expect(ddl).toContain('idx_harness_workspace_actions_page');
     expect(ddl).toContain('idx_harness_workspace_actions_session');
@@ -646,6 +663,93 @@ describe('HarnessPG', () => {
     ).resolves.toEqual([]);
   });
 
+  it('round-trips subagentTypeId on the session record (M4)', async () => {
+    const harness = store.stores.harness;
+    expect(harness).toBeDefined();
+
+    await harness!.saveSession(
+      createSampleSessionRecord({ subagentTypeId: 'scoped-worker', subagentToolAllowlistScoped: true }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
+    const loaded = await harness!.loadSession({ sessionId: 'session-1' });
+    expect(loaded?.subagentTypeId).toBe('scoped-worker');
+    expect(loaded?.subagentToolAllowlistScoped).toBe(true);
+
+    // A record without the field round-trips as undefined (legacy / top-level).
+    await harness!.saveSession(createSampleSessionRecord({ id: 'session-2', threadId: 'thread-2' }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
+    const topLevel = await harness!.loadSession({ sessionId: 'session-2' });
+    expect(topLevel?.subagentTypeId).toBeUndefined();
+    expect(topLevel?.subagentToolAllowlistScoped).toBeUndefined();
+  });
+
+  it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
+    const harness = store.stores.harness!;
+    const mk = (runId: string, completedAt: number, over: Record<string, unknown> = {}) => ({
+      harnessName: 'default',
+      runId,
+      sessionId: 'session-rs',
+      resourceId: 'u1',
+      threadId: 'thread-rs',
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      startedAt: completedAt - 10,
+      completedAt,
+      durationMs: 10,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      toolRollup: { count: 1, errors: 0, totalDurationMs: 4, maxDurationMs: 4, perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } } },
+      createdAt: completedAt,
+      ...over,
+    });
+
+    const saved = await harness.saveRunSummary({ summary: mk('rs-1', 100) as any });
+    expect(saved.durationMs).toBe(10);
+    // Idempotent: a later write for the same runId is a no-op.
+    const again = await harness.saveRunSummary({ summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any });
+    expect(again.durationMs).toBe(10);
+    expect(again.status).toBe('completed');
+
+    const loaded = await harness.loadRunSummary({ runId: 'rs-1' });
+    expect(loaded?.toolRollup?.perTool.lookup?.count).toBe(1);
+    expect(loaded?.usage.totalTokens).toBe(3);
+
+    await harness.saveRunSummary({ summary: mk('rs-2', 200) as any });
+    await harness.saveRunSummary({ summary: mk('rs-3', 300) as any });
+    // Newest-first; composite keyset paging.
+    const page1 = await harness.listRunSummaries({ sessionId: 'session-rs', limit: 2 });
+    expect(page1.summaries.map(s => s.runId)).toEqual(['rs-3', 'rs-2']);
+    expect(page1.nextBeforeCompletedAt).toBe(200);
+    const page2 = await harness.listRunSummaries({
+      sessionId: 'session-rs',
+      limit: 2,
+      beforeCompletedAt: page1.nextBeforeCompletedAt,
+      beforeRunId: page1.nextBeforeRunId,
+    });
+    expect(page2.summaries.map(s => s.runId)).toEqual(['rs-1']);
+    expect(page2.nextBeforeCompletedAt).toBeUndefined();
+
+    // Tie boundary: two rows share completedAt=200 — paging with limit 1 must
+    // return BOTH (no skip) thanks to the composite (completedAt, runId) cursor.
+    await harness.saveRunSummary({ summary: mk('rs-2b', 200) as any });
+    const seen: string[] = [];
+    let cursorC: number | undefined;
+    let cursorR: string | undefined;
+    for (let i = 0; i < 10; i++) {
+      const p = await harness.listRunSummaries({ sessionId: 'session-rs', limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      seen.push(...p.summaries.map(s => s.runId));
+      if (p.nextBeforeCompletedAt === undefined) break;
+      cursorC = p.nextBeforeCompletedAt;
+      cursorR = p.nextBeforeRunId;
+    }
+    expect(seen).toEqual(['rs-3', 'rs-2b', 'rs-2', 'rs-1']);
+  });
+
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
@@ -743,6 +847,58 @@ describe('HarnessPG', () => {
           initialLease: { ownerId: 'harness-worker', ttlMs: 30_000 },
         }),
       ).rejects.toBeInstanceOf(HarnessStorageThreadDeleteFenceConflictError);
+    });
+  });
+
+  // §5.2a/§5.3/§5.5 cross-adapter parity (mirrors InMemoryHarness): closing a
+  // session then resolving the SAME (resourceId, threadId) must surface the
+  // CLOSED owner for reopen, not null and not a fresh active row.
+  it('returns the closed current owner by thread for reopen (no fresh active row)', async () => {
+    const harness = store.stores.harness;
+    expect(harness).toBeDefined();
+
+    await harness!.saveSession(
+      createSampleSessionRecord({ id: 'closed-owner', closedAt: 2000, lastActivityAt: 2000 }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      harness!.loadSessionByThread({ threadId: 'thread-1', resourceId: 'resource-1' }),
+    ).resolves.toMatchObject({ id: 'closed-owner', closedAt: 2000 });
+
+    const admitted = await harness!.createOrLoadActiveSession(
+      createSampleSessionRecord({ id: 'would-be-fresh', lastActivityAt: 3000 }),
+      { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+    );
+    expect(admitted).toMatchObject({
+      created: false,
+      leaseAcquired: false,
+      record: expect.objectContaining({ id: 'closed-owner', closedAt: 2000 }),
+    });
+    await expect(harness!.loadSession({ sessionId: 'would-be-fresh' })).resolves.toBeNull();
+  });
+
+  // §4.5b cross-adapter parity (mirrors InMemoryHarness): a child admitted under
+  // a CLOSING parent must surface the parent's closing window.
+  it('carries the parent closing window on parent-unavailable (closing)', async () => {
+    const harness = store.stores.harness;
+    expect(harness).toBeDefined();
+
+    await harness!.saveSession(
+      createSampleSessionRecord({ id: 'closing-parent', closingAt: 5000, closeDeadlineAt: 9000, lastActivityAt: 5000 }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    await expect(
+      harness!.createOrLoadActiveSession(
+        createSampleSessionRecord({ id: 'child', threadId: 'child-thread', parentSessionId: 'closing-parent' }),
+        { initialLease: { ownerId: 'h-2', ttlMs: 30_000 } },
+      ),
+    ).rejects.toMatchObject({
+      name: 'HarnessStorageParentSessionUnavailableError',
+      reason: 'closing',
+      closingAt: 5000,
+      closeDeadlineAt: 9000,
     });
   });
 
@@ -960,6 +1116,472 @@ describe('HarnessPG', () => {
       }),
     ).resolves.toEqual({ inbox: [], actionTokens: [], actionReceipts: [], outbox: [] });
   });
+
+  it('replay state reflects single-epoch seq bounds unchanged', async () => {
+    const harness = store.stores.harness;
+    await harness!.saveSession(createSampleSessionRecord(), { ownerId: 'h-1', ifVersion: 0 });
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-1:1',
+      epoch: 'epoch-1',
+      sequence: 1,
+      event: { type: 'app.event', id: 'harness-v1:epoch-1:1', timestamp: 1000 },
+      emittedAt: 1000,
+      storedAt: 1001,
+    });
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-1:2',
+      epoch: 'epoch-1',
+      sequence: 2,
+      event: { type: 'app.event', id: 'harness-v1:epoch-1:2', timestamp: 1002 },
+      emittedAt: 1002,
+      storedAt: 1003,
+    });
+
+    await expect(
+      harness!.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toEqual({ epoch: 'epoch-1', oldestSequence: 1, newestSequence: 2 });
+  });
+
+  it('collapses to null on a multi-epoch ledger, matching the authoritative in-memory adapter', async () => {
+    // §10.5: replay state is anchored to the CURRENT in-memory Session
+    // instance's epoch, which storage cannot observe. A multi-epoch ledger is
+    // ambiguous, so storage returns null; the server then 412s the stale cursor
+    // and the client recovers via the snapshot path. The in-memory reference
+    // (packages/core/.../inmemory.ts: `if (epochs.size !== 1) return null;`)
+    // returns null for the identical input, so pg MUST too.
+    const harness = store.stores.harness;
+    await harness!.saveSession(createSampleSessionRecord(), { ownerId: 'h-1', ifVersion: 0 });
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:1',
+      epoch: 'epoch-prior',
+      sequence: 1,
+      event: { type: 'agent_start', id: 'harness-v1:epoch-prior:1', timestamp: 1000 },
+      emittedAt: 1000,
+      storedAt: 1000,
+    });
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:2',
+      epoch: 'epoch-prior',
+      sequence: 2,
+      event: { type: 'agent_end', id: 'harness-v1:epoch-prior:2', timestamp: 1010 },
+      emittedAt: 1010,
+      storedAt: 1010,
+    });
+    // Fresh, chronologically-newest epoch after a rehydrate.
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:aFresh:0',
+      epoch: 'aFresh',
+      sequence: 0,
+      event: { type: 'agent_start', id: 'harness-v1:aFresh:0', timestamp: 2000 },
+      emittedAt: 2000,
+      storedAt: 2000,
+    });
+
+    await expect(
+      harness!.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('still collapses to null when the prior epoch and fresh epoch share a stored_at millisecond', async () => {
+    // Edge case: stored_at is `Date.now()` and same-ms cross-epoch collisions are
+    // routine; a stored_at/sequence tiebreak could otherwise misidentify the
+    // "newest" epoch. Collapsing to null is independent of stored_at ordering,
+    // so the ambiguous ledger stays null regardless of the clock collision.
+    const harness = store.stores.harness;
+    await harness!.saveSession(createSampleSessionRecord(), { ownerId: 'h-1', ifVersion: 0 });
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:epoch-prior:5',
+      epoch: 'epoch-prior',
+      sequence: 5,
+      event: { type: 'agent_end', id: 'harness-v1:epoch-prior:5', timestamp: 1500 },
+      emittedAt: 1500,
+      storedAt: 1500,
+    });
+    // Fresh epoch's seq-0 event lands in the SAME millisecond as the prior
+    // epoch's higher-sequence row.
+    await harness!.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      eventId: 'harness-v1:aFresh:0',
+      epoch: 'aFresh',
+      sequence: 0,
+      event: { type: 'agent_start', id: 'harness-v1:aFresh:0', timestamp: 1500 },
+      emittedAt: 1500,
+      storedAt: 1500,
+    });
+
+    await expect(
+      harness!.getSessionEventReplayState({
+        harnessName: 'default',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      }),
+    ).resolves.toBeNull();
+  });
+});
+
+function sampleChannelBinding(overrides: Partial<ChannelBinding> = {}): ChannelBinding {
+  return {
+    id: 'binding-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    status: 'active',
+    platform: 'slack',
+    externalTenantId: 'T1',
+    externalChannelId: 'C1',
+    externalThreadId: 'th-1',
+    resourceId: 'resource-1',
+    threadId: 'thread-1',
+    sessionId: 'session-1',
+    mode: 'per-user-resource',
+    generation: 1,
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('HarnessPG channel binding ledger (§5.1h / §14.1 / PF-824)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-channel-binding-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  it('saves a binding and loads it back by external tuple', async () => {
+    const harness = store.stores.harness!;
+    const binding = sampleChannelBinding();
+    await harness.saveChannelBinding(binding);
+
+    const byId = await harness.loadChannelBinding({ bindingId: binding.id });
+    expect(byId).toEqual(binding);
+
+    const byExternal = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toEqual(binding);
+  });
+
+  it('excludes non-active rows from the external lookup', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'fenced', status: 'replaced' }));
+
+    const byExternal = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(byExternal).toBeNull();
+
+    // The fenced row is still addressable by id.
+    const byId = await harness.loadChannelBinding({ bindingId: 'fenced' });
+    expect(byId?.status).toBe('replaced');
+  });
+
+  it('rejects a second active binding for the same tuple (§5.2h)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'first' }));
+
+    await expect(harness.saveChannelBinding(sampleChannelBinding({ id: 'second' }))).rejects.toBeInstanceOf(
+      HarnessStorageChannelBindingConflictError,
+    );
+
+    // The conflict names the holder of the active row.
+    await harness
+      .saveChannelBinding(sampleChannelBinding({ id: 'third' }))
+      .catch((err: HarnessStorageChannelBindingConflictError) => {
+        expect(err).toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+        expect(err.heldBy).toBe('first');
+      });
+
+    // Re-saving the SAME id (an in-place update) is always allowed.
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'first', lastInboundAt: 5000 })),
+    ).resolves.toBeUndefined();
+    const reloaded = await harness.loadChannelBinding({ bindingId: 'first' });
+    expect(reloaded?.lastInboundAt).toBe(5000);
+  });
+
+  it('treats a missing optional external id as a sentinel match (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // Persist a binding with no tenant/channel id, then look it up with the same
+    // omitted ids — the sentinel makes them collide, not SQL NULL semantics.
+    const binding = sampleChannelBinding({
+      id: 'no-optional',
+      externalTenantId: undefined,
+      externalChannelId: undefined,
+    });
+    await harness.saveChannelBinding(binding);
+
+    const matched = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(matched).toEqual(binding);
+
+    // A second active binding with the same omitted optional ids still conflicts.
+    await expect(
+      harness.saveChannelBinding(
+        sampleChannelBinding({ id: 'no-optional-2', externalTenantId: undefined, externalChannelId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageChannelBindingConflictError);
+
+    // Supplying a real tenant id is a DIFFERENT tuple, so it does not match/conflict.
+    const distinct = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalThreadId: 'th-1',
+    });
+    expect(distinct).toBeNull();
+  });
+
+  it('keeps an empty-string optional external id distinct from undefined (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // The out-of-band U+001F-prefixed sentinel (not '') means an EXPLICIT empty-string
+    // tenant id round-trips faithfully and addresses a different tuple than an omitted
+    // tenant id.
+    const empty = sampleChannelBinding({ id: 'empty-tenant', externalTenantId: '', externalChannelId: '' });
+    await harness.saveChannelBinding(empty);
+
+    const reloaded = await harness.loadChannelBinding({ bindingId: 'empty-tenant' });
+    expect(reloaded?.externalTenantId).toBe('');
+    expect(reloaded?.externalChannelId).toBe('');
+
+    // The empty-string tuple matches an empty-string lookup ...
+    const matched = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: '',
+      externalChannelId: '',
+      externalThreadId: 'th-1',
+    });
+    expect(matched?.id).toBe('empty-tenant');
+
+    // ... but an OMITTED optional id is a distinct tuple and must not collide.
+    const omitted = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(omitted).toBeNull();
+  });
+
+  it('a literal single-space external id does not alias the missing-optional-id sentinel (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    // Binding A omits the optional external ids (sentinel-normalised).
+    await harness.saveChannelBinding(
+      sampleChannelBinding({ id: 'missing', externalTenantId: undefined, externalChannelId: undefined }),
+    );
+    // Binding B uses real single-space external ids — a DIFFERENT tuple that must
+    // not alias the missing-id sentinel. Both active rows coexist (no conflict).
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'space', externalTenantId: ' ', externalChannelId: ' ' })),
+    ).resolves.toBeUndefined();
+
+    // The single-space tuple round-trips faithfully and resolves to its own binding.
+    const space = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: ' ',
+      externalChannelId: ' ',
+      externalThreadId: 'th-1',
+    });
+    expect(space?.id).toBe('space');
+    expect(space?.externalTenantId).toBe(' ');
+    expect(space?.externalChannelId).toBe(' ');
+
+    // The missing-id tuple resolves to the missing-id binding only — no aliasing.
+    const missing = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalThreadId: 'th-1',
+    });
+    expect(missing?.id).toBe('missing');
+  });
+
+  it('advances inbound activity forward-only (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ updatedAt: 1000 }));
+
+    const forward = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 5000 });
+    expect(forward?.lastInboundAt).toBe(5000);
+    expect(forward?.updatedAt).toBe(5000);
+
+    // An older ingress must NOT regress the marker.
+    const backward = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 2000 });
+    expect(backward?.lastInboundAt).toBe(5000);
+    expect(backward?.updatedAt).toBe(5000);
+
+    // A newer ingress advances it again.
+    const newer = await harness.touchChannelBindingInbound({ bindingId: 'binding-1', at: 9000 });
+    expect(newer?.lastInboundAt).toBe(9000);
+
+    // Touching an unknown binding returns null.
+    expect(await harness.touchChannelBindingInbound({ bindingId: 'missing', at: 1 })).toBeNull();
+  });
+
+  it('resolves idempotently and fences the prior active binding on replacement (§14.1)', async () => {
+    const harness = store.stores.harness!;
+    const first = await harness.resolveChannelBinding({ candidate: sampleChannelBinding({ id: 'gen-1' }) });
+    expect(first).toEqual({ binding: expect.objectContaining({ id: 'gen-1', generation: 1 }), created: true });
+
+    // No replacement: the existing active binding wins (idempotent), generation stays.
+    const again = await harness.resolveChannelBinding({ candidate: sampleChannelBinding({ id: 'gen-1-dup' }) });
+    expect(again.created).toBe(false);
+    expect(again.binding.id).toBe('gen-1');
+
+    // Replacement fences the prior active binding and bumps the generation.
+    const replaced = await harness.resolveChannelBinding({
+      candidate: sampleChannelBinding({ id: 'gen-2', updatedAt: 2000 }),
+      replaceBindingId: 'gen-1',
+    });
+    expect(replaced.created).toBe(true);
+    expect(replaced.binding.generation).toBe(2);
+    expect(replaced.replacedBindingId).toBe('gen-1');
+
+    const fenced = await harness.loadChannelBinding({ bindingId: 'gen-1' });
+    expect(fenced?.status).toBe('replaced');
+    expect(fenced?.replacedByBindingId).toBe('gen-2');
+
+    // Exactly one active binding remains for the tuple.
+    const active = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(active?.id).toBe('gen-2');
+  });
+
+  it('lists active bindings for a scope ordered by activity then id, with cursor paging (§14.8)', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'a', externalThreadId: 'th-a', lastOutboundAt: 100 }));
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'b', externalThreadId: 'th-b', lastOutboundAt: 300 }));
+    await harness.saveChannelBinding(sampleChannelBinding({ id: 'c', externalThreadId: 'th-c', lastInboundAt: 200 }));
+
+    const page1 = await harness.listActiveChannelBindingsForScope({ harnessName: 'default', limit: 2 });
+    expect(page1.bindings.map(b => b.id)).toEqual(['b', 'c']);
+    expect(page1.nextCursor).toBe('c');
+
+    const page2 = await harness.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      limit: 2,
+      cursor: page1.nextCursor,
+    });
+    expect(page2.bindings.map(b => b.id)).toEqual(['a']);
+    expect(page2.nextCursor).toBeUndefined();
+
+    // An unknown cursor pages to the end of the set rather than restarting.
+    const stale = await harness.listActiveChannelBindingsForScope({
+      harnessName: 'default',
+      limit: 2,
+      cursor: 'ghost',
+    });
+    expect(stale.bindings).toEqual([]);
+  });
+
+  it('removes the binding on deleteSessions and frees the tuple for rebind', async () => {
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id: 'session-1' }), { ownerId: 'h-1', ifVersion: 0 });
+    const seeded = await harness.loadSession({ sessionId: 'session-1' });
+    if (!seeded) throw new Error('expected seeded session');
+    await harness.saveChannelBinding(sampleChannelBinding({ sessionId: 'session-1' }));
+
+    await harness.deleteSessions({
+      sessions: [
+        {
+          sessionId: 'session-1',
+          ifVersion: seeded.version,
+          expectedResourceId: seeded.resourceId,
+          expectedThreadId: seeded.threadId,
+          expectedCreatedAt: seeded.createdAt,
+        },
+      ],
+    });
+
+    // The session-scoped binding is gone.
+    expect(await harness.loadChannelBinding({ bindingId: 'binding-1' })).toBeNull();
+    expect(await harness.listChannelBindingsForSession({ sessionId: 'session-1' })).toEqual([]);
+
+    // The conversation tuple is free, so a replacement session can rebind it.
+    await expect(
+      harness.saveChannelBinding(sampleChannelBinding({ id: 'rebind', sessionId: 'session-2' })),
+    ).resolves.toBeUndefined();
+    const rebound = await harness.loadChannelBindingByExternal({
+      harnessName: 'default',
+      channelId: 'support',
+      platform: 'slack',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'th-1',
+    });
+    expect(rebound?.id).toBe('rebind');
+  });
 });
 
 function sampleWorkspaceActionJournalEntry(
@@ -990,3 +1612,795 @@ function sampleWorkspaceActionJournalEntry(
     ...overrides,
   };
 }
+
+function sampleProviderCallbackBinding(
+  overrides: Partial<HarnessProviderCallbackBinding> = {},
+): HarnessProviderCallbackBinding {
+  return {
+    id: 'callback-binding-1',
+    providerId: 'slack',
+    selectorKind: 'installation',
+    selectorValue: 'installation-1',
+    harnessName: 'default',
+    channelId: 'support',
+    origin: { route: 'support-events' },
+    status: 'active',
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('HarnessPG provider callback binding ledger (§5.1i)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-provider-callback-binding-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  it('dedupes exact active selector bindings and creates the active-selector indexes', async () => {
+    const harness = store.stores.harness!;
+
+    await expect(harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding())).resolves.toMatchObject({
+      duplicate: false,
+      conflict: false,
+      binding: { id: 'callback-binding-1', status: 'active' },
+    });
+    await expect(
+      harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding({ id: 'callback-binding-retry' })),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: false,
+      binding: { id: 'callback-binding-1' },
+    });
+
+    const indexes = await store.db.manyOrNone<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND indexname = ANY($1)
+       ORDER BY indexname`,
+      [['idx_harness_provider_callback_active_selector', 'idx_harness_provider_callback_selector_status']],
+    );
+    expect(indexes.map(row => row.indexname)).toEqual([
+      'idx_harness_provider_callback_active_selector',
+      'idx_harness_provider_callback_selector_status',
+    ]);
+    // The active-selector index is a PARTIAL UNIQUE index (WHERE status = 'active').
+    const activeSelectorDef = indexes.find(
+      row => row.indexname === 'idx_harness_provider_callback_active_selector',
+    )?.indexdef;
+    expect(activeSelectorDef).toMatch(/UNIQUE INDEX/i);
+    expect(activeSelectorDef).toMatch(/WHERE.*status.*=.*'active'/i);
+  });
+
+  it('reports same selector with a different target as a conflict without retargeting', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          channelId: 'sales',
+          origin: { route: 'sales-events' },
+        }),
+      ),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: true,
+      binding: { id: 'callback-binding-1', channelId: 'support' },
+    });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', channelId: 'support' });
+  });
+
+  it('replaces active selector bindings and keeps replaced rows terminal', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding(), {
+        replaceBindingId: 'callback-binding-1',
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-disabled',
+          status: 'disabled',
+          harnessName: 'support-disabled',
+          channelId: 'support-disabled',
+          createdAt: 1500,
+          updatedAt: 1500,
+          origin: { route: 'support-events-disabled' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', status: 'active' });
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).resolves.toMatchObject({
+      duplicate: false,
+      conflict: false,
+      replacedBindingId: 'callback-binding-1',
+      binding: { id: 'callback-binding-2', harnessName: 'support-v2', status: 'active' },
+    });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-2' });
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      conflict: false,
+      replacedBindingId: 'callback-binding-1',
+      binding: { id: 'callback-binding-2', status: 'active' },
+    });
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+  });
+
+  it('rejects replacement retries when the previous owner was not replaced by the duplicate id', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+    const stalledReplacement = sampleProviderCallbackBinding({
+      id: 'callback-binding-2',
+      status: 'disabled',
+      harnessName: 'support-v2',
+      channelId: 'support-v2',
+      createdAt: 2000,
+      updatedAt: 2000,
+      origin: { route: 'support-events-v2' },
+    });
+    // Seed a disabled row with the would-be replacement id that the replacement target
+    // never transitioned to (replaced_by_binding_id stays NULL), so the unique-conflict
+    // resolver must refuse to treat the retry as an idempotent success.
+    await store.db.none(
+      `INSERT INTO ${TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS}
+            (id, provider_id, selector_kind, selector_value, harness_name, channel_id, origin, status,
+             created_at, updated_at, replaced_at, replaced_by_binding_id, last_error)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        stalledReplacement.id,
+        stalledReplacement.providerId,
+        stalledReplacement.selectorKind,
+        stalledReplacement.selectorValue,
+        stalledReplacement.harnessName,
+        stalledReplacement.channelId,
+        JSON.stringify(stalledReplacement.origin),
+        stalledReplacement.status,
+        stalledReplacement.createdAt,
+        stalledReplacement.updatedAt,
+        null,
+        null,
+        null,
+      ],
+    );
+
+    await expect(
+      harness.resolveProviderCallbackBinding(
+        sampleProviderCallbackBinding({
+          id: 'callback-binding-2',
+          harnessName: 'support-v2',
+          channelId: 'support-v2',
+          createdAt: 2000,
+          updatedAt: 2000,
+          origin: { route: 'support-events-v2' },
+        }),
+        { replaceBindingId: 'callback-binding-1' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageProviderCallbackBindingTransitionError);
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toMatchObject({ id: 'callback-binding-1', status: 'active' });
+  });
+
+  it('round-trips provider binding JSON columns through mark transitions', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+    await harness.markProviderCallbackBindingStatus({
+      bindingId: 'callback-binding-1',
+      status: 'undeliverable',
+      updatedAt: 2000,
+      lastError: { code: 'worker_unavailable', message: 'provider missing', retryable: true },
+    });
+
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).resolves.toMatchObject({
+      id: 'callback-binding-1',
+      origin: { route: 'support-events' },
+      status: 'active',
+      lastError: undefined,
+    });
+  });
+
+  it('allows disabled or undeliverable bindings to reactivate when no active selector owner exists', async () => {
+    const harness = store.stores.harness!;
+    await harness.resolveProviderCallbackBinding(sampleProviderCallbackBinding());
+
+    await expect(
+      harness.markProviderCallbackBindingStatus({
+        bindingId: 'callback-binding-1',
+        status: 'disabled',
+        updatedAt: 2000,
+        lastError: { code: 'worker_unavailable', message: 'provider disabled', retryable: true },
+      }),
+    ).resolves.toMatchObject({ status: 'disabled', lastError: { code: 'worker_unavailable' } });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 3000 }),
+    ).resolves.toMatchObject({ status: 'active', lastError: undefined });
+    await expect(
+      harness.markProviderCallbackBindingStatus({
+        bindingId: 'callback-binding-1',
+        status: 'undeliverable',
+        updatedAt: 4000,
+        lastError: { code: 'worker_unavailable', message: 'provider undeliverable', retryable: true },
+      }),
+    ).resolves.toMatchObject({ status: 'undeliverable', lastError: { code: 'worker_unavailable' } });
+    await expect(
+      harness.loadProviderCallbackBindingBySelector({
+        providerId: 'slack',
+        selectorKind: 'installation',
+        selectorValue: 'installation-1',
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      harness.markProviderCallbackBindingStatus({ bindingId: 'callback-binding-1', status: 'active', updatedAt: 5000 }),
+    ).resolves.toMatchObject({ status: 'active', lastError: undefined });
+  });
+});
+
+describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
+  const store = new PostgresStore({ ...TEST_CONFIG, id: 'pg-harness-renew-subtree-test-store' });
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await store.stores.harness?.dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.stores.harness?.dangerouslyClearAll().catch(() => {});
+    await store.close();
+  });
+
+  async function seedOwned(
+    id: string,
+    ownerId: string,
+    parentSessionId?: string,
+    overrides: Partial<Parameters<typeof createSampleSessionRecord>[0]> = {},
+  ) {
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id, threadId: `t-${id}`, parentSessionId, ...overrides }), {
+      ownerId,
+      ifVersion: 0,
+    });
+    await harness.acquireSessionLease({ sessionId: id, ownerId, ttlMs: 60_000 });
+  }
+
+  it('atomically renews the root and every active descendant (incl. a grandchild) to one capped expiry', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('child', 'h-1', 'root');
+    await seedOwned('grandchild', 'h-1', 'child');
+
+    const before = Date.now();
+    const result = await harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    // child + grandchild — the recursive CTE must descend past the first level.
+    expect(result.renewedDescendantCount).toBe(2);
+
+    for (const id of ['root', 'child', 'grandchild']) {
+      const rec = await harness.loadSession({ sessionId: id });
+      expect(rec?.leaseExpiresAt).toBeGreaterThanOrEqual(before + 120_000 - 5_000);
+    }
+  });
+
+  it('skips closed descendants (no live lease) but still renews active ones', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('open-child', 'h-1', 'root');
+    // A closed descendant holds no live lease and must not be counted/renewed.
+    await harness.saveSession(
+      createSampleSessionRecord({
+        id: 'closed-child',
+        threadId: 't-closed',
+        parentSessionId: 'root',
+        closedAt: 5000,
+        lastActivityAt: 5000,
+      }),
+      { ownerId: 'h-1', ifVersion: 0 },
+    );
+
+    const result = await harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 });
+    expect(result.renewedDescendantCount).toBe(1);
+  });
+
+  it('fences and renews NOTHING when an active descendant is owned by another instance (§5.8 all-or-nothing)', async () => {
+    const harness = store.stores.harness!;
+    await seedOwned('root', 'h-1');
+    await seedOwned('foreign-child', 'h-2', 'root'); // split subtree
+
+    const rootBefore = await harness.loadSession({ sessionId: 'root' });
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 120_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+
+    // Root lease must be untouched — no parent-only partial commit.
+    const rootAfter = await harness.loadSession({ sessionId: 'root' });
+    expect(rootAfter?.leaseExpiresAt).toBe(rootBefore?.leaseExpiresAt);
+  });
+
+  it('throws SessionNotFound for an unknown root and LeaseConflict for a non-owned root', async () => {
+    const harness = store.stores.harness!;
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'ghost', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await seedOwned('root', 'h-2'); // owned by someone else
+    await expect(
+      harness.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: 'h-1', ttlMs: 1000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  describe('plan tasks (§5.1k)', () => {
+    const OWNER = 'plan-owner';
+
+    async function setupSession(
+      sessionId = 'plan-session',
+      overrides: Partial<Parameters<typeof createSampleSessionRecord>[0]> = {},
+    ): Promise<{ sessionId: string; version: number }> {
+      const harness = store.stores.harness!;
+      const record = createSampleSessionRecord({ id: sessionId, ...overrides });
+      const res = await harness.createOrLoadActiveSession(record, {
+        initialLease: { ownerId: OWNER, ttlMs: 30_000 },
+      });
+      return { sessionId, version: res.version };
+    }
+
+    function fence(sessionId: string, ifSessionVersion: number, owner = OWNER) {
+      return { harnessName: 'default', sessionId, ownerId: owner, ifSessionVersion };
+    }
+
+    function sampleTask(sessionId: string, overrides: Partial<HarnessPlanTask> = {}): HarnessPlanTask {
+      return {
+        taskId: 'task-1',
+        harnessName: 'default',
+        sessionId,
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        order: 0,
+        status: 'pending',
+        statusSource: 'explicit',
+        content: 'do the thing',
+        createdAt: 1000,
+        updatedAt: 1000,
+        version: 0,
+        ...overrides,
+      };
+    }
+
+    it('creates a root task and lists it', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const created = await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      expect(created).toMatchObject({ taskId: 'task-1', status: 'pending', version: 1, statusSource: 'explicit' });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks).toHaveLength(1);
+      expect(listed.tasks[0]).toMatchObject({ taskId: 'task-1', content: 'do the thing' });
+    });
+
+    it('createPlanTask is idempotent on idempotencyKey within a session', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const a = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 't-a', idempotencyKey: 'idem-1', content: 'first' }),
+      });
+      const b = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 't-b', idempotencyKey: 'idem-1', content: 'second' }),
+      });
+      expect(b.taskId).toBe('t-a');
+      expect(b.content).toBe('first');
+      expect(b.version).toBe(a.version);
+    });
+
+    it('updatePlanTask advances the per-row version and applies the patch', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      const r1 = await harness.updatePlanTask({
+        fence: fence(sessionId, version),
+        taskId: 'task-1',
+        ifVersion: 1,
+        patch: { status: 'in_progress', activeForm: 'doing it', startedAt: 4000, completedAt: 5000, blockedBy: ['x'] },
+      });
+      expect(r1.version).toBe(2);
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks[0]).toMatchObject({
+        status: 'in_progress',
+        activeForm: 'doing it',
+        startedAt: 4000,
+        completedAt: 5000,
+        blockedBy: ['x'],
+        version: 2,
+      });
+    });
+
+    it('updatePlanTask rejects a stale per-row version', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId) });
+      await expect(
+        harness.updatePlanTask({
+          fence: fence(sessionId, version),
+          taskId: 'task-1',
+          ifVersion: 99,
+          patch: { status: 'completed' },
+        }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+    });
+
+    it('updatePlanTask throws not-found for an unknown task', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.updatePlanTask({ fence: fence(sessionId, version), taskId: 'nope', ifVersion: 1, patch: {} }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskNotFoundError);
+    });
+
+    it('the session-owner fence rejects a wrong ownerId', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.createPlanTask({ fence: fence(sessionId, version, 'someone-else'), task: sampleTask(sessionId) }),
+      ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    });
+
+    it('the session-owner fence rejects a stale session version', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await expect(
+        harness.createPlanTask({ fence: fence(sessionId, version + 5), task: sampleTask(sessionId) }),
+      ).rejects.toBeInstanceOf(HarnessStorageVersionConflictError);
+    });
+
+    it('the session-owner fence throws not-found for an unknown session', async () => {
+      const harness = store.stores.harness!;
+      await expect(
+        harness.createPlanTask({ fence: fence('ghost', 1), task: sampleTask('ghost') }),
+      ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    });
+
+    it('listPlanTasks paginates and orders by (parentTaskId, order)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'r1', order: 1 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'r0', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r0', order: 1 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'c0', parentTaskId: 'r0', order: 0 }),
+      });
+
+      const page1 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+      expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+      expect(page1.cursor).toBeDefined();
+      const page2 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+      expect(page2.tasks.map(t => t.taskId)).toEqual(['c0', 'c1']);
+      expect(page2.cursor).toBeUndefined();
+    });
+
+    it('listPlanTasks keyset-continues even when the cursor row was deleted between pages', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      for (let i = 0; i < 4; i++) {
+        await harness.createPlanTask({
+          fence: fence(sessionId, version),
+          task: sampleTask(sessionId, { taskId: `r${i}`, order: i }),
+        });
+      }
+      const page1 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2 });
+      expect(page1.tasks.map(t => t.taskId)).toEqual(['r0', 'r1']);
+      // Delete the cursor's own row before the next page — keyset continues at r2
+      // (cross-adapter parity with the in-memory adapter).
+      await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'r1' });
+      const page2 = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 2, cursor: page1.cursor });
+      expect(page2.tasks.map(t => t.taskId)).toEqual(['r2', 'r3']);
+    });
+
+    it('listPlanTasks isolates by session', async () => {
+      const harness = store.stores.harness!;
+      const a = await setupSession('sess-a', { threadId: 'thread-a' });
+      const b = await setupSession('sess-b', { threadId: 'thread-b' });
+      await harness.createPlanTask({
+        fence: fence(a.sessionId, a.version),
+        task: sampleTask(a.sessionId, { taskId: 'ta' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(b.sessionId, b.version),
+        task: sampleTask(b.sessionId, { taskId: 'tb' }),
+      });
+      const listedA = await harness.listPlanTasks({ harnessName: 'default', sessionId: a.sessionId, limit: 10 });
+      expect(listedA.tasks.map(t => t.taskId)).toEqual(['ta']);
+    });
+
+    it('deletePlanTaskSubtree cascades to all descendants (recursive CTE)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'root' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'd', order: 9 }),
+      });
+
+      const res = await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'root' });
+      expect(res.deletedCount).toBe(4);
+      const remaining = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(remaining.tasks.map(t => t.taskId)).toEqual(['d']);
+    });
+
+    it('deletePlanTaskSubtree terminates on a parentTaskId cycle (UNION guard)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'x', parentTaskId: 'y' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'y', parentTaskId: 'x' }),
+      });
+      const res = await harness.deletePlanTaskSubtree({ fence: fence(sessionId, version), rootTaskId: 'x' });
+      expect(res.deletedCount).toBe(2);
+      const remaining = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(remaining.tasks).toHaveLength(0);
+    });
+
+    it('mutatePlanTasksForSession applies multi-row ops atomically', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+      });
+      await harness.mutatePlanTasksForSession({
+        fence: fence(sessionId, version),
+        ops: [
+          { kind: 'create', task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'p', order: 0 }) },
+          { kind: 'create', task: sampleTask(sessionId, { taskId: 'c2', parentTaskId: 'p', order: 1 }) },
+          { kind: 'update', taskId: 'p', ifVersion: 1, patch: { status: 'in_progress' } },
+        ],
+      });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks.map(t => t.taskId)).toEqual(['p', 'c1', 'c2']);
+      expect(listed.tasks.find(t => t.taskId === 'p')).toMatchObject({ status: 'in_progress', version: 2 });
+    });
+
+    it('mutatePlanTasksForSession rejects all ops when one op conflicts (transaction rollback)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'p', order: 0 }),
+      });
+      await expect(
+        harness.mutatePlanTasksForSession({
+          fence: fence(sessionId, version),
+          ops: [
+            { kind: 'create', task: sampleTask(sessionId, { taskId: 'new', order: 5 }) },
+            { kind: 'update', taskId: 'p', ifVersion: 99, patch: { status: 'completed' } },
+          ],
+        }),
+      ).rejects.toBeInstanceOf(HarnessStoragePlanTaskVersionConflictError);
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks.map(t => t.taskId)).toEqual(['p']);
+    });
+
+    it('loadPlanTaskSubtree returns a bounded next-N subtree honoring depth + status', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'root', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'a', parentTaskId: 'root', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'b', parentTaskId: 'a', order: 0 }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'c', parentTaskId: 'root', order: 1, status: 'completed' }),
+      });
+
+      const d1 = await harness.loadPlanTaskSubtree({
+        harnessName: 'default',
+        sessionId,
+        rootTaskId: 'root',
+        depth: 1,
+        limit: 10,
+      });
+      expect(d1.tasks.map(t => t.taskId)).toEqual(['root', 'a', 'c']);
+      expect(d1.truncated).toBe(false);
+
+      const completed = await harness.loadPlanTaskSubtree({
+        harnessName: 'default',
+        sessionId,
+        status: 'completed',
+        limit: 10,
+      });
+      expect(completed.tasks.map(t => t.taskId)).toEqual(['c']);
+
+      const limited = await harness.loadPlanTaskSubtree({
+        harnessName: 'default',
+        sessionId,
+        rootTaskId: 'root',
+        limit: 2,
+      });
+      expect(limited.tasks).toHaveLength(2);
+      expect(limited.truncated).toBe(true);
+    });
+
+    it('session delete cascades plan tasks (§5.2g)', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      await harness.createPlanTask({ fence: fence(sessionId, version), task: sampleTask(sessionId, { taskId: 't1' }) });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 't2', parentTaskId: 't1' }),
+      });
+      await harness.deleteSession({ harnessName: 'default', sessionId });
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks).toHaveLength(0);
+    });
+
+    it('countPlanTasksByStatus aggregates by status and counts roots + orphans', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      // Two real roots (one with a child) + an orphan whose parent is unresolvable.
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'r1', order: 0, status: 'in_progress' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'r2', order: 1, status: 'pending' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'c1', parentTaskId: 'r1', order: 0, status: 'completed' }),
+      });
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'orphan', parentTaskId: 'missing', order: 2, status: 'pending' }),
+      });
+
+      const counts = await harness.countPlanTasksByStatus({ harnessName: 'default', sessionId });
+      expect(counts.total).toBe(4);
+      // The orphan's parent is not in the set, so it counts as a root alongside r1/r2.
+      expect(counts.rootCount).toBe(3);
+      expect(counts.byStatus.in_progress).toBe(1);
+      expect(counts.byStatus.pending).toBe(2);
+      expect(counts.byStatus.completed).toBe(1);
+    });
+
+    it('round-trips the delegatedSubagentSessionId link (TM-6) through create, list, subtree, and update', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession();
+      const created = await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'd1', delegatedSubagentSessionId: 'sub-abc' }),
+      });
+      expect(created.delegatedSubagentSessionId).toBe('sub-abc');
+      const listed = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(listed.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+      const sub = await harness.loadPlanTaskSubtree({
+        harnessName: 'default',
+        sessionId,
+        rootTaskId: 'd1',
+        depth: 0,
+        limit: 10,
+      });
+      expect(sub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-abc');
+      await harness.updatePlanTask({
+        fence: fence(sessionId, version),
+        taskId: 'd1',
+        ifVersion: created.version,
+        patch: { delegatedSubagentSessionId: 'sub-xyz' },
+      });
+      const after = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
+      expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
+      // The updated link also hydrates through a subtree read (not just list).
+      const afterSub = await harness.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'd1', depth: 0, limit: 10 });
+      expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
+    });
+  });
+});

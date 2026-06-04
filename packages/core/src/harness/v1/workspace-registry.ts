@@ -15,11 +15,27 @@
 import { RequestContext } from '../../request-context';
 import type { Workspace } from '../../workspace';
 
-import { HarnessConfigError, HarnessWorkspaceInUseError, HarnessWorkspaceProvisioningError } from './errors';
-import type { EventEmitter } from './events';
+import { HarnessConfigError, HarnessResourceWorkspaceInUseError, HarnessWorkspaceProvisioningError } from './errors';
 import type { HarnessWorkspaceConfig } from './types';
 import { nonDurableProvider } from './workspace-provider';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
+
+/**
+ * @internal Non-`HarnessEventV1` workspace lifecycle notice. §2.7/§10.2: the
+ * harness does not define public workspace events; provider audit is
+ * provider-owned inspection data. This optional callback lets in-process owners
+ * observe lifecycle/error transitions without putting them on the public
+ * `session.subscribe(...)` / SSE event stream. Provisioning failures still throw.
+ */
+export type WorkspaceNotice =
+  | {
+      kind: 'status';
+      sessionId?: string;
+      resourceId?: string;
+      providerId?: string;
+      status: 'initializing' | 'ready' | 'destroying' | 'destroyed' | 'lost' | 'error';
+    }
+  | { kind: 'error'; sessionId?: string; resourceId?: string; providerId?: string; error: { name: string; message: string } };
 
 // ---------------------------------------------------------------------------
 // Internal entry shapes.
@@ -76,16 +92,16 @@ export interface InheritPerSessionOpts {
 
 export class WorkspaceRegistry {
   private readonly _config?: HarnessWorkspaceConfig;
-  private readonly _emit: EventEmitter;
+  private readonly _onNotice?: (notice: WorkspaceNotice) => void;
   private readonly _shared: SharedEntry | undefined;
   private readonly _perResource = new Map<string, PerResourceEntry>();
   private readonly _perSession = new Map<string, PerSessionEntry>();
   private readonly _resolvedProvider?: WorkspaceProvider;
   private _closed = false;
 
-  constructor(opts: { config?: HarnessWorkspaceConfig; emitter: EventEmitter }) {
+  constructor(opts: { config?: HarnessWorkspaceConfig; onNotice?: (notice: WorkspaceNotice) => void }) {
     this._config = opts.config;
-    this._emit = opts.emitter;
+    this._onNotice = opts.onNotice;
 
     if (!this._config) {
       return;
@@ -272,7 +288,7 @@ export class WorkspaceRegistry {
     const entry = this._perResource.get(opts.resourceId);
     if (!entry) return;
     if (entry.refCount > 0) {
-      throw new HarnessWorkspaceInUseError(opts.resourceId, entry.refCount);
+      throw new HarnessResourceWorkspaceInUseError(opts.resourceId);
     }
     await this._destroyPerResourceEntry(opts.resourceId, entry);
   }
@@ -495,27 +511,23 @@ export class WorkspaceRegistry {
     providerId?: string;
     status: 'initializing' | 'ready' | 'destroying' | 'destroyed' | 'lost' | 'error';
   }): void {
-    this._emit.emit(
-      {
-        type: 'workspace_status_changed',
-        resourceId: opts.resourceId,
-        providerId: opts.providerId,
-        status: opts.status,
-      },
-      opts.sessionId !== undefined ? { sessionId: opts.sessionId } : undefined,
-    );
+    this._onNotice?.({
+      kind: 'status',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      resourceId: opts.resourceId,
+      providerId: opts.providerId,
+      status: opts.status,
+    });
   }
 
   private _emitError(opts: { sessionId?: string; resourceId?: string; providerId?: string; err: unknown }): void {
     const e = opts.err instanceof Error ? opts.err : new Error(String(opts.err));
-    this._emit.emit(
-      {
-        type: 'workspace_error',
-        resourceId: opts.resourceId,
-        providerId: opts.providerId,
-        error: { name: e.name, message: e.message },
-      },
-      opts.sessionId !== undefined ? { sessionId: opts.sessionId } : undefined,
-    );
+    this._onNotice?.({
+      kind: 'error',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      resourceId: opts.resourceId,
+      providerId: opts.providerId,
+      error: { name: e.name, message: e.message },
+    });
   }
 }

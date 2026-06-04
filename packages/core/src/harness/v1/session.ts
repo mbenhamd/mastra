@@ -28,11 +28,12 @@
  * Callers must re-resolve via `harness.session(...)` to get a fresh instance.
  */
 
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
+import type { AgentSignalContents } from '../../agent/signals';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
@@ -41,13 +42,15 @@ import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionEventReplayUnsupportedError,
-  HarnessStorageSessionNotFoundError,
+  HarnessStorageVersionConflictError,
 } from '../../storage/domains/harness';
 import type {
   GoalJudgeDecision,
   GoalState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
+  HarnessPlanTask,
+  HarnessRunSummary,
   HarnessStorage,
   HarnessStorageAttachmentUnavailableError,
   HarnessRuntimeDependencyRefs,
@@ -62,6 +65,7 @@ import type {
   SaveAttachmentReferenceInput,
   SessionGrants,
   SessionRecord,
+  SessionSummary,
 } from '../../storage/domains/harness';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
@@ -71,42 +75,111 @@ import { convertStoredMessageToHarnessMessage } from '../_shared/message-convers
 import type { StoredMessageRow } from '../_shared/message-conversion';
 import type { HarnessMessage } from '../types';
 
+// §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
+// always validates caller-reachable input, so the checked variant is bound to the local name.
+import { activityTimelineMessageReadBound, buildActivityTimeline } from './activity-timeline';
+import type { ActivityTimelineSessionInput } from './activity-timeline';
 import {
+  assertJsonValue,
+  canonicalJson,
+  jsonValuesEqual,
+  sha256CanonicalJsonChecked as sha256CanonicalJson,
+} from './canonical-json';
+// §5.1k / §6.4 plan-task session operations (TM-3/TM-4): the live session is the
+// serialized writer for its plan tree; these helpers own rollup/cycle/in-progress.
+// §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
+// and the tool-visible context.
+import { toHarnessDisplayStateSnapshotV1 } from './display-state';
+import type { HarnessDisplayStateSnapshotV1 } from './display-state';
+import {
+  HarnessAbortedError,
   HarnessAdmissionConflictError,
   HarnessAttachmentUnavailableError,
+  HarnessBusyError,
   HarnessConfigError,
+  HarnessError,
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
+  HarnessOutputGenerationError,
   HarnessOverrideConflictError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
   HarnessQueueItemExpiredError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
-  HarnessSessionClosingError,
+  harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessSessionLockedError,
-  HarnessSessionNotFoundError,
   HarnessStateConflictError,
+  HarnessStateSerializationError,
+  HarnessStorageError,
   HarnessSkillArgsValidationError,
   HarnessSkillNotFoundError,
+  HarnessSubagentDepthExceededError,
   HarnessValidationError,
   HarnessWorkspaceLostError,
+  redactPublicBoundaryRejection,
 } from './errors';
-import { EventEmitter, parseHarnessEventId, projectHarnessPublicError, snapshotHarnessEventForJson } from './events';
+import type { HarnessAbortReason, HarnessOutputGenerationReason } from './errors';
+import {
+  assertCustomEventType,
+  assertJsonSerializable,
+  EventEmitter,
+  parseHarnessEventId,
+  projectHarnessPublicError,
+  projectToolEventPayloadForJson,
+  snapshotHarnessEventForJson,
+} from './events';
 import type {
   EmitInput,
   HarnessEvent,
   HarnessEventListener,
   HarnessEventUnsubscribe,
+  RunCompletedEvent,
+  RunCompletedStatus,
+  RunToolRollup,
   SubagentEndEvent,
+  SubagentReasoningDeltaEvent,
   SubagentStartEvent,
   SubagentTextDeltaEvent,
   SubagentToolEndEvent,
   SubagentToolStartEvent,
-  TaskUpdatedEvent,
 } from './events';
 import type { Harness } from './harness';
+import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
+import type {
+  AddTaskInput,
+  CheckInput,
+  DecomposeChildInput,
+  DelegatedSubagentOutcome,
+  PlanTaskSessionPort,
+  PlanTaskSummary,
+  PlanTaskView,
+  UpdateTaskInput,
+} from './plan-task-session';
+import {
+  planTaskAdd,
+  planTaskCheck,
+  planTaskComplete,
+  planTaskDecompose,
+  planTaskDelegate,
+  planTaskReconcileDelegation,
+  planTaskReparent,
+  planTaskUpdate,
+  PLAN_TASK_UPDATED_EVENT,
+} from './plan-task-session';
+import {
+  createPlanTaskTools,
+  TASK_ADD_TOOL_ID,
+  TASK_CHECK_TOOL_ID,
+  TASK_COMPLETE_TOOL_ID,
+  TASK_DECOMPOSE_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+  TASK_REPARENT_TOOL_ID,
+  TASK_UPDATE_TOOL_ID,
+  TASK_WRITE_TOOL_ID,
+} from './plan-task-tool';
+import { callerRequestContextToPersisted, validateCallerRequestContext } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import type {
   AgentResult,
@@ -122,6 +195,7 @@ import type {
   HarnessMode,
   InboxResponseOptions,
   InboxResponseResult,
+  HarnessCustomEventInput,
   HarnessRequestContext,
   HarnessSkill,
   HarnessSkillActionMetadata,
@@ -145,6 +219,8 @@ import type {
   SessionSignalResult,
   SetStateOptions,
   ToolCategory,
+  ActivityTimelineOptions,
+  SessionActivityTimeline,
 } from './types';
 
 type MessageAdmissionIdentity = {
@@ -156,6 +232,23 @@ type Deferred<T> = {
   promise: Promise<T>;
   resolve: (value: T) => void;
   reject: (reason: unknown) => void;
+};
+
+/**
+ * §S4.1 — a pending event-ledger append awaiting transient-failure retry. Everything
+ * except `storedAt` is captured at enqueue time; `storedAt` is stamped at write time so
+ * each retry records its own persistence timestamp.
+ */
+type PendingEventAppend = {
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  eventId: string;
+  epoch: string;
+  sequence: number;
+  event: JsonValue;
+  emittedAt: number;
 };
 
 type MessageAdmissionStart = {
@@ -199,6 +292,9 @@ type ActionCatalogMcpTimedOutWork = {
  * Shared with the built-in `askUser` / `submitPlan` tools so the contract
  * lives in a single place (`packages/core/src/tools/builtin`).
  */
+/** Defensive cap on the synthetic-aborted-tool tombstone set (§10.2 / S1). */
+const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
+
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
@@ -206,6 +302,20 @@ const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
+/**
+ * §S4.1 — max transiently-failed event-ledger appends retained for retry before
+ * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
+ * the durable log: the failed slot is backlogged and retried (in order) ahead of any
+ * later sequence on the next append, preserving ledger contiguity. Past this bound we
+ * can no longer guarantee retry without unbounded memory, so we hard-latch and let a
+ * reconnect recover via the §10.5 snapshot path.
+ */
+const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
+/** TM-6 reconcile-on-rehydrate bounded retry (transient/CAS/locked failures). */
+const DELEGATION_RECONCILE_MAX_RETRIES = 5;
+const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
+/** TM-6 `includeSubtree` transfer cap; a clipped subtree is flagged truncated. */
+const DELEGATED_SUBTREE_MAX_NODES = 100;
 const ACTION_CATALOG_DEFAULT_LIMIT = 100;
 const ACTION_CATALOG_MAX_LIMIT = 500;
 const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
@@ -229,6 +339,138 @@ const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
   'additionalProperties',
 ]);
 const RESERVED_MCP_SERVER_KEYS = new Set([...Object.getOwnPropertyNames(Object.prototype), '__proto__']);
+
+function isPlainStateObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * §10.2 state_changed sentinel for a whole-root change. `session.state` is
+ * `unknown` — it may legitimately be a scalar, array, or plain object root (see
+ * `firstNonJsonStatePath`, which explicitly allows scalar/array roots). When
+ * the root itself is not a plain object on both sides, there are no top-level
+ * keys to diff, so a genuine root change is reported under this sentinel key,
+ * matching the `$`-for-root path convention used elsewhere in this module.
+ */
+const STATE_ROOT_SENTINEL = '$';
+
+/**
+ * §10.2 state_changed: the keys whose value changed between two durable
+ * `session.state` snapshots.
+ *
+ * When BOTH snapshots are plain objects, the result is the set of top-level
+ * keys that were added, removed, or mutated. Reference-equal values
+ * short-circuit (the common `setState` spread keeps unchanged value refs
+ * intact), so only genuinely-changed keys are reported; a canonical
+ * (key-order-independent) JSON compare confirms changed references.
+ *
+ * When the root is NOT a plain object on both sides (e.g. a scalar->scalar,
+ * array->array, or scalar<->object transition), there are no top-level keys to
+ * diff. A genuine change is then reported under the `'$'` root sentinel so the
+ * state_changed signal still fires; consumers read the full new root from the
+ * event's `state` field. Equal roots (canonical JSON) report no change.
+ */
+function diffStateKeys(prev: unknown, next: unknown): string[] {
+  if (!isPlainStateObject(prev) || !isPlainStateObject(next)) {
+    if (prev === next) return [];
+    if (jsonValuesEqual(prev as JsonValue | undefined, next as JsonValue | undefined)) return [];
+    return [STATE_ROOT_SENTINEL];
+  }
+  const a = prev;
+  const b = next;
+  const changed: string[] = [];
+  for (const key of new Set<string>([...Object.keys(a), ...Object.keys(b)])) {
+    const av = a[key];
+    const bv = b[key];
+    if (av === bv) continue;
+    if (jsonValuesEqual(av as JsonValue | undefined, bv as JsonValue | undefined)) continue;
+    changed.push(key);
+  }
+  return changed;
+}
+
+/**
+ * §5.1 state-shape validation. Returns the dotted path (`$` for the root) of the
+ * FIRST value in a candidate `session.state` that cannot round-trip through
+ * `JSON.stringify`/`JSON.parse` as plain JSON, or `undefined` when the whole
+ * value is valid. Valid = `null`, string, boolean, FINITE number, plain array,
+ * or PLAIN object whose values are all valid.
+ *
+ * The check is descriptor-STRICT — it rejects everything `JSON.stringify` would
+ * silently DROP or TRANSFORM, not just obviously-bad scalar values:
+ *   - scalar: `undefined`, `function`, `symbol`, `bigint`, `NaN`/`Infinity`
+ *   - circular references
+ *   - non-plain objects (`Date`/`Map`/`Set`/`RegExp`/class instances) — these
+ *     either throw, serialize as `{}`, or transform via `toJSON`
+ *   - symbol-keyed properties (dropped by JSON)
+ *   - non-enumerable own properties (dropped by JSON)
+ *   - accessor properties (getters/setters) — not data, and a getter would run
+ *     arbitrary/throwing code; we reject WITHOUT invoking it
+ *   - arrays with non-index own properties or sparse holes (dropped / become null)
+ * Traversal is deterministic (`Reflect.ownKeys` order) so the reported path is
+ * stable, and a data value is only READ after its descriptor is confirmed safe.
+ */
+function firstNonJsonStatePath(value: unknown, path: string, seen: Set<object>): string | undefined {
+  if (value === null) return undefined;
+  const t = typeof value;
+  if (t === 'string' || t === 'boolean') return undefined;
+  if (t === 'number') return Number.isFinite(value as number) ? undefined : path;
+  if (t === 'undefined' || t === 'function' || t === 'symbol' || t === 'bigint') return path;
+  if (t !== 'object') return path;
+  const obj = value as object;
+  if (seen.has(obj)) return path; // circular reference
+
+  if (Array.isArray(obj)) {
+    seen.add(obj);
+    const len = obj.length;
+    // Reject any own key that isn't a dense [0, len) index (extra props +
+    // accessors are dropped/transformed by JSON; `length` is intrinsic).
+    for (const key of Reflect.ownKeys(obj)) {
+      if (key === 'length') continue;
+      if (typeof key === 'symbol') return done(seen, obj, path);
+      // Only CANONICAL dense indices are real array elements; `"01"`/`"1.0"`/
+      // `""`/`" "` etc. coerce into range but are non-index props JSON drops.
+      const idx = Number(key);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= len || String(idx) !== key) return done(seen, obj, path);
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (desc === undefined || desc.get !== undefined || desc.set !== undefined) {
+        return done(seen, obj, path === '$' ? String(idx) : `${path}.${idx}`);
+      }
+    }
+    for (let i = 0; i < len; i++) {
+      const childPath = path === '$' ? String(i) : `${path}.${i}`;
+      if (!(i in obj)) return done(seen, obj, childPath); // sparse hole (JSON → null)
+      const r = firstNonJsonStatePath((obj as unknown[])[i], childPath, seen);
+      if (r !== undefined) return done(seen, obj, r);
+    }
+    seen.delete(obj);
+    return undefined;
+  }
+
+  // Only plain objects (Object.prototype or null prototype) are valid JSON
+  // containers; Date/Map/Set/class instances etc. are not round-trippable.
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) return path;
+  seen.add(obj);
+  for (const key of Reflect.ownKeys(obj)) {
+    if (typeof key === 'symbol') return done(seen, obj, path); // symbol-keyed prop (dropped)
+    const childPath = path === '$' ? key : `${path}.${key}`;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) return done(seen, obj, childPath);
+    if (!desc.enumerable) return done(seen, obj, childPath); // dropped by JSON
+    if (desc.get !== undefined || desc.set !== undefined) return done(seen, obj, childPath); // accessor — never invoked
+    const r = firstNonJsonStatePath((obj as Record<string, unknown>)[key], childPath, seen);
+    if (r !== undefined) return done(seen, obj, r);
+  }
+  seen.delete(obj);
+  return undefined;
+}
+
+/** Pop the circular-tracking frame and return the offending path. */
+function done(seen: Set<object>, obj: object, path: string): string {
+  seen.delete(obj);
+  return path;
+}
 
 function cloneMcpCatalogValue(value: unknown): unknown | undefined {
   if (value === undefined) return undefined;
@@ -455,6 +697,41 @@ const JUDGE_TRUNCATE_LIMIT = 4000;
 const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mcp', 'other'];
 const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
 
+/**
+ * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate,
+ * and the HITL suspension tools ask_user / submit_plan). These are harness
+ * infrastructure, NOT user/agent tools, so the §4.2e permission gate never applies
+ * to them — an engaged default 'deny'/'ask' must not block or suspend the harness's
+ * own orchestration (denying ask_user/submit_plan would break the question /
+ * plan-approval flows the gate itself relies on). Kept in sync with `_buildToolsets`.
+ */
+const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
+  TASK_ADD_TOOL_ID,
+  TASK_DECOMPOSE_TOOL_ID,
+  TASK_REPARENT_TOOL_ID,
+  TASK_UPDATE_TOOL_ID,
+  TASK_COMPLETE_TOOL_ID,
+  TASK_CHECK_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+  TASK_WRITE_TOOL_ID,
+  SPAWN_SUBAGENT_TOOL_ID,
+  ASK_USER_TOOL_ID,
+  SUBMIT_PLAN_TOOL_ID,
+]);
+
+/**
+ * The subset of harness built-ins that a per-subagent `toolAllowlist` does NOT
+ * auto-keep (M4): `spawn_subagent` / `task_delegate` are capability-escalation
+ * vectors — a scoped subagent could otherwise run a broader child. Under an
+ * allowlist these must be listed explicitly to be available; without an allowlist
+ * they bypass the gate as normal harness infrastructure. Everything else in
+ * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
+ */
+const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
+  SPAWN_SUBAGENT_TOOL_ID,
+  TASK_DELEGATE_TOOL_ID,
+]);
+
 function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
   if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
     throw new HarnessValidationError(method, `unknown ToolCategory ${JSON.stringify(value)}`);
@@ -530,6 +807,14 @@ function buildJudgeContinuation(opts: { turn: number; max: number; objective: st
 }
 
 /**
+ * Defensive cap on `inProgressTaskIds` in the lazily-seeded plan-task summary
+ * (§5.1k / TM-5). The single-in-progress-per-root rule keeps this naturally
+ * small; the cap bounds a degenerate tree from materializing an unbounded id
+ * list into the display snapshot.
+ */
+const PLAN_TASK_SUMMARY_IN_PROGRESS_CAP = 100;
+
+/**
  * Active-tool tracking for `SessionDisplayState.activeTools`. One entry per
  * `tool_start` that has not yet been settled by a matching `tool_end`. Drops
  * out on `tool_end` regardless of `isError`.
@@ -553,6 +838,22 @@ export interface ActiveSubagentState {
   task: string;
   parentToolCallId: string;
   startedAt: number;
+  /**
+   * Live child-run progress for the parent's display snapshot (§SA2). Lets a
+   * polling / reconnecting / display-state consumer see a subagent's inner
+   * progress from the PARENT snapshot alone (streaming consumers can still read
+   * the `subagent_*` event family). Best-effort + in-memory: updated as the
+   * child's bridged events arrive; absent fields mean "not yet observed".
+   */
+  status?: 'running' | 'completed' | 'failed';
+  /** The child's currently-executing tool, if one is in flight; cleared when it ends. */
+  currentToolName?: string;
+  /** Count of child tool calls observed so far. */
+  toolCalls?: number;
+  /** The child run's token usage, populated at the child's terminal. */
+  usage?: TokenUsage;
+  /** Last time this projection was updated from a child event. */
+  updatedAt?: number;
 }
 
 /** Cumulative token usage for the session's thread. */
@@ -591,6 +892,78 @@ interface ActiveTurnWaiter {
  * `getDisplayState()` doc-comment for the split rationale. All `Record<>`
  * collections returned here are fresh on every call; do not mutate them.
  */
+// ---------------------------------------------------------------------------
+// Run projection (§5.1b SessionRunProjection). A bounded read-model view of the
+// active run for the session list/detail UI — NOT the durable
+// HarnessRunOperationalState recovery record. Populated from live session state;
+// `getDisplayState().currentRun` is present only while a run is in flight.
+// ---------------------------------------------------------------------------
+export type HarnessRunStatus = 'starting' | 'running' | 'waiting' | 'resuming' | 'completed' | 'failed' | 'interrupted';
+
+export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 'use-skill' | 'inbox-response';
+
+export interface SessionRunProjection {
+  runId: string;
+  traceId?: string;
+  status: HarnessRunStatus;
+  operation: {
+    kind: HarnessRunOperationRefKind;
+    signalId?: string;
+    queuedItemId?: string;
+    itemId?: string;
+    responseId?: string;
+    skillName?: string;
+  };
+  modeId: string;
+  modelId: string;
+  agentId: string;
+  startedAt: number;
+  updatedAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
+// `run_completed` event + the durable run summary. An OpenRunSpan is opened at
+// the run's FIRST `agent_start` (agent_start is emitted ONCE per run; a resume
+// reuses the runId and emits only the terminal `agent_end`) and finalized +
+// removed at the run's terminal `agent_end`. It is intentionally NOT cleared by
+// `_resetTurnTracking`/`_endTurn`, so it survives an in-process suspend/resume
+// and the duration spans the whole run (including any HITL wait). A run whose
+// original start was lost to a process restart has NO OpenRunSpan when its
+// terminal fires post-restart → the summary is marked `reconstructed` and omits
+// the start/duration/rollup rather than publishing falsely precise metrics.
+// ---------------------------------------------------------------------------
+
+/** @internal — captured run identity for a run summary (mirrors the live projection's effective identity). */
+interface RunSpanIdentity {
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  operationKind?: HarnessRunOperationRefKind;
+}
+
+/** @internal — in-memory accumulator for one in-flight run's span + tool rollup. */
+interface OpenRunSpan {
+  startedAt: number;
+  identity: RunSpanIdentity;
+  /** Per-tool-call start times (runId-scoped), used to compute `tool_end.durationMs` even across an in-process suspend. */
+  activeToolStarts: Map<string, { toolName: string; startedAt: number }>;
+  rollup: {
+    count: number;
+    errors: number;
+    totalDurationMs: number;
+    maxDurationMs: number;
+    perTool: Map<string, { count: number; errors: number; totalDurationMs: number }>;
+  };
+}
+
+/** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
+const MAX_FINALIZED_RUN_IDS = 4096;
+
 export interface SessionDisplayState {
   // Identity
   sessionId: string;
@@ -608,6 +981,10 @@ export interface SessionDisplayState {
   currentRunId?: string;
   currentMessageId?: string;
   currentTraceId?: string;
+  // §5.1b structured projection of the in-flight run (present only while a run
+  // is active). Consolidates the loose currentRun* fields above into the spec
+  // SessionRunProjection shape for the session list/detail UI.
+  currentRun?: SessionRunProjection;
 
   // Activity
   activeTools: Record<string, ActiveToolState>;
@@ -626,13 +1003,24 @@ export interface SessionDisplayState {
 
   // Goal
   goal?: SessionRecord['goal'];
+
+  // Plan tasks (§5.1k / TM-5): a BOUNDED summary — counts + active in_progress
+  // ids + root count — NOT the full tree. UIs drive detail off the
+  // `papersflow.plan_task.updated` event deltas + the bounded `plan_task_check`
+  // read. Absent until the session has observed its plan tree.
+  planTasks?: PlanTaskSummary;
 }
 
-export type SessionDisplayPending = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies'>;
+export type SessionDisplayPending = Omit<
+  NonNullable<SessionRecord['pendingResume']>,
+  'runtimeDependencies' | 'requestContext'
+>;
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
   if (!pending) return null;
-  const { runtimeDependencies: _runtimeDependencies, ...displayPending } = pending;
+  // Strip storage-internal recovery fields (runtimeDependencies) and the caller
+  // app bag (requestContext) — neither belongs on the public display projection.
+  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
   return displayPending;
 }
 
@@ -651,6 +1039,12 @@ export interface SessionInternals {
   leaseExpiresAt: number;
   /** Durable event replay cursor seed from the previous live owner, if any. */
   eventReplaySeed?: { epoch: string; nextSequence: number };
+  /**
+   * §10.5: when false, transient streaming deltas (`text_delta`,
+   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`) are NOT persisted to the durable session-event log
+   * (live subscribers still receive them). Defaults to true.
+   */
+  persistTransientStreamingEvents?: boolean;
 }
 
 export class Session {
@@ -670,6 +1064,15 @@ export class Session {
   private readonly _emitter: EventEmitter;
 
   /**
+   * In-process, NON-persisted display-refresh listeners. Distinct from the
+   * `_emitter` event pool: a ping here recomputes the display snapshot for any
+   * `subscribeDisplayState` listener WITHOUT emitting a persisted §10.2 event or
+   * touching SSE/`harness.subscribe` consumers. Used to surface a freshly-seeded
+   * plan-task summary (TM-5) that reflects already-durable state.
+   */
+  private readonly _displayRefreshListeners = new Set<() => void>();
+
+  /**
    * Queue resolvers indexed by `queuedItem.id`. Set in `queue()` so the
    * caller's promise settles when the head turn completes (or rejects on
    * permanent failure). Cleared after settle. Items recovered from
@@ -682,11 +1085,15 @@ export class Session {
   >();
   /** `queuedItem.id` of the turn currently running (live or suspended). */
   private _currentQueuedItemId?: string;
+  /**
+   * `yolo` of the turn currently running. Set at drain-begin from the queued
+   * item so suspend-capture can persist it onto `pendingResume` and a resumed
+   * run keeps auto-granting tool approvals (§4.2e). Cleared with the turn.
+   */
+  private _currentTurnYolo = false;
   /** `queuedItem.source` of the turn currently running. Used by the goal
    *  judge loop to skip re-judging on goal-driven continuation turns. */
   private _currentQueuedItemSource?: 'user' | 'goal';
-  /** Hydrated queue items should emit `queue_item_replayed` once per session instance. */
-  private readonly _replayedQueuedItemIds = new Set<string>();
   /** Fresh remote queue admissions have no local promise resolver but are not crash replays. */
   private readonly _liveAdmittedQueuedItemIds = new Set<string>();
   /** True while `_maybeDrainQueue` is running so re-entrant kicks are no-ops. */
@@ -708,14 +1115,75 @@ export class Session {
    * `_resume` path. Not persisted — these are run-only fields.
    */
   private _currentRunId?: string;
+  /** §5.1b run-start time for the SessionRunProjection; set at agent_start, cleared on turn reset. */
+  private _currentRunStartedAt?: number;
+  /**
+   * §5.1b effective per-run mode/model for the SessionRunProjection. Captured in
+   * `message()` (the single turn runner for live signal/stream/sync/queue-drain/
+   * useSkill paths) so the projection reports the run's EFFECTIVE identity (a
+   * per-turn `mode`/`model` override), not just the session default. Read only
+   * while `_currentRunId` is set; cleared on turn reset.
+   */
+  private _currentRunModeId?: string;
+  private _currentRunModelId?: string;
+  /**
+   * §5.1b: the originating signalId of the live run, when it is signal-backed.
+   * Lets the live SessionRunProjection report `operation: { kind: 'signal',
+   * signalId }` (symmetric with the pending-resume branch) so a UI can link the
+   * running turn to its durable signal row. Undefined for queue-backed runs (the
+   * queuedItemId discriminates those) and for paths with no originating signal.
+   */
+  private _currentRunSignalId?: string;
+  /**
+   * §5.1 — the active turn's caller request context (the `app` metadata bag +
+   * trusted `channel` projection). Stashed in `_buildRequestContext` so a
+   * suspension can persist it on `PendingResume` and a `respondTo*` resume can
+   * rebuild the SAME context (queued drains already carry it via
+   * `item.requestContext`; resume previously dropped it). Cleared per turn.
+   */
+  private _currentTurnRequestContext?: PersistedRequestContextInput;
   private _currentMessageId?: string;
   private _currentTraceId?: string;
+  /**
+   * Span-summary — in-flight run span accumulators, keyed by runId. Opened at a
+   * run's first `agent_start`, finalized + deleted at its terminal `agent_end`.
+   * NOT reset per turn, so it survives an in-process suspend/resume. See
+   * {@link OpenRunSpan}.
+   */
+  private readonly _openRuns = new Map<string, OpenRunSpan>();
+  /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
+  private readonly _finalizedRunIds = new Set<string>();
+  /** Span-summary — tail promise serializing best-effort durable run-summary writes (Slice B). */
+  private _runSummaryPersistence: Promise<void> = Promise.resolve();
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
   private readonly _turnAbortSignalCleanups = new WeakMap<AbortController, () => void>();
   private readonly _operationEvidenceSignalIds = new Set<string>();
   private readonly _activeTools = new Map<string, ActiveToolState>();
+  /**
+   * `${runId}:${toolCallId}` of tools for which a SYNTHETIC aborted `tool_end`
+   * was emitted at turn end (§10.2). A late real `tool-result`/`tool-error` chunk
+   * for the same key (the abort path can reach `_endTurn` before the drain
+   * delivers the real result) is suppressed ONCE so the consumer never sees two
+   * terminals for one tool. Bounded by `_maxAbortedToolTombstones`.
+   */
+  private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /** §SA3 — count of `spawn_subagent` children currently in flight from this parent
+   *  (incremented at the spawn gate, decremented when the child settles). Used for
+   *  the `subagents.maxConcurrent` backpressure check; counts the create window too. */
+  _subagentSpawnInFlight = 0;
+  /** TM-6 reconcile-on-rehydrate pending retry timers (cleared on close). */
+  private readonly _delegationReconcileRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  /**
+   * §5.1k / TM-5 bounded plan-task summary for `getDisplayState()`. Kept in
+   * memory and refreshed for FREE on every plan-task mutation (the mutator
+   * already holds the post-image), so a display snapshot never loads the tree.
+   * Seeded lazily once (`_planTaskSummarySeeded`) for a hydrated session that has
+   * pre-existing tasks but hasn't mutated yet; `undefined` until first observed.
+   */
+  private _planTaskSummary: PlanTaskSummary | undefined;
+  private _planTaskSummarySeeded = false;
   /**
    * Cumulative usage for the session's thread. Live counter, single source of
    * truth in-process. Seeded from `internals.record.tokenUsage` in the
@@ -828,10 +1296,24 @@ export class Session {
    */
   private readonly _messageTokenAccountedRunIds = new Set<string>();
   private readonly _messageTokenAccountingRunIds = new Set<string>();
+  /** §10.5: when false, transient streaming deltas are not persisted (live-only). */
+  private readonly _persistTransientStreamingEvents: boolean;
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   private _eventPersistenceTail: Promise<void> = Promise.resolve();
+  /** HARD latch — unrecoverable durable-log failure (id unparseable, or §S4.1 backlog overflow). */
   private _eventPersistenceError: unknown;
+  /**
+   * §S4.1 — ordered backlog of event-ledger appends that failed transiently, awaiting
+   * retry. Retried FIFO ahead of any later sequence on the next append so the durable
+   * log stays contiguous (no skipped slot → no undetected replay gap).
+   */
+  private readonly _failedEventAppends: PendingEventAppend[] = [];
+  /**
+   * §S4.1 — true once a transient append failure has been surfaced live (one
+   * `storage_error` per degraded episode). Reset when the backlog fully drains.
+   */
+  private _eventPersistenceDegraded = false;
   private readonly _backgroundTurnCompletions = new Set<Promise<unknown>>();
 
   /** @internal — constructed by the Harness, not directly. */
@@ -887,6 +1369,7 @@ export class Session {
     this._harness = internals.harness;
     this._storage = internals.storage;
     this._ownerId = internals.ownerId;
+    this._persistTransientStreamingEvents = internals.persistTransientStreamingEvents ?? true;
     this._emitter = new EventEmitter(
       { sessionId: this.id },
       {
@@ -987,49 +1470,270 @@ export class Session {
     return this._emitter.emit(event);
   }
 
+  /**
+   * §6.1/§6.3/§10.2: tool-authored custom event emission (`ctx.emitCustomEvent`).
+   * Validates the type (dotted custom prefix, not a reserved built-in family) and
+   * the payload (JSON-serializable) at call time — both throw `HarnessValidationError`
+   * / `HarnessEventSerializationError` before anything is dispatched. The harness
+   * stamps id/timestamp/sessionId via `_emit` and attributes the event to the live
+   * run when one is active.
+   */
+  _emitCustomEvent(input: HarnessCustomEventInput): void {
+    this._assertOpenForTurn('ctx.emitCustomEvent');
+    if (input === null || typeof input !== 'object') {
+      throw new HarnessValidationError('ctx.emitCustomEvent', 'expects an object with `type` and optional `payload`');
+    }
+    if (typeof input.type !== 'string') {
+      throw new HarnessValidationError('ctx.emitCustomEvent.type', 'must be a string');
+    }
+    // §10.3: the input carries only `type` + optional `payload`; the harness owns
+    // every envelope field (id/timestamp/sessionId/runId). Reject extra top-level
+    // keys so a tool cannot smuggle reserved envelope fields.
+    for (const key of Object.keys(input)) {
+      if (key !== 'type' && key !== 'payload') {
+        throw new HarnessValidationError(
+          'ctx.emitCustomEvent',
+          `unexpected field "${key}" — only "type" and "payload" are allowed`,
+        );
+      }
+    }
+    assertCustomEventType(input.type);
+    // §6.1: tool-context custom events may only be emitted while a turn is in
+    // flight. The gate is the active-turn marker, NOT `_currentRunId`: the
+    // structured sync `message({ sync, output })` path runs `agent.generate(...)`
+    // atomically and only learns its runId when generate returns, yet tools
+    // execute mid-generate — so requiring a known run id would wrongly reject a
+    // legitimate in-run emit. A cleared turn controller means a stale/post-turn or
+    // evicted context (both clear it via `_endTurn`).
+    if (this._currentTurnAbortController === undefined) {
+      throw new HarnessValidationError(
+        'ctx.emitCustomEvent',
+        'no active turn — custom events may only be emitted during a run',
+      );
+    }
+    // Payload is optional; only validate JSON-serializability when one is present
+    // (the walker treats a bare `undefined` as non-serializable).
+    if (input.payload !== undefined) {
+      assertJsonSerializable(input.type, this.id, input.payload);
+    }
+    this._emit({
+      type: input.type as `${string}.${string}`,
+      // §10.3: the harness fills the session identity fields. `sessionId` is
+      // stamped by the emitter; `resourceId` / `threadId` are stamped here so a
+      // custom event routes by the same (resourceId, threadId) tuple as built-in
+      // session-scoped events.
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      ...(input.payload !== undefined ? { payload: input.payload } : {}),
+      // Attribute to the run when known; the structured-sync window before
+      // agent_start has no runId yet, which is acceptable (sessionId still anchors it).
+      ...(this._currentRunId !== undefined ? { runId: this._currentRunId } : {}),
+    });
+  }
+
   /** @internal — waits for prior event ledger writes before replay decisions. */
   async _flushEventPersistence(): Promise<void> {
+    // §S4.1 — give a transient backlog one retry so a QUIET session (no new events
+    // arriving to drive the on-append retry) can still recover its durable log before
+    // a replay decision is made.
+    if (this._failedEventAppends.length > 0 && this._eventPersistenceError === undefined) {
+      this._eventPersistenceTail = this._eventPersistenceTail
+        .catch(() => undefined)
+        .then(() => this._processEventPersistence(undefined));
+    }
     await this._eventPersistenceTail;
     if (this._eventPersistenceError !== undefined) {
       throw this._eventPersistenceError;
+    }
+    // §S4.1 — an un-drained backlog means the ledger is NOT yet contiguous; replaying
+    // it now would silently miss the queued tail. Surface a retryable storage error so
+    // the caller falls back to the §10.5 snapshot path instead of replaying a gap.
+    if (this._failedEventAppends.length > 0) {
+      throw new HarnessStorageError({
+        operation: 'session_event_append',
+        cause: undefined,
+        retryable: true,
+        sessionId: this._record.id,
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      });
     }
   }
 
   private _enqueueSessionEventPersistence(event: HarnessEvent): void {
     if (this._eventPersistenceError !== undefined) return;
-    let parsed: ReturnType<typeof parseHarnessEventId>;
-    let storedEvent: JsonValue;
-    try {
-      parsed = parseHarnessEventId(event.id);
-      storedEvent = snapshotHarnessEventForJson(event);
-    } catch (err) {
-      this._eventPersistenceError = err;
-      console.error('[harness/v1] session event serialization failed:', err);
+    // §10.5: high-volume transient streaming deltas are live-subscriber-only when
+    // persistence is disabled — skip the durable `appendSessionEvent` (live dispatch
+    // already delivered them). The emitter seq still advanced, so a reconnect whose
+    // `Last-Event-ID` precedes a skipped delta gets a 412 `unreplayable_gap` and
+    // recovers via the §10.5 snapshot/message path. Removes per-token write amplification.
+    if (
+      !this._persistTransientStreamingEvents &&
+      (event.type === 'text_delta' ||
+        event.type === 'subagent_text_delta' ||
+        event.type === 'reasoning_delta' ||
+        event.type === 'subagent_reasoning_delta')
+    ) {
       return;
     }
-    const record = this._record;
-    const task = this._eventPersistenceTail
-      .catch(() => undefined)
-      .then(async () => {
-        if (this._eventPersistenceError !== undefined) return;
-        await this._storage.appendSessionEvent({
-          harnessName: record.harnessName,
-          sessionId: record.id,
-          resourceId: record.resourceId,
-          threadId: record.threadId,
-          eventId: event.id,
-          epoch: parsed.epoch,
-          sequence: parsed.sequence,
-          event: storedEvent,
-          emittedAt: event.timestamp,
-          storedAt: Date.now(),
-        });
-      });
-    this._eventPersistenceTail = task.catch(err => {
-      if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return;
+    let parsed: ReturnType<typeof parseHarnessEventId>;
+    try {
+      parsed = parseHarnessEventId(event.id);
+    } catch (err) {
+      // The event id encodes the ledger slot (epoch:sequence). If it cannot be
+      // parsed we cannot place a contiguity-preserving sentinel, so fail-stop.
       this._eventPersistenceError = err;
-      console.error('[harness/v1] session event persistence failed:', err);
-    });
+      console.error('[harness/v1] session event id parse failed:', err);
+      return;
+    }
+    let storedEvent: JsonValue;
+    try {
+      storedEvent = snapshotHarnessEventForJson(event);
+    } catch (err) {
+      // §S4.2 — ONE unserializable event must not poison the whole durable log.
+      // The live subscriber already received the real event; substitute a JSON-safe
+      // `storage_error` SENTINEL at the SAME (epoch, sequence) so the ledger stays
+      // CONTIGUOUS (the slot is filled, not skipped → no undetected replay gap) and
+      // later events keep persisting normally. A reconnect replaying this slot sees
+      // the sentinel instead of the lost event.
+      console.error('[harness/v1] session event serialization failed; storing replay sentinel:', err);
+      storedEvent = {
+        id: event.id,
+        type: 'storage_error',
+        timestamp: event.timestamp,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        operation: 'session_event_append',
+        retryable: false,
+        error: {
+          code: 'harness.event_serialization',
+          message: `event serialization failed; original "${(event as { type?: string }).type ?? 'unknown'}" event omitted from the durable log`,
+        },
+      } as unknown as JsonValue;
+    }
+    const record = this._record;
+    const next: PendingEventAppend = {
+      harnessName: record.harnessName,
+      sessionId: record.id,
+      resourceId: record.resourceId,
+      threadId: record.threadId,
+      eventId: event.id,
+      epoch: parsed.epoch,
+      sequence: parsed.sequence,
+      event: storedEvent,
+      emittedAt: event.timestamp,
+    };
+    // Serialize all ledger work on the tail so appends + backlog retries stay ordered.
+    this._eventPersistenceTail = this._eventPersistenceTail
+      .catch(() => undefined)
+      .then(() => this._processEventPersistence(next));
+  }
+
+  /**
+   * §S4.1 — durable event-ledger writer. Runs serialized on `_eventPersistenceTail`.
+   * Drains any transiently-failed backlog FIFO, then appends `next` (when provided).
+   * Never throws: a re-failed append is re-queued for the next attempt, and an
+   * unbounded backlog hard-latches. Contiguity is preserved — `next` never jumps ahead
+   * of an earlier un-persisted slot.
+   */
+  private async _processEventPersistence(next: PendingEventAppend | undefined): Promise<void> {
+    if (this._eventPersistenceError !== undefined) return; // hard latch (id-parse / overflow)
+
+    // 1) Retry the backlog in order; STOP at the first re-failure so a later sequence
+    //    never persists ahead of an earlier failed one.
+    while (this._failedEventAppends.length > 0) {
+      const head = this._failedEventAppends[0]!;
+      try {
+        await this._storage.appendSessionEvent({ ...head, storedAt: Date.now() });
+        this._failedEventAppends.shift();
+      } catch (err) {
+        if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) {
+          // Storage has no event ledger at all → nothing to retry; drop the backlog.
+          this._failedEventAppends.length = 0;
+          this._eventPersistenceDegraded = false;
+          return;
+        }
+        if (next) this._backlogFailedAppend(next, err);
+        return;
+      }
+    }
+    // Backlog fully drained → durable log is contiguous again.
+    if (this._eventPersistenceDegraded) this._eventPersistenceDegraded = false;
+
+    if (!next) return;
+
+    // 2) Append the new event.
+    try {
+      await this._storage.appendSessionEvent({ ...next, storedAt: Date.now() });
+    } catch (err) {
+      if (err instanceof HarnessStorageSessionEventReplayUnsupportedError) return;
+      this._backlogFailedAppend(next, err);
+    }
+  }
+
+  /**
+   * §S4.1 — queue a failed append for retry. Surfaces a live `storage_error` once per
+   * degraded episode (so subscribers learn the log is lagging in real time), and
+   * hard-latches if the backlog exceeds {@link MAX_PENDING_FAILED_EVENT_APPENDS}.
+   */
+  private _backlogFailedAppend(args: PendingEventAppend, err: unknown): void {
+    this._failedEventAppends.push(args);
+    if (!this._eventPersistenceDegraded) {
+      this._eventPersistenceDegraded = true;
+      console.error('[harness/v1] session event persistence failed; backlogged for retry:', err);
+      // §10.2: the durable log is lagging. Emit a live, RETRYABLE storage_error so
+      // subscribers learn now (vs only discovering the lag on reconnect). The degraded
+      // flag is already set, so this event's own append — queued behind the backlog —
+      // does not re-trigger this emit.
+      const isStorageErr = err instanceof HarnessStorageError;
+      this._emitter.emit({
+        type: 'storage_error',
+        operation: 'session_event_append',
+        retryable: true,
+        error: {
+          code: 'harness.storage',
+          message: isStorageErr ? err.message : 'session event persistence failed',
+        },
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      } as EmitInput);
+    }
+    if (this._failedEventAppends.length > MAX_PENDING_FAILED_EVENT_APPENDS) {
+      // Past the bound we cannot keep retrying without unbounded memory → fail-stop.
+      // Reconnect past the gap recovers via the §10.5 snapshot path.
+      const overflow = new HarnessStorageError({
+        operation: 'session_event_append',
+        cause: err,
+        retryable: false,
+        sessionId: this._record.id,
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      });
+      this._eventPersistenceError = overflow;
+      this._failedEventAppends.length = 0;
+      console.error(
+        `[harness/v1] session event backlog exceeded ${MAX_PENDING_FAILED_EVENT_APPENDS}; durable log fail-stop:`,
+        err,
+      );
+      // The earlier retryable storage_error promised retries we can no longer make;
+      // emit a terminal NON-retryable one so subscribers fall back to snapshot recovery.
+      this._emitter.emit({
+        type: 'storage_error',
+        operation: 'session_event_append',
+        retryable: false,
+        error: {
+          code: 'harness.storage',
+          message: 'session event persistence backlog overflow; durable log degraded',
+        },
+        resourceId: this._record.resourceId,
+        threadId: this._record.threadId,
+        harnessName: this._record.harnessName,
+      } as EmitInput);
+    }
   }
 
   /**
@@ -1039,10 +1743,228 @@ export class Session {
    * back to its `queue()` item.
    */
   private _emitTurnEvent(event: EmitInput): HarnessEvent {
-    if (this._currentQueuedItemId !== undefined && (event as { queuedItemId?: string }).queuedItemId === undefined) {
-      return this._emitter.emit({ ...event, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    // Span-summary: enrich `tool_end` with durationMs + accumulate the run's
+    // tool rollup BEFORE emit, so the live subscriber and the durable row carry
+    // the same value. Returns the (possibly enriched) event to emit.
+    const toEmit = this._trackRunSpanPreEmit(event);
+    let emitted: HarnessEvent;
+    if (this._currentQueuedItemId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
+      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    } else {
+      emitted = this._emitter.emit(toEmit);
     }
-    return this._emitter.emit(event);
+    // Span-summary: open the run span on `agent_start`; finalize (emit
+    // `run_completed`) on a terminal `agent_end`. Runs AFTER emit so
+    // `run_completed` follows its `agent_end`.
+    this._trackRunSpanPostEmit(emitted);
+    return emitted;
+  }
+
+  /**
+   * Span-summary pre-emit hook. On `tool_start`, records the call's start in the
+   * open run span. On `tool_end`, computes `durationMs` from that start (when
+   * known) and folds the call into the run's tool rollup, returning an event
+   * carrying `durationMs`. All other events pass through unchanged. Counting
+   * happens HERE — the single emit choke — so a suppressed/never-emitted
+   * `tool_end` (e.g. a late real result dropped by the aborted-tool tombstone)
+   * cannot double-count, and a synthetic aborted `tool_end` counts exactly once.
+   */
+  private _trackRunSpanPreEmit(event: EmitInput): EmitInput {
+    const type = (event as { type?: string }).type;
+    if (type === 'tool_start') {
+      const e = event as { runId?: string; toolCallId?: string; toolName?: string };
+      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
+      if (span && e.toolCallId !== undefined) {
+        span.activeToolStarts.set(e.toolCallId, { toolName: e.toolName ?? 'unknown', startedAt: Date.now() });
+      }
+      return event;
+    }
+    if (type === 'tool_end') {
+      const e = event as {
+        runId?: string;
+        toolCallId?: string;
+        toolName?: string;
+        isError?: boolean;
+        durationMs?: number;
+      };
+      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
+      if (!span) return event;
+      const toolName = e.toolName ?? 'unknown';
+      const start = e.toolCallId !== undefined ? span.activeToolStarts.get(e.toolCallId) : undefined;
+      let durationMs: number | undefined = e.durationMs;
+      if (durationMs === undefined && start) durationMs = Math.max(0, Date.now() - start.startedAt);
+      if (e.toolCallId !== undefined) span.activeToolStarts.delete(e.toolCallId);
+      // Fold into the rollup (count every emitted terminal; duration only when known).
+      const r = span.rollup;
+      r.count += 1;
+      const isError = e.isError === true;
+      if (isError) r.errors += 1;
+      if (durationMs !== undefined) {
+        r.totalDurationMs += durationMs;
+        if (durationMs > r.maxDurationMs) r.maxDurationMs = durationMs;
+      }
+      const per = r.perTool.get(toolName) ?? { count: 0, errors: 0, totalDurationMs: 0 };
+      per.count += 1;
+      if (isError) per.errors += 1;
+      if (durationMs !== undefined) per.totalDurationMs += durationMs;
+      r.perTool.set(toolName, per);
+      return durationMs !== undefined ? ({ ...event, durationMs } as EmitInput) : event;
+    }
+    return event;
+  }
+
+  /**
+   * Span-summary post-emit hook. Opens the run span on the run's first
+   * `agent_start`; on a terminal (non-suspended) `agent_end`, finalizes the run
+   * exactly once (emits `run_completed`, persists the durable summary).
+   */
+  private _trackRunSpanPostEmit(event: HarnessEvent): void {
+    if (event.type === 'agent_start') {
+      const runId = event.runId;
+      if (runId !== undefined && !this._openRuns.has(runId)) {
+        this._openRuns.set(runId, {
+          startedAt: this._currentRunStartedAt ?? event.timestamp,
+          identity: this._captureRunSpanIdentity(),
+          activeToolStarts: new Map(),
+          rollup: { count: 0, errors: 0, totalDurationMs: 0, maxDurationMs: 0, perTool: new Map() },
+        });
+      }
+      return;
+    }
+    if (event.type === 'agent_end' && event.finishReason !== 'suspended') {
+      this._finalizeRunSpan(event.runId, event.finishReason, event.usage, event.timestamp);
+    }
+  }
+
+  /** Capture the run's effective identity (mirrors {@link _buildCurrentRunProjection}'s live branch). */
+  private _captureRunSpanIdentity(): RunSpanIdentity {
+    const rec = this._record;
+    const modeId = this._currentRunModeId ?? rec.modeId;
+    const identity: RunSpanIdentity = {
+      resourceId: rec.resourceId,
+      threadId: rec.threadId,
+      agentId: this._modeAgentId(modeId),
+      modeId,
+      modelId: this._currentRunModelId ?? rec.modelId,
+      operationKind: this._currentQueuedItemId !== undefined ? 'queue' : 'signal',
+    };
+    if (rec.parentSessionId !== undefined) identity.parentSessionId = rec.parentSessionId;
+    if (this._currentTraceId !== undefined) identity.traceId = this._currentTraceId;
+    return identity;
+  }
+
+  /**
+   * Emit the canonical `run_completed` event for a terminal run, exactly once.
+   * A run with a live {@link OpenRunSpan} reports trusted start/duration/rollup;
+   * a run whose start was lost to a restart is marked `reconstructed` and omits
+   * those (usage + identity + finishReason are still reported).
+   */
+  private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
+    if (this._finalizedRunIds.has(runId)) return;
+    if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
+    this._finalizedRunIds.add(runId);
+
+    const span = this._openRuns.get(runId);
+    const reconstructed = span === undefined;
+    const identity = span?.identity ?? this._captureRunSpanIdentity();
+    const status: RunCompletedStatus =
+      finishReason === 'complete' ? 'completed' : finishReason === 'error' ? 'failed' : 'interrupted';
+
+    const event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'> = {
+      type: 'run_completed',
+      runId,
+      status,
+      finishReason,
+      usage,
+      completedAt,
+      resourceId: identity.resourceId,
+      threadId: identity.threadId,
+      agentId: identity.agentId,
+      modeId: identity.modeId,
+      modelId: identity.modelId,
+      ...(identity.parentSessionId !== undefined ? { parentSessionId: identity.parentSessionId } : {}),
+      ...(identity.traceId !== undefined ? { traceId: identity.traceId } : {}),
+      ...(identity.operationKind !== undefined ? { operationKind: identity.operationKind } : {}),
+    };
+    if (reconstructed) {
+      event.reconstructed = true;
+    } else {
+      event.startedAt = span!.startedAt;
+      event.durationMs = Math.max(0, completedAt - span!.startedAt);
+      event.toolRollup = this._materializeToolRollup(span!.rollup);
+    }
+    this._openRuns.delete(runId);
+
+    // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
+    // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
+    this._emitTurnEvent(event as EmitInput);
+
+    // Slice B (durable run summary) is wired here.
+    this._persistRunSummary(event, status, reconstructed);
+  }
+
+  /** Convert the in-memory rollup (Maps) into the JSON-safe {@link RunToolRollup}. */
+  private _materializeToolRollup(rollup: OpenRunSpan['rollup']): RunToolRollup {
+    const perTool: RunToolRollup['perTool'] = {};
+    for (const [name, v] of rollup.perTool) {
+      perTool[name] = { count: v.count, errors: v.errors, totalDurationMs: v.totalDurationMs };
+    }
+    return {
+      count: rollup.count,
+      errors: rollup.errors,
+      totalDurationMs: rollup.totalDurationMs,
+      maxDurationMs: rollup.maxDurationMs,
+      perTool,
+    };
+  }
+
+  /**
+   * Span-summary Slice B — persist the durable run summary (one row per run,
+   * idempotent first-terminal-wins). Best-effort and OFF the turn's critical
+   * path: a failed write logs once and never throws (the `run_completed` event
+   * itself is already emitted + persisted in the event log, so the summary table
+   * is a secondary projection). Writes are chained on a tail so tests can flush.
+   */
+  private _persistRunSummary(
+    event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>,
+    status: RunCompletedStatus,
+    reconstructed: boolean,
+  ): void {
+    const summary: HarnessRunSummary = {
+      harnessName: this._record.harnessName,
+      runId: event.runId,
+      sessionId: this.id,
+      resourceId: event.resourceId,
+      threadId: event.threadId,
+      agentId: event.agentId,
+      modeId: event.modeId,
+      modelId: event.modelId,
+      status,
+      finishReason: event.finishReason,
+      reconstructed,
+      completedAt: event.completedAt,
+      usage: event.usage,
+      createdAt: event.completedAt,
+      ...(event.parentSessionId !== undefined ? { parentSessionId: event.parentSessionId } : {}),
+      ...(event.traceId !== undefined ? { traceId: event.traceId } : {}),
+      ...(event.operationKind !== undefined ? { operationKind: event.operationKind } : {}),
+      ...(event.startedAt !== undefined ? { startedAt: event.startedAt } : {}),
+      ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+      ...(event.toolRollup !== undefined ? { toolRollup: event.toolRollup } : {}),
+    };
+    this._runSummaryPersistence = this._runSummaryPersistence
+      .then(() => this._storage.saveRunSummary({ summary }))
+      .then(
+        () => undefined,
+        err => {
+          console.error('[harness/v1] run summary persistence failed:', err);
+        },
+      );
+  }
+
+  /** @internal — await all in-flight run-summary writes (tests). */
+  async _internalFlushRunSummaries(): Promise<void> {
+    await this._runSummaryPersistence;
   }
 
   /**
@@ -1062,6 +1984,7 @@ export class Session {
     event:
       | Omit<SubagentStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentTextDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
+      | Omit<SubagentReasoningDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
@@ -1071,6 +1994,45 @@ export class Session {
       return this._emitter.emit({ ...stamped, queuedItemId: this._currentQueuedItemId } as EmitInput);
     }
     return this._emitter.emit(stamped);
+  }
+
+  /**
+   * @internal — §SA2: fold a bridged CHILD turn event into the parent's
+   * `_activeSubagents` display projection so a polling/reconnecting consumer can
+   * see the subagent's live inner progress (status / current tool / tool count /
+   * usage) from the parent snapshot alone. Best-effort: a no-op if the key was
+   * already cleared (child closed). `key` is the spawn `toolCallId` or the
+   * delegate `delegate:<childId>` key.
+   */
+  _internalUpdateSubagentProgress(key: string, event: HarnessEvent): void {
+    const entry = this._activeSubagents.get(key);
+    if (!entry) return;
+    switch (event.type) {
+      case 'agent_start':
+        entry.status = 'running';
+        break;
+      case 'tool_start':
+        entry.currentToolName = event.toolName;
+        entry.toolCalls = (entry.toolCalls ?? 0) + 1;
+        break;
+      case 'tool_end':
+        // Best-effort clear: only when the ending tool is the one we last showed
+        // (concurrent inner tools just leave the most-recent name until it ends).
+        if (entry.currentToolName === event.toolName) entry.currentToolName = undefined;
+        break;
+      case 'agent_end':
+        entry.status =
+          event.finishReason === 'error' || event.finishReason === 'aborted'
+            ? 'failed'
+            : event.finishReason === 'complete'
+              ? 'completed'
+              : entry.status;
+        entry.usage = event.usage;
+        break;
+      default:
+        return; // text/reasoning deltas don't change the projection
+    }
+    entry.updatedAt = Date.now();
   }
 
   /** @internal — number of registered listeners (for tests). */
@@ -1087,16 +2049,24 @@ export class Session {
    * Returns the controller so the calling path can hand `controller.signal`
    * to `agent.stream` / `agent.generate` / `agent.resumeStream`.
    */
-  private _beginTurn(callerSignal: AbortSignal | undefined): AbortController {
+  private _beginTurn(
+    callerSignal: AbortSignal | undefined,
+    runIdentity?: { modeId?: string; modelId?: string },
+  ): AbortController {
     const controller = new AbortController();
     this._currentTurnAbortController = controller;
     this._resetTurnTracking();
+    // §5.1b: stamp the run's EFFECTIVE identity AFTER the reset above, so the
+    // SessionRunProjection reports a per-turn `mode`/`model` override (or a queued
+    // item's own mode/model) for the live run rather than the session default.
+    this._currentRunModeId = runIdentity?.modeId;
+    this._currentRunModelId = runIdentity?.modelId;
     controller.signal.addEventListener('abort', () => this._scheduleActiveTurnAbort(controller), { once: true });
     if (callerSignal) {
       if (callerSignal.aborted) {
-        controller.abort((callerSignal as { reason?: unknown }).reason);
+        controller.abort(this._forwardCallerAbortReason(callerSignal));
       } else {
-        const forwardAbort = () => controller.abort((callerSignal as { reason?: unknown }).reason);
+        const forwardAbort = () => controller.abort(this._forwardCallerAbortReason(callerSignal));
         callerSignal.addEventListener('abort', forwardAbort, { once: true });
         this._turnAbortSignalCleanups.set(controller, () => callerSignal.removeEventListener('abort', forwardAbort));
       }
@@ -1110,8 +2080,16 @@ export class Session {
    */
   private _resetTurnTracking(): void {
     this._currentRunId = undefined;
+    this._currentRunStartedAt = undefined;
+    this._currentRunModeId = undefined;
+    this._currentRunModelId = undefined;
+    this._currentRunSignalId = undefined;
+    this._currentTurnRequestContext = undefined;
     this._currentMessageId = undefined;
     this._currentTraceId = undefined;
+    // Default OFF each turn; queued-drain / resume re-arm it from the item /
+    // captured pendingResume below so non-yolo turns never inherit a stale value.
+    this._currentTurnYolo = false;
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
@@ -1130,13 +2108,61 @@ export class Session {
     this._turnAbortSignalCleanups.delete(controller);
     if (this._currentTurnAbortController === controller) {
       this._currentTurnAbortController = undefined;
+      // §10.2 — any tool still in the active set when the turn ends produced no
+      // tool-result/error chunk (the turn aborted/errored/closed before it
+      // settled). Emit a synthetic aborted `tool_end` for each BEFORE clearing so
+      // a streaming consumer always gets a terminal for every `tool_start`. On a
+      // normal turn the drain already removed every tool, so this is a no-op.
+      this._emitAbortedToolEnds();
       this._currentRunId = undefined;
+      this._currentRunStartedAt = undefined;
+      this._currentRunModeId = undefined;
+      this._currentRunModelId = undefined;
+      this._currentRunSignalId = undefined;
+      this._currentTurnRequestContext = undefined;
       this._currentMessageId = undefined;
       this._currentTraceId = undefined;
       this._activeTools.clear();
       this._toolInputBuffers.clear();
     }
     this._notifyMaybeIdle();
+  }
+
+  /**
+   * Emit a synthetic aborted `tool_end` for every tool still in the active set —
+   * tools whose turn ended before they produced a result/error chunk. Keeps the
+   * `tool_start` → `tool_end` pairing complete for streaming consumers. Skips when
+   * the run id is unknown (cannot attribute the terminal). Best-effort: emitted on
+   * the live subscriber stream like any other turn event.
+   */
+  private _emitAbortedToolEnds(): void {
+    if (this._activeTools.size === 0) return;
+    // A turn that PARKED for resume (suspend / tool-approval / question /
+    // plan-approval) is NOT abandoned — the parked tool resumes and emits its own
+    // real tool_end. Only synthesize for genuinely terminal turns (abort / error /
+    // complete-with-dangling-tool); never tombstone a tool that will resume.
+    if (this._record.pendingResume !== undefined) return;
+    const runId = this._currentRunId;
+    if (runId === undefined) return;
+    // Defensive bound: drop the tombstone set if it grew large (aborted tools
+    // whose late real result never arrived). Losing suppression for very old
+    // entries is harmless — their late result is extremely unlikely by then.
+    if (this._abortedToolTombstones.size > MAX_ABORTED_TOOL_TOMBSTONES) {
+      this._abortedToolTombstones.clear();
+    }
+    for (const tool of this._activeTools.values()) {
+      this._emitTurnEvent({
+        type: 'tool_end',
+        runId,
+        toolCallId: tool.toolCallId,
+        toolName: tool.toolName,
+        output: { aborted: true, reason: 'turn ended before the tool produced a result' },
+        isError: true,
+      } as EmitInput);
+      // Suppress a late real terminal for this tool (the drain may still deliver
+      // its tool-result/tool-error after this turn ended).
+      this._abortedToolTombstones.add(`${runId}:${tool.toolCallId}`);
+    }
   }
 
   private _createActiveTurnWaiter(): ActiveTurnWaiter {
@@ -1155,7 +2181,7 @@ export class Session {
     this._activeTurnWaiters.add(waiter);
     if (this._state === 'deleted') {
       this._activeTurnWaiters.delete(waiter);
-      waiter.reject(new HarnessSessionDeletedError(this.id));
+      waiter.reject(new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId));
     }
     if (activeTurn?.signal.aborted) {
       this._activeTurnWaiters.delete(waiter);
@@ -1199,6 +2225,176 @@ export class Session {
     if (full.finishReason === 'aborted') return 'aborted';
     if (full.finishReason === 'error') return 'error';
     return 'complete';
+  }
+
+  /**
+   * §4.5 `HarnessOutputGenerationError`: classify a non-suspended structured
+   * sync-generate result that cannot yield a successful public typed value.
+   * Returns `undefined` when the result carries a valid object.
+   */
+  private _classifyStructuredOutputFailure(full: FullOutput<unknown>): HarnessOutputGenerationReason | undefined {
+    // An output processor rejected the response (tripwire) — object is absent by
+    // construction, so check this before the missing-object case.
+    if (full.tripwire !== undefined) return 'tripwire';
+    // Schema-bearing sync form but the model produced no structured object.
+    if (full.object === undefined) return 'structured_output_missing_object';
+    return undefined;
+  }
+
+  /**
+   * §4.5: normalize an error thrown out of the structured sync-generate path.
+   * Aborts and harness-domain errors propagate with their own type; an already-
+   * typed generation error passes through; anything else is an opaque agent/
+   * runtime failure wrapped as `model_error`. Harness errors are detected by the
+   * `Harness…Error` name they all carry — not every one exposes a `harness.*`
+   * code (e.g. `HarnessSessionDeletedError`/`HarnessSessionLockedError`, which
+   * the active-turn waiter rejects with), so the code alone is not sufficient.
+   */
+  private _asStructuredOutputError(err: unknown, runId: string | undefined, abortSignal: AbortSignal): unknown {
+    if (err instanceof HarnessOutputGenerationError) return err;
+    if (abortSignal.aborted) return err;
+    if (err instanceof Error && err.name.startsWith('Harness')) return err;
+    // §4.5: the agent layer surfaces structured-output schema validation as a
+    // MastraError carrying this stable id (stream/base/output-format-handlers.ts);
+    // distinguish it from an opaque model failure so callers see the precise reason.
+    const reason: HarnessOutputGenerationReason =
+      (err as { id?: unknown } | null | undefined)?.id === 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED'
+        ? 'structured_output_validation_failed'
+        : 'model_error';
+    return new HarnessOutputGenerationError(this.id, reason, runId, { cause: err });
+  }
+
+  /** §10.2 `agent_end.usage`: the run's token usage (zero when unavailable, e.g. an error path with no terminal output). */
+  private _runUsage(full?: FullOutput<unknown>): TokenUsage {
+    const delta = full ? this._tokenUsageDeltaFromFullOutput(full) : undefined;
+    return delta ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  }
+
+  /**
+   * §10.2 agent_start/agent_end require a `runId`. The run id is coalesced from
+   * the explicit dispatch/full id and the captured `_currentRunId`; when no run
+   * id exists at all (a turn that failed before a run was reserved), no
+   * lifecycle event is emitted — there was no run to start or end.
+   */
+  private _emitAgentStart(runId: string | undefined, signalId?: string): void {
+    const id = runId ?? this._currentRunId;
+    if (id === undefined) return;
+    // Stamp the active run id at agent_start so subsequent streamed chunks —
+    // which (for the long-lived thread subscription) do NOT carry their own
+    // runId — can be attributed to this run by `_emitForChunk` (§10.2
+    // text_delta/tool_start/tool_end all require a runId).
+    if (this._currentRunId === undefined) {
+      this._currentRunId = id;
+      // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
+      // is the canonical run-start choke for all entry paths.
+      this._currentRunStartedAt = Date.now();
+      // §5.1b: a signal-backed run records its originating signalId so the live
+      // projection's `operation` can link to the durable signal row.
+      this._currentRunSignalId = signalId;
+    }
+    this._emitTurnEvent({ type: 'agent_start', runId: id });
+  }
+
+  private _emitAgentEnd(opts: {
+    runId: string | undefined;
+    finishReason: 'complete' | 'aborted' | 'error' | 'suspended';
+    full?: FullOutput<unknown>;
+  }): void {
+    const id = opts.runId ?? this._currentRunId;
+    if (id === undefined) return;
+    this._emitTurnEvent({
+      type: 'agent_end',
+      runId: id,
+      finishReason: opts.finishReason,
+      usage: this._runUsage(opts.full),
+    });
+  }
+
+  /**
+   * §10.2 suspension event: project a captured `PendingResume` into the matching
+   * pending shape (tool_approval_required / tool_suspension_required /
+   * question_pending / plan_approval_required). Sandbox/path-access prompts
+   * project to `question_pending` (§10.2 defines no dedicated sandbox event).
+   * Emitted after the durable-parking barrier so subscribers can reconstruct
+   * the pending state from storage.
+   */
+  private _emitPendingEvent(pending: PendingResume): void {
+    const sourceFields =
+      pending.source === 'subagent'
+        ? {
+            source: 'subagent' as const,
+            subagentToolCallId: pending.subagentToolCallId ?? '',
+            subagentSessionId: this.id,
+          }
+        : { source: 'parent' as const };
+    const base = {
+      runId: pending.runId,
+      itemId: pending.itemId ?? '',
+      requestedAt: pending.requestedAt,
+      toolCallId: pending.toolCallId,
+      ...sourceFields,
+    };
+    const p = pending.payload ?? {};
+    switch (pending.kind) {
+      case 'tool-approval':
+        this._emitTurnEvent({
+          type: 'tool_approval_required',
+          ...base,
+          toolName: pending.toolName ?? '',
+          ...(p.toolCategory !== undefined ? { toolCategory: p.toolCategory } : {}),
+          approvalReasons: p.approvalReasons ?? [],
+          // §10.2 (events.ts:202 "Public payloads are JSON-safe projections"):
+          // `p.input` is the raw runtime `payload.args` from the suspended
+          // output (Date/Map/class/bigint). Project it at emit so the first
+          // live subscriber and the durable/replayed row carry the identical
+          // value — the same live===replay guarantee as tool_start/tool_end.
+          input: projectToolEventPayloadForJson(
+            p.input,
+            'tool_approval_required.input',
+            this._harness._internalMaxEventPayloadBytes,
+          ),
+        } as EmitInput);
+        return;
+      case 'tool-suspension':
+        this._emitTurnEvent({
+          type: 'tool_suspension_required',
+          ...base,
+          toolName: pending.toolName ?? '',
+          // §10.2: `suspendData` is the tool's raw `suspendPayload` and can hold
+          // runtime objects, so project it at emit for live===replay parity.
+          suspendData: projectToolEventPayloadForJson(
+            p.suspendData,
+            'tool_suspension_required.suspendData',
+            this._harness._internalMaxEventPayloadBytes,
+          ),
+        } as EmitInput);
+        return;
+      case 'question':
+        this._emitTurnEvent({
+          type: 'question_pending',
+          ...base,
+          question: p.question ?? '',
+          ...(p.options !== undefined ? { options: p.options } : {}),
+          ...(p.selectionMode !== undefined ? { selectionMode: p.selectionMode } : {}),
+        } as EmitInput);
+        return;
+      case 'plan-approval':
+        this._emitTurnEvent({
+          type: 'plan_approval_required',
+          ...base,
+          title: p.title ?? '',
+          plan: p.plan ?? '',
+        } as EmitInput);
+        return;
+      case 'sandbox-access':
+        // §10.2: sandbox/path-access prompts project to question_pending.
+        this._emitTurnEvent({
+          type: 'question_pending',
+          ...base,
+          question: p.sandboxAccess?.reason ?? `Allow ${p.sandboxAccess?.semanticType ?? 'sandbox'} access?`,
+        } as EmitInput);
+        return;
+    }
   }
 
   private _raceActiveTurnWaiter<T>(promise: Promise<T>, activeTurnWaiter?: Promise<never>): Promise<T> {
@@ -1279,6 +2475,10 @@ export class Session {
       completionTokens: this._tokenUsage.completionTokens + delta.completionTokens,
       totalTokens: this._tokenUsage.totalTokens + delta.totalTokens,
     };
+    // §10.2 StateEvent: emit the new cumulative session total whenever a turn
+    // commits a usage delta (covers message / signal / queue turn paths, which
+    // all funnel through here).
+    this._emit({ type: 'token_usage_changed', usage: { ...this._tokenUsage } });
   }
 
   private _clearPendingTokenUsageFlushErrorIfSaved(tokenUsage: TokenUsage | undefined): void {
@@ -1632,6 +2832,25 @@ export class Session {
     return false;
   }
 
+  /** Classify why the session is busy for `HarnessBusyError` (§4.5a). */
+  private _busyReason(): 'in_flight' | 'pending_approval' | 'pending_suspension' | 'pending_question' | 'pending_plan' {
+    const pending = this._record.pendingResume;
+    if (pending !== undefined && this._record.cancelRequest === undefined) {
+      switch (pending.kind) {
+        case 'tool-suspension':
+          return 'pending_suspension';
+        case 'question':
+          return 'pending_question';
+        case 'plan-approval':
+          return 'pending_plan';
+        // 'tool-approval' and 'sandbox-access' are both approval-style gates.
+        default:
+          return 'pending_approval';
+      }
+    }
+    return 'in_flight';
+  }
+
   private _isShutdownDrainBusy(): boolean {
     if (this._currentTurnAbortController !== undefined) return true;
     if (this._record.pendingResume !== undefined) return false;
@@ -1650,6 +2869,22 @@ export class Session {
   }
 
   /**
+   * §4.2c: the in-flight run's id, or `null` when no run is active. Reads the
+   * live run marker stamped at `agent_start`. Spec also allows a reconciled
+   * `SessionRecord.currentRun` snapshot fallback, but v1 does not yet persist
+   * `currentRun` (that durable read-model is a separate lane), so this is
+   * live-best-effort: a rehydrated idle session reports `null`.
+   */
+  getCurrentRunId(): string | null {
+    return this._currentRunId ?? null;
+  }
+
+  /** §4.2c: the in-flight run's trace id, or `null` when absent (live-best-effort, see {@link getCurrentRunId}). */
+  getCurrentTraceId(): string | null {
+    return this._currentTraceId ?? null;
+  }
+
+  /**
    * Cumulative token usage for this session, accumulated across every
    * completed turn (manual or queued). Returns a fresh shallow copy so
    * callers can't mutate the running aggregate.
@@ -1665,7 +2900,7 @@ export class Session {
 
   async extendLease(opts: { ttlMs: number }): Promise<void> {
     if (this._state === 'deleted') {
-      throw new HarnessSessionDeletedError(this.id);
+      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     }
     if (this._state !== 'live' && this._state !== 'closing') {
       throw new HarnessSessionClosedError(this.id);
@@ -1680,42 +2915,17 @@ export class Session {
       );
     }
 
-    const defaultTtl = this._harness._internalLeaseTtlMs;
-    const run = async (): Promise<void> => {
-      if (this._state !== 'live' && this._state !== 'closing') {
-        throw this._state === 'deleted'
-          ? new HarnessSessionDeletedError(this.id)
-          : new HarnessSessionClosedError(this.id);
-      }
-      const remainingExtension =
-        this._leaseExtensionDeadline !== undefined && Number.isFinite(this._leaseExtensionDeadline)
-          ? this._leaseExtensionDeadline - Date.now()
-          : 0;
-      const effectiveTtl = Math.max(opts.ttlMs, defaultTtl, remainingExtension);
-      try {
-        const lease = await this._storage.renewSessionLease({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          ownerId: this._ownerId,
-          ttlMs: effectiveTtl,
-        });
-        this._markLeaseRenewed(lease.expiresAt);
-        this._leaseExtensionDeadline = lease.expiresAt;
-      } catch (err) {
-        if (err instanceof HarnessStorageLeaseConflictError) {
-          await this._harness._internalEvictLiveSessionLeaseLost(this);
-          throw new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt);
-        }
-        if (err instanceof HarnessStorageSessionNotFoundError) {
-          await this._harness._internalEvictLiveSessionLeaseLost(this);
-          throw new HarnessSessionNotFoundError(this.id);
-        }
-        throw err;
-      }
-    };
-    const next = this._leaseRenewalChain.then(run, run);
-    this._leaseRenewalChain = next.catch(() => {});
-    return next;
+    const effectiveTtl = Math.max(opts.ttlMs, this._harness._internalLeaseTtlMs);
+    // §5.8: a child has no separately-renewable lease, so `extendLease` extends
+    // the whole subtree through the root (capped at the root, never shrinking
+    // it). The helper resolves the live root, serializes on the ROOT's lease
+    // chain (so it can't race the background sweep), renews root + active
+    // descendants atomically, advances the ROOT's extension deadline so the next
+    // sweep keeps the extension, and fences the subtree (throwing locked/not-
+    // found) if ownership can't be proven. We do NOT wrap this in the calling
+    // session's own renewal chain: the helper already serializes on the root
+    // chain, and a second wrap would deadlock when the caller IS the root.
+    await this._harness._internalRenewProveSubtree(this, effectiveTtl, { propagateRootDeadline: true });
   }
 
   async withExtendedLease<T>(fn: () => Promise<T>, opts: { ttlMs: number }): Promise<T> {
@@ -1728,6 +2938,17 @@ export class Session {
     if (deadline === undefined || !Number.isFinite(deadline)) return defaultTtlMs;
     const remaining = deadline - Date.now();
     return remaining > defaultTtlMs ? remaining : defaultTtlMs;
+  }
+
+  /**
+   * @internal §5.8 — advance the root's effective-TTL deadline after a subtree
+   * renewal so the next background sweep keeps the extension instead of
+   * shortening it back to the default TTL. Advance-only.
+   */
+  _setLeaseExtensionDeadline(deadline: number): void {
+    if (this._leaseExtensionDeadline === undefined || deadline > this._leaseExtensionDeadline) {
+      this._leaseExtensionDeadline = deadline;
+    }
   }
 
   _enqueueLeaseRenewal(run: () => Promise<void>): Promise<void> {
@@ -1755,6 +2976,9 @@ export class Session {
    */
   waitForIdle(opts?: { timeoutMs?: number }): Promise<void> {
     this._assertLive('waitForIdle()');
+    if (opts?.timeoutMs !== undefined && (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs < 0)) {
+      throw new HarnessValidationError('waitForIdle().timeoutMs', 'timeoutMs must be a finite non-negative number');
+    }
     if (!this.isBusy()) return Promise.resolve();
 
     return new Promise<void>((resolve, reject) => {
@@ -1834,13 +3058,13 @@ export class Session {
       waiter.cleanup = cleanup;
       this._idleWaiters.add(waiter);
       if (timeoutMs === 0) {
-        this.abort({ reason: 'session_close_timeout' });
-        resolveAfter(this._failPendingQueueForClose(new HarnessSessionClosingError(this.id)));
+        this._abortActiveTurn('session_closed');
+        resolveAfter(this._failPendingQueueForClose(harnessSessionClosingError(this)));
       } else {
         timer = setTimeout(() => {
           timer = undefined;
-          this.abort({ reason: 'session_close_timeout' });
-          resolveAfter(this._failPendingQueueForClose(new HarnessSessionClosingError(this.id)));
+          this._abortActiveTurn('session_closed');
+          resolveAfter(this._failPendingQueueForClose(harnessSessionClosingError(this)));
         }, timeoutMs);
       }
     });
@@ -1879,7 +3103,7 @@ export class Session {
       this._idleWaiters.add(waiter);
       if (waiter.check()) return;
       const rejectAfterTimeout = () => {
-        this.abort({ reason: 'session_shutdown_timeout' });
+        this._abortActiveTurn('process_restart');
         cleanup();
         reject(new HarnessValidationError('shutdown()', 'Session did not drain before shutdown deadline'));
       };
@@ -1895,14 +3119,59 @@ export class Session {
   }
 
   /**
-   * Cancel the in-flight turn (if any). The agent receives the abort signal
-   * and unwinds. No-op when no turn is running. The optional `reason` is
-   * forwarded as the `AbortSignal.reason` so tools can branch on it.
+   * Cancel the in-flight turn (if any). The agent receives the abort signal and
+   * unwinds. No-op when no turn is running.
+   *
+   * §6.2: the tool-visible `abortSignal.reason` is always a typed
+   * `HarnessAbortedError`. Public `abort()` is ordinary agent-layer cancellation
+   * → `agent_aborted`. The optional `reason` string is accepted for source
+   * compatibility but is NOT a structured reason — the harness owns the typed
+   * `HarnessAbortReason`, so a caller cannot mislabel a lifecycle cause.
    */
-  abort(opts?: { reason?: string }): void {
+  abort(_opts?: { reason?: string }): void {
+    this._abortActiveTurn('agent_aborted');
+  }
+
+  /**
+   * §6.2: abort the in-flight turn's controller with a typed `HarnessAbortedError`
+   * so tools observe `abortSignal.reason instanceof HarnessAbortedError`. All
+   * harness-internal abort sources (public abort, cancel, close/shutdown drain
+   * timeout, eviction, parent propagation) route here. No-op when idle. Abort is
+   * idempotent — the first selected reason wins (§6.2 "not replaced").
+   */
+  private _abortActiveTurn(reason: HarnessAbortReason, opts?: { parentSessionId?: string }): void {
     const controller = this._currentTurnAbortController;
     if (!controller) return;
-    controller.abort(opts?.reason ?? 'session_aborted');
+    controller.abort(new HarnessAbortedError(this.id, reason, opts?.parentSessionId));
+  }
+
+  /**
+   * §6.2: select the typed `HarnessAbortedError` to stamp on this turn's
+   * controller when an external caller `AbortSignal` fires. A signal already
+   * carrying THIS session's typed abort is forwarded unchanged (the harness-owned
+   * reason "is not replaced by a later source"). A parent run's abort propagating
+   * into a live subagent (built-in subagents share the parent tool's abort signal)
+   * becomes child-local `parent_aborted`; a caller abort while this session is in
+   * the close lifecycle is `session_closed`; any other external/raw caller abort
+   * is ordinary `agent_aborted`.
+   */
+  private _forwardCallerAbortReason(callerSignal: AbortSignal): HarnessAbortedError {
+    const callerReason = (callerSignal as { reason?: unknown }).reason;
+    if (callerReason instanceof HarnessAbortedError && callerReason.sessionId === this.id) {
+      return callerReason;
+    }
+    if (
+      this.parentSessionId !== undefined &&
+      callerReason instanceof HarnessAbortedError &&
+      callerReason.sessionId === this.parentSessionId &&
+      !this.isClosing
+    ) {
+      return new HarnessAbortedError(this.id, 'parent_aborted', this.parentSessionId);
+    }
+    if (this.isClosing) {
+      return new HarnessAbortedError(this.id, 'session_closed');
+    }
+    return new HarnessAbortedError(this.id, 'agent_aborted');
   }
 
   private _currentCancelRequest(): SessionRecord['cancelRequest'] {
@@ -1916,6 +3185,48 @@ export class Session {
    * receives the abort signal and unwinds through the normal turn cleanup path.
    */
   async cancel(opts?: { reason?: string; requestedBy?: string }): Promise<void> {
+    // Public entry: never parent-originated. The §6.2 `parent_aborted` source is
+    // harness-owned — only the internal subagent cascade may select it (passing
+    // the real parent id), so a caller cannot mislabel the abort by supplying a
+    // matching `requestedBy`.
+    return this._cancelInternal(opts, undefined);
+  }
+
+  /**
+   * §SA1 — cancel ONE in-flight subagent of this session by its session id,
+   * without cancelling this parent or its siblings. The target must be an active
+   * subagent of THIS session (`getDisplayState().activeSubagents` /
+   * `subagent_*` events expose the id); a non-child id, an already-settled child,
+   * or a child not live in this process is a safe no-op.
+   *
+   * Cancellation reaches the child via the same harness-owned parent-origin
+   * cascade as a full `cancel()` does for all children — so an inline
+   * `spawn_subagent` child aborts its turn (the spawn tool's `finally` then closes
+   * it), and a detached `task_delegate` child aborts + the delegation driver rolls
+   * its plan task up to `failed` (its `cancelRequest` is also honored by
+   * reconcile-on-rehydrate). Same-process only: a child owned by another live
+   * instance is not reachable here.
+   */
+  async cancelSubagent(opts: { subagentSessionId: string; reason?: string }): Promise<void> {
+    this._assertNotDeleted();
+    // Ownership guard: only cancel a subagent THIS session is actively running.
+    const isOwnChild = Array.from(this._activeSubagents.values()).some(
+      s => s.subagentSessionId === opts.subagentSessionId,
+    );
+    if (!isOwnChild) return;
+    const child = this._harness._internalGetLiveSession(opts.subagentSessionId);
+    if (!child) return; // not live in this process — best-effort no-op
+    try {
+      await child._cancelInternal({ reason: opts.reason ?? 'subagent_cancelled', requestedBy: this.id }, this.id);
+    } catch {
+      // Best-effort: a late race (child already settling/closed) must not throw.
+    }
+  }
+
+  private async _cancelInternal(
+    opts?: { reason?: string; requestedBy?: string },
+    parentOrigin?: string,
+  ): Promise<void> {
     this._assertNotDeleted();
     if (this._currentCancelRequest() !== undefined) return;
 
@@ -1984,21 +3295,10 @@ export class Session {
     const durableReason = committedCancel.reason;
     this._clearQueueWakeTimer();
 
-    this._emitter.emit({
-      type: 'task_cancellation_requested',
-      requestedAt: committedCancel.requestedAt,
-      ...(durableReason !== undefined ? { reason: durableReason } : {}),
-      ...(committedCancel.requestedBy !== undefined ? { requestedBy: committedCancel.requestedBy } : {}),
-    } as EmitInput);
-
+    // §10.2: cancellation/queue-drop are not public HarnessEventV1 events. The
+    // observable effect is the rejected operation promises + cleared queue +
+    // updated display snapshot below.
     for (const dropped of removedItems) {
-      this._emitter.emit({
-        type: 'queue_item_cancelled',
-        queuedItemId: dropped.queuedItemId,
-        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
-        ...(durableReason !== undefined ? { reason: durableReason } : {}),
-      } as EmitInput);
-
       const resolver = this._queueResolvers.get(dropped.queuedItemId);
       if (resolver) {
         this._queueResolvers.delete(dropped.queuedItemId);
@@ -2020,7 +3320,17 @@ export class Session {
       this._currentQueuedItemId = undefined;
       this._currentQueuedItemSource = undefined;
     }
-    this.abort({ reason: durableReason ?? 'session_cancelled' });
+    // §6.2: the tool-visible abort reason is typed. A cancel cascaded from this
+    // session's parent (harness-owned `parentOrigin`, matching this child's
+    // parentSessionId) surfaces `parent_aborted` with the parent id; any other
+    // cancel is ordinary `agent_aborted`. The durable `cancelRequest.reason` string
+    // is preserved separately on the record; the caller-supplied `requestedBy` is an
+    // audit field and is NOT the abort-source authority.
+    if (parentOrigin !== undefined && parentOrigin === this.parentSessionId) {
+      this._abortActiveTurn('parent_aborted', { parentSessionId: this.parentSessionId });
+    } else {
+      this._abortActiveTurn('agent_aborted');
+    }
 
     for (const completed of completedUnfinalizedItems) {
       await this._settleCompletedQueuedItemAfterCancellation(completed.item, completed.result, completed.modeId);
@@ -2035,7 +3345,9 @@ export class Session {
         const child = this._harness._internalGetLiveSession(childId);
         if (!child) return;
         try {
-          await child.cancel({ reason: reason ?? 'parent_cancelled', requestedBy: this.id });
+          // Internal cascade: pass this session id as the harness-owned parent
+          // origin so the child's live turn aborts with `parent_aborted`.
+          await child._cancelInternal({ reason: reason ?? 'parent_cancelled', requestedBy: this.id }, this.id);
         } catch {
           // Cancellation has already committed for the parent. Child
           // propagation is best-effort and must not roll it back.
@@ -2102,13 +3414,8 @@ export class Session {
 
     if (!removed) return;
 
-    this._emitter.emit({
-      type: 'queue_item_cancelled',
-      queuedItemId: removed.queuedItemId,
-      ...(removed.admissionId !== undefined ? { admissionId: removed.admissionId } : {}),
-      ...(reason !== undefined ? { reason } : {}),
-    } as EmitInput);
-
+    // §10.2: queue-item cancellation is not a public event — the observable
+    // effect is the rejected operation promise below + the cleared queue.
     const resolver = this._queueResolvers.get(removed.queuedItemId);
     if (resolver) {
       this._queueResolvers.delete(removed.queuedItemId);
@@ -2151,6 +3458,25 @@ export class Session {
     return this._state === 'closing' || (this._record.closingAt !== undefined && this._record.closedAt === undefined);
   }
 
+  /**
+   * True while a pending interaction (tool approval/suspension, question, plan)
+   * parks the session, pinning it in memory so pressure/idle eviction skips it
+   * (§5.4). The pin lifts when the prompt is answered or the session closes.
+   */
+  isPinned(): boolean {
+    return this._record.pendingResume !== undefined && this._record.cancelRequest === undefined;
+  }
+
+  /** Epoch-ms when this session entered closing, if it has. Used to build `HarnessSessionClosingError` (§4.5b). */
+  get closingAt(): number | undefined {
+    return this._record.closingAt;
+  }
+
+  /** Epoch-ms close deadline for this session, if closing. Used to build `HarnessSessionClosingError` (§4.5b). */
+  get closeDeadlineAt(): number | undefined {
+    return this._record.closeDeadlineAt;
+  }
+
   /** Read-only snapshot of the underlying record. */
   getRecord(): Readonly<SessionRecord> {
     return this._record;
@@ -2163,19 +3489,54 @@ export class Session {
   /**
    * Soft-close: persist `closingAt`, reject new work, drain admitted turns
    * until the close deadline, terminalize descendants, set `closedAt`, release
-   * the lease, and drop from the live map. Final — the same `sessionId` cannot be re-hydrated.
-   * Idempotent: a second call is a no-op once `closed`. The cascade through
-   * descendants (§5.5) is driven by the Harness, not by this method directly.
-   *
-   * @internal — public users go through `harness.closeSession({ sessionId })`
-   * or `session.close()` (defined here) which currently delegates back to
-   * the harness so cascade is enforced in one place. We expose this method
-   * so the harness has a clear hook; the harness method is still the
-   * recommended call site.
+   * the lease, and drop from the live map. The session remains **reopenable**
+   * (§5.3): a later `harness.session({ sessionId })` or `{ threadId, resourceId }`
+   * resolve transitions it Closed -> Active. Idempotent: a second call is a
+   * no-op once `closed`. The cascade through descendants (§5.5) is driven by
+   * the Harness, not by this method directly.
    */
   async close(): Promise<void> {
     if (this._state === 'closed') return;
     await this._harness._closeSession(this);
+  }
+
+  /**
+   * Session-first delete (§4.1): removes this session and the durable
+   * conversation/artifacts it owns, subject to ownership and safety guards.
+   * This is the normal product destructive path; it delegates to the Harness
+   * so the descendant cascade (§5.5) is enforced in one place. This is the
+   * guarded delete: it fails with `HarnessSessionDeleteBlockedError` if the
+   * session still has non-terminal dependents. The operator force-delete path
+   * is intentionally NOT exposed here (§4.1) — operators call
+   * `harness.deleteSession({ force: true })` directly.
+   */
+  async delete(): Promise<void> {
+    await this._harness.deleteSession({ sessionId: this.id, resourceId: this.resourceId });
+  }
+
+  /**
+   * Session-first rename (§4.1 / §13.3c): update the title of this session's
+   * backing thread, authorized through the live session (it holds the write
+   * lease). Asserts the session is live first so a closed/closing/deleted
+   * session is rejected rather than mutating the thread out from under the
+   * session lifecycle; reopen first to rename a closed conversation.
+   */
+  async rename(opts: { title: string }): Promise<void> {
+    this._assertLive('rename()');
+    await this._harness._threadOps.rename({ resourceId: this.resourceId, threadId: this.threadId, title: opts.title });
+  }
+
+  /**
+   * Session-first clone (§4.2 / §2.2): copy this conversation into a new usable
+   * session. Copies committed message history and, when `copyAppMetadata` is
+   * requested, app-owned thread metadata only. Per §5.2a it copies NO
+   * `SessionRecord` (no mode/model/grants/state/pending/run/goal/workspace/
+   * channel rows) and never copies the lease, live process handles, active
+   * streams, or in-flight tool execution ownership. The new session owns its
+   * cloned thread and starts fresh from harness defaults.
+   */
+  async clone(opts?: { title?: string; copyAppMetadata?: boolean }): Promise<Session> {
+    return this._harness._cloneSession(this, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -2198,6 +3559,52 @@ export class Session {
     return this._getWorkspaceUnchecked();
   }
 
+  // ---------------------------------------------------------------------------
+  // §4.2 / §6.1 workspace access primitives. These mirror the tool-facing
+  // `HarnessRequestContext` accessors. The split lets a turn avoid cloud-sandbox
+  // cold starts: `hasWorkspace()`/`isWorkspaceReady()`/`peekWorkspace()` are
+  // sync, NON-materializing reads; `resolveWorkspace()` is the explicit async
+  // materialize/resume path. NOTE: the legacy `getWorkspace()` above is async +
+  // materializing (kept for its established callers/tests); `resolveWorkspace()`
+  // is its spec-named alias. (Migrating `getWorkspace()` itself to a sync read is
+  // a separate, larger §4.2 reconciliation — ~25 call sites — left as follow-up.)
+  // ---------------------------------------------------------------------------
+
+  /** §6.1: is a workspace CONFIGURED for this harness (regardless of whether it
+   * has been materialized)? Sync, non-materializing. */
+  hasWorkspace(): boolean {
+    return this._harness._workspaceKind !== undefined;
+  }
+
+  /** §6.1: is a usable workspace handle already materialized (warm/cached)? Sync,
+   * non-materializing — `false` does not mean "no workspace", only "not yet
+   * resolved" (or lost). A workspace marked lost is NOT ready even if a stale
+   * handle lingers. */
+  isWorkspaceReady(): boolean {
+    return this._workspace !== undefined && !this._workspaceLost;
+  }
+
+  /** §6.1: the already-materialized workspace handle, or `undefined` if it has not
+   * been resolved yet (or was lost). Sync and NON-materializing — never triggers a
+   * cold start and never throws; `resolveWorkspace()` surfaces a lost workspace. */
+  peekWorkspace(): Workspace | undefined {
+    return this._workspaceLost ? undefined : this._workspace;
+  }
+
+  /** §6.1: explicitly materialize/resume the workspace (a cloud sandbox cold start
+   * may happen here). Throws `HarnessWorkspaceLostError` if the workspace was lost
+   * across restart, or a validation error if no workspace is configured. */
+  async resolveWorkspace(): Promise<Workspace> {
+    const workspace = await this.getWorkspace();
+    if (workspace === undefined) {
+      throw new HarnessValidationError(
+        'resolveWorkspace()',
+        'no workspace is configured for this harness (set `workspace.kind` in HarnessConfig)',
+      );
+    }
+    return workspace;
+  }
+
   private async _getWorkspaceUnchecked(): Promise<Workspace | undefined> {
     if (this._workspace) return this._workspace;
     if (this._workspaceResolving) return this._workspaceResolving;
@@ -2206,7 +3613,10 @@ export class Session {
     if (!kind) return undefined;
 
     if (this._workspaceLost) {
-      throw new HarnessWorkspaceLostError(this.id, this._harness._workspaceRegistry.providerId ?? 'unknown');
+      throw new HarnessWorkspaceLostError(this.id, {
+        reason: 'restart',
+        providerId: this._harness._workspaceRegistry.providerId,
+      });
     }
 
     const resolve = async (): Promise<Workspace> => {
@@ -2221,6 +3631,10 @@ export class Session {
       // The spawn tool flips `_subagentFreshWorkspace` for the `fresh` case so
       // we don't accidentally inherit when a fresh workspace is requested.
       if (this.parentSessionId && this._subagentInheritWorkspace) {
+        // §6.2 strict-lazy: a lazy parent turn may not have materialized its
+        // workspace yet, but inheriting requires the parent's entry to exist.
+        // Resolve the (live) parent's workspace first (idempotent).
+        await this._harness._internalEnsureParentWorkspaceForInherit(this.parentSessionId);
         return this._harness._workspaceRegistry.inheritPerSession({
           parentSessionId: this.parentSessionId,
           childSessionId: this.id,
@@ -2265,6 +3679,22 @@ export class Session {
    * subagent sessions unless the spawn definition opts into `'fresh'`.
    */
   _subagentInheritWorkspace?: boolean;
+
+  /**
+   * @internal — `SubagentDefinition.tools` for a spawned subagent session, set at
+   * spawn/delegate time. Layered onto the subagent's tool surface in
+   * `_buildToolsets` (§9). Undefined for non-subagent sessions.
+   */
+  _subagentToolsOverride?: ToolsInput;
+
+  /**
+   * @internal — `SubagentDefinition.toolAllowlist` for a spawned/delegated subagent
+   * session (M4): the hard name-scope this subagent may call. Composed into the
+   * §4.2e permission resolver so a non-listed tool is denied (removed pre-exposure).
+   * Undefined ⇒ no allowlist scope. Set at spawn/delegate; restored on a delegated
+   * child's reattach from `delegatedSubagentTypeId`.
+   */
+  _subagentToolAllowlist?: readonly string[];
 
   /** @internal — writes the latest opaque workspace state into the session record. */
   private async _persistWorkspaceState(state: unknown): Promise<void> {
@@ -2718,7 +4148,11 @@ export class Session {
   }
 
   private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor, workspaceId: string): string {
-    return [server.key, this._record.modeId, this._record.modelId ?? '', workspaceId].join('\0');
+    // canonicalJson is NUL-/sentinel-safe: every byte (incl. the historical '\0'
+    // separator) is JSON-escaped, so distinct (serverKey, modeId, modelId,
+    // workspaceId) tuples — any of which can carry arbitrary strings — never
+    // collide the way a single-char `join` could.
+    return canonicalJson([server.key, this._record.modeId, this._record.modelId ?? null, workspaceId]);
   }
 
   private _currentMcpActionCatalogWorkspaceId(): string {
@@ -2919,6 +4353,16 @@ export class Session {
     if (typeof ref !== 'string' || ref.length === 0) {
       throw new HarnessValidationError('skills.use()', 'ref must be a non-empty string');
     }
+    // §3: useSkill is a fail-fast operation — it must refuse on a busy session
+    // rather than interleaving/queuing like a default message.
+    if (this.isBusy()) {
+      throw new HarnessBusyError(this.id, this._busyReason());
+    }
+
+    // §4.4c: validate caller request context before skill resolution so a bad
+    // app bag fails fast (attributed to skills.use()); the normalized value is
+    // forwarded to the delegated message() turn (which re-validates idempotently).
+    const callerRequestContext = validateCallerRequestContext(opts?.requestContext, 'skills.use()');
 
     const tryWorkspaceSkill = async () => {
       const workspace = await this.getWorkspace();
@@ -2935,6 +4379,7 @@ export class Session {
         return this.message({
           content: expandedContent,
           ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
+          ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
         });
       }
     }
@@ -2946,6 +4391,7 @@ export class Session {
       return this.message({
         content: expandedContent,
         ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
+        ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
       });
     }
 
@@ -2975,6 +4421,7 @@ export class Session {
     return this.message({
       content: expandedContent,
       ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
+      ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
     });
   }
 
@@ -3338,7 +4785,7 @@ export class Session {
   private async _ensureThreadSubscription(agent: Agent): Promise<AgentThreadSubscription<unknown>> {
     if (this._threadSubscriptionClosed) {
       if (this._state === 'deleted') {
-        throw new HarnessSessionDeletedError(this.id);
+        throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
       }
       if (this._state === 'closed' || this._state === 'evicted') {
         throw new HarnessSessionClosedError(this.id);
@@ -3370,7 +4817,7 @@ export class Session {
         // Best-effort — hard-delete or close won while subscribeToThread was pending.
       }
       if (this._state === 'deleted') {
-        throw new HarnessSessionDeletedError(this.id);
+        throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
       }
       if (this._state === 'closed' || this._state === 'evicted') {
         throw new HarnessSessionClosedError(this.id);
@@ -3511,6 +4958,40 @@ export class Session {
   }
 
   /**
+   * Drain a RESUME run's own `fullStream` through `_emitForChunk` so the
+   * approved tool's `tool_end` and any post-approval `text_delta` surface LIVE
+   * (§10.4) to subscribers. Unlike the initial run, a resume reuses the
+   * suspended run's `runId` (`pending.runId`), which the long-lived thread
+   * subscription has already recorded in its `seenRunIds`; the subscription
+   * therefore dedups the re-registered resume run and never re-drains it, so
+   * this local drain is the SOLE consumer of the resumed segment's chunks (no
+   * double-emit). This is an independent evented reader over the output's
+   * shared chunk buffer; it does NOT gate completion delivery, which stays on
+   * the `getFullOutput()` / `_waitUntilFinished()` path. `_emitForChunk` never
+   * emits a terminal `agent_end` — the resume's terminal is emitted explicitly
+   * by `respondTo*` after this drain — so a re-suspend or error mid-resume does
+   * not produce a spurious terminal here.
+   */
+  private async _drainResumeStream(out: MastraModelOutput<unknown>): Promise<void> {
+    const stream = (out as { fullStream?: ReadableStream<unknown> }).fullStream;
+    if (!stream) return;
+    // The resume run replays the approved tool's `tool-result` chunk WITHOUT a
+    // preceding `tool-call` chunk in this segment (the `tool-call` landed in the
+    // initial, suspended turn), so `_activeTools` (seeded only by `tool-call`)
+    // does not necessarily hold the resumed tool. `_emitForChunk` now reads the
+    // `toolName` from the chunk payload itself (which always carries it), so the
+    // live `tool_end` surfaces the real name without re-seeding `_activeTools`.
+    for await (const chunk of stream as AsyncIterable<{
+      type: string;
+      payload?: unknown;
+      data?: unknown;
+      runId?: string;
+    }>) {
+      this._emitForChunk(chunk);
+    }
+  }
+
+  /**
    * Settle the outstanding completion waiter for `runId` with the bundled
    * `FullOutput`. Always called from `_watchRunCompletion` with the output
    * reference captured at registration time (runtime cleanup may have
@@ -3560,40 +5041,50 @@ export class Session {
    * drain is the single consumer of chunks.
    */
   private _emitForChunk(chunk: { type: string; payload?: unknown; data?: unknown; runId?: string }): void {
+    // §10.2 TurnEvent/ToolEvent — runId identifies the streaming run. Mid-run
+    // chunks carry it; fall back to the session's current run id.
+    const runId = chunk.runId ?? this._currentRunId;
     switch (chunk.type) {
       case 'text-start': {
+        // §10.2 defines no message-boundary event; we still track the in-flight
+        // message id for the display snapshot.
         const payload = chunk.payload as { id: string };
         this._currentMessageId = payload.id;
-        this._emitTurnEvent({ type: 'message_start', messageId: payload.id });
         return;
       }
       case 'text-delta': {
         const payload = chunk.payload as { id: string; text?: string };
-        if (typeof payload?.text === 'string' && payload.text.length > 0) {
-          this._emitTurnEvent({
-            type: 'message_update',
-            messageId: payload.id,
-            delta: payload.text,
-          });
+        if (runId !== undefined && typeof payload?.text === 'string' && payload.text.length > 0) {
+          this._emitTurnEvent({ type: 'text_delta', runId, delta: payload.text });
         }
         return;
       }
       case 'text-end': {
         const payload = chunk.payload as { id: string };
-        this._emitTurnEvent({ type: 'message_end', messageId: payload.id });
         if (this._currentMessageId === payload.id) {
           this._currentMessageId = undefined;
         }
         return;
       }
+      case 'reasoning-delta': {
+        // §10.2 streaming reasoning. Mirrors `text-delta`: emit one
+        // `reasoning_delta` per chunk that carries real reasoning text (gate on
+        // non-empty + a known runId). `reasoning-start`/`reasoning-end` carry no
+        // text and define no message boundary, so they emit nothing (default
+        // case). The AI-SDK chunk is `{ type:'reasoning-delta', payload:{ text } }`
+        // (stream/types.ts ReasoningDeltaPayload; aisdk/v5/transform.ts maps the
+        // provider `reasoning-delta.delta` into `payload.text`).
+        const payload = chunk.payload as { id: string; text?: string };
+        if (runId !== undefined && typeof payload?.text === 'string' && payload.text.length > 0) {
+          this._emitTurnEvent({ type: 'reasoning_delta', runId, delta: payload.text });
+        }
+        return;
+      }
       case 'tool-call-input-streaming-start': {
+        // §10.2 has no tool-input-streaming events; keep the buffer for the
+        // display snapshot of in-flight args, but emit nothing.
         const payload = chunk.payload as { toolCallId: string; toolName: string };
         this._toolInputBuffers.set(payload.toolCallId, { toolName: payload.toolName, text: '' });
-        this._emitTurnEvent({
-          type: 'tool_input_start',
-          toolCallId: payload.toolCallId,
-          toolName: payload.toolName,
-        });
         return;
       }
       case 'tool-call-delta': {
@@ -3604,17 +5095,11 @@ export class Session {
           toolName,
           text: (prev?.text ?? '') + payload.argsTextDelta,
         });
-        this._emitTurnEvent({
-          type: 'tool_input_delta',
-          toolCallId: payload.toolCallId,
-          argsTextDelta: payload.argsTextDelta,
-        });
         return;
       }
       case 'tool-call-input-streaming-end': {
         const payload = chunk.payload as { toolCallId: string };
         this._toolInputBuffers.delete(payload.toolCallId);
-        this._emitTurnEvent({ type: 'tool_input_end', toolCallId: payload.toolCallId });
         return;
       }
       case 'tool-call': {
@@ -3626,78 +5111,96 @@ export class Session {
           startedAt: Date.now(),
         });
         this._toolInputBuffers.delete(payload.toolCallId);
-        this._emitTurnEvent({
-          type: 'tool_start',
-          toolCallId: payload.toolCallId,
-          toolName: payload.toolName,
-          args: payload.args,
-        });
+        if (runId !== undefined) {
+          // §10.2: project `input` to its JSON-safe replay shape AT EMIT so the
+          // live subscriber and the durable/replayed row carry the identical
+          // value (the raw `args` may hold Date/Map/Set/class/bigint/cycles).
+          this._emitTurnEvent({
+            type: 'tool_start',
+            runId,
+            toolCallId: payload.toolCallId,
+            toolName: payload.toolName,
+            input: projectToolEventPayloadForJson(
+              payload.args,
+              'tool_start.input',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
+          });
+        }
         return;
       }
       case 'tool-result': {
-        const payload = chunk.payload as { toolCallId: string; result: unknown; isError?: boolean };
+        const payload = chunk.payload as { toolCallId: string; toolName?: string; result: unknown; isError?: boolean };
+        // §10.4: the resume segment replays the approved tool's `tool-result`
+        // WITHOUT a preceding `tool-call` in this segment, so `_activeTools` (seeded
+        // only by `tool-call`) misses on resume and `tool_end.toolName` would be ''.
+        // The chunk payload itself carries the required `toolName` (ToolResultPayload,
+        // stream/types.ts) on BOTH the initial and resume paths, so prefer it; fall
+        // back to the `_activeTools` entry for any chunk shape that omits it.
+        const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
-        this._emitTurnEvent({
-          type: 'tool_end',
-          toolCallId: payload.toolCallId,
-          result: payload.result,
-          isError: payload.isError ?? false,
-        });
+        // Suppress a real terminal that arrives AFTER a synthetic aborted tool_end
+        // was already emitted for this (runId, toolCallId) — one-shot (S1).
+        if (runId !== undefined && this._abortedToolTombstones.delete(`${runId}:${payload.toolCallId}`)) {
+          return;
+        }
+        if (runId !== undefined) {
+          // Project `output` at emit so live === replay (§10.2). Shared/aliased
+          // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
+          this._emitTurnEvent({
+            type: 'tool_end',
+            runId,
+            toolCallId: payload.toolCallId,
+            toolName,
+            output: projectToolEventPayloadForJson(
+              payload.result,
+              'tool_end.output',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
+            isError: payload.isError ?? false,
+          });
+        }
         return;
       }
       case 'tool-error': {
-        const payload = chunk.payload as { toolCallId: string; error: unknown };
+        const payload = chunk.payload as { toolCallId: string; toolName?: string; error: unknown };
+        // Same resume gap as `tool-result`: prefer the payload's own `toolName`
+        // (ToolErrorPayload, stream/types.ts) so a resumed/replayed `tool-error`
+        // carries the real name; fall back to `_activeTools` for chunk shapes
+        // that omit it.
+        const toolName = payload.toolName || this._activeTools.get(payload.toolCallId)?.toolName || '';
         this._activeTools.delete(payload.toolCallId);
-        this._emitTurnEvent({
-          type: 'tool_end',
-          toolCallId: payload.toolCallId,
-          result: payload.error,
-          isError: true,
-        });
+        // One-shot suppression of a late real terminal after a synthetic abort (S1).
+        if (runId !== undefined && this._abortedToolTombstones.delete(`${runId}:${payload.toolCallId}`)) {
+          return;
+        }
+        if (runId !== undefined) {
+          // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
+          // `harnessEventJsonReplacer` keeps name/code/message — NOT flattened
+          // into `harness.internal`), and projected at emit so the raw thrown
+          // Error (stack/cause/prototype) never reaches a live subscriber while
+          // replay sees only {name,code,message}.
+          this._emitTurnEvent({
+            type: 'tool_end',
+            runId,
+            toolCallId: payload.toolCallId,
+            toolName,
+            output: projectToolEventPayloadForJson(
+              payload.error,
+              'tool_end.output',
+              this._harness._internalMaxEventPayloadBytes,
+            ),
+            isError: true,
+          });
+        }
         return;
       }
       default: {
-        // Bridge whitelisted data-* writer chunks (§10.2) into typed harness events.
-        if (typeof chunk.type === 'string' && chunk.type.startsWith('data-')) {
-          const data = (chunk as { data?: unknown }).data;
-          if (chunk.type === 'data-task-updated') {
-            const tasks = (data as { tasks?: unknown })?.tasks;
-            if (Array.isArray(tasks)) {
-              this._emitTurnEvent({ type: 'task_updated', tasks: tasks as TaskUpdatedEvent['tasks'] });
-            }
-          } else if (chunk.type === 'data-tool-update') {
-            const payload = data as { toolCallId?: unknown; partialResult?: unknown } | undefined;
-            if (
-              payload &&
-              typeof payload.toolCallId === 'string' &&
-              payload.toolCallId.length > 0 &&
-              this._activeTools.has(payload.toolCallId)
-            ) {
-              this._emitTurnEvent({
-                type: 'tool_update',
-                toolCallId: payload.toolCallId,
-                partialResult: payload.partialResult,
-              });
-            }
-          } else if (chunk.type === 'data-shell-output') {
-            const payload = data as { toolCallId?: unknown; output?: unknown; stream?: unknown } | undefined;
-            if (
-              payload &&
-              typeof payload.toolCallId === 'string' &&
-              payload.toolCallId.length > 0 &&
-              typeof payload.output === 'string' &&
-              (payload.stream === 'stdout' || payload.stream === 'stderr') &&
-              this._activeTools.has(payload.toolCallId)
-            ) {
-              this._emitTurnEvent({
-                type: 'shell_output',
-                toolCallId: payload.toolCallId,
-                output: payload.output,
-                stream: payload.stream,
-              });
-            }
-          }
-        }
+        // §10.2 defines no tool-progress / shell-output / task-update built-in
+        // events. Tool authors surface progress via §10.3 custom events
+        // (dotted `${string}.${string}` types), which flow through the custom
+        // event path — the harness does not synthesize built-ins from `data-*`
+        // writer chunks.
         return;
       }
     }
@@ -3747,6 +5250,35 @@ export class Session {
       throw new HarnessValidationError('message().admissionId', 'admissionId must be a non-empty string');
     }
 
+    // §3 / §4.4a: the sync structured-output form is the one fail-fast signal
+    // form — it needs a clean turn boundary, so refuse on a busy session rather
+    // than launching a concurrent generate. Default message()/signal()/queue()
+    // stay busy-independent.
+    if (opts.output !== undefined && opts.sync === true && this.isBusy()) {
+      throw new HarnessBusyError(this.id, this._busyReason());
+    }
+
+    // §4.4c: validate caller-supplied request context before any admission
+    // side-effect (hash, evidence reservation, dispatch). Only `app` is allowed;
+    // reserved/infrastructure keys are rejected here with HarnessValidationError.
+    const callerRequestContext = validateCallerRequestContext(opts.requestContext, 'message()');
+    // When a turn is already in flight, the signal-routed path interleaves into
+    // that active run and its streamOptions (which carry the request context)
+    // are ignored, so a caller `app` could never reach the running tools. Reject
+    // rather than silently drop it. We key off an already-active turn — NOT the
+    // broader isBusy() (which also covers a pending queue / pending resume with
+    // no active run, where this message wakes a fresh run that DOES receive the
+    // context). This guard runs before this turn's own _beginTurn, so the
+    // controller here reflects a pre-existing active turn. (The structured+sync
+    // form already rejected busy above.)
+    if (callerRequestContext !== undefined && this._currentTurnAbortController !== undefined) {
+      throw new HarnessConfigError(
+        'message().requestContext',
+        'cannot be supplied while a run is active on this thread — it would interleave into the running execution and could not reach its tools',
+      );
+    }
+    const persistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+
     // Resolve the effective mode (per-call override wins, else session's).
     const effectiveModeId = opts.mode ?? this._record.modeId;
     const effectiveModelId = opts.model ?? this._record.modelId;
@@ -3754,10 +5286,14 @@ export class Session {
     const agent = this._harness.getAgentForMode(effectiveModeId);
     const admissionHashes =
       opts.admissionId !== undefined
-        ? this._computeMessageAdmissionHashes(opts, {
-            modeId: effectiveModeId,
-            modelId: effectiveModelId,
-          })
+        ? this._computeMessageAdmissionHashes(
+            opts,
+            {
+              modeId: effectiveModeId,
+              modelId: effectiveModelId,
+            },
+            persistedRequestContext,
+          )
         : undefined;
     const admissionHash = admissionHashes?.primary;
     const compatibleAdmissionHashes = admissionHashes?.legacyCompatible;
@@ -3810,7 +5346,10 @@ export class Session {
     // `session.abort()` can cancel the in-flight run. If the caller passes
     // their own AbortSignal, we forward it into the session controller so
     // both paths converge on a single signal handed to the agent.
-    const turnAbortController = this._beginTurn(opts.abortSignal);
+    const turnAbortController = this._beginTurn(opts.abortSignal, {
+      modeId: effectiveModeId,
+      modelId: effectiveModelId,
+    });
     const turnAbortSignal = turnAbortController.signal;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
@@ -3825,7 +5364,7 @@ export class Session {
     };
     const assertOwnedMessageTurnNotDeleted = () => {
       if (this._state === 'deleted') {
-        const err = new HarnessSessionDeletedError(this.id);
+        const err = new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
         failOwnedMessageTurnBeforeDispatch(err);
         throw err;
       }
@@ -3843,12 +5382,16 @@ export class Session {
           modeId: effectiveModeId,
           modelId: effectiveModelId,
           abortSignal: turnAbortSignal,
+          ...(persistedRequestContext ? { persistedRequestContext } : {}),
         }),
         activeTurnWaiter.promise,
       ]);
     } catch (err) {
       failOwnedMessageTurnBeforeDispatch(err);
-      throw err;
+      // §13.3f.1 — message() is a public §4.2b boundary; _buildRequestContext can
+      // reject with a raw provider/storage/runtime error (workspace materialization,
+      // persistence). Redact before rejecting the caller's promise.
+      throw redactPublicBoundaryRejection(err);
     }
     assertOwnedMessageTurnNotDeleted();
 
@@ -3860,14 +5403,14 @@ export class Session {
       ...(mode.instructions ? { instructions: mode.instructions } : {}),
     };
 
-    // agent_start signals the turn has begun. Subscribers can latch their
-    // accumulators here. Emitted before either agent.stream() or
-    // agent.generate() so structured/sync paths still see the boundary.
-    this._emitTurnEvent({ type: 'agent_start' });
-
     // Structured + sync path: agent.generate with structuredOutput.
     if (opts.output !== undefined && opts.sync === true) {
       let agentEndEmitted = false;
+      let agentStartRunId: string | undefined;
+      // Hoisted so the catch can emit `agent_end.usage` from the run's actual
+      // output when a usable result existed but turned out to be a generation
+      // failure (tripwire / missing object). Undefined when generate threw.
+      let observedFull: FullOutput<unknown> | undefined;
       try {
         const result = await Promise.race([
           agent.generate(opts.content, {
@@ -3877,6 +5420,12 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         const full = result as FullOutput<unknown>;
+        observedFull = full;
+        // §10.2 agent_start carries the runId; generate is atomic, so we learn
+        // the runId only once it returns. (If generate threw, no run terminal
+        // was observed — no agent_start/agent_end, per §10.2's runId rule.)
+        agentStartRunId = full.runId;
+        this._emitAgentStart(full.runId);
         if (full.finishReason === 'suspended') {
           await this._captureMessageSuspendWithTokenUsage(
             full,
@@ -3886,27 +5435,37 @@ export class Session {
             activeTurnWaiter.promise,
           );
         } else {
+          // Account token usage for the run regardless of whether it produced a
+          // usable object — the model consumed tokens either way. This runs before
+          // the §4.5 failure throw so a tripwire/missing-object turn is not dropped
+          // from the durable counter.
           const tokenUsageDelta = this._recordTurnCompletion(full, { persist: false });
           if (tokenUsageDelta !== undefined) {
             await Promise.race([this._persistTokenUsageOrLatch(), activeTurnWaiter.promise]);
           }
+          // §4.5: a non-suspended structured result that carries no usable object
+          // (or was rejected by a processor tripwire) is a generation failure. Throw
+          // after accounting but before emitting a terminal so the catch below
+          // surfaces an `error` agent_end rather than a spurious `complete`.
+          const outputFailure = this._classifyStructuredOutputFailure(full);
+          if (outputFailure !== undefined) {
+            throw new HarnessOutputGenerationError(this.id, outputFailure, full.runId);
+          }
         }
-        this._emitTurnEvent({
-          type: 'agent_end',
-          reason: this._agentEndReasonForFullOutput(full),
-          runId: full.runId,
-        });
+        this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
         agentEndEmitted = true;
         await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
         return full.object;
       } catch (err) {
-        if (!agentEndEmitted) {
+        if (!agentEndEmitted && agentStartRunId !== undefined) {
           this._emitTurnEvent({
             type: 'agent_end',
-            reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+            runId: agentStartRunId,
+            finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
+            usage: this._runUsage(observedFull),
           });
         }
-        throw err;
+        throw this._asStructuredOutputError(err, agentStartRunId, turnAbortSignal);
       } finally {
         finishOwnedMessageTurn();
       }
@@ -3922,13 +5481,36 @@ export class Session {
     // `agent.stream(signal, streamOptions)`; on an active same-agent run
     // the signal drains mid-flight into the running execution loop. Both
     // paths surface chunks through the same subscription stream.
+    let sub;
     try {
-      await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
+      sub = await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
     } catch (err) {
+      failOwnedMessageTurnBeforeDispatch(err);
+      // §13.3f.1 — message() is a public §4.2b boundary; subscribeToThread can
+      // reject with a raw runtime error. Redact before rejecting the caller.
+      throw redactPublicBoundaryRejection(err);
+    }
+    assertOwnedMessageTurnNotDeleted();
+
+    // §4.4c: authoritative active-delivery check, using the same `sub.activeRunId()` predicate
+    // signal() relies on, now that the live subscription is open. The early
+    // `_currentTurnAbortController` guard is a cheap fast path; this catches a run that started
+    // during the intervening request-context/admission awaits (where an interleaving signal would
+    // ignore the streamOptions carrying the caller `app`). It runs BEFORE the durable admission
+    // reservation below, so rejecting here writes nothing durable and the owned-turn cleanup
+    // suffices — and, crucially, it does NOT poison an idempotent retry with a spurious `failed`
+    // evidence row. The single residual window is the awaited reservation itself (admissionId
+    // path only): a run starting precisely during that write is admission-scoped only and is not
+    // delivered to the interleaved run, matching how `abortSignal` behaves on active-delivery —
+    // we deliberately do not reject post-reservation, because that would poison the retry.
+    if (callerRequestContext !== undefined && sub.activeRunId() !== null) {
+      const err = new HarnessConfigError(
+        'message().requestContext',
+        'cannot be supplied while a run is active on this thread — it would interleave into the running execution and could not reach its tools',
+      );
       failOwnedMessageTurnBeforeDispatch(err);
       throw err;
     }
-    assertOwnedMessageTurnNotDeleted();
 
     if (admissionIdentity !== undefined && admissionHash !== undefined && admissionStart !== undefined) {
       try {
@@ -3970,7 +5552,10 @@ export class Session {
         }
       } catch (err) {
         failOwnedMessageTurnBeforeDispatch(err);
-        throw err;
+        // §13.3f.1 — message() is a public §4.2b boundary; the admission
+        // reservation write can reject with a raw storage error. Redact before
+        // rejecting the caller (the conflict/deleted Harness errors pass through).
+        throw redactPublicBoundaryRejection(err);
       }
       assertOwnedMessageTurnNotDeleted();
     }
@@ -4015,8 +5600,16 @@ export class Session {
         }
       }
       failOwnedMessageTurnBeforeDispatch(thrown);
-      throw thrown;
+      // §13.3f.1 — message() is a public §4.2b boundary; agent.sendSignal() can
+      // throw a raw runtime error. Redact before rejecting the caller's promise
+      // (a HarnessSessionDeletedError from the evidence write passes through).
+      throw redactPublicBoundaryRejection(thrown);
     }
+
+    // §10.2 agent_start carries the runId — emit it now that the run is
+    // dispatched (signal.runId known) and before the drain surfaces any chunk.
+    // signal.signal.id is the originating signalId — stamped for the run projection.
+    this._emitAgentStart(signal.runId, signal.signal.id);
 
     // Register the completion waiter BEFORE the drain has a chance to see
     // a terminal chunk for this runId (the run can start synchronously on
@@ -4117,7 +5710,10 @@ export class Session {
           await awaitPendingMessageEvidence();
         } catch (err) {
           await failDispatchedMessageTurn(err);
-          throw err;
+          // §13.3f.1 — message({ stream: true }) is a public §4.2b boundary; the
+          // pending-evidence wait can reject with a raw storage error. Redact
+          // before rejecting the caller (internal waiters keep the raw err).
+          throw redactPublicBoundaryRejection(err);
         }
         try {
           out = signal.output
@@ -4155,7 +5751,10 @@ export class Session {
           }
           if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
           void this._maybeDrainQueue();
-          throw err;
+          // §13.3f.1 — message({ stream: true }) is a public §4.2b boundary; the
+          // run-output wait can reject with a raw provider/runtime error. Redact
+          // before rejecting the caller (internal waiters keep the raw err).
+          throw redactPublicBoundaryRejection(err);
         }
       }
       if (!out) {
@@ -4163,13 +5762,18 @@ export class Session {
         // Drop the completion waiter so duplicate retries do not treat an
         // unregistered run as live forever.
         await failDispatchedMessageTurn(err);
-        throw err;
+        // §13.3f.1 — public §4.2b boundary. `err` here is a construction-safe
+        // HarnessConfigError, so the wrap is a pass-through; applied for parity
+        // with the other stream-setup throws.
+        throw redactPublicBoundaryRejection(err);
       }
       try {
         await awaitPendingMessageEvidence();
       } catch (err) {
         await failDispatchedMessageTurn(err);
-        throw err;
+        // §13.3f.1 — public §4.2b boundary; the pending-evidence wait can reject
+        // with a raw storage error. Redact before rejecting the caller.
+        throw redactPublicBoundaryRejection(err);
       }
       let streamCompletedEvidenceWriteFailed = false;
       let streamAgentEndEmitted = false;
@@ -4217,11 +5821,7 @@ export class Session {
           return full;
         })
         .then(async full => {
-          this._emitTurnEvent({
-            type: 'agent_end',
-            reason: this._agentEndReasonForFullOutput(full),
-            runId: full.runId,
-          });
+          this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
           streamAgentEndEmitted = true;
           await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
         })
@@ -4248,8 +5848,9 @@ export class Session {
           if (!streamAgentEndEmitted) {
             this._emitTurnEvent({
               type: 'agent_end',
-              reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+              finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
               runId: signal.runId,
+              usage: this._runUsage(),
             });
           }
           // The caller owns the visible stream; swallow drain-side errors.
@@ -4318,11 +5919,7 @@ export class Session {
       } catch (err) {
         throw err;
       }
-      this._emitTurnEvent({
-        type: 'agent_end',
-        reason: this._agentEndReasonForFullOutput(full),
-        runId: full.runId,
-      });
+      this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
       agentEndEmitted = true;
       await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
       return full;
@@ -4359,11 +5956,18 @@ export class Session {
       if (!agentEndEmitted) {
         this._emitTurnEvent({
           type: 'agent_end',
-          reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+          finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
           runId: signal.runId,
+          usage: this._runUsage(),
         });
       }
-      throw err;
+      // §13.3f.1 — `message()` is a public §4.2b boundary; its promise
+      // rejection must not leak raw provider/driver/SQL/path text. Redact a raw
+      // cause into a `HarnessExecutionError` (safe `.message`, raw `.cause`
+      // local-only); Harness-own errors pass through with their typed message.
+      // The wire/event/durable surfaces are unchanged (they already project via
+      // `projectHarnessPublicError`, which maps both shapes to `harness.internal`).
+      throw redactPublicBoundaryRejection(err);
     } finally {
       if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
       finishOwnedMessageTurn();
@@ -4517,7 +6121,7 @@ export class Session {
       sessionId: this.id,
       resourceId: this.resourceId,
       threadId: this.threadId,
-      kind: 'message',
+      kind: 'signal',
       admissionId,
       attemptedAdmissionHash: admissionHash,
     });
@@ -4736,6 +6340,26 @@ export class Session {
     };
   }
 
+  /**
+   * @internal §14.2 deterministic per-`admissionId` signal id for the channel
+   * signal-delivery admission path. Unlike {@link _messageAdmissionIdentity},
+   * only the `signalId` is deterministic — a signal interleaves into whatever
+   * run is active, so its `runId` is not predetermined and is recorded on the
+   * reservation after dispatch. The id is namespaced (`harness-channel-signal-`)
+   * so it never collides with the message/queue admission id spaces.
+   */
+  private _channelSignalAdmissionSignalId(admissionId: string): string {
+    const digest = sha256CanonicalJson({
+      kind: 'channel-signal-admission',
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      admissionId,
+    });
+    return `harness-channel-signal-${digest.slice(0, 32)}`;
+  }
+
   private async _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
@@ -4812,17 +6436,71 @@ export class Session {
       });
   }
 
+  /**
+   * §4.2f / §10.2 signal-result boundary. Settle the durable per-`signalId`
+   * result evidence and project the matching OperationEvent. Owned-turn (1:1)
+   * signals call this from the run terminal — the run's output IS the answer
+   * attributable to that signal, so `agent_end` is *not* the settlement
+   * boundary; `signal_completed` / `signal_failed` are. Evidence is best-effort
+   * for non-`admissionId` callers (the run terminal is the live settlement and
+   * `lookupMessageResult(signalId)` is the durable recovery path).
+   *
+   * Interleaved active-run signals ALSO settle through this helper, but with a
+   * documented caveat: a run can answer several drained signals, so each
+   * interleaved `signalId` is currently settled from the SHARED run terminal
+   * (a run-aggregate result, not a per-segment distinct answer). This is the
+   * interim until the runtime emits per-signal terminal markers
+   * (`AgentThreadStreamRuntime` per-segment attribution); the alternative —
+   * leaving interleaved evidence `pending` forever — is worse for recovery, so
+   * the shared-run terminal is used as the best available answer. See the
+   * call-site comment in `signal()`'s active-delivery path.
+   */
+  private async _settleSignalResult(
+    signalId: string,
+    outcome:
+      | { status: 'completed'; runId: string; result: AgentResult }
+      | { status: 'failed'; runId?: string; error: { code: string; message: string } },
+  ): Promise<void> {
+    if (outcome.status === 'completed') {
+      await this._writeMessageResultEvidenceBestEffort({
+        status: 'completed',
+        signalId,
+        runId: outcome.runId,
+        result: outcome.result,
+      });
+      this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
+      return;
+    }
+    await this._writeMessageResultEvidenceBestEffort({
+      status: 'failed',
+      signalId,
+      ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+      error: outcome.error,
+    });
+    this._emit({
+      type: 'signal_failed',
+      signalId,
+      ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+      error: outcome.error,
+    });
+  }
+
   private _computeMessageAdmissionHashes(
     opts: MessageOptions,
     stable: { modeId: string; modelId: string },
+    persistedRequestContext?: PersistedRequestContextInput,
   ): MessageAdmissionHashes {
-    const primary = sha256CanonicalJson(this._messageAdmissionHashInput(opts, undefined, { hashVersion: 2 }));
+    const primary = sha256CanonicalJson(
+      this._messageAdmissionHashInput(opts, undefined, { hashVersion: 2 }, persistedRequestContext),
+    );
     // Pre-v2 evidence hashed the effective mode/model. Keep compatibility
     // candidates for the current effective tuple only; old evidence does not
     // persist enough metadata to safely infer previous defaults after drift.
     const legacyCompatible = [
-      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable)),
-      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable, { includeAttachmentMetadata: false })),
+      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable, undefined, persistedRequestContext)),
+      sha256CanonicalJson(
+        this._messageAdmissionHashInput(opts, stable, { includeAttachmentMetadata: false }, persistedRequestContext),
+      ),
     ];
     return {
       primary,
@@ -4834,9 +6512,12 @@ export class Session {
     opts: MessageOptions,
     stable?: { modeId: string; modelId: string },
     options?: { hashVersion?: number; includeAttachmentMetadata?: boolean },
+    persistedRequestContext?: PersistedRequestContextInput,
   ) {
     return {
-      kind: 'message',
+      // Operation-kind discriminator in the admission hash (signal vs queue);
+      // §5.1d token is `'signal'`. Distinct from the queue path's `kind: 'queue'`.
+      kind: 'signal',
       ...(options?.hashVersion !== undefined ? { hashVersion: options.hashVersion } : {}),
       content: opts.content,
       ...(stable !== undefined
@@ -4866,6 +6547,10 @@ export class Session {
             }
           : {}),
       })),
+      // §4.4c / §5.1: caller request context is part of admission identity when
+      // present. Absent => omitted => the hash is byte-identical to pre-feature
+      // evidence (backward-compatible). Mirrors the queue path's requestContext.
+      ...(persistedRequestContext ? { requestContext: clonePersistedRequestContext(persistedRequestContext) } : {}),
     };
   }
 
@@ -4893,12 +6578,50 @@ export class Session {
   // the in-flight run's surface was committed when it started and cannot
   // be changed mid-flight.
   // -------------------------------------------------------------------------
-  async signal(opts: SessionSignalOptions): Promise<SessionSignalResult> {
+  async signal(
+    opts: SessionSignalOptions,
+    /**
+     * @internal §14.2 channel-ingress trusted hook. The channel bridge supplies
+     * a pre-built trusted `requestContext.channel` projection (NOT caller input —
+     * it bypasses {@link validateCallerRequestContext}) and the already-persisted
+     * inbox attachments. On idle-wake the trusted context rides the fresh run; on
+     * active-delivery (§21 shared terminal) the content interleaves and the
+     * in-flight run's committed context stands — the channel context cannot reach
+     * the in-flight run's already-committed tools, so it is intentionally not
+     * re-applied there. No SDK caller supplies both `opts.requestContext` and
+     * this (channel ingress has no caller app bag).
+     */
+    internal?: {
+      persistedRequestContext?: PersistedRequestContextInput;
+      attachments?: PersistedAttachment[];
+      /**
+       * §14.2 channel-ingress idempotency: the durable per-`admissionId` signal
+       * id minted by {@link _admitChannelSignalTurn}. Stamping the dispatched
+       * signal with this deterministic id (instead of a fresh random one) ties
+       * the in-flight run to the reservation written before dispatch, so a
+       * recovery replay short-circuits to the SAME run instead of firing a
+       * second interleave/wake. No SDK caller supplies this — only channel
+       * ingress.
+       */
+      signalId?: string;
+    },
+  ): Promise<SessionSignalResult> {
     this._assertLive('signal()');
     this._assertOpenForTurn('signal()');
     if (typeof opts.content !== 'string') {
       throw new HarnessValidationError('signal()', '`content` must be a string');
     }
+
+    // §4.4c: validate caller request context before the thread subscription
+    // (an observable side effect) and before the routing decision. The trusted
+    // channel projection (internal) is a top-level sibling of the caller `app`
+    // bag — combine, never deep-merge (mirrors `_admitQueue`).
+    const callerRequestContext = validateCallerRequestContext(opts.requestContext, 'signal()');
+    const callerPersistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+    const persistedRequestContext: PersistedRequestContextInput | undefined =
+      internal?.persistedRequestContext !== undefined || callerPersistedRequestContext !== undefined
+        ? { ...(internal?.persistedRequestContext ?? {}), ...(callerPersistedRequestContext ?? {}) }
+        : undefined;
 
     // Resolve effective mode + backing agent.
     const effectiveModeId = opts.mode ?? this._record.modeId;
@@ -4922,25 +6645,36 @@ export class Session {
 
     // Active-delivery + per-turn overrides → reject at admission.
     if (willInterleave) {
-      if (effectiveModeId !== this._record.modeId) {
-        throw new HarnessOverrideConflictError(
-          this.id,
-          'mode',
-          `cannot override mode on a signal that drains into an active run (run ${activeRunId})`,
-        );
+      // §3 / §4.5a: the in-flight run's surface (mode/model/tools) is committed
+      // at start, so a signal that *carries* a per-turn mode override and drains
+      // into the active run is rejected regardless of the override's value —
+      // keying off `opts.mode` presence, not whether it differs from the session
+      // default. (The session-default comparison missed the case where the
+      // active run itself started with a per-turn mode override.)
+      if (opts.mode !== undefined) {
+        throw new HarnessOverrideConflictError(this.id, activeRunId!, ['mode']);
       }
       if (opts.additionalTools !== undefined) {
-        throw new HarnessOverrideConflictError(
-          this.id,
-          'additionalTools',
-          `cannot supply additionalTools on a signal that drains into an active run (run ${activeRunId})`,
+        throw new HarnessOverrideConflictError(this.id, activeRunId!, ['addTools']);
+      }
+      // Request context cannot reach an in-flight run's tools (its streamOptions
+      // were committed at start), so reject rather than silently drop the app bag.
+      if (callerRequestContext !== undefined) {
+        throw new HarnessConfigError(
+          'signal().requestContext',
+          'cannot be supplied on an active-delivery signal — the in-flight run already committed its request context and could not receive a new app bag',
         );
       }
     }
 
     if (!willInterleave) {
       // Owned-turn path: same bookkeeping as the message() default path.
-      const turnAbortController = this._beginTurn(opts.abortSignal);
+      // `signal()` supports a per-turn `mode` override but not `model`, so the
+      // effective model is the session default.
+      const turnAbortController = this._beginTurn(opts.abortSignal, {
+        modeId: effectiveModeId,
+        modelId: this._record.modelId,
+      });
       const turnAbortSignal = turnAbortController.signal;
       const activeTurnWaiter = this._createActiveTurnWaiter();
       void activeTurnWaiter.promise.catch(() => {});
@@ -4950,7 +6684,7 @@ export class Session {
       };
       const assertOwnedSignalTurnNotDeleted = () => {
         if (this._state === 'deleted') {
-          throw new HarnessSessionDeletedError(this.id);
+          throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
         }
       };
       let dispatched;
@@ -4961,6 +6695,7 @@ export class Session {
             modeId: effectiveModeId,
             modelId: this._record.modelId,
             abortSignal: turnAbortSignal,
+            ...(persistedRequestContext ? { persistedRequestContext } : {}),
           }),
           activeTurnWaiter.promise,
         ]);
@@ -4973,10 +6708,22 @@ export class Session {
         };
         assertOwnedSignalTurnNotDeleted();
         this._assertOpenForTurn('signal()');
-        this._emitTurnEvent({ type: 'agent_start' });
+
+        // §13.7/§14.2: attach persisted attachment bytes as model file-parts on
+        // the idle-wake run. No attachments → bare `opts.content` (unchanged).
+        const signalContents = await Promise.race([
+          this._buildSignalContentsWithAttachments(opts.content, internal?.attachments),
+          activeTurnWaiter.promise,
+        ]);
+        assertOwnedSignalTurnNotDeleted();
+        this._assertOpenForTurn('signal()');
 
         dispatched = agent.sendSignal(
-          { type: 'user-message', contents: opts.content as never },
+          {
+            ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+            type: 'user-message',
+            contents: signalContents as never,
+          },
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
@@ -4985,13 +6732,36 @@ export class Session {
         );
       } catch (err) {
         finishOwnedSignalTurn();
-        throw err;
+        // §13.3f.1 — signal() is a public §4.2b boundary; the dispatch setup
+        // (_buildRequestContext / _buildSignalContentsWithAttachments /
+        // agent.sendSignal) can reject with a raw provider/storage/runtime error.
+        // Redact before rejecting the caller (Harness-own deleted/closing errors
+        // pass through unchanged). The trusted `internal` channel-ingress hook is
+        // NOT a public §4.2b caller — the recovery worker needs the concrete
+        // error for failure classification / re-dispatch, so it is exempt.
+        throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
       }
+
+      // §10.2 agent_start carries the runId — emit it now the run is dispatched.
+      // dispatched.signal.id is the originating signalId — stamped for the run projection.
+      this._emitAgentStart(dispatched.runId, dispatched.signal.id);
+
+      // §4.2f: record durable per-`signalId` pending evidence on acceptance so
+      // `lookupMessageResult(signalId)` can answer across restarts. Best-effort
+      // for this non-`admissionId` path — the run terminal below is the live
+      // settlement.
+      const ownedSignalId = dispatched.signal.id;
+      this._writeMessageResultEvidenceBestEffortInBackground({
+        status: 'pending',
+        signalId: ownedSignalId,
+        runId: dispatched.runId,
+      });
 
       // Register the completion waiter before any terminal chunks land.
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
       let agentEndEmitted = false;
+      let signalSettled = false;
 
       // Background continuation runs the post-turn bookkeeping so the
       // caller's `result` promise resolves with the final AgentResult.
@@ -5005,6 +6775,7 @@ export class Session {
             await Promise.race([
               this._maybeCaptureSuspend(full, undefined, effectiveModeId, this._record.modelId, {
                 tokenUsageDelta: full.finishReason === 'suspended' ? tokenUsageDelta : undefined,
+                originSignalId: ownedSignalId,
               }).catch(err => {
                 this._latchDurableTurnFlushError(err, full);
                 throw err;
@@ -5020,24 +6791,53 @@ export class Session {
                 activeTurnWaiter.promise,
               ]);
             }
-            this._emitTurnEvent({
-              type: 'agent_end',
-              reason: this._agentEndReasonForFullOutput(full),
-              runId: full.runId,
-            });
+            this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
             agentEndEmitted = true;
+            // §4.2f/§10.2 — the owned run's terminal IS this signal's answer
+            // (1:1). Settle the durable per-`signalId` evidence and project
+            // `signal_completed` (the promise/SDK boundary, not `agent_end`).
+            //
+            // A SUSPENDED turn is parked (pendingResume + suspension_required),
+            // NOT answered — leave the evidence `pending` until resume
+            // terminalizes; do not write completed evidence or emit
+            // `signal_completed`. Settle BEFORE the interruptible goal judge so a
+            // goal-judge / active-turn-waiter rejection cannot flip an already
+            // answered signal to `signal_failed`.
+            if (full.finishReason !== 'suspended') {
+              await this._settleSignalResult(ownedSignalId, {
+                status: 'completed',
+                runId: dispatched.runId,
+                result: full as AgentResult,
+              });
+              signalSettled = true;
+            }
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
             return full as AgentResult;
           })
-          .catch(err => {
+          .catch(async err => {
             if (!agentEndEmitted) {
               this._emitTurnEvent({
                 type: 'agent_end',
-                reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+                finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
                 runId: dispatched.runId,
+                usage: this._runUsage(),
               });
             }
-            throw err;
+            // Don't re-settle a signal already answered as completed (a post-run
+            // goal-judge/abort rejection must not flip a terminal result).
+            if (!signalSettled) {
+              await this._settleSignalResult(ownedSignalId, {
+                status: 'failed',
+                runId: dispatched.runId,
+                error: projectHarnessPublicError(err),
+              });
+            }
+            // §13.3f.1 — `handle.result` is a public §4.2b boundary; redact a raw
+            // cause before rejecting it (safe `.message`, raw `.cause`
+            // local-only). The durable `signal_failed` evidence above is already
+            // projected via `projectHarnessPublicError`, so only the in-process
+            // promise rejection changes.
+            throw redactPublicBoundaryRejection(err);
           })
           .finally(() => {
             finishOwnedSignalTurn();
@@ -5063,20 +6863,83 @@ export class Session {
 
     // Active-delivery path: signal drains into the existing run. No turn
     // bookkeeping owned here; the in-flight run owns its own completion.
-    // Pass empty streamOptions — the runtime ignores them when active.
-    this._assertOpenForTurn('signal()');
-    const dispatched = agent.sendSignal(
-      { type: 'user-message', contents: opts.content as never },
-      {
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        ifIdle: { behavior: 'wake', streamOptions: {} as never },
-      },
-    );
+    // Pass empty streamOptions — the runtime ignores them when active. The
+    // interleaved content still carries its attachment file-parts; the §21
+    // shared-terminal run absorbs them mid-flight (the in-flight run's committed
+    // requestContext/surface is unchanged — see the `internal` doc above).
+    let dispatched: ReturnType<typeof agent.sendSignal>;
+    try {
+      this._assertOpenForTurn('signal()');
+      const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
+      this._assertOpenForTurn('signal()');
+      dispatched = agent.sendSignal(
+        {
+          ...(internal?.signalId !== undefined ? { id: internal.signalId } : {}),
+          type: 'user-message',
+          contents: interleavedContents as never,
+        },
+        {
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          ifIdle: { behavior: 'wake', streamOptions: {} as never },
+        },
+      );
+    } catch (err) {
+      // §13.3f.1 — active-delivery signal() is ALSO a public §4.2b boundary; its
+      // dispatch setup (_buildSignalContentsWithAttachments / agent.sendSignal)
+      // can reject with a raw provider/storage/runtime error. Redact before
+      // rejecting the caller (Harness-own closing/deleted errors pass through).
+      // The trusted `internal` channel-ingress recovery worker is exempt — it
+      // needs the concrete error for failure classification / re-dispatch.
+      throw internal === undefined ? redactPublicBoundaryRejection(err) : err;
+    }
+
+    // §4.2f: record durable per-`signalId` pending evidence on acceptance so
+    // `lookupMessageResult(signalId)` answers across restarts (not just the
+    // process-local run map).
+    const interleavedSignalId = dispatched.signal.id;
+    this._writeMessageResultEvidenceBestEffortInBackground({
+      status: 'pending',
+      signalId: interleavedSignalId,
+      runId: dispatched.runId,
+    });
 
     // Shared completion promise with whichever caller owns the run.
     const completion = this._awaitRunCompletion(dispatched.runId);
     void completion.catch(() => {});
+
+    // §4.2f/§10.2: settle this signal's durable per-`signalId` evidence from the
+    // run it drained into and project signal_completed/failed. The result is the
+    // shared run terminal — per-segment distinct-answer attribution for
+    // concurrent interleaved signals is a documented runtime refinement (it
+    // requires per-segment terminal markers from `AgentThreadStreamRuntime`); a
+    // suspended run leaves the evidence pending until resume terminalizes.
+    const result = this._trackBackgroundTurnCompletion(
+      completion
+        .then(async full => {
+          if (full.finishReason !== 'suspended') {
+            await this._settleSignalResult(interleavedSignalId, {
+              status: 'completed',
+              runId: dispatched.runId,
+              result: full as AgentResult,
+            });
+          }
+          return full as AgentResult;
+        })
+        .catch(async err => {
+          await this._settleSignalResult(interleavedSignalId, {
+            status: 'failed',
+            runId: dispatched.runId,
+            error: projectHarnessPublicError(err),
+          });
+          // §13.3f.1 — `handle.result` is a public §4.2b boundary (same as the
+          // idle-wake branch above); redact a raw cause before rejecting it. The
+          // durable `signal_failed` evidence already uses projectHarnessPublicError,
+          // so only the in-process promise rejection changes.
+          throw redactPublicBoundaryRejection(err);
+        }),
+    );
+    void result.catch(() => {});
 
     return {
       id: dispatched.signal.id,
@@ -5084,7 +6947,7 @@ export class Session {
       willInterleave: true,
       accepted: true,
       signal: dispatched.signal,
-      result: completion as Promise<AgentResult>,
+      result,
     };
   }
 
@@ -5138,7 +7001,7 @@ export class Session {
       };
       const assertOwnedReminderTurnNotDeleted = () => {
         if (this._state === 'deleted') {
-          throw new HarnessSessionDeletedError(this.id);
+          throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
         }
       };
       let dispatched;
@@ -5161,7 +7024,6 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
-        this._emitTurnEvent({ type: 'agent_start' });
 
         dispatched = agent.sendSignal(
           {
@@ -5180,6 +7042,10 @@ export class Session {
         finishOwnedReminderTurn();
         throw err;
       }
+
+      // §10.2 agent_start carries the runId — emit it now the run is dispatched.
+      // dispatched.signal.id is the originating signalId — stamped for the run projection.
+      this._emitAgentStart(dispatched.runId, dispatched.signal.id);
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
@@ -5209,11 +7075,7 @@ export class Session {
                 activeTurnWaiter.promise,
               ]);
             }
-            this._emitTurnEvent({
-              type: 'agent_end',
-              reason: this._agentEndReasonForFullOutput(full),
-              runId: full.runId,
-            });
+            this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
             agentEndEmitted = true;
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
           })
@@ -5221,8 +7083,9 @@ export class Session {
             if (!agentEndEmitted) {
               this._emitTurnEvent({
                 type: 'agent_end',
-                reason: turnAbortSignal.aborted ? 'aborted' : 'error',
+                finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
                 runId: dispatched.runId,
+                usage: this._runUsage(),
               });
             }
             throw err;
@@ -5287,12 +7150,12 @@ export class Session {
     queuedItemId = this._currentQueuedItemId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
-    opts: { tokenUsageDelta?: TokenUsage } = {},
+    opts: { tokenUsageDelta?: TokenUsage; originSignalId?: string } = {},
   ): Promise<void> {
     if (full.finishReason !== 'suspended') return;
     this._captureTurnRunId(full);
     const payload = full.suspendPayload as
-      | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown }
+      | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] }
       | undefined;
     if (!payload || !full.runId) {
       await this._persistTokenUsageDelta(opts.tokenUsageDelta);
@@ -5300,7 +7163,14 @@ export class Session {
       return;
     }
 
-    const pending = this._pendingResumeFromSuspendedOutput(full, payload, queuedItemId, modeId, modelId);
+    const pending = this._pendingResumeFromSuspendedOutput(
+      full,
+      payload,
+      queuedItemId,
+      modeId,
+      modelId,
+      opts.originSignalId,
+    );
     if (pending === undefined) return;
     const existing = this._record.pendingResume;
     if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
@@ -5311,24 +7181,24 @@ export class Session {
     await this._flushUpdate(prev => ({ ...prev, pendingResume: pending }), { tokenUsageDelta: opts.tokenUsageDelta });
     this._clearPendingDurableTurnFlushErrorIfRepaired(full);
 
-    // Emit suspension_required AFTER the durable-parking barrier (§5.4) so
-    // any subscriber observing this event can reconstruct the pending state
-    // from storage.
-    this._emitTurnEvent({
-      type: 'suspension_required',
-      kind: pending.kind,
-      toolCallId: pending.toolCallId,
-      toolName: pending.toolName,
-      runId: pending.runId,
-    });
+    // Emit the §10.2 pending event AFTER the durable-parking barrier (§5.4) so
+    // any subscriber observing it can reconstruct the pending state from storage.
+    this._emitPendingEvent(pending);
   }
 
   private _pendingResumeFromSuspendedOutput(
     full: FullOutput<unknown>,
-    payload: { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown },
+    payload: {
+      toolCallId: string;
+      toolName: string;
+      args?: unknown;
+      suspendPayload?: unknown;
+      approvalReasons?: string[];
+    },
     queuedItemId = this._currentQueuedItemId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
+    originSignalId?: string,
   ): PendingResume | undefined {
     if (!full.runId) return undefined;
     const kind = this._classifyResumeKind(payload);
@@ -5341,8 +7211,16 @@ export class Session {
       source: 'parent',
       requestedAt: Date.now(),
       ...(queuedItemId !== undefined ? { queuedItemId } : {}),
+      ...(originSignalId !== undefined ? { originSignalId } : {}),
       modeId,
+      // §4.2e — carry the active turn's yolo so the resumed run keeps auto-granting.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(modeId, modelId),
+      // §5.1 — persist the suspended turn's caller app bag so a resume rebuilds the
+      // SAME context (a re-suspend re-captures it because resume re-stashes it).
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: this._buildResumePayload(kind, payload),
     };
 
@@ -5362,11 +7240,14 @@ export class Session {
 
   private _buildResumePayload(
     kind: PendingResume['kind'],
-    payload: { args?: unknown; suspendPayload?: unknown },
+    payload: { args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] },
   ): PendingResume['payload'] {
     switch (kind) {
       case 'tool-approval':
-        return { input: payload.args };
+        return {
+          input: payload.args,
+          ...(payload.approvalReasons !== undefined ? { approvalReasons: payload.approvalReasons } : {}),
+        };
       case 'tool-suspension':
         return { input: payload.args, suspendData: payload.suspendPayload };
       case 'question': {
@@ -5397,6 +7278,12 @@ export class Session {
   // observe a stale value.
   // -------------------------------------------------------------------------
 
+  /** §4.2a: the session's current mode id (the durable default modeId). */
+  getCurrentModeId(): string {
+    this._assertLive('getCurrentModeId()');
+    return this._record.modeId;
+  }
+
   /** Resolved active mode (per the session record). */
   getCurrentMode(): HarnessMode {
     this._assertLive('getCurrentMode()');
@@ -5414,7 +7301,17 @@ export class Session {
     this._harness._getMode(opts.mode);
     const previousModeId = this._record.modeId;
     if (previousModeId === opts.mode) return;
-    await this._flushUpdate(prev => ({ ...prev, modeId: opts.mode }));
+    // §4.2e — entering a mode re-establishes its base permission policy when it
+    // declares one (the mode owns the base; runtime grants/setPolicy overlay it).
+    // A mode that declares no `permissions` leaves the existing rules untouched.
+    const seededRules = this._harness._modePermissionRules(opts.mode);
+    await this._flushUpdate(prev => ({
+      ...prev,
+      modeId: opts.mode,
+      ...(seededRules !== undefined
+        ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
+        : {}),
+    }));
     this._emitter.emit({ type: 'mode_changed', modeId: opts.mode, previousModeId });
   }
 
@@ -5496,12 +7393,9 @@ export class Session {
         [opts.agentType]: opts.model,
       },
     }));
-    this._emitter.emit({
-      type: 'model_override_set',
-      agentType: opts.agentType,
-      modelId: opts.model,
-      previousModelId,
-    });
+    // §10.2: subagent model overrides are not a public event — the override is
+    // reflected in `SessionRecord.subagentModelOverrides` and the display
+    // snapshot (the StateEvent set has only the session-level `model_changed`).
   }
 
   /** Read the pinned subagent model for an `agentType`, or `null` when unset. */
@@ -5545,6 +7439,10 @@ export class Session {
         typeof updatesOrUpdater === 'function'
           ? (updatesOrUpdater as (prev: TState) => TState)(current)
           : ({ ...(current as object), ...(updatesOrUpdater as object) } as TState);
+      // §5.1: reject non-JSON-serializable state BEFORE the durable commit so a
+      // function/bigint/Date/circular value never silently corrupts the row.
+      const badPath = firstNonJsonStatePath(next, '$', new Set());
+      if (badPath !== undefined) throw new HarnessStateSerializationError(this.id, badPath);
       return { ...prev, state: next };
     }, opts);
   }
@@ -5562,6 +7460,205 @@ export class Session {
   // OM progress) live in `session.state`, not here — see the spec doc-comment
   // in §4.2 for the split rationale.
   // -------------------------------------------------------------------------
+
+  /**
+   * §4.2e — upload a raw-bytes file attachment scoped to this session. A flat
+   * convenience over the kind-based {@link Harness.attachments}`.upload`: the caller
+   * supplies a simple `{ name, mimeType, data }` form (always `kind: 'file'`) and the
+   * session's own `sessionId`/`resourceId` are supplied automatically. Returns the
+   * stable attachment id. `onProgress`, when provided, is invoked once on success with
+   * `(byteLength, byteLength)` — the in-process upload completes atomically, so there is
+   * no incremental progress to report.
+   */
+  async uploadAttachment(opts: {
+    name: string;
+    mimeType: string;
+    data: Uint8Array;
+    onProgress?: (loaded: number, total: number) => void;
+  }): Promise<{ attachmentId: string }> {
+    this._assertLive('uploadAttachment()');
+    const ref = await this._harness.attachments.upload({
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      kind: 'file',
+      filename: opts.name,
+      contentType: opts.mimeType,
+      data: opts.data,
+    });
+    opts.onProgress?.(opts.data.byteLength, opts.data.byteLength);
+    return { attachmentId: ref.attachmentId };
+  }
+
+  /**
+   * §4.2e — delete a session-scoped attachment by id. A flat convenience over
+   * {@link Harness.attachments}`.delete` that supplies this session's identity.
+   */
+  async deleteAttachment(opts: { attachmentId: string }): Promise<void> {
+    this._assertLive('deleteAttachment()');
+    await this._harness.attachments.delete({
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      attachmentId: opts.attachmentId,
+    });
+  }
+
+  /**
+   * §4.2d — set a single application-owned thread setting. Writes ONLY to
+   * `HarnessThread.metadata.app[key]` (the one public thread-metadata extension point);
+   * it never touches a raw top-level thread-metadata key, and the harness never reads
+   * `metadata.app` for any runtime decision. `key` must match the storage-safe grammar
+   * `^[A-Za-z_][A-Za-z0-9_]{0,127}$` and must not be a prototype-pollution name
+   * (`__proto__` / `prototype` / `constructor`) or a reserved Harness/Mastra namespace
+   * (`__mastra*` / `mastra__*`); `value` must be canonical JSON. Invalid input throws
+   * {@link HarnessValidationError} before any storage access. Concurrent writes are
+   * read-merge-write (last-writer-wins). Like the other thread-metadata operations
+   * (e.g. thread rename), this requires the session's thread to already exist in storage —
+   * a brand-new thread is persisted on first activity; otherwise `HarnessThreadNotFoundError`.
+   */
+  async setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void> {
+    this._assertLive('setThreadSetting()');
+    const { key } = opts;
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
+      throw new HarnessValidationError('setThreadSetting().key', 'must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$');
+    }
+    if (
+      key === '__proto__' ||
+      key === 'prototype' ||
+      key === 'constructor' ||
+      key.startsWith('__mastra') ||
+      key.startsWith('mastra__')
+    ) {
+      throw new HarnessValidationError(
+        'setThreadSetting().key',
+        `key "${key}" is reserved (prototype-pollution or Harness/Mastra namespace)`,
+      );
+    }
+    // Validate + normalize to canonical JSON before touching storage (drops undefined props).
+    const normalized = assertJsonValue(opts.value, 'setThreadSetting().value');
+    const settings = await this._harness._threadOps.getSettings({
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+    });
+    const rawApp = (settings as { app?: unknown }).app;
+    const currentApp =
+      rawApp !== null && typeof rawApp === 'object' && !Array.isArray(rawApp)
+        ? (rawApp as Record<string, JsonValue>)
+        : {};
+    await this._harness._threadOps.setSettings({
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      patch: { app: { ...currentApp, [key]: normalized } },
+    });
+  }
+
+  /**
+   * §4.2d — in-process convenience subscription to the wire-safe
+   * {@link HarnessDisplayStateSnapshotV1}. Emits the current snapshot immediately, then a new
+   * snapshot whenever a session event changes it (recomputed per event and de-duplicated against
+   * the last emitted snapshot). With `windowMs > 0` it throttles with trailing coalescing: the
+   * first change in a window emits immediately (leading edge), further changes coalesce into one
+   * pending snapshot flushed at the window's end. Listener exceptions are isolated. The returned
+   * unsubscribe clears any pending timer and stops all further emits. No terminal "closed"
+   * snapshot is delivered — `getDisplayState()` is only available while the session is live.
+   */
+  subscribeDisplayState(
+    listener: (state: HarnessDisplayStateSnapshotV1) => void,
+    opts?: { windowMs?: number },
+  ): () => void {
+    this._assertLive('subscribeDisplayState()');
+    const windowMs = opts?.windowMs !== undefined && opts.windowMs > 0 ? opts.windowMs : 0;
+    let stopped = false;
+    let lastEmitted: string | undefined;
+    let pending: { snap: HarnessDisplayStateSnapshotV1; serialized: string } | undefined;
+    let windowTimer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribeRaw: HarnessEventUnsubscribe | undefined;
+
+    const stop = (): void => {
+      if (stopped) return;
+      stopped = true;
+      if (windowTimer !== undefined) {
+        clearTimeout(windowTimer);
+        windowTimer = undefined;
+      }
+      pending = undefined;
+      unsubscribeRaw?.();
+      this._displayRefreshListeners.delete(onEvent);
+    };
+
+    const emit = (snap: HarnessDisplayStateSnapshotV1, serialized: string): void => {
+      lastEmitted = serialized;
+      try {
+        listener(snap);
+      } catch {
+        // Isolate listener exceptions — they must not disrupt the producer or other listeners.
+      }
+    };
+
+    const compute = (): { snap: HarnessDisplayStateSnapshotV1; serialized: string } | undefined => {
+      let snap: HarnessDisplayStateSnapshotV1;
+      try {
+        snap = toHarnessDisplayStateSnapshotV1(this.getDisplayState());
+      } catch {
+        // Session is closing/closed/deleted — no further snapshots are available.
+        stop();
+        return undefined;
+      }
+      return { snap, serialized: JSON.stringify(snap) };
+    };
+
+    const flushWindow = (): void => {
+      windowTimer = undefined;
+      if (stopped) return;
+      if (pending !== undefined && pending.serialized !== lastEmitted) {
+        emit(pending.snap, pending.serialized);
+      }
+      pending = undefined;
+    };
+
+    const onEvent = (): void => {
+      if (stopped) return;
+      const computed = compute();
+      if (computed === undefined || computed.serialized === lastEmitted) return; // dedupe
+      if (windowMs === 0) {
+        emit(computed.snap, computed.serialized);
+        return;
+      }
+      if (windowTimer === undefined) {
+        emit(computed.snap, computed.serialized); // leading edge
+        windowTimer = setTimeout(flushWindow, windowMs);
+      } else {
+        pending = computed; // coalesce latest within the open window
+      }
+    };
+
+    // Immediate initial emit so a fresh subscriber has current state, BEFORE wiring the raw
+    // event stream (so we never double-emit the same snapshot).
+    const initial = compute();
+    if (initial !== undefined) emit(initial.snap, initial.serialized);
+    if (stopped) return stop;
+    unsubscribeRaw = this.subscribe(onEvent);
+    // Also wake on in-process display-only refreshes (e.g. the lazy plan-task
+    // summary seed) that carry no persisted event.
+    this._displayRefreshListeners.add(onEvent);
+    return stop;
+  }
+
+  /**
+   * Ping `subscribeDisplayState` listeners to recompute their snapshot WITHOUT
+   * emitting a persisted §10.2 event. Used when an in-process, display-only
+   * derived value changes for already-durable state (the TM-5 plan-task summary
+   * seed). The per-subscriber dedupe (`serialized !== lastEmitted`) drops the
+   * ping when nothing actually changed.
+   */
+  private _notifyDisplayRefresh(): void {
+    for (const listener of this._displayRefreshListeners) {
+      try {
+        listener();
+      } catch {
+        // Isolate listener exceptions — they must not disrupt other listeners.
+      }
+    }
+  }
 
   getDisplayState(): SessionDisplayState {
     this._assertLive('getDisplayState()');
@@ -5600,7 +7697,96 @@ export class Session {
     if (this._currentTraceId !== undefined) snapshot.currentTraceId = this._currentTraceId;
     if (this._currentQueuedItemId !== undefined) snapshot.currentQueuedItemId = this._currentQueuedItemId;
     if (rec.goal !== undefined) snapshot.goal = rec.goal;
+    const currentRun = this._buildCurrentRunProjection();
+    if (currentRun !== undefined) snapshot.currentRun = currentRun;
+    // §5.1k / TM-5 bounded plan-task summary. Kick a one-time lazy seed (cheap,
+    // bounded) for a hydrated session, then surface the cached summary if present.
+    this._maybeSeedPlanTaskSummary();
+    if (this._planTaskSummary !== undefined) snapshot.planTasks = this._planTaskSummary;
     return snapshot;
+  }
+
+  /**
+   * §5.1b SessionRunProjection — a bounded, LIVE read-model view of the in-flight
+   * (or suspended) run for the session list/detail UI. Returns `undefined` when no
+   * run is active and nothing is pending. F11b fidelity:
+   *   - `modeId`/`modelId`/`agentId` reflect the run's EFFECTIVE identity (a
+   *     per-turn `opts.mode`/`opts.model` override is captured by `message()`;
+   *     a suspended run takes the captured `pendingResume.modeId`).
+   *   - `status` is `running` for a live turn, and `waiting`/`resuming` for a
+   *     suspended turn (sourced from `pendingResume`; `resumedAt` ⇒ `resuming`).
+   *   - `operation.kind` is `queue` for a queued item, else `signal` (carrying
+   *     the owned-signal `signalId` when known); the finer kinds
+   *     (`sync-generate`/`use-skill`/`inbox-response`) still fold into `signal`.
+   *   - `startedAt` is the run-start (`agent_start`) for a live turn, or the
+   *     pending interaction's `requestedAt` for a suspended turn.
+   * Remaining minor nuance: a live turn reports `running` even at the very
+   * `starting` instant (no separate starting phase is tracked).
+   */
+  private _buildCurrentRunProjection(): SessionRunProjection | undefined {
+    const rec = this._record;
+    // A pending interaction owns the projection ONLY when no UNRELATED live run is
+    // executing: either there is no live run, or the live run IS the resume of
+    // this pending (the resume continues the pending's own runId). A genuinely new
+    // turn started while suspended (default `message()`/`signal()` are not
+    // busy-blocked by a pending) has a different `_currentRunId` and must show as
+    // `running`, not be masked by the stale pending.
+    const pending = rec.pendingResume;
+    if (pending !== undefined && (this._currentRunId === undefined || this._currentRunId === pending.runId)) {
+      const modeId = pending.modeId ?? pending.runtimeDependencies?.modeId ?? rec.modeId;
+      const operation: SessionRunProjection['operation'] =
+        pending.queuedItemId !== undefined
+          ? { kind: 'queue', queuedItemId: pending.queuedItemId }
+          : pending.originSignalId !== undefined
+            ? { kind: 'signal', signalId: pending.originSignalId }
+            : { kind: 'signal' };
+      return {
+        runId: pending.runId,
+        status: pending.resumedAt !== undefined ? 'resuming' : 'waiting',
+        operation,
+        modeId,
+        modelId: pending.runtimeDependencies?.modelId ?? rec.modelId,
+        agentId: this._modeAgentId(modeId),
+        startedAt: pending.requestedAt,
+        updatedAt: pending.resumedAt ?? pending.requestedAt,
+      };
+    }
+    // Live in-flight turn (no pending): report the run's EFFECTIVE identity (a
+    // per-turn `mode`/`model` override, not just the session default — §5.1b
+    // effective identity), captured by `_beginTurn`.
+    if (this._currentRunId !== undefined) {
+      const modeId = this._currentRunModeId ?? rec.modeId;
+      const queuedItemId = this._currentQueuedItemId;
+      const projection: SessionRunProjection = {
+        runId: this._currentRunId,
+        status: 'running',
+        operation:
+          queuedItemId !== undefined
+            ? { kind: 'queue', queuedItemId }
+            : {
+                kind: 'signal',
+                ...(this._currentRunSignalId !== undefined ? { signalId: this._currentRunSignalId } : {}),
+              },
+        modeId,
+        modelId: this._currentRunModelId ?? rec.modelId,
+        agentId: this._modeAgentId(modeId),
+        startedAt: this._currentRunStartedAt ?? rec.lastActivityAt,
+        updatedAt: rec.lastActivityAt,
+      };
+      if (this._currentTraceId !== undefined) projection.traceId = this._currentTraceId;
+      return projection;
+    }
+    return undefined;
+  }
+
+  /** Resolve a mode's backing agentId for the run projection, tolerating a mode
+   * that has since been removed from config (fall back to the session default). */
+  private _modeAgentId(modeId: string): string {
+    try {
+      return this._harness._getMode(modeId).agentId;
+    } catch {
+      return this._harness._getMode(this._record.modeId).agentId;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -5645,6 +7831,201 @@ export class Session {
 
     const result = await memory.listMessages({ threadId: this.threadId, resourceId: this.resourceId, perPage: false });
     return result.messages.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
+  }
+
+  /**
+   * §5.1b.4 / §5.6 / §10.6 — bounded, redacted activity timeline. A READ-TIME
+   * projection assembled from this session's durable thread/message log + goal +
+   * pending inbox, and (under `includeDescendants`) descendant subagent entries.
+   * It never settles promises, proves delivery, claims rows, or mutates state.
+   * The lower-durability source kinds (operation-result / durable-work / channel /
+   * file-reference) are not emitted yet — see {@link buildActivityTimeline}.
+   */
+  async getActivityTimeline(opts: ActivityTimelineOptions = {}): Promise<SessionActivityTimeline> {
+    this._assertLive('getActivityTimeline()');
+    const includeDescendants = opts.includeDescendants === true;
+    const generatedAt = Date.now();
+    // P6.3 — derive the bounded per-thread read window up front (also validates
+    // limit + decodes/validates the cursor BEFORE any message scan), so each thread
+    // reads at most `limit + 1` messages instead of its whole log.
+    const readBound = activityTimelineMessageReadBound(opts, this.id, includeDescendants);
+
+    const sessions: ActivityTimelineSessionInput[] = [
+      {
+        sessionId: this.id,
+        threadId: this.threadId,
+        depth: 0,
+        messages: await this._activityMessagesForThread(this.threadId, this.resourceId, readBound),
+        ...(this._record.goal
+          ? {
+              goal: {
+                id: this._record.goal.id,
+                objective: this._record.goal.objective,
+                status: this._record.goal.status,
+                createdAt: this._record.goal.createdAt,
+                ...(this._record.goal.lastDecision ? { lastDecision: this._record.goal.lastDecision } : {}),
+              },
+            }
+          : {}),
+        ...(this._record.pendingResume
+          ? {
+              pendingInbox: [
+                {
+                  itemId: this._record.pendingResume.itemId ?? this._record.pendingResume.toolCallId,
+                  kind: this._record.pendingResume.kind,
+                  requestedAt: this._record.pendingResume.requestedAt,
+                  ...(this._record.pendingResume.toolName ? { toolName: this._record.pendingResume.toolName } : {}),
+                  ...(this._record.pendingResume.runId ? { runId: this._record.pendingResume.runId } : {}),
+                },
+              ],
+            }
+          : {}),
+      },
+    ];
+
+    if (includeDescendants) {
+      // Bounded BFS over non-deleted descendant subagent sessions sharing this
+      // (harnessName, resourceId). Each contributes a `subagent` entry plus its
+      // own message log; descendant goal/pending are deferred with the heavier
+      // source kinds. Caps keep the read-time projection server-bounded (§9).
+      const MAX_DESCENDANTS = 50;
+      const MAX_DEPTH = 4;
+      const collected: { id: string; threadId: string; parentSessionId: string; depth: number; lastActivityAt: number }[] = [];
+      let frontier = [{ id: this.id, depth: 0 }];
+      const visited = new Set<string>([this.id]);
+      while (frontier.length > 0 && collected.length < MAX_DESCENDANTS) {
+        const nextFrontier: { id: string; depth: number }[] = [];
+        for (const node of frontier) {
+          if (node.depth >= MAX_DEPTH) continue;
+          let children: SessionSummary[];
+          try {
+            children = await this._storage.listSessions({
+              harnessName: this._record.harnessName,
+              resourceId: this.resourceId,
+              parentSessionId: node.id,
+            });
+          } catch {
+            continue; // best-effort: a flaky list does not fail the whole timeline
+          }
+          for (const child of children) {
+            if (visited.has(child.id) || collected.length >= MAX_DESCENDANTS) continue;
+            visited.add(child.id);
+            collected.push({
+              id: child.id,
+              threadId: child.threadId,
+              parentSessionId: node.id,
+              depth: node.depth + 1,
+              lastActivityAt: child.lastActivityAt,
+            });
+            nextFrontier.push({ id: child.id, depth: node.depth + 1 });
+          }
+        }
+        frontier = nextFrontier;
+      }
+      for (const child of collected) {
+        sessions.push({
+          sessionId: child.id,
+          threadId: child.threadId,
+          parentSessionId: child.parentSessionId,
+          depth: child.depth,
+          messages: await this._activityMessagesForThread(child.threadId, this.resourceId, readBound),
+          subagent: {
+            parentSessionId: child.parentSessionId,
+            childSessionId: child.id,
+            // DURABLE anchor (PR #200 review): `generatedAt` regenerated per request,
+            // so a cursor page could re-return / reorder the subagent entry forever.
+            // SessionSummary has no createdAt, but lastActivityAt is stored and only
+            // moves on real child activity — stable across paginated reads.
+            createdAt: child.lastActivityAt,
+          },
+        });
+      }
+    }
+
+    return buildActivityTimeline(
+      { addressedSessionId: this.id, addressedThreadId: this.threadId, generatedAt, sessions },
+      opts,
+    );
+  }
+
+  /**
+   * Read a thread's persisted message log for the activity timeline, BOUNDED to the
+   * oldest `limit + 1` messages at/after the optional cursor (P6.3). Previously this
+   * read `perPage: false` (the whole thread log) for every session in the timeline —
+   * up to 1 + MAX_DESCENDANTS threads — then discarded all but `limit` entries. The
+   * inclusive `dateRange.start` + ascending order + `perPage = limit + 1` are a correct
+   * superset of what `buildActivityTimeline` can place on the page; it still applies the
+   * precise `> cursor` filter and the final `limit` slice, so output is unchanged.
+   */
+  private async _activityMessagesForThread(
+    threadId: string,
+    resourceId: string,
+    bound: { limit: number; sinceOccurredAt?: number },
+  ): Promise<HarnessMessage[]> {
+    const memory = await this._harness._internalTryGetMemoryStorage();
+    if (!memory) return [];
+    const pageSize = bound.limit + 1;
+    const fetchPage = (page: number, startMs: number | undefined, startExclusive: boolean) =>
+      memory.listMessages({
+        threadId,
+        resourceId,
+        perPage: pageSize,
+        page,
+        orderBy: { field: 'createdAt', direction: 'ASC' },
+        ...(startMs !== undefined ? { filter: { dateRange: { start: new Date(startMs), startExclusive } } } : {}),
+      });
+    const msgTs = (msg: { createdAt: unknown }) => new Date(msg.createdAt as Date).getTime();
+
+    // PR #200 review (P2): storage orders only by createdAt while the timeline
+    // tiebreaks by (occurredAt, sessionId, entryId), so a fetch boundary that
+    // splits a SAME-TIMESTAMP run lets storage return an arbitrary subset of that
+    // run — entries can be skipped across cursor pages or `truncated`
+    // under-reported. Two invariants restore correctness while staying bounded:
+    //   1. COHORT COMPLETENESS — every timestamp present in the returned rows is
+    //      returned COMPLETELY (keep paging while the trailing timestamp repeats),
+    //      so buildActivityTimeline's precise tiebreak always sees full cohorts.
+    //   2. CURSOR PROGRESS — accumulate at least `limit + 1` rows STRICTLY AFTER
+    //      the cursor timestamp (a cursor parked at the end of a large cohort
+    //      otherwise refetches only already-consumed rows and the walk stalls).
+    // Each fetch stays bounded; the pre-P6.3 code read the entire log, so this
+    // remains a strict win even on pathological same-timestamp data.
+    const rows: Awaited<ReturnType<typeof fetchPage>>['messages'] = [];
+    let windowStartMs = bound.sinceOccurredAt;
+    let windowExclusive = false;
+    let beyondCursorCount = 0;
+    for (;;) {
+      const first = await fetchPage(0, windowStartMs, windowExclusive);
+      let fetched = first.messages;
+      rows.push(...fetched);
+      let exhausted = fetched.length < pageSize;
+      if (!exhausted) {
+        // Invariant 1: complete the trailing timestamp's cohort.
+        const boundaryMs = msgTs(fetched[fetched.length - 1]!);
+        for (let page = 1; ; page++) {
+          const next = await fetchPage(page, windowStartMs, windowExclusive);
+          let advanced = next.messages.length === 0;
+          for (const msg of next.messages) {
+            if (msgTs(msg) === boundaryMs) {
+              rows.push(msg);
+            } else {
+              advanced = true;
+              break;
+            }
+          }
+          if (next.messages.length < pageSize) exhausted = !advanced && true;
+          if (advanced || next.messages.length < pageSize) break;
+        }
+        // Invariant 2: continue strictly past the completed cohort if needed.
+        windowStartMs = boundaryMs;
+        windowExclusive = true;
+      }
+      beyondCursorCount =
+        bound.sinceOccurredAt === undefined
+          ? rows.length
+          : rows.reduce((n, msg) => (msgTs(msg) > bound.sinceOccurredAt! ? n + 1 : n), 0);
+      if (exhausted || beyondCursorCount >= pageSize) break;
+    }
+    return rows.map(msg => convertStoredMessageToHarnessMessage(msg as unknown as StoredMessageRow));
   }
 
   // -------------------------------------------------------------------------
@@ -5825,14 +8206,10 @@ export class Session {
         },
       });
     });
-    this._emitQueueBackpressureDrops(droppedItems);
+    this._failBackpressureDroppedItems(droppedItems);
     if (!admitted) {
-      this._emitQueueFullRejected({
-        source: 'goal',
-        policy: this._harness._internalQueueBackpressure,
-        maxQueueDepth: cap,
-        goalId: goal.id,
-      });
+      // §10.2: queue-full/backpressure is not a public event — the goal item is
+      // simply not admitted (rejected at the caller for direct queue()).
       return;
     }
     void this._maybeDrainQueue();
@@ -5936,7 +8313,14 @@ export class Session {
       return;
     }
 
-    if (decision.decision === 'waiting') return;
+    if (decision.decision === 'waiting') {
+      // §10.2: the judge parked the goal at an external checkpoint. Surface it
+      // as `goal_waiting` (turnsUsed is unchanged — see the computation above)
+      // so subscribers can distinguish a checkpoint pause from a budget/judge
+      // failure (`goal_paused`) or completion (`goal_done`).
+      this._emit({ type: 'goal_waiting', goalId: evaluatedGoalId, reason: decision.reason, turnsUsed });
+      return;
+    }
 
     // decision.decision === 'continue'
     if (turnsUsed >= updated.maxTurns) {
@@ -6435,6 +8819,156 @@ export class Session {
     });
   }
 
+  // -------------------------------------------------------------------------
+  // Observational Memory — §4.2e / §9.2.
+  //
+  // OM is advisory memory context, not a recovery proof boundary. The config
+  // accessors below read the resolved per-session OM config (the persisted
+  // `SessionRecord.observationalMemory` snapshot, falling back to the harness
+  // defaults); the model switches are session-config writes that commit under
+  // the session lease via `_flushUpdate` and never touch raw MemoryStorage rows.
+  // The redacted snapshot read (`getRecord`/`loadProgress`, §4.8) is a separate
+  // follow-up slice.
+  //
+  // CONTRACT (read this): `switchObserverModel`/`switchReflectorModel` record
+  // durable per-session INTENT — they do NOT change runtime OM behavior today.
+  // Effective OM (its observer/reflector models, scope, and thresholds) is fixed
+  // at the Agent's Memory CONSTRUCTION via `Memory.threadConfig.observationalMemory`;
+  // the harness deliberately does NOT thread a per-turn OM option, because core
+  // Memory builds its OM engine only from constructor config AND suppresses the
+  // MessageHistory processor whenever it sees OM "enabled" (so a runtime OM option
+  // for a Memory not constructed with OM would drop history without attaching OM —
+  // see the DEFERRED note on `_omWriteConfig`). To actually USE OM, construct the
+  // Agent's Memory with OM; the `om.get*` accessors then report that resolved
+  // config, and the switches stay recorded intent until upstream adds runtime OM
+  // override. An explicit switch logs a one-time advisory (see `_warnOmIntentInert`).
+  // -------------------------------------------------------------------------
+
+  readonly om = Object.freeze({
+    getObserverModelId: (): string | null => this._omObserverModelId(),
+    getReflectorModelId: (): string | null => this._omReflectorModelId(),
+    getObservationThreshold: (): number => this._omObservationThreshold(),
+    getReflectionThreshold: (): number => this._omReflectionThreshold(),
+    switchObserverModel: (opts: { model: string }): Promise<void> => this._omSwitchObserverModel(opts),
+    switchReflectorModel: (opts: { model: string }): Promise<void> => this._omSwitchReflectorModel(opts),
+  });
+
+  private _omDefaults() {
+    return this._harness._getObservationalMemoryDefaults();
+  }
+
+  private _omObserverModelId(): string | null {
+    this._assertLive('om.getObserverModelId()');
+    return this._record.observationalMemory?.observerModelId ?? this._omDefaults().observerModelId ?? null;
+  }
+
+  private _omReflectorModelId(): string | null {
+    this._assertLive('om.getReflectorModelId()');
+    return this._record.observationalMemory?.reflectorModelId ?? this._omDefaults().reflectorModelId ?? null;
+  }
+
+  /** Effective observation trigger threshold. `0` means "use the memory adapter default". */
+  private _omObservationThreshold(): number {
+    this._assertLive('om.getObservationThreshold()');
+    return this._record.observationalMemory?.observationThreshold ?? this._omDefaults().observationThreshold ?? 0;
+  }
+
+  /** Effective reflection trigger threshold. `0` means "use the memory adapter default". */
+  private _omReflectionThreshold(): number {
+    this._assertLive('om.getReflectionThreshold()');
+    return this._record.observationalMemory?.reflectionThreshold ?? this._omDefaults().reflectionThreshold ?? 0;
+  }
+
+  private async _omSwitchObserverModel(opts: { model: string }): Promise<void> {
+    this._assertLive('om.switchObserverModel()');
+    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
+      throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
+    }
+    this._warnOmIntentInert();
+    if (this._record.observationalMemory?.observerModelId === opts.model) return;
+    await this._omWriteConfig(prev => ({ ...prev, observerModelId: opts.model }));
+  }
+
+  private async _omSwitchReflectorModel(opts: { model: string }): Promise<void> {
+    this._assertLive('om.switchReflectorModel()');
+    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
+      throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
+    }
+    this._warnOmIntentInert();
+    if (this._record.observationalMemory?.reflectorModelId === opts.model) return;
+    await this._omWriteConfig(prev => ({ ...prev, reflectorModelId: opts.model }));
+  }
+
+  /** @internal — guards {@link _warnOmIntentInert} to once per live session. */
+  private _omIntentInertWarned = false;
+
+  /**
+   * §9.2 OM honesty — warn ONCE per session that an explicit `session.om.*` model
+   * switch records durable per-session INTENT but does NOT change runtime OM
+   * behavior. OM observer/reflector models, scope, and thresholds are fixed at
+   * the Agent's Memory CONSTRUCTION (Memory `threadConfig.observationalMemory`);
+   * the per-turn path forwards only temporal markers, so a session-level switch
+   * is inert at runtime today — and core Memory SUPPRESSES MessageHistory when it
+   * sees OM "enabled", so a runtime OM option for non-OM-constructed Memory would
+   * drop history WITHOUT attaching OM. The config is still recorded (read-back via
+   * `om.get*`) for forward-compat + declared-intent inspection. Advisory only.
+   */
+  private _warnOmIntentInert(): void {
+    if (this._omIntentInertWarned) return;
+    this._omIntentInertWarned = true;
+    console.warn(
+      '[harness/v1] session.om model switch records durable per-session intent but does NOT change runtime ' +
+        'Observational Memory behavior: OM models/scope/thresholds are fixed at the Agent Memory construction ' +
+        '(threadConfig.observationalMemory). Effective OM requires constructing the Memory with OM; per-session ' +
+        'runtime override is pending upstream support. The intent is still recorded for read-back.',
+    );
+  }
+
+  /** The full per-session OM snapshot seeded from the resolved harness defaults. */
+  private _omDefaultSeed(): NonNullable<SessionRecord['observationalMemory']> {
+    const d = this._omDefaults();
+    return {
+      scope: d.scope,
+      ...(d.observerModelId !== undefined ? { observerModelId: d.observerModelId } : {}),
+      ...(d.reflectorModelId !== undefined ? { reflectorModelId: d.reflectorModelId } : {}),
+      ...(d.observationThreshold !== undefined ? { observationThreshold: d.observationThreshold } : {}),
+      ...(d.reflectionThreshold !== undefined ? { reflectionThreshold: d.reflectionThreshold } : {}),
+    };
+  }
+
+  /**
+   * Commit an OM config patch under the session lease. When the session has no
+   * persisted OM snapshot yet (a legacy/unseeded record), the base is the FULL
+   * resolved default seed — not a bare `{ scope }` — so a single-field switch
+   * freezes the effective scope/thresholds/peer model rather than dropping them.
+   */
+  private async _omWriteConfig(
+    patch: (
+      prev: NonNullable<SessionRecord['observationalMemory']>,
+    ) => NonNullable<SessionRecord['observationalMemory']>,
+  ): Promise<void> {
+    await this._flushUpdate(prev => {
+      const base = prev.observationalMemory ?? this._omDefaultSeed();
+      return { ...prev, observationalMemory: patch(base) };
+    });
+  }
+
+  // §9.2 PER-TURN OM ENABLEMENT — DEFERRED (BLOCKED ON @mastra/memory).
+  //
+  // Threading `memory.options.observationalMemory` into a turn does NOT enable or
+  // configure OM at runtime: `@mastra/memory` builds its OM engine ONLY from the
+  // Memory instance's CONSTRUCTOR `threadConfig.observationalMemory` (index.ts
+  // `_initOMEngine` returns null otherwise), and the per-turn path forwards only
+  // `temporalMarkers` to the processor — models/scope/thresholds are fixed at
+  // construction. Worse, core memory SKIPS the MessageHistory input processor
+  // whenever it sees OM "enabled" in the effective config (memory.ts), so passing
+  // a runtime OM option for an Agent whose Memory was NOT constructed with OM would
+  // SUPPRESS normal history WITHOUT attaching OM. So the harness does NOT thread a
+  // per-turn OM option today; `session.om.*` records durable per-session config
+  // intent (above), and effective enablement requires the Agent's Memory to be
+  // constructed with OM. Faithful runtime enablement needs upstream support for
+  // runtime OM engine construction/override.
+
   private async _resume(
     expectedKind: PendingResume['kind'],
     resumeData: unknown,
@@ -6486,7 +9020,11 @@ export class Session {
 
     const itemId = pending.itemId ?? pending.toolCallId;
     if (requestedItemId !== undefined && requestedItemId !== itemId) {
-      throw new HarnessInboxItemNotFoundError(this.id, requestedItemId);
+      throw new HarnessInboxItemNotFoundError(
+        this.id,
+        requestedItemId,
+        expectedKind === 'sandbox-access' ? undefined : expectedKind,
+      );
     }
     const responseHash =
       responseId !== undefined
@@ -6624,21 +9162,30 @@ export class Session {
         `pending ${expectedKind} resume`,
       ).agent;
     } catch (err) {
+      let thrown = err;
       if (responseId !== undefined) {
-        await this._recordInboxResponsePreDispatchFailure(
-          {
-            responseId,
-            responseHash: responseHash!,
-            itemId,
-            queuedItemId: pendingQueuedItemId,
-            kind: expectedKind,
-            pending,
-            response: persistedResponse,
-          },
-          err,
-        );
+        try {
+          await this._recordInboxResponsePreDispatchFailure(
+            {
+              responseId,
+              responseHash: responseHash!,
+              itemId,
+              queuedItemId: pendingQueuedItemId,
+              kind: expectedKind,
+              pending,
+              response: persistedResponse,
+            },
+            err,
+          );
+        } catch (responseErr) {
+          thrown = responseErr;
+        }
       }
-      throw err;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the runtime-drift
+      // resolution throws a construction-safe HarnessRuntimeDriftError
+      // (pass-through), but the pre-dispatch-failure write can surface a raw
+      // storage error. Redact before rejecting the caller.
+      throw redactPublicBoundaryRejection(thrown);
     }
 
     // Mark resumed under the lease BEFORE calling the agent (idempotency
@@ -6737,26 +9284,17 @@ export class Session {
       );
     }
 
-    if (expectedKind === 'sandbox-access') {
-      const approved =
-        typeof resumeData === 'object' &&
-        resumeData !== null &&
-        'approved' in resumeData &&
-        (resumeData as { approved: unknown }).approved === true;
-      const sandboxAccess = pending.payload?.sandboxAccess;
-      this._emitTurnEvent({
-        type: 'sandbox_access_resolved',
-        requestId: pending.itemId ?? pending.toolCallId,
-        toolCallId: pending.toolCallId,
-        semanticType: sandboxAccess?.semanticType ?? 'custom',
-        approved,
-      });
-    }
+    // §10.2 defines no sandbox_access_resolved event — sandbox/path-access
+    // prompts surface as question_pending and resolve via the inbox response
+    // transition + display snapshot (no dedicated resolved event).
 
     // Resumed runs run under a session-owned AbortController too, so
     // `session.abort()` can cancel an in-flight resume (e.g. ESC after the
     // user approved a tool that's now grinding through a long workflow).
     const turnAbortController = this._beginTurn(undefined);
+    // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
+    // Re-arm the transient so a re-suspend on this resumed run persists it again.
+    this._currentTurnYolo = pending.yolo === true;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
     const finishResumedTurn = () => {
@@ -6765,7 +9303,7 @@ export class Session {
     };
     const assertResumedTurnNotDeleted = () => {
       if (this._state === 'deleted') {
-        throw new HarnessSessionDeletedError(this.id);
+        throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
       }
     };
     try {
@@ -6780,21 +9318,62 @@ export class Session {
         }
       }
       finishResumedTurn();
-      throw thrown;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the open-for-turn assert
+      // throws construction-safe Harness errors (pass-through), but the
+      // response-failed write can surface a raw storage error. Redact before
+      // rejecting the caller.
+      throw redactPublicBoundaryRejection(thrown);
     }
     let full: FullOutput<unknown>;
     try {
       assertResumedTurnNotDeleted();
+      // §4.2e / §6.1 — rebuild + pass the harness RequestContext on RESUME too, so
+      // the resumed turn carries the 'harness' slot AND the per-tool permission gate
+      // resolver. The resolver is a live closure (not serializable into the suspend
+      // snapshot via toJSON), so without this a resumed turn would run UNGATED — the
+      // §4.2e pre-action gate must re-evaluate before resume/execute, not just on the
+      // initial turn.
+      const resumeRequestContext = await this._buildRequestContext({
+        modeId: resumeModeId,
+        modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
+        abortSignal: turnAbortController.signal,
+        // §5.1 — rebuild the SAME caller app bag the suspended turn carried (the
+        // queued-drain path already threads `item.requestContext`; resume used to
+        // drop it). `_buildRequestContext` re-stashes it so a re-suspend on this
+        // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
+        ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
+        yolo: pending.yolo === true,
+      });
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
         abortSignal: turnAbortController.signal,
+        requestContext: resumeRequestContext,
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
+      // §10.4 — suspension events interleave with text/tool events on the live
+      // subscriber stream and are followed by a `tool_end` after resume. The
+      // resume run REUSES the suspended run's `runId` (`pending.runId`), which is
+      // already in the long-lived thread subscription's `seenRunIds`
+      // (thread-stream-runtime.ts), so that subscription dedups the re-registered
+      // resume run and never re-drains it. Drain the resume run's own
+      // `fullStream` through the same `_emitForChunk` path so the approved tool's
+      // `tool_end` and any post-approval `text_delta` surface LIVE to subscribers
+      // before the terminal `agent_end`. This local drain is the SOLE consumer of
+      // the resumed segment's chunks (no double-emit). Completion delivery stays
+      // on the independent `getFullOutput()` path below — draining is a separate
+      // evented reader over the shared chunk buffer and does not gate settlement.
       const fullOutput = out.getFullOutput() as Promise<FullOutput<unknown>>;
       void fullOutput.catch(() => {});
+      const resumeDrain = this._drainResumeStream(out as MastraModelOutput<unknown>);
+      void resumeDrain.catch(() => {});
       full = await Promise.race([fullOutput, activeTurnWaiter.promise]);
+      // The drain feeds `tool_end`/`text_delta` for the resumed segment; await it
+      // (best-effort) so those live events are emitted before the terminal
+      // `agent_end` below. A drain error must not fail the resume — settlement
+      // already came from `getFullOutput()`.
+      await Promise.race([resumeDrain.catch(() => {}), activeTurnWaiter.promise]);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
@@ -6811,8 +9390,69 @@ export class Session {
           thrown = responseErr;
         }
       }
+      // §4.2f — a failed resume of an owned `signal()` turn terminalizes that
+      // signal's still-`pending` durable evidence as `signal_failed`, mirroring
+      // the owned-turn failure path; otherwise it would stay pending forever.
+      if (pending.originSignalId !== undefined) {
+        await this._settleSignalResult(pending.originSignalId, {
+          status: 'failed',
+          runId: pending.runId,
+          error: projectHarnessPublicError(err),
+        });
+      }
       finishResumedTurn();
-      throw thrown;
+      // §5.4 / §5.7 — `pendingResume.resumedAt` is the at-least-once
+      // idempotency marker, set under the lease BEFORE the agent call so a
+      // CRASH between "marked resumed" and "cleared pending" replays as a
+      // no-op on rehydration (the next caller observes the durable marker and
+      // rejects rather than double-resuming). That crash-recovery contract is
+      // preserved untouched: it only governs markers that SURVIVE a process
+      // death. Here, by contrast, the resume threw IN-PROCESS — no completion,
+      // re-suspension, or settlement occurred (those land in the later try
+      // block, never this catch; the only writes reaching this catch are the
+      // resumeStream/getFullOutput rejection and the queue-completion mark,
+      // and `_markQueuedTurnCompleted` never throws QueuePostRunFinalizationPendingError,
+      // so the deferred-finalization defer is not in play here). We KNOW the
+      // attempt failed, so it is both safe and strictly better than waiting for
+      // QUEUE_ACCEPTED_RECOVERY_STALE_MS to revert the marker back to undefined,
+      // restoring the suspension to its retryable `waiting` state. Without this,
+      // an immediate `respondTo*` retry hits the `resumedAt`-set branch and is
+      // told "awaiting agent confirmation", and `_maybeDrainQueue` parks until
+      // the staleness window elapses — a real liveness gap (F2).
+      //
+      // The revert is CAS-guarded (only clears the marker WE stamped on the
+      // SAME pending identity) and best-effort: if a concurrent caller already
+      // cleared/advanced pending it leaves it alone, and if the session is
+      // CLOSING/CLOSED/DELETED/EVICTED the revert flush rejects — we swallow
+      // that, because (a) `_isShutdownDrainBusy()` already treats a parked
+      // pendingResume as non-busy (a suspension awaiting a user response must
+      // not block shutdown), and (b) a closed/deleted record is being torn down,
+      // so a residual `resumedAt` on it is never observed again. The original
+      // resume error must surface regardless, so the revert never masks it (F4).
+      try {
+        await this._revertFailedResumeMarker(pending, resumedAt);
+      } catch {
+        // best-effort; closing/closed/deleted session — see comment above.
+      }
+      // §S3.1 — surface the failed resume as a NON-terminal `resume_failed` event so
+      // an event-only consumer learns the attempt failed instead of seeing the run
+      // stuck "running". It is deliberately NOT a terminal `agent_end`: the marker
+      // revert above restored the suspension to `waiting`, so a subsequent
+      // `respondTo*` can retry (finalizing here would wrongly mark the run failed and
+      // poison a later retry's run_completed/run-summary for the same runId).
+      this._emitTurnEvent({
+        type: 'resume_failed',
+        runId: pending.runId,
+        retryable: true,
+        error: projectHarnessPublicError(thrown),
+      });
+      // §13.3f.1 — respondTo* (this resume) is a public §4.2b boundary; the
+      // resumed agent run (resumeStream / getFullOutput) can reject with a raw
+      // provider/runtime error. Redact before rejecting the caller's promise.
+      // The durable signal_failed evidence already uses projectHarnessPublicError,
+      // and a HarnessSessionDeletedError from the response-failed write passes
+      // through unchanged.
+      throw redactPublicBoundaryRejection(thrown);
     }
 
     // Clear pending + apply any remaining mode flip in a single CAS write. A
@@ -6824,7 +9464,13 @@ export class Session {
       const suspendedPayload =
         full.finishReason === 'suspended'
           ? (full.suspendPayload as
-              | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown }
+              | {
+                  toolCallId: string;
+                  toolName: string;
+                  args?: unknown;
+                  suspendPayload?: unknown;
+                  approvalReasons?: string[];
+                }
               | undefined)
           : undefined;
       const suspendedPending =
@@ -6835,6 +9481,7 @@ export class Session {
               pendingQueuedItemId,
               resumeModeId,
               resumeRuntimeDependencies.modelId,
+              pending.originSignalId,
             )
           : undefined;
       const suspendedTokenUsageDelta =
@@ -6843,8 +9490,18 @@ export class Session {
       let alreadyAccounted = false;
       if (completingQueuedItemId !== undefined) {
         if (modeFlipTarget && modeFlipTarget !== previousModeId) {
+          // §4.2e — a plan-approval mode transition re-establishes the target
+          // mode's base permission policy (when it declares one), exactly like
+          // create + switchMode. Keeps permissionRules consistent with modeId.
+          const seededRules = this._harness._modePermissionRules(modeFlipTarget);
           await Promise.race([
-            this._flushUpdate(prev => ({ ...prev, modeId: modeFlipTarget })),
+            this._flushUpdate(prev => ({
+              ...prev,
+              modeId: modeFlipTarget,
+              ...(seededRules !== undefined
+                ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
+                : {}),
+            })),
             activeTurnWaiter.promise,
           ]);
         }
@@ -6893,7 +9550,15 @@ export class Session {
                 },
               };
             }
-            if (modeFlipTarget) next.modeId = modeFlipTarget;
+            if (modeFlipTarget) {
+              next.modeId = modeFlipTarget;
+              // §4.2e — re-seed the base permission policy for the transitioned mode.
+              const seededRules = this._harness._modePermissionRules(modeFlipTarget);
+              if (seededRules !== undefined) {
+                next.permissionRules = seededRules;
+                next.permissionRulesSeedHash = sha256CanonicalJson(seededRules);
+              }
+            }
             if (completingQueuedItemId !== undefined) {
               next.pendingQueue = (prev.pendingQueue ?? []).filter(x => x.id !== completingQueuedItemId);
               const receipt = prev.queueAdmissionReceipts?.[completingQueuedItemId];
@@ -6922,14 +9587,10 @@ export class Session {
         activeTurnWaiter.promise,
       ]);
 
-      // Pending resolved — emit before the (optional) re-suspension capture
-      // so subscribers see ordering: resolved → (mode_changed?) → required?.
-      this._emitTurnEvent({
-        type: 'suspension_resolved',
-        kind: expectedKind,
-        toolCallId: pending.toolCallId,
-        runId: pending.runId,
-      });
+      // §10.2 defines no suspension_resolved event — resolution is observed via
+      // the inbox response transition + display snapshot. A mode flip on a plan
+      // approval still emits mode_changed; a re-suspension emits the matching
+      // §10.2 pending event.
       if (modeFlipTarget && modeFlipTarget !== previousModeId) {
         this._emitter.emit({
           type: 'mode_changed',
@@ -6939,23 +9600,27 @@ export class Session {
       }
 
       if (suspendedPending !== undefined) {
-        this._emitTurnEvent({
-          type: 'suspension_required',
-          kind: suspendedPending.kind,
-          toolCallId: suspendedPending.toolCallId,
-          toolName: suspendedPending.toolName,
-          runId: suspendedPending.runId,
-        });
+        this._emitPendingEvent(suspendedPending);
       }
 
       // If the resumed run did NOT suspend again, the turn is complete from
       // the harness's perspective. Surface that to subscribers via agent_end.
       if (full.finishReason !== 'suspended') {
-        this._emitTurnEvent({
-          type: 'agent_end',
-          reason: this._agentEndReasonForFullOutput(full),
-          runId: full.runId,
-        });
+        this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
+
+        // §4.2f — an owned `signal()` turn that suspended left its durable
+        // per-`signalId` evidence `pending`. The terminal (non-suspended)
+        // resume IS that signal's answer (1:1), so settle the evidence and
+        // project `signal_completed`/`signal_failed` now; otherwise a suspended
+        // owned signal would stay pending forever. Queued turns are settled via
+        // their queue receipt above and never carry `originSignalId`.
+        if (pending.originSignalId !== undefined) {
+          await this._settleSignalResult(pending.originSignalId, {
+            status: 'completed',
+            runId: pending.runId,
+            result: full as AgentResult,
+          });
+        }
 
         // If this was the terminal completion of a queued turn, settle the
         // resolver, remove the head item, clear current, then kick the drain
@@ -6978,7 +9643,11 @@ export class Session {
       if (err instanceof QueuePostRunFinalizationPendingError && completingQueuedItemId !== undefined) {
         this._deferQueuedTurnRetry(err);
       }
-      throw err;
+      // §13.3f.1 — respondTo* is a public §4.2b boundary; the post-completion
+      // bookkeeping (_flushUpdate / settle / finalize) can reject with a raw
+      // storage error. Redact before rejecting the caller (the deferred
+      // QueuePostRunFinalizationPendingError and other Harness errors pass through).
+      throw redactPublicBoundaryRejection(err);
     } finally {
       finishResumedTurn();
     }
@@ -7007,7 +9676,11 @@ export class Session {
       throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'itemId must be a string');
     }
     if (requestedItemId !== undefined && receipt.itemId !== requestedItemId) {
-      throw new HarnessInboxItemNotFoundError(this.id, requestedItemId);
+      throw new HarnessInboxItemNotFoundError(
+        this.id,
+        requestedItemId,
+        expectedKind === 'sandbox-access' ? undefined : expectedKind,
+      );
     }
     const attemptedHash = this._computeInboxResponseHash({
       kind: expectedKind,
@@ -7245,15 +9918,59 @@ export class Session {
     return pending.runtimeDependencies ?? receipt?.runtimeDependencies ?? { modeId, ...(modelId ? { modelId } : {}) };
   }
 
+  /**
+   * §5.4 / §5.7 — revert the at-least-once resume marker after an IN-PROCESS
+   * resume failure so the suspension returns to a retryable `waiting` state
+   * instead of looking "resuming" until the staleness window elapses.
+   *
+   * Only the in-process resume catch calls this, where we KNOW the agent call
+   * threw before any settlement/re-suspension (those land in the later try
+   * block, not the resume catch). The crash-recovery contract — a marker that
+   * SURVIVES process death rejects on rehydration — is unaffected, since this
+   * never runs on a rehydrated marker.
+   *
+   * CAS-guarded: clears `resumedAt` only when `pendingResume` is still the same
+   * suspension (same runId/toolCallId/itemId) and still carries exactly the
+   * marker WE stamped (`=== resumedAt`). A concurrent caller that already
+   * cleared or advanced pending is left untouched. After a successful revert we
+   * void-kick `_maybeDrainQueue()` (only while live) so a parked queue self-heals
+   * in-process rather than waiting for an external trigger.
+   *
+   * The flush is allowed to reject on a closing/closed/deleted/evicted session;
+   * the caller swallows that (the record is being torn down and a parked
+   * pendingResume is already non-busy for shutdown — see `_isShutdownDrainBusy`).
+   */
+  private async _revertFailedResumeMarker(pending: PendingResume, resumedAt: number): Promise<void> {
+    let reverted = false;
+    await this._flushUpdate(prev => {
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        current.resumedAt !== resumedAt ||
+        current.runId !== pending.runId ||
+        current.toolCallId !== pending.toolCallId ||
+        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId)
+      ) {
+        return prev;
+      }
+      reverted = true;
+      const restored: PendingResume = { ...current };
+      delete restored.resumedAt;
+      return { ...prev, pendingResume: restored };
+    });
+    if (reverted && this._state === 'live') {
+      void this._maybeDrainQueue();
+    }
+  }
+
   private async _maybeRecoverStaleQueuedResume(): Promise<QueueResumeRecoveryResult> {
     if (this._currentTurnAbortController !== undefined) return { status: 'none' };
     const pending = this._record.pendingResume;
     if (pending?.resumedAt === undefined) return { status: 'none' };
     const queuedItemId = this._queuedItemIdForPendingResume(pending);
     if (queuedItemId === undefined) return { status: 'none' };
-    if (!this._queueResolvers.has(queuedItemId)) {
-      this._emitQueueItemReplayedOnce(queuedItemId);
-    }
+    // §10.2: no queue_item_replayed event on crash-recovery — the recovered
+    // turn flows through normal drain/agent_start; settlement evidence stays durable.
     this._ensureQueuedItemContext(queuedItemId);
 
     const currentReceipt = this._record.queueAdmissionReceipts?.[queuedItemId];
@@ -7480,6 +10197,297 @@ export class Session {
     return { accepted: true, queuedItemId: admission.queuedItemId, duplicate: admission.duplicate };
   }
 
+  /**
+   * @internal §14.2 channel ingress admission via the queue path. Like
+   * `admitQueue` but threads a persisted `requestContext` (the trusted
+   * `requestContext.channel` projection built by the bridge) into the queued item
+   * so the admitted turn — and its crash recovery — carry channel provenance.
+   * `admissionId` (the inbox item id) makes a provider/worker retry idempotent.
+   */
+  async _admitChannelQueueTurn(opts: {
+    content: string;
+    admissionId: string;
+    requestContext: PersistedRequestContextInput;
+    mode?: string;
+    model?: string;
+    // Already-normalized persisted attachments from the durable inbox row. The
+    // channel bridge resolves provider files to Harness-owned refs before the row
+    // exists (§14.2 step 3); a queued/retried turn never depends on live bytes.
+    attachments?: PersistedAttachment[];
+    // §14.2 step 7/8: when the bridge has already computed and persisted the
+    // admissionHash, it is replayed here so the queue boundary rejects a payload
+    // that does not match the persisted admission (recovery integrity).
+    expectedAdmissionHash?: string;
+  }): Promise<QueueAdmissionResult> {
+    if (opts.admissionId.length === 0) {
+      throw new HarnessValidationError('admitChannelQueueTurn().admissionId', 'admissionId must be a non-empty string');
+    }
+    const queueOpts: QueueOptions = {
+      content: opts.content,
+      admissionId: opts.admissionId,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+    };
+    const admission = await this._admitQueue(queueOpts, 'admitQueue()', {
+      persistedRequestContext: opts.requestContext,
+      ...(opts.attachments !== undefined ? { persistedAttachments: opts.attachments } : {}),
+      ...(opts.expectedAdmissionHash !== undefined ? { expectedAdmissionHash: opts.expectedAdmissionHash } : {}),
+    });
+    if (!admission.duplicate) {
+      this._liveAdmittedQueuedItemIds.add(admission.queuedItemId);
+    }
+    void this._maybeDrainQueue();
+    return { accepted: true, queuedItemId: admission.queuedItemId, duplicate: admission.duplicate };
+  }
+
+  /**
+   * @internal §14.2 step 7: the queue admissionHash for a channel turn, computed
+   * over the exact persisted admission payload (content + persisted attachments +
+   * policy-selected mode/model + trusted requestContext). The bridge records this
+   * on the inbox row BEFORE runtime admission so recovery replays the SAME payload
+   * and validates it via {@link _admitChannelQueueTurn}'s `expectedAdmissionHash`
+   * — never re-running channel policy once the hash exists.
+   */
+  _channelQueueAdmissionHash(
+    opts: { content: string; mode?: string; model?: string },
+    attachments: PersistedAttachment[],
+    requestContext: PersistedRequestContextInput,
+  ): string {
+    const queueOpts: QueueOptions = {
+      content: opts.content,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+    };
+    return this._computeQueueAdmissionHash(queueOpts, attachments, requestContext);
+  }
+
+  /**
+   * @internal §14.2 channel signal-admission duplicate resolution. Decides
+   * whether existing reservation evidence proves a run was already DISPATCHED
+   * (so the caller short-circuits without re-dispatching) or not (so the caller
+   * re-dispatches under the deterministic signalId — closing the pre-dispatch
+   * lost-signal window from C2/C7).
+   *
+   * - `failed`: rethrow the projected error (matches the message/queue
+   *   duplicate-of-failed contract).
+   * - `completed`: the run already answered — short-circuit to its identity.
+   * - `pending` WITH a recorded `runId`: a run was durably dispatched under this
+   *   admissionId — short-circuit to that real run (no double interleave/wake).
+   * - `pending` WITHOUT a `runId`: the reservation committed but the dispatch
+   *   never recorded a run (pre-dispatch crash window). Return `undefined` so the
+   *   caller (re-)dispatches; NEVER fabricate `runId === signalId` (C7).
+   * - tombstone / missing `status`: expired evidence — throw.
+   * - `undefined` input (no evidence): `undefined` (caller proceeds to reserve).
+   */
+  /**
+   * @internal §14.2 idempotency resolver for a replayed channel-signal admission.
+   *
+   * Channel-signal operation-admission evidence is intentionally a pre-dispatch
+   * BARRIER, not the durable answer. `_admitChannelSignalTurn` reserves `pending`
+   * evidence keyed by the deterministic signalId WITH admissionId/admissionHash,
+   * then records the dispatched `runId` on that same `pending` row. The run's
+   * completed/failed terminal settles through `_settleSignalResult`, which writes
+   * evidence WITHOUT admissionId/admissionHash (it is the shared terminal for all
+   * signals, channel or not, and carries no admission identity). Because
+   * `sameMessageEvidenceIdentity` (storage) compares admissionId+admissionHash,
+   * that terminal write is an identity mismatch the best-effort path swallows —
+   * so this evidence row stays `pending` (with a runId) for the lifetime of the
+   * operation. That is by design and matches §14.2 ("answer read-only from a
+   * stored row that is already terminal or accepted/queued"): the DURABLE answer
+   * for an idempotent channel duplicate lives on the channel INBOX row plus the
+   * run terminal, not on this admission record. The `failed` branch below is
+   * therefore defensive — it never fires for channel signals because the failure
+   * terminal never reaches this row — and the `pending + runId` branch is the
+   * live short-circuit that re-resolves a replay to its original run without
+   * re-dispatching.
+   */
+  private _channelSignalDispatchedDuplicate(
+    evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | undefined,
+  ): { runId: string; signalId: string; willInterleave: boolean } | undefined {
+    if (evidence === undefined) return undefined;
+    if (!('status' in evidence)) {
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().admissionId',
+        'duplicate channel signal admission evidence has expired',
+      );
+    }
+    if (evidence.status === 'failed') {
+      throw publicErrorProjectionToError(evidence.error);
+    }
+    // A `pending` reservation with no durable `runId` was never delivered to a
+    // run — signal re-dispatch, do not short-circuit to a fabricated identity.
+    if (evidence.status === 'pending' && evidence.runId === undefined) return undefined;
+    return {
+      runId: evidence.runId!,
+      signalId: evidence.signalId,
+      willInterleave: false,
+    };
+  }
+
+  /**
+   * @internal §14.2 channel ingress admission via the SIGNAL path. The
+   * interactive counterpart to {@link _admitChannelQueueTurn}: an inbound that
+   * the channel policy selected `delivery: 'signal'` for interleaves into an
+   * active run (§21 shared terminal) or wakes a fresh idle run, rather than
+   * appending a sequential queue boundary. The trusted `requestContext.channel`
+   * projection and the already-persisted inbox attachments are threaded via the
+   * internal signal hook. `signal()` has no per-turn `model` override, so a
+   * policy `model` is rejected by {@link admitChannelInbound} before reaching
+   * here. Returns the run/signal ids the bridge persists on the inbox row.
+   */
+  async _admitChannelSignalTurn(opts: {
+    content: string;
+    admissionId: string;
+    requestContext: PersistedRequestContextInput;
+    expectedAdmissionHash: string;
+    mode?: string;
+    attachments?: PersistedAttachment[];
+  }): Promise<{ runId: string; signalId: string; willInterleave: boolean }> {
+    if (opts.admissionId.length === 0) {
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().admissionId',
+        'admissionId must be a non-empty string',
+      );
+    }
+    if (opts.expectedAdmissionHash.length === 0) {
+      throw new HarnessValidationError(
+        'admitChannelSignalTurn().expectedAdmissionHash',
+        'expectedAdmissionHash must be a non-empty string',
+      );
+    }
+    // §14.2 idempotency barrier (signal analogue of the queue path's
+    // `admissionId`-keyed `queueAdmissionReceipts` de-dup). The deterministic
+    // per-`admissionId` signal id ties the dispatched run to a durable
+    // reservation written BEFORE dispatch. On the admitted→accepted recovery
+    // crash window the worker replays this method against the still-pending
+    // row, but the existing reservation short-circuits to the ORIGINAL run
+    // instead of firing a second interleave/wake (double model turn / spend).
+    const signalId = this._channelSignalAdmissionSignalId(opts.admissionId);
+    const existing = await this._resolveMessageAdmissionDuplicate({
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    const dispatchedDuplicate = this._channelSignalDispatchedDuplicate(existing);
+    if (dispatchedDuplicate !== undefined) return dispatchedDuplicate;
+    // Reserve the admissionId durably BEFORE dispatch. The conflict-detecting
+    // write rejects a payload-mismatched replay and resolves a concurrent winner
+    // to its evidence (returned and short-circuited here, never double-dispatched).
+    const reserved = await this._writeMessageResultEvidence({
+      status: 'pending',
+      signalId,
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    if (!reserved.created) {
+      const reservedDuplicate = this._channelSignalDispatchedDuplicate(reserved.evidence);
+      if (reservedDuplicate !== undefined) return reservedDuplicate;
+      // The reservation already exists but carries NO durable runId: a crash
+      // between reserving and recording the dispatched run (the pre-dispatch
+      // lost-signal window, C2/C7). The signal was never delivered to a run, so
+      // fall through and (re-)dispatch under the SAME deterministic signalId — a
+      // real run is created exactly once on recovery instead of fabricating a
+      // runId for a run that never started. This is safe because channel-ingress
+      // admission for a given admissionId is SERIALIZED by the durable inbox-row
+      // claim (admitChannelInbound's initial claim / recoverChannelInboxOnce's
+      // reclaim), so `_admitChannelSignalTurn` never runs concurrently for the
+      // same admissionId — a pending-without-runId reservation is always the
+      // single claimant's own crashed prior attempt, never a live concurrent run.
+    }
+    const handle = await this.signal(
+      {
+        content: opts.content,
+        ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      },
+      {
+        persistedRequestContext: opts.requestContext,
+        signalId,
+        ...(opts.attachments !== undefined ? { attachments: opts.attachments } : {}),
+      },
+    );
+    // Record the dispatched run on the durable reservation BEFORE returning so the
+    // recovery worker can distinguish "dispatched" (pending + runId) from
+    // "never dispatched" (pending + no runId) and only re-dispatch the latter.
+    // Awaited (not best-effort/background): the reservation's runId is the
+    // recovery discriminator for the lost-signal window, not a convenience field.
+    // The conflicting-write path resolves a concurrent winner to its evidence;
+    // the same-signal runId update never conflicts (runId is not part of the
+    // admission identity), so a duplicate here returns the already-recorded run.
+    const recordedRun = await this._writeMessageResultEvidence({
+      status: 'pending',
+      signalId,
+      runId: handle.runId,
+      admissionId: opts.admissionId,
+      admissionHash: opts.expectedAdmissionHash,
+    });
+    if (!recordedRun.created) {
+      const recordedDuplicate = this._channelSignalDispatchedDuplicate(recordedRun.evidence);
+      if (recordedDuplicate !== undefined) return recordedDuplicate;
+    }
+    // The shared run terminal settles `handle.result` in the background (§4.2f /
+    // §21); the bridge persists `runId`/`signalId` synchronously and does not
+    // await the answer here. Swallow so an unawaited rejection is not unhandled.
+    void handle.result.catch(() => {});
+    return { runId: handle.runId, signalId: handle.id, willInterleave: handle.willInterleave };
+  }
+
+  /**
+   * @internal §13.7/§14.2 step 3: resolve inbound channel provider files
+   * (AttachmentRefs the bridge has already uploaded) into Harness-owned persisted
+   * attachment refs scoped to this resolved session. Thin wrapper over the same
+   * `_resolveAttachmentRefs` the queue/message admission paths use — validates
+   * ownership + loads metadata, so the durable inbox row, admissionHash, and the
+   * admitted turn all carry the SAME normalized attachments.
+   */
+  async _resolveChannelInboundAttachments(refs: AttachmentRef[]): Promise<PersistedAttachment[]> {
+    if (refs.length === 0) return [];
+    return this._resolveAttachmentRefs('channel ingress attachments', refs);
+  }
+
+  /**
+   * @internal §14.2 step 7: the SIGNAL admissionHash for a channel turn, computed
+   * over the exact persisted admission payload (content + persisted attachments +
+   * policy-selected mode + trusted requestContext). Discriminated `kind: 'signal'`
+   * (distinct from the queue path's `kind: 'queue'`) so a queue-vs-signal payload
+   * never collides. Persisted on the inbox row BEFORE runtime admission so
+   * recovery replays the SAME payload and never re-runs policy. Hashes the same
+   * `PersistedAttachment` projection as {@link _computeQueueAdmissionHash}. Note:
+   * signal delivery has no `model` field, so model is intentionally absent.
+   */
+  _channelSignalAdmissionHash(
+    opts: { content: string; mode?: string },
+    attachments: PersistedAttachment[],
+    requestContext: PersistedRequestContextInput,
+  ): string {
+    return sha256CanonicalJson({
+      kind: 'signal',
+      content: opts.content,
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      attachments: attachments.map(attachment => ({
+        kind: attachment.kind,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        ...(attachment.kind === 'ref'
+          ? {
+              attachmentId: attachment.attachmentId,
+              resourceId: this.resourceId,
+              ownerSessionId: attachment.ownerSessionId,
+              bytes: attachment.bytes,
+              sha256: attachment.sha256,
+              source: attachment.source,
+              attachmentKind: attachment.attachmentKind ?? 'file',
+              ...(attachment.primitiveType ? { primitiveType: attachment.primitiveType } : {}),
+              ...(attachment.elementType ? { elementType: attachment.elementType } : {}),
+              ...(attachment.renderer ? { renderer: attachment.renderer } : {}),
+              ...(attachment.schemaId ? { schemaId: attachment.schemaId } : {}),
+              ...(attachment.metadata ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
+              ...(attachment.object ? { object: attachment.object } : {}),
+            }
+          : { url: attachment.url }),
+      })),
+      requestContext: clonePersistedRequestContext(requestContext),
+    });
+  }
+
   private async _admitQueue(
     opts: QueueOptions,
     methodName: 'queue()' | 'admitQueue()',
@@ -7507,6 +10515,18 @@ export class Session {
     }
     this._validateQueueSchedulingOptions(opts, methodName);
 
+    // §4.4c: validate caller request context before attachment resolution,
+    // hashing, and persistence. A direct queue()/admitQueue() caller supplies
+    // `app`; the channel-bridge path supplies a trusted `channel` via `internal`.
+    // They are top-level siblings — combine into one persisted DTO, never deep
+    // merge. (No path supplies both today; channel ingress has no SDK caller.)
+    const callerRequestContext = validateCallerRequestContext(opts.requestContext, methodName);
+    const callerPersistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+    const effectivePersistedRequestContext: PersistedRequestContextInput | undefined =
+      internal?.persistedRequestContext !== undefined || callerPersistedRequestContext !== undefined
+        ? { ...(internal?.persistedRequestContext ?? {}), ...(callerPersistedRequestContext ?? {}) }
+        : undefined;
+
     const attachments =
       internal?.persistedAttachments ??
       (await this._resolveAttachmentRefs(`${methodName}.attachments`, opts.attachments ?? []));
@@ -7515,7 +10535,7 @@ export class Session {
     }
     const effectiveModeId = opts.mode ?? this._record.modeId;
     const admissionId = opts.admissionId ?? `queue-${randomUUID()}`;
-    const admissionHash = this._computeQueueAdmissionHash(opts, attachments, internal?.persistedRequestContext);
+    const admissionHash = this._computeQueueAdmissionHash(opts, attachments, effectivePersistedRequestContext);
     if (internal?.expectedAdmissionHash !== undefined && internal.expectedAdmissionHash !== admissionHash) {
       throw new HarnessAdmissionConflictError(this.id, admissionId, internal.expectedAdmissionHash, admissionHash);
     }
@@ -7534,7 +10554,7 @@ export class Session {
     const cap = this._harness._internalMaxQueueDepth;
     const queueBackpressure = this._harness._internalQueueBackpressure;
     if (queueBackpressure === 'reject' && (this._record.pendingQueue?.length ?? 0) >= cap) {
-      throw new HarnessQueueFullError(this.id, cap);
+      throw new HarnessQueueFullError(this.id, cap, this._record.pendingQueue?.length ?? 0);
     }
     const queuedItemId = this._queueAdmissionQueuedItemId(admissionId);
     const item: QueuedItem = {
@@ -7544,8 +10564,8 @@ export class Session {
       enqueuedAt: Date.now(),
       content: opts.content,
       attachments,
-      ...(internal?.persistedRequestContext
-        ? { requestContext: clonePersistedRequestContext(internal.persistedRequestContext) }
+      ...(effectivePersistedRequestContext
+        ? { requestContext: clonePersistedRequestContext(effectivePersistedRequestContext) }
         : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
       mode: effectiveModeId,
@@ -7596,13 +10616,13 @@ export class Session {
             return prev;
           }
           if (prev.closingAt !== undefined || this.isClosing) {
-            throw new HarnessSessionClosingError(this.id);
+            throw harnessSessionClosingError(this);
           }
           if (prev.cancelRequest !== undefined) {
             throw new HarnessSessionCancelledError(this.id, prev.cancelRequest.reason);
           }
           if (queueBackpressure === 'reject' && (prev.pendingQueue?.length ?? 0) >= cap) {
-            throw new HarnessQueueFullError(this.id, cap);
+            throw new HarnessQueueFullError(this.id, cap, prev.pendingQueue?.length ?? 0);
           }
           return this._applyQueueBackpressureForAppend(prev, {
             item,
@@ -7626,7 +10646,7 @@ export class Session {
       return { queuedItemId: admittedReceipt.queuedItemId, evidence: admittedReceipt, duplicate: true };
     }
 
-    this._emitQueueBackpressureDrops(droppedItems);
+    this._failBackpressureDroppedItems(droppedItems);
     return { queuedItemId: item.id, evidence: receipt, duplicate: false };
   }
 
@@ -7886,7 +10906,7 @@ export class Session {
           opts.onRejected?.();
           return prev;
         }
-        throw new HarnessQueueFullError(this.id, opts.maxQueueDepth);
+        throw new HarnessQueueFullError(this.id, opts.maxQueueDepth, queue.length);
       }
 
       const [dropped] = queue.splice(dropIdx, 1);
@@ -7931,48 +10951,17 @@ export class Session {
     return next;
   }
 
-  private _emitQueueBackpressureDrops(droppedItems: QueueBackpressureDrop[]): void {
+  // §10.2: backpressure drops emit no public event — the observable effect is
+  // the rejected drop-oldest operation promises below. (The reject-policy path
+  // throws HarnessQueueFullError at the caller and admits nothing.)
+  private _failBackpressureDroppedItems(droppedItems: QueueBackpressureDrop[]): void {
     for (const dropped of droppedItems) {
-      this._emitter.emit({
-        type: 'queue_full_dropped',
-        source: dropped.source,
-        policy: 'drop-oldest',
-        maxQueueDepth: dropped.maxQueueDepth,
-        queuedItemId: dropped.queuedItemId,
-        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
-        ...(dropped.replacementQueuedItemId !== undefined
-          ? { replacementQueuedItemId: dropped.replacementQueuedItemId }
-          : {}),
-        ...(dropped.replacementAdmissionId !== undefined
-          ? { replacementAdmissionId: dropped.replacementAdmissionId }
-          : {}),
-        ...(dropped.goalId !== undefined ? { goalId: dropped.goalId } : {}),
-      } as EmitInput);
       const resolver = this._queueResolvers.get(dropped.queuedItemId);
       if (resolver) {
         this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessQueueFullDroppedError(dropped.queuedItemId));
       }
     }
-  }
-
-  private _emitQueueFullRejected(opts: {
-    source: 'queue' | 'goal';
-    policy?: 'reject' | 'drop-oldest';
-    maxQueueDepth: number;
-    goalId?: string;
-    queuedItemId?: string;
-    admissionId?: string;
-  }): void {
-    this._emitter.emit({
-      type: 'queue_full_dropped',
-      source: opts.source,
-      policy: opts.policy ?? 'reject',
-      maxQueueDepth: opts.maxQueueDepth,
-      ...(opts.queuedItemId !== undefined ? { queuedItemId: opts.queuedItemId } : {}),
-      ...(opts.admissionId !== undefined ? { admissionId: opts.admissionId } : {}),
-      ...(opts.goalId !== undefined ? { goalId: opts.goalId } : {}),
-    } as EmitInput);
   }
 
   private _isTerminalQueueReceipt(receipt: QueueAdmissionReceipt): boolean {
@@ -8146,12 +11135,8 @@ export class Session {
     if (!didCommit) return hasRunnableHead;
 
     for (const dropped of expired) {
-      this._emitter.emit({
-        type: 'queue_item_expired',
-        queuedItemId: dropped.queuedItemId,
-        ...(dropped.admissionId !== undefined ? { admissionId: dropped.admissionId } : {}),
-        deadline: dropped.deadline,
-      } as EmitInput);
+      // §10.2: no queue_item_expired event — the observable effect is the
+      // rejected operation promise (HarnessQueueItemExpiredError) below.
       const resolver = this._queueResolvers.get(dropped.queuedItemId);
       if (resolver) {
         this._queueResolvers.delete(dropped.queuedItemId);
@@ -8201,12 +11186,13 @@ export class Session {
         if (!head) return;
         this._currentQueuedItemId = head.id;
         this._currentQueuedItemSource = head.source ?? 'user';
-        const isLiveAdmission = this._queueResolvers.has(head.id) || this._liveAdmittedQueuedItemIds.delete(head.id);
-        const isReplay = !isLiveAdmission;
-        if (isReplay) {
-          this._emitQueueItemReplayedOnce(head.id);
-        } else {
-          this._emitter.emit({ type: 'queue_item_started', queuedItemId: head.id });
+        // §10.2: no queue_item_started / queue_item_replayed events — the closed
+        // union has no queue-lifecycle family; the drained turn's `agent_start`
+        // marks the boundary. We still clear the live-admission marker (only
+        // when no live resolver is tracking the item, mirroring the prior
+        // short-circuit) so `_liveAdmittedQueuedItemIds` does not leak.
+        if (!this._queueResolvers.has(head.id)) {
+          this._liveAdmittedQueuedItemIds.delete(head.id);
         }
 
         let suspended = false;
@@ -8319,7 +11305,13 @@ export class Session {
     // Queued turns run under a session-owned AbortController so
     // `session.abort()` can cancel an in-flight queued run too.
     this._assertOpenForTurn('queue drain');
-    const turnAbortController = this._beginTurn(undefined);
+    const turnAbortController = this._beginTurn(undefined, {
+      modeId: effectiveModeId,
+      modelId: item.model ?? this._record.modelId,
+    });
+    // §4.2e — arm per-turn yolo for the drain so suspend-capture persists it onto
+    // pendingResume (so a later resume keeps auto-granting). `_beginTurn` reset it.
+    this._currentTurnYolo = item.yolo === true;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
     const finishQueuedTurn = () => {
@@ -8328,7 +11320,7 @@ export class Session {
     };
     const assertQueuedTurnNotDeleted = () => {
       if (this._state === 'deleted') {
-        throw new HarnessSessionDeletedError(this.id);
+        throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
       }
     };
     let agentStarted = false;
@@ -8342,6 +11334,7 @@ export class Session {
           modelId: this._modelIdForQueuedItem(item.id),
           abortSignal: turnAbortController.signal,
           persistedRequestContext: item.requestContext,
+          yolo: item.yolo === true,
         }),
         activeTurnWaiter.promise,
       ]);
@@ -8354,9 +11347,6 @@ export class Session {
         ...(mode.instructions ? { instructions: mode.instructions } : {}),
       };
 
-      this._emitTurnEvent({ type: 'agent_start' });
-      agentStarted = true;
-
       await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
       assertQueuedTurnNotDeleted();
       await Promise.race([
@@ -8368,8 +11358,16 @@ export class Session {
         activeTurnWaiter.promise,
       ]);
       assertQueuedTurnNotDeleted();
+      // §13.7/§14.2: forward persisted attachment bytes as model file-parts so a
+      // queued (channel or direct) turn's attachments actually reach the agent,
+      // not just the dedup identity. No attachments → bare `item.content`.
+      const queuedContents = await Promise.race([
+        this._buildSignalContentsWithAttachments(item.content, item.attachments),
+        activeTurnWaiter.promise,
+      ]);
+      assertQueuedTurnNotDeleted();
       const signal = agent.sendSignal(
-        { id: identity.signalId, type: 'user-message', contents: item.content as never },
+        { id: identity.signalId, type: 'user-message', contents: queuedContents as never },
         {
           runId: identity.runId,
           resourceId: this.resourceId,
@@ -8382,6 +11380,11 @@ export class Session {
           ? identity
           : { runId: signal.runId, signalId: signal.signal.id };
       fallbackRunId = signalIdentity.runId;
+      // §10.2 agent_start carries the runId — emit it only AFTER sendSignal so
+      // the run is registered and the runId matches the one chunks/completion
+      // use (signalIdentity.runId may differ from the pre-dispatch identity).
+      this._emitAgentStart(signalIdentity.runId);
+      agentStarted = true;
       const completion = this._awaitQueuedRunCompletion(
         item,
         signalIdentity.runId,
@@ -8420,8 +11423,9 @@ export class Session {
       if (agentStarted && !agentEndEmitted && !(err instanceof QueuePostRunFinalizationPendingError)) {
         this._emitTurnEvent({
           type: 'agent_end',
-          reason: turnAbortController.signal.aborted ? 'aborted' : 'error',
+          finishReason: turnAbortController.signal.aborted ? 'aborted' : 'error',
           runId: fallbackRunId,
+          usage: this._runUsage(),
           queuedItemId: item.id,
         });
       }
@@ -8643,6 +11647,11 @@ export class Session {
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => {
+      // Teardown guard: if the session was closed/evicted/deleted while this
+      // retry was parked, `_settleCompletedQueuedItemAfterCancellation` would
+      // hit `_flushUpdate`'s terminal reject and reschedule itself forever — a
+      // perpetual no-op finalization loop on a dead session. Bail instead.
+      if (!this._canDrainQueue()) return;
       void this._settleCompletedQueuedItemAfterCancellation(item, full, modeId).catch(() => {
         this._notifyMaybeIdle();
       });
@@ -8666,7 +11675,17 @@ export class Session {
       }
       const now = Date.now();
       const next: SessionRecord = { ...prev };
-      if (opts?.modeId !== undefined) next.modeId = opts.modeId;
+      if (opts?.modeId !== undefined) {
+        next.modeId = opts.modeId;
+        // §4.2e — re-seed the base permission policy WITH the modeId flip so a crash
+        // between this queued-completion write and the later settlement flush can
+        // never persist the target mode alongside the previous mode's rules.
+        const seededRules = this._harness._modePermissionRules(opts.modeId);
+        if (seededRules !== undefined) {
+          next.permissionRules = seededRules;
+          next.permissionRulesSeedHash = sha256CanonicalJson(seededRules);
+        }
+      }
       if (receipt) {
         next.queueAdmissionReceipts = {
           ...(prev.queueAdmissionReceipts ?? {}),
@@ -8708,11 +11727,7 @@ export class Session {
     if (tokenUsageDelta !== undefined && full.finishReason !== 'suspended') {
       await this._raceActiveTurnWaiter(this._persistTokenUsageOrLatch(), activeTurnWaiter);
     }
-    this._emitTurnEvent({
-      type: 'agent_end',
-      reason: this._agentEndReasonForFullOutput(full),
-      runId: full.runId,
-    });
+    this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
     opts.onAgentEnd?.();
     await this._raceActiveTurnWaiter(this._runGoalJudge(full, (item.source ?? 'user') === 'goal'), activeTurnWaiter);
     return full;
@@ -8811,13 +11826,71 @@ export class Session {
         );
       }
       if (loaded.bytes !== attachment.bytes) {
+        // §4.5a has no separate `bytes_mismatch`; a recorded-size mismatch is a
+        // digest/bytes mismatch (the persisted ref no longer resolves to the
+        // recorded bytes).
         throw new HarnessAttachmentUnavailableError(
           attachment.ownerSessionId,
-          'bytes_mismatch',
+          'digest_mismatch',
           attachment.attachmentId,
         );
       }
     }
+  }
+
+  /**
+   * §14.2 / §13.7: build the agent signal contents for a turn, attaching any
+   * persisted attachment bytes as model file/image parts. With no attachments
+   * the contents stay the bare `content` string (byte-identical to the prior
+   * text-only dispatch — no behavior change for the common case). When
+   * attachments are present we load each ref's bytes (already validated by
+   * {@link _validateQueuedAttachmentRefs}) and build a structured user message
+   * mirroring the non-v1 harness file-part pattern, so the agent turn actually
+   * receives the attachment, not just the dedup identity.
+   */
+  private async _buildSignalContentsWithAttachments(
+    content: string,
+    attachments: PersistedAttachment[] | undefined,
+  ): Promise<AgentSignalContents> {
+    if (attachments === undefined || attachments.length === 0) {
+      return content;
+    }
+    const parts: Array<
+      { type: 'text'; text: string } | { type: 'file'; data: string; mediaType: string; filename?: string }
+    > = [{ type: 'text', text: content }];
+    for (const attachment of attachments) {
+      if (attachment.kind === 'url') {
+        // A URL-only attachment carries no bytes to inline; surface it as a file
+        // reference so the model still sees the link + filename.
+        parts.push({ type: 'file', data: attachment.url, mediaType: attachment.mimeType, filename: attachment.name });
+        continue;
+      }
+      const loaded = await this._storage.loadAttachment({
+        harnessName: this._record.harnessName,
+        sessionId: attachment.ownerSessionId,
+        attachmentId: attachment.attachmentId,
+      });
+      if (!loaded) {
+        throw new HarnessAttachmentUnavailableError(attachment.ownerSessionId, 'not_found', attachment.attachmentId);
+      }
+      const base64 = Buffer.from(loaded.data).toString('base64');
+      // Inline both image and non-image attachment bytes through the AI SDK v5
+      // file-part shape (a `data:<mime>;base64,<bytes>` URL). The v5 image-part
+      // shape keys on `image`/`mediaType`, not `data`/`mimeType`, so a hand-built
+      // `{ type: 'image', data, mimeType }` part silently drops its bytes when
+      // MessageList runs `convertImageFilePart` (it reads `part.image`, which is
+      // undefined). The file shape preserves bytes for image/* mime types too —
+      // `convertToDataContent` decodes the data URL regardless of media type — so
+      // one code path covers every inline attachment.
+      parts.push({
+        type: 'file',
+        data: `data:${attachment.mimeType};base64,${base64}`,
+        mediaType: attachment.mimeType,
+        filename: attachment.name,
+      });
+    }
+    // Upstream signals API (#merge): AgentSignalContents is a bare parts array.
+    return parts as AgentSignalContents;
   }
 
   private async _registerQuestion(
@@ -8851,10 +11924,18 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId: params.modeId ?? this._record.modeId,
+      // §4.2e — carry the active turn's yolo so a later tool approval on the
+      // resumed run is still auto-granted (pre-registered pendings win over the
+      // suspend-capture merge, so yolo must be stamped here too).
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         params.modeId ?? this._record.modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         question: params.question,
         ...(params.options ? { options: params.options } : {}),
@@ -8874,13 +11955,7 @@ export class Session {
       return { ...prev, pendingResume: pending };
     });
     if (!registered) return;
-    this._emitTurnEvent({
-      type: 'suspension_required',
-      kind: 'question',
-      toolCallId,
-      toolName: ASK_USER_TOOL_NAME,
-      runId,
-    });
+    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
   }
 
   private async _registerSandboxAccess(
@@ -8916,10 +11991,16 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId,
+      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         modeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         sandboxAccess: {
           semanticType: params.semanticType,
@@ -8950,20 +12031,9 @@ export class Session {
       return { ...prev, pendingResume: pending };
     });
     if (!registered) return;
-    this._emitTurnEvent({
-      type: 'sandbox_access_requested',
-      requestId: params.requestId,
-      toolCallId,
-      semanticType: params.semanticType,
-      ...(params.reason !== undefined ? { reason: params.reason } : {}),
-      ...(sanitizedPayload !== undefined ? { payload: sanitizedPayload } : {}),
-    });
-    this._emitTurnEvent({
-      type: 'suspension_required',
-      kind: 'sandbox-access',
-      toolCallId,
-      runId,
-    });
+    // §10.2: sandbox/path-access has no dedicated event — it projects to
+    // question_pending via the captured pending resume.
+    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
   }
 
   private async _registerPlanApproval(
@@ -8995,10 +12065,16 @@ export class Session {
       source: (this._record.subagentDepth ?? 0) > 0 ? 'subagent' : 'parent',
       requestedAt: Date.now(),
       modeId: submittingModeId,
+      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
+      ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         submittingModeId,
         params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
       ),
+      // §5.1 — carry the active turn's caller app bag onto the pending resume.
+      ...(this._currentTurnRequestContext
+        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
       payload: {
         ...(params.title !== undefined ? { title: params.title } : {}),
         plan: params.plan,
@@ -9018,13 +12094,7 @@ export class Session {
       return { ...prev, pendingResume: pending };
     });
     if (!registered) return;
-    this._emitTurnEvent({
-      type: 'suspension_required',
-      kind: 'plan-approval',
-      toolCallId,
-      toolName: SUBMIT_PLAN_TOOL_NAME,
-      runId,
-    });
+    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
   }
 
   /**
@@ -9073,6 +12143,22 @@ export class Session {
     });
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
+    // §10.2 OperationEvent — `queue_completed` is the queue settlement boundary,
+    // not `agent_end`. Requires the accepted-signal identities (`runId`,
+    // `signalId`); skip if the receipt never crossed the agent boundary.
+    if (!terminalFailure) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[itemId];
+      if (settledReceipt?.runId && settledReceipt.signalId) {
+        this._emit({
+          type: 'queue_completed',
+          runId: settledReceipt.runId,
+          queuedItemId: itemId,
+          signalId: settledReceipt.signalId,
+          ...(settledReceipt.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+          result,
+        });
+      }
+    }
     const resolver = this._queueResolvers.get(itemId);
     if (resolver) {
       this._queueResolvers.delete(itemId);
@@ -9130,6 +12216,33 @@ export class Session {
     });
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
+    // §10.2 OperationEvent — a late failure may race a completion that already
+    // won (`completedResult`): emit `queue_completed` for that, else
+    // `queue_failed`. `signalId`/`runId` are optional on the failed event.
+    {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[itemId];
+      if (completedResult !== undefined) {
+        if (settledReceipt?.runId && settledReceipt.signalId) {
+          this._emit({
+            type: 'queue_completed',
+            runId: settledReceipt.runId,
+            queuedItemId: itemId,
+            signalId: settledReceipt.signalId,
+            ...(settledReceipt.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+            result: completedResult,
+          });
+        }
+      } else {
+        this._emit({
+          type: 'queue_failed',
+          queuedItemId: itemId,
+          ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
+          ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
+          ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+          error: projectHarnessPublicError(err),
+        });
+      }
+    }
     const resolver = this._queueResolvers.get(itemId);
     if (resolver) {
       this._queueResolvers.delete(itemId);
@@ -9213,12 +12326,6 @@ export class Session {
     }
   }
 
-  private _emitQueueItemReplayedOnce(queuedItemId: string): void {
-    if (this._replayedQueuedItemIds.has(queuedItemId)) return;
-    this._replayedQueuedItemIds.add(queuedItemId);
-    this._emitter.emit({ type: 'queue_item_replayed', queuedItemId });
-  }
-
   private _ensureQueuedItemContext(queuedItemId: string): void {
     if (this._currentQueuedItemId !== undefined) return;
     const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
@@ -9274,6 +12381,12 @@ export class Session {
     this._queueWakeAt = undefined;
   }
 
+  /** TM-6 — cancel any pending reconcile-on-rehydrate retry timers on teardown. */
+  private _clearDelegationReconcileTimers(): void {
+    for (const timer of this._delegationReconcileRetryTimers) clearTimeout(timer);
+    this._delegationReconcileRetryTimers.clear();
+  }
+
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
     if (this._queueResolvers.size === 0) {
       timer.unref?.();
@@ -9291,10 +12404,10 @@ export class Session {
 
   private _assertLive(_method: string): void {
     if (this._state === 'deleted') {
-      throw new HarnessSessionDeletedError(this.id);
+      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     }
     if (this.isClosing) {
-      throw new HarnessSessionClosingError(this.id);
+      throw harnessSessionClosingError(this);
     }
     if (this._state !== 'live') {
       throw new HarnessSessionClosedError(this.id);
@@ -9303,13 +12416,13 @@ export class Session {
 
   private _assertNotDeleted(): void {
     if (this._state === 'deleted') {
-      throw new HarnessSessionDeletedError(this.id);
+      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     }
   }
 
   private _assertOpenForTurn(_method: string): void {
     if (this._state === 'deleted') {
-      throw new HarnessSessionDeletedError(this.id);
+      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     }
     if (this._state === 'closed') {
       throw new HarnessSessionClosedError(this.id);
@@ -9351,63 +12464,171 @@ export class Session {
       return Promise.reject(new HarnessSessionClosedError(this.id));
     }
     if (this._state === 'deleted') {
-      return Promise.reject(new HarnessSessionDeletedError(this.id));
+      return Promise.reject(new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId));
     }
     if (this._state === 'evicted') {
       return Promise.reject(new HarnessSessionClosedError(this.id));
     }
     const run = async (): Promise<void> => {
-      const leaseExpiresAt = this._record.leaseExpiresAt;
-      if (
-        (this._state === 'live' || this._state === 'closing') &&
-        leaseExpiresAt !== undefined &&
-        leaseExpiresAt <= Date.now()
-      ) {
-        await this._harness._internalEvictLiveSessionLeaseLost(this);
-        throw new HarnessSessionLockedError(this.id, 'unknown', leaseExpiresAt);
+      // §5.8 write-concurrency: a caller-supplied `ifVersion` (remote state
+      // PATCH OCC) must fail closed on conflict — never retry. Internal flushes
+      // may recover from a cross-owner CAS conflict once (same-process writes
+      // serialize on the flush chain, so a conflict here means another owner).
+      const maxRetries = opts?.ifVersion !== undefined ? 0 : 1;
+      for (let attempt = 0; ; attempt++) {
+        const leaseExpiresAt = this._record.leaseExpiresAt;
+        if (
+          (this._state === 'live' || this._state === 'closing') &&
+          leaseExpiresAt !== undefined &&
+          leaseExpiresAt <= Date.now()
+        ) {
+          await this._harness._internalEvictLiveSessionLeaseLost(this);
+          throw new HarnessSessionLockedError(this.id, 'unknown', leaseExpiresAt);
+        }
+        if (opts?.ifVersion !== undefined && this._record.version !== opts.ifVersion) {
+          throw new HarnessStateConflictError(this.id, opts.ifVersion, this._record.version);
+        }
+        // §10.2 state_changed: capture the pre-update durable state so we can
+        // diff it after the write commits. Internal flushes that don't touch
+        // `state` (mode/model/token/goal/pendingResume) keep the same reference
+        // and produce no changed keys, so they never emit.
+        const prevState = this._record.state;
+        const updated = update(this._record);
+        const tokenUsageDelta =
+          typeof opts?.tokenUsageDelta === 'function' ? opts.tokenUsageDelta() : opts?.tokenUsageDelta;
+        const tokenUsageForSave =
+          tokenUsageDelta !== undefined
+            ? {
+                promptTokens: this._tokenUsage.promptTokens + tokenUsageDelta.promptTokens,
+                completionTokens: this._tokenUsage.completionTokens + tokenUsageDelta.completionTokens,
+                totalTokens: this._tokenUsage.totalTokens + tokenUsageDelta.totalTokens,
+              }
+            : this._tokenUsage;
+        const next: SessionRecord = {
+          ...updated,
+          // Overlay the live token-usage counter so every CAS write persists the
+          // latest aggregate. Updaters never need to thread `tokenUsage` through
+          // their closures, and `_recordTurnCompletion` mutations between save
+          // construction and post-save assignment are not lost — we re-overlay
+          // from the live counter below.
+          tokenUsage: { ...tokenUsageForSave },
+          lastActivityAt: Date.now(),
+        };
+        const saveOpts = {
+          harnessName: this._record.harnessName,
+          ownerId: this._ownerId,
+          ifVersion: this._record.version,
+        };
+        try {
+          const saved =
+            opts?.attachmentReferences && opts.attachmentReferences.length > 0
+              ? await this._storage.saveSessionWithAttachmentReferences(next, saveOpts, opts.attachmentReferences)
+              : await this._storage.saveSession(next, saveOpts);
+          // `tokenUsageDelta` is applied only after a successful save, so a
+          // failed attempt never double-counts on retry.
+          this._applyTokenUsageDelta(tokenUsageDelta);
+          this._clearPendingTokenUsageFlushErrorIfSaved(next.tokenUsage);
+          // §5.8 advance-only lease expiry: `next` was built from an older
+          // `_record`, so a subtree renewal that marked a later expiry on this
+          // session while the save was in flight must not be regressed by this
+          // reassignment. Carry the max so the local lease guard never fences a
+          // still-valid session early. saveSession does not persist lease
+          // metadata, so this is an in-memory reconciliation only.
+          const committedLeaseExpiresAt =
+            Math.max(next.leaseExpiresAt ?? 0, this._record.leaseExpiresAt ?? 0) || undefined;
+          this._record = {
+            ...next,
+            tokenUsage: { ...this._tokenUsage },
+            version: saved.version,
+            leaseExpiresAt: committedLeaseExpiresAt,
+          };
+          // §10.2 state_changed — emit only when durable `session.state` actually
+          // changed, after the record is committed so subscribers reading state
+          // see the post-write value.
+          const stateChangedKeys = diffStateKeys(prevState, this._record.state);
+          if (stateChangedKeys.length > 0) {
+            this._emit({
+              type: 'state_changed',
+              // §10.2: full post-commit root. `session.state` is `unknown` and may
+              // be a scalar/array/object root; carry it as-is so a `'$'`-keyed root
+              // change is readable from this field. `undefined` (no state yet) is
+              // reported as `{}` to keep the prior empty-object default.
+              state: (this._record.state ?? {}) as JsonValue,
+              changedKeys: stateChangedKeys,
+            });
+          }
+          return;
+        } catch (err) {
+          // §5.8: the save's lease-holder check fired — another owner holds the
+          // lease, so subtree ownership was lost (root conflict) or split (child
+          // conflict). Fence the WHOLE live subtree rather than only this session
+          // or retrying into a contested record.
+          if (err instanceof HarnessStorageLeaseConflictError) {
+            await this._harness._internalEvictSubtreeLeaseLost(this);
+            throw new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt);
+          }
+          if (!(err instanceof HarnessStorageVersionConflictError) || attempt >= maxRetries) {
+            throw err;
+          }
+          // §5.8: before re-applying, prove this owner still holds the SUBTREE
+          // lease. For a child this proves through the root, not the child's own
+          // row — renewing the child alone would not detect a parent/root
+          // ownership loss or subtree split. The helper renews root + active
+          // descendants and fences the whole subtree (throwing locked/not-found)
+          // if ownership can't be proven.
+          await this._harness._internalRenewProveSubtree(
+            this,
+            this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+          );
+          const reloaded = await this._storage.loadSession({
+            harnessName: this._record.harnessName,
+            sessionId: this.id,
+          });
+          if (!reloaded) {
+            await this._harness._internalEvictLiveSessionLeaseLost(this);
+            throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+          }
+          // Adopt the concurrent durable state under our proven lease, then loop
+          // to re-apply the (pure) updater against the reloaded record.
+          this._record = { ...reloaded, ownerId: this._ownerId, leaseExpiresAt: this._record.leaseExpiresAt };
+        }
       }
-      if (opts?.ifVersion !== undefined && this._record.version !== opts.ifVersion) {
-        throw new HarnessStateConflictError(this.id, opts.ifVersion, this._record.version);
-      }
-      const updated = update(this._record);
-      const tokenUsageDelta =
-        typeof opts?.tokenUsageDelta === 'function' ? opts.tokenUsageDelta() : opts?.tokenUsageDelta;
-      const tokenUsageForSave =
-        tokenUsageDelta !== undefined
-          ? {
-              promptTokens: this._tokenUsage.promptTokens + tokenUsageDelta.promptTokens,
-              completionTokens: this._tokenUsage.completionTokens + tokenUsageDelta.completionTokens,
-              totalTokens: this._tokenUsage.totalTokens + tokenUsageDelta.totalTokens,
-            }
-          : this._tokenUsage;
-      const next: SessionRecord = {
-        ...updated,
-        // Overlay the live token-usage counter so every CAS write persists the
-        // latest aggregate. Updaters never need to thread `tokenUsage` through
-        // their closures, and `_recordTurnCompletion` mutations between save
-        // construction and post-save assignment are not lost — we re-overlay
-        // from the live counter below.
-        tokenUsage: { ...tokenUsageForSave },
-        lastActivityAt: Date.now(),
-      };
-      const saveOpts = {
-        harnessName: this._record.harnessName,
-        ownerId: this._ownerId,
-        ifVersion: this._record.version,
-      };
-      const saved =
-        opts?.attachmentReferences && opts.attachmentReferences.length > 0
-          ? await this._storage.saveSessionWithAttachmentReferences(next, saveOpts, opts.attachmentReferences)
-          : await this._storage.saveSession(next, saveOpts);
-      this._applyTokenUsageDelta(tokenUsageDelta);
-      this._clearPendingTokenUsageFlushErrorIfSaved(next.tokenUsage);
-      this._record = { ...next, tokenUsage: { ...this._tokenUsage }, version: saved.version };
     };
     // Chain so concurrent callers serialize against the latest in-memory
     // version. Swallow chain-link errors so one caller's failure doesn't
     // poison subsequent flushes.
     const next = this._flushChain.then(run, run);
     this._flushChain = next.catch(() => {});
+    return next;
+  }
+
+  /**
+   * Serialize a plan-task read-modify-write op onto the same per-session
+   * `_flushChain` that serializes `_flushUpdate`.
+   *
+   * §5.8 / TM-5 concurrency: a single model turn can emit parallel tool calls
+   * (the agent loop executes tool calls in a step concurrently), so two
+   * `task_*` tools can run at once for one live session. Each plan-task op does
+   * a read (`listPlanTasks`) → compute (rollup / single-`in_progress` / cycle
+   * checks) → write (`mutatePlanTasksForSession`). The storage fence keys on the
+   * SESSION version, which plan-task writes do NOT bump, and per-row OCC only
+   * guards same-row writes — so two ops touching DIFFERENT rows (e.g. each
+   * driving a different sibling `in_progress`) both read the same pre-image,
+   * both pass their invariant checks, and both commit, violating the per-root
+   * single-`in_progress` / rollup invariants. Running the whole op body inside
+   * this chain makes them one-at-a-time per session, so the second op's read
+   * sees the first op's committed result and its invariant check is honored.
+   *
+   * Unlike `_flushUpdate`, errors propagate to the caller (a `task_*` tool must
+   * surface a conflict) but are swallowed from the stored chain link so one
+   * op's failure never poisons a later op.
+   */
+  private _serializePlanTaskWrite<T>(run: () => Promise<T>): Promise<T> {
+    const next = this._flushChain.then(run, run);
+    this._flushChain = next.then(
+      () => {},
+      () => {},
+    );
     return next;
   }
 
@@ -9420,21 +12641,58 @@ export class Session {
    * Returns undefined when no overrides apply (agent runs with its own tools).
    */
   private _buildToolsets(mode: HarnessMode, callAdditional?: ToolsInput): Record<string, ToolsInput> | undefined {
+    // §4.2e workspace tool profile: when the mode declares `workspaceTools.expose`,
+    // withhold workspace-category tools (read/edit/execute) NOT in the list from
+    // the harness-controlled toolsets (mode + per-call). mcp/other/uncategorized
+    // tools and the harness built-ins are never filtered. Needs a configured
+    // `toolCategoryResolver`; with none, categories are null and nothing is hidden.
+    const expose = mode.workspaceTools?.expose;
+    const profile = (tools: ToolsInput): ToolsInput =>
+      expose ? this._applyWorkspaceToolProfile(tools, expose) : tools;
     const toolsets: Record<string, ToolsInput> = {};
-    if (mode.tools) toolsets[`mode:${mode.id}`] = mode.tools;
-    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = mode.additionalTools;
-    if (callAdditional) toolsets[`call:additional`] = callAdditional;
+    if (mode.tools) toolsets[`mode:${mode.id}`] = profile(mode.tools);
+    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
+    if (callAdditional) toolsets[`call:additional`] = profile(callAdditional);
+    // §9 — a SubagentDefinition.tools override (set on the child session at spawn)
+    // is layered onto the subagent's surface, subject to the same workspace-tool
+    // profile + permission gate as any other tool.
+    if (this._subagentToolsOverride) toolsets[`subagent:tools`] = profile(this._subagentToolsOverride);
 
-    // Built-in `spawn_subagent` tool. Registered automatically when the
-    // harness has any subagent types configured. Closes over this session
-    // so the tool can resolve the registry, create child sessions, bridge
-    // events back, and enforce the depth cap (§9).
+    // Built-in tools registered on the `harness:builtin` toolset (§6.4 / §9).
+    // `spawn_subagent` is conditional on subagent types being configured; the
+    // plan-task tools are always available. Both close over this session so they
+    // act on the calling session only (§6.4 ownership rule).
+    const builtins: ToolsInput = {};
     const spawn = createSpawnSubagentTool(this);
-    if (spawn) {
-      toolsets['harness:builtin'] = { [SPAWN_SUBAGENT_TOOL_ID]: spawn };
+    if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+    // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
+    // for the durable HarnessPlanTask tree; each write routes through this
+    // session under its lease.
+    Object.assign(builtins, createPlanTaskTools(this));
+    if (Object.keys(builtins).length > 0) {
+      toolsets['harness:builtin'] = builtins;
     }
 
     return Object.keys(toolsets).length === 0 ? undefined : toolsets;
+  }
+
+  /**
+   * Withhold workspace-category tools (`read`/`edit`/`execute`) whose category is
+   * NOT in `expose` (§4.2e workspace tool profile). `mcp`/`other`/uncategorized
+   * tools pass through unchanged — the profile governs the workspace tool surface
+   * only, never the workspace itself. Returns a fresh map; the input is untouched.
+   */
+  private _applyWorkspaceToolProfile(tools: ToolsInput, expose: readonly ToolCategory[]): ToolsInput {
+    if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) return tools;
+    const allowed = new Set<ToolCategory>(expose);
+    const out: Record<string, unknown> = {};
+    for (const [name, tool] of Object.entries(tools as Record<string, unknown>)) {
+      const category = this._harness.getToolCategory({ toolName: name });
+      const isWorkspaceCategory = category === 'read' || category === 'edit' || category === 'execute';
+      if (isWorkspaceCategory && !allowed.has(category)) continue; // withheld for this mode
+      out[name] = tool;
+    }
+    return out as ToolsInput;
   }
 
   /**
@@ -9453,19 +12711,41 @@ export class Session {
     abortSignal: AbortSignal;
     persistedRequestContext?: PersistedRequestContextInput;
     resolveWorkspace?: boolean;
+    /**
+     * Per-turn `yolo` (§4.2e / `QueueOverrides.yolo`). When `true`, clear the
+     * POLICY-level approval reason this turn would raise (an effective `ask` from
+     * the permission gate). Per spec it suppresses ONLY the `policy` reason — it
+     * never suppresses a tool-owned `requireApproval`/`needsApprovalFn`, and never
+     * bypasses a `deny`. Only the queued-turn drain sets it today (a queued item
+     * persists `yolo` so it survives crash replay).
+     */
+    yolo?: boolean;
   }): Promise<RequestContext> {
     const session = this;
     const stateSnapshot = (this._record.state ?? {}) as unknown;
     const persistedRequestContext = turn.persistedRequestContext
       ? clonePersistedRequestContext(turn.persistedRequestContext)
       : undefined;
-    // Resolve the workspace eagerly so tools see a populated `ctx.workspace`
-    // without each tool re-awaiting. Catalog-only callers can opt out to avoid
-    // provisioning a workspace for read-only inventory.
+    // §5.1 — stash the turn's caller context so a suspension can persist it on
+    // `PendingResume` and a resume rebuild the SAME app bag. GUARDED on
+    // `turn.persistedRequestContext` so non-turn callers (e.g. `mcp.listTools`,
+    // which pass no caller context) never clobber an active turn's stash; the
+    // per-turn reset in `_resetTurnTracking` keeps turn N's bag out of turn N+1.
+    if (persistedRequestContext !== undefined) {
+      this._currentTurnRequestContext = persistedRequestContext;
+    }
+    // §6.2 strict-lazy materialization: context construction MUST NOT cold-start a
+    // (cloud) workspace solely to fill the `ctx.workspace` field. Default to the
+    // cached handle (non-materializing); a tool that needs the filesystem calls
+    // `ctx.resolveWorkspace()`, and the workspace's own built-in tools resolve
+    // through the agent's workspace independently of this slot. This is UNIFORM
+    // across top-level and subagent sessions: a `fresh`/per-session subagent owns
+    // a DISTINCT workspace identity, but the backing sandbox is provisioned only
+    // when that session first resolves it — `fresh` guarantees independence on
+    // resolution, not allocation at spawn (task #36). A caller may force eager
+    // materialization with `resolveWorkspace: true`.
     let workspace: Workspace | undefined;
-    if (turn.resolveWorkspace === false) {
-      workspace = this._workspace;
-    } else {
+    if (turn.resolveWorkspace === true) {
       try {
         workspace = await this._getWorkspaceUnchecked();
       } catch {
@@ -9473,9 +12753,13 @@ export class Session {
         // The registry has already emitted workspace_error so subscribers know.
         workspace = undefined;
       }
+    } else {
+      workspace = this.peekWorkspace();
     }
     const harnessSlot: HarnessRequestContext<unknown> = {
-      harnessId: this._harness.ownerId,
+      // §6.1: harnessName is the stable namespace; harnessInstanceId is per-process.
+      harnessName: this._record.harnessName,
+      harnessInstanceId: this._harness.ownerId,
       sessionId: this.id,
       threadId: this.threadId,
       resourceId: this.resourceId,
@@ -9495,6 +12779,7 @@ export class Session {
         session._registerPlanApproval({ ...params, modeId: turn.modeId, modelId: turn.modelId }),
       registerSandboxAccess: params =>
         session._registerSandboxAccess({ ...params, modeId: turn.modeId, modelId: turn.modelId }),
+      emitCustomEvent: event => session._emitCustomEvent(event),
       extendLease: opts => session.extendLease(opts),
       // Subagent linkage — set from the record so spawned sessions report
       // their depth + parent linkage on the harness slot.
@@ -9506,6 +12791,16 @@ export class Session {
         if (!agentType) return null;
         return this._record.subagentModelOverrides?.[agentType] ?? null;
       },
+      // §6.1 workspace access — delegate to the owning session so the
+      // materialization/lease logic stays in one place. `getWorkspace()` is the
+      // sync cached read (non-materializing); `resolveWorkspace()` cold-starts.
+      hasWorkspace: () => session.hasWorkspace(),
+      isWorkspaceReady: () => session.isWorkspaceReady(),
+      getWorkspace: () => session.peekWorkspace(),
+      resolveWorkspace: () => session.resolveWorkspace(),
+      // §5.1b.4/§5.6/§10.6 activity timeline — delegate to the owning session so the
+      // read-time projection logic lives in one place.
+      getActivityTimeline: (opts?: ActivityTimelineOptions) => session.getActivityTimeline(opts),
       // Tool-facing skill execution. Delegates back to the owning session
       // so resolution, args validation, prompt construction, and dispatch
       // stay in one place (§4.6).
@@ -9519,7 +12814,118 @@ export class Session {
     if (persistedRequestContext?.channel) {
       entries.push(['channel', persistedRequestContext.channel]);
     }
+    // §4.2e permission GATE — thread a per-tool policy resolver the loop's
+    // tool-call step consults (deny → block, ask → require approval, allow →
+    // proceed). OPT-IN: only engaged when the operator configured a policy
+    // (mode.permissions/runtime rules, or an explicit defaultPermissionPolicy),
+    // so an unconfigured harness keeps today's no-gate behavior.
+    if (this._toolPermissionGateEngaged()) {
+      // Snapshot rules/grants/default at turn-build time so a concurrent
+      // switchMode (or runtime setPolicy) mid-turn cannot retroactively re-gate an
+      // in-flight turn. Resume rebuilds the context (re-snapshots the CURRENT
+      // policy), so parked approvals still re-evaluate per §4.2e.
+      const ruleSnapshot: PermissionRules = {
+        categories: { ...this._record.permissionRules.categories },
+        tools: { ...this._record.permissionRules.tools },
+      };
+      const grantSnapshot: SessionGrants = {
+        categories: [...this._record.sessionGrants.categories],
+        tools: [...this._record.sessionGrants.tools],
+      };
+      const defaultPolicy = this._harness._getDefaultPermissionPolicy();
+      // M4: snapshot the subagent allowlist alongside the policy so a non-listed
+      // tool resolves to a hard `deny` (the §14.7 channel fence already ran upstream
+      // at the pre-exposure gate; this composes after it and ahead of the policy).
+      const allowlistSnapshot = this._subagentToolAllowlist ? new Set(this._subagentToolAllowlist) : undefined;
+      entries.push([
+        '__mastra_toolPermissionPolicy',
+        (toolName: string) =>
+          session._resolveToolPolicy(toolName, ruleSnapshot, grantSnapshot, defaultPolicy, allowlistSnapshot),
+      ]);
+      // §O4 — deny observability: the loop calls this when the policy above blocks
+      // a tool (pre-exposure removal or action-time refusal), so a `tool_denied`
+      // event surfaces WHY instead of the denial being silent. Sync + best-effort.
+      entries.push([
+        '__mastra_onToolDenied',
+        (info: {
+          toolName: string;
+          stage: 'pre-exposure' | 'action';
+          toolCallId?: string;
+          forcedToolChoice?: boolean;
+        }) => {
+          session._emitTurnEvent({
+            type: 'tool_denied',
+            toolName: info.toolName,
+            stage: info.stage,
+            ...(info.toolCallId !== undefined ? { toolCallId: info.toolCallId } : {}),
+            ...(info.forcedToolChoice ? { forcedToolChoice: true } : {}),
+            ...(session._currentRunId !== undefined ? { runId: session._currentRunId } : {}),
+          });
+        },
+      ]);
+    }
+    // §4.2e `yolo` — a per-turn suppressor for the POLICY-level approval reason
+    // (an effective `ask` from the permission gate). Per spec it clears ONLY the
+    // `policy` reason; it never suppresses a tool-owned `requireApproval`/
+    // `needsApprovalFn`, and never bypasses a `deny`. The loop's tool-call step
+    // honors it AFTER the `deny` short-circuit.
+    if (turn.yolo === true) {
+      entries.push(['__mastra_yoloAutoApprove', true]);
+    }
     return new RequestContext(entries);
+  }
+
+  /**
+   * Whether the §4.2e permission gate is engaged for this session. True when the
+   * session has ANY per-tool/category rule, OR the harness `defaultPermissionPolicy`
+   * was explicitly configured. When neither holds, the gate is OFF (no resolver is
+   * threaded) and tools run ungated, preserving pre-§4.2e behavior.
+   */
+  private _toolPermissionGateEngaged(): boolean {
+    if (this._harness._isDefaultPermissionPolicyConfigured()) return true;
+    // M4: a subagent capability allowlist must engage the gate too — the resolver
+    // is what hard-denies (and pre-exposure removes) tools outside the scope.
+    if (this._subagentToolAllowlist !== undefined) return true;
+    const rules = this._record.permissionRules;
+    return Object.keys(rules.categories).length > 0 || Object.keys(rules.tools).length > 0;
+  }
+
+  /**
+   * Resolve the effective permission policy for a tool (§4.2e order) against a
+   * per-turn POLICY SNAPSHOT: a per-tool rule wins, else the tool's category rule,
+   * else the harness default. A matching tool/category GRANT turns an `ask` into
+   * `allow` (a grant suppresses only the policy-level ask; it never overrides a
+   * `deny`). Harness-owned built-ins always resolve to `allow` — they are
+   * infrastructure, never gated by the session policy.
+   */
+  private _resolveToolPolicy(
+    toolName: string,
+    rules: PermissionRules,
+    grants: SessionGrants,
+    defaultPolicy: PermissionPolicy,
+    allowlist?: ReadonlySet<string>,
+  ): PermissionPolicy {
+    // Always-kept builtins (HITL + local plan-task orchestration) bypass the gate
+    // entirely — but the escalation builtins (spawn_subagent / task_delegate) do
+    // NOT, so an allowlist below can still gate them (anti-escalation, M4).
+    if (HARNESS_BUILTIN_TOOL_IDS.has(toolName) && !ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
+    // M4 — subagent capability scope: a tool outside the allowlist is a hard deny
+    // (removed pre-exposure; refused at action time), regardless of permission rules.
+    if (allowlist !== undefined && !allowlist.has(toolName)) return 'deny';
+    // Escalation builtins that are either un-scoped (no allowlist) or explicitly
+    // listed run as normal harness infrastructure.
+    if (ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
+    const category = this._harness.getToolCategory({ toolName }) ?? undefined;
+    let policy: PermissionPolicy =
+      (rules.tools[toolName] as PermissionPolicy | undefined) ??
+      (category !== undefined ? (rules.categories[category] as PermissionPolicy | undefined) : undefined) ??
+      defaultPolicy;
+    if (policy === 'ask') {
+      const granted =
+        grants.tools.includes(toolName) || (category !== undefined && grants.categories.includes(category));
+      if (granted) policy = 'allow';
+    }
+    return policy;
   }
 
   private async _setTurnState<TState = unknown>(
@@ -9534,6 +12940,10 @@ export class Session {
         typeof updatesOrUpdater === 'function'
           ? (updatesOrUpdater as (prev: TState) => TState)(current)
           : ({ ...(current as object), ...(updatesOrUpdater as object) } as TState);
+      // §5.1: same pre-commit JSON-serializability guard as `setState()` — a tool
+      // that writes a non-serializable value fails closed, not silently.
+      const badPath = firstNonJsonStatePath(next, '$', new Set());
+      if (badPath !== undefined) throw new HarnessStateSerializationError(this.id, badPath);
       return { ...prev, state: next };
     });
   }
@@ -9544,7 +12954,7 @@ export class Session {
       return;
     }
     this._state = 'closing';
-    this._rejectIdleWaiters(new HarnessSessionClosingError(this.id));
+    this._rejectIdleWaiters(harnessSessionClosingError(this));
   }
 
   /** @internal — restore admission if close failed before the durable marker committed. */
@@ -9558,7 +12968,7 @@ export class Session {
    * @internal — used by the Harness after close starts. New work is rejected
    * immediately while previously admitted flushes serialize before the marker.
    */
-  _flushClosingMarker(params: { closeTimeoutMs: number }): Promise<SessionRecord> {
+  _flushClosingMarker(params: { closeTimeoutMs: number; closeDeadlineAt?: number }): Promise<SessionRecord> {
     if (this.isClosed) {
       return Promise.resolve(this._record);
     }
@@ -9566,7 +12976,15 @@ export class Session {
 
     const run = async (): Promise<SessionRecord> => {
       const closingAt = this._record.closingAt ?? Date.now();
-      const closeDeadlineAt = this._record.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
+      // §5.5: ONE fixed deadline for the whole subtree. The close owner stamps a
+      // single `closeDeadlineAt` at the root and propagates it here, so a
+      // descendant marked mid-walk never resets the clock to its own wall-clock
+      // `now + closeTimeoutMs`. The per-node `closingAt + closeTimeoutMs` is only
+      // a fallback for the root (or a standalone flush where no subtree deadline
+      // is supplied) and is overridden by any deadline already persisted on the
+      // record (resumed close).
+      const closeDeadlineAt =
+        this._record.closeDeadlineAt ?? params.closeDeadlineAt ?? closingAt + params.closeTimeoutMs;
       const next: SessionRecord = {
         ...this._record,
         closingAt,
@@ -9625,23 +13043,34 @@ export class Session {
    */
   _markClosed(updatedRecord: SessionRecord): void {
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
+    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
+    // that will never reach a terminal here) so they cannot accumulate.
+    this._openRuns.clear();
+    this._finalizedRunIds.clear();
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
   }
 
   /** @internal — used by Harness hard-delete after storage has removed the row. */
   _markDeleted(): void {
-    const err = new HarnessSessionDeletedError(this.id);
+    const err = new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     this._leaseExtensionDeadline = undefined;
     this._state = 'deleted';
+    this._openRuns.clear();
+    this._finalizedRunIds.clear();
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
     const activeTurn = this._currentTurnAbortController;
     if (activeTurn) {
-      activeTurn.abort('session_deleted');
+      // §6.2: hard-delete is a terminal teardown — the record is gone, so tools
+      // should run rollback/cleanup (`session_closed`), not the record-survives
+      // `process_restart` semantics. The operation rejection above already carries
+      // the precise HarnessSessionDeletedError.
+      activeTurn.abort(new HarnessAbortedError(this.id, 'session_closed'));
       this._endTurn(activeTurn);
     }
     if (this._queuedResumeRecoveryTimer !== undefined) {
@@ -9649,6 +13078,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const [queuedItemId, resolver] of this._queueResolvers) {
@@ -9683,7 +13113,9 @@ export class Session {
     this._rejectActiveTurnWaiters(err);
     const activeTurn = this._currentTurnAbortController;
     if (activeTurn) {
-      activeTurn.abort('session_evicted');
+      // §6.2: eviction releases live process ownership without a durable close —
+      // tools see `process_restart` so they do best-effort cleanup, not rollback.
+      activeTurn.abort(new HarnessAbortedError(this.id, 'process_restart'));
       this._endTurn(activeTurn);
     }
     if (this._queuedResumeRecoveryTimer !== undefined) {
@@ -9691,6 +13123,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
+    this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const [queuedItemId, resolver] of this._queueResolvers) {
@@ -9702,6 +13135,14 @@ export class Session {
   /** @internal — update local lease metadata after the owning Harness renews storage. */
   _markLeaseRenewed(expiresAt: number): void {
     if (this._state !== 'live' && this._state !== 'closing') return;
+    // Advance-only (§5.8): a subtree renewal marks the root AND every live
+    // descendant from the root's renewal chain, which can interleave with a
+    // descendant's own `_flushUpdate`. Never regress the in-memory expiry below
+    // a value already observed, so a racing flush carrying an older snapshot
+    // can't shorten a freshly renewed lease. Storage remains authoritative via
+    // `renewSessionLeaseSubtree`.
+    const current = this._record.leaseExpiresAt;
+    if (current !== undefined && current >= expiresAt) return;
     this._record = { ...this._record, leaseExpiresAt: expiresAt };
   }
 
@@ -9740,6 +13181,627 @@ export class Session {
     this._runCompletionPromises.clear();
   }
 
+  // -------------------------------------------------------------------------
+  // Plan tasks (HARNESS_V1_SPEC.md §5.1k / §6.4 — TM-3/TM-4).
+  //
+  // The model mutates its plan tree exclusively through the built-in plan-task
+  // tools (`task_add` / `task_decompose` / `task_reparent` / `task_update` /
+  // `task_complete` / `plan_task_check` / `task_write`), which call these
+  // methods. The session is the single serialized writer: every mutator fences
+  // on this owner + the current SessionRecord.version (§5.8), runs the TM-4
+  // hierarchy semantics, commits transaction-shaped via
+  // `mutatePlanTasksForSession`, and emits `papersflow.plan_task.updated`.
+  // -------------------------------------------------------------------------
+
+  /** Build the small port the plan-task operations need. */
+  private _planTaskPort(): PlanTaskSessionPort {
+    const session = this;
+    return {
+      id: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      harnessName: this._record.harnessName,
+      storage: this._storage,
+      ownerId: this._ownerId,
+      get sessionVersion() {
+        return session._record.version;
+      },
+      emitPlanTaskEvent: payload => session._emitPlanTaskEvent(payload),
+      setPlanTaskSummary: summary => {
+        session._planTaskSummary = summary;
+        session._planTaskSummarySeeded = true;
+      },
+    };
+  }
+
+  /**
+   * §5.1k / TM-5 — lazily seed the bounded plan-task summary ONCE for a hydrated
+   * session that may carry pre-existing plan tasks but hasn't mutated yet, so the
+   * first `getDisplayState()` after hydration eventually reflects the tree.
+   *
+   * The counts (`total`/`byStatus`/`rootCount`) come from a cheap EXACT aggregate
+   * (`countPlanTasksByStatus` — a `COUNT(*) GROUP BY status`, never a row load) so
+   * they are correct no matter how large the tree is; a bounded single-page read
+   * would silently undercount a tree larger than the page. `inProgressTaskIds`
+   * is naturally bounded (one explicit per root by §5.1k) and read via a small
+   * status-filtered subtree slice, capped defensively.
+   *
+   * Idempotent and fire-and-forget — any mutation recomputes the authoritative
+   * summary from the post-image for free. Best-effort: a failed read leaves the
+   * summary unseeded for a later retry. When the seed completes and nothing else
+   * populated the summary first, it nudges any display subscriber so the absent
+   * `planTasks` field becomes observable without waiting for an unrelated event.
+   */
+  private _maybeSeedPlanTaskSummary(): void {
+    if (this._planTaskSummarySeeded) return;
+    this._planTaskSummarySeeded = true;
+    void Promise.all([
+      this._storage.countPlanTasksByStatus({ harnessName: this._record.harnessName, sessionId: this.id }),
+      // Bounded: in_progress is at most one explicit per root (§5.1k); cap defensively.
+      this._storage.loadPlanTaskSubtree({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        status: 'in_progress',
+        limit: PLAN_TASK_SUMMARY_IN_PROGRESS_CAP,
+      }),
+    ])
+      .then(([counts, inProgress]) => {
+        // A concurrent mutation may have set the authoritative summary first; only
+        // fill the seed if nothing has populated it yet.
+        if (this._planTaskSummary !== undefined) return;
+        this._planTaskSummary = {
+          total: counts.total,
+          byStatus: counts.byStatus,
+          rootCount: counts.rootCount,
+          inProgressTaskIds: inProgress.tasks.map(t => t.taskId),
+        };
+        // Make the freshly-seeded summary observable: a display-only refresh so a
+        // subscriber sees `planTasks` without waiting for an unrelated §10.2 event.
+        // No persisted event is emitted — the seed reflects already-durable state.
+        this._notifyDisplayRefresh();
+      })
+      .catch(() => {
+        // Allow a later snapshot to retry the seed.
+        this._planTaskSummarySeeded = false;
+      });
+  }
+
+  /**
+   * Emit the `papersflow.plan_task.updated` custom event (§10.3). Goes through
+   * the same validation/stamping path as `ctx.emitCustomEvent`, so it is gated
+   * on an active turn — plan tasks are only mutated by tools running mid-turn.
+   */
+  private _emitPlanTaskEvent(payload: JsonValue): void {
+    this._emitCustomEvent({ type: PLAN_TASK_UPDATED_EVENT, payload });
+  }
+
+  /** @internal — `task_add`. Add one plan task. Serialized per session. */
+  _planTaskAdd(input: AddTaskInput): Promise<PlanTaskView> {
+    return this._serializePlanTaskWrite(() => planTaskAdd(this._planTaskPort(), input));
+  }
+
+  /** @internal — `task_decompose`. Add N children under a parent atomically. */
+  _planTaskDecompose(parentTaskId: string, children: DecomposeChildInput[]): Promise<PlanTaskView[]> {
+    return this._serializePlanTaskWrite(() => planTaskDecompose(this._planTaskPort(), parentTaskId, children));
+  }
+
+  /** @internal — `task_reparent`. Move a subtree (cycle-checked). */
+  _planTaskReparent(taskId: string, newParentTaskId: string | null, order?: number): Promise<void> {
+    return this._serializePlanTaskWrite(() => planTaskReparent(this._planTaskPort(), taskId, newParentTaskId, order));
+  }
+
+  /** @internal — `task_update`. Patch status/content/priority/blockedBy. */
+  _planTaskUpdate(taskId: string, patch: UpdateTaskInput): Promise<PlanTaskView> {
+    return this._serializePlanTaskWrite(() => planTaskUpdate(this._planTaskPort(), taskId, patch));
+  }
+
+  /** @internal — `task_complete`. Mark completed; triggers rollup. */
+  _planTaskComplete(taskId: string): Promise<PlanTaskView> {
+    return this._serializePlanTaskWrite(() => planTaskComplete(this._planTaskPort(), taskId));
+  }
+
+  /** @internal — `plan_task_check`. The bounded anti-forgetting read. */
+  _planTaskCheck(input: CheckInput): Promise<{ tasks: PlanTaskView[]; truncated: boolean }> {
+    return planTaskCheck(this._planTaskPort(), input);
+  }
+
+  // -------------------------------------------------------------------------
+  // TM-6 — durable subtask → subagent DELEGATION (§5.1k / §5.6 / §8).
+  //
+  // `task_delegate` hands a plan task (and, optionally, its subtree subset) to a
+  // subagent SESSION whose completion the plan task tracks across turns and
+  // restarts. Unlike `spawn_subagent` (a synchronous in-turn child the parent
+  // awaits inline), delegation is DURABLE: the link is the persisted
+  // `delegatedSubagentSessionId` on the plan task, the parent turn does NOT
+  // block, and the rollup fires from a completion HOOK on the child's terminal
+  // outcome — re-established by reconcile-on-rehydrate after a restart.
+  // -------------------------------------------------------------------------
+
+  /**
+   * @internal — `task_delegate`. Spawn/create a subagent SESSION for `taskId`,
+   * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
+   * and arm the live completion hook. Returns the view + the created subagent
+   * session id. Throws `HarnessValidationError` / `HarnessSubagentDepthExceededError`
+   * BEFORE any plan-task or session mutation so a rejected delegation is a no-op.
+   */
+  async _planTaskDelegate(input: {
+    taskId: string;
+    agentType: string;
+    task?: string;
+    includeSubtree?: boolean;
+    modelOverride?: string;
+  }): Promise<PlanTaskView & { subagentSessionId: string }> {
+    this._assertLive('task_delegate');
+    const def = this._harness._getSubagentType(input.agentType);
+    if (!def) {
+      throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
+    }
+    if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
+      throw new HarnessValidationError('modelOverride', 'must be a string when provided');
+    }
+
+    // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
+    // spawn tool's pre-creation gate).
+    const childDepth = this.subagentDepth + 1;
+    const maxDepth = this._harness._getSubagentMaxDepth();
+    if (childDepth > maxDepth) {
+      throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
+    }
+
+    // Resolve the delegated task body. Default to the plan task's own content so a
+    // delegation with no explicit `task` still hands the subagent a description.
+    const planForBody = await this._storage.loadPlanTaskSubtree({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      rootTaskId: input.taskId,
+      depth: 0,
+      limit: 1,
+    });
+    const planRow = planForBody.tasks[0];
+    if (!planRow) throw new HarnessValidationError('taskId', `unknown task "${input.taskId}"`);
+    let taskBody = input.task ?? planRow.content;
+    if (input.includeSubtree) {
+      // Surface the delegated subtree SUBSET so the subagent sees the unit it
+      // owns. This is a LOSSLESS transfer: every node keeps its stable taskId,
+      // parent edge, status, sibling order, and blockedBy ids, rendered by true
+      // depth (computed from the parent chain, not a flat one-level indent). A
+      // clipped subtree appends an explicit truncation marker so the subagent
+      // knows the unit it received is incomplete.
+      const subtree = await this._storage.loadPlanTaskSubtree({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        rootTaskId: input.taskId,
+        limit: DELEGATED_SUBTREE_MAX_NODES,
+      });
+      taskBody = `${taskBody}\n\n${this._renderDelegatedSubtree(input.taskId, subtree.tasks, subtree.truncated)}`;
+    }
+
+    // Create the durable subagent SESSION (reuse the subagent-tool creation path:
+    // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
+    // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
+    // tracked by the plan task across turns.
+    //
+    // ORPHAN WINDOW (bounded, accepted): a crash between this `session(...)` and
+    // the `planTaskDelegate` link write below leaves a subagent-tool child with
+    // `parentSessionId` set but NO plan task referencing it. This is identical to
+    // the `spawn_subagent` tool's create-then-use window and is reclaimed by the
+    // SAME §5.4/§5.6 lifecycle: the child ran no turn (no durable evidence, no
+    // work), holds only an unrenewable child lease, and is cascade-evicted as a
+    // descendant whose ancestry is not fully live (`lease_lost`, see
+    // `_renewLiveSessionLeaseSubtree` orphan handling) or closed when the parent
+    // terminalizes. The link write below is the durable point of no return; the
+    // child is best-effort closed on a rejected link so the only residual orphan
+    // is a crash precisely inside this window, which the lifecycle reclaims.
+    const child = await this._harness.session({
+      resourceId: this.resourceId,
+      threadId: { fresh: true },
+      parentSessionId: this.id,
+      origin: 'subagent-tool',
+      // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
+      // documented), not the harness default mode.
+      modeId: def.modeId ?? this._record.modeId,
+      modelId: input.modelOverride ?? def.defaultModelId,
+      subagentDepth: childDepth,
+      // M4 — persist the type so the durable delegated child's per-subagent
+      // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
+      // hydrate, not only this parent's delegation-reattach.
+      subagentTypeId: input.agentType,
+    });
+    const subagentWorkspaceMode = def.workspace ?? 'inherit';
+    child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+    if (def.tools) child._subagentToolsOverride = def.tools;
+    if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
+
+    // Write the durable link + drive the task in_progress under the owner fence.
+    // If this rejects (e.g. single-in_progress conflict) the child session was
+    // created but never linked; close it best-effort so we leave no orphan.
+    let view: PlanTaskView;
+    try {
+      view = await this._serializePlanTaskWrite(() =>
+        planTaskDelegate(this._planTaskPort(), {
+          taskId: input.taskId,
+          subagentSessionId: child.id,
+          // Persist the subagent type so a reattach-on-rehydrate can re-resolve the
+          // SubagentDefinition and restore the tools / workspace overrides (§9).
+          subagentTypeId: input.agentType,
+        }),
+      );
+    } catch (err) {
+      try {
+        await child.close();
+      } catch {
+        // best-effort cleanup
+      }
+      throw err;
+    }
+
+    // Track for display (mirrors the spawn tool) keyed by the subagent id so a
+    // delegated subagent renders while it runs.
+    this._activeSubagents.set(`delegate:${child.id}`, {
+      subagentSessionId: child.id,
+      agentType: input.agentType,
+      task: taskBody,
+      parentToolCallId: `delegate:${input.taskId}`,
+      startedAt: Date.now(),
+    });
+
+    // Arm the LIVE completion hook: drive the child's turn DETACHED (the parent
+    // turn must not block), and roll the plan task up when the child settles. The
+    // delegated `child.message` carries a DETERMINISTIC `admissionId` derived from
+    // the delegation link, so the run is durably idempotent: its terminal outcome
+    // (completed-with-result / failed-with-error) is persisted as message-result
+    // evidence on the child session, and a re-message with the same id observes
+    // the original run instead of enqueuing a second one. That durable evidence —
+    // plus the `delegatedSubagentSessionId` link — is what makes delegation
+    // recoverable: if this process dies before the hook fires,
+    // reconcile-on-rehydrate reads the child's terminal evidence and rolls up.
+    void this._driveDelegatedSubagent(input.taskId, child, taskBody);
+
+    return { ...view, subagentSessionId: child.id };
+  }
+
+  /**
+   * @internal — render a delegated subtree subset as a LOSSLESS structured block
+   * for the subagent. Each node keeps its stable `taskId`, parent edge, status,
+   * sibling order, and `blockedBy` ids, indented by its TRUE depth (computed from
+   * the in-subset parent chain). Nodes are ordered as a stable pre-order
+   * traversal (siblings by `order`, then `taskId`) so the same subtree always
+   * renders identically. A clipped subtree (the storage `truncated` flag, or a
+   * node whose parent fell outside the returned page) appends an explicit
+   * truncation marker so the subagent knows its unit is incomplete.
+   */
+  private _renderDelegatedSubtree(rootTaskId: string, tasks: HarnessPlanTask[], storageTruncated: boolean): string {
+    const byId = new Map(tasks.map(t => [t.taskId, t]));
+    const childrenOf = new Map<string | undefined, HarnessPlanTask[]>();
+    let parentDropped = false;
+    for (const t of tasks) {
+      // A node whose parent is not in the returned page (other than the root,
+      // whose parent is intentionally outside the subset) means the subtree was
+      // clipped above this node — flag it as truncated.
+      const parentKey =
+        t.taskId === rootTaskId
+          ? undefined
+          : t.parentTaskId !== undefined && byId.has(t.parentTaskId)
+            ? t.parentTaskId
+            : undefined;
+      if (t.taskId !== rootTaskId && (t.parentTaskId === undefined || !byId.has(t.parentTaskId))) {
+        parentDropped = true;
+      }
+      const bucket = childrenOf.get(parentKey);
+      if (bucket) bucket.push(t);
+      else childrenOf.set(parentKey, [t]);
+    }
+    for (const bucket of childrenOf.values()) {
+      bucket.sort((a, b) =>
+        a.order !== b.order ? a.order - b.order : a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0,
+      );
+    }
+    const lines: string[] = [];
+    const walk = (node: HarnessPlanTask, depth: number): void => {
+      const indent = '  '.repeat(depth);
+      const fields = [`id=${node.taskId}`, `status=${node.status}`, `order=${node.order}`];
+      if (node.blockedBy !== undefined && node.blockedBy.length > 0) {
+        fields.push(`blockedBy=${node.blockedBy.join(',')}`);
+      }
+      lines.push(`${indent}- [${fields.join(' ')}] ${node.content}`);
+      for (const child of childrenOf.get(node.taskId) ?? []) walk(child, depth + 1);
+    };
+    const root = byId.get(rootTaskId);
+    if (root) walk(root, 0);
+    let block = `Delegated subtree (lossless — taskId/status/order/blockedBy preserved):\n${lines.join('\n')}`;
+    if (storageTruncated || parentDropped) {
+      block += `\n(TRUNCATED: the subtree was clipped at ${DELEGATED_SUBTREE_MAX_NODES} nodes; some descendants are not shown.)`;
+    }
+    return block;
+  }
+
+  /**
+   * @internal — deterministic `admissionId` for a delegated subagent turn. Stable
+   * across restarts (keyed on the parent session + delegated task id) so the
+   * delegated `child.message` is durably idempotent: re-issuing it on rehydrate
+   * RE-ATTACHES to the original run (observes its terminal evidence) instead of
+   * enqueuing a fresh, duplicate run. Namespaced so it never collides with a
+   * caller-supplied admissionId.
+   */
+  private _delegationAdmissionId(taskId: string): string {
+    return `harness-delegate:${this.id}:${taskId}`;
+  }
+
+  /**
+   * @internal — detached driver for a delegated subagent turn. On settle it
+   * reconciles the plan task and closes the child (§5.6 auto-close). Never
+   * rejects — a delegated subagent failure becomes a `failed` plan-task rollup,
+   * not an unhandled rejection on the parent. The `admissionId` makes the
+   * `child.message` durably idempotent (see `_delegationAdmissionId`).
+   */
+  private async _driveDelegatedSubagent(taskId: string, child: Session, taskBody: string): Promise<void> {
+    let outcome: DelegatedSubagentOutcome;
+    // §SA2 — fold the detached child's live progress into the parent's display
+    // projection (the delegate path has no event bridge of its own, unlike the
+    // spawn tool). Unsubscribed in the finally below.
+    const progressKey = `delegate:${child.id}`;
+    const unsubProgress = child.subscribe(event => this._internalUpdateSubagentProgress(progressKey, event));
+    try {
+      const result = await child.message({ content: taskBody, admissionId: this._delegationAdmissionId(taskId) });
+      // A resolved turn can still be a FAILURE: the mock/real agent surfaces an
+      // abort/cancel as `finishReason: 'aborted' | 'error'` rather than a
+      // rejection, and a cancelled child session records `cancelRequest`. Treat
+      // any of those as a failed delegation so a cancelled subagent does not
+      // masquerade as a completed plan task.
+      const finishReason = (result as { finishReason?: string } | undefined)?.finishReason;
+      const failed =
+        finishReason === 'aborted' || finishReason === 'error' || child._record.cancelRequest !== undefined;
+      outcome = failed ? 'failed' : 'completed';
+    } catch {
+      // Subagent error / abort / cancel that rejected → the delegated task FAILED.
+      // (Includes the rehydrate re-attach observing a `failed` durable evidence
+      // row, or a crash-orphaned `pending` reservation that fail-closes.)
+      outcome = 'failed';
+    } finally {
+      unsubProgress();
+      this._activeSubagents.delete(`delegate:${child.id}`);
+    }
+    await this._reconcileDelegatedTask(taskId, child.id, outcome);
+    // §5.6 auto-close the delegated subagent once its work has settled.
+    try {
+      await child.close();
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * @internal — roll a delegated plan task up from its subagent session's
+   * terminal `outcome`. Idempotent + fence-guarded; emits best-effort because the
+   * subagent can terminalize outside any parent turn. Called by the live hook AND
+   * reconcile-on-rehydrate.
+   */
+  async _reconcileDelegatedTask(
+    taskId: string,
+    subagentSessionId: string,
+    outcome: DelegatedSubagentOutcome,
+  ): Promise<void> {
+    if (this._state === 'closed') return;
+    try {
+      await this._serializePlanTaskWrite(() =>
+        planTaskReconcileDelegation(this._planTaskPort(), { taskId, subagentSessionId, outcome }),
+      );
+    } catch {
+      // A fence/version race is benign here — a later reconcile (or hydrate scan)
+      // re-reads the durable link and retries. The durable child outcome is the
+      // authority, not this one attempt.
+    }
+  }
+
+  /**
+   * @internal — read the DURABLE terminal outcome of a delegated subagent turn
+   * from the child session's message-result evidence (the same evidence the
+   * deterministic delegation `admissionId` persists; see
+   * `_delegationAdmissionId`). The signal id is reconstructed from the child's
+   * own record fields exactly as `_messageAdmissionIdentity` derives it, so this
+   * works even after the child session has CLOSED (evidence outlives the live
+   * session). Returns the mapped plan-task outcome, or `undefined` when no
+   * terminal evidence exists yet (still `pending`, absent, or a tombstone).
+   *
+   * FAITHFUL ACROSS CRASH: the message-result-evidence primitive records
+   * `completed` whenever a turn RESOLVES and `failed` only when it REJECTS, so a
+   * run that resolves with `finishReason: 'error' | 'aborted'` (rather than
+   * rejecting) settles as `completed` evidence. But the durable evidence carries
+   * the run's full `result` (the `AgentResult`/`FullOutput`, persisted at the
+   * `status: 'completed'` write), and that result carries `finishReason`. So we
+   * read it back here and map a non-success finishReason to a `failed` delegation
+   * — exactly what the live driver does in-process via `result.finishReason`.
+   * This closes the former resolve-with-error crash window WITHOUT a new
+   * primitive: rejecting runs are durable `failed`, resolve-with-error/aborted
+   * runs are now durable-`completed`-but-finishReason-failed, and cancellation is
+   * captured by the `cancelRequest` override in the reconcile scan.
+   */
+  private async _loadDelegationOutcomeFromEvidence(
+    childRecord: SessionRecord,
+    taskId: string,
+  ): Promise<DelegatedSubagentOutcome | undefined> {
+    const admissionId = this._delegationAdmissionId(taskId);
+    const digest = sha256CanonicalJson({
+      kind: 'message-admission',
+      harnessName: childRecord.harnessName,
+      sessionId: childRecord.id,
+      resourceId: childRecord.resourceId,
+      threadId: childRecord.threadId,
+      admissionId,
+    });
+    const signalId = `harness-message-${digest.slice(0, 32)}`;
+    let evidence: AgentSignalResultStatus | OperationAdmissionTombstone | null;
+    try {
+      evidence = await this._storage.loadMessageResultEvidence({
+        harnessName: childRecord.harnessName,
+        sessionId: childRecord.id,
+        resourceId: childRecord.resourceId,
+        threadId: childRecord.threadId,
+        signalId,
+      });
+    } catch {
+      return undefined;
+    }
+    if (!evidence || !('status' in evidence)) return undefined;
+    if (evidence.status === 'completed') {
+      // A turn that RESOLVED but with a non-success finishReason is a FAILED
+      // delegation (the live driver maps it the same way). The finishReason rides
+      // on the durable `result` payload, so this stays faithful across a crash.
+      const finishReason = (evidence as { result?: { finishReason?: unknown } }).result?.finishReason;
+      if (finishReason === 'error' || finishReason === 'aborted') return 'failed';
+      return 'completed';
+    }
+    if (evidence.status === 'failed') return 'failed';
+    return undefined; // 'pending' — no terminal outcome yet.
+  }
+
+  /**
+   * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
+   * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
+   * non-terminal and reconcile each against the delegated subagent session's
+   * DURABLE state. The authority is the child's durable message-result evidence
+   * (persisted by the deterministic delegation `admissionId`), not a guess from
+   * the session close marker:
+   *   - durable terminal evidence (completed/failed) → roll the plan task up from
+   *     it (a FAILED delegated run recovers as `failed`, not `completed`);
+   *   - subagent session GONE/deleted → fail closed (`failed`);
+   *   - subagent CLOSED with no terminal evidence → map from the close marker
+   *     (cancelled = failed; clean close = completed) as a conservative fallback;
+   *   - subagent still LIVE with no terminal evidence → RE-ATTACH by re-issuing
+   *     the delegated `child.message` with the SAME deterministic admissionId,
+   *     which OBSERVES the original run (admission dedup) rather than enqueuing a
+   *     second one. A crash-orphaned `pending` reservation whose run died with
+   *     the old process fail-closes after the durable-wait timeout.
+   *
+   * Resilient: a transient/CAS failure on a single task does not strand it — the
+   * scan re-arms a bounded retry so a stuck `in_progress` delegation is not left
+   * with no path forward while the parent stays live.
+   */
+  async _reconcileDelegationsOnHydrate(attempt = 0): Promise<void> {
+    if (this._state !== 'live') return;
+    let cursor: string | undefined;
+    const delegated: HarnessPlanTask[] = [];
+    try {
+      for (;;) {
+        const page = await this._storage.listPlanTasks({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          limit: 500,
+          cursor,
+        });
+        for (const t of page.tasks) {
+          if (t.delegatedSubagentSessionId !== undefined && !TERMINAL_PLAN_TASK_STATUSES.has(t.status)) {
+            delegated.push(t);
+          }
+        }
+        if (!page.cursor || page.tasks.length === 0) break;
+        cursor = page.cursor;
+      }
+    } catch {
+      // Best-effort: the listing itself failed transiently — re-arm a bounded
+      // retry so a delegated task is not stranded by a flaky read.
+      this._scheduleDelegationReconcileRetry(attempt);
+      return;
+    }
+
+    let needsRetry = false;
+    for (const task of delegated) {
+      const childId = task.delegatedSubagentSessionId!;
+      let childRecord: SessionRecord | null;
+      try {
+        childRecord = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
+      } catch {
+        // Transient storage error reading the child — retry the whole scan later
+        // rather than silently leaving this task stuck `in_progress`.
+        needsRetry = true;
+        continue;
+      }
+      // Subagent session GONE/deleted → fail closed.
+      if (!childRecord) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        continue;
+      }
+      // A CANCELLED subagent is a FAILED delegation regardless of how the run
+      // finishReason landed — mirrors the live driver's `cancelRequest` override
+      // (a run can race to `complete` after a cancel, but the delegation was
+      // cancelled, so the plan task fails). Checked before the evidence so a
+      // `completed` evidence row from that race cannot mask the cancel.
+      if (childRecord.cancelRequest !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        continue;
+      }
+      // DURABLE terminal evidence is the authority — a delegated run that ERRORED
+      // before closing recovers as `failed`, not `completed`.
+      const durable = await this._loadDelegationOutcomeFromEvidence(childRecord, task.taskId);
+      if (durable !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, durable);
+        continue;
+      }
+      // Subagent session CLOSED with no terminal evidence → fall back to the close
+      // marker (a clean close is the conservative "the subagent finished" read;
+      // the cancel case is already handled above).
+      if (childRecord.closedAt !== undefined) {
+        await this._reconcileDelegatedTask(task.taskId, childId, 'completed');
+        continue;
+      }
+      // Subagent still active → RE-ATTACH by re-issuing the delegated message with
+      // the deterministic admissionId. The dedup path observes the original run
+      // (no second run); a crash-orphaned `pending` fail-closes via the driver.
+      let child: Session | undefined;
+      try {
+        child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
+      } catch {
+        // Could not re-acquire the child (locked elsewhere / transient) — retry
+        // the scan later so the task is not stranded.
+        needsRetry = true;
+        continue;
+      }
+      // §9 — restore the SubagentDefinition overrides on the reattached child. The
+      // `tools` / `workspace` overrides are applied in-memory at delegate time and
+      // are not persisted on the child, so re-resolve them from the durable
+      // subagent type id before re-driving (unknown/unset type ⇒ mode-derived
+      // surface, the documented fallback).
+      if (task.delegatedSubagentTypeId !== undefined) {
+        const def = this._harness._getSubagentType(task.delegatedSubagentTypeId);
+        if (def) {
+          child._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
+          if (def.tools) child._subagentToolsOverride = def.tools;
+          if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
+        }
+      }
+      this._activeSubagents.set(`delegate:${child.id}`, {
+        subagentSessionId: child.id,
+        agentType: 'delegated',
+        task: task.content,
+        parentToolCallId: `delegate:${task.taskId}`,
+        startedAt: Date.now(),
+      });
+      void this._driveDelegatedSubagent(task.taskId, child, task.content);
+    }
+    if (needsRetry) this._scheduleDelegationReconcileRetry(attempt);
+  }
+
+  /**
+   * @internal — bounded retry for reconcile-on-rehydrate. A transient/CAS/locked
+   * failure on a delegated task re-arms the scan with exponential backoff (capped
+   * attempts) so a stuck `in_progress` delegation is not permanently stranded
+   * while the parent session stays live. A terminal/permanent outcome (gone →
+   * failed, durable terminal evidence) already fails-closed in the scan and is
+   * not retried.
+   */
+  private _scheduleDelegationReconcileRetry(attempt: number): void {
+    if (attempt >= DELEGATION_RECONCILE_MAX_RETRIES) return;
+    const next = attempt + 1;
+    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
+    const timer = setTimeout(() => {
+      this._delegationReconcileRetryTimers.delete(timer);
+      if (this._state !== 'live') return;
+      void this._reconcileDelegationsOnHydrate(next);
+    }, backoffMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    this._delegationReconcileRetryTimers.add(timer);
+  }
+
   /** @internal — accessor for the Harness when it needs the owner id back. */
   get _internalOwnerId(): string {
     return this._ownerId;
@@ -9758,43 +13820,6 @@ export class Session {
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-function sha256CanonicalJson(value: unknown): string {
-  return createHash('sha256')
-    .update(canonicalJson(assertJsonValue(value)), 'utf8')
-    .digest('hex');
-}
-
-function assertJsonValue(value: unknown, path = 'value'): JsonValue {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value) || Object.is(value, -0)) {
-      throw new HarnessValidationError(path, 'must be a finite JSON number');
-    }
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const out: JsonValue[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      if (!(index in value)) throw new HarnessValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
-      out.push(assertJsonValue(value[index], `${path}[${index}]`));
-    }
-    return out;
-  }
-  if (typeof value === 'object' && value !== null && isPlainJsonObject(value)) {
-    const out: Record<string, JsonValue> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      if (entry !== undefined) out[key] = assertJsonValue(entry, `${path}.${key}`);
-    }
-    return out;
-  }
-  throw new HarnessValidationError(path, 'must be JSON-serializable for admission hashing');
-}
-
-function jsonValuesEqual(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
-  if (left === undefined || right === undefined) return left === right;
-  return canonicalJson(left) === canonicalJson(right);
-}
-
 function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
 }
@@ -9802,20 +13827,6 @@ function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<
 function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
   if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
   return record[key];
-}
-
-function isPlainJsonObject(value: object): value is Record<string, unknown> {
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function canonicalJson(value: JsonValue): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
-    .join(',')}}`;
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
@@ -9837,8 +13848,8 @@ function clonePersistedRequestContext(input: PersistedRequestContextInput): Pers
   return JSON.parse(JSON.stringify(input)) as PersistedRequestContextInput;
 }
 
-class QueueRecoveryPendingError extends Error {
-  code = 'harness.queue_recovery_pending';
+class QueueRecoveryPendingError extends HarnessError {
+  readonly code = 'harness.queue_recovery_pending';
   readonly retryAt: number;
 
   constructor(retryAt: number) {
@@ -9848,8 +13859,8 @@ class QueueRecoveryPendingError extends Error {
   }
 }
 
-class QueueRecoveryStaleError extends Error {
-  code = 'harness.queue_recovery_stale';
+class QueueRecoveryStaleError extends HarnessError {
+  readonly code = 'harness.queue_recovery_stale';
 
   constructor() {
     super('queued turn was accepted by the signal runtime but no live run or durable terminal result is available');
@@ -9857,8 +13868,8 @@ class QueueRecoveryStaleError extends Error {
   }
 }
 
-class QueueResumeRecoveryStaleError extends Error {
-  code = 'harness.queue_resume_recovery_stale';
+class QueueResumeRecoveryStaleError extends HarnessError {
+  readonly code = 'harness.queue_resume_recovery_stale';
 
   constructor() {
     super('queued turn resume was marked in flight but no terminal queue result is available');
@@ -9866,8 +13877,8 @@ class QueueResumeRecoveryStaleError extends Error {
   }
 }
 
-class QueuePostRunFinalizationPendingError extends Error {
-  code = 'harness.queue_post_run_finalization_pending';
+class QueuePostRunFinalizationPendingError extends HarnessError {
+  readonly code = 'harness.queue_post_run_finalization_pending';
   readonly retryAt: number;
   readonly cause: unknown;
 

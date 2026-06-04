@@ -116,20 +116,23 @@ function getHarnessSlot(streamCalls: any[]): HarnessRequestContext {
 // 1. Tool sees `ctx.workspace`
 // ---------------------------------------------------------------------------
 
-describe('HarnessRequestContext.workspace — runtime plumbing', () => {
-  it('exposes the shared workspace on the slot during a tool call', async () => {
+describe('HarnessRequestContext.workspace — lazy runtime plumbing (§6.2)', () => {
+  it('does NOT materialize the shared workspace for a turn that never resolves it', async () => {
     const ws = makeWorkspace('shared');
     const { harness, agent } = setupHarness({
       workspace: { kind: 'shared', workspace: ws },
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // §6.2: context construction must not materialize solely to fill the slot.
     await session.message({ content: 'hi' });
-
-    const slot = getHarnessSlot(agent.streamCalls);
-    expect(slot.workspace).toBe(ws);
+    expect(getHarnessSlot(agent.streamCalls).workspace).toBeUndefined();
+    // Explicit resolution materializes it; subsequent turns see the cached handle.
+    await expect(session.resolveWorkspace()).resolves.toBe(ws);
+    await session.message({ content: 'again' });
+    expect(getHarnessSlot(agent.streamCalls).workspace).toBe(ws);
   });
 
-  it('exposes per-resource workspace on the slot', async () => {
+  it('lazily provisions a per-resource workspace only on resolveWorkspace()', async () => {
     const created: Workspace[] = [];
     const provider = nonDurableProvider(() => {
       const w = makeWorkspace('per-resource');
@@ -141,11 +144,16 @@ describe('HarnessRequestContext.workspace — runtime plumbing', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'hi' });
+    expect(created).toHaveLength(0); // a no-filesystem turn never cold-starts the sandbox
+    expect(getHarnessSlot(agent.streamCalls).workspace).toBeUndefined();
 
+    await session.resolveWorkspace();
+    expect(created).toHaveLength(1);
+    await session.message({ content: 'again' });
     expect(getHarnessSlot(agent.streamCalls).workspace).toBe(created[0]);
   });
 
-  it('exposes per-session workspace on the slot', async () => {
+  it('lazily provisions a per-session workspace only on resolveWorkspace()', async () => {
     const created: Workspace[] = [];
     const provider = resumableProvider({
       providerId: 'per-session',
@@ -160,7 +168,11 @@ describe('HarnessRequestContext.workspace — runtime plumbing', () => {
     });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     await session.message({ content: 'hi' });
+    expect(created).toHaveLength(0);
 
+    await session.resolveWorkspace();
+    expect(created).toHaveLength(1);
+    await session.message({ content: 'again' });
     expect(getHarnessSlot(agent.streamCalls).workspace).toBe(created[0]);
   });
 
@@ -362,21 +374,51 @@ describe('Subagent workspace inheritance — runtime', () => {
     expect(created[0]!.destroy).toHaveBeenCalledTimes(1);
   });
 
-  it("'fresh': child gets an independent workspace, parent's unaffected", async () => {
+  it("'fresh': a subagent that never touches the filesystem does NOT cold-start a workspace at spawn (strict-lazy §6.2)", async () => {
     const { harness, created } = subagentSetup({ workspace: 'fresh' });
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const parentWs = await parent.getWorkspace();
+    const parentWs = await parent.getWorkspace(); // parent explicitly materializes → 1
 
     const tool = createSpawnSubagentTool(parent)!;
     await tool.execute!({ agentType: 'explore', task: 'go' }, execCtx('tc-fresh-1'));
 
-    // Two physical workspaces were provisioned. The child's was destroyed
-    // when the spawn tool auto-closed it. Parent's is still alive.
-    expect(created).toHaveLength(2);
-    const parentStub = parentWs as unknown as StubWorkspace;
-    const child = created.find(w => w !== parentStub)!;
-    expect(child.destroy).toHaveBeenCalledTimes(1);
-    expect(parentStub.destroy).not.toHaveBeenCalled();
+    // The 'fresh' child ran but never resolved its workspace, so under strict-lazy
+    // materialization (§6.2 / task #36) NO second sandbox was cold-started for a
+    // speculative/no-op subagent. `fresh` guarantees a DISTINCT workspace WHEN the
+    // child resolves one (its own per-session registry key), not allocation at
+    // spawn. The distinct-per-session provisioning mechanism is covered by the
+    // 'lazily provisions a per-session workspace' test above; parent stays alive.
+    expect(created).toHaveLength(1);
+    expect(created[0]).toBe(parentWs as unknown as StubWorkspace);
+    expect((parentWs as unknown as StubWorkspace).destroy).not.toHaveBeenCalled();
+  });
+
+  it("'inherit' resolves even when the parent never materialized its workspace (strict-lazy parent §6.2)", async () => {
+    // BLOCKER guard: under strict-lazy, a parent turn may never resolve its
+    // workspace, so a child inheriting it must materialize the parent on demand
+    // rather than throwing "parent has no workspace to inherit".
+    const { harness, created } = subagentSetup({ workspace: 'inherit' });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Parent is lazy — it has NOT resolved its workspace.
+    expect(created).toHaveLength(0);
+
+    const registry = (harness as unknown as { _workspaceRegistry: any })._workspaceRegistry;
+    // Inheriting first ensures the (live) parent's workspace is materialized...
+    await (
+      harness as unknown as {
+        _internalEnsureParentWorkspaceForInherit: (id: string) => Promise<void>;
+      }
+    )._internalEnsureParentWorkspaceForInherit(parent.id);
+    expect(created).toHaveLength(1); // parent materialized on demand
+
+    // ...then the child inherit acquire shares that same parent workspace.
+    const childWs = registry.inheritPerSession({
+      parentSessionId: parent.id,
+      childSessionId: 'child-x',
+      resourceId: 'u1',
+    });
+    expect(childWs).toBe(created[0]);
+    expect(created).toHaveLength(1); // no second workspace — shared, not duplicated
   });
 });
 
@@ -410,7 +452,7 @@ describe('Provider failures surface as HarnessWorkspaceProvisioningError', () =>
     await expect(s.getWorkspace()).rejects.toBeInstanceOf(HarnessWorkspaceProvisioningError);
   });
 
-  it('emits a workspace_error event on the harness when provisioning fails', async () => {
+  it('surfaces provider create failure as HarnessWorkspaceProvisioningError with NO public workspace event (§2.7/§10.2)', async () => {
     const provider: WorkspaceProvider = {
       providerId: 'broken',
       resumable: true,
@@ -420,16 +462,16 @@ describe('Provider failures surface as HarnessWorkspaceProvisioningError', () =>
       resume: async () => makeWorkspace(),
     };
     const { harness } = setupHarness({ workspace: { kind: 'per-session', provider } });
-    const events: any[] = [];
-    harness.subscribe(e => {
-      if (e.type === 'workspace_error') events.push(e);
-    });
+    // §10.2: workspace lifecycle/error is provider-owned inspection data, NOT a
+    // public HarnessEventV1 event — nothing should reach the public stream.
+    const eventTypes: string[] = [];
+    harness.subscribe(e => eventTypes.push((e as { type: string }).type));
     const s = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
+    // The provisioning failure still surfaces — as a thrown typed error.
     await expect(s.getWorkspace()).rejects.toBeInstanceOf(HarnessWorkspaceProvisioningError);
-    expect(events).toHaveLength(1);
-    expect(events[0].providerId).toBe('broken');
-    expect(events[0].error.message).toContain('boom');
+    expect(eventTypes).not.toContain('workspace_error');
+    expect(eventTypes).not.toContain('workspace_status_changed');
   });
 });
 
@@ -498,6 +540,58 @@ describe('eager: true — non-shared kinds', () => {
     );
     await new Promise(r => setImmediate(r));
     expect(calls).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §6.1 workspace access accessors (F12): hasWorkspace / isWorkspaceReady /
+// getWorkspace (sync) / resolveWorkspace (async) + the deferred getActivityTimeline.
+// ---------------------------------------------------------------------------
+
+describe('HarnessRequestContext §6.1 workspace accessors (F12)', () => {
+  it('reports configured-but-not-yet-ready, then ready after resolveWorkspace (lazy §6.2)', async () => {
+    const ws = makeWorkspace('shared');
+    const { harness, agent } = setupHarness({ workspace: { kind: 'shared', workspace: ws } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+
+    const slot = getHarnessSlot(agent.streamCalls);
+    // Configured but NOT materialized by a no-filesystem turn (§6.2 strict-lazy).
+    expect(slot.hasWorkspace()).toBe(true);
+    expect(slot.isWorkspaceReady()).toBe(false);
+    expect(slot.getWorkspace()).toBeUndefined(); // sync, non-materializing cached read
+    // Explicit async materialization, then the sync reads reflect the warm handle.
+    await expect(slot.resolveWorkspace()).resolves.toBe(ws);
+    expect(session.hasWorkspace()).toBe(true);
+    expect(session.isWorkspaceReady()).toBe(true);
+    expect(session.peekWorkspace()).toBe(ws);
+    await expect(session.resolveWorkspace()).resolves.toBe(ws);
+  });
+
+  it('reports no workspace + resolveWorkspace rejects when none is configured', async () => {
+    const { harness, agent } = setupHarness(); // no workspace
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+
+    const slot = getHarnessSlot(agent.streamCalls);
+    expect(slot.hasWorkspace()).toBe(false);
+    expect(slot.isWorkspaceReady()).toBe(false);
+    expect(slot.getWorkspace()).toBeUndefined();
+    await expect(slot.resolveWorkspace()).rejects.toThrow(/no workspace is configured/);
+    expect(session.hasWorkspace()).toBe(false);
+    expect(session.peekWorkspace()).toBeUndefined();
+  });
+
+  it('getActivityTimeline resolves a read-time projection from the request-context slot (§5.1b.4)', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    const slot = getHarnessSlot(agent.streamCalls);
+    const tl = await slot.getActivityTimeline();
+    expect(tl.sessionId).toBe(session.id);
+    expect(tl.threadId).toBe(session.threadId);
+    expect(tl.includeDescendants).toBe(false);
+    expect(Array.isArray(tl.entries)).toBe(true);
   });
 });
 

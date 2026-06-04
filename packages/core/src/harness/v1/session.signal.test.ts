@@ -161,6 +161,29 @@ describe('Session.signal()', () => {
     expect(types).toContain('agent_end');
   });
 
+  it('owned-turn settles by signalId: emits signal_completed and writes durable result evidence (§4.2f/§10.2)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      events.push(e);
+    });
+
+    const handle = await session.signal({ content: 'hi' });
+    await handle.result;
+
+    // §10.2 OperationEvent — settlement is by signalId, not agent_end.
+    const completed = events.find(e => e.type === 'signal_completed');
+    expect(completed).toBeDefined();
+    expect((completed as { signalId: string }).signalId).toBe(handle.id);
+    expect((completed as { runId: string }).runId).toBe(handle.runId);
+
+    // §4.2f durable per-signalId result evidence is queryable after the turn.
+    const lookup = await session.lookupMessageResult(handle.id);
+    expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+  });
+
   it('rejects an owned idle-wake result when the live session is marked deleted', async () => {
     const agent = new MockAgent({ id: 'default' });
     let release!: () => void;
@@ -205,6 +228,144 @@ describe('Session.signal()', () => {
     (session as any)._markDeleted();
 
     await expect(signal).rejects.toBeInstanceOf(HarnessSessionDeletedError);
+  });
+
+  it('§13.3f.1: redacts a raw dispatch failure on the public signal() boundary', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    // The idle-wake dispatch setup (`_buildRequestContext` /
+    // `_buildSignalContentsWithAttachments` / `agent.sendSignal`) rejects with a
+    // RAW provider/runtime error. `signal()` is a public §4.2b boundary, so its
+    // promise rejection must be REDACTED: a generic `harness.internal` message
+    // with the raw original preserved local-only on `.cause`.
+    agent.sendSignal = (() => {
+      throw new Error('provider dispatch exploded: dsn=postgres://secret@db');
+    }) as any;
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const thrown = await session.signal({ content: 'hi' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((thrown as Error).name).toBe('HarnessExecutionError');
+    expect((thrown as Error).message).toBe('An internal harness error occurred');
+    expect(((thrown as { cause?: Error }).cause as Error).message).toBe(
+      'provider dispatch exploded: dsn=postgres://secret@db',
+    );
+  });
+
+  it('§13.3f.1: passes a Harness-own dispatch failure (deleted) through unredacted', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    let started!: () => void;
+    const subscribeStarted = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    agent.subscribeToThread = async () => {
+      started();
+      return new Promise(() => {}) as any;
+    };
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const signal = session.signal({ content: 'hi' });
+    await subscribeStarted;
+    (session as any)._markDeleted();
+
+    // The redaction wrap is a pass-through for construction-safe Harness errors:
+    // the caller still receives the concrete HarnessSessionDeletedError it
+    // branches on, NOT a HarnessExecutionError.
+    await expect(signal).rejects.toBeInstanceOf(HarnessSessionDeletedError);
+  });
+
+  it('§13.3f.1: redacts a raw dispatch failure on the ACTIVE-DELIVERY public signal() boundary', async () => {
+    // Stage a held in-flight run so the follow-up signal() routes through the
+    // ACTIVE-DELIVERY branch (`willInterleave: true`), NOT idle-wake. There the
+    // dispatch setup (`_buildSignalContentsWithAttachments` / `agent.sendSignal`)
+    // is wrapped in its own try/catch. A RAW provider/runtime error escaping that
+    // dispatch must be REDACTED on this public §4.2b boundary: a generic
+    // `harness.internal` message with the raw original preserved local-only on
+    // `.cause`. Mirrors the idle-wake redaction assertion exactly.
+    const agent = new MockAgent({ id: 'default' });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({ holdUntil: hold });
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const firstPromise = session.message({ content: 'first' });
+    await waitForStreamCalls(agent, 1);
+    // Confirm the run is genuinely in-flight: the next signal() will hit the
+    // active-delivery branch (not idle-wake) because a run owns the active slot.
+    expect(session.isRunning()).toBe(true);
+
+    // Make the active-delivery dispatch reject with a RAW error AFTER the run is
+    // already active. `sendSignal` is the active-delivery dispatch call inside the
+    // wrapped try/catch.
+    agent.sendSignal = (() => {
+      throw new Error('active-delivery dispatch exploded: dsn=postgres://secret@db');
+    }) as any;
+
+    const thrown = await session.signal({ content: 'second' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    try {
+      expect((thrown as Error).name).toBe('HarnessExecutionError');
+      expect((thrown as Error).message).toBe('An internal harness error occurred');
+      expect(((thrown as { cause?: Error }).cause as Error).message).toBe(
+        'active-delivery dispatch exploded: dsn=postgres://secret@db',
+      );
+    } finally {
+      release();
+      await firstPromise;
+    }
+  });
+
+  it('§13.3f.1: ACTIVE-DELIVERY channel-ingress (internal) dispatch failure passes through RAW (recovery-worker exemption)', async () => {
+    // Same active-delivery staging as above, but the dispatch is the trusted
+    // channel-ingress recovery hook (`internal !== undefined`). That hook is NOT
+    // a public §4.2b caller — the recovery worker needs the concrete error for
+    // failure classification / re-dispatch, so the raw error passes through
+    // UNREDACTED (no HarnessExecutionError wrap).
+    const agent = new MockAgent({ id: 'default' });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({ holdUntil: hold });
+
+    const { harness } = setupHarness({ agents: { default: agent } });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const firstPromise = session.message({ content: 'first' });
+    await waitForStreamCalls(agent, 1);
+    expect(session.isRunning()).toBe(true);
+
+    agent.sendSignal = (() => {
+      throw new Error('active-delivery dispatch exploded: dsn=postgres://secret@db');
+    }) as any;
+
+    // The second positional `internal` arg flags the trusted channel-ingress
+    // path. `_buildSignalContentsWithAttachments` is called with no attachments,
+    // so the throw originates from `agent.sendSignal`.
+    const thrown = await (session.signal as any)({ content: 'second' }, { signalId: 'ingress-1' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    try {
+      // RAW error preserved — no redaction for the trusted recovery worker.
+      expect((thrown as Error).name).toBe('Error');
+      expect((thrown as Error).message).toBe('active-delivery dispatch exploded: dsn=postgres://secret@db');
+    } finally {
+      release();
+      await firstPromise;
+    }
   });
 
   it('does not emit agent_start for active-delivery (the live run owns the lifecycle)', async () => {

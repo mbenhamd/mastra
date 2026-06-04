@@ -56,6 +56,30 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
+  it('drained item settles with queue_completed carrying queuedItemId + signalId (§10.2)', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => events.push(e));
+
+    await session.queue({ content: 'do work' });
+
+    const completed = events.find(e => e.type === 'queue_completed') as
+      | { queuedItemId: string; signalId: string; runId: string }
+      | undefined;
+    expect(completed).toBeDefined();
+    // §10.2 — settlement is by queuedItemId/signalId, not agent_end. (There is
+    // no queue_item_started event; the queuedItemId comes from the settlement.)
+    expect(typeof completed!.queuedItemId).toBe('string');
+    expect(completed!.queuedItemId.length).toBeGreaterThan(0);
+    expect(typeof completed!.signalId).toBe('string');
+    expect(completed!.signalId.length).toBeGreaterThan(0);
+    expect(typeof completed!.runId).toBe('string');
+    await session.close();
+  });
+
   it('rejects when content is empty', async () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -219,7 +243,11 @@ describe('Session.queue() — admission', () => {
     // Yield so the drain has a chance to start the first item.
     await new Promise(resolve => setImmediate(resolve));
 
-    await expect(session.queue({ content: 'second' })).rejects.toBeInstanceOf(HarnessQueueFullError);
+    const rejection = await session.queue({ content: 'second' }).catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(HarnessQueueFullError);
+    // §4.5a: the error carries both the cap and the observed depth at rejection.
+    expect(rejection).toMatchObject({ maxQueueDepth: 1, currentDepth: expect.any(Number) });
+    expect((rejection as HarnessQueueFullError).currentDepth).toBeGreaterThanOrEqual(1);
     agent.enqueueRun({ finishReason: 'stop', runId: 'r1', text: 'done' });
     await session.respondToToolApproval({ approved: true });
     await first;
@@ -252,16 +280,11 @@ describe('Session.queue() — admission', () => {
     const droppedReceipt = Object.values(session.getRecord().queueAdmissionReceipts ?? {}).find(
       receipt => receipt.admissionId === 'queue-drop-oldest-first',
     );
+    // §10.2: backpressure emits no public event — the dropped item's receipt is
+    // failed with the stable error code (asserted above).
     expect(droppedReceipt).toMatchObject({
       status: 'failed',
       error: expect.objectContaining({ code: 'harness.queue_full_dropped' }),
-    });
-    expect(events.find(e => e.type === 'queue_full_dropped')).toMatchObject({
-      source: 'queue',
-      policy: 'drop-oldest',
-      maxQueueDepth: 1,
-      admissionId: 'queue-drop-oldest-first',
-      replacementAdmissionId: 'queue-drop-oldest-second',
     });
     await session.cancelQueuedItem({ queuedItemId: second.queuedItemId, reason: 'test cleanup' });
     await session.close();
@@ -488,7 +511,7 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
-  it('emits queue_item_started for fresh remote queue admissions', async () => {
+  it('drains fresh remote queue admissions and settles them (no queue lifecycle events — §10.2)', async () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -498,8 +521,15 @@ describe('Session.queue() — admission', () => {
     const admitted = await session.admitQueue({ content: 'do work', admissionId: 'queue-admit-event' });
     await session.waitForIdle({ timeoutMs: 1000 });
 
-    expect(events.find(e => e.type === 'queue_item_started')).toMatchObject({ queuedItemId: admitted.queuedItemId });
-    expect(events.find(e => e.type === 'queue_item_replayed')).toBeUndefined();
+    // §10.2: no queue_item_started / replayed — the drained turn settles via the
+    // OperationEvent keyed by the admitted item.
+    const types = events.map(e => (e as { type: string }).type);
+    expect(types).not.toContain('queue_item_started');
+    expect(types).not.toContain('queue_item_replayed');
+    const completed = events.find(e => (e as { type: string }).type === 'queue_completed') as
+      | { queuedItemId: string }
+      | undefined;
+    expect(completed?.queuedItemId).toBe(admitted.queuedItemId);
     await session.close();
   });
 
@@ -669,6 +699,165 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
+  // Regression lock for a SUSPECTED queue-wedge bug:
+  //
+  //   "If a queued item's dispatch throws (agent.sendSignal throws, or the run
+  //    terminalizes error), _runQueuedTurn's catch (~10180) emits agent_end:error
+  //    and rethrows but never moves the receipt off 'admitting' — so the item is
+  //    stuck 'admitting' forever and the queue WEDGES (later items never drain)."
+  //
+  // Ground truth (per the real flow): _runQueuedTurn rethrows → _maybeDrainQueue's
+  // catch (session.ts ~9967) sees a non-pending error → calls _failQueuedTurn
+  // (session.ts ~9978/10901), which transitions the receipt to 'failed', removes
+  // the item from pendingQueue, emits queue_failed, rejects the queue() resolver,
+  // clears _currentQueuedItemId, and re-kicks _maybeDrainQueue so the next item
+  // drains. The claim is therefore REFUTED; this test locks that in.
+  it('settles a failed queued dispatch and drains the next item (queue does not wedge)', async () => {
+    const { harness, agent } = setupHarness();
+    // Item 2's run succeeds; item 1's dispatch is forced to throw below.
+    agent.enqueueRun({ finishReason: 'stop', text: 'second reply' });
+
+    // Make ONLY the first queued dispatch throw a raw error from sendSignal —
+    // the genuine path into _runQueuedTurn's catch for a queued turn. We key on
+    // call count (item 1 drains head-of-line before item 2) and let every other
+    // sendSignal fall through to the real Agent.sendSignal so item 2 runs.
+    const realSendSignal = agent.sendSignal.bind(agent);
+    let sendSignalCalls = 0;
+    const sendSignalCallsPerItem = new Map<string, number>();
+    (agent as any).sendSignal = (signal: any, options: any) => {
+      sendSignalCalls++;
+      // No attachments → `signal.contents` is the raw queued content string.
+      const contents = typeof signal?.contents === 'string' ? signal.contents : JSON.stringify(signal?.contents);
+      sendSignalCallsPerItem.set(contents, (sendSignalCallsPerItem.get(contents) ?? 0) + 1);
+      if (sendSignalCalls === 1) {
+        throw new Error('boom: dispatch failed');
+      }
+      return realSendSignal(signal, options);
+    };
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+
+    // Queue two items. FIFO: 'first' drains first (and fails), 'second' next.
+    const firstAdmission = await session.admitQueue({ content: 'first', admissionId: 'queue-fail-first' });
+    const secondAdmission = await session.admitQueue({ content: 'second', admissionId: 'queue-ok-second' });
+
+    const first = session.queue({ content: 'first', admissionId: 'queue-fail-first' });
+    const second = session.queue({ content: 'second', admissionId: 'queue-ok-second' });
+    void first.catch(() => {});
+
+    // (1) The first item is SETTLED as failed (its queue() promise rejects).
+    // The raw 'boom' is projected through projectHarnessPublicError, so the
+    // surfaced message is the sanitized public form — the point is it REJECTS
+    // (settles) rather than hanging forever on 'admitting'.
+    await expect(first).rejects.toThrow();
+
+    // (2) The queue is NOT WEDGED — the second item still drains and completes.
+    const secondResult = await second;
+    expect(secondResult.text).toBe('second reply');
+
+    // Let any re-kicked drain settle so we can assert terminal ground truth.
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    // (1, cont.) The failed item's receipt is terminal 'failed' and it is
+    // DEQUEUED (not stuck on 'admitting', not lingering in pendingQueue).
+    const failedReceipt = session.getRecord().queueAdmissionReceipts?.[firstAdmission.queuedItemId];
+    expect(failedReceipt?.status).toBe('failed');
+    expect(failedReceipt?.error).toMatchObject({ code: expect.any(String) });
+    const completedReceipt = session.getRecord().queueAdmissionReceipts?.[secondAdmission.queuedItemId];
+    expect(completedReceipt?.status).toBe('completed');
+    expect(session.getRecord().pendingQueue).toEqual([]);
+
+    // (1, cont.) A queue_failed OperationEvent was emitted for the failed item,
+    // and a queue_completed for the second — the closed-union settlement surface.
+    const queueFailed = events.find(
+      e => e.type === 'queue_failed' && (e as { queuedItemId?: string }).queuedItemId === firstAdmission.queuedItemId,
+    );
+    expect(queueFailed).toBeDefined();
+    const queueCompleted = events.find(
+      e =>
+        e.type === 'queue_completed' && (e as { queuedItemId?: string }).queuedItemId === secondAdmission.queuedItemId,
+    );
+    expect(queueCompleted).toBeDefined();
+    // Note: because the throw originates INSIDE sendSignal (before agent_start),
+    // _runQueuedTurn's `agentStarted && !agentEndEmitted` gate (session.ts ~10181)
+    // is not satisfied, so no agent_end:error is emitted for this failure — the
+    // run was never registered. queue_failed is the settlement surface here.
+
+    // (3) The failed item is NOT re-run forever — bounded invocations. Item 1's
+    // content saw exactly one dispatch attempt; total dispatch calls are bounded.
+    expect(sendSignalCallsPerItem.get('first') ?? 0).toBe(1);
+    expect(sendSignalCalls).toBeLessThanOrEqual(3);
+
+    await session.close();
+  });
+
+  // Companion to the above, exercising the OTHER throw site the reviewer named:
+  // a failure AFTER agent_start (the run terminalizes/the completion rejects),
+  // which DOES hit _runQueuedTurn's `agentStarted && !agentEndEmitted` gate
+  // (session.ts ~10181) → emits agent_end:error → rethrows → _maybeDrainQueue
+  // catch → _failQueuedTurn. Same ground truth: settle + dequeue + drain next.
+  it('settles a queued run that fails AFTER agent_start and still drains the next item', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'first reply' });
+    agent.enqueueRun({ finishReason: 'stop', text: 'second reply' });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    // Make ONLY the first queued item's run-completion reject — after sendSignal
+    // succeeded and agent_start was emitted. This is the post-dispatch failure
+    // path. The real method is restored for the second item.
+    const realAwait = (session as any)._awaitQueuedRunCompletion.bind(session);
+    let awaitCalls = 0;
+    (session as any)._awaitQueuedRunCompletion = async (...args: unknown[]) => {
+      awaitCalls++;
+      if (awaitCalls === 1) {
+        throw new Error('boom: run terminalized error');
+      }
+      return realAwait(...args);
+    };
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+
+    const firstAdmission = await session.admitQueue({ content: 'first', admissionId: 'queue-postsignal-fail' });
+    const secondAdmission = await session.admitQueue({ content: 'second', admissionId: 'queue-postsignal-ok' });
+
+    const first = session.queue({ content: 'first', admissionId: 'queue-postsignal-fail' });
+    const second = session.queue({ content: 'second', admissionId: 'queue-postsignal-ok' });
+    void first.catch(() => {});
+
+    await expect(first).rejects.toThrow();
+    const secondResult = await second;
+    expect(secondResult.text).toBe('second reply');
+
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(session.getRecord().queueAdmissionReceipts?.[firstAdmission.queuedItemId]?.status).toBe('failed');
+    expect(session.getRecord().queueAdmissionReceipts?.[secondAdmission.queuedItemId]?.status).toBe('completed');
+    expect(session.getRecord().pendingQueue).toEqual([]);
+
+    // queue_failed settlement + the post-agent_start agent_end:error emit.
+    expect(
+      events.some(
+        e => e.type === 'queue_failed' && (e as { queuedItemId?: string }).queuedItemId === firstAdmission.queuedItemId,
+      ),
+    ).toBe(true);
+    expect(events.some(e => e.type === 'agent_end' && (e as { finishReason?: string }).finishReason === 'error')).toBe(
+      true,
+    );
+
+    // Bounded: the failing item's completion was awaited exactly once (no
+    // unbounded re-run), and the second still ran.
+    expect(awaitCalls).toBe(2);
+
+    await session.close();
+  });
+
   it('does not treat a later default mode switch as a conflicting duplicate admission', async () => {
     const defaultAgent = new MockAgent({ id: 'default' });
     const otherAgent = new MockAgent({ id: 'other' });
@@ -770,7 +959,7 @@ describe('Session.queue() — FIFO + per-turn overrides', () => {
 // ---------------------------------------------------------------------------
 
 describe('Session.queue() — events', () => {
-  it('emits queue_item_started before agent_start and tags turn events with queuedItemId', async () => {
+  it('tags a drained turn’s agent_start / agent_end with queuedItemId (no queue_item_started — §10.2)', async () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({ finishReason: 'stop', text: 'ok' });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
@@ -782,20 +971,20 @@ describe('Session.queue() — events', () => {
 
     await session.queue({ content: 'go' });
 
-    const types = events.map(e => e.type);
-    const started = types.indexOf('queue_item_started');
+    const types = events.map(e => (e as { type: string }).type);
     const agentStart = types.indexOf('agent_start');
     const agentEnd = types.indexOf('agent_end');
-    expect(started).toBeGreaterThanOrEqual(0);
-    expect(agentStart).toBeGreaterThan(started);
+    expect(agentStart).toBeGreaterThanOrEqual(0);
     expect(agentEnd).toBeGreaterThan(agentStart);
 
-    // queuedItemId flows through agent_start / agent_end.
-    const startedEvt = events[started] as Extract<HarnessEvent, { type: 'queue_item_started' }>;
+    // §10.2: no queue_item_started event — but queuedItemId still flows through
+    // the drained turn's agent_start / agent_end (the `_currentQueuedItemId` tag).
+    expect(types).not.toContain('queue_item_started');
     const startEvt = events[agentStart] as Extract<HarnessEvent, { type: 'agent_start' }>;
     const endEvt = events[agentEnd] as Extract<HarnessEvent, { type: 'agent_end' }>;
-    expect(startEvt.queuedItemId).toBe(startedEvt.queuedItemId);
-    expect(endEvt.queuedItemId).toBe(startedEvt.queuedItemId);
+    expect(typeof startEvt.queuedItemId).toBe('string');
+    expect(startEvt.queuedItemId).toBeTruthy();
+    expect(endEvt.queuedItemId).toBe(startEvt.queuedItemId);
   });
 });
 
@@ -1153,9 +1342,9 @@ describe('Session.queue() — suspension', () => {
 
     expect(replayAgent.streamCalls).toHaveLength(0);
     expect(replayAgent.resumeCalls).toHaveLength(0);
-    expect(events.find(e => e.type === 'queue_item_started')).toBeUndefined();
-    expect(events.find(e => e.type === 'queue_item_replayed')).toMatchObject({ queuedItemId });
-    expect(events.find(e => e.type === 'agent_end')).toMatchObject({ queuedItemId });
+    // §10.2: no queue_item_started / replayed events — agent_end (tagged with
+    // queuedItemId) + cleared pendingResume are the observable recovery effects.
+    expect(events.find(e => (e as { type: string }).type === 'agent_end')).toMatchObject({ queuedItemId });
     expect(replaySession.getRecord().pendingResume).toBeUndefined();
     expect(replaySession.getRecord().pendingQueue).toEqual([]);
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
@@ -1422,12 +1611,10 @@ describe('Session.queue() — suspension', () => {
     const result = await replaySession.respondToToolApproval({ approved: true });
 
     expect(result.text).toBe('resumed done');
-    expect(events.find(e => e.type === 'suspension_resolved')).toMatchObject({ queuedItemId });
+    // §10.2 defines no suspension_resolved event — the resumed queued turn
+    // settles via agent_end (tagged with queuedItemId) + cleared pending state.
     const agentEnds = events.filter(e => e.type === 'agent_end');
     expect(agentEnds).toEqual([expect.objectContaining({ queuedItemId })]);
-    expect(events.findIndex(e => e.type === 'agent_end')).toBeGreaterThan(
-      events.findIndex(e => e.type === 'suspension_resolved'),
-    );
     expect(replaySession.getRecord().pendingResume).toBeUndefined();
     expect(replaySession.getRecord().pendingQueue).toEqual([]);
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
@@ -1515,8 +1702,8 @@ describe('Session.queue() — suspension', () => {
     await replaySession.waitForIdle({ timeoutMs: 1000 });
 
     expect(replayAgent.resumeCalls).toHaveLength(0);
-    expect(events.find(e => e.type === 'queue_item_started')).toBeUndefined();
-    expect(events.find(e => e.type === 'queue_item_replayed')).toMatchObject({ queuedItemId });
+    // §10.2: no queue_item_started / replayed events; the stale-resume outcome
+    // is observable via cleared pendingResume + the failed receipt below.
     expect(replaySession.getRecord().pendingResume).toBeUndefined();
     expect(replaySession.getRecord().pendingQueue).toEqual([]);
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
@@ -1555,7 +1742,7 @@ describe('Session.queue() — drains after message()', () => {
 // ---------------------------------------------------------------------------
 
 describe('Session.queue() — crash replay', () => {
-  it('emits queue_item_replayed (not _started) when a hydrated record carries a pending head item', async () => {
+  it('drains a hydrated pending head item on crash recovery (no queue lifecycle event — §10.2)', async () => {
     // Inject a SessionRecord directly into storage so we bypass the
     // live-session map entirely and exercise the hydration path. This
     // simulates "process restarted with one item still in pendingQueue".
@@ -1612,12 +1799,11 @@ describe('Session.queue() — crash replay', () => {
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
 
-    const replayed = events.find(e => e.type === 'queue_item_replayed');
-    const started = events.find(e => e.type === 'queue_item_started');
-    expect(replayed).toBeDefined();
-    expect((replayed as Extract<HarnessEvent, { type: 'queue_item_replayed' }>).queuedItemId).toBe(queuedItemId);
-    expect(started).toBeUndefined();
-    // Item drained off the queue successfully.
+    const types = events.map(e => (e as { type: string }).type);
+    // §10.2: crash-recovery drain emits no queue_item_replayed / queue_item_started.
+    expect(types).not.toContain('queue_item_replayed');
+    expect(types).not.toContain('queue_item_started');
+    // Item drained off the queue successfully on hydration.
     expect(replayAgent.streamCalls).toHaveLength(1);
   });
 
@@ -1846,7 +2032,7 @@ describe('Session.queue() — crash replay', () => {
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
+        code: 'harness.runtime_drift',
         message: expect.stringContaining('mode "removed-mode" is not registered'),
       },
     });
@@ -1923,7 +2109,7 @@ describe('Session.queue() — crash replay', () => {
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
+        code: 'harness.runtime_drift',
         message: expect.stringContaining('old-agent'),
       },
     });
@@ -2013,13 +2199,13 @@ describe('Session.queue() — crash replay', () => {
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
+        code: 'harness.runtime_drift',
         message: expect.stringContaining('workspace_provider "unconfigured"'),
       },
     });
   });
 
-  it('fails closed when queued work admitted with a shared workspace replays after restart', async () => {
+  it('does NOT fail closed when queued work admitted with a shared workspace replays after restart (PF-818)', async () => {
     const storage = new InMemoryStore();
     const harnessStore = await storage.getStore('harness');
     if (!harnessStore) throw new Error('expected harness storage');
@@ -2060,7 +2246,8 @@ describe('Session.queue() — crash replay', () => {
               modeId: 'default',
               agentId: 'default',
               modelId: 'default',
-              workspaceProviderId: 'shared:harness-old-owner',
+              // Recorded with the PF-818 stable shared-workspace identity.
+              workspaceProviderId: 'shared',
             },
             status: 'accepted',
             runId: 'stale-run',
@@ -2094,15 +2281,14 @@ describe('Session.queue() — crash replay', () => {
     const replaySession = await replayHarness.session({ sessionId });
     await replaySession.waitForIdle({ timeoutMs: 1000 });
 
-    expect(replayAgent.streamCalls).toHaveLength(0);
+    // PF-818: a shared workspace is a single refcounted workspace with no per-owner
+    // identity, so its stable 'shared' drift token matches across a process restart
+    // (new ownerId). The queued work must RUN, not fail closed on a spurious drift.
+    expect(replayAgent.streamCalls.length).toBeGreaterThan(0);
     expect(replaySession.getRecord().pendingQueue).toEqual([]);
-    expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
-      status: 'failed',
-      error: {
-        code: 'harness.runtime_dependency_drifted',
-        message: expect.stringContaining('workspace_provider "shared:harness-old-owner"'),
-      },
-    });
+    expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]?.error?.code).not.toBe(
+      'harness.runtime_drift',
+    );
   });
 
   it('fails closed when queued work replays after runtime compatibility generation drift', async () => {
@@ -2182,8 +2368,8 @@ describe('Session.queue() — crash replay', () => {
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
       error: {
-        code: 'harness.runtime_dependency_drifted',
-        message: expect.stringContaining('runtime_compatibility_generation "generation-a"'),
+        code: 'harness.runtime_drift',
+        message: expect.stringContaining('recorded generation "generation-a"'),
       },
     });
   });
@@ -2459,7 +2645,8 @@ describe('Session.queue() — crash replay', () => {
     await new Promise(resolve => setImmediate(resolve));
 
     expect(replayAgent.streamCalls).toHaveLength(0);
-    expect(events.some(e => e.type === 'queue_item_replayed')).toBe(true);
+    // §10.2: no queue_item_replayed event — the parked-on-recovery state is
+    // observable via the retained head item + busy + accepted receipt below.
     expect(replaySession.getRecord().pendingQueue).toMatchObject([{ id: queuedItemId }]);
     expect(replaySession.isBusy()).toBe(true);
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({

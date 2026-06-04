@@ -10,6 +10,8 @@ import type {
   GoalOptions,
   GoalState,
   HarnessChannelDiagnostics,
+  HarnessChannelInboundResult,
+  HarnessChannelTransportRequest,
   HarnessDisplayStateSnapshotV1,
   HarnessMessage,
   InboxResponseResult,
@@ -31,6 +33,7 @@ import {
   createHarnessSessionResponseSchema,
   harnessChannelDiagnosticsQuerySchema,
   harnessChannelDiagnosticsResponseSchema,
+  harnessChannelInboundPathParams,
   harnessAttachmentPathParams,
   harnessAttachmentUploadBodySchema,
   harnessAttachmentUploadResponseSchema,
@@ -59,14 +62,17 @@ import {
   listHarnessSessionsQuerySchema,
   listHarnessSessionsResponseSchema,
 } from '../schemas/harness';
-import { createRoute } from '../server-adapter/routes/route-builder';
+import { createPublicRoute, createRoute } from '../server-adapter/routes/route-builder';
 
 import { toHarnessDisplayStateSnapshotV1 } from './harness-display-state';
 import { enforceThreadAccess, getEffectiveResourceId } from './utils';
 
 type SessionLifecycleStatus = 'active' | 'closing' | 'closed';
 type PendingInboxKind = 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
-type PublicPendingResume = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies'>;
+type PublicPendingResume = Omit<
+  NonNullable<SessionRecord['pendingResume']>,
+  'runtimeDependencies' | 'requestContext'
+>;
 type ParsedHarnessEventId = { epoch: string; sequence: number };
 type UrlAttachmentInput = {
   kind: 'url';
@@ -291,6 +297,11 @@ type HarnessLike = {
     resourceId: string;
     limit?: number;
   }): Promise<HarnessChannelDiagnostics | null>;
+  handleChannelInboundRequest(
+    channelId: string,
+    request: HarnessChannelTransportRequest,
+    opts?: { continueAdmission?: boolean },
+  ): Promise<HarnessChannelInboundResult>;
   closeSession(opts: { sessionId: string; resourceId?: string }): Promise<void>;
   ownerId?: string;
 };
@@ -337,6 +348,40 @@ const DEFAULT_URL_INGESTION_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_URL_INGESTION_TIMEOUT_MS = 30_000;
 const DEFAULT_URL_INGESTION_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+// §14.2 public channel webhook ingress abuse controls. The route is
+// createPublicRoute (no app auth); the adapter's verifyInbound owns provider
+// signature auth, but the transport layer still pre-gates body size and
+// content-type BEFORE handing bytes to the core bridge / adapter.
+//
+// A tighter-than-default raw-body cap (the generic adapter bodyLimit default is
+// ~4.5MB). The adapter's bodyLimit middleware rejects oversized bodies with 413
+// before the handler runs; this in-handler guard is a defense-in-depth check for
+// adapters/tests that supply rawBody without enforcing a transport bodyLimit.
+const CHANNEL_INBOUND_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+
+// SSE keep-alive cadence for the session event stream. Idle harness sessions can
+// stream nothing for long stretches; without a periodic comment frame, intervening
+// proxies (and some clients) silently drop a connection they believe is dead. A `:`
+// comment line is ignored by the EventSource parser yet keeps the socket warm.
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
+// Provider webhooks post JSON or form-encoded payloads. Reject anything else
+// (415) before the body reaches the parser / adapter.
+const CHANNEL_INBOUND_ALLOWED_CONTENT_TYPES = [
+  'application/json',
+  'application/x-www-form-urlencoded',
+  'multipart/form-data',
+];
+
+function rawBodyByteLength(rawBody: Uint8Array | string): number {
+  return typeof rawBody === 'string' ? Buffer.byteLength(rawBody, 'utf8') : rawBody.byteLength;
+}
+
+function isAllowedChannelContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  const base = contentType.split(';', 1)[0]!.trim().toLowerCase();
+  return CHANNEL_INBOUND_ALLOWED_CONTENT_TYPES.includes(base);
+}
 
 function toHarnessErrorBody(
   code: string,
@@ -385,6 +430,8 @@ function encodeHarnessSseEvent(event: HarnessEvent): Uint8Array {
   const data = JSON.stringify(event, harnessSseJsonReplacer);
   return new TextEncoder().encode(`id: ${event.id}\nevent: ${event.type}\ndata: ${data}\n\n`);
 }
+
+const HARNESS_SSE_HEARTBEAT_FRAME = new TextEncoder().encode(`: keep-alive\n\n`);
 
 function harnessSseJsonReplacer(_key: string, value: unknown): unknown {
   if (value instanceof Error) {
@@ -1445,22 +1492,32 @@ function mapHarnessError(error: unknown): never {
     throwHarnessHttpError(501, 'harness.channel_diagnostics_unsupported', message, undefined, false);
   }
   if (
-    name === 'HarnessRuntimeDependencyDriftError' ||
-    name === 'harness.runtime_dependency_drifted' ||
-    harnessErrorString(error, 'code') === 'harness.runtime_dependency_drifted'
+    name === 'HarnessRuntimeDriftError' ||
+    name === 'harness.runtime_drift' ||
+    harnessErrorString(error, 'code') === 'harness.runtime_drift' ||
+    // Bare storage-row cause code (§4.5d HarnessRowErrorCode) projects to the
+    // same namespaced wire code (§13.3f.1).
+    harnessErrorString(error, 'code') === 'runtime_dependency_drifted'
   ) {
-    const context = harnessErrorProp(error, 'context');
-    throwHarnessHttpError(409, 'harness.runtime_dependency_drifted', message, {
-      dependencyKind: harnessErrorString(error, 'dependencyKind') ?? harnessErrorString(error, 'kind'),
-      dependencyId: harnessErrorString(error, 'dependencyId') ?? harnessErrorString(error, 'id'),
+    throwHarnessHttpError(409, 'harness.runtime_drift', message, {
+      sessionId: harnessErrorString(error, 'sessionId'),
+      runId: harnessErrorString(error, 'runId'),
+      backgroundTaskId: harnessErrorString(error, 'backgroundTaskId'),
+      missingRefs: harnessErrorProp(error, 'missingRefs'),
+      driftedRefs: harnessErrorProp(error, 'driftedRefs'),
+    });
+  }
+  if (name === 'HarnessBusyError') {
+    throwHarnessHttpError(409, 'harness.busy', message, {
+      sessionId: harnessErrorString(error, 'sessionId'),
       reason: harnessErrorString(error, 'reason'),
-      ...(context !== undefined ? { context } : {}),
     });
   }
   if (name === 'HarnessQueueFullError') {
     throwHarnessHttpError(429, 'harness.queue_full', message, {
       sessionId: harnessErrorString(error, 'sessionId'),
       maxQueueDepth: harnessErrorNumber(error, 'maxQueueDepth'),
+      currentDepth: harnessErrorNumber(error, 'currentDepth'),
     });
   }
   if (name === 'HarnessAdmissionConflictError') {
@@ -1541,8 +1598,7 @@ function mapHarnessError(error: unknown): never {
   }
   if (name === 'HarnessSubagentDepthExceededError') {
     throwHarnessHttpError(409, 'harness.subagent_depth_exceeded', message, {
-      sessionId: harnessErrorString(error, 'sessionId'),
-      attemptedDepth: harnessErrorNumber(error, 'depth'),
+      attemptedDepth: harnessErrorNumber(error, 'attemptedDepth'),
       maxDepth: harnessErrorNumber(error, 'maxDepth'),
     });
   }
@@ -1550,7 +1606,7 @@ function mapHarnessError(error: unknown): never {
     throwHarnessHttpError(409, 'harness.workspace_provider_mismatch', message, {
       sessionId: harnessErrorString(error, 'sessionId'),
       storedProviderId: harnessErrorString(error, 'storedProviderId'),
-      configuredProviderId: harnessErrorString(error, 'expectedProviderId'),
+      configuredProviderId: harnessErrorString(error, 'configuredProviderId'),
     });
   }
   if (name === 'HarnessWorkspaceLostError') {
@@ -1687,7 +1743,9 @@ function displayStateFromRecord(record: SessionRecord): SessionDisplayState {
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): PublicPendingResume | null {
   if (!pending) return null;
-  const { runtimeDependencies: _runtimeDependencies, ...displayPending } = pending;
+  // Strip storage-internal recovery fields (runtimeDependencies) and the caller
+  // app bag (requestContext) — restored on resume, never surfaced publicly.
+  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
   return displayPending;
 }
 
@@ -1984,6 +2042,116 @@ export const GET_HARNESS_CHANNEL_DIAGNOSTICS_ROUTE = createRoute({
   },
 });
 
+export const POST_HARNESS_CHANNEL_INBOUND_ROUTE = createPublicRoute({
+  method: 'POST',
+  path: '/harness/:name/channels/:channelId/inbound',
+  responseType: 'datastream-response',
+  pathParamSchema: harnessChannelInboundPathParams,
+  onValidationError: harnessValidationErrorHook,
+  summary: 'Channel webhook inbound ingress',
+  description:
+    'Transport entrypoint for a registered channel provider webhook. Resolves the channel, runs the adapter ' +
+    'verifyInbound provider-auth boundary, applies the §13.6 worker-readiness gate, and durably records the ' +
+    'inbound (record-only ACK; a recovery worker finishes admission). Public route: the channel adapter owns ' +
+    'the provider signature-auth boundary, not the server auth middleware.',
+  tags: ['Harness'],
+  // Defense-in-depth body cap for the public webhook (tighter than the generic
+  // adapter default). The adapter bodyLimit middleware rejects oversized bodies
+  // with 413 before the handler runs; the in-handler rawBody guard below is the
+  // fallback for adapters/tests that do not enforce a transport bodyLimit.
+  maxBodySize: CHANNEL_INBOUND_MAX_BODY_BYTES,
+  // The provider signs the EXACT request bytes; a JSON parse + re-serialize would
+  // break HMAC verification, and a signed-but-not-strict-JSON payload carrying
+  // `content-type: application/json` would otherwise be rejected with a 400 before
+  // verifyInbound runs. Capture the raw bytes only and defer parsing/verification to
+  // the adapter on `rawBody`. The adapter still flows `body: requestBody` (undefined
+  // here) to handleChannelInboundRequest, which the bridge tolerates.
+  skipBodyParse: true,
+  // Webhook ingress is intentionally NOT app-authenticated: a channel provider
+  // (Slack, etc.) cannot carry a Mastra session token. The adapter's verifyInbound
+  // owns the provider signature-auth boundary (§14.2), which the core bridge runs
+  // before any durable row is created.
+  handler: async ({ mastra, name, channelId, requestBody, getHeader, getHeaders, rawBody, requestPathParams }) => {
+    const pathName = stringPathParam(requestPathParams, name, 'name');
+    const pathChannelId = stringPathParam(requestPathParams, channelId, 'channelId');
+    const inboundPath = `/harness/${pathName}/channels/${pathChannelId}/inbound`;
+
+    // Build the lower-cased header set FIRST so the §14.2 gates and the headers
+    // forwarded to verifyInbound read the same canonical content-type (a separate
+    // per-name lookup could diverge from the forwarded map). Forward the FULL
+    // header set + unparsed `rawBody` so the adapter can verify an HMAC over the
+    // exact bytes and read provider signature/timestamp headers (Slack
+    // X-Slack-Signature, etc.). `body` carries the parsed payload for adapters
+    // that don't need raw bytes.
+    const headers: Record<string, string | string[]> = {};
+    const allHeaders = getHeaders?.();
+    if (allHeaders) {
+      for (const [key, value] of Object.entries(allHeaders)) {
+        headers[key.toLowerCase()] = value;
+      }
+    } else {
+      // Fallback: an adapter that only exposes per-name lookup still forwards
+      // content-type so verification can at least branch on it.
+      const contentTypeHeader = getHeader?.('content-type');
+      if (contentTypeHeader !== undefined) {
+        headers['content-type'] = contentTypeHeader;
+      }
+    }
+
+    // §14.2 transport-layer abuse gates, applied BEFORE registry resolution /
+    // adapter verification / any durable work. Content-type allowlist (415) and a
+    // raw-body size cap (413) are transport concerns the route owns; provider
+    // signature + replay-window validation stay in the adapter's verifyInbound.
+    // Read content-type from the canonical headers map (a multi-valued header
+    // collapses to its first value for the allowlist check).
+    const forwardedContentType = headers['content-type'];
+    const contentType = Array.isArray(forwardedContentType) ? forwardedContentType[0] : forwardedContentType;
+    if (!isAllowedChannelContentType(contentType)) {
+      return jsonResponse(
+        toHarnessErrorBody('harness.bad_request', 'unsupported channel webhook content-type'),
+        { status: 415 },
+      );
+    }
+    if (rawBody !== undefined && rawBodyByteLength(rawBody) > CHANNEL_INBOUND_MAX_BODY_BYTES) {
+      return jsonResponse(toHarnessErrorBody('harness.bad_request', 'channel webhook payload too large'), {
+        status: 413,
+      });
+    }
+
+    const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
+    // The route is a thin transport mapper: it forwards a transport-neutral request
+    // to the core ingress bridge, which owns registry resolution, provider
+    // verification, the readiness gate, and durable admission, and returns a
+    // transport-neutral result this handler maps to an HTTP status + §13.3 envelope.
+    const transportRequest: HarnessChannelTransportRequest = {
+      method: 'POST',
+      path: inboundPath,
+      headers,
+      ...(rawBody !== undefined ? { rawBody } : {}),
+      body: requestBody,
+      receivedAt: Date.now(),
+    };
+    const result = await harness.handleChannelInboundRequest(pathChannelId, transportRequest);
+    if (result.kind === 'ok') {
+      return jsonResponse(
+        {
+          inboxItemId: result.inboxItemId,
+          status: result.status,
+          duplicate: result.duplicate,
+          ...(result.binding !== undefined ? { binding: result.binding } : {}),
+          ...(result.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
+          ...(result.queuedItemId !== undefined ? { queuedItemId: result.queuedItemId } : {}),
+        },
+        { status: result.ackStatus },
+      );
+    }
+    return jsonResponse(
+      toHarnessErrorBody(result.error.code, result.error.message, result.error.details, result.error.retryable),
+      { status: result.httpStatus },
+    );
+  },
+});
+
 export const POST_HARNESS_ATTACHMENT_ROUTE = createRoute({
   method: 'POST',
   path: '/harness/:name/sessions/:sessionId/attachments',
@@ -2162,7 +2330,8 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
   summary: 'Stream Harness session events',
   description: 'Streams typed Harness session events with Last-Event-ID replay and 412 recovery.',
   tags: ['Harness'],
-  handler: async ({ mastra, requestContext, name, sessionId, getHeader, abortSignal, requestPathParams }) => {
+  handler: async handlerArgs => {
+    const { mastra, requestContext, name, sessionId, getHeader, abortSignal, requestPathParams } = handlerArgs;
     let unsubscribe: (() => void) | undefined;
     try {
       const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
@@ -2183,9 +2352,17 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
       let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
       let replaying = parsed !== undefined;
       let closed = false;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const heartbeatOverride = (handlerArgs as unknown as { heartbeatIntervalMs?: unknown }).heartbeatIntervalMs;
+      const heartbeatIntervalMs =
+        typeof heartbeatOverride === 'number' ? heartbeatOverride : SSE_HEARTBEAT_INTERVAL_MS;
       const cleanup = () => {
         if (closed) return;
         closed = true;
+        if (heartbeat !== undefined) {
+          clearInterval(heartbeat);
+          heartbeat = undefined;
+        }
         unsubscribe?.();
         unsubscribe = undefined;
       };
@@ -2306,6 +2483,18 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
             for (const event of liveQueue.splice(0)) {
               if (replayedEventIds.has(event.id)) continue;
               streamController.enqueue(encodeHarnessSseEvent(event));
+            }
+            if (!closed && heartbeatIntervalMs > 0) {
+              heartbeat = setInterval(() => {
+                if (closed) return;
+                try {
+                  streamController.enqueue(HARNESS_SSE_HEARTBEAT_FRAME);
+                } catch {
+                  cleanup();
+                }
+              }, heartbeatIntervalMs);
+              // Do not keep the process alive solely for the keep-alive timer.
+              (heartbeat as { unref?: () => void }).unref?.();
             }
           } catch (error) {
             cleanup();

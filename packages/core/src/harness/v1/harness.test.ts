@@ -25,6 +25,22 @@ import type {
   ChannelOutboxItem,
 } from '../../storage/domains/harness';
 import {
+  HarnessAbortedError,
+  HarnessConfigError,
+  HarnessLiveSessionLimitError,
+  HarnessOverrideConflictError,
+  HarnessQueueFullError,
+  HarnessSessionClosedError,
+  HarnessSessionClosingError,
+  HarnessSessionConflictError,
+  HarnessSessionCorruptError,
+  HarnessSessionDeletedError,
+  HarnessSessionLockedError,
+  HarnessSessionNotFoundError,
+  HarnessStorageError,
+  HarnessValidationError,
+} from './errors';
+import {
   HarnessStorage,
   HarnessStorageChannelOutboxClaimConflictError,
   HarnessStorageDeleteGuardConflictError,
@@ -37,16 +53,7 @@ import { MastraWorker } from '../../worker';
 
 import { extractSignalContents, MockAgent } from './__test-utils__';
 import type { HarnessSessionDeleteBlockedError } from './errors';
-import {
-  HarnessConfigError,
-  HarnessSessionClosedError,
-  HarnessSessionClosingError,
-  HarnessSessionDeletedError,
-  HarnessSessionLockedError,
-  HarnessSessionNotFoundError,
-  HarnessValidationError,
-} from './errors';
-import { Harness } from './harness';
+import { Harness, createHarnessOperatorThreadController } from './harness';
 import type { HarnessChannelConfig } from './types';
 
 function makeAgent(name = 'test-agent') {
@@ -212,7 +219,7 @@ function channelActionReceiptRow(overrides: Partial<ChannelActionReceipt> = {}):
     attempts: 1,
     claimId: 'receipt-claim-secret',
     claimExpiresAt: 3000,
-    lastError: { code: 'provider_delivery_failed', message: 'receipt-error-secret', retryable: true },
+    lastError: { code: 'delivery_operation_unavailable', message: 'receipt-error-secret', retryable: true },
     createdAt: 1000,
     updatedAt: 1000,
     ...overrides,
@@ -1038,6 +1045,18 @@ describe('Harness v1 — construction', () => {
       harnesses: { primary: harness },
     });
 
+    // §10.2 channel_outbox_* events.
+    const channelEvents: Array<{
+      type: string;
+      outboxItemId?: string;
+      bindingId?: string;
+      kind?: string;
+      providerMessageId?: string;
+    }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_')) channelEvents.push(e as never);
+    });
+
     await expect(harness.channels.enqueueOutbox(channelOutboxInput())).resolves.toMatchObject({
       duplicate: false,
       conflict: false,
@@ -1074,6 +1093,13 @@ describe('Harness v1 — construction', () => {
       items: [{ outboxItemId: expect.any(String), status: 'sent', providerMessageId: 'provider-message-1' }],
     });
     expect(delivered).toEqual(['outbox-key-1']);
+
+    // Only the fresh enqueue emits channel_outbox_enqueued (duplicate/conflict do
+    // not); the successful dispatch emits channel_outbox_sent after the durable
+    // sent transition commits.
+    expect(channelEvents.map(e => e.type)).toEqual(['channel_outbox_enqueued', 'channel_outbox_sent']);
+    expect(channelEvents[0]).toMatchObject({ bindingId: 'support-binding', outboxItemId: expect.any(String) });
+    expect(channelEvents[1]).toMatchObject({ bindingId: 'support-binding', providerMessageId: 'provider-message-1' });
   });
 
   it('uses canonical payload hashes for channel outbox idempotency', async () => {
@@ -1134,6 +1160,13 @@ describe('Harness v1 — construction', () => {
       channels: { slack: makeChannelProvider('slack') },
       harnesses: { primary: harness },
     });
+    // This test persists RAW inbox rows that are claimable at wall-clock time, so
+    // stop the §14.2 recovery worker the bind auto-started — otherwise a background
+    // tick crossing the poll interval could mutate a row before the assertions.
+    // (Channel tests that save raw claimable inbox rows must stop the loop; tests
+    // that only go through admitChannelInbound get live real-time claims and the
+    // main C4 setup() already stops it.)
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
     const root = await harness.session({ sessionId: 'session-1', resourceId: 'resource-1', threadId: { fresh: true } });
     const child = await harness.session({
       sessionId: 'child-1',
@@ -1170,9 +1203,16 @@ describe('Harness v1 — construction', () => {
       resourceId: 'resource-1',
       visibleSessionIds: expect.arrayContaining([root.id, child.id]),
       bindings: [{ channelId: 'support', providerId: 'slack', bindingId: 'support-binding' }],
-      inbox: [{ id: 'inbox-1', status: 'received', lastError: { code: 'worker_unavailable', retryable: true } }],
+      // §13.3f.1: bare row codes are projected to namespaced wire codes.
+      inbox: [{ id: 'inbox-1', status: 'received', lastError: { code: 'harness.worker_unavailable', retryable: true } }],
       actionTokens: [{ actionTokenId: 'action-token-1', owningSessionId: child.id, status: 'active' }],
-      actionReceipts: [{ id: 'receipt-1', owningSessionId: child.id, lastError: { code: 'provider_delivery_failed' } }],
+      actionReceipts: [
+        {
+          id: 'receipt-1',
+          owningSessionId: child.id,
+          lastError: { code: 'harness.channel_delivery_unavailable', reason: 'delivery_operation_unavailable' },
+        },
+      ],
       outbox: [{ id: 'outbox-1', source: { kind: 'session-event', id: 'event-1' } }],
       redacted: true,
       truncated: false,
@@ -1470,6 +1510,11 @@ describe('Harness v1 — construction', () => {
       harnesses: { primary: harness },
     });
 
+    const failedEvents: Array<{ type: string; dead?: boolean; attempts?: number; error?: { code: string } }> = [];
+    harness.subscribe(e => {
+      if (e.type === 'channel_outbox_failed') failedEvents.push(e as never);
+    });
+
     await harness.channels.enqueueOutbox(channelOutboxInput());
 
     await expect(harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-dead' })).resolves.toEqual({
@@ -1485,6 +1530,12 @@ describe('Harness v1 — construction', () => {
         },
       ],
     });
+
+    // §10.2 channel_outbox_failed: terminal (dead) and the bare row code is
+    // projected to its namespaced wire code (`unknown` -> `harness.internal`),
+    // never leaked bare onto the public event boundary (§13.3f.1).
+    expect(failedEvents).toHaveLength(1);
+    expect(failedEvents[0]).toMatchObject({ dead: true, error: { code: 'harness.internal' } });
   });
 
   it('uses the dispatch clock for retryable outbox failure backoff', async () => {
@@ -1674,8 +1725,15 @@ describe('Harness v1 — construction', () => {
       ),
     ).toThrow(
       expect.objectContaining({
-        code: 'harness.runtime_dependency_drifted',
-        dependencyKind: 'runtime_compatibility_generation',
+        code: 'harness.runtime_drift',
+        driftedRefs: expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'mode',
+            ref: 'default',
+            expectedGeneration: 'generation-b',
+            actualGeneration: 'generation-a',
+          }),
+        ]),
       }),
     );
 
@@ -1703,8 +1761,10 @@ describe('Harness v1 — construction', () => {
       ),
     ).toThrow(
       expect.objectContaining({
-        code: 'harness.runtime_dependency_drifted',
-        dependencyKind: 'runtime_compatibility_generation',
+        code: 'harness.runtime_drift',
+        driftedRefs: expect.arrayContaining([
+          expect.objectContaining({ kind: 'mode', ref: 'default', expectedGeneration: 'generation-a' }),
+        ]),
       }),
     );
   });
@@ -1829,6 +1889,26 @@ describe('Harness v1 — session(...) by thread', () => {
     const rehydrated = await harness2.session({ threadId: 't1', resourceId: 'r1' });
     expect(rehydrated.id).toBe(id);
     expect(rehydrated).not.toBe(original);
+  });
+
+  it('emits session_hydrated on rehydrate and harness_shutdown on shutdown (§10.2)', async () => {
+    const first = await harness.session({ threadId: 't-hyd', resourceId: 'r1' });
+    const id = first.id;
+    await harness.shutdown();
+
+    const harness2 = makeHarness({ sessions: { storage } });
+    const harnessEvents: string[] = [];
+    harness2.subscribe(e => harnessEvents.push((e as { type: string }).type));
+
+    const rehydrated = await harness2.session({ threadId: 't-hyd', resourceId: 'r1' });
+    expect(rehydrated.id).toBe(id);
+    // §10.2: a session re-loaded from storage emits session_hydrated (fanned to
+    // harness.subscribe as a session-scoped observer event).
+    expect(harnessEvents).toContain('session_hydrated');
+
+    await harness2.shutdown();
+    // §10.2: harness-scoped process-shutdown marker on harness.subscribe.
+    expect(harnessEvents).toContain('harness_shutdown');
   });
 
   it('uses the registered Mastra harness key as the storage namespace', async () => {
@@ -2018,13 +2098,14 @@ describe('Harness v1 — session(...) by thread', () => {
     expect(stranger.resourceId).toBe('r2');
   });
 
-  it('creates a fresh record after the previous session on that thread is closed', async () => {
+  it('reopens the same closed session on thread lookup instead of forking a fresh one (§5.3)', async () => {
     const first = await harness.session({ threadId: 't1', resourceId: 'r1' });
     await first.close();
 
     const second = await harness.session({ threadId: 't1', resourceId: 'r1' });
-    expect(second.id).not.toBe(first.id);
+    expect(second.id).toBe(first.id);
     expect(second.threadId).toBe('t1');
+    expect(second.isClosed).toBe(false);
   });
 });
 
@@ -2047,10 +2128,12 @@ describe('Harness v1 — session(...) by sessionId', () => {
     await expect(harness.session({ sessionId: 'nope' })).rejects.toThrow(HarnessSessionNotFoundError);
   });
 
-  it('throws HarnessSessionClosedError after the session is closed', async () => {
+  it('reopens a closed session on direct-ID lookup instead of failing (§5.3)', async () => {
     const created = await harness.session({ threadId: 't1', resourceId: 'r1' });
     await created.close();
-    await expect(harness.session({ sessionId: created.id })).rejects.toThrow(HarnessSessionClosedError);
+    const reopened = await harness.session({ sessionId: created.id });
+    expect(reopened.id).toBe(created.id);
+    expect(reopened.isClosed).toBe(false);
   });
 
   it('does not leak existence across resources (foreign resourceId surfaces as not-found)', async () => {
@@ -2065,32 +2148,91 @@ describe('Harness v1 — session(...) by sessionId', () => {
     const fetched = await harness.session({ sessionId: created.id, resourceId: 'r1' });
     expect(fetched).toBe(created);
   });
+
+  // §5.2a/§4.5: a closed/closing record requested by id, while a DIFFERENT session
+  // currently owns the thread, is an expected CONFLICT — reopening it would create a
+  // second active owner. Fail with HarnessSessionConflictError naming the active owner
+  // (distinct from duplicate-owner corruption).
+  function makeOwnershipBaseRecord() {
+    return {
+      harnessName: 'default',
+      resourceId: 'r1',
+      origin: 'top-level' as const,
+      ownsThread: false,
+      modeId: 'default',
+      modelId: 'default',
+      subagentModelOverrides: {},
+      permissionRules: { categories: {}, tools: {} },
+      sessionGrants: { categories: [], tools: [] },
+      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      pendingQueue: [],
+      state: undefined,
+      version: 0,
+    };
+  }
+
+  it('throws HarnessSessionConflictError when a closed direct-ID record is no longer the thread owner (§5.2a/§4.5)', async () => {
+    const base = makeOwnershipBaseRecord();
+    const t0 = Date.now();
+    // The superseded (closed) record the caller asks for by id.
+    await storage.saveSession(
+      { ...base, id: 'sess-stale', threadId: 't-conflict', createdAt: t0, lastActivityAt: t0, closedAt: t0 },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+    // A different, currently-active owner of the same thread (later activity → current owner).
+    await storage.saveSession(
+      { ...base, id: 'sess-active', threadId: 't-conflict', createdAt: t0 + 1, lastActivityAt: t0 + 1000 },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    await expect(harness.session({ sessionId: 'sess-stale' })).rejects.toBeInstanceOf(HarnessSessionConflictError);
+    await expect(harness.session({ sessionId: 'sess-stale' })).rejects.toMatchObject({
+      code: 'harness.session_conflict',
+      resourceId: 'r1',
+      threadId: 't-conflict',
+      requestedSessionId: 'sess-stale',
+      activeSessionId: 'sess-active',
+    });
+  });
+
+  it('still throws HarnessSessionCorruptError when an ACTIVE direct-ID record collides with a different active owner (§5.2a)', async () => {
+    const base = makeOwnershipBaseRecord();
+    const t0 = Date.now();
+    // Two genuinely-active records on one thread — only reachable via out-of-band
+    // mutation, since saveSession refuses a second active insert on an owned thread.
+    await storage.saveSession(
+      { ...base, id: 'sess-dup-a', threadId: 't-corrupt', createdAt: t0, lastActivityAt: t0 },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+    await storage.saveSession(
+      { ...base, id: 'sess-dup-b', threadId: 't-corrupt-staging', createdAt: t0, lastActivityAt: t0 },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+    // Move B onto A's thread out-of-band (update path skips the active-owner guard).
+    await storage.saveSession(
+      { ...base, id: 'sess-dup-b', threadId: 't-corrupt', createdAt: t0, lastActivityAt: t0 + 1000 },
+      { harnessName: 'default', ifVersion: 1 },
+    );
+
+    await expect(harness.session({ sessionId: 'sess-dup-a' })).rejects.toBeInstanceOf(HarnessSessionCorruptError);
+    await expect(harness.session({ sessionId: 'sess-dup-a' })).rejects.toMatchObject({
+      code: 'harness.session_corrupt',
+      reason: 'duplicate_session_owner',
+      sessionId: 'sess-dup-a',
+      threadId: 't-corrupt',
+      ownerSessionIds: ['sess-dup-b'],
+    });
+  });
 });
 
-describe('Harness v1 — session(...) by resource', () => {
-  it('creates fresh thread + session when nothing active exists', async () => {
+describe('Harness v1 — session(...) by resource (removed, §5.3)', () => {
+  it('rejects resource-only resolution — there is no "continue latest" resolver', async () => {
     const harness = makeHarness();
-    const session = await harness.session({ resourceId: 'r1' });
-    expect(session.resourceId).toBe('r1');
-    expect(session.threadId).toMatch(/^thread-/);
-  });
-
-  it('returns one of the live sessions for the resource', async () => {
-    const harness = makeHarness();
-    const first = await harness.session({ threadId: 't1', resourceId: 'r1' });
-    const second = await harness.session({ threadId: 't2', resourceId: 'r1' });
-
-    const found = await harness.session({ resourceId: 'r1' });
-    expect([first.id, second.id]).toContain(found.id);
-  });
-
-  it('skips closed sessions when searching for the most-recent active', async () => {
-    const harness = makeHarness();
-    const first = await harness.session({ threadId: 't1', resourceId: 'r1' });
-    await first.close();
-
-    const found = await harness.session({ resourceId: 'r1' });
-    expect(found.id).not.toBe(first.id);
+    // §5.3: resource-only resolution is intentionally not a resolver overload —
+    // the type forbids it and the runtime rejects it. "Continue latest" is
+    // product policy: read listSessions(...) then resolve a concrete
+    // sessionId/threadId.
+    await expect(harness.session({ resourceId: 'r1' } as never)).rejects.toBeInstanceOf(HarnessConfigError);
   });
 });
 
@@ -2109,6 +2251,133 @@ describe('Harness v1 — lifecycle', () => {
     const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
     await s.close();
     await expect(s.close()).resolves.toBeUndefined();
+  });
+
+  it('Session.delete() removes a closed session via the harness cascade (§4.1)', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    await s.close();
+    await s.delete();
+    expect(harness._internalLiveSessionCount()).toBe(0);
+    await expect(storage.loadSession({ sessionId: s.id, harnessName: 'default' })).resolves.toBeNull();
+  });
+
+  it('operator force-delete removes an active session (Session.delete is guarded-only, §4.1)', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    // Force-delete is the operator path, not exposed on the Session handle.
+    await harness.deleteSession({ sessionId: s.id, resourceId: 'r1', force: true });
+    expect(harness._internalLiveSessionCount()).toBe(0);
+    await expect(storage.loadSession({ sessionId: s.id, harnessName: 'default' })).resolves.toBeNull();
+  });
+
+  it('Session.rename() updates the backing thread title (§4.1)', async () => {
+    const harness = makeHarness();
+    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 't1', title: 'Original' });
+    const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    await s.rename({ title: 'Renamed conversation' });
+    const thread = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: 't1' });
+    expect(thread?.title).toBe('Renamed conversation');
+  });
+
+  it('Session.clone() creates a new owning session over a copied thread (§4.1)', async () => {
+    const harness = makeHarness();
+    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 't1', title: 'Source' });
+    const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
+
+    const cloned = await s.clone({ title: 'Clone' });
+    expect(cloned.id).not.toBe(s.id);
+    expect(cloned.threadId).not.toBe(s.threadId);
+    expect(cloned.resourceId).toBe('r1');
+    expect(cloned.isClosed).toBe(false);
+
+    const clonedThread = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: cloned.threadId });
+    expect(clonedThread?.title).toBe('Clone');
+    // Cloning never tears down or mutates the source session.
+    expect(s.isClosed).toBe(false);
+  });
+
+  it('pressure-evicts the least-recently-active unpinned session at maxLive (§5.4)', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage, maxLive: 2 } });
+    const a = await harness.session({ threadId: 'ta', resourceId: 'r1' });
+    await harness.session({ threadId: 'tb', resourceId: 'r1' });
+    expect(harness._internalLiveSessionCount()).toBe(2);
+
+    // A third live session exceeds the cap → evict the LRU (a, the oldest).
+    const c = await harness.session({ threadId: 'tc', resourceId: 'r1' });
+    expect(harness._internalLiveSessionCount()).toBe(2);
+    expect(c.threadId).toBe('tc');
+
+    // The evicted session's record persists (reopenable), and re-resolving it
+    // hydrates transparently.
+    await expect(storage.loadSession({ sessionId: a.id, harnessName: 'default' })).resolves.not.toBeNull();
+    const reA = await harness.session({ sessionId: a.id });
+    expect(reA.id).toBe(a.id);
+  });
+
+  it('throws HarnessLiveSessionLimitError when every live session at maxLive is pinned (§5.4)', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage, maxLive: 1 } });
+    const now = Date.now();
+    await storage.saveSession(
+      {
+        harnessName: 'default',
+        id: 'sess-pinned',
+        resourceId: 'r1',
+        threadId: 'tp',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        pendingResume: {
+          kind: 'question',
+          itemId: 'q1',
+          runId: 'run-q',
+          toolCallId: 'tc-q',
+          source: 'parent',
+          requestedAt: now,
+          payload: { question: 'pick' },
+        },
+        state: undefined,
+        createdAt: now,
+        lastActivityAt: now,
+        version: 0,
+      } as any,
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const pinned = await harness.session({ sessionId: 'sess-pinned' });
+    expect(pinned.isPinned()).toBe(true);
+    expect(harness._internalLiveSessionCount()).toBe(1);
+
+    // Only live session is pinned → a new session cannot evict it.
+    await expect(harness.session({ threadId: 'tnew', resourceId: 'r1' })).rejects.toBeInstanceOf(
+      HarnessLiveSessionLimitError,
+    );
+  });
+
+  it('idle-evicts an unpinned session after idleTimeoutMs (§5.4)', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage, idleTimeoutMs: 1 } });
+    const s = await harness.session({ threadId: 'ti', resourceId: 'r1' });
+    expect(harness._internalLiveSessionCount()).toBe(1);
+
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await (harness as unknown as { _evictIdleSessions(): Promise<void> })._evictIdleSessions();
+
+    expect(harness._internalLiveSessionCount()).toBe(0);
+    // The evicted record persists and rehydrates transparently.
+    await expect(storage.loadSession({ sessionId: s.id, harnessName: 'default' })).resolves.not.toBeNull();
+    const re = await harness.session({ sessionId: s.id });
+    expect(re.id).toBe(s.id);
   });
 
   it('persists closing markers before terminal close', async () => {
@@ -2219,7 +2488,7 @@ describe('Harness v1 — lifecycle', () => {
   it('does not cascade thread delete after shutdown begins', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
-    const thread = await harness.threads.create({ resourceId: 'r1', threadId: 'delete-during-shutdown' });
+    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'delete-during-shutdown' });
     const s = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const originalRelease = storage.releaseSessionLease.bind(storage);
     let releaseShutdown!: () => void;
@@ -2238,7 +2507,7 @@ describe('Harness v1 — lifecycle', () => {
 
     const shutdown = harness.shutdown();
     await releaseSeen;
-    await harness.threads.delete({ resourceId: 'r1', threadId: thread.id });
+    await createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id });
     releaseShutdown();
     await shutdown;
 
@@ -2249,7 +2518,7 @@ describe('Harness v1 — lifecycle', () => {
   it('does not delete thread data when shutdown starts during a delete cascade', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
-    const thread = await harness.threads.create({ resourceId: 'r1', threadId: 'delete-cascade-during-shutdown' });
+    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'delete-cascade-during-shutdown' });
     const s = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const originalSaveSession = storage.saveSession.bind(storage);
     let releaseTerminalSave!: () => void;
@@ -2269,13 +2538,13 @@ describe('Harness v1 — lifecycle', () => {
       return originalSaveSession(...args);
     }) as typeof storage.saveSession;
 
-    const deleting = harness.threads.delete({ resourceId: 'r1', threadId: thread.id });
+    const deleting = createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id });
     await terminalSaveSeen;
     const shutdown = harness.shutdown();
     releaseTerminalSave();
     await Promise.all([deleting, shutdown]);
 
-    await expect(harness.threads.get({ resourceId: 'r1', threadId: thread.id })).resolves.toMatchObject({
+    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toMatchObject({
       id: thread.id,
     });
     const stored = await storage.loadSession({ sessionId: s.id, harnessName: 'default' });
@@ -2322,7 +2591,10 @@ describe('Harness v1 — lifecycle', () => {
     agent.enqueueRun({
       holdUntil: hold.promise,
       onAbort: reason => {
-        expect(reason).toBe('session_close_timeout');
+        // §6.2: close-drain timeout aborts the live turn with a typed
+        // HarnessAbortedError carrying the close-lifecycle reason.
+        expect(reason).toBeInstanceOf(HarnessAbortedError);
+        expect(reason).toMatchObject({ reason: 'session_closed', sessionId: s.id });
         abortSeen.resolve();
       },
     });
@@ -2345,6 +2617,44 @@ describe('Harness v1 — lifecycle', () => {
 
     const stored = await storage.loadSession({ sessionId: s.id, harnessName: 'default' });
     expect(stored?.closedAt).toBeDefined();
+  });
+
+  it('aborts an active turn at the shutdown drain deadline with process_restart (§6.2)', async () => {
+    const storage = makeStorage();
+    const agent = new MockAgent({ id: 'default' });
+    const hold = deferred();
+    const abortSeen = deferred();
+    let abortReason: unknown;
+    agent.enqueueRun({
+      holdUntil: hold.promise,
+      onAbort: reason => {
+        abortReason = reason;
+        abortSeen.resolve();
+      },
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const s = await harness.session({ threadId: { fresh: true }, resourceId: 'r1' });
+    const message = s.message({ content: 'slow' });
+    void message.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    expect(s.isRunning()).toBe(true);
+
+    // Shutdown rejects on drain-timeout (the turn did not finish in time); that is
+    // expected here — we are asserting the tool-visible abort reason it produced.
+    const shutdownDone = harness.shutdown({ drainTimeoutMs: 1 }).catch(() => undefined);
+    await abortSeen.promise;
+    hold.resolve();
+    await shutdownDone;
+
+    // §6.2: shutdown releases live process ownership without a durable close, so
+    // the turn aborts with the typed process_restart reason.
+    expect(abortReason).toBeInstanceOf(HarnessAbortedError);
+    expect(abortReason).toMatchObject({ reason: 'process_restart', sessionId: s.id });
   });
 
   it('bounds close when an active turn ignores the abort signal', async () => {
@@ -2598,6 +2908,142 @@ describe('Harness v1 — lifecycle', () => {
     await parent.close();
 
     expect(closedSessionIds).toEqual([grandchild.id, child.id, parent.id]);
+  });
+
+  it('§5.5: stamps ONE fixed close deadline across a 3-level subtree (not depth-multiplied)', async () => {
+    const storage = makeStorage();
+    const closeTimeoutMs = 250;
+    const harness = makeHarness({ sessions: { storage, closeTimeoutMs } });
+    const closingEvents: Array<{ sessionId?: string; closingAt?: number; closeDeadlineAt?: number }> = [];
+    harness.subscribe(event => {
+      if (event.type === 'session_closing') {
+        closingEvents.push({
+          sessionId: event.sessionId,
+          closingAt: event.closingAt,
+          closeDeadlineAt: event.closeDeadlineAt,
+        });
+      }
+    });
+
+    const parent = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    await parent.close();
+
+    // Every node in the subtree shares the SINGLE root deadline. Under the
+    // pre-fix per-node computation each descendant stamped its own (later)
+    // `Date.now() + closeTimeoutMs` during the BFS marking walk, so the child's
+    // and grandchild's deadlines would be strictly greater than the root's.
+    expect(closingEvents).toHaveLength(3);
+    const root = closingEvents.find(e => e.sessionId === parent.id)!;
+    const childEvent = closingEvents.find(e => e.sessionId === child.id)!;
+    const grandchildEvent = closingEvents.find(e => e.sessionId === grandchild.id)!;
+    expect(root.closeDeadlineAt).toBe((root.closingAt ?? 0) + closeTimeoutMs);
+    expect(childEvent.closeDeadlineAt).toBe(root.closeDeadlineAt);
+    expect(grandchildEvent.closeDeadlineAt).toBe(root.closeDeadlineAt);
+
+    // And the durable records carry the same single deadline.
+    for (const id of [parent.id, child.id, grandchild.id]) {
+      const stored = await harness.loadSession({ sessionId: id, includeClosed: true });
+      expect(stored?.closeDeadlineAt).toBe(root.closeDeadlineAt);
+    }
+  });
+
+  it('§5.5: a busy 3-level subtree closes within ~closeTimeoutMs, not depth-multiplied', async () => {
+    const storage = makeStorage();
+    const closeTimeoutMs = 60;
+    const agent = new MockAgent({ id: 'default' });
+    // One held run per subtree level: each session is busy when close drains, so
+    // every node's `_waitForCloseDrain` actually blocks until the deadline. Under
+    // the pre-fix per-node deadline the waits stack (≈ depth × closeTimeoutMs);
+    // with one shared deadline the whole drain is bounded by ~closeTimeoutMs.
+    const hold = deferred();
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'p' });
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'c' });
+    agent.enqueueRun({ holdUntil: hold.promise, text: 'g' });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, closeTimeoutMs },
+    });
+
+    const parent = await harness.session({ threadId: { fresh: true }, resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    const pMsg = parent.message({ content: 'p' });
+    const cMsg = child.message({ content: 'c' });
+    const gMsg = grandchild.message({ content: 'g' });
+    await waitFor(() => agent.streamCalls.length === 3, 'all three turns in flight');
+
+    const startedAt = Date.now();
+    const close = parent.close();
+    await close;
+    const elapsed = Date.now() - startedAt;
+
+    // Bounded by a single deadline (+ scheduling slack), NOT 3× the timeout.
+    expect(elapsed).toBeLessThan(closeTimeoutMs * 2);
+
+    hold.resolve();
+    await Promise.allSettled([pMsg, cMsg, gMsg]);
+
+    for (const id of [parent.id, child.id, grandchild.id]) {
+      const stored = await storage.loadSession({ sessionId: id, harnessName: 'default' });
+      expect(stored?.closedAt).toBeDefined();
+    }
+  });
+
+  it('§5.5: a descendant marked during the close walk inherits the root deadline', async () => {
+    // Build the subtree first, then drive close on the root. Children are
+    // discovered + marked DURING the BFS close walk (after the root deadline is
+    // fixed), so a child/grandchild marked later must still carry the root's
+    // single deadline rather than a fresh `now + closeTimeoutMs`.
+    const storage = makeStorage();
+    const closeTimeoutMs = 1000;
+    const harness = makeHarness({ sessions: { storage, closeTimeoutMs } });
+    const deadlineBySession = new Map<string, number>();
+    harness.subscribe(event => {
+      if (event.type === 'session_closing' && event.sessionId && event.closeDeadlineAt !== undefined) {
+        deadlineBySession.set(event.sessionId, event.closeDeadlineAt);
+      }
+    });
+
+    const parent = await harness.session({ threadId: 't1', resourceId: 'r1' });
+    const child = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: parent.id,
+    });
+    const grandchild = await harness.session({
+      threadId: { fresh: true },
+      resourceId: 'r1',
+      parentSessionId: child.id,
+    });
+
+    await parent.close();
+
+    const rootDeadline = deadlineBySession.get(parent.id);
+    expect(rootDeadline).toBeDefined();
+    expect(deadlineBySession.get(child.id)).toBe(rootDeadline);
+    expect(deadlineBySession.get(grandchild.id)).toBe(rootDeadline);
   });
 
   it('repairs a stored closing marker without resetting the deadline', async () => {
@@ -3011,7 +3457,10 @@ describe('Harness v1 — delete lifecycle', () => {
     await expect(harness.deleteSession({ sessionId: parent.id, resourceId: 'r1' })).rejects.toMatchObject({
       name: 'HarnessSessionDeleteBlockedError',
       sessionId: parent.id,
-      blockers: expect.arrayContaining([`${parent.id}:not_closed`, `${child.id}:not_closed`]),
+      blockers: expect.arrayContaining([
+        expect.objectContaining({ source: 'session', id: parent.id, status: 'not_closed' }),
+        expect.objectContaining({ source: 'child_session', id: child.id, status: 'not_closed' }),
+      ]),
     } satisfies Partial<HarnessSessionDeleteBlockedError>);
     await expect(storage.loadSession({ sessionId: parent.id, harnessName: 'default' })).resolves.not.toBeNull();
     await expect(storage.loadSession({ sessionId: child.id, harnessName: 'default' })).resolves.not.toBeNull();
@@ -3046,7 +3495,9 @@ describe('Harness v1 — delete lifecycle', () => {
     );
 
     await expect(harness.deleteSession({ sessionId: session.id, resourceId: 'r1' })).rejects.toMatchObject({
-      blockers: expect.arrayContaining([`${session.id}:queue_receipt:queued`]),
+      blockers: expect.arrayContaining([
+        expect.objectContaining({ source: 'queue', id: 'queued', status: 'completed' }),
+      ]),
     } satisfies Partial<HarnessSessionDeleteBlockedError>);
   });
 
@@ -3634,11 +4085,112 @@ describe('Harness v1 — crash recovery (lease TTL)', () => {
 });
 
 describe('Harness v1 — concurrent resolver race', () => {
-  // In-flight dedup of parallel session() calls for the same thread is not
-  // yet implemented — the current resolver lets both calls race to
-  // _createFresh. Track the desired behavior here so it surfaces when the
-  // dedup map lands.
-  it.todo('serialises two parallel session() calls for the same thread to a single record');
+  // §5.3 cold-resolution singleflight. Two CONCURRENT session() calls for the
+  // SAME not-yet-live target (same harness instance) must collapse onto one
+  // hydrate/adopt and receive the SAME Session. Without the singleflight both
+  // calls miss _liveSessions, both cold-hydrate, both acquire the lease under
+  // the same ownerId (CAS does not conflict for the same owner), and the second
+  // _adoptSession overwrites the first's event bridge — leaking a subscription
+  // and leaving two live Session objects for one row with racing flush chains.
+
+  it('collapses two parallel session({ resourceId, threadId }) cold creates to one Session + one bridge', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: 't-race', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race', resourceId: 'r1' }),
+    ]);
+    // Same instance — not just same id (would double-adopt without the fix).
+    expect(a).toBe(b);
+    // Exactly one live session + exactly one event bridge for the row.
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount(a.id)).toBe(1);
+  });
+
+  it('collapses three parallel session({ resourceId, threadId }) cold creates to one Session', async () => {
+    const harness = makeHarness();
+    const [a, b, c] = await Promise.all([
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+      harness.session({ threadId: 't-race3', resourceId: 'r1' }),
+    ]);
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount(a.id)).toBe(1);
+  });
+
+  it('collapses two parallel session({ sessionId }) cold hydrates of a stored-but-not-live row to one Session + one bridge', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const t0 = Date.now();
+    // A row owned by THIS harness with a live lease, but never adopted into
+    // _liveSessions — exactly the "not-yet-live" state two cold resolves race on.
+    await storage.saveSession(
+      {
+        id: 'sess-cold',
+        harnessName: 'default',
+        resourceId: 'r1',
+        threadId: 't-cold',
+        origin: 'top-level',
+        ownsThread: false,
+        modeId: 'default',
+        modelId: 'default',
+        subagentModelOverrides: {},
+        permissionRules: { categories: {}, tools: {} },
+        sessionGrants: { categories: [], tools: [] },
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        pendingQueue: [],
+        state: undefined,
+        version: 0,
+        createdAt: t0,
+        lastActivityAt: t0,
+        ownerId: harness.ownerId,
+        leaseExpiresAt: t0 + 60_000,
+      },
+      { harnessName: 'default', ifVersion: 0 },
+    );
+
+    const [a, b] = await Promise.all([
+      harness.session({ sessionId: 'sess-cold' }),
+      harness.session({ sessionId: 'sess-cold' }),
+    ]);
+    expect(a).toBe(b);
+    expect(a.id).toBe('sess-cold');
+    expect(harness._internalLiveSessionCount()).toBe(1);
+    expect(harness._internalSessionEventBridgeCount('sess-cold')).toBe(1);
+  });
+
+  it('does not falsely dedupe DISTINCT sessions resolved in parallel', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: 't-distinct-a', resourceId: 'r1' }),
+      harness.session({ threadId: 't-distinct-b', resourceId: 'r1' }),
+    ]);
+    expect(a).not.toBe(b);
+    expect(a.id).not.toBe(b.id);
+    expect(harness._internalLiveSessionCount()).toBe(2);
+  });
+
+  it('does not dedupe { fresh: true } — each fresh call mints its own session', async () => {
+    const harness = makeHarness();
+    const [a, b] = await Promise.all([
+      harness.session({ threadId: { fresh: true }, resourceId: 'r1' }),
+      harness.session({ threadId: { fresh: true }, resourceId: 'r1' }),
+    ]);
+    expect(a).not.toBe(b);
+    expect(a.id).not.toBe(b.id);
+    expect(a.threadId).not.toBe(b.threadId);
+    expect(harness._internalLiveSessionCount()).toBe(2);
+  });
+
+  it('clears the in-flight entry on failure so a retry can proceed', async () => {
+    const harness = makeHarness();
+    // First cold resolve fails (unknown sessionId). The singleflight entry must
+    // be cleared in finally so a subsequent resolve is not served the cached
+    // rejected promise.
+    await expect(harness.session({ sessionId: 'ghost' })).rejects.toThrow(HarnessSessionNotFoundError);
+    await expect(harness.session({ sessionId: 'ghost' })).rejects.toThrow(HarnessSessionNotFoundError);
+  });
 
   it('serialises lease acquisition per session — distinct sessions resolve in parallel', async () => {
     // A single harness owns its leases; parallel resolves for *different*
@@ -3732,5 +4284,1443 @@ describe('Session — identity + lifecycle', () => {
     expect(rec.threadId).toBe('t1');
     expect(rec.resourceId).toBe('r1');
     expect(rec.closedAt).toBeUndefined();
+  });
+});
+
+describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
+  function makeIngressCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      harnessName: 'primary',
+      channelId: 'support',
+      providerId: 'slack',
+      platform: 'slack',
+      conversationKind: 'channel',
+      trigger: 'message',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      externalMessageId: 'M1',
+      content: 'hello',
+      receivedAt: 1000,
+      ...overrides,
+    } as never;
+  }
+
+  function setup(channelOverrides: Record<string, unknown> = {}) {
+    const storage = makeStorage();
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeHarnessChannelConfig(channelOverrides) },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    return { harness, storage };
+  }
+
+  type ResolveResult = {
+    binding: { id: string; status: string; generation: number; mode: string; lastInboundAt?: number };
+    resolved: { resourceId: string; threadId: string; sessionId: string; mode: string };
+  };
+
+  it('resolves a new active binding, deriving stable namespaced thread/session ids', async () => {
+    const { harness } = setup();
+    const r = (await (harness as never as {
+      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    expect(r.resolved.resourceId).toBe('resource-1');
+    expect(r.resolved.threadId).toMatch(/^ch:/);
+    expect(r.resolved.sessionId).toMatch(/^chs:/);
+    expect(r.resolved.mode).toBe('shared-resource');
+    expect(r.binding).toMatchObject({ status: 'active', generation: 1, mode: 'shared-resource' });
+
+    // Stability: a fresh harness with the same inputs derives the SAME ids.
+    const { harness: h2 } = setup();
+    const r2 = (await (h2 as never as {
+      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    expect(r2.resolved.threadId).toBe(r.resolved.threadId);
+    expect(r2.resolved.sessionId).toBe(r.resolved.sessionId);
+
+    // Separation: a different resolved resourceId derives a DIFFERENT threadId.
+    const { harness: h3 } = setup({ ingress: { resolveResource: async () => ({ resourceId: 'other', mode: 'shared-resource' }) } });
+    const r3 = (await (h3 as never as {
+      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    expect(r3.resolved.threadId).not.toBe(r.resolved.threadId);
+  });
+
+  it('§14.1: a missing optional external id does NOT collide with a literal single space', async () => {
+    // Residual #3: `normChannelExternalId` must use the same out-of-band sentinel
+    // as the storage tuple key. A provider may legitimately send a single-space
+    // externalChannelId; if `undefined` normalised to `' '` (the old behaviour),
+    // an absent id and a literal space would derive the SAME thread/session id and
+    // collide at the channel level even though storage keeps them distinct.
+    const call = (h: Harness) =>
+      (h as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      })._resolveChannelBindingForIngress.bind(h) as (c: never) => Promise<ResolveResult>;
+
+    const { harness: hMissing } = setup();
+    const missing = await call(hMissing)(makeIngressCtx({ externalChannelId: undefined }));
+
+    const { harness: hSpace } = setup();
+    const space = await call(hSpace)(makeIngressCtx({ externalChannelId: ' ' }));
+
+    // Absent external id and a literal single space derive DISTINCT ids.
+    expect(missing.resolved.threadId).not.toBe(space.resolved.threadId);
+    expect(missing.resolved.sessionId).not.toBe(space.resolved.sessionId);
+
+    // …and each remains stable on its own inputs (no accidental cross-talk).
+    const { harness: hMissing2 } = setup();
+    const missing2 = await call(hMissing2)(makeIngressCtx({ externalChannelId: undefined }));
+    expect(missing2.resolved.threadId).toBe(missing.resolved.threadId);
+  });
+
+  it('idempotently reuses the active binding and advances lastInboundAt only forward', async () => {
+    const { harness } = setup();
+    const call = (harness as never as {
+      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+    })._resolveChannelBindingForIngress.bind(harness) as (c: never) => Promise<ResolveResult>;
+    const first = await call(makeIngressCtx({ receivedAt: 1000 }));
+    const second = await call(makeIngressCtx({ receivedAt: 2000 }));
+    expect(second.binding.id).toBe(first.binding.id); // same active binding, not a duplicate
+    expect(second.binding.lastInboundAt).toBe(2000);
+    // A delayed/out-of-order OLDER ingress must NOT regress the activity marker.
+    const stale = await call(makeIngressCtx({ receivedAt: 500 }));
+    expect(stale.binding.lastInboundAt).toBe(2000);
+  });
+
+  it("maps a 'custom' policy mode to the durable 'shared-resource' mode (§5.1h)", async () => {
+    const { harness } = setup({
+      ingress: { resolveResource: async () => ({ resourceId: 'r', mode: 'custom' }) },
+    });
+    const r = (await (harness as never as {
+      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    expect(r.binding.mode).toBe('shared-resource');
+  });
+
+  it('rejects a policy that returns sessionId without threadId (§14.1 no mispairing)', async () => {
+    const { harness } = setup({
+      ingress: { resolveResource: async () => ({ resourceId: 'r', sessionId: 's1', mode: 'shared-resource' }) },
+    });
+    await expect(
+      (harness as never as { _resolveChannelBindingForIngress: (c: never) => Promise<unknown> })._resolveChannelBindingForIngress(
+        makeIngressCtx(),
+      ),
+    ).rejects.toBeInstanceOf(HarnessValidationError);
+  });
+});
+
+describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () => {
+  function makeIngressCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      harnessName: 'primary',
+      channelId: 'support',
+      providerId: 'slack',
+      platform: 'slack',
+      conversationKind: 'channel',
+      trigger: 'message',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      externalMessageId: 'M1',
+      content: 'hello from channel',
+      receivedAt: 1000,
+      ...overrides,
+    } as never;
+  }
+
+  function setup(
+    channelOverrides: Partial<HarnessChannelConfig> = {},
+    sessionsOverrides: Record<string, unknown> = {},
+  ) {
+    // Shared storage: the harness session storage IS the Mastra's harness store
+    // instance, so `_usesSeparateSessionStorage()` is false and session creation
+    // for a fresh channel conversation is not blocked by the separate-storage
+    // thread-must-exist guard. (Channel ingress under SEPARATE session storage
+    // needs a resolver create-with-explicit-id capability — C4 follow-up.)
+    const composite = new InMemoryStore();
+    const storage = composite.stores.harness as ReturnType<typeof makeStorage>;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage, ...sessionsOverrides },
+      channels: { support: makeHarnessChannelConfig(channelOverrides) },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    // Binding auto-starts the §14.2 recovery worker loop; stop it so these tests
+    // drive recovery explicitly (via recoverChannelInboxOnce) without a background
+    // tick racing their assertions. The loop itself is covered by dedicated
+    // scheduler tests below.
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    return { harness, storage };
+  }
+
+  type AdmitResult = {
+    inboxItemId: string;
+    status: string;
+    binding?: { id: string };
+    sessionId?: string;
+    queuedItemId?: string;
+    duplicate: boolean;
+  };
+
+  it('records the inbox row, resolves a binding+session, and admits the turn via queue', async () => {
+    const { harness } = setup();
+    const events: Array<{ type: string; inboxItemId?: string; delivery?: string }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e as never);
+    });
+
+    const r = (await (harness as never as {
+      admitChannelInbound: (c: never) => Promise<AdmitResult>;
+    }).admitChannelInbound(makeIngressCtx())) as AdmitResult;
+
+    expect(r.status).toBe('queued');
+    expect(r.duplicate).toBe(false);
+    expect(r.binding?.id).toMatch(/^binding-/);
+    expect(r.sessionId).toMatch(/^chs:/);
+    expect(typeof r.queuedItemId).toBe('string');
+    expect(events.map(e => e.type)).toEqual(['channel_ingress_received', 'channel_ingress_admitted']);
+    expect(events[1]).toMatchObject({ delivery: 'queue', inboxItemId: r.inboxItemId });
+  });
+
+  it('is idempotent for a provider retry (same external message) — no double admission', async () => {
+    const { harness } = setup();
+    const events: string[] = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e.type);
+    });
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+    const first = await call(makeIngressCtx());
+    const second = await call(makeIngressCtx()); // same externalMessageId → same inbox row
+    expect(second.duplicate).toBe(true);
+    expect(second.status).toBe('queued');
+    expect(second.inboxItemId).toBe(first.inboxItemId);
+    // The retry does not re-emit received/admitted (already admitted).
+    expect(events).toEqual(['channel_ingress_received', 'channel_ingress_admitted']);
+  });
+
+  it('threads policy-selected admission mode/model through the persisted admissionHash without conflict', async () => {
+    // §14.2 step 7: the bridge computes the admissionHash over the EXACT payload
+    // (content + persisted attachments + policy mode/model + requestContext) and
+    // persists it BEFORE admitting, then replays it as expectedAdmissionHash. If
+    // the pre-computed hash and the queue-boundary recompute disagree (e.g. a field
+    // is dropped on one side), _admitQueue throws HarnessAdmissionConflictError.
+    // A clean 'queued' result proves the payload threads consistently.
+    const { harness } = setup({
+      ingress: {
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { mode: 'default', model: 'model-x' },
+        }),
+      },
+    });
+    const r = (await (harness as never as {
+      admitChannelInbound: (c: never) => Promise<AdmitResult>;
+    }).admitChannelInbound(makeIngressCtx())) as AdmitResult;
+    expect(r.status).toBe('queued');
+    expect(typeof r.queuedItemId).toBe('string');
+  });
+
+  it('preserves the recovery-complete admission on a failure AFTER the admitted write', async () => {
+    // Model a crash AFTER the queue append but BEFORE the 'queued' status commits:
+    // make the 'queued' inbox write throw. The failure lands after the 'admitted'
+    // write committed admissionHash/bindingId/resolved ids, so the 'failed' row
+    // must RETAIN that recovery-complete admission (catch spreads the latest
+    // committed row, not the stale pre-admission row) — recovery then replays the
+    // persisted payload and never re-runs policy.
+    const { harness, storage } = setup();
+    const realUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      row: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      if (row.status === 'queued') throw new Error('crash before queued commit');
+      return realUpdate(row, opts);
+    };
+    const events: Array<{ type: string; inboxItemId?: string }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e as never);
+    });
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+
+    await expect(call(makeIngressCtx())).rejects.toThrow();
+    expect(events.map(e => e.type)).toEqual(['channel_ingress_received', 'channel_ingress_failed']);
+
+    const failed = await storage.claimChannelInboxItems({
+      harnessName: 'primary',
+      channelId: 'support',
+      statuses: ['failed'],
+      claimId: 'recovery-claim',
+      limit: 10,
+      now: 4_000_000_000_000,
+      claimTtlMs: 30_000,
+    });
+    expect(failed).toHaveLength(1);
+    const row = failed[0]!;
+    expect(row.status).toBe('failed');
+    // Recovery-complete admission survived the failure (NOT reset to the
+    // pre-admission shape): admissionHash + binding + resolved ids + bound
+    // requestContext are all still present.
+    expect(typeof row.admissionHash).toBe('string');
+    expect(row.bindingId).toMatch(/^binding-/);
+    expect(row.resourceId).toBe('resource-1');
+    expect(typeof row.threadId).toBe('string');
+    expect(row.sessionId).toMatch(/^chs:/);
+    expect(row.delivery).toBe('queue');
+    expect(row.requestContext.channel?.bindingId).toBe(row.bindingId);
+    // It also carries the failure evidence the worker needs.
+    expect(row.lastError).toMatchObject({ code: 'unknown', retryable: true });
+  });
+
+  it('persists a durable failed inbox row (with lastError) and emits channel_ingress_failed when admission errors', async () => {
+    // Force the admission body to throw after the row is created (resolveResource
+    // rejects). The catch must record status:'failed' + lastError on the row, NOT
+    // leave it stranded at 'received'. (Regression guard: a failed update without
+    // lastError throws inside the in-memory store and is swallowed.)
+    const { harness, storage } = setup({
+      ingress: {
+        resolveResource: async () => {
+          throw new Error('policy boom');
+        },
+      },
+    });
+    const events: Array<{ type: string; inboxItemId?: string; error?: { code: string; message: string } }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e as never);
+    });
+
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+
+    // The local thrown error still carries the raw resolver text (it stays a
+    // local-only cause); only the PUBLIC projection is redacted.
+    await expect(call(makeIngressCtx())).rejects.toThrow(/policy boom/);
+
+    // received emitted, then failed (not admitted).
+    expect(events.map(e => e.type)).toEqual(['channel_ingress_received', 'channel_ingress_failed']);
+    // §13.3f.1: a raw (non-namespaced) resolver Error must NOT leak its message
+    // or its `err.name` code onto the public channel_ingress_failed event. It is
+    // redacted to the reserved `harness.internal` catch-all with a generic message.
+    expect(events[1]?.error).toEqual({ code: 'harness.internal', message: 'An internal harness error occurred' });
+    expect(events[1]?.error?.message).not.toMatch(/policy boom/);
+    const failedItemId = events[1]?.inboxItemId;
+    expect(typeof failedItemId).toBe('string');
+
+    // The durable row transitioned to 'failed' and carries diagnostic lastError.
+    // The recovery worker can reclaim it once the original admission claim lapses
+    // (the admission claim was stamped with wall-clock Date.now(), so the reclaim
+    // `now` must sit past that expiry — 'failed' is non-terminal, so it is eligible).
+    const claimed = await storage.claimChannelInboxItems({
+      harnessName: 'primary',
+      channelId: 'support',
+      statuses: ['failed'],
+      claimId: 'recovery-claim',
+      limit: 10,
+      now: 4_000_000_000_000,
+      claimTtlMs: 30_000,
+    });
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.id).toBe(failedItemId);
+    expect(claimed[0]?.status).toBe('failed');
+    // The durable row keeps the bare `code: 'unknown'` (row-side readability,
+    // §13.3f.1), but its stored message is the redacted public projection — the
+    // raw resolver text never reaches the durable failure receipt either.
+    expect(claimed[0]?.lastError).toMatchObject({ code: 'unknown', retryable: true });
+    expect(claimed[0]?.lastError?.message).toBe('An internal harness error occurred');
+    expect(claimed[0]?.lastError?.message).not.toMatch(/policy boom/);
+  });
+
+  it('backs off (in-progress duplicate) when the failed row still holds a live claim — does not steal it', async () => {
+    // After a failed admission the durable row is 'failed' but its admission claim
+    // is still live (claimExpiresAt = wall-clock now + TTL). A synchronous
+    // re-delivery of the same provider event within that window must NOT steal the
+    // claim and re-run admission (that would claim-conflict and emit a false
+    // failure). It reports the existing non-terminal row as an in-progress
+    // duplicate, leaving recovery to the worker after the claim lapses.
+    // (Exercises the `!created.claimed` branch with real calls — no internal
+    // idempotency-key reconstruction needed.)
+    let boom = true;
+    const { harness } = setup({
+      ingress: {
+        resolveResource: async () => {
+          if (boom) throw new Error('transient resolver outage');
+          return { resourceId: 'resource-1', mode: 'shared-resource' };
+        },
+      },
+    });
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+
+    await expect(call(makeIngressCtx())).rejects.toThrow(/transient resolver outage/);
+
+    // Heal the resolver and re-deliver the SAME provider event immediately. The
+    // failed row's claim is still live, so admission backs off rather than retrying
+    // synchronously (within-TTL recovery is the worker's job, not the ingress call).
+    boom = false;
+    const events: string[] = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e.type);
+    });
+    const replay = await call(makeIngressCtx());
+    expect(replay.duplicate).toBe(true);
+    expect(replay.status).toBe('failed'); // unchanged — not re-admitted under the live claim
+    // No received/admitted/failed re-emitted — we did not steal the live claim.
+    expect(events).toEqual([]);
+  });
+
+  // ——— §14.2 recovery worker (recoverChannelInboxOnce) ———
+
+  type RecoverResult = { claimed: number; queued: number; failed: number; dead: number };
+  const WORKER_NOW = 4_000_000_000_000; // past any wall-clock admission-claim expiry
+
+  it('worker resumes a row that failed AFTER admit by replaying the persisted admission (admissionHash present)', async () => {
+    // Crash the original admission after the queue append but before the 'queued'
+    // write, leaving a 'failed' row that is recovery-complete (admissionHash +
+    // resolved ids). The worker takes the replay-only path: re-admit with the
+    // stored payload + expectedAdmissionHash → queue de-dupes on admissionId → row
+    // reaches 'queued' without re-running policy or double-queuing.
+    const { harness, storage } = setup();
+    const realUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      row: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      if (row.status === 'queued') throw new Error('crash before queued commit');
+      return realUpdate(row, opts);
+    };
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+    await expect(call(makeIngressCtx())).rejects.toThrow();
+    // Heal storage so recovery can commit.
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = realUpdate;
+
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toMatchObject({ claimed: 1, queued: 1, failed: 0, dead: 0 });
+  });
+
+  it('worker resumes a row that failed BEFORE binding resolution by re-running resolution (no admissionHash)', async () => {
+    // First admission throws in resolveResource → 'failed' row with NO admissionHash
+    // (policy never completed). The worker reconstructs the ChannelIngressContext
+    // from the persisted envelope (conversationKind/trigger) and resumes from
+    // binding resolution → admitted → queued.
+    let boom = true;
+    const { harness } = setup({
+      ingress: {
+        resolveResource: async () => {
+          if (boom) throw new Error('resolver outage');
+          return { resourceId: 'resource-1', mode: 'shared-resource' };
+        },
+      },
+    });
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+    await expect(call(makeIngressCtx())).rejects.toThrow(/resolver outage/);
+
+    boom = false;
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toMatchObject({ claimed: 1, queued: 1, failed: 0, dead: 0 });
+  });
+
+  it('worker dead-letters a row already at maxAttempts (no further admission attempt)', async () => {
+    const { harness, storage } = setup();
+    await storage.saveChannelInboxItem(
+      channelInboxRow({
+        id: 'inbox-dead-1',
+        status: 'failed',
+        attempts: 10, // == default maxAttempts
+        claimId: undefined,
+        claimExpiresAt: undefined,
+        admissionHash: 'persisted-hash',
+        externalMessageId: 'm-dead',
+      }),
+    );
+    const failedEvents: Array<{ type: string }> = [];
+    harness.subscribe(e => {
+      if (e.type === 'channel_ingress_failed') failedEvents.push(e as never);
+    });
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toMatchObject({ claimed: 1, queued: 0, failed: 0, dead: 1 });
+    expect(failedEvents).toHaveLength(1);
+  });
+
+  it('worker is a no-op when there are no claimable rows', async () => {
+    const { harness } = setup();
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toEqual({ claimed: 0, queued: 0, accepted: 0, failed: 0, dead: 0 });
+  });
+
+  // ——— §14.2 error taxonomy ———
+  // Drive a 'received'/'failed' (no-admissionHash) row, then recover with a
+  // resolveResource that throws a specific error so the worker's classifier maps
+  // it to the durable failure shape (status / bare lastError.code / nextAttemptAt).
+
+  async function recoverAfterThrow(err: unknown): Promise<{
+    res: RecoverResult;
+    storage: ReturnType<typeof makeStorage>;
+    failedEvents: Array<{ error?: { code: string; message: string } }>;
+  }> {
+    const { harness, storage } = setup({
+      ingress: {
+        resolveResource: async () => {
+          throw err;
+        },
+      },
+    });
+    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+    // First admission fails → durable 'failed' row (no admissionHash).
+    await expect(call(makeIngressCtx())).rejects.toThrow();
+    const failedEvents: Array<{ error?: { code: string; message: string } }> = [];
+    harness.subscribe(e => {
+      if (e.type === 'channel_ingress_failed') failedEvents.push(e as never);
+    });
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    return { res, storage, failedEvents };
+  }
+
+  async function claimFailedRow(storage: ReturnType<typeof makeStorage>) {
+    // Inspect the recovered row past its backoff `nextAttemptAt` + worker claim.
+    const rows = await storage.claimChannelInboxItems({
+      harnessName: 'primary',
+      channelId: 'support',
+      statuses: ['failed'],
+      claimId: 'inspect',
+      limit: 10,
+      now: WORKER_NOW + 1_000_000,
+      claimTtlMs: 1_000,
+    });
+    return rows[0];
+  }
+
+  it.each([
+    ['HarnessSessionLockedError', () => new HarnessSessionLockedError('chs:x', 'owner-y', WORKER_NOW + 1), 'session_locked'],
+    ['HarnessLiveSessionLimitError', () => new HarnessLiveSessionLimitError(2, 2), 'live_session_limit'],
+    ['HarnessQueueFullError', () => new HarnessQueueFullError('chs:x', 0, 0), 'queue_full'],
+  ])('classifies %s as retryable failed with its bare code + backoff', async (_name, makeErr, code) => {
+    const { res, storage } = await recoverAfterThrow(makeErr());
+    expect(res).toMatchObject({ failed: 1, dead: 0, queued: 0 });
+    const row = await claimFailedRow(storage);
+    expect(row?.status).toBe('failed');
+    expect(row?.lastError).toMatchObject({ code, retryable: true });
+    expect(row?.nextAttemptAt).toBeGreaterThan(WORKER_NOW); // backoff scheduled
+  });
+
+  it.each([
+    ['HarnessSessionClosedError', () => new HarnessSessionClosedError('chs:x'), 'session_closed'],
+    ['HarnessSessionDeletedError', () => new HarnessSessionDeletedError('chs:x', 'resource-1', 'thread-1'), 'session_deleted'],
+    [
+      'HarnessOverrideConflictError',
+      () => new HarnessOverrideConflictError('chs:x', 'run-1', ['mode']),
+      'override_conflict',
+    ],
+    // Unrecoverable row-shape / invalid-policy resolution → terminal, not retried.
+    ['HarnessValidationError', () => new HarnessValidationError('field', 'bad'), 'unknown'],
+  ])('classifies %s as terminal dead (operator repair), ignoring maxAttempts', async (_name, makeErr) => {
+    const { res, failedEvents } = await recoverAfterThrow(makeErr());
+    expect(res).toMatchObject({ dead: 1, failed: 0, queued: 0 });
+    expect(failedEvents).toHaveLength(1); // the worker still surfaces a failure event
+    expect(failedEvents[0]?.error?.code).toBeTruthy(); // carries the projected error identity
+  });
+
+  it('clamps a session_closing failed row’s nextAttemptAt to closeDeadlineAt (deadline in the future)', async () => {
+    const deadline = WORKER_NOW + 1_000; // sooner than the ~2s+ exponential backoff for attempt 1
+    const { res, storage } = await recoverAfterThrow(
+      new HarnessSessionClosingError('chs:x', WORKER_NOW - 1_000, deadline),
+    );
+    expect(res).toMatchObject({ failed: 1, dead: 0 });
+    const row = await claimFailedRow(storage);
+    expect(row?.lastError).toMatchObject({ code: 'session_closing', retryable: true });
+    expect(row?.nextAttemptAt).toBe(deadline); // clamped to the deadline, not now+backoff
+  });
+
+  it('dead-letters a session_closing row once the close deadline has passed', async () => {
+    const { res } = await recoverAfterThrow(
+      new HarnessSessionClosingError('chs:x', WORKER_NOW - 10_000, WORKER_NOW - 1_000), // deadline already past
+    );
+    expect(res).toMatchObject({ dead: 1, failed: 0 });
+  });
+
+  // ——— §14.2 recovery worker scheduler (start-on-bind / tick / stop) ———
+
+  type RecoveryTimerProbe = { _channelInboxRecoveryTimer?: unknown; _tickChannelInboxRecovery: () => Promise<void> };
+  const probe = (h: unknown) => h as unknown as RecoveryTimerProbe;
+
+  // A harness bound WITHOUT stopping the recovery loop (the C4 setup stops it).
+  function makeBoundHarness(channels?: Record<string, HarnessChannelConfig>) {
+    const composite = new InMemoryStore();
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: composite.stores.harness },
+      ...(channels ? { channels } : {}),
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    return harness;
+  }
+
+  it('starts the recovery loop on bind when channels are configured, and stops it on shutdown', async () => {
+    const harness = makeBoundHarness({ support: makeHarnessChannelConfig() });
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeDefined();
+    await harness.shutdown();
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeUndefined();
+  });
+
+  it('does NOT start the recovery loop when no channels are configured', async () => {
+    const harness = makeBoundHarness(); // no channels
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeUndefined();
+    await harness.shutdown();
+  });
+
+  it('restarts the recovery loop when shutdown rolls back on a drain failure (PF-812)', async () => {
+    const harness = makeBoundHarness({ support: makeHarnessChannelConfig() });
+    const session = await harness.session({ threadId: 't-rollback', resourceId: 'u' });
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeDefined();
+
+    // Force the shutdown drain to fail once so shutdown() rolls back: it restores
+    // live sessions + lease renewal, and (PF-812) must also resume the channel
+    // recovery worker rather than leaving channel recovery permanently dead.
+    vi.spyOn(
+      session as unknown as { _flushEventPersistence: () => Promise<void> },
+      '_flushEventPersistence',
+    ).mockRejectedValueOnce(new Error('event persistence failed'));
+    await expect(harness.shutdown()).rejects.toBeInstanceOf(HarnessStorageError);
+
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeDefined();
+    expect(harness.channelWorkerReadiness({ channelId: 'support' })).toEqual({ ready: true });
+
+    await harness.shutdown(); // clean shutdown now succeeds (spy exhausted)
+    expect(probe(harness)._channelInboxRecoveryTimer).toBeUndefined();
+  });
+
+  it('tick runs one recovery pass per configured channel', async () => {
+    const harness = makeBoundHarness({ a: makeHarnessChannelConfig(), b: makeHarnessChannelConfig() });
+    probe(harness)._channelInboxRecoveryTimer && (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    const spy = vi
+      .spyOn(harness as unknown as { recoverChannelInboxOnce: (o: unknown) => Promise<unknown> }, 'recoverChannelInboxOnce')
+      .mockResolvedValue({ claimed: 0, queued: 0, failed: 0, dead: 0 });
+    await probe(harness)._tickChannelInboxRecovery();
+    const channelArgs = spy.mock.calls.map(c => (c[0] as { channelId: string }).channelId).sort();
+    expect(channelArgs).toEqual(['a', 'b']);
+    await harness.shutdown();
+  });
+
+  it('tick is reentrancy-guarded (a concurrent pass is a no-op)', async () => {
+    const { harness } = setup(); // loop already stopped by setup
+    (harness as unknown as { _channelInboxRecoveryRunning: boolean })._channelInboxRecoveryRunning = true;
+    const spy = vi.spyOn(harness as unknown as { recoverChannelInboxOnce: () => Promise<unknown> }, 'recoverChannelInboxOnce');
+    await probe(harness)._tickChannelInboxRecovery();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  // ——— §14.2 claim-renewal heartbeat ———
+
+  type HeartbeatProbe = {
+    _withChannelInboxClaimHeartbeat: <T>(
+      storage: unknown,
+      item: ChannelInboxItem,
+      claimId: string,
+      claimTtlMs: number,
+      claimRenewMs: number,
+      operation: () => Promise<T>,
+    ) => Promise<T>;
+  };
+
+  it('renews the inbox claim on the heartbeat interval while a slow operation runs', async () => {
+    const { harness, storage } = setup();
+    const renewSpy = vi
+      .spyOn(storage, 'renewChannelInboxClaim')
+      .mockResolvedValue({ claimExpiresAt: 99_999, storageNow: 1 });
+    const result = await (harness as unknown as HeartbeatProbe)._withChannelInboxClaimHeartbeat(
+      storage,
+      channelInboxRow({ id: 'hb-1' }),
+      'claim-x',
+      30_000,
+      5, // renew every 5ms
+      async () => {
+        await new Promise(r => setTimeout(r, 40)); // slow enough for the 5ms heartbeat to fire
+        return 'done';
+      },
+    );
+    expect(result).toBe('done');
+    expect(renewSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(renewSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ inboxItemId: 'hb-1', claimId: 'claim-x', claimTtlMs: 30_000 }),
+    );
+  });
+
+  it('treats a heartbeat renewal failure as benign (does not fail the operation)', async () => {
+    // A renewal that fails is NOT surfaced as an operation error — a genuine claim
+    // loss is detected by the operation's own claim-checked writes (which throw),
+    // and a renewal that fails because the row already committed terminal must not
+    // produce a false failure. The heartbeat just stops renewing.
+    const { harness, storage } = setup();
+    const renewSpy = vi
+      .spyOn(storage, 'renewChannelInboxClaim')
+      .mockRejectedValue(new Error('claim lost to another worker'));
+    const result = await (harness as unknown as HeartbeatProbe)._withChannelInboxClaimHeartbeat(
+      storage,
+      channelInboxRow({ id: 'hb-2' }),
+      'claim-x',
+      30_000,
+      5,
+      async () => {
+        await new Promise(r => setTimeout(r, 40));
+        return 'done';
+      },
+    );
+    expect(result).toBe('done'); // benign — no throw
+    expect(renewSpy).toHaveBeenCalled(); // it tried, then stopped after the failure
+    expect(renewSpy.mock.calls.length).toBeLessThan(8); // stopped renewing (not every 5ms for 40ms)
+  });
+
+  // ——— §14.2 record-only admission (continueAdmission:false / ACK-after-received) ———
+
+  it('records + ACKs without admitting (continueAdmission:false); the recovery worker completes it', async () => {
+    const { harness } = setup();
+    const events: string[] = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e.type);
+    });
+    const admit = (harness as never as {
+      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+
+    const r = await admit(makeIngressCtx(), { continueAdmission: false });
+    expect(r.status).toBe('received');
+    expect(r.duplicate).toBe(false);
+    expect(r.queuedItemId).toBeUndefined();
+    expect(r.binding).toBeUndefined();
+    expect(events).toEqual(['channel_ingress_received']); // recorded, NOT admitted
+
+    // The 'received' row (claim released) is completed by the recovery worker.
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toMatchObject({ claimed: 1, queued: 1 });
+  });
+
+  it('record-only is idempotent: a duplicate provider retry reports the same received row, still un-admitted', async () => {
+    const { harness } = setup();
+    const admit = (harness as never as {
+      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+
+    const first = await admit(makeIngressCtx(), { continueAdmission: false }); // records + releases claim
+    const events: string[] = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e.type);
+    });
+    // A duplicate provider retry (same external message) re-claims the released
+    // 'received' row, reports it as a duplicate, and re-releases — no admission.
+    const dup = await admit(makeIngressCtx(), { continueAdmission: false });
+    expect(dup.inboxItemId).toBe(first.inboxItemId);
+    expect(dup.status).toBe('received');
+    expect(dup.duplicate).toBe(true);
+    expect(events).toEqual([]); // no new received/admitted events on the duplicate
+  });
+
+  // ——— §13.6 worker-readiness gate ———
+
+  it('reports ready when the recovery worker loop is running', () => {
+    const harness = makeBoundHarness({ support: makeHarnessChannelConfig() });
+    expect(harness.channelWorkerReadiness({ channelId: 'support' })).toEqual({ ready: true });
+    return harness.shutdown();
+  });
+
+  it('reports worker_not_started when the loop is stopped, draining on shutdown, and not_configured for an unknown channel', async () => {
+    const harness = makeBoundHarness({ support: makeHarnessChannelConfig() });
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    expect(harness.channelWorkerReadiness({ channelId: 'support' })).toEqual({
+      ready: false,
+      reason: 'worker_not_started',
+    });
+    expect(harness.channelWorkerReadiness({ channelId: 'nope' })).toEqual({
+      ready: false,
+      reason: 'channel_not_configured',
+    });
+    await harness.shutdown();
+    expect(harness.channelWorkerReadiness({ channelId: 'support' })).toEqual({
+      ready: false,
+      reason: 'server_draining',
+    });
+  });
+});
+
+describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 / §21 / §13.7)', () => {
+  function makeIngressCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      harnessName: 'primary',
+      channelId: 'support',
+      providerId: 'slack',
+      platform: 'slack',
+      conversationKind: 'channel',
+      trigger: 'message',
+      externalTenantId: 'T1',
+      externalChannelId: 'C1',
+      externalThreadId: 'TS1',
+      externalMessageId: 'M1',
+      content: 'hello from channel',
+      receivedAt: 1000,
+      ...overrides,
+    } as never;
+  }
+
+  function setup(channelOverrides: Partial<HarnessChannelConfig> = {}) {
+    const agent = new MockAgent({ id: 'default' });
+    const composite = new InMemoryStore();
+    const storage = composite.stores.harness as ReturnType<typeof makeStorage>;
+    // Capture the latest durable inbox row per id (storage exposes no get-by-id),
+    // so tests can assert on persisted delivery/runId/signalId/attachments.
+    const rows = new Map<string, ChannelInboxItem>();
+    const realUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      await realUpdate(record, opts);
+      rows.set(record.id, { ...record });
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeHarnessChannelConfig(channelOverrides) },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    return { harness, storage, agent, rows };
+  }
+
+  type AdmitResult = {
+    inboxItemId: string;
+    status: string;
+    binding?: { id: string };
+    sessionId?: string;
+    queuedItemId?: string;
+    duplicate: boolean;
+  };
+
+  const admit = (harness: Harness) =>
+    (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
+      harness,
+    ) as (c: never) => Promise<AdmitResult>;
+
+  it("queue delivery is the default — unchanged when the policy selects no delivery", async () => {
+    const { harness, rows } = setup();
+    const r = await admit(harness)(makeIngressCtx());
+    expect(r.status).toBe('queued');
+    expect(typeof r.queuedItemId).toBe('string');
+    const row = rows.get(r.inboxItemId);
+    expect(row?.delivery).toBe('queue');
+    expect(row?.runId).toBeUndefined();
+    expect(row?.signalId).toBeUndefined();
+  });
+
+  it("signal delivery admits as a SIGNAL: idle-wake → status accepted, runId/signalId persisted, event delivery: 'signal'", async () => {
+    const { harness, rows, agent } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    const events: Array<{ type: string; delivery?: string; runId?: string; signalId?: string }> = [];
+    harness.subscribe(e => {
+      if (e.type.startsWith('channel_ingress_')) events.push(e as never);
+    });
+
+    const r = await admit(harness)(makeIngressCtx());
+
+    expect(r.status).toBe('accepted');
+    // queue-only field is absent for a signal admission
+    expect(r.queuedItemId).toBeUndefined();
+    const row = rows.get(r.inboxItemId);
+    expect(row?.delivery).toBe('signal');
+    expect(typeof row?.runId).toBe('string');
+    expect(typeof row?.signalId).toBe('string');
+    expect(row?.acceptedAt).toBeDefined();
+    const admitted = events.find(e => e.type === 'channel_ingress_admitted');
+    expect(admitted).toMatchObject({ delivery: 'signal', runId: row?.runId, signalId: row?.signalId });
+    // the idle-wake run actually dispatched to the agent
+    expect(agent.streamCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('worker resumes a SIGNAL row that crashed AFTER dispatch but before the accepted commit WITHOUT firing a second run (post-dispatch idempotency)', async () => {
+    // §14.2 POST-DISPATCH idempotency case: crash the original admission on the
+    // 'accepted' write (after `_admitChannelSignalTurn` already dispatched a run
+    // AND recorded its runId on the reservation), leaving an 'admitted' signal
+    // row that carries the admissionHash + resolved ids. The recovery worker
+    // reclaims it and replays `_admitChannelSignalTurn`, but the durable
+    // per-`admissionId` reservation now carries a real runId, so it
+    // short-circuits to the ORIGINAL run instead of dispatching a SECOND
+    // interleave/wake (no double model turn / double spend). This does NOT cover
+    // the pre-dispatch lost-signal window — see the next test for that.
+    const { harness, storage, agent, rows } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    const wrappedUpdate = storage.updateChannelInboxItem.bind(storage);
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: ChannelInboxItem,
+      opts: { claimId: string },
+    ) => {
+      if (record.status === 'accepted') throw new Error('crash before accepted commit');
+      return wrappedUpdate(record, opts);
+    };
+    await expect(admit(harness)(makeIngressCtx())).rejects.toThrow(/crash before accepted commit/);
+    // The first admission already dispatched exactly one run before the crash.
+    expect(agent.streamCalls.length).toBe(1);
+    const firstRunId = agent.streamCalls[0]?.options?.runId as string | undefined;
+
+    // Heal storage so recovery can commit, then run one recovery pass past the
+    // wall-clock admission-claim expiry.
+    (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = wrappedUpdate;
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      accepted: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, accepted: 1 });
+    // The recovery replay did NOT dispatch a second run — still exactly one.
+    // (Before the fix this was 2: the worker re-ran `_admitChannelSignalTurn`,
+    // minting a fresh signal/run for one inbound.)
+    expect(agent.streamCalls.length).toBe(1);
+    const recoveredRow = [...rows.values()].find(r => r.status === 'accepted');
+    expect(recoveredRow?.status).toBe('accepted');
+    // The recovered row reuses the original run, not a freshly minted second one.
+    if (firstRunId !== undefined) expect(recoveredRow?.runId).toBe(firstRunId);
+  });
+
+  it('worker re-delivers a SIGNAL row that crashed AFTER admit but BEFORE dispatch — no lost signal (C2/C7 pre-dispatch window)', async () => {
+    // §14.2 PRE-DISPATCH lost-signal window (C2/C7): the durable 'pending'
+    // reservation is written BEFORE `signal()` dispatches a run. Crash the very
+    // first stream() so the reservation commits with NO runId and NO run is ever
+    // created (streamCalls === 0). Before the fix, recovery saw the still-pending
+    // reservation and short-circuited to a fabricated `runId === signalId`,
+    // permanently losing the signal while marking the row 'accepted'. After the
+    // fix, a 'pending' reservation with no recorded runId is treated as
+    // never-dispatched and the worker RE-DISPATCHES under the SAME deterministic
+    // signalId, delivering exactly one run.
+    const { harness, agent, rows } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    // Crash the FIRST dispatch before any run is created: `signal()` calls
+    // `agent.sendSignal(...)` to wake/interleave a run, so throwing there leaves
+    // the durable reservation committed (written before dispatch) but no run and
+    // no streamCall. Subsequent dispatches (recovery) succeed.
+    const realSendSignal = agent.sendSignal.bind(agent);
+    let crashed = false;
+    (agent as { sendSignal: unknown }).sendSignal = (signal: unknown, target: unknown) => {
+      if (!crashed) {
+        crashed = true;
+        throw new Error('crash before dispatch');
+      }
+      return realSendSignal(signal as never, target as never);
+    };
+
+    await expect(admit(harness)(makeIngressCtx())).rejects.toThrow(/crash before dispatch/);
+    // The pre-dispatch crash means NO run was ever created.
+    expect(agent.streamCalls.length).toBe(0);
+    // The live catch path records the row as 'failed' (spreading the already-
+    // committed 'admitted' state, so admissionHash + resolved ids survive). The
+    // pending signal reservation was written before dispatch but carries no runId.
+    const failedRow = [...rows.values()].find(r => r.status === 'failed');
+    expect(failedRow?.status).toBe('failed');
+    expect(failedRow?.admissionHash).toBeDefined();
+    expect(failedRow?.runId).toBeUndefined();
+
+    // Recovery replays `_admitChannelSignalTurn`; the pending reservation has no
+    // runId, so the worker RE-DISPATCHES instead of fabricating an identity.
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      accepted: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, accepted: 1 });
+    // Exactly one run was dispatched on recovery — the signal was NOT lost.
+    expect(agent.streamCalls.length).toBe(1);
+    expect(extractSignalContents(agent.streamCalls[0]?.messages)).toBe('hello from channel');
+    const recoveredRow = [...rows.values()].find(r => r.status === 'accepted');
+    expect(recoveredRow?.status).toBe('accepted');
+    // The recovered row carries a REAL dispatched runId, never the synthesized
+    // `runId === signalId` fabrication (C7).
+    expect(typeof recoveredRow?.runId).toBe('string');
+    const dispatchedRunId = agent.streamCalls[0]?.options?.runId as string | undefined;
+    if (dispatchedRunId !== undefined) expect(recoveredRow?.runId).toBe(dispatchedRunId);
+    expect(recoveredRow?.runId).not.toBe(recoveredRow?.signalId);
+  });
+
+  it('signal delivery interleaves into an active run and shares its run terminal (§21)', async () => {
+    let releaseFirst!: () => void;
+    const hold = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    const { harness, rows, agent } = setup({
+      ingress: {
+        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+      },
+    });
+    // First inbound wakes a run that holds mid-flight, so the second inbound
+    // arrives while a run is active on the same resolved channel session.
+    agent.enqueueRun({ holdUntil: hold, text: 'first' });
+
+    const first = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-first' }));
+    expect(first.status).toBe('accepted');
+    const firstRow = rows.get(first.inboxItemId);
+
+    // Wait until the held run is the active run on the thread.
+    for (let i = 0; i < 100 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+
+    const second = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-second', content: 'second' }));
+    expect(second.status).toBe('accepted');
+    const secondRow = rows.get(second.inboxItemId);
+
+    // §21: the interleaved signal shares the active run's terminal — same runId.
+    expect(secondRow?.runId).toBe(firstRow?.runId);
+    expect(secondRow?.signalId).not.toBe(firstRow?.signalId);
+    // The first inbound woke the run (its content went to the agent); the second
+    // interleaved into that same run rather than starting a fresh stream.
+    expect(extractSignalContents(agent.streamCalls[0]?.messages)).toBe('hello from channel');
+    expect(agent.streamCalls.length).toBe(1);
+
+    releaseFirst();
+  });
+
+  it("rejects delivery: 'signal' carrying a policy model override (signal has no per-turn model)", async () => {
+    const { harness } = setup({
+      ingress: {
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal', model: 'model-x' },
+        }),
+      },
+    });
+    await expect(admit(harness)(makeIngressCtx())).rejects.toBeInstanceOf(HarnessValidationError);
+  });
+
+  it('record-only recovery replays inbound attachments (C4): raw files survive an ACK-before-admission crash', async () => {
+    // §14.2 record-only durability (C4): a route that records the 'received' row
+    // and ACKs BEFORE admission cannot scope the bytes to a session yet, so the
+    // durable row's `attachments` is []. The RAW provider refs are persisted on
+    // the row (`rawFiles`) so FROM-SCRATCH recovery re-populates the ingress
+    // context and normalizes the SAME attachments the live path would have.
+    // Before the fix, `reconstructChannelIngressContext` dropped the files and
+    // the recovered turn carried ZERO attachments.
+    const { harness, rows, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('attachment-bytes'),
+    });
+
+    const recordOnly = (harness as never as {
+      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+
+    // Record + ACK before admission, carrying the inbound provider file refs.
+    const r = await recordOnly(
+      makeIngressCtx({
+        externalMessageId: 'M-record-only-file',
+        content: 'see attached',
+        files: [{ attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
+      { continueAdmission: false },
+    );
+    expect(r.status).toBe('received');
+    const receivedRow = rows.get(r.inboxItemId) ?? [...rows.values()].find(row => row.status === 'received');
+    // The received row is not session-scoped yet → no normalized attachments, but
+    // the RAW provider refs are persisted for recovery.
+    expect(receivedRow?.attachments).toEqual([]);
+    expect(receivedRow?.rawFiles?.length).toBe(1);
+    expect(receivedRow?.rawFiles?.[0]).toMatchObject({ attachmentId, resourceId });
+
+    // FROM-SCRATCH recovery normalizes the raw refs and dispatches the turn.
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: 4_000_000_000_000 })) as {
+      claimed: number;
+      queued: number;
+    };
+    expect(res).toMatchObject({ claimed: 1, queued: 1 });
+
+    // The recovered row now carries the normalized attachment (not []).
+    const recoveredRow = [...rows.values()].find(row => row.status === 'queued');
+    expect(recoveredRow?.attachments.length).toBe(1);
+    expect(recoveredRow?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt' });
+
+    // The dispatched turn carries the file part — the SAME shape the non-channel
+    // queue/live path forwards (role:'user' with a file content part).
+    for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
+      role?: string;
+      content?: Array<{ type: string; filename?: string }>;
+    };
+    expect(dispatched.role).toBe('user');
+    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+  });
+
+  it('normalizes inbound files into durable row attachments and forwards them to the queued turn', async () => {
+    const { harness, rows, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    // Resolve the binding WITHOUT admitting a turn (no competing queue drain),
+    // materialize that exact channel session via its threadId, then upload an
+    // attachment owned by it and reference it on the single inbound under test.
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const { attachmentId } = await session.uploadAttachment({
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('attachment-bytes'),
+    });
+
+    const r = await admit(harness)(
+      makeIngressCtx({
+        externalMessageId: 'M-with-file',
+        content: 'see attached',
+        files: [{ attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
+    );
+    expect(r.status).toBe('queued');
+    const row = rows.get(r.inboxItemId);
+    // Durable row carries the normalized ref (metadata only), not [].
+    expect(row?.attachments.length).toBe(1);
+    expect(row?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt', mimeType: 'text/plain' });
+
+    // The queued turn dispatched a structured user message carrying the file part.
+    for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
+      role?: string;
+      content?: Array<{ type: string; mediaType?: string; filename?: string }>;
+    };
+    expect(dispatched.role).toBe('user');
+    expect(dispatched.content?.some(p => p.type === 'text')).toBe(true);
+    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+  });
+
+  it('the idempotency key distinguishes two inbound messages that differ only by their files', async () => {
+    const { harness, rows } = setup();
+    const { resolved } = await (harness as never as {
+      _resolveChannelBindingForIngress: (
+        c: never,
+      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const sessionId = resolved.sessionId;
+    const resourceId = resolved.resourceId;
+    const session = await harness.session({
+      resourceId,
+      threadId: resolved.threadId,
+      sessionId,
+    } as never);
+    const a = await session.uploadAttachment({ name: 'a.txt', mimeType: 'text/plain', data: new TextEncoder().encode('A') });
+    const b = await session.uploadAttachment({ name: 'b.txt', mimeType: 'text/plain', data: new TextEncoder().encode('B') });
+
+    // Same idempotency identity (same external ids/content) but different files →
+    // a DIFFERENT payloadHash → a payload conflict, not a false duplicate.
+    const withA = await admit(harness)(
+      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: a.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+    );
+    const withB = await admit(harness)(
+      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: b.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+    );
+    expect(withA.inboxItemId).toBe(withB.inboxItemId);
+    expect((withB as { conflict?: boolean }).conflict).toBe(true);
+    const row = rows.get(withA.inboxItemId);
+    // The first (file A) admission stands; the conflicting retry did not overwrite it.
+    expect(row?.attachments[0]).toMatchObject({ attachmentId: a.attachmentId });
+  });
+
+  it('an inbound with no files leaves the dispatched contents a bare string (unchanged)', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({ text: 'ok' });
+    const before = agent.streamCalls.length;
+    const r = await admit(harness)(makeIngressCtx({ externalMessageId: 'M-nofiles' }));
+    expect(r.status).toBe('queued');
+    for (let i = 0; i < 100 && agent.streamCalls.length <= before; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages)).toBe('hello from channel');
+  });
+});
+
+describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4c)', () => {
+  // Adapter with a verifyInbound that projects the transport body into an ingress
+  // envelope; `bad: true` simulates a failed provider signature verification.
+  function makeInboundConfig(overrides: Partial<HarnessChannelConfig> = {}): HarnessChannelConfig {
+    return makeHarnessChannelConfig({
+      adapter: {
+        deliver: async () => ({}),
+        verifyInbound: async (request: { body?: unknown }) => {
+          const body = (request.body ?? {}) as {
+            content?: string;
+            externalMessageId?: string;
+            bad?: boolean;
+            files?: { attachmentId: string; resourceId: string; sha256?: string }[];
+          };
+          if (body.bad) throw new Error('provider signature verification failed');
+          return {
+            platform: 'slack',
+            conversationKind: 'channel',
+            trigger: 'message',
+            externalTenantId: 'T1',
+            externalChannelId: 'C1',
+            externalThreadId: 'TS1',
+            externalMessageId: body.externalMessageId ?? 'M1',
+            content: body.content ?? 'hello from channel',
+            ...(body.files !== undefined ? { files: body.files } : {}),
+            receivedAt: 1000,
+          };
+        },
+      } as never,
+      ...overrides,
+    });
+  }
+
+  function setup(channelOverrides: Partial<HarnessChannelConfig> = {}) {
+    const composite = new InMemoryStore();
+    const storage = composite.stores.harness as ReturnType<typeof makeStorage>;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeInboundConfig(channelOverrides) },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    // Recovery loop stays running so `channelWorkerReadiness` reports ready (the
+    // §13.6 gate requires a started worker). Its poll interval is floored at 1s, far
+    // longer than these synchronous tests, so no background tick races the asserts.
+    return { harness, storage };
+  }
+
+  function inboundRequest(body: unknown): never {
+    return {
+      method: 'POST',
+      path: '/harness/primary/channels/support/inbound',
+      headers: { 'content-type': 'application/json' },
+      body,
+    } as never;
+  }
+
+  it('404 not_found for an unregistered channel (registry boundary, no verification)', async () => {
+    const { harness } = setup();
+    const result = await harness.handleChannelInboundRequest('nope', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({ kind: 'not_found', httpStatus: 404, error: { code: 'harness.not_found' } });
+  });
+
+  it('401 verify_failed when the adapter rejects the provider signature', async () => {
+    const { harness } = setup();
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ bad: true }));
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 401,
+      error: { code: 'harness.permission_denied' },
+    });
+  });
+
+  it('redacts the raw verifyInbound error message on the public verify_failed envelope (§13.3f.1)', async () => {
+    // The adapter throws a message that would leak provider-auth internals
+    // (signing-secret/config hints) to an anonymous webhook caller.
+    const { harness } = setup({
+      adapter: {
+        deliver: async () => ({}),
+        verifyInbound: async () => {
+          throw new Error('SLACK_SIGNING_SECRET mismatch: expected v0=deadbeef but got v0=cafe');
+        },
+      } as never,
+    });
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 401,
+      error: { code: 'harness.permission_denied', message: 'channel inbound verification failed' },
+    });
+    // The raw adapter cause must NOT cross the public envelope.
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).not.toContain('SLACK_SIGNING_SECRET');
+    expect(message).not.toContain('v0=deadbeef');
+  });
+
+  it('400 verify_failed when the channel adapter has no inbound verification', async () => {
+    // Adapter without verifyInbound — cannot project provider transport into an envelope.
+    const { harness } = setup({ adapter: { deliver: async () => ({}) } as never });
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 400,
+      error: { code: 'harness.bad_request' },
+    });
+  });
+
+  it('503 worker_unavailable when the readiness gate is not ready, before creating a row', async () => {
+    const { harness } = setup();
+    (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({
+      kind: 'not_ready',
+      httpStatus: 503,
+      error: { code: 'harness.worker_unavailable', retryable: true, details: { reason: 'worker_not_started' } },
+    });
+    // §14.2: the gate returns BEFORE a durable inbox row is created. Restarting the
+    // worker and retrying the same provider event admits a FRESH row (duplicate:false),
+    // which proves the 503 path persisted nothing to de-dupe against.
+    (harness as unknown as { _ensureChannelInboxRecoveryLoop: () => void })._ensureChannelInboxRecoveryLoop();
+    const retry = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }), {
+      continueAdmission: true,
+    });
+    expect(retry).toMatchObject({ kind: 'ok', duplicate: false });
+  });
+
+  it('202 record-only ACK by default (continueAdmission omitted → received)', async () => {
+    const { harness } = setup();
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }));
+    expect(result).toMatchObject({ kind: 'ok', ackStatus: 202, status: 'received', duplicate: false });
+  });
+
+  it('200 and full admission when continueAdmission is true', async () => {
+    const { harness } = setup();
+    const result = await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'hi' }),
+      { continueAdmission: true },
+    );
+    expect(result).toMatchObject({ kind: 'ok', ackStatus: 200, status: 'queued', duplicate: false });
+    expect((result as { sessionId?: string }).sessionId).toMatch(/^chs:/);
+  });
+
+  it('200 duplicate:true for an exact provider retry', async () => {
+    const { harness } = setup();
+    const first = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }), {
+      continueAdmission: true,
+    });
+    const second = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }), {
+      continueAdmission: true,
+    });
+    expect(first).toMatchObject({ kind: 'ok', duplicate: false });
+    expect(second).toMatchObject({ kind: 'ok', ackStatus: 200, status: 'queued', duplicate: true });
+  });
+
+  it('409 conflict for the same idempotency key with a different payload', async () => {
+    const { harness } = setup();
+    await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'first', externalMessageId: 'M-conflict' }),
+      { continueAdmission: true },
+    );
+    const conflicting = await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'SECOND DIFFERENT', externalMessageId: 'M-conflict' }),
+      { continueAdmission: true },
+    );
+    expect(conflicting).toMatchObject({
+      kind: 'conflict',
+      httpStatus: 409,
+      error: { code: 'harness.channel_action_conflict' },
+    });
+  });
+
+  it('409 conflict when only the attachments differ (payload hash covers files)', async () => {
+    const { harness } = setup();
+    // Record-only ACK: the payloadHash (which covers `ctx.files`) is computed and
+    // the durable row created at the idempotency-key boundary, BEFORE binding
+    // resolution + attachment normalization. That is the layer this test pins —
+    // a different attachment set under the same key is a conflict, not a false
+    // duplicate. (continueAdmission:true would additionally require the refs to be
+    // uploaded Harness records, which §13.7 normalization now resolves; the
+    // hash-covers-files contract is independent of that.)
+    await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a1', resourceId: 'r1' }] }),
+      { continueAdmission: false },
+    );
+    const differentFiles = await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a2', resourceId: 'r1' }] }),
+      { continueAdmission: false },
+    );
+    // Same route + externalMessageId (same idempotency key) but a different attachment set must be a
+    // conflict, not a false duplicate — otherwise the second message is silently dropped.
+    expect(differentFiles).toMatchObject({ kind: 'conflict', httpStatus: 409 });
+  });
+
+  it('200 duplicate:true when both content and attachments match', async () => {
+    const { harness } = setup();
+    const files = [{ attachmentId: 'a1', resourceId: 'r1' }];
+    // Record-only ACK pins the payloadHash idempotency layer (see the conflict
+    // test above) independent of attachment normalization.
+    const first = await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'x', externalMessageId: 'M-dup-files', files }),
+      { continueAdmission: false },
+    );
+    const second = await harness.handleChannelInboundRequest(
+      'support',
+      inboundRequest({ content: 'x', externalMessageId: 'M-dup-files', files }),
+      { continueAdmission: false },
+    );
+    expect(first).toMatchObject({ kind: 'ok', duplicate: false });
+    expect(second).toMatchObject({ kind: 'ok', duplicate: true });
   });
 });

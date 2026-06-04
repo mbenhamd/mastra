@@ -12,6 +12,7 @@ import type {
   StorageFavoriteType,
   StorageWorkspaceType,
   StorageSkillType,
+  StorageToolProviderConnection,
   StorageWorkflowRun,
   ObservationalMemoryRecord,
   DatasetRecord,
@@ -27,8 +28,11 @@ import type {
   AttachmentReference,
   ChannelActionReceipt,
   ChannelActionToken,
+  ChannelBinding,
   ChannelInboxItem,
   ChannelOutboxItem,
+  HarnessPlanTask,
+  HarnessRunSummary,
   HarnessProviderCallbackBinding,
   HarnessWakeupItem,
   HarnessSessionEventRecord,
@@ -123,16 +127,25 @@ export class InMemoryDB {
   readonly harnessOperationTombstones = new Map<string, OperationAdmissionTombstone>();
   readonly harnessSessionEvents = new Map<string, HarnessSessionEventRecord>();
   readonly harnessWorkspaceActionJournal = new Map<string, WorkspaceActionJournalEntry>();
+  readonly harnessChannelBindings = new Map<string, ChannelBinding>();
   readonly harnessChannelInbox = new Map<string, ChannelInboxItem>();
   readonly harnessProviderCallbackBindings = new Map<string, HarnessProviderCallbackBinding>();
   readonly harnessChannelActionTokens = new Map<string, ChannelActionToken>();
   readonly harnessChannelActionReceipts = new Map<string, ChannelActionReceipt>();
   readonly harnessChannelOutbox = new Map<string, ChannelOutboxItem>();
   readonly harnessWakeupItems = new Map<string, HarnessWakeupItem>();
+  readonly harnessPlanTasks = new Map<string, HarnessPlanTask>();
+  /** Span-summary durable run history, keyed by `${harnessName}::${runId}`. */
+  readonly harnessRunSummaries = new Map<string, HarnessRunSummary>();
   readonly harnessThreadDeleteFences = new Map<
     string,
     { threadId: string; ownerId: string; leaseId: string; createdAt: number; expiresAt: number }
   >();
+
+  /**
+   * Tool provider connections keyed by `${authorId}\u0000${providerId}\u0000${connectionId}`.
+   */
+  readonly toolProviderConnections = new Map<string, StorageToolProviderConnection>();
 
   /**
    * Clears all data from all collections.
@@ -188,12 +201,16 @@ export class InMemoryDB {
     this.harnessOperationTombstones.clear();
     this.harnessSessionEvents.clear();
     this.harnessWorkspaceActionJournal.clear();
+    this.harnessChannelBindings.clear();
     this.harnessChannelInbox.clear();
     this.harnessProviderCallbackBindings.clear();
     this.harnessChannelActionTokens.clear();
     this.harnessChannelActionReceipts.clear();
     this.harnessChannelOutbox.clear();
     this.harnessWakeupItems.clear();
+    this.harnessPlanTasks.clear();
+    this.harnessRunSummaries.clear();
     this.harnessThreadDeleteFences.clear();
+    this.toolProviderConnections.clear();
   }
 }

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { resolveToolRequiresApproval } from './approval';
+import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from './approval';
 
 describe('resolveToolRequiresApproval', () => {
-  it('treats static requireApproval as an approval floor', async () => {
+  it('lets needsApprovalFn override a static requireApproval seed (#17337 precedence)', async () => {
     await expect(
       resolveToolRequiresApproval({
         tool: {
@@ -11,10 +11,10 @@ describe('resolveToolRequiresApproval', () => {
         },
         args: { path: '/tmp/file.txt' },
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe(false);
   });
 
-  it('treats global requireToolApproval as an approval floor', async () => {
+  it('lets needsApprovalFn override the global requireToolApproval seed (#17337 precedence)', async () => {
     await expect(
       resolveToolRequiresApproval({
         tool: {
@@ -24,7 +24,7 @@ describe('resolveToolRequiresApproval', () => {
         requireToolApproval: true,
         args: { path: '/tmp/file.txt' },
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe(false);
   });
 
   it('lets dynamic-only approval skip safe calls', async () => {
@@ -96,5 +96,75 @@ describe('resolveToolRequiresApproval', () => {
       }),
     ).resolves.toBe(true);
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('dangerous-tool'), expect.any(Error));
+  });
+});
+
+describe('resolveToolApprovalRequirement', () => {
+  it('captures a reason from an object-returning predicate', async () => {
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: { needsApprovalFn: vi.fn().mockReturnValue({ required: true, reason: 'writes outside workspace' }) },
+        args: { path: '/etc/passwd' },
+      }),
+    ).resolves.toEqual({ required: true, reasons: ['writes outside workspace'] });
+  });
+
+  it('returns no reasons for a boolean-returning predicate', async () => {
+    await expect(
+      resolveToolApprovalRequirement({ tool: { needsApprovalFn: vi.fn().mockReturnValue(true) } }),
+    ).resolves.toEqual({ required: true, reasons: [] });
+  });
+
+  it('drops the reason when the predicate does not require approval', async () => {
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: { needsApprovalFn: vi.fn().mockReturnValue({ required: false, reason: 'safe path' }) },
+      }),
+    ).resolves.toEqual({ required: false, reasons: [] });
+  });
+
+  it('a predicate returning { required: false } overrides the static seed (#17337 precedence)', async () => {
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: { requireApproval: true, needsApprovalFn: vi.fn().mockReturnValue({ required: false, reason: 'x' }) },
+      }),
+    ).resolves.toEqual({ required: false, reasons: [] });
+  });
+
+  it('supports a function-valued requireApproval returning an object', async () => {
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: { requireApproval: vi.fn().mockReturnValue({ required: true, reason: 'protected' }) },
+        args: { path: '/protected' },
+      }),
+    ).resolves.toEqual({ required: true, reasons: ['protected'] });
+  });
+
+  it('ignores an empty reason string', async () => {
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: { needsApprovalFn: vi.fn().mockReturnValue({ required: true, reason: '' }) },
+      }),
+    ).resolves.toEqual({ required: true, reasons: [] });
+  });
+
+  it('fails safe with no reason when the predicate throws', async () => {
+    const logger = { error: vi.fn() };
+    await expect(
+      resolveToolApprovalRequirement({
+        tool: {
+          needsApprovalFn: vi.fn().mockImplementation(() => {
+            throw new Error('boom');
+          }),
+        },
+        logger,
+        toolName: 'dangerous-tool',
+      }),
+    ).resolves.toEqual({ required: true, reasons: [] });
+  });
+
+  it('keeps the boolean resolver in sync with the richer resolver', async () => {
+    const tool = { needsApprovalFn: vi.fn().mockReturnValue({ required: true, reason: 'because' }) };
+    await expect(resolveToolRequiresApproval({ tool })).resolves.toBe(true);
   });
 });

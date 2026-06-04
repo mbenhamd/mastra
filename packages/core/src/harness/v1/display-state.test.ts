@@ -163,4 +163,33 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
     expect(snapshot.queueDepth).toBe(1);
     expect(snapshot.goal).toMatchObject({ id: 'goal-1', status: 'active' });
   });
+
+  it('carries the bounded plan-task summary (counts/byStatus/inProgressTaskIds/rootCount), copied not shared', () => {
+    const planTasks = {
+      total: 4,
+      byStatus: { in_progress: 2, pending: 2 } as Record<string, number>,
+      inProgressTaskIds: ['task-a', 'task-r'],
+      rootCount: 2,
+    };
+    const snapshot = toHarnessDisplayStateSnapshotV1(makeDisplayState({ planTasks }));
+
+    expect(snapshot.planTasks).toEqual({
+      total: 4,
+      byStatus: { in_progress: 2, pending: 2 },
+      inProgressTaskIds: ['task-a', 'task-r'],
+      rootCount: 2,
+    });
+    // Defensive copy: mutating the snapshot must not reach back into the source.
+    snapshot.planTasks!.inProgressTaskIds.push('leak');
+    snapshot.planTasks!.byStatus.pending = 99;
+    expect(planTasks.inProgressTaskIds).toEqual(['task-a', 'task-r']);
+    expect(planTasks.byStatus.pending).toBe(2);
+    // Bounded shape — no full tree embedded.
+    expect(Object.keys(snapshot.planTasks!).sort()).toEqual(['byStatus', 'inProgressTaskIds', 'rootCount', 'total']);
+  });
+
+  it('omits planTasks when the session has not observed a plan tree', () => {
+    const snapshot = toHarnessDisplayStateSnapshotV1(makeDisplayState());
+    expect(snapshot.planTasks).toBeUndefined();
+  });
 });

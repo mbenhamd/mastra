@@ -11,14 +11,7 @@ import type { ZodError } from 'zod/v4';
 import { z } from 'zod/v4';
 
 import type { InMemoryTaskStore } from '../a2a/store';
-import {
-  allowsHarnessSseSubscriptionToken,
-  coreAuthMiddleware,
-  findBearerEquivalentHarnessQueryParam,
-  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM,
-  hasHarnessSseSubscriptionToken,
-  isHarnessClientRoute,
-} from '../auth/helpers';
+import { coreAuthMiddleware } from '../auth/helpers';
 import {
   MASTRA_CLIENT_TYPE_HEADER,
   MASTRA_IS_STUDIO_KEY,
@@ -26,6 +19,7 @@ import {
   isStudioClientTypeHeader,
 } from '../constants';
 import { formatZodError } from '../handlers/error';
+export { isZodError, type ZodErrorLike } from '../handlers/error';
 import { normalizeRoutePath } from '../utils';
 import { generateOpenAPIDocument, convertCustomRoutesToOpenAPIPaths } from './openapi-utils';
 import type { ServerRoute } from './routes';
@@ -107,35 +101,12 @@ export interface ParsedRequestParams {
   bodyParseError?: {
     message: string;
   };
-}
-
-const SENSITIVE_QUERY_PARAMS = new Set([
-  HARNESS_SSE_SUBSCRIPTION_TOKEN_QUERY_PARAM.toLowerCase(),
-  'access_token',
-  'accesstoken',
-  'apikey',
-  'authorization',
-  'authtoken',
-  'bearer',
-  'token',
-]);
-
-function normalizeSensitiveQueryParamKey(key: string): string {
-  return key.toLowerCase().split('[')[0]?.split('.')[0] ?? key.toLowerCase();
-}
-
-export function redactSensitiveQueryParams<T extends Record<string, unknown>>(queryParams: T): T {
-  const redacted: Record<string, unknown> = { ...queryParams };
-
-  for (const key of Object.keys(redacted)) {
-    const normalizedKey = key.toLowerCase();
-    const baseKey = normalizeSensitiveQueryParamKey(key);
-    if (SENSITIVE_QUERY_PARAMS.has(normalizedKey) || SENSITIVE_QUERY_PARAMS.has(baseKey)) {
-      redacted[key] = '[REDACTED]';
-    }
-  }
-
-  return redacted as T;
+  /**
+   * Unparsed request body bytes/text, captured BEFORE any parse, for handlers
+   * that must verify a provider signature over the exact bytes (e.g. channel
+   * webhooks). Undefined for methods/paths where no body was read.
+   */
+  rawBody?: Uint8Array | string;
 }
 
 function isAbortSignalError(error: unknown): boolean {
@@ -511,57 +482,31 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     },
   ): Promise<{ status: number; error: string; headers?: Record<string, string> } | null> {
     const authConfig = this.mastra.getServer()?.auth;
-    const harnessClientRoute = isHarnessClientRoute(route);
 
-    if (harnessClientRoute) {
-      const queryCredential = findBearerEquivalentHarnessQueryParam(context.getQuery);
-      if (queryCredential) {
-        return {
-          status: 400,
-          error: `Bearer-equivalent query credentials are not accepted on Harness routes: ${queryCredential}`,
-        };
-      }
-
-      if (hasHarnessSseSubscriptionToken(route, context.getQuery) && !allowsHarnessSseSubscriptionToken(route)) {
-        return {
-          status: 400,
-          error: 'Scoped Harness SSE subscription tokens are only accepted on the session events route',
-        };
-      }
-
-      if (route.requiresAuth === false) {
-        return {
-          status: 500,
-          error: 'Harness routes require authentication',
-        };
-      }
-
-      if (!authConfig) {
-        return {
-          status: 500,
-          error: 'Harness routes require server auth configuration',
-        };
-      }
-    }
-
-    // No auth config means no auth required for legacy/non-Harness routes.
+    // No auth config means no auth required
     if (!authConfig) {
       return null;
     }
 
-    // Check route-level requiresAuth flag first (explicit per-route setting).
-    // This opt-out is route-specific and not available in the global middleware.
+    // Check route-level requiresAuth flag first (explicit per-route setting)
+    // This opt-out is route-specific and not available in the global middleware
     if (route.requiresAuth === false) {
       return null;
     }
 
-    // Extract token from headers/query. Harness routes intentionally skip the
-    // legacy apiKey query fallback; scoped SSE tokens stay in the raw request
-    // for route-scoped auth providers and are never forwarded as auth context.
+    // Extract token from headers/query
     const authHeader = context.getHeader('authorization');
     let token: string | null = authHeader ? authHeader.replace('Bearer ', '') : null;
-    if (!token && !harnessClientRoute) {
+    if (!token) {
       token = context.getQuery('apiKey') || null;
+    }
+
+    const fallbackHeaders = new Headers();
+    for (const headerName of ['authorization', 'cookie']) {
+      const headerValue = context.getHeader(headerName);
+      if (headerValue) {
+        fallbackHeaders.set(headerName, headerValue);
+      }
     }
 
     // Delegate to coreAuthMiddleware for all auth logic
@@ -573,9 +518,10 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       authConfig,
       customRouteAuthConfig: this.customRouteAuthConfig,
       requestContext: context.requestContext,
-      rawRequest: context.request,
+      rawRequest:
+        context.request ??
+        new Request(`http://localhost${context.path}`, { method: context.method, headers: fallbackHeaders }),
       token,
-      forceAuth: harnessClientRoute,
       buildAuthorizeContext: context.buildAuthorizeContext ?? (() => null),
       requiresAuth: route.requiresAuth,
     });
@@ -659,7 +605,6 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     await this.validateEELicense();
     await this.validateAgentBuilderLicense();
     await this.validateFGAPolicyCoverage();
-    await this.mastra.init();
     await this.registerCustomApiRoutes();
     await this.registerRoutes();
   }
@@ -829,7 +774,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     const serverOnError = this.mastra.getServer()?.onError;
     app.onError((err, c) => {
       if (serverOnError) {
-        return serverOnError(err, c);
+        return serverOnError(err, c as unknown as Parameters<typeof serverOnError>[1]);
       }
       return c.json({ error: 'Internal Server Error' }, 500);
     });
@@ -939,6 +884,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       headers['set-cookie'] = setCookies;
     }
     if (isResponseClosed(nodeRes)) {
+      await response.body?.cancel();
       return;
     }
     nodeRes.writeHead(response.status, headers);

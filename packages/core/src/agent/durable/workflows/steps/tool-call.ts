@@ -16,7 +16,7 @@ import { DurableStepIds } from '../../constants';
 import { globalRunRegistry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type { DurableToolCallInput, SerializableDurableOptions, AgentSuspendedEventData } from '../../types';
-import { resolveTool, toolRequiresApproval } from '../../utils/resolve-runtime';
+import { resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
 import { serializeError } from '../../utils/serialize-state';
 
 /**
@@ -218,13 +218,18 @@ export function createDurableToolCallStep() {
           },
         });
 
-      // 2. Check if tool requires approval
-      const requiresApproval = await toolRequiresApproval(tool, agentOptions.requireToolApproval, args, {
-        requestContext,
-        workspace,
-        logger,
-        toolName,
-      });
+      // 2. Check if tool requires approval (and capture any reason the predicate surfaced)
+      const { required: requiresApproval, reasons: approvalReasons } = await toolApprovalRequirement(
+        tool,
+        agentOptions.requireToolApproval,
+        args,
+        {
+          requestContext,
+          workspace,
+          logger,
+          toolName,
+        },
+      );
 
       if (requiresApproval && !resumeData) {
         const resumeSchema = JSON.stringify({
@@ -241,7 +246,7 @@ export function createDurableToolCallStep() {
             type: 'tool-call-approval',
             runId,
             from: ChunkFrom.AGENT,
-            payload: { toolCallId, toolName, args, resumeSchema },
+            payload: { toolCallId, toolName, args, resumeSchema, ...(approvalReasons.length > 0 ? { approvalReasons } : {}) },
           });
         }
 
@@ -266,6 +271,7 @@ export function createDurableToolCallStep() {
             toolCallId,
             toolName,
             args,
+            ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
           },
           {
             resumeLabel: toolCallId,

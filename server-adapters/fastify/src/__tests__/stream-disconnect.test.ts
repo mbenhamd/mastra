@@ -10,8 +10,11 @@ class MockRawReply extends EventEmitter {
   ended = false;
   destroyed = false;
   writableEnded = false;
+  writeHeadStatus: number | undefined;
 
-  writeHead(): void {}
+  writeHead(status: number): void {
+    this.writeHeadStatus = status;
+  }
 
   write(): boolean {
     this.writes += 1;
@@ -318,6 +321,8 @@ describe('stream disconnect handling', () => {
     const reply = {
       header: vi.fn(),
       status: vi.fn(),
+      getHeaders: () => ({}),
+      hijack: vi.fn(),
       raw: rawReply,
     } as unknown as FastifyReply;
     const request = {
@@ -359,7 +364,10 @@ describe('stream disconnect handling', () => {
 
     expect(canceledByRequestClose).toBe(true);
     await expect(canceled).resolves.toBe('request aborted');
-    expect(reply.status).toHaveBeenCalledWith(200);
+    // The datastream-response path now hijacks the reply and writes the status +
+    // headers directly to the raw response (so the SSE content-type is not dropped),
+    // rather than going through reply.status().
+    expect(rawReply.writeHeadStatus).toBe(200);
     expect(rawReply.ended).toBe(true);
   });
 
@@ -374,6 +382,8 @@ describe('stream disconnect handling', () => {
     const reply = {
       header: vi.fn(),
       status: vi.fn(),
+      getHeaders: () => ({}),
+      hijack: vi.fn(),
       raw: rawReply,
     } as unknown as FastifyReply;
     const request = {

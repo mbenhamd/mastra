@@ -17,18 +17,19 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { HarnessStorageDomainError } from '../../storage/domains/harness';
 import type {
+  ChannelActionReceipt,
+  ChannelOutboxItem,
   GoalJudgeDecision,
   GoalState,
   JsonValue,
-  PendingResume,
   SessionRecord,
 } from '../../storage/domains/harness';
-import type { TaskItem } from '../../tools/builtin/shared';
 
-import { HarnessEventSerializationError, HarnessValidationError } from './errors';
-import type { EventSerializationReason } from './errors';
-import type { SessionLifecycleState } from './session';
+import { HarnessError, HarnessEventSerializationError, HarnessStorageError, HarnessValidationError } from './errors';
+import type { EventSerializationReason, HarnessStorageOperation, HarnessStorageSubject } from './errors';
+import type { HarnessRunOperationRefKind, SessionLifecycleState, TokenUsage } from './session';
 import type { PermissionPolicy, ToolCategory } from './types';
 
 // ---------------------------------------------------------------------------
@@ -78,12 +79,48 @@ export interface SessionClosingEvent extends HarnessEventBase {
 
 export interface SessionClosedEvent extends HarnessEventBase {
   type: 'session_closed';
-  reason: 'requested' | 'shutdown';
+  // §5.5: `closedAt` is written only on an explicit close request, so the
+  // terminal `session_closed` event always carries `reason: 'requested'`.
+  // Shutdown does NOT close live sessions — it evicts them (`session_evicted`
+  // reason 'shutdown'), which is non-terminal and leaves `closedAt` unset.
+  reason: 'requested';
 }
 
 export interface SessionEvictedEvent extends HarnessEventBase {
   type: 'session_evicted';
   reason: 'idle' | 'pressure' | 'pinned_timeout' | 'shutdown' | 'lease_lost';
+}
+
+/**
+ * ADVISORY pre-eviction notice (§O3). Emitted immediately before a SOFT,
+ * non-forced eviction (`pressure` = live-cap enforcer, `idle` = idle reaper) so
+ * an external consumer can react best-effort (e.g. stop sending, surface a
+ * banner) before the session leaves the live cache. The session's durable state
+ * is already flushed by the time this fires; eviction is NOT terminal (the
+ * session rehydrates on next access). This is advisory only: listeners are
+ * sync fire-and-forget and CANNOT delay or veto the eviction (the forced
+ * `shutdown` / `lease_lost` / `pinned_timeout` paths emit no warning).
+ */
+export interface SessionEvictionWarningEvent extends HarnessEventBase {
+  type: 'session_eviction_warning';
+  reason: 'idle' | 'pressure';
+}
+
+/**
+ * Session re-loaded from storage into the live cache on next access (§10.2).
+ * Non-terminal observer notification; the durable session is unchanged.
+ */
+export interface SessionHydratedEvent extends HarnessEventBase {
+  type: 'session_hydrated';
+}
+
+/**
+ * Process shutdown (§10.2). Harness-scoped only — delivered to
+ * `harness.subscribe(...)` and NOT part of per-session SSE replay. Sessions
+ * persist; this is a process-lifecycle notification, not a session close.
+ */
+export interface HarnessShutdownEvent extends HarnessEventBase {
+  type: 'harness_shutdown';
 }
 
 export interface ModeChangedEvent extends HarnessEventBase {
@@ -98,15 +135,27 @@ export interface ModelChangedEvent extends HarnessEventBase {
   previousModelId: string;
 }
 
-export interface ModelOverrideSetEvent extends HarnessEventBase {
-  type: 'model_override_set';
-  agentType: string;
-  modelId: string;
-  previousModelId: string | null;
+/**
+ * Cumulative session token usage changed after a turn committed its delta
+ * (§10.2). `usage` is the new running total for the session.
+ */
+export interface TokenUsageChangedEvent extends HarnessEventBase {
+  type: 'token_usage_changed';
+  usage: TokenUsage;
 }
 
 export interface StateChangedEvent extends HarnessEventBase {
   type: 'state_changed';
+  // §10.2: the full post-commit `session.state` so subscribers can sync durable
+  // state from the event alone, plus the top-level keys whose value changed.
+  // This is durable session state, NOT the debounced render snapshot — see
+  // §10.2's note that `display_state_changed` is not a v1 built-in event.
+  //
+  // `session.state` is `unknown` and may be a scalar, array, or plain-object
+  // root, so this is the full `JsonValue` (not narrowed to an object). For a
+  // non-object root change, `changedKeys` carries the `'$'` root sentinel; the
+  // new root value is read from this `state` field.
+  state: JsonValue;
   changedKeys: string[];
 }
 
@@ -145,128 +194,234 @@ export interface PermissionPolicyChangedEvent extends HarnessEventBase {
 
 export interface AgentStartEvent extends HarnessEventBase {
   type: 'agent_start';
+  runId: string;
+  /** Run-start overrides committed for this turn, when any were applied. */
+  overrides?: { model?: string; mode?: string; yolo?: boolean };
 }
 
 /**
- * Assistant message lifecycle (§10.2).
- *
- * Each assistant message produced inside a turn gets exactly one
- * `message_start`, zero or more `message_update` (text deltas), and one
- * `message_end`. `messageId` is stable across the trio and matches the
- * ai-sdk text-stream id, so a UI can address an in-flight message slot
- * directly.
+ * Streaming assistant text (§10.2). One `text_delta` per text chunk the model
+ * streams within a turn. `runId` identifies the run; `signalId` attributes the
+ * delta to a specific accepted signal when known. (§10.2 defines no
+ * message-boundary events — `text_delta` is the only streaming-text event.)
  */
-export interface MessageStartEvent extends HarnessEventBase {
-  type: 'message_start';
-  messageId: string;
-}
-
-export interface MessageUpdateEvent extends HarnessEventBase {
-  type: 'message_update';
-  messageId: string;
+export interface TextDeltaEvent extends HarnessEventBase {
+  type: 'text_delta';
+  runId: string;
+  signalId?: string;
   delta: string;
 }
 
-export interface MessageEndEvent extends HarnessEventBase {
-  type: 'message_end';
-  messageId: string;
+/**
+ * Streaming assistant reasoning/thinking text (§10.2). One `reasoning_delta`
+ * per `reasoning-delta` chunk the model streams within a turn — mirrors
+ * `text_delta`. Additive and entirely chunk-driven: it is emitted only when a
+ * reasoning chunk actually arrives, so models that do not stream reasoning (or
+ * have reasoning disabled) produce none. The harness never forces reasoning on.
+ */
+export interface ReasoningDeltaEvent extends HarnessEventBase {
+  type: 'reasoning_delta';
+  runId: string;
+  signalId?: string;
+  delta: string;
 }
 
 /**
- * Tool-input streaming (§10.2). Models that build arguments incrementally
- * surface a `tool_input_start` → N × `tool_input_delta` → `tool_input_end`
- * sequence before the actual `tool_start`. Models that emit a complete
- * `tool-call` chunk in one shot skip the triplet entirely; clients must
- * tolerate either shape.
+ * Tool-call lifecycle (§10.2). `tool_start` when the (complete) tool call is
+ * issued; `tool_end` when it resolves. Public payloads are JSON-safe
+ * projections (raw non-JSON tool objects stay inside the runtime). §10.2 has no
+ * incremental tool-input-streaming or tool-progress events — tools surface
+ * progress via §10.3 custom events instead.
  */
-export interface ToolInputStartEvent extends HarnessEventBase {
-  type: 'tool_input_start';
-  toolCallId: string;
-  toolName: string;
-}
-
-export interface ToolInputDeltaEvent extends HarnessEventBase {
-  type: 'tool_input_delta';
-  toolCallId: string;
-  argsTextDelta: string;
-  toolName?: string;
-}
-
-export interface ToolInputEndEvent extends HarnessEventBase {
-  type: 'tool_input_end';
-  toolCallId: string;
-}
-
 export interface ToolStartEvent extends HarnessEventBase {
   type: 'tool_start';
+  runId: string;
   toolCallId: string;
   toolName: string;
-  args: unknown;
-}
-
-/**
- * Tool progress (§10.2). Long-running tools (shell, downloads, codegen)
- * publish incremental `partialResult`s between `tool_start` and `tool_end`.
- *
- * Source of truth is the `data-tool-update` chunk that tools write via
- * `ctx.writer?.custom({ type: 'data-tool-update', data: { toolCallId, partialResult } })` —
- * the same call works outside a Harness, where consumers read the chunk
- * directly from `agent.stream().fullStream`. Inside a Harness,
- * `_drainStreamToEvents` recognizes the whitelisted `data-tool-update`
- * chunk type and bridges it into this typed event so subscribers can
- * switch on `event.type === 'tool_update'`.
- */
-export interface ToolUpdateEvent extends HarnessEventBase {
-  type: 'tool_update';
-  toolCallId: string;
-  partialResult: unknown;
-}
-
-/**
- * Streaming shell output (§10.2). Tools that wrap a child process publish
- * stdout/stderr chunks via
- * `ctx.writer?.custom({ type: 'data-shell-output', data: { toolCallId, output, stream } })`.
- * Inside a Harness, `_drainStreamToEvents` bridges the whitelisted
- * `data-shell-output` chunk into this typed event. Outside a Harness, the
- * chunk surfaces directly on `agent.stream().fullStream`.
- */
-export interface ShellOutputEvent extends HarnessEventBase {
-  type: 'shell_output';
-  toolCallId: string;
-  output: string;
-  stream: 'stdout' | 'stderr';
-}
-
-/**
- * Task list update (§10.2). Surfaces a new task list to subscribers
- * (TUI progress widget, sidebar, observers).
- *
- * Source of truth is the `data-task-updated` chunk that tools write via
- * `ctx.writer?.custom({ type: 'data-task-updated', data: { tasks } })` —
- * the same call works outside a Harness, where consumers read the chunk
- * directly from `agent.stream().fullStream`. Inside a Harness,
- * `_drainStreamToEvents` recognizes the whitelisted `data-task-updated`
- * chunk type and bridges it into this typed event so subscribers can
- * switch on `event.type === 'task_updated'`.
- *
- * The harness owns this event type — tools must not synthesize it through
- * `ctx.emitEvent`. Use `writer.custom` instead.
- */
-export interface TaskUpdatedEvent extends HarnessEventBase {
-  type: 'task_updated';
-  tasks: TaskItem[];
+  input: unknown;
 }
 
 export interface ToolEndEvent extends HarnessEventBase {
   type: 'tool_end';
+  runId: string;
   toolCallId: string;
-  result: unknown;
+  toolName: string;
+  output: unknown;
   isError: boolean;
+  /**
+   * Wall-clock duration of the tool call in ms, when a matching `tool_start` was
+   * observed in this process for `(runId, toolCallId)` (span-summary S3/S4).
+   * ABSENT — not zero — when the start is unknown: a resumed/hydrated tool whose
+   * start predates a restart, or a synthetic aborted terminal. Consumers key by
+   * `(runId, toolCallId)` and treat a missing value as "unknown", never 0.
+   */
+  durationMs?: number;
 }
 
 export interface AgentEndEvent extends HarnessEventBase {
   type: 'agent_end';
-  reason: 'complete' | 'aborted' | 'error' | 'suspended';
+  runId: string;
+  finishReason: string;
+  usage: TokenUsage;
+}
+
+/**
+ * §O4 — a tool was blocked by the §4.2e permission gate. Closes the "deny is
+ * silent" observability gap: a `pre-exposure` denial removes the tool from the
+ * model surface before the call (otherwise invisible), and an `action` denial
+ * refuses an issued tool-call (otherwise only a generic tool result). Emitted
+ * best-effort from the shared loop's optional deny callback; carries no tool
+ * args. `toolCallId` is present only for an action denial; `forcedToolChoice` is
+ * true when a forced `toolChoice` named a denied tool (the run then errors).
+ */
+export interface ToolDeniedEvent extends HarnessEventBase {
+  type: 'tool_denied';
+  toolName: string;
+  stage: 'pre-exposure' | 'action';
+  toolCallId?: string;
+  forcedToolChoice?: boolean;
+}
+
+/**
+ * Compact per-run tool aggregate carried on `run_completed` and the durable run
+ * summary (span-summary S4). Bounded by the number of DISTINCT tool names in the
+ * run; never carries per-call inputs/outputs. `errors` counts tool calls whose
+ * terminal was `isError`. Durations are summed/maxed over the calls whose start
+ * was observed in-process; a call with an unknown start contributes to `count`
+ * but not to the duration aggregates.
+ */
+export interface RunToolRollup {
+  count: number;
+  errors: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+  perTool: Record<string, { count: number; errors: number; totalDurationMs: number }>;
+}
+
+/** Terminal disposition of a run (span-summary). `complete`→completed, `error`→failed, `aborted`→interrupted. */
+export type RunCompletedStatus = 'completed' | 'failed' | 'interrupted';
+
+/**
+ * Canonical terminal run signal (span-summary O6). Emitted EXACTLY ONCE per run,
+ * when it reaches a NON-suspended terminal (complete / error / abort) — never on
+ * a suspend (the run parks and later resumes under the same `runId`). Carries the
+ * run identity, wall-clock timing, finish reason, per-run token `usage` (RAW —
+ * cost is a consumer concern, computed by Doxa from usage + model id), and a
+ * compact tool rollup.
+ *
+ * `reconstructed: true` marks a run whose originating start was lost (it began
+ * before a process restart and completed after): `startedAt`, `durationMs` and
+ * `toolRollup` are then ABSENT rather than falsely precise, while `usage`,
+ * identity and `finishReason` are still reported.
+ */
+export interface RunCompletedEvent extends HarnessEventBase {
+  type: 'run_completed';
+  runId: string;
+  status: RunCompletedStatus;
+  finishReason: string;
+  usage: TokenUsage;
+  completedAt: number;
+  /** Run-start wall-clock time; ABSENT on a `reconstructed` run. */
+  startedAt?: number;
+  /** `completedAt - startedAt`; ABSENT on a `reconstructed` run. */
+  durationMs?: number;
+  reconstructed?: boolean;
+  // Identity (sessionId is on HarnessEventBase).
+  resourceId: string;
+  threadId: string;
+  parentSessionId?: string;
+  agentId: string;
+  modeId: string;
+  modelId: string;
+  traceId?: string;
+  /** The operation that drove the run (signal / queue / sync-generate / use-skill / inbox-response), when known. */
+  operationKind?: HarnessRunOperationRefKind;
+  /** Compact tool aggregate; ABSENT on a `reconstructed` run (partial in-memory state cannot be trusted). */
+  toolRollup?: RunToolRollup;
+}
+
+/**
+ * §S3.1 — a RESUME attempt (respondTo*) failed but the suspension remains
+ * RETRYABLE. This is NON-terminal: it does NOT finalize the run (no `agent_end` /
+ * `run_completed`), because the harness reverts the resume marker so the
+ * suspension returns to `waiting` and a subsequent `respondTo*` can retry. It
+ * lets an event-only consumer learn the resume failed WITHOUT mistaking the run
+ * as completed or failed (the prior gap: a failed resume emitted no event, so
+ * consumers saw the run stuck "running"). `retryable` reflects whether the
+ * suspension was restored to a retryable state.
+ */
+export interface ResumeFailedEvent extends HarnessEventBase {
+  type: 'resume_failed';
+  runId: string;
+  retryable: boolean;
+  error: { code: string; message: string };
+}
+
+/**
+ * Diagnostic/run-surface error (§10.2). `signalId` may attribute where the
+ * runtime noticed the error, but promise settlement uses the OperationEvents
+ * (`signal_failed` / `queue_failed`), not this event.
+ */
+export interface TurnErrorEvent extends HarnessEventBase {
+  type: 'error';
+  runId?: string;
+  signalId?: string;
+  error: { code: string; message: string };
+}
+
+// ---------------------------------------------------------------------------
+// Operation settlement events (§10.2). These — not `agent_end` — are the
+// promise/SDK settlement boundary for admitted work. One run can answer
+// several signals, so `agent_end` alone never identifies which `signal(...)`
+// or `queue(...)` call completed; the operation is identified by `signalId` /
+// `queuedItemId` and projected from the durable per-signal result evidence
+// (§5.1d).
+//
+// `result` SCOPE — two cases, by how the operation reached the model:
+//   - Owned (1:1) signals and `queue(...)` items each run as their OWN turn, so
+//     `result` is the distinct per-operation answer (never the aggregate of
+//     other operations).
+//   - INTERLEAVED active-delivery signals (a `signal(...)` drained into an
+//     already-running turn, §4.2f) share that turn's single continuous
+//     response, so each such `signal_completed.result` is the SHARED run
+//     terminal, not a per-segment distinct answer. This is a documented interim
+//     (per-segment attribution is design-gated — see `_settleSignalResult` in
+//     session.ts). Consumers that need to know which operations were
+//     co-answered together group settlement events by their shared `runId`.
+// ---------------------------------------------------------------------------
+
+export interface SignalCompletedEvent extends HarnessEventBase {
+  type: 'signal_completed';
+  runId: string;
+  signalId: string;
+  admissionId?: string;
+  result: unknown;
+}
+
+export interface SignalFailedEvent extends HarnessEventBase {
+  type: 'signal_failed';
+  signalId: string;
+  runId?: string;
+  admissionId?: string;
+  error: { code: string; message: string };
+}
+
+export interface QueueCompletedEvent extends HarnessEventBase {
+  type: 'queue_completed';
+  runId: string;
+  queuedItemId: string;
+  signalId: string;
+  admissionId?: string;
+  result: unknown;
+}
+
+export interface QueueFailedEvent extends HarnessEventBase {
+  type: 'queue_failed';
+  queuedItemId: string;
+  signalId?: string;
+  runId?: string;
+  admissionId?: string;
+  error: { code: string; message: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -275,99 +430,248 @@ export interface AgentEndEvent extends HarnessEventBase {
 // storage (§5.4).
 // ---------------------------------------------------------------------------
 
-export interface SuspensionRequiredEvent extends HarnessEventBase {
-  type: 'suspension_required';
-  kind: PendingResume['kind'];
-  toolCallId: string;
-  toolName?: string;
-}
+// ---------------------------------------------------------------------------
+// Suspension — tool / question / plan needs user input (§10.2). The closed
+// union has FOUR pending shapes (no generic `suspension_required` and no
+// `suspension_resolved` — resolution is observed via the inbox response
+// transition + display snapshot). `source: 'subagent'` carries the parent-side
+// `subagentToolCallId` + child `subagentSessionId`; clients post the response
+// to the child session's inbox. Sandbox/path-access prompts project to
+// `question_pending` (§10.2: no dedicated sandbox event).
+// ---------------------------------------------------------------------------
 
-export interface SuspensionResolvedEvent extends HarnessEventBase {
-  type: 'suspension_resolved';
-  kind: PendingResume['kind'];
-  toolCallId: string;
-}
+type SuspensionSource =
+  | { source: 'parent' }
+  | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string };
 
-export interface SandboxAccessRequestedEvent extends HarnessEventBase {
-  type: 'sandbox_access_requested';
-  requestId: string;
-  toolCallId: string;
-  semanticType: 'file' | 'command' | 'network' | 'mcp' | 'custom';
-  reason?: string;
-  payload?: JsonValue;
-}
-
-export interface SandboxAccessResolvedEvent extends HarnessEventBase {
-  type: 'sandbox_access_resolved';
-  requestId: string;
-  toolCallId: string;
-  semanticType: 'file' | 'command' | 'network' | 'mcp' | 'custom';
-  approved: boolean;
-}
-
-/**
- * Session-wide cancellation was durably requested. Per-item queue drops are
- * emitted as `queue_item_cancelled` so consumers can audit both the session
- * verdict and each resolver that was rejected.
- */
-export interface TaskCancellationRequestedEvent extends HarnessEventBase {
-  type: 'task_cancellation_requested';
+export type ToolApprovalRequiredEvent = HarnessEventBase & {
+  type: 'tool_approval_required';
+  runId: string;
+  itemId: string;
   requestedAt: number;
-  reason?: string;
-  requestedBy?: string;
+  toolCallId: string;
+  toolName: string;
+  toolCategory?: string;
+  /** Reasons the tool requires approval (§10.2). Empty when none are recorded. */
+  approvalReasons: string[];
+  input: unknown;
+} & SuspensionSource;
+
+export type ToolSuspensionRequiredEvent = HarnessEventBase & {
+  type: 'tool_suspension_required';
+  runId: string;
+  itemId: string;
+  requestedAt: number;
+  toolCallId: string;
+  toolName: string;
+  suspendData: unknown;
+} & SuspensionSource;
+
+export type QuestionPendingEvent = HarnessEventBase & {
+  type: 'question_pending';
+  runId: string;
+  itemId: string;
+  requestedAt: number;
+  toolCallId: string;
+  question: string;
+  options?: { label: string; description?: string }[];
+  selectionMode?: 'single_select' | 'multi_select';
+} & SuspensionSource;
+
+export type PlanApprovalRequiredEvent = HarnessEventBase & {
+  type: 'plan_approval_required';
+  runId: string;
+  itemId: string;
+  requestedAt: number;
+  toolCallId: string;
+  title: string;
+  plan: string;
+} & SuspensionSource;
+
+// §10.2: session-wide cancellation is not a public HarnessEventV1 event. The
+// observable effect is the rejected operation promises + cleared queue +
+// updated display snapshot; there is no task_cancellation_requested event.
+
+// ---------------------------------------------------------------------------
+// Queue lifecycle events (§10.2). These are *lifecycle* notifications, not the
+// settlement boundary: the queued operation settles through the OperationEvents
+// above (`queue_completed` / `queue_failed`, keyed by `queuedItemId` /
+// `signalId`), NOT through `agent_end`. One run can answer several queued or
+// signalled operations, so `agent_end` alone never identifies which `queue()`
+// call finished.
+// §10.2: there is no queue-lifecycle event family (no queue_item_started /
+// replayed / expired / queue_full_dropped). Queued work settles through the
+// OperationEvents above (`queue_completed` / `queue_failed`); the drained
+// turn's `agent_start` marks the run boundary; backpressure / expiry / drop
+// surface as rejected operation promises, not events.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Attachment events (§10.2, session-scoped).
+// ---------------------------------------------------------------------------
+
+export interface AttachmentUploadedEvent extends HarnessEventBase {
+  type: 'attachment_uploaded';
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  bytes: number;
+}
+
+export interface AttachmentDeletedEvent extends HarnessEventBase {
+  type: 'attachment_deleted';
+  attachmentId: string;
 }
 
 // ---------------------------------------------------------------------------
-// Queue events (§10.2). The queue's lifecycle is: `enqueued → started →
-// removed`. Outcome is observable through the turn's own `agent_end`
-// (correlated by `queuedItemId`) and the resolved/rejected `queue()` promise,
-// so we don't emit `queue_item_completed` / `queue_item_failed` — that would
-// be a redundant restatement of `agent_end`.
+// Channel events (§14 / §10.2). Best-effort projections of the durable Channel*
+// ledger rows (ingress inbox, action token/receipt, outbox) — NOT the durable
+// recovery/dispatch substrate itself. Harness-scoped (carry harnessName +
+// channelId); session-scoped when a binding/session is known.
 //
-//   - `queue_item_started`  — drain pulled the head item; turn is about to
-//                             begin under a fresh `runId`.
-//   - `queue_item_replayed` — same, but emitted instead of `started` when
-//                             the source is crash-recovery rather than a
-//                             live `queue()` call. The original caller's
-//                             promise is gone; events flow but no resolver
-//                             settles.
+// EMISSION READINESS: the three `channel_outbox_*` events are emitted today by
+// the outbox enqueue/dispatch path. The `channel_ingress_*` and
+// `channel_action_*` events are defined here as part of the closed v1 event
+// union so consumers can switch exhaustively, but are EMITTED only once the §14
+// ingress (C4) and action/approval bridge (C5) orchestration lands. Until then
+// they are a reserved, type-level contract — not a runtime guarantee.
+// ---------------------------------------------------------------------------
+export interface ChannelIngressReceivedEvent extends HarnessEventBase {
+  type: 'channel_ingress_received';
+  harnessName: string;
+  channelId: string;
+  inboxItemId: string;
+  externalMessageId: string;
+  bindingId?: string;
+}
+
+export interface ChannelIngressAdmittedEvent extends HarnessEventBase {
+  type: 'channel_ingress_admitted';
+  harnessName: string;
+  channelId: string;
+  inboxItemId: string;
+  bindingId: string;
+  delivery: 'signal' | 'queue';
+  runId?: string;
+  signalId?: string;
+  queuedItemId?: string;
+}
+
+export interface ChannelIngressFailedEvent extends HarnessEventBase {
+  type: 'channel_ingress_failed';
+  harnessName: string;
+  channelId: string;
+  inboxItemId?: string;
+  externalMessageId?: string;
+  error: { code: string; message: string };
+}
+
+export interface ChannelOutboxEnqueuedEvent extends HarnessEventBase {
+  type: 'channel_outbox_enqueued';
+  harnessName: string;
+  channelId: string;
+  outboxItemId: string;
+  bindingId: string;
+  kind: ChannelOutboxItem['kind'];
+}
+
+export interface ChannelOutboxSentEvent extends HarnessEventBase {
+  type: 'channel_outbox_sent';
+  harnessName: string;
+  channelId: string;
+  outboxItemId: string;
+  bindingId: string;
+  providerMessageId?: string;
+}
+
+export interface ChannelOutboxFailedEvent extends HarnessEventBase {
+  type: 'channel_outbox_failed';
+  harnessName: string;
+  channelId: string;
+  outboxItemId: string;
+  bindingId: string;
+  attempts: number;
+  dead: boolean;
+  // §13.3f.1: `code` is the namespaced harness.* wire code. `reason` carries the
+  // optional discriminator that distinguishes the bare row code collapsed onto a
+  // shared envelope (e.g. `platform_unlinked` vs `operator_closed` under
+  // `harness.channel_binding_closed`). Optional and additive — absent when the
+  // projection has no discriminator.
+  error: { code: string; reason?: string; message: string };
+}
+
+export interface ChannelActionReceivedEvent extends HarnessEventBase {
+  type: 'channel_action_received';
+  harnessName: string;
+  channelId: string;
+  actionReceiptId: string;
+  actionTokenId: string;
+  actionId: string;
+  itemId: string;
+}
+
+export interface ChannelActionAcceptedEvent extends HarnessEventBase {
+  type: 'channel_action_accepted';
+  harnessName: string;
+  channelId: string;
+  actionReceiptId: string;
+  actionTokenId: string;
+  actionId: string;
+  itemId: string;
+  responseId: string;
+}
+
+export interface ChannelActionAppliedEvent extends HarnessEventBase {
+  type: 'channel_action_applied';
+  harnessName: string;
+  channelId: string;
+  actionReceiptId: string;
+  actionTokenId: string;
+  actionId: string;
+  itemId: string;
+}
+
+export interface ChannelActionConflictEvent extends HarnessEventBase {
+  type: 'channel_action_conflict';
+  harnessName: string;
+  channelId: string;
+  actionReceiptId: string;
+  actionTokenId: string;
+  actionId: string;
+  itemId: string;
+  conflictReason?: ChannelActionReceipt['conflictReason'];
+}
+
+export interface ChannelActionFailedEvent extends HarnessEventBase {
+  type: 'channel_action_failed';
+  harnessName: string;
+  channelId: string;
+  actionReceiptId?: string;
+  actionTokenId?: string;
+  actionId?: string;
+  itemId?: string;
+  error: { code: string; message: string };
+}
+
+// ---------------------------------------------------------------------------
+// Storage failure events (§10.2). Session-scoped or harness-scoped depending on
+// origin. Surfaces a storage failure that occurred on a BACKGROUND / best-effort
+// path (lease renewal, event persistence, idle eviction flush) where the error
+// is not propagated to a caller's awaited promise — foreground storage failures
+// already reach the caller as a thrown `HarnessStorageError`. `operation` /
+// `subject` use the same taxonomy as `HarnessStorageError`.
 // ---------------------------------------------------------------------------
 
-export interface QueueItemStartedEvent extends HarnessEventBase {
-  type: 'queue_item_started';
-  queuedItemId: string;
-}
-
-export interface QueueItemReplayedEvent extends HarnessEventBase {
-  type: 'queue_item_replayed';
-  queuedItemId: string;
-}
-
-export interface QueueItemCancelledEvent extends HarnessEventBase {
-  type: 'queue_item_cancelled';
-  queuedItemId: string;
-  admissionId?: string;
-  reason?: string;
-}
-
-export interface QueueItemExpiredEvent extends HarnessEventBase {
-  type: 'queue_item_expired';
-  queuedItemId: string;
-  admissionId?: string;
-  /** Epoch ms — the deadline that was missed. */
-  deadline: number;
-}
-
-export interface QueueFullDroppedEvent extends HarnessEventBase {
-  type: 'queue_full_dropped';
-  source: 'queue' | 'goal';
-  policy: 'reject' | 'drop-oldest';
-  maxQueueDepth: number;
-  queuedItemId?: string;
-  admissionId?: string;
-  replacementQueuedItemId?: string;
-  replacementAdmissionId?: string;
-  goalId?: string;
+export interface StorageErrorEvent extends HarnessEventBase {
+  type: 'storage_error';
+  operation: HarnessStorageOperation;
+  retryable: boolean;
+  error: { code: 'harness.storage'; message: string };
+  resourceId?: string;
+  threadId?: string;
+  harnessName?: string;
+  channelId?: string;
+  subject?: HarnessStorageSubject;
 }
 
 // ---------------------------------------------------------------------------
@@ -379,66 +683,20 @@ export interface QueueFullDroppedEvent extends HarnessEventBase {
 
 export interface CustomEvent extends HarnessEventBase {
   type: `${string}.${string}`;
+  // §10.3: the harness fills the event/session identity fields — `id`,
+  // `sessionId`, `timestamp` (from HarnessEventBase / the emitter) plus
+  // `resourceId` and `threadId`. Subscribers route custom events by the same
+  // (resourceId, threadId) tuple as built-in session-scoped events.
+  resourceId: string;
+  threadId: string;
   payload?: unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Thread lifecycle events (§10.2 — sidebar surface).
-//
-// Threads are the durable artifact (message log + title), distinct from
-// the runtime Session. These events fire on the harness emitter so a
-// sidebar can be reactive without polling. `thread_deleted` fires AFTER
-// any cascade-close of the active session, so subscribers see the
-// session_closed event first.
-// ---------------------------------------------------------------------------
-
-export interface ThreadCreatedEvent extends HarnessEventBase {
-  type: 'thread_created';
-  threadId: string;
-  resourceId: string;
-  title?: string;
-}
-
-export interface ThreadRenamedEvent extends HarnessEventBase {
-  type: 'thread_renamed';
-  threadId: string;
-  resourceId: string;
-  title: string;
-  previousTitle?: string;
-}
-
-export interface ThreadDeletedEvent extends HarnessEventBase {
-  type: 'thread_deleted';
-  threadId: string;
-  resourceId: string;
-  /** True when a live session was cascaded-closed as part of the delete. */
-  cascadedSessionClose: boolean;
-}
-
-export interface ThreadClonedEvent extends HarnessEventBase {
-  type: 'thread_cloned';
-  threadId: string;
-  resourceId: string;
-  sourceThreadId: string;
-  title?: string;
-}
-
-/**
- * Emitted after `harness.threads.setSettings()` commits a patch to a thread's
- * metadata. `patch` includes only the keys that actually changed (no-op
- * writes do not emit). `removedKeys` lists keys that were present before and
- * absent after — drives reactive UI invalidation without subscribers having
- * to diff metadata themselves.
- */
-export interface ThreadSettingsChangedEvent extends HarnessEventBase {
-  type: 'thread_settings_changed';
-  threadId: string;
-  resourceId: string;
-  /** Keys whose values changed (does not include removed keys). */
-  patch: Record<string, unknown>;
-  /** Keys that were deleted by this patch (had `value: undefined`). */
-  removedKeys: string[];
-}
+// §4.1/§10.2: there are NO thread_* lifecycle events. Thread CRUD is an
+// internal/operator op (no public `harness.threads.*` surface — see
+// `createHarnessOperatorThreadController`), and the closed HarnessEventV1 union
+// has no thread family. Sidebar/product surfaces react to `Session` lifecycle
+// events (session_created/closing/closed) + display snapshots instead.
 
 // ---------------------------------------------------------------------------
 // Subagent events (§10.2 / §10.6 — parent-session attribution).
@@ -477,6 +735,22 @@ export interface SubagentTextDeltaEvent extends HarnessEventBase {
   depth: number;
 }
 
+/**
+ * A subagent's streaming reasoning/thinking text, attributed to the parent
+ * (§10.2 / §10.6) — mirrors `subagent_text_delta`. Bridged from the child's
+ * own `reasoning_delta` events. Like all subagent deltas, additive and emitted
+ * only when the child actually streams reasoning.
+ */
+export interface SubagentReasoningDeltaEvent extends HarnessEventBase {
+  type: 'subagent_reasoning_delta';
+  toolCallId: string;
+  subagentSessionId: string;
+  agentType: string;
+  delta: string;
+  parentId?: string;
+  depth: number;
+}
+
 export interface SubagentToolStartEvent extends HarnessEventBase {
   type: 'subagent_tool_start';
   toolCallId: string;
@@ -484,7 +758,14 @@ export interface SubagentToolStartEvent extends HarnessEventBase {
   agentType: string;
   innerToolCallId: string;
   toolName: string;
-  args?: unknown;
+  /**
+   * JSON-safe projection of the subagent tool call's input/args — mirrors
+   * `tool_start.input` so consumers can render a subagent's tool args just
+   * like the top-level agent's. Sourced from the bridged `tool_start.input`,
+   * which was already projected at emit through
+   * {@link projectToolEventPayloadForJson} + `_internalMaxEventPayloadBytes`.
+   */
+  input: unknown;
   parentId?: string;
   depth: number;
 }
@@ -543,6 +824,18 @@ export interface GoalDoneEvent extends HarnessEventBase {
   turnsUsed: number;
 }
 
+// §10.2 / §4.7: the goal judge returned `waiting` — the goal requires an
+// external checkpoint (user feedback, human verification, another out-of-loop
+// event) before the assistant continues. The auto-continuation loop stops
+// without advancing `turnsUsed`; `reason` carries the judge's guidance about
+// the outstanding checkpoint.
+export interface GoalWaitingEvent extends HarnessEventBase {
+  type: 'goal_waiting';
+  goalId: string;
+  reason: string;
+  turnsUsed: number;
+}
+
 export interface GoalPausedEvent extends HarnessEventBase {
   type: 'goal_paused';
   goalId: string;
@@ -559,85 +852,73 @@ export interface GoalClearedEvent extends HarnessEventBase {
   goalId: string;
 }
 
-// ---------------------------------------------------------------------------
-// Workspace events (§2.7 / §10.2).
-//
-// Emitted when a workspace transitions through lifecycle states (initial
-// resolve, ready, destroying, destroyed) and when the provider's
-// create/resume hook throws. `sessionId` and `resourceId` are populated
-// for `per-session` / `per-resource` ownership; `shared` workspaces emit
-// at the harness level with both fields absent.
-// ---------------------------------------------------------------------------
-
-export interface WorkspaceStatusChangedEvent extends HarnessEventBase {
-  type: 'workspace_status_changed';
-  sessionId?: string;
-  resourceId?: string;
-  providerId?: string;
-  status: 'initializing' | 'ready' | 'destroying' | 'destroyed' | 'lost' | 'error';
-}
-
-export interface WorkspaceErrorEvent extends HarnessEventBase {
-  type: 'workspace_error';
-  sessionId?: string;
-  resourceId?: string;
-  providerId?: string;
-  error: { name: string; message: string };
-}
+// §2.7 / §10.2: Harness v1 does NOT define workspace lifecycle/error events.
+// Provider filesystem audit, if present, is provider-owned inspection data and
+// is not part of the closed HarnessEventV1 union. Workspace provisioning
+// failures surface as thrown `HarnessWorkspaceProvisioningError` (and friends);
+// status transitions are an optional internal notice (see
+// `WorkspaceRegistry`), never a public `session.subscribe`/SSE event.
 
 export type HarnessEvent =
   | SessionCreatedEvent
   | SessionClosingEvent
   | SessionClosedEvent
   | SessionEvictedEvent
+  | SessionEvictionWarningEvent
+  | SessionHydratedEvent
+  | HarnessShutdownEvent
   | ModeChangedEvent
   | ModelChangedEvent
-  | ModelOverrideSetEvent
+  | TokenUsageChangedEvent
   | StateChangedEvent
   | PermissionGrantedEvent
   | PermissionRevokedEvent
   | PermissionPolicyChangedEvent
   | AgentStartEvent
-  | MessageStartEvent
-  | MessageUpdateEvent
-  | MessageEndEvent
-  | ToolInputStartEvent
-  | ToolInputDeltaEvent
-  | ToolInputEndEvent
+  | TextDeltaEvent
+  | ReasoningDeltaEvent
   | ToolStartEvent
-  | ToolUpdateEvent
-  | ShellOutputEvent
-  | TaskUpdatedEvent
   | ToolEndEvent
   | AgentEndEvent
-  | SuspensionRequiredEvent
-  | SuspensionResolvedEvent
-  | SandboxAccessRequestedEvent
-  | SandboxAccessResolvedEvent
-  | TaskCancellationRequestedEvent
-  | QueueItemStartedEvent
-  | QueueItemReplayedEvent
-  | QueueItemCancelledEvent
-  | QueueItemExpiredEvent
-  | QueueFullDroppedEvent
-  | ThreadCreatedEvent
-  | ThreadRenamedEvent
-  | ThreadDeletedEvent
-  | ThreadClonedEvent
-  | ThreadSettingsChangedEvent
+  | RunCompletedEvent
+  | ToolDeniedEvent
+  | ResumeFailedEvent
+  | TurnErrorEvent
+  | SignalCompletedEvent
+  | SignalFailedEvent
+  | QueueCompletedEvent
+  | QueueFailedEvent
+  | ToolApprovalRequiredEvent
+  | ToolSuspensionRequiredEvent
+  | QuestionPendingEvent
+  | PlanApprovalRequiredEvent
   | SubagentStartEvent
   | SubagentTextDeltaEvent
+  | SubagentReasoningDeltaEvent
   | SubagentToolStartEvent
   | SubagentToolEndEvent
   | SubagentEndEvent
   | GoalSetEvent
   | GoalJudgedEvent
   | GoalDoneEvent
+  | GoalWaitingEvent
   | GoalPausedEvent
   | GoalResumedEvent
   | GoalClearedEvent
-  | WorkspaceStatusChangedEvent
-  | WorkspaceErrorEvent
+  | AttachmentUploadedEvent
+  | AttachmentDeletedEvent
+  | ChannelIngressReceivedEvent
+  | ChannelIngressAdmittedEvent
+  | ChannelIngressFailedEvent
+  | ChannelOutboxEnqueuedEvent
+  | ChannelOutboxSentEvent
+  | ChannelOutboxFailedEvent
+  | ChannelActionReceivedEvent
+  | ChannelActionAcceptedEvent
+  | ChannelActionAppliedEvent
+  | ChannelActionConflictEvent
+  | ChannelActionFailedEvent
+  | StorageErrorEvent
   | CustomEvent;
 
 export type HarnessEventListener = (event: HarnessEvent) => void | Promise<void>;
@@ -689,18 +970,162 @@ export function snapshotHarnessEventForJson(value: unknown, path = 'event'): Jso
   }
 }
 
-export function projectHarnessPublicError(err: unknown): { code: string; message: string } {
-  if (err instanceof Error) {
-    return { code: (err as { code?: string }).code ?? err.name ?? 'harness.message_failed', message: err.message };
+/**
+ * Project a single tool-event payload field (`tool_start.input` /
+ * `tool_end.output`) into its JSON-safe replay shape AT EMIT TIME so the live
+ * subscriber and the durable replay row carry the identical value.
+ *
+ * The raw AI-SDK chunk hands us live runtime objects (`Date` instances, `Map`,
+ * `Set`, class instances, the raw thrown `Error` for a failed tool, `undefined`
+ * own-props, shared/aliased references). Persistence already normalizes the
+ * whole event through {@link snapshotHarnessEventForJson} before writing the
+ * durable row, but live listeners previously received the un-normalized raw
+ * object — so `tool_end.output.at` was a `Date` live but the ISO string on
+ * replay, a class instance live but a plain object on replay, etc.
+ *
+ * Running the SAME projector (sharing {@link harnessEventJsonReplacer}, so a
+ * tool's own nested `Error` stays a faithful `{ name, code, message }` and is
+ * NOT flattened into `harness.internal`) at emit makes live === replay by
+ * construction: the field is already JSON-safe by the time the event is
+ * stamped, so the persist-path `snapshotHarnessEventForJson` over the whole
+ * event is a structural no-op for it.
+ *
+ * Failure mode is deterministic and identical for both paths: a payload that
+ * cannot round-trip through JSON (a `bigint`, a true cycle, a value whose
+ * `toJSON` throws) is replaced by the stable {@link TOOL_PAYLOAD_UNSERIALIZABLE}
+ * sentinel rather than thrown. The emitted event then carries ONLY the
+ * sentinel, so the persist-path snapshot of the whole event succeeds and the
+ * durable row matches the live value byte-for-byte. This deliberately does
+ * NOT crash the turn (a single non-serializable tool result must not tear down
+ * the stream) and does NOT silently disable persistence while live delivery
+ * succeeds — the previous split that the live/replay divergence created.
+ *
+ * A value that legitimately serializes to NOTHING — a top-level `undefined`
+ * (the common void/side-effect tool result), a bare function, or a symbol —
+ * is a valid "no result", NOT a serialization failure, so it projects to
+ * `null` rather than the sentinel. The sentinel is reserved for genuine
+ * round-trip failures (bigint / cycle / throwing `toJSON`), so a consumer that
+ * treats the sentinel as an error state never mislabels a void tool result.
+ * This also matches the pre-projection whole-event snapshot, where an
+ * `output: undefined` field was simply dropped (`JSON.stringify` omits
+ * `undefined`-valued keys) and persistence succeeded.
+ */
+export const TOOL_PAYLOAD_UNSERIALIZABLE = {
+  __mastraHarness: 'unserializable-tool-payload',
+} as const satisfies JsonValue;
+
+/**
+ * Stable sentinel substituted for a tool-event payload whose JSON-serialized
+ * size exceeds the configured `files.maxEventPayloadBytes` budget. Distinct
+ * discriminator from {@link TOOL_PAYLOAD_UNSERIALIZABLE} so a consumer can tell
+ * "too large" from "could not serialize" from a genuine result.
+ *
+ * Like the unserializable sentinel, the cap is applied AT EMIT (before the
+ * round-trip `JSON.parse`), so the emitted event carries ONLY the sentinel and
+ * the persist-path whole-event snapshot is a structural no-op for the field —
+ * live === replay by construction. A model-generated tool result that blows the
+ * budget must not silently fall out of the durable ledger nor tear down the
+ * stream; it is replaced by this bounded, detectable marker instead.
+ */
+export const TOOL_PAYLOAD_TOO_LARGE = {
+  __mastraHarness: 'oversized-tool-payload',
+} as const satisfies JsonValue;
+
+export function projectToolEventPayloadForJson(value: unknown, path: string, maxBytes?: number): JsonValue {
+  try {
+    const encoded = JSON.stringify(value, harnessEventJsonReplacer);
+    // A top-level `undefined` / function / symbol serializes to nothing. That
+    // is a legitimate "no result" (a void/side-effect tool), not a failure, so
+    // surface it as `null` instead of the unserializable sentinel — identical
+    // on both the live and replay paths.
+    if (encoded === undefined) {
+      return null;
+    }
+    // Size cap is checked on the already-computed serialized string BEFORE the
+    // round-trip `JSON.parse`, so an oversized payload is never re-materialized
+    // and the sentinel is identical on the live and replay paths. Order is
+    // deliberate: undefined ("no result") first, then size, then parse; the
+    // surrounding `try` keeps the unserializable-sentinel path (bigint / cycle /
+    // throwing `toJSON`) at top priority.
+    if (maxBytes !== undefined && Buffer.byteLength(encoded, 'utf8') > maxBytes) {
+      return { ...TOOL_PAYLOAD_TOO_LARGE };
+    }
+    return JSON.parse(encoded) as JsonValue;
+  } catch {
+    // bigint / circular / throwing `toJSON`: keep the wire JSON-safe and
+    // identical on both paths instead of propagating (which would crash the
+    // drain loop) or silently disabling persistence (live/replay split).
+    return { ...TOOL_PAYLOAD_UNSERIALIZABLE };
   }
-  return { code: 'harness.message_failed', message: String(err) };
 }
 
+/**
+ * Generic, caller-safe message for any error that does NOT already carry a
+ * namespaced `harness.*` code. §13.3f.1: `harness.internal` is the reserved
+ * catch-all for unhandled failures, and the raw `err.message` (driver text,
+ * SQL fragments, filesystem paths, stack-derived prose) MUST NOT cross the
+ * v1 wire. The raw cause stays local-only (logs / `HarnessStorageError.cause`).
+ */
+const HARNESS_INTERNAL_REDACTED_MESSAGE = 'An internal harness error occurred';
+
+/**
+ * Project an arbitrary thrown value into the public `{ code, message }` shape
+ * carried by `channel_ingress_failed` / `signal_failed` / `queue_failed` /
+ * durable receipts and `error` turn events.
+ *
+ * Per §13.3f.1, every public error surface must expose a fully-namespaced
+ * `harness.*` code and must never leak a raw driver/SQL/path message. Trust is
+ * by INSTANCE, never by a `.code` string — a forged `code: 'harness.storage'`
+ * on a raw `Error` must NOT pass through, since its message could carry driver
+ * text. Only the harness's own error classes are honored:
+ * - A `HarnessError` (the shared base of every `harness.*`-coded class) passes
+ *   through with its own safe `code` + its (constructed, already-safe) message.
+ * - A `HarnessStorageError` maps to `harness.storage` (it has no `.code` field;
+ *   its message is the safe "Harness storage <op> failed …" summary, and its
+ *   raw `cause` is local-only).
+ * - A `HarnessStorageDomainError` (the shared base of every adapter-thrown
+ *   `harness.storage.*`-coded class) passes through with its specific
+ *   `harness.storage.*` code + its constructed (safe) message. These reach a
+ *   public boundary directly on the channel ingress / recovery-worker paths,
+ *   which do NOT rewrap into the §4.5d `HarnessStorageError`; without this
+ *   branch they would regress to the reserved `harness.internal`.
+ * - Anything else — a raw `TypeError`/`Error`/`MastraError` (even one bearing a
+ *   spoofed `harness.*` code), or a non-Error throw (string/object) — maps to
+ *   the reserved `harness.internal` code with a generic redacted message. The
+ *   raw cause is never surfaced here.
+ */
+export function projectHarnessPublicError(err: unknown): { code: string; message: string } {
+  if (err instanceof HarnessStorageError) {
+    return { code: 'harness.storage', message: err.message };
+  }
+  if (err instanceof HarnessStorageDomainError) {
+    return { code: err.code, message: err.message };
+  }
+  if (err instanceof HarnessError) {
+    return { code: err.code, message: err.message };
+  }
+  return { code: 'harness.internal', message: HARNESS_INTERNAL_REDACTED_MESSAGE };
+}
+
+/**
+ * JSON-serializes an arbitrary `Error` nested ANYWHERE inside an event payload
+ * (e.g. a tool's own `error` output projected into `tool_end.output`) so the
+ * event can round-trip through the durable replay ledger.
+ *
+ * This is NOT the public-error projection boundary — that is
+ * `projectHarnessPublicError`, which the operation-settlement / channel paths
+ * call directly to build `error: { code, message }` and which redacts raw
+ * causes per §13.3f.1. Here we faithfully preserve the original error's
+ * `name` / `code` / `message` so a replayed tool error is not flattened into a
+ * generic `harness.internal`; redacting a tool's own diagnostic output would be
+ * lossy and is not what §13.3f.1 governs.
+ */
 function harnessEventJsonReplacer(_key: string, value: unknown): unknown {
   if (value instanceof Error) {
     return {
       name: value.name,
-      ...projectHarnessPublicError(value),
+      code: (value as { code?: string }).code ?? value.name,
+      message: value.message,
     };
   }
   return value;
@@ -828,21 +1253,6 @@ export class EventEmitter {
 // ---------------------------------------------------------------------------
 
 /**
- * Map `pendingResume.kind` to the suspension event kind. Emitted by
- * `Session` after the pending record commits.
- */
-export function suspensionRequiredFor(pending: PendingResume): SuspensionRequiredEvent {
-  return {
-    type: 'suspension_required',
-    id: '',
-    timestamp: 0,
-    kind: pending.kind,
-    toolCallId: pending.toolCallId,
-    toolName: pending.toolName,
-  } as SuspensionRequiredEvent;
-}
-
-/**
  * Map a `SessionRecord` to the payload of `session_created`. Centralized so
  * the Session and Harness emit identical fields.
  */
@@ -874,6 +1284,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'session_closing',
   'session_closed',
   'session_evicted',
+  'session_eviction_warning',
   'session_pin_overflow',
   'mode_changed',
   'model_changed',
@@ -892,6 +1303,9 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'shell_output',
   'task_updated',
   'tool_end',
+  'run_completed',
+  'tool_denied',
+  'resume_failed',
   'suspension_required',
   'suspension_resolved',
   'sandbox_access_requested',
@@ -912,6 +1326,7 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'goal_set',
   'goal_judged',
   'goal_done',
+  'goal_waiting',
   'goal_paused',
   'goal_resumed',
   'goal_cleared',
@@ -920,14 +1335,32 @@ const RESERVED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'permission_granted',
   'permission_revoked',
   'permission_policy_changed',
+  // §6.3: the exact type `error` is reserved (not a prefix family).
+  'error',
 ]);
 
 /** Prefixes reserved for built-in event families (subagent_*, goal_*, etc.). */
 const RESERVED_EVENT_PREFIXES: readonly string[] = [
-  'subagent_',
-  'goal_',
+  // §6.3 reserved internal-prefix families — a custom event type must not START
+  // with any of these (even dotted, e.g. `tool_start.progress` is rejected).
+  'agent_',
+  'text_',
+  'reasoning_',
+  'message_',
   'queue_',
+  'tool_',
+  'subagent_',
+  'state_',
+  'mode_',
+  'model_',
   'session_',
+  'token_',
+  'channel_',
+  'goal_',
+  'attachment_',
+  'display_',
+  'storage_',
+  // Additional built-in families this impl owns (stricter than §6.3 — safe).
   'workspace_',
   'thread_',
   'permission_',

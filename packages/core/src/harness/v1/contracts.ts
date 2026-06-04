@@ -139,11 +139,12 @@ export type HarnessEvidence =
  *
  * Runtime recovery fields stay storage-internal; public routes already
  * strip `runtimeDependencies`, and the canonical type keeps that boundary
- * explicit for future producers.
+ * explicit for future producers. The caller `requestContext` (app bag) is
+ * likewise storage-internal — restored on resume, never surfaced publicly.
  */
 export type PendingInteraction = Omit<
   PendingResume,
-  'runtimeDependencies' | 'resumedAt' | 'approvedTransitionModeId' | 'modeTransitionAppliedAt'
+  'runtimeDependencies' | 'requestContext' | 'resumedAt' | 'approvedTransitionModeId' | 'modeTransitionAppliedAt'
 >;
 
 /**

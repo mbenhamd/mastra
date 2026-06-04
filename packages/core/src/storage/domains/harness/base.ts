@@ -12,9 +12,30 @@ import type {
   ChannelDiagnosticsRows,
   ChannelOutboxItem,
   ChannelProviderDeliveryReceipt,
+  ChannelBinding,
+  ResolveChannelBindingResult,
+  ListActiveChannelBindingsResult,
   HarnessProviderCallbackBinding,
   ChannelInboxInitialClaim,
   ChannelInboxItem,
+  CountPlanTasksByStatusInput,
+  CreatePlanTaskInput,
+  DeletePlanTaskSubtreeInput,
+  DeletePlanTaskSubtreeResult,
+  HarnessPlanTask,
+  ListPlanTasksInput,
+  ListPlanTasksResult,
+  LoadPlanTaskSubtreeInput,
+  LoadPlanTaskSubtreeResult,
+  PlanTaskCountSummary,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+  LoadRunSummaryInput,
+  ListRunSummariesInput,
+  ListRunSummariesResult,
+  MutatePlanTasksForSessionInput,
+  UpdatePlanTaskInput,
+  UpdatePlanTaskResult,
   CreateOrLoadChannelActionReceiptResult,
   CreateOrLoadChannelActionTokenResult,
   CreateOrLoadChannelInboxItemResult,
@@ -42,12 +63,14 @@ import type {
   ReleaseSessionLeaseInput,
   ResolveProviderCallbackBindingResult,
   RenewSessionLeaseInput,
+  RenewSessionLeaseSubtreeInput,
   SaveAttachmentInput,
   SaveAttachmentReferenceInput,
   SaveAttachmentResult,
   SaveSessionOptions,
   SaveSessionResult,
   SessionLeaseResult,
+  SubtreeSessionLeaseResult,
   SessionRecord,
   SessionSummary,
   ThreadDeleteFenceLease,
@@ -61,11 +84,47 @@ export interface WriteMessageResultEvidenceResult {
 }
 
 /**
+ * §14.1: missing optional external IDs normalise to this out-of-band sentinel so
+ * the platform-conversation tuple stays unique without relying on SQL NULL
+ * uniqueness semantics. The U+001F (Unit Separator) prefix is a C0 control
+ * character no provider emits in a real external id (including a literal single
+ * space), so an absent external id never collides with a present one in storage
+ * tuple keys, channel idempotency keys, or derived thread ids. NUL (U+0000) is
+ * deliberately avoided: the LibSQL driver rejects NUL bytes in string args.
+ *
+ * Storage adapters and the harness channel id-derivation must share this exact
+ * constant so the storage tuple key and the harness-level idempotency/thread-id
+ * keys agree on the missing-external-id encoding.
+ */
+export const CHANNEL_BINDING_EXTERNAL_ID_SENTINEL = '__mastra_missing_external_id__';
+
+/**
+ * Shared base for every storage-domain harness error. Each subclass carries a
+ * fully-namespaced `harness.storage.*` wire `code` and a constructed, safe
+ * message (ids / status names / a harness-built `reason` — never raw driver,
+ * SQL, or filesystem text). Membership is by INSTANCE: the public-error
+ * projection (`projectHarnessPublicError`, §13.3f.1) trusts `err instanceof
+ * HarnessStorageDomainError` to pass `code` + `message` through, so these
+ * adapter-thrown errors surface their specific `harness.storage.*` code instead
+ * of collapsing to the reserved `harness.internal` when they reach a public
+ * boundary directly (e.g. the channel ingress / recovery-worker paths, which do
+ * NOT rewrap into the §4.5d `HarnessStorageError`). A forged `.code` on a raw
+ * `Error` is NOT a `HarnessStorageDomainError` instance, so it stays redacted.
+ *
+ * This is distinct from the §4.5d `HarnessStorageError` (in `harness/v1/errors`),
+ * which is the harness-domain wrapper used on session paths and projects to the
+ * generic `harness.storage` code while keeping its raw `cause` local-only.
+ */
+export abstract class HarnessStorageDomainError extends Error {
+  abstract readonly code: string;
+}
+
+/**
  * Thrown by `saveSession` when `ifVersion` does not match the record's
  * current `version`. The caller should rehydrate and retry once
  * (HARNESS_V1_SPEC.md §5.8).
  */
-export class HarnessStorageVersionConflictError extends Error {
+export class HarnessStorageVersionConflictError extends HarnessStorageDomainError {
   readonly name: string = 'HarnessStorageVersionConflictError';
   readonly code: 'harness.storage.version_conflict' | 'harness.storage.delete_guard_conflict' =
     'harness.storage.version_conflict';
@@ -105,7 +164,7 @@ export class HarnessStorageDeleteGuardConflictError extends HarnessStorageVersio
  * Thrown by `acquireSessionLease` / `renewSessionLease` / `releaseSessionLease`
  * / `saveSession` when another owner currently holds the lease.
  */
-export class HarnessStorageLeaseConflictError extends Error {
+export class HarnessStorageLeaseConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageLeaseConflictError';
   readonly code = 'harness.storage.lease_conflict' as const;
   constructor(
@@ -122,7 +181,7 @@ export class HarnessStorageLeaseConflictError extends Error {
  * the bytes. The harness layer maps this to the public
  * `HarnessAttachmentInUseError`.
  */
-export class HarnessStorageAttachmentInUseError extends Error {
+export class HarnessStorageAttachmentInUseError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAttachmentInUseError';
   readonly code = 'harness.storage.attachment_in_use' as const;
   constructor(
@@ -134,7 +193,7 @@ export class HarnessStorageAttachmentInUseError extends Error {
   }
 }
 
-export class HarnessStorageAttachmentUnavailableError extends Error {
+export class HarnessStorageAttachmentUnavailableError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAttachmentUnavailableError';
   readonly code = 'harness.storage.attachment_unavailable' as const;
   constructor(
@@ -149,7 +208,7 @@ export class HarnessStorageAttachmentUnavailableError extends Error {
  * Thrown by lease/attachment operations when the targeted session record
  * does not exist in storage.
  */
-export class HarnessStorageSessionNotFoundError extends Error {
+export class HarnessStorageSessionNotFoundError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSessionNotFoundError';
   readonly code = 'harness.storage.session_not_found' as const;
   constructor(public readonly sessionId: string) {
@@ -157,30 +216,68 @@ export class HarnessStorageSessionNotFoundError extends Error {
   }
 }
 
-export class HarnessStorageParentSessionUnavailableError extends Error {
+/**
+ * Thrown by `updatePlanTask` / `mutatePlanTasksForSession` when a plan-task row
+ * targeted by `taskId` does not exist for the owning session (§5.1k).
+ */
+export class HarnessStoragePlanTaskNotFoundError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskNotFoundError';
+  readonly code = 'harness.storage.plan_task_not_found' as const;
+  constructor(
+    public readonly sessionId: string,
+    public readonly taskId: string,
+  ) {
+    super(`Plan task "${taskId}" not found for session "${sessionId}"`);
+  }
+}
+
+/**
+ * Thrown by a plan-task field write when the supplied per-row `ifVersion` does
+ * not match the row's current `version`. This is the field-write OCC token that
+ * runs INSIDE the session-owner fence (§5.8); a session-level conflict surfaces
+ * as `HarnessStorageVersionConflictError` and a wrong/expired owner as
+ * `HarnessStorageLeaseConflictError`.
+ */
+export class HarnessStoragePlanTaskVersionConflictError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskVersionConflictError';
+  readonly code = 'harness.storage.plan_task_version_conflict' as const;
+  constructor(
+    public readonly taskId: string,
+    public readonly expectedVersion: number,
+    public readonly actualVersion: number,
+  ) {
+    super(`Plan task "${taskId}" version conflict: expected ${expectedVersion}, found ${actualVersion}`);
+  }
+}
+
+export class HarnessStorageParentSessionUnavailableError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageParentSessionUnavailableError';
   readonly code = 'harness.storage.parent_session_unavailable' as const;
   constructor(
     public readonly parentSessionId: string,
     public readonly reason: 'not_found' | 'closed' | 'closing',
+    /** Closing window for the parent when `reason === 'closing'`, so callers can
+     * surface a spec-accurate `HarnessSessionClosingError` (§4.5b). */
+    public readonly closingAt?: number,
+    public readonly closeDeadlineAt?: number,
   ) {
     super(`Parent session "${parentSessionId}" is unavailable for child admission: ${reason}`);
   }
 }
 
-export class HarnessStorageAdmissionConflictError extends Error {
+export class HarnessStorageAdmissionConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageAdmissionConflictError';
   readonly code = 'harness.storage.admission_conflict' as const;
   constructor(
     public readonly sessionId: string,
-    public readonly kind: 'message' | 'queue',
+    public readonly kind: 'signal' | 'queue',
     public readonly admissionId: string,
   ) {
     super(`Admission "${admissionId}" for ${kind} in session "${sessionId}" conflicts with stored evidence`);
   }
 }
 
-export class HarnessStorageThreadDeleteFenceConflictError extends Error {
+export class HarnessStorageThreadDeleteFenceConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageThreadDeleteFenceConflictError';
   readonly code = 'harness.storage.thread_delete_fence_conflict' as const;
   constructor(
@@ -191,7 +288,7 @@ export class HarnessStorageThreadDeleteFenceConflictError extends Error {
   }
 }
 
-export class HarnessStorageThreadDeleteFenceUnsupportedError extends Error {
+export class HarnessStorageThreadDeleteFenceUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageThreadDeleteFenceUnsupportedError';
   readonly code = 'harness.storage.thread_delete_fence_unsupported' as const;
   constructor() {
@@ -199,7 +296,7 @@ export class HarnessStorageThreadDeleteFenceUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageSessionEventReplayUnsupportedError extends Error {
+export class HarnessStorageSessionEventReplayUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageSessionEventReplayUnsupportedError';
   readonly code = 'harness.storage.session_event_replay_unsupported' as const;
   constructor() {
@@ -207,7 +304,18 @@ export class HarnessStorageSessionEventReplayUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageWorkspaceActionJournalUnsupportedError extends Error {
+export class HarnessStorageSubtreeLeaseRenewalUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageSubtreeLeaseRenewalUnsupportedError';
+  readonly code = 'harness.storage.subtree_lease_renewal_unsupported' as const;
+  constructor() {
+    super(
+      'HarnessStorage.renewSessionLeaseSubtree must be implemented atomically by this storage adapter ' +
+        '(single storage-linearized cycle over the root + active descendants — see §5.8)',
+    );
+  }
+}
+
+export class HarnessStorageWorkspaceActionJournalUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWorkspaceActionJournalUnsupportedError';
   readonly code = 'harness.storage.workspace_action_journal_unsupported' as const;
   constructor() {
@@ -215,7 +323,23 @@ export class HarnessStorageWorkspaceActionJournalUnsupportedError extends Error 
   }
 }
 
-export class HarnessStorageChannelDiagnosticsUnsupportedError extends Error {
+export class HarnessStoragePlanTaskUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStoragePlanTaskUnsupportedError';
+  readonly code = 'harness.storage.plan_task_unsupported' as const;
+  constructor() {
+    super('HarnessStorage plan tasks must be implemented by this storage adapter');
+  }
+}
+
+export class HarnessStorageRunSummaryUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageRunSummaryUnsupportedError';
+  readonly code = 'harness.storage.run_summary_unsupported' as const;
+  constructor() {
+    super('HarnessStorage run summaries must be implemented by this storage adapter');
+  }
+}
+
+export class HarnessStorageChannelDiagnosticsUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelDiagnosticsUnsupportedError';
   readonly code = 'harness.storage.channel_diagnostics_unsupported' as const;
   constructor() {
@@ -223,7 +347,34 @@ export class HarnessStorageChannelDiagnosticsUnsupportedError extends Error {
   }
 }
 
-export class HarnessStorageProviderCallbackBindingUnsupportedError extends Error {
+export class HarnessStorageChannelBindingUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageChannelBindingUnsupportedError';
+  readonly code = 'harness.storage.channel_binding_unsupported' as const;
+  constructor() {
+    super('HarnessStorage channel bindings must be implemented by this storage adapter');
+  }
+}
+
+/**
+ * Thrown when a write would leave two `active` bindings for the same platform
+ * conversation tuple (§5.2h: active rows are unique at storage level). Create or
+ * replace through `resolveChannelBinding`, which fences the prior active row.
+ */
+export class HarnessStorageChannelBindingConflictError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageChannelBindingConflictError';
+  readonly code = 'harness.storage.channel_binding_conflict' as const;
+  constructor(
+    public readonly channelId: string,
+    public readonly externalThreadId: string,
+    public readonly heldBy: string,
+  ) {
+    super(
+      `An active channel binding already exists for channel "${channelId}" thread "${externalThreadId}" (held by "${heldBy}")`,
+    );
+  }
+}
+
+export class HarnessStorageProviderCallbackBindingUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageProviderCallbackBindingUnsupportedError';
   readonly code = 'harness.storage.provider_callback_binding_unsupported' as const;
   constructor() {
@@ -231,7 +382,7 @@ export class HarnessStorageProviderCallbackBindingUnsupportedError extends Error
   }
 }
 
-export class HarnessStorageProviderCallbackBindingTransitionError extends Error {
+export class HarnessStorageProviderCallbackBindingTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageProviderCallbackBindingTransitionError';
   readonly code = 'harness.storage.provider_callback_binding_transition_invalid' as const;
   constructor(
@@ -246,7 +397,7 @@ export class HarnessStorageProviderCallbackBindingTransitionError extends Error 
   }
 }
 
-export class HarnessStorageChannelInboxClaimConflictError extends Error {
+export class HarnessStorageChannelInboxClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelInboxClaimConflictError';
   readonly code = 'harness.storage.channel_inbox_claim_conflict' as const;
   constructor(
@@ -257,7 +408,7 @@ export class HarnessStorageChannelInboxClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelInboxTransitionError extends Error {
+export class HarnessStorageChannelInboxTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelInboxTransitionError';
   readonly code = 'harness.storage.channel_inbox_transition_invalid' as const;
   constructor(
@@ -272,7 +423,7 @@ export class HarnessStorageChannelInboxTransitionError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionClaimConflictError extends Error {
+export class HarnessStorageChannelActionClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionClaimConflictError';
   readonly code = 'harness.storage.channel_action_claim_conflict' as const;
   constructor(
@@ -283,7 +434,7 @@ export class HarnessStorageChannelActionClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionTokenConflictError extends Error {
+export class HarnessStorageChannelActionTokenConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionTokenConflictError';
   readonly code = 'harness.storage.channel_action_token_conflict' as const;
   constructor(
@@ -294,7 +445,7 @@ export class HarnessStorageChannelActionTokenConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelActionReceiptTransitionError extends Error {
+export class HarnessStorageChannelActionReceiptTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelActionReceiptTransitionError';
   readonly code = 'harness.storage.channel_action_receipt_transition_invalid' as const;
   constructor(
@@ -309,7 +460,7 @@ export class HarnessStorageChannelActionReceiptTransitionError extends Error {
   }
 }
 
-export class HarnessStorageChannelOutboxClaimConflictError extends Error {
+export class HarnessStorageChannelOutboxClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelOutboxClaimConflictError';
   readonly code = 'harness.storage.channel_outbox_claim_conflict' as const;
   constructor(
@@ -320,7 +471,7 @@ export class HarnessStorageChannelOutboxClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageChannelOutboxTransitionError extends Error {
+export class HarnessStorageChannelOutboxTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelOutboxTransitionError';
   readonly code = 'harness.storage.channel_outbox_transition_invalid' as const;
   constructor(
@@ -335,7 +486,7 @@ export class HarnessStorageChannelOutboxTransitionError extends Error {
   }
 }
 
-export class HarnessStorageWakeupClaimConflictError extends Error {
+export class HarnessStorageWakeupClaimConflictError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWakeupClaimConflictError';
   readonly code = 'harness.storage.wakeup_claim_conflict' as const;
   constructor(
@@ -346,7 +497,7 @@ export class HarnessStorageWakeupClaimConflictError extends Error {
   }
 }
 
-export class HarnessStorageWakeupTransitionError extends Error {
+export class HarnessStorageWakeupTransitionError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageWakeupTransitionError';
   readonly code = 'harness.storage.wakeup_transition_invalid' as const;
   constructor(
@@ -414,10 +565,14 @@ export abstract class HarnessStorage extends StorageDomain {
   abstract loadSession(opts: { harnessName?: string; sessionId: string }): Promise<SessionRecord | null>;
 
   /**
-   * Lookup by (thread, resource). Returns only **active** records
-   * (`closedAt === undefined`). Returns `null` when no active record exists,
-   * even if one or more closed records match — close-then-reopen-by-thread
-   * is guaranteed to create a fresh session (HARNESS_V1_SPEC.md §5.3).
+   * Lookup by (thread, resource). Returns the **current owner** for the tuple,
+   * including Closed and Closing records (HARNESS_V1_SPEC.md §5.2a/§5.3/§5.5):
+   * Closed owners are reopen candidates, Closing owners fail new-work hydration
+   * with `HarnessSessionClosingError`. Returns `null` only when no current
+   * owner exists for the `(harnessName, resourceId, threadId)` pair — this is
+   * what makes `harness.session({ threadId, resourceId })` reopen the same
+   * session after close instead of minting a fresh active record. Deleted
+   * records are removed and are never returned.
    *
    * Implementations reject new rows that would create a second active session
    * for the same `(harnessName, resourceId, threadId)` admission key.
@@ -580,6 +735,34 @@ export abstract class HarnessStorage extends StorageDomain {
   abstract renewSessionLease(opts: RenewSessionLeaseInput): Promise<SessionLeaseResult>;
 
   /**
+   * Renew the parent/root lease AND every active (non-closed) descendant lease
+   * entry under it on a single storage-linearized cycle (§5.8). All descendants
+   * are capped at the root's new `expiresAt`, committed in one pass so the call
+   * never returns a parent-only partial success. It throws
+   * `HarnessStorageSessionNotFoundError` when the root is missing and
+   * `HarnessStorageLeaseConflictError` when the root is not held/expired by this
+   * owner OR when an active descendant has been claimed by a DIFFERENT instance
+   * (a split subtree) — in either case it renews nothing. A same-owner
+   * descendant whose mirror lapsed is re-adopted to the capped expiry (that is
+   * the §5.8 repair, not a fence). Closed/closing descendants hold no live lease
+   * and are skipped.
+   *
+   * `renewedDescendantCount` reports how many descendant entries were extended.
+   *
+   * No safe base default exists: composing per-node `renewSessionLease` calls
+   * would renew the root and descendants in SEPARATE writes, so a mid-walk
+   * adapter failure could leave the root renewed while a descendant is not —
+   * exactly the parent-only partial commit §5.8 forbids. Rather than ship that
+   * trap, the base throws `HarnessStorageSubtreeLeaseRenewalUnsupportedError`;
+   * every adapter MUST override with a single storage-linearized cycle (the
+   * in-memory adapter does a synchronous validate-all-then-commit pass; SQL
+   * adapters use one transactional recursive `UPDATE`).
+   */
+  async renewSessionLeaseSubtree(_opts: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
+    throw new HarnessStorageSubtreeLeaseRenewalUnsupportedError();
+  }
+
+  /**
    * Release the lease (clears `ownerId` and `leaseExpiresAt`). No-op when
    * `opts.ownerId` does not match the current owner — releasing a lease you
    * do not hold should not throw, since the common cause is "we noticed our
@@ -681,7 +864,7 @@ export abstract class HarnessStorage extends StorageDomain {
     sessionId: string;
     resourceId: string;
     threadId?: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     admissionId: string;
     attemptedAdmissionHash: string;
   }): Promise<{
@@ -696,7 +879,7 @@ export abstract class HarnessStorage extends StorageDomain {
     harnessName?: string;
     sessionId: string;
     resourceId: string;
-    kind: 'message' | 'queue';
+    kind: 'signal' | 'queue';
     signalId?: string;
     queuedItemId?: string;
     now: number;
@@ -790,6 +973,79 @@ export abstract class HarnessStorage extends StorageDomain {
     lastError?: HarnessProviderCallbackBinding['lastError'];
   }): Promise<HarnessProviderCallbackBinding> {
     throw new HarnessStorageProviderCallbackBindingUnsupportedError();
+  }
+
+  // -------------------------------------------------------------------------
+  // Channel bindings (§5.1h / §14.1). Durable per-conversation binding rows.
+  // Concrete throw-by-default so adapters that don't support channels inherit a
+  // clean unsupported error; InMemoryHarness overrides with real implementations.
+  // -------------------------------------------------------------------------
+
+  async saveChannelBinding(_record: ChannelBinding): Promise<void> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  /**
+   * §14.1 forward-only activity-marker advance. Atomically merges the named
+   * binding's `lastInboundAt`/`updatedAt` up to `max(stored, at)` against the
+   * authoritative current row and returns the merged binding (or null if the row
+   * no longer exists). Unlike a caller-side read-modify-write through
+   * `saveChannelBinding`, this can never regress the marker under concurrent or
+   * out-of-order same-binding ingress; adapters back it with a nullable-safe
+   * conditional update, e.g. `GREATEST(COALESCE(last_inbound_at, 0), $at)`.
+   */
+  async touchChannelBindingInbound(_opts: {
+    harnessName?: string;
+    bindingId: string;
+    at: number;
+  }): Promise<ChannelBinding | null> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  async loadChannelBinding(_opts: { bindingId: string }): Promise<ChannelBinding | null> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  async loadChannelBindingByExternal(_opts: {
+    harnessName: string;
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  }): Promise<ChannelBinding | null> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  /**
+   * §14.1 atomic resolve: returns the existing active binding for the
+   * candidate's platform-conversation tuple, or commits the candidate as a new
+   * active binding. When `replaceBindingId` is set, the named prior binding is
+   * marked `replaced` (with `replacedByBindingId`) and the candidate is committed
+   * with an incremented generation — never two active owners for one tuple.
+   */
+  async resolveChannelBinding(_opts: {
+    candidate: ChannelBinding;
+    replaceBindingId?: string;
+  }): Promise<ResolveChannelBindingResult> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  async listChannelBindingsForSession(_opts: { sessionId: string }): Promise<ChannelBinding[]> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  async listActiveChannelBindingsForScope(_opts: {
+    harnessName: string;
+    channelId?: string;
+    limit: number;
+    cursor?: string;
+  }): Promise<ListActiveChannelBindingsResult> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
+  }
+
+  async deleteChannelBinding(_opts: { bindingId: string }): Promise<void> {
+    throw new HarnessStorageChannelBindingUnsupportedError();
   }
 
   // -------------------------------------------------------------------------
@@ -1012,6 +1268,122 @@ export abstract class HarnessStorage extends StorageDomain {
   }): Promise<{ claimExpiresAt: number; storageNow: number }>;
 
   abstract updateHarnessWakeupItem(record: HarnessWakeupItem, opts: { claimId: string }): Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Plan tasks (HARNESS_V1_SPEC.md §5.1k / §4.8f)
+  //
+  // The durable, arbitrary-depth, model-authored agent task/todo TREE — distinct
+  // from the runtime work-unit `HarnessTask`. All mutators are session-owner
+  // fenced on `{ harnessName, sessionId, ownerId, ifSessionVersion }`: the
+  // adapter verifies the owning `SessionRecord` still has `ownerId` holding an
+  // unexpired lease (else `HarnessStorageLeaseConflictError`) and a `version`
+  // matching `ifSessionVersion` (else `HarnessStorageVersionConflictError`)
+  // before any row changes. Status ROLLUP, `blockedBy` cycle-prevention, the
+  // plan tool (§6.4), and the `plan_task_*` event (§10.3) are DEFERRED to
+  // TM-3 / TM-4 / TM-5; this layer persists `blockedBy` as data only.
+  //
+  // Concrete throw-by-default so adapters that do not yet support plan tasks
+  // inherit a clean unsupported error; the in-memory / PG / LibSQL adapters
+  // override with real implementations.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Insert one plan-task node under the session-owner fence. When the node's
+   * `idempotencyKey` matches an existing task in the same session, the existing
+   * row is returned unchanged (idempotent retry). Returns the stored row.
+   */
+  async createPlanTask(_opts: CreatePlanTaskInput): Promise<HarnessPlanTask> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Partial field write of a plan task by `taskId`, guarded by per-row OCC
+   * (`ifVersion`) inside the session-owner fence. Throws
+   * `HarnessStoragePlanTaskNotFoundError` when the row is missing and
+   * `HarnessStoragePlanTaskVersionConflictError` on per-row version mismatch.
+   */
+  async updatePlanTask(_opts: UpdatePlanTaskInput): Promise<UpdatePlanTaskResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Cascade-delete a task and ALL its descendants (walked by `parentTaskId` via
+   * a recursive CTE / BFS) under the session-owner fence — never reparent to
+   * root. The walk defensively guards cycles (visited set / `UNION`). No-op
+   * (deletedCount 0) when the root task does not exist.
+   */
+  async deletePlanTaskSubtree(_opts: DeletePlanTaskSubtreeInput): Promise<DeletePlanTaskSubtreeResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Transaction-shaped multi-row mutation (create/update/deleteSubtree ops) for
+   * decompose/reparent (TM-3 / TM-4). All ops apply under one adapter boundary
+   * or none do. Fenced on the session owner.
+   */
+  async mutatePlanTasksForSession(_opts: MutatePlanTasksForSessionInput): Promise<void> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * List plan tasks for a session (harnessName+sessionId scoped), paginated by
+   * `limit`/`cursor` and ordered by `(parentTaskId, order)`. Read-only — does
+   * not require the lease.
+   */
+  async listPlanTasks(_opts: ListPlanTasksInput): Promise<ListPlanTasksResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Focused bounded read: the next-N nodes of the subtree under `rootTaskId`
+   * (or session roots when omitted), bounded by `depth` and optionally filtered
+   * by `status`. The anti-forgetting "re-orient" read. Read-only.
+   */
+  async loadPlanTaskSubtree(_opts: LoadPlanTaskSubtreeInput): Promise<LoadPlanTaskSubtreeResult> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  /**
+   * Cheap exact aggregate over the session's plan tasks for the bounded
+   * display-state summary (§5.1k / TM-5): `total`, per-status counts, and the
+   * root count — computed by `COUNT(*) GROUP BY status` (plus a roots count),
+   * NOT by loading rows. Keeps the display summary EXACT even when the tree is
+   * larger than any single read page. Read-only — does not require the lease.
+   */
+  async countPlanTasksByStatus(_opts: CountPlanTasksByStatusInput): Promise<PlanTaskCountSummary> {
+    throw new HarnessStoragePlanTaskUnsupportedError();
+  }
+
+  // -------------------------------------------------------------------------
+  // Run summaries (span-summary O1/O2). Durable per-run HISTORY — one row per
+  // completed run, written once (first terminal wins). Distinct from the
+  // single-run `HarnessRunOperationalState` recovery lane. Read-only listing
+  // does not require the lease.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Write one run summary. IDEMPOTENT: the first terminal for a `runId` wins;
+   * a later write for the same `(harnessName, runId)` is a no-op (so duplicate
+   * terminal paths and cross-instance retries cannot clobber or duplicate the
+   * row). Returns the stored summary (the existing one on a no-op).
+   */
+  async saveRunSummary(_opts: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
+  }
+
+  /** Load one run summary by `runId`, or `null` when absent. Read-only. */
+  async loadRunSummary(_opts: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
+  }
+
+  /**
+   * List a session's completed-run summaries, newest first (by `completedAt`,
+   * ties broken by `runId`), keyset-paginated via `beforeCompletedAt`.
+   * Read-only.
+   */
+  async listRunSummaries(_opts: ListRunSummariesInput): Promise<ListRunSummariesResult> {
+    throw new HarnessStorageRunSummaryUnsupportedError();
+  }
 
   // -------------------------------------------------------------------------
   // Test-only

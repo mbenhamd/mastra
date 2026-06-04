@@ -77,7 +77,7 @@ class FakeAgent extends Agent<any, any, any> {
   }
 }
 
-function setup(opts?: { maxDepth?: number; chunks?: any[] }) {
+function setup(opts?: { maxDepth?: number; maxConcurrent?: number; chunks?: any[] }) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent');
   if (opts?.chunks) childAgent.chunks = opts.chunks;
@@ -92,6 +92,7 @@ function setup(opts?: { maxDepth?: number; chunks?: any[] }) {
     sessions: { storage },
     subagents: {
       maxDepth: opts?.maxDepth ?? 2,
+      ...(opts?.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
       types: {
         explore: {
           agentId: 'child-agent',
@@ -172,7 +173,7 @@ describe('spawn_subagent tool — execution', () => {
 
     expect(result.isError).toBe(true);
     expect(result.errorName).toBe('HarnessSubagentDepthExceededError');
-    expect(result.depth).toBe(1);
+    expect(result.attemptedDepth).toBe(2);
     expect(result.maxDepth).toBe(1);
     expect(parent.subagentDepth).toBe(1);
   });
@@ -238,5 +239,299 @@ describe('spawn_subagent tool — execution', () => {
     const childId = result.subagentSessionId as string;
     const childRecord = await storage.loadSession({ sessionId: childId });
     expect(childRecord?.closedAt).toBeDefined();
+  });
+});
+
+describe('spawn_subagent — mode inheritance (§9)', () => {
+  it('a subagent type with NO modeId inherits the PARENT current mode, not the harness default', async () => {
+    const parentAgent = new FakeAgent('parent-agent');
+    const childAgent = new FakeAgent('child-agent');
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'parentMode', agentId: 'parent-agent' },
+        { id: 'childMode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          // No modeId → inherits the parent's CURRENT mode (§9).
+          inheriter: { agentId: 'child-agent', description: 'inherits parent mode' },
+          // Control: an explicit modeId is honored as-is.
+          pinned: { agentId: 'child-agent', modeId: 'childMode', description: 'pinned mode' },
+        },
+      },
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await parent.switchMode({ mode: 'parentMode' });
+      const tool = createSpawnSubagentTool(parent)!;
+
+      const inherited = (await tool.execute!({ agentType: 'inheriter', task: 't' } as any, execCtx('tc-a'))) as any;
+      const inheritedRec = await storage.loadSession({ sessionId: inherited.subagentSessionId });
+      // Inherits the parent's CURRENT mode ('parentMode'), NOT the harness default ('default').
+      expect(inheritedRec!.modeId).toBe('parentMode');
+
+      const pinned = (await tool.execute!({ agentType: 'pinned', task: 't' } as any, execCtx('tc-b'))) as any;
+      const pinnedRec = await storage.loadSession({ sessionId: pinned.subagentSessionId });
+      expect(pinnedRec!.modeId).toBe('childMode'); // explicit modeId still honored
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+describe('subagent type validation (§9)', () => {
+  it('rejects a subagent type whose modeId is backed by a DIFFERENT agent than def.agentId', () => {
+    expect(
+      () =>
+        new Harness({
+          agents: { a: new FakeAgent('a'), b: new FakeAgent('b') } as any,
+          modes: [
+            { id: 'default', agentId: 'a' },
+            { id: 'b-mode', agentId: 'b' },
+          ],
+          defaultModeId: 'default',
+          sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+          subagents: {
+            maxDepth: 2,
+            // agentId 'a' but modeId 'b-mode' runs agent 'b' → must be rejected.
+            types: { mismatch: { agentId: 'a', modeId: 'b-mode', description: 'bad' } },
+          },
+        }),
+    ).toThrow(/conflicts with mode/);
+  });
+});
+
+describe('spawn_subagent tool — concurrency backpressure (§SA3)', () => {
+  it('rejects a spawn once maxConcurrent in-flight is reached, then allows after one frees', async () => {
+    const { harness } = setup({ maxConcurrent: 1 });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      // One spawn already in flight (the create→run window the counter reserves).
+      (parent as any)._subagentSpawnInFlight = 1;
+      const rejected = (await tool.execute!({ agentType: 'explore', task: 'x' } as any, execCtx('tc-2'))) as any;
+      expect(rejected.isError).toBe(true);
+      expect(rejected.errorName).toBe('HarnessSubagentConcurrencyLimitError');
+      expect(rejected.maxConcurrent).toBe(1);
+      expect(rejected.subagentSessionId).toBe('');
+
+      // Free the slot → a spawn proceeds (child runs to completion) and releases.
+      (parent as any)._subagentSpawnInFlight = 0;
+      const ok = (await tool.execute!({ agentType: 'explore', task: 'y' } as any, execCtx('tc-3'))) as any;
+      expect(ok.isError).toBeFalsy();
+      expect(typeof ok.subagentSessionId).toBe('string');
+      expect((parent as any)._subagentSpawnInFlight).toBe(0); // reservation released in finally
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does not gate spawns when maxConcurrent is unset (no per-parent limit)', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const tool = createSpawnSubagentTool(parent)!;
+      (parent as any)._subagentSpawnInFlight = 99; // would exceed any limit
+      const ok = (await tool.execute!({ agentType: 'explore', task: 'z' } as any, execCtx('tc-4'))) as any;
+      expect(ok.isError).toBeFalsy();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+describe('spawn_subagent tool — toolAllowlist (§M4)', () => {
+  it('wires a definition toolAllowlist onto the child session', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const harness = new Harness({
+      agents: { 'parent-agent': new FakeAgent('parent-agent'), 'child-agent': new FakeAgent('child-agent') } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'scoped-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage },
+      subagents: {
+        maxDepth: 2,
+        types: {
+          scoped: {
+            agentId: 'child-agent',
+            modeId: 'scoped-mode',
+            description: 'a scoped subagent',
+            toolAllowlist: ['readDoc', 'search'],
+          },
+        },
+      },
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // Acquire the child the spawn tool will create + observe its allowlist by
+      // re-resolving the type the way spawn does (the spawn wiring sets the field
+      // from def.toolAllowlist).
+      const def = (harness as any)._getSubagentType('scoped');
+      expect(def.toolAllowlist).toEqual(['readDoc', 'search']);
+      const child = await harness.session({
+        resourceId: 'u1',
+        threadId: { fresh: true },
+        parentSessionId: parent.id,
+        origin: 'subagent-tool',
+        modeId: 'scoped-mode',
+        subagentDepth: 1,
+      });
+      // Mirror the spawn wiring + assert the resolver hard-denies a non-listed tool.
+      (child as any)._subagentToolAllowlist = def.toolAllowlist;
+      expect((child as any)._toolPermissionGateEngaged()).toBe(true);
+      expect(
+        (child as any)._resolveToolPolicy(
+          'writeDoc',
+          { categories: {}, tools: {} },
+          { categories: [], tools: [] },
+          'allow',
+          new Set(def.toolAllowlist),
+        ),
+      ).toBe('deny');
+      expect(
+        (child as any)._resolveToolPolicy(
+          'readDoc',
+          { categories: {}, tools: {} },
+          { categories: [], tools: [] },
+          'allow',
+          new Set(def.toolAllowlist),
+        ),
+      ).toBe('allow');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('rejects a malformed toolAllowlist at construction', () => {
+    const base = {
+      agents: { a: new FakeAgent('a') } as any,
+      modes: [{ id: 'm', agentId: 'a' }],
+      defaultModeId: 'm',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    };
+    for (const bad of [{ toolAllowlist: 'x' as any }, { toolAllowlist: [''] }, { toolAllowlist: ['dup', 'dup'] }]) {
+      expect(
+        () =>
+          new Harness({
+            ...base,
+            subagents: { types: { t: { agentId: 'a', description: 'd', ...bad } } },
+          } as any),
+      ).toThrow(/toolAllowlist/);
+    }
+  });
+});
+
+describe('subagent live progress projection (§SA2)', () => {
+  it('folds bridged child events into the parent activeSubagents display snapshot', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const key = 'tc-sa2';
+      (parent as any)._activeSubagents.set(key, {
+        subagentSessionId: 'child-1',
+        agentType: 'explore',
+        task: 'look around',
+        parentToolCallId: key,
+        startedAt: 1,
+      });
+      const upd = (e: any) => (parent as any)._internalUpdateSubagentProgress(key, e);
+
+      upd({ type: 'agent_start', runId: 'r' });
+      upd({ type: 'tool_start', runId: 'r', toolCallId: 'it1', toolName: 'readDoc', input: {} });
+      let snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.status).toBe('running');
+      expect(snap.currentToolName).toBe('readDoc');
+      expect(snap.toolCalls).toBe(1);
+
+      upd({ type: 'tool_end', runId: 'r', toolCallId: 'it1', toolName: 'readDoc', output: {}, isError: false });
+      snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.currentToolName).toBeUndefined();
+      expect(snap.toolCalls).toBe(1);
+
+      upd({
+        type: 'agent_end',
+        runId: 'r',
+        finishReason: 'complete',
+        usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
+      });
+      snap = parent.getDisplayState().activeSubagents[key]!;
+      expect(snap.status).toBe('completed');
+      expect(snap.usage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('maps an errored/aborted child terminal to failed status', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const key = 'tc-sa2b';
+      (parent as any)._activeSubagents.set(key, {
+        subagentSessionId: 'child-2',
+        agentType: 'explore',
+        task: 't',
+        parentToolCallId: key,
+        startedAt: 1,
+      });
+      (parent as any)._internalUpdateSubagentProgress(key, {
+        type: 'agent_end',
+        runId: 'r',
+        finishReason: 'error',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      });
+      expect(parent.getDisplayState().activeSubagents[key]!.status).toBe('failed');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('is a no-op once the subagent entry was cleared (child closed)', async () => {
+    const { harness } = setup();
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      // No entry for this key — must not throw.
+      expect(() =>
+        (parent as any)._internalUpdateSubagentProgress('gone', { type: 'agent_start', runId: 'r' }),
+      ).not.toThrow();
+      expect(parent.getDisplayState().activeSubagents.gone).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+describe('spawn_subagent — inline suspension is an error, not a completion (§S3.3)', () => {
+  it('reports a HITL-suspended inline subagent as isError + HarnessSubagentSuspendedError', async () => {
+    const { harness, childAgent } = setup();
+    // Drive the child to a HITL suspension: a default message() RESOLVES with
+    // finishReason 'suspended' (it does not reject).
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'c-tc', toolName: 'need_input', args: {} },
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: any[] = [];
+      parent.subscribe(e => events.push(e));
+      const tool = createSpawnSubagentTool(parent)!;
+      const out = (await tool.execute!({ agentType: 'explore', task: 'explore X' } as any, execCtx('tc-susp'))) as any;
+      // The inline subagent cannot be resumed → error result, NOT a success.
+      expect(out.isError).toBe(true);
+      expect((out.result as { errorName?: string })?.errorName).toBe('HarnessSubagentSuspendedError');
+      const end = events.find(e => e.type === 'subagent_end') as { isError?: boolean } | undefined;
+      expect(end?.isError).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
   });
 });

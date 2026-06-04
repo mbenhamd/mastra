@@ -54,12 +54,20 @@ export const TABLE_HARNESS_OPERATION_TOMBSTONES = 'mastra_harness_operation_tomb
 export const TABLE_HARNESS_SESSION_EVENTS = 'mastra_harness_session_events';
 export const TABLE_HARNESS_THREAD_DELETE_FENCES = 'mastra_harness_thread_delete_fences';
 export const TABLE_HARNESS_CHANNEL_INBOX = 'mastra_harness_channel_inbox';
+export const TABLE_HARNESS_CHANNEL_BINDINGS = 'mastra_harness_channel_bindings';
 export const TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS = 'mastra_harness_provider_callback_bindings';
 export const TABLE_HARNESS_CHANNEL_ACTION_TOKENS = 'mastra_harness_channel_action_tokens';
 export const TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS = 'mastra_harness_channel_action_receipts';
 export const TABLE_HARNESS_CHANNEL_OUTBOX = 'mastra_harness_channel_outbox';
 export const TABLE_HARNESS_WAKEUPS = 'mastra_harness_wakeups';
 export const TABLE_HARNESS_WORKSPACE_ACTIONS = 'mastra_harness_workspace_actions';
+export const TABLE_HARNESS_PLAN_TASKS = 'mastra_harness_plan_tasks';
+export const TABLE_HARNESS_RUN_SUMMARIES = 'mastra_harness_run_summaries';
+// Tool provider connections
+export const TABLE_TOOL_PROVIDER_CONNECTIONS = 'mastra_tool_provider_connections';
+
+// Notifications
+export const TABLE_NOTIFICATIONS = 'mastra_notifications';
 
 /** Union of all core table name constants. */
 export type TABLE_NAMES =
@@ -104,12 +112,17 @@ export type TABLE_NAMES =
   | typeof TABLE_HARNESS_SESSION_EVENTS
   | typeof TABLE_HARNESS_THREAD_DELETE_FENCES
   | typeof TABLE_HARNESS_CHANNEL_INBOX
+  | typeof TABLE_HARNESS_CHANNEL_BINDINGS
   | typeof TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS
   | typeof TABLE_HARNESS_CHANNEL_ACTION_TOKENS
   | typeof TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS
   | typeof TABLE_HARNESS_CHANNEL_OUTBOX
   | typeof TABLE_HARNESS_WAKEUPS
-  | typeof TABLE_HARNESS_WORKSPACE_ACTIONS;
+  | typeof TABLE_HARNESS_WORKSPACE_ACTIONS
+  | typeof TABLE_HARNESS_PLAN_TASKS
+  | typeof TABLE_HARNESS_RUN_SUMMARIES
+  | typeof TABLE_TOOL_PROVIDER_CONNECTIONS
+  | typeof TABLE_NOTIFICATIONS;
 
 export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
@@ -202,6 +215,7 @@ export const AGENT_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
   workflows: { type: 'jsonb', nullable: true },
   agents: { type: 'jsonb', nullable: true },
   integrationTools: { type: 'jsonb', nullable: true },
+  toolProviders: { type: 'jsonb', nullable: true },
   inputProcessors: { type: 'jsonb', nullable: true },
   outputProcessors: { type: 'jsonb', nullable: true },
   memory: { type: 'jsonb', nullable: true },
@@ -366,6 +380,59 @@ export const FAVORITES_SCHEMA: Record<string, StorageColumn> = {
   entityType: { type: 'text', nullable: false }, // 'agent' | 'skill'
   entityId: { type: 'text', nullable: false },
   createdAt: { type: 'timestamp', nullable: false },
+};
+
+/**
+ * Per-author registry of authorized tool provider connections. Stores a stable
+ * user-supplied label across agents. Composite primary key on
+ * (authorId, providerId, connectionId). `scope` buckets identity:
+ * 'per-author' (default), 'shared' (visible to all callers), or
+ * 'caller-supplied' (authorId is a host-app end-user id forwarded via request
+ * context).
+ */
+export const TOOL_PROVIDER_CONNECTIONS_SCHEMA: Record<string, StorageColumn> = {
+  authorId: { type: 'text', nullable: false },
+  providerId: { type: 'text', nullable: false },
+  connectionId: { type: 'text', nullable: false },
+  toolkit: { type: 'text', nullable: false },
+  label: { type: 'text', nullable: true },
+  scope: { type: 'text', nullable: false },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
+export const NOTIFICATIONS_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false },
+  threadId: { type: 'text', nullable: false },
+  source: { type: 'text', nullable: false },
+  kind: { type: 'text', nullable: false },
+  priority: { type: 'text', nullable: false },
+  status: { type: 'text', nullable: false },
+  summary: { type: 'text', nullable: false },
+  payload: { type: 'jsonb', nullable: true },
+  resourceId: { type: 'text', nullable: true },
+  agentId: { type: 'text', nullable: true },
+  sourceId: { type: 'text', nullable: true },
+  dedupeKey: { type: 'text', nullable: true },
+  coalesceKey: { type: 'text', nullable: true },
+  coalescedCount: { type: 'integer', nullable: false },
+  attributes: { type: 'jsonb', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+  deliveredAt: { type: 'timestamp', nullable: true },
+  seenAt: { type: 'timestamp', nullable: true },
+  dismissedAt: { type: 'timestamp', nullable: true },
+  archivedAt: { type: 'timestamp', nullable: true },
+  discardedAt: { type: 'timestamp', nullable: true },
+  deliverAt: { type: 'timestamp', nullable: true },
+  summaryAt: { type: 'timestamp', nullable: true },
+  deliveryReason: { type: 'text', nullable: true },
+  deliveryAttempts: { type: 'integer', nullable: false },
+  lastDeliveryAttemptAt: { type: 'timestamp', nullable: true },
+  lastDeliveryError: { type: 'text', nullable: true },
+  deliveredSignalId: { type: 'text', nullable: true },
+  summarySignalId: { type: 'text', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
 };
 
 export const SKILL_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
@@ -679,6 +746,8 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     parent_session_id: { type: 'text', nullable: true },
     origin: { type: 'text', nullable: false },
     subagent_depth: { type: 'integer', nullable: true },
+    subagent_type_id: { type: 'text', nullable: true },
+    subagent_tool_allowlist_scoped: { type: 'boolean', nullable: true },
     owns_thread: { type: 'boolean', nullable: false },
     mode_id: { type: 'text', nullable: false },
     model_id: { type: 'text', nullable: false },
@@ -824,7 +893,34 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     request_context: { type: 'jsonb', nullable: false },
     content: { type: 'text', nullable: false },
     attachments: { type: 'jsonb', nullable: false },
+    raw_files: { type: 'jsonb', nullable: true },
     last_error: { type: 'jsonb', nullable: true },
+  },
+  [TABLE_HARNESS_CHANNEL_BINDINGS]: {
+    id: { type: 'text', nullable: false, primaryKey: true },
+    harness_name: { type: 'text', nullable: false },
+    channel_id: { type: 'text', nullable: false },
+    provider_id: { type: 'text', nullable: false },
+    status: { type: 'text', nullable: false },
+    platform: { type: 'text', nullable: false },
+    // §14.1: missing optional external IDs are persisted as a non-null sentinel so
+    // the partial-unique ACTIVE-binding index never relies on SQL NULL uniqueness.
+    external_tenant_id: { type: 'text', nullable: false },
+    external_channel_id: { type: 'text', nullable: false },
+    external_thread_id: { type: 'text', nullable: false },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    mode: { type: 'text', nullable: false },
+    generation: { type: 'integer', nullable: false },
+    created_at: { type: 'bigint', nullable: false },
+    updated_at: { type: 'bigint', nullable: false },
+    last_inbound_at: { type: 'bigint', nullable: true },
+    last_outbound_at: { type: 'bigint', nullable: true },
+    closed_at: { type: 'bigint', nullable: true },
+    closed_reason: { type: 'text', nullable: true },
+    replaced_by_binding_id: { type: 'text', nullable: true },
+    undeliverable_reason: { type: 'text', nullable: true },
   },
   [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: {
     id: { type: 'text', nullable: false, primaryKey: true },
@@ -993,6 +1089,65 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     result: { type: 'jsonb', nullable: true },
     created_at: { type: 'bigint', nullable: false },
   },
+  // Harness plan tasks (HARNESS_V1_SPEC.md §5.1k). The durable, arbitrary-depth,
+  // model-authored agent task/todo TREE — adjacency list via parent_task_id,
+  // sibling ordering via "order". Distinct from the runtime work-unit
+  // HarnessTask. `blocked_by` / `metadata` are JSON; cycle-checking + rollup
+  // that consume blocked_by are DEFERRED to TM-4. `delegated_subagent_session_id`
+  // is RESERVED for TM-6.
+  [TABLE_HARNESS_PLAN_TASKS]: {
+    harness_name: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    task_id: { type: 'text', nullable: false },
+    idempotency_key: { type: 'text', nullable: true },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    parent_task_id: { type: 'text', nullable: true },
+    order: { type: 'integer', nullable: false },
+    status: { type: 'text', nullable: false },
+    status_source: { type: 'text', nullable: false },
+    content: { type: 'text', nullable: false },
+    active_form: { type: 'text', nullable: true },
+    priority: { type: 'integer', nullable: true },
+    blocked_by: { type: 'jsonb', nullable: true },
+    origin: { type: 'text', nullable: true },
+    delegated_subagent_session_id: { type: 'text', nullable: true },
+    // Subagent TYPE id of a delegated task, persisted alongside the session id so
+    // a delegated subagent reattached after rehydrate can re-resolve its
+    // SubagentDefinition (tools / workspace mode) — those overrides are otherwise
+    // in-memory only (§9 / TM-6).
+    delegated_subagent_type_id: { type: 'text', nullable: true },
+    metadata: { type: 'jsonb', nullable: true },
+    created_at: { type: 'bigint', nullable: false },
+    updated_at: { type: 'bigint', nullable: false },
+    started_at: { type: 'bigint', nullable: true },
+    completed_at: { type: 'bigint', nullable: true },
+    version: { type: 'integer', nullable: false },
+  },
+  [TABLE_HARNESS_RUN_SUMMARIES]: {
+    harness_name: { type: 'text', nullable: false },
+    run_id: { type: 'text', nullable: false },
+    session_id: { type: 'text', nullable: false },
+    resource_id: { type: 'text', nullable: false },
+    thread_id: { type: 'text', nullable: false },
+    parent_session_id: { type: 'text', nullable: true },
+    agent_id: { type: 'text', nullable: false },
+    mode_id: { type: 'text', nullable: false },
+    model_id: { type: 'text', nullable: false },
+    trace_id: { type: 'text', nullable: true },
+    operation_kind: { type: 'text', nullable: true },
+    status: { type: 'text', nullable: false },
+    finish_reason: { type: 'text', nullable: false },
+    reconstructed: { type: 'boolean', nullable: false },
+    started_at: { type: 'bigint', nullable: true },
+    completed_at: { type: 'bigint', nullable: false },
+    duration_ms: { type: 'bigint', nullable: true },
+    usage: { type: 'jsonb', nullable: false },
+    tool_rollup: { type: 'jsonb', nullable: true },
+    created_at: { type: 'bigint', nullable: false },
+  },
+  [TABLE_TOOL_PROVIDER_CONNECTIONS]: TOOL_PROVIDER_CONNECTIONS_SCHEMA,
+  [TABLE_NOTIFICATIONS]: NOTIFICATIONS_SCHEMA,
 };
 
 /**
@@ -1023,11 +1178,18 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_SESSION_EVENTS],
     compositePrimaryKey: ['harness_name', 'session_id', 'epoch', 'sequence'],
   },
+  [TABLE_HARNESS_RUN_SUMMARIES]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_RUN_SUMMARIES],
+    compositePrimaryKey: ['harness_name', 'run_id'],
+  },
   [TABLE_HARNESS_THREAD_DELETE_FENCES]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_THREAD_DELETE_FENCES],
   },
   [TABLE_HARNESS_CHANNEL_INBOX]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_INBOX],
+  },
+  [TABLE_HARNESS_CHANNEL_BINDINGS]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_CHANNEL_BINDINGS],
   },
   [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS],
@@ -1049,6 +1211,16 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
     columns: TABLE_SCHEMAS[TABLE_HARNESS_WORKSPACE_ACTIONS],
     compositePrimaryKey: ['harness_name', 'session_id', 'id'],
   },
+  [TABLE_HARNESS_PLAN_TASKS]: {
+    columns: TABLE_SCHEMAS[TABLE_HARNESS_PLAN_TASKS],
+    compositePrimaryKey: ['harness_name', 'session_id', 'task_id'],
+  },
+  [TABLE_FAVORITES]: { columns: FAVORITES_SCHEMA, compositePrimaryKey: ['userId', 'entityType', 'entityId'] },
+  [TABLE_TOOL_PROVIDER_CONNECTIONS]: {
+    columns: TOOL_PROVIDER_CONNECTIONS_SCHEMA,
+    compositePrimaryKey: ['authorId', 'providerId', 'connectionId'],
+  },
+  [TABLE_NOTIFICATIONS]: { columns: NOTIFICATIONS_SCHEMA, compositePrimaryKey: ['threadId', 'id'] },
 };
 
 /**

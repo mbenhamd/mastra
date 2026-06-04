@@ -4,6 +4,7 @@ import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
 import type { CallSettings, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
+import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/channel-tool-fence';
 import type { MessageList } from '../../../agent/message-list';
 import type { CreatedAgentSignal } from '../../../agent/signals';
 import { TripWire } from '../../../agent/trip-wire';
@@ -14,9 +15,10 @@ import { mergeProviderOptions } from '../../../llm/model/provider-options';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
 import type { IMastraLogger } from '../../../logger';
+import type { Mastra } from '../../../mastra';
 import { ConsoleLogger } from '../../../logger';
-import { createObservabilityContext, SpanType } from '../../../observability';
-import type { ModelInferenceContext } from '../../../observability';
+import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
+import type { AnySpan, ModelInferenceContext, TracingContext } from '../../../observability';
 import { executeWithContextSync, getStepAvailableToolNames } from '../../../observability/utils';
 import type { CachedLLMStepResponse, InputProcessorOrWorkflow, ProcessorStreamWriter } from '../../../processors/index';
 import { isProcessorWorkflow } from '../../../processors/index';
@@ -43,7 +45,7 @@ import {
 } from '../../../tools/payload-transform';
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
-import { isMastraTool } from '../../../tools/toolchecks';
+import { getProviderToolName, isMastraTool, isProviderTool } from '../../../tools/toolchecks';
 import { makeCoreTool } from '../../../utils';
 import { createStep } from '../../../workflows/workflow';
 import type { Workspace } from '../../../workspace/workspace';
@@ -54,6 +56,7 @@ import { buildMessagesFromChunks } from './build-messages-from-chunks';
 import type { CollectedChunk } from './build-messages-from-chunks';
 import { resolveConfiguredToolCallConcurrency, updateToolCallForeachConcurrency } from './tool-call-concurrency';
 import type { ToolCallForeachOptions } from './tool-call-concurrency';
+import { notifyToolDenied } from './tool-permission-notify';
 
 function getRequestInputProcessors({
   inputProcessors,
@@ -107,16 +110,94 @@ type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   transportRef?: StreamTransportRef;
   transportResolver?: () => StreamTransport | undefined;
   toolPayloadTransform?: NonNullable<OuterLLMRun['_internal']>['toolPayloadTransform'];
+  mastra?: Mastra;
+  tracingContext?: TracingContext;
 };
+
+type ToolResolvers = {
+  resolveTool: (toolName: string) => ToolSet[string] | undefined;
+  resolveDirectOrProviderTool: (toolName: string) => ToolSet[string] | undefined;
+  resolveDirectOrIdTool: (toolName: string) => ToolSet[string] | undefined;
+};
+
+function createToolResolvers(tools?: ToolSet): ToolResolvers {
+  let providerToolsByName: Map<string, ToolSet[string]> | undefined;
+  let toolsById: Map<string, ToolSet[string]> | undefined;
+
+  const ensureToolIndexes = () => {
+    if (providerToolsByName && toolsById) {
+      return;
+    }
+
+    const nextProviderToolsByName = new Map<string, ToolSet[string]>();
+    const nextToolsById = new Map<string, ToolSet[string]>();
+
+    for (const tool of Object.values(tools || {})) {
+      if (!tool || typeof tool !== 'object') {
+        continue;
+      }
+
+      if (isProviderTool(tool)) {
+        const providerToolName = getProviderToolName(tool.id);
+        if (!nextProviderToolsByName.has(providerToolName)) {
+          nextProviderToolsByName.set(providerToolName, tool);
+        }
+
+        const explicitProviderName = (tool as { name?: unknown }).name;
+        if (typeof explicitProviderName === 'string' && !nextProviderToolsByName.has(explicitProviderName)) {
+          nextProviderToolsByName.set(explicitProviderName, tool);
+        }
+      }
+
+      const toolId = (tool as { id?: unknown }).id;
+      if (typeof toolId === 'string' && !nextToolsById.has(toolId)) {
+        nextToolsById.set(toolId, tool);
+      }
+    }
+
+    providerToolsByName = nextProviderToolsByName;
+    toolsById = nextToolsById;
+  };
+
+  const resolveDirectOrProviderTool = (toolName: string) => {
+    const directTool = tools?.[toolName];
+    if (directTool) {
+      return directTool;
+    }
+    ensureToolIndexes();
+    return providerToolsByName?.get(toolName);
+  };
+  const resolveDirectOrIdTool = (toolName: string) => {
+    const directTool = tools?.[toolName];
+    if (directTool) {
+      return directTool;
+    }
+    ensureToolIndexes();
+    return toolsById?.get(toolName);
+  };
+
+  return {
+    resolveTool: toolName => {
+      const tool = resolveDirectOrProviderTool(toolName);
+      if (tool) {
+        return tool;
+      }
+      ensureToolIndexes();
+      return toolsById?.get(toolName);
+    },
+    resolveDirectOrProviderTool,
+    resolveDirectOrIdTool,
+  };
+}
 
 async function addToolPayloadTransformToChunk<OUTPUT>(
   chunk: ChunkType<OUTPUT>,
   {
-    tools,
+    resolveTool,
     policy,
     logger,
   }: {
-    tools?: ToolSet;
+    resolveTool: ToolResolvers['resolveTool'];
     policy?: NonNullable<OuterLLMRun['_internal']>['toolPayloadTransform'];
     logger?: IMastraLogger;
   },
@@ -132,10 +213,7 @@ async function addToolPayloadTransformToChunk<OUTPUT>(
     return chunk;
   }
 
-  const tool =
-    tools?.[toolName] ||
-    findProviderToolByName(tools, toolName) ||
-    Object.values(tools || {}).find((candidate: any) => `id` in candidate && candidate.id === toolName);
+  const tool = resolveTool(toolName);
   const source = {
     policy,
     toolTransform: (tool as { transform?: unknown } | undefined)?.transform as any,
@@ -320,9 +398,122 @@ async function processOutputStream<OUTPUT = undefined>({
   transportRef,
   transportResolver,
   toolPayloadTransform,
+  mastra,
+  tracingContext,
 }: ProcessOutputStreamOptions<OUTPUT>): Promise<ProcessOutputStreamResult> {
   let transportSet = false;
   const collectedChunks: CollectedChunk[] = [];
+  const { resolveTool, resolveDirectOrProviderTool, resolveDirectOrIdTool } = createToolResolvers(tools);
+  const clientToolArgsTextByToolCallId = new Map<string, string[]>();
+  const clientToolObservabilityByToolCallId = new Map<
+    string,
+    {
+      carrier: unknown;
+      span: AnySpan;
+      ended: boolean;
+    }
+  >();
+
+  const endClientToolObservabilitySpan = (toolCallId: string, args?: unknown): void => {
+    const entry = clientToolObservabilityByToolCallId.get(toolCallId);
+    if (!entry || entry.ended) {
+      clientToolArgsTextByToolCallId.delete(toolCallId);
+      return;
+    }
+
+    entry.span.end(args !== undefined ? { metadata: { args } } : undefined);
+    entry.ended = true;
+    clientToolArgsTextByToolCallId.delete(toolCallId);
+  };
+
+  const parseClientToolArgsFromDeltas = (toolCallId: string): unknown | undefined => {
+    const deltas = clientToolArgsTextByToolCallId.get(toolCallId);
+    if (!deltas?.length) {
+      return undefined;
+    }
+
+    const input = deltas.join('');
+    if (!input) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(input);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const injectClientToolObservability = ({
+    toolCallId,
+    toolName,
+    args,
+    providerExecuted,
+    payload,
+  }: {
+    toolCallId: string;
+    toolName: string;
+    args?: unknown;
+    providerExecuted?: boolean;
+    payload: Record<string, unknown> & { observability?: unknown };
+  }) => {
+    const toolDef = resolveDirectOrProviderTool(toolName);
+    const inferredProviderExecuted = inferProviderExecuted(providerExecuted, toolDef);
+    const isClientTool = !inferredProviderExecuted && !(toolDef as { execute?: unknown } | undefined)?.execute;
+
+    if (!isClientTool || !mastra || !tracingContext?.currentSpan) {
+      return { toolDef, inferredProviderExecuted };
+    }
+
+    const existingCarrier = clientToolObservabilityByToolCallId.get(toolCallId);
+    if (existingCarrier) {
+      payload.observability = existingCarrier.carrier;
+      if (args !== undefined) {
+        endClientToolObservabilitySpan(toolCallId, args);
+      }
+      return { toolDef, inferredProviderExecuted };
+    }
+
+    const proxy = mastra.observability?.getClientObservabilityProxy?.();
+    if (!proxy) {
+      return { toolDef, inferredProviderExecuted };
+    }
+
+    try {
+      const parentSpan =
+        tracingContext.currentSpan.type === SpanType.AGENT_RUN
+          ? tracingContext.currentSpan
+          : (tracingContext.currentSpan.findParent(SpanType.AGENT_RUN) ?? tracingContext.currentSpan);
+      const clientToolSpan = parentSpan.createChildSpan({
+        type: SpanType.CLIENT_TOOL_CALL,
+        name: `client_tool: '${toolName}'`,
+        entityType: EntityType.TOOL,
+        entityId: toolName,
+        entityName: toolName,
+        attributes: {
+          toolDescription: (toolDef as { description?: string } | undefined)?.description,
+          toolType: 'client-tool',
+        },
+        ...(args !== undefined ? { input: args } : {}),
+      });
+      if (clientToolSpan) {
+        const carrier = proxy.inject(clientToolSpan);
+        const entry = { carrier, span: clientToolSpan, ended: false };
+        clientToolObservabilityByToolCallId.set(toolCallId, entry);
+        payload.observability = carrier;
+        if (args !== undefined) {
+          endClientToolObservabilitySpan(toolCallId, args);
+        }
+      }
+    } catch (err) {
+      logger?.warn?.('[ClientObservabilityProxy] failed to create CLIENT_TOOL_CALL span', {
+        error: err instanceof Error ? err.message : String(err),
+        toolName,
+      });
+    }
+
+    return { toolDef, inferredProviderExecuted };
+  };
 
   for await (let chunk of outputStream._getBaseStream()) {
     // Stop processing chunks if the abort signal has fired.
@@ -358,10 +549,43 @@ async function processOutputStream<OUTPUT = undefined>({
     }
 
     chunk = await addToolPayloadTransformToChunk(chunk, {
-      tools,
+      resolveTool,
       policy: toolPayloadTransform,
       logger,
     });
+
+    // Client-tool observability (#merge, upstream): bind a CLIENT_TOOL_CALL span
+    // early on input-streaming-start, accumulate arg deltas, and end the span
+    // once args are known — mirrors upstream's pre-switch block verbatim.
+    let toolInputStartToolDef: ToolSet[string] | undefined;
+    if (chunk.type === 'tool-call-input-streaming-start') {
+      ({ toolDef: toolInputStartToolDef } = injectClientToolObservability({
+        toolCallId: chunk.payload.toolCallId,
+        toolName: chunk.payload.toolName,
+        providerExecuted: chunk.payload.providerExecuted,
+        payload: chunk.payload as unknown as Record<string, unknown> & { observability?: unknown },
+      }));
+    } else if (chunk.type === 'tool-call-delta') {
+      const toolCallId = chunk.payload.toolCallId;
+      if (toolCallId && chunk.payload.argsTextDelta) {
+        const deltas = clientToolArgsTextByToolCallId.get(toolCallId) ?? [];
+        deltas.push(chunk.payload.argsTextDelta);
+        clientToolArgsTextByToolCallId.set(toolCallId, deltas);
+      }
+    } else if (chunk.type === 'tool-call-input-streaming-end') {
+      const parsedArgs = parseClientToolArgsFromDeltas(chunk.payload.toolCallId);
+      if (parsedArgs !== undefined) {
+        endClientToolObservabilitySpan(chunk.payload.toolCallId, parsedArgs);
+      }
+    } else if (chunk.type === 'tool-call') {
+      injectClientToolObservability({
+        toolCallId: chunk.payload.toolCallId,
+        toolName: chunk.payload.toolName,
+        args: chunk.payload.args,
+        providerExecuted: chunk.payload.providerExecuted,
+        payload: chunk.payload as unknown as Record<string, unknown> & { observability?: unknown },
+      });
+    }
 
     // Collect every chunk for post-stream message building
     collectedChunks.push({
@@ -383,9 +607,7 @@ async function processOutputStream<OUTPUT = undefined>({
         break;
 
       case 'tool-call-input-streaming-start': {
-        const tool =
-          tools?.[chunk.payload.toolName] ||
-          Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
+        const tool = toolInputStartToolDef || resolveDirectOrIdTool(chunk.payload.toolName);
 
         if (tool && 'onInputStart' in tool) {
           try {
@@ -404,9 +626,7 @@ async function processOutputStream<OUTPUT = undefined>({
       }
 
       case 'tool-call-delta': {
-        const tool =
-          tools?.[chunk.payload.toolName || ''] ||
-          Object.values(tools || {})?.find(tool => `id` in tool && tool.id === chunk.payload.toolName);
+        const tool = chunk.payload.toolName ? resolveDirectOrIdTool(chunk.payload.toolName) : undefined;
 
         if (tool && 'onInputDelta' in tool) {
           try {
@@ -475,8 +695,7 @@ async function processOutputStream<OUTPUT = undefined>({
         // For same-stream results (call + result in one step), no matching part exists yet
         // so updateToolInvocation returns false — buildMessagesFromChunks handles the merge.
         if (chunk.payload.result != null) {
-          const resultToolDef =
-            tools?.[chunk.payload.toolName] || findProviderToolByName(tools, chunk.payload.toolName);
+          const resultToolDef = resolveDirectOrProviderTool(chunk.payload.toolName);
           messageList.updateToolInvocation({
             type: 'tool-invocation',
             toolInvocation: {
@@ -615,8 +834,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   maxProcessorRetries,
   workspace,
   outputWriter,
+  mastra,
 }: OuterLLMRun<TOOLS, OUTPUT> & { toolCallForeachOptions?: ToolCallForeachOptions }) {
-  const initialSystemMessages = messageList.getAllSystemMessages();
+  const initialUntaggedSystemMessages = messageList.getSystemMessages();
   const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(toolCallConcurrency);
 
   let currentIteration = 0;
@@ -678,11 +898,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               },
             });
           }
-          // Reset system messages to original before each step execution
-          // This ensures that system message modifications in prepareStep/processInputStep/processors
-          // don't persist across steps - each step starts fresh with original system messages
-          if (initialSystemMessages) {
-            messageList.replaceAllSystemMessages(initialSystemMessages);
+          // Reset the mutable untagged bucket before each step execution. Tagged
+          // processor-owned buckets remain on messageList and are assembled later.
+          if (initialUntaggedSystemMessages) {
+            messageList.replaceAllSystemMessages(initialUntaggedSystemMessages);
           }
 
           if (inputData.processorRetryFeedback) {
@@ -705,7 +924,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
           const currentStep: {
             messageId: string;
-            createdAt: Date;
             model: MastraLanguageModel;
             tools?: TOOLS | undefined;
             toolChoice?: ToolChoice<TOOLS> | undefined;
@@ -716,7 +934,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             workspace?: Workspace;
           } = {
             messageId: currentMessageId,
-            createdAt: new Date(),
             model,
             tools,
             toolChoice,
@@ -765,6 +982,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 stepNumber: inputData.output?.steps?.length || 0,
                 ...createObservabilityContext(stepTracingContext),
                 requestContext,
+                memory: _internal?.memory,
+                resourceId: _internal?.resourceId,
+                threadId: _internal?.threadId,
                 model,
                 steps: inputData.output?.steps || [],
                 messageId: currentStep.messageId,
@@ -780,6 +1000,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 abortSignal: options?.abortSignal,
               });
               Object.assign(currentStep, processInputStepResult);
+              // §14.7 INC-1b: an input processor may have re-introduced a reserved
+              // channel tool name into the tool surface after convertTools fenced it.
+              // Re-enforce the reservation (no-op unless this is a channel-bound turn
+              // that stamped a reserved set onto the per-call requestContext).
+              const channelToolFence = readChannelToolFence(requestContext);
+              if (channelToolFence && currentStep.tools) {
+                enforceChannelToolFence(currentStep.tools as Record<string, unknown>, channelToolFence, logger);
+              }
               executedStepModel =
                 currentStep.model.provider && currentStep.model.modelId
                   ? `${currentStep.model.provider}/${currentStep.model.modelId}`
@@ -877,6 +1105,66 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               }
               logger?.error('Error in processInputStep processors:', error);
               throw error;
+            }
+          }
+
+          // §4.2e PRE-EXPOSURE gate: when a session threads a per-tool permission
+          // resolver on the request context, drop `deny` tools from the final
+          // surface BEFORE the model/provider call (and from `activeTools`), and
+          // fail closed if a forced `toolChoice` names a denied tool. Opt-in and a
+          // strict no-op when no resolver is present, so non-harness agents are
+          // unaffected. `ask`/`allow` tools stay exposed (`ask` still suspends at
+          // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
+          // pattern above.
+          const permissionPolicy = requestContext?.get('__mastra_toolPermissionPolicy') as
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined;
+          if (permissionPolicy && currentStep.tools) {
+            const toolSurface = currentStep.tools as Record<string, unknown>;
+            const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
+            // §O4 — the forced-toolChoice denied tool (if any), resolved up front so
+            // its `tool_denied` event carries `forcedToolChoice: true` on its FIRST
+            // (deduped) emit even when the tool is also present in the surface.
+            const forcedDeniedName =
+              toolChoice &&
+              typeof toolChoice === 'object' &&
+              toolChoice.type === 'tool' &&
+              typeof toolChoice.toolName === 'string' &&
+              permissionPolicy(toolChoice.toolName) === 'deny'
+                ? toolChoice.toolName
+                : undefined;
+            // Surface each pre-exposure removal exactly once (a denied tool is
+            // otherwise dropped silently); dedup across the surface + activeTools +
+            // the forced-choice branch.
+            const deniedNames = new Set<string>();
+            const notifyDenied = (toolName: string): void => {
+              if (deniedNames.has(toolName)) return;
+              deniedNames.add(toolName);
+              notifyToolDenied(requestContext, {
+                toolName,
+                stage: 'pre-exposure',
+                ...(toolName === forcedDeniedName ? { forcedToolChoice: true } : {}),
+              });
+            };
+            for (const toolName of Object.keys(toolSurface)) {
+              if (permissionPolicy(toolName) === 'deny') {
+                delete toolSurface[toolName];
+                notifyDenied(toolName);
+              }
+            }
+            if (Array.isArray(currentStep.activeTools)) {
+              currentStep.activeTools = (currentStep.activeTools as string[]).filter(name => {
+                if (permissionPolicy(name) !== 'deny') return true;
+                notifyDenied(name);
+                return false;
+              }) as typeof currentStep.activeTools;
+            }
+            if (forcedDeniedName !== undefined) {
+              // Covers a forced denied tool that was not in the surface/activeTools.
+              notifyDenied(forcedDeniedName);
+              throw new Error(
+                `Forced toolChoice names a permission-denied tool "${forcedDeniedName}" (pre-exposure gate, §4.2e)`,
+              );
             }
           }
 
@@ -1149,7 +1437,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                       messageId: currentStep.messageId,
                     });
 
-                    safeEnqueue(controller, {
+                    return {
                       runId,
                       from: ChunkFrom.AGENT,
                       type: 'step-start',
@@ -1158,7 +1446,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         warnings: warnings || [],
                         messageId: currentStep.messageId,
                       },
-                    });
+                    };
                   },
                   shouldThrowError: !isLastModel,
                 }),
@@ -1219,6 +1507,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               drainPendingSignals: _internal?.drainPendingSignals,
               transportRef: _internal?.transportRef,
               transportResolver,
+              mastra,
+              tracingContext: modelSpanTracker?.getTracingContext() ?? tracingContext,
               toolPayloadTransform: _internal?.toolPayloadTransform,
             });
 
@@ -1230,7 +1520,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               messageId: currentStep.messageId,
               responseModelMetadata: buildResponseModelMetadata(runState, currentStep.model),
               tools: currentStep.tools,
-              createdAt: currentStep.createdAt,
             });
             for (const msg of builtMessages) {
               messageList.add(msg, 'response');

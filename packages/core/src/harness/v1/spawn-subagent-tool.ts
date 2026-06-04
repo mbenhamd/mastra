@@ -35,6 +35,7 @@ export function createSpawnSubagentTool(parent: Session) {
     _listSubagentTypeIds(): string[];
     _getSubagentType(id: string): SubagentDefinition | undefined;
     _getSubagentMaxDepth(): number;
+    _getSubagentMaxConcurrent(): number | undefined;
     session(opts: unknown): Promise<Session>;
   };
   const typeIds = harness._listSubagentTypeIds();
@@ -73,7 +74,11 @@ export function createSpawnSubagentTool(parent: Session) {
     reason: z.string().optional(),
     message: z.string().optional(),
     depth: z.number().optional(),
+    /** Attempted child depth for a `HarnessSubagentDepthExceededError` result (§4.5b). */
+    attemptedDepth: z.number().optional(),
     maxDepth: z.number().optional(),
+    /** Per-parent concurrent-spawn cap for a `HarnessSubagentConcurrencyLimitError` result (§SA3). */
+    maxConcurrent: z.number().optional(),
   });
 
   return createTool({
@@ -101,12 +106,12 @@ export function createSpawnSubagentTool(parent: Session) {
       const childDepth = parentDepth + 1;
       const maxDepth = harness._getSubagentMaxDepth();
       if (childDepth > maxDepth) {
-        const err = new HarnessSubagentDepthExceededError(parent.id, parentDepth, maxDepth);
+        const err = new HarnessSubagentDepthExceededError(maxDepth, childDepth);
         return {
           isError: true,
           errorName: err.name,
           message: err.message,
-          depth: parentDepth,
+          attemptedDepth: childDepth,
           maxDepth,
           subagentSessionId: '',
           result: undefined,
@@ -125,145 +130,217 @@ export function createSpawnSubagentTool(parent: Session) {
         };
       }
 
-      // Create a fresh thread + session for the subagent. The session is
-      // `origin: 'subagent-tool'` and `parentSessionId` is wired so cascade
-      // rules + the depth field on the record are populated correctly.
-      const child = await harness.session({
-        resourceId: parent.resourceId,
-        threadId: { fresh: true },
-        parentSessionId: parent.id,
-        origin: 'subagent-tool',
-        modeId: def.modeId,
-        modelId: modelOverride ?? def.defaultModelId,
-        subagentDepth: childDepth,
-      });
+      // §SA3 backpressure — reject (do not create a child session) when this parent
+      // already has `maxConcurrent` spawn subagents in flight. The counter is
+      // reserved BEFORE the create await below and released in the finally, so
+      // concurrent (parallel tool-call) spawns see an accurate in-flight count.
+      const maxConcurrent = harness._getSubagentMaxConcurrent();
+      const parentInFlight = parent as unknown as { _subagentSpawnInFlight: number };
+      if (maxConcurrent !== undefined && parentInFlight._subagentSpawnInFlight >= maxConcurrent) {
+        return {
+          isError: true,
+          errorName: 'HarnessSubagentConcurrencyLimitError',
+          reason: `subagent concurrency limit reached (maxConcurrent ${maxConcurrent}, in flight ${parentInFlight._subagentSpawnInFlight})`,
+          maxConcurrent,
+          subagentSessionId: '',
+          result: undefined,
+        };
+      }
+      parentInFlight._subagentSpawnInFlight += 1;
+      try {
+        // Create a fresh thread + session for the subagent. The session is
+        // `origin: 'subagent-tool'` and `parentSessionId` is wired so cascade
+        // rules + the depth field on the record are populated correctly.
+        const child = await harness.session({
+          resourceId: parent.resourceId,
+          threadId: { fresh: true },
+          parentSessionId: parent.id,
+          origin: 'subagent-tool',
+          // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
+          // documented), not the harness default mode.
+          modeId: def.modeId ?? parent.getCurrentModeId(),
+          modelId: modelOverride ?? def.defaultModelId,
+          subagentDepth: childDepth,
+          // M4 — persist the type so the child's per-subagent overrides (tools /
+          // workspace / toolAllowlist) survive a direct-by-id hydrate.
+          subagentTypeId: agentType,
+        });
 
-      // Workspace inheritance (§2.7 / §8). `'inherit'` (default) makes the
-      // child share the parent's workspace via a refcount on the same entry.
-      // `'fresh'` provisions a new per-session workspace; only valid under
-      // `kind: 'per-session'` (validated at harness construction).
-      const subagentWorkspaceMode = def.workspace ?? 'inherit';
-      child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+        // Workspace inheritance (§2.7 / §8). `'inherit'` (default) makes the
+        // child share the parent's workspace via a refcount on the same entry.
+        // `'fresh'` provisions a new per-session workspace; only valid under
+        // `kind: 'per-session'` (validated at harness construction).
+        const subagentWorkspaceMode = def.workspace ?? 'inherit';
+        child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+        if (def.tools) child._subagentToolsOverride = def.tools;
+        if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
 
-      // Bridge the child's per-turn events into the parent's subscriber
-      // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and
-      // `queuedItemId` automatically. Track inner tool names by call id so
-      // `subagent_tool_end` can carry the same `toolName` as its start.
-      const innerToolNames = new Map<string, string>();
-      const resolvedModelId = modelOverride ?? def.defaultModelId ?? '';
-      const unsub = child.subscribe(event => {
-        if (!event.type) return;
-        switch (event.type) {
-          case 'agent_start':
-            parent._emitSubagentEvent({
-              type: 'subagent_start',
-              toolCallId,
-              subagentSessionId: child.id,
-              agentType,
-              task,
-              modelId: resolvedModelId,
-              depth: childDepth,
-            });
-            break;
-          case 'message_update':
-            if (typeof event.delta === 'string' && event.delta.length > 0) {
+        // Bridge the child's per-turn events into the parent's subscriber
+        // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and
+        // `queuedItemId` automatically. Track inner tool names by call id so
+        // `subagent_tool_end` can carry the same `toolName` as its start.
+        const innerToolNames = new Map<string, string>();
+        const resolvedModelId = modelOverride ?? def.defaultModelId ?? '';
+        const unsub = child.subscribe(event => {
+          if (!event.type) return;
+          // §SA2 — fold the child's live progress into the parent's display
+          // projection (keyed by this spawn's toolCallId).
+          parent._internalUpdateSubagentProgress(toolCallId, event);
+          switch (event.type) {
+            case 'agent_start':
               parent._emitSubagentEvent({
-                type: 'subagent_text_delta',
+                type: 'subagent_start',
                 toolCallId,
                 subagentSessionId: child.id,
                 agentType,
-                delta: event.delta,
+                task,
+                modelId: resolvedModelId,
                 depth: childDepth,
               });
+              break;
+            case 'text_delta':
+              if (typeof event.delta === 'string' && event.delta.length > 0) {
+                parent._emitSubagentEvent({
+                  type: 'subagent_text_delta',
+                  toolCallId,
+                  subagentSessionId: child.id,
+                  agentType,
+                  delta: event.delta,
+                  depth: childDepth,
+                });
+              }
+              break;
+            case 'reasoning_delta':
+              if (typeof event.delta === 'string' && event.delta.length > 0) {
+                parent._emitSubagentEvent({
+                  type: 'subagent_reasoning_delta',
+                  toolCallId,
+                  subagentSessionId: child.id,
+                  agentType,
+                  delta: event.delta,
+                  depth: childDepth,
+                });
+              }
+              break;
+            case 'tool_start':
+              innerToolNames.set(event.toolCallId, event.toolName);
+              parent._emitSubagentEvent({
+                type: 'subagent_tool_start',
+                toolCallId,
+                subagentSessionId: child.id,
+                agentType,
+                innerToolCallId: event.toolCallId,
+                toolName: event.toolName,
+                // `event.input` is already the JSON-safe projection the child's
+                // own `_emitForChunk` produced via projectToolEventPayloadForJson
+                // + `_internalMaxEventPayloadBytes`, so forward it as-is.
+                input: event.input,
+                depth: childDepth,
+              });
+              break;
+            case 'tool_end': {
+              const toolName = innerToolNames.get(event.toolCallId) ?? 'unknown';
+              innerToolNames.delete(event.toolCallId);
+              parent._emitSubagentEvent({
+                type: 'subagent_tool_end',
+                toolCallId,
+                subagentSessionId: child.id,
+                agentType,
+                innerToolCallId: event.toolCallId,
+                toolName,
+                output: event.output,
+                isError: event.isError ?? false,
+                depth: childDepth,
+              });
+              break;
             }
-            break;
-          case 'tool_start':
-            innerToolNames.set(event.toolCallId, event.toolName);
-            parent._emitSubagentEvent({
-              type: 'subagent_tool_start',
-              toolCallId,
+          }
+        });
+
+        // Track the active subagent so `getDisplayState()` renders it.
+
+        const activeMap = (parent as any)._activeSubagents as Map<
+          string,
+          {
+            subagentSessionId: string;
+            agentType: string;
+            task: string;
+            parentToolCallId: string;
+            startedAt: number;
+          }
+        >;
+        activeMap.set(toolCallId, {
+          subagentSessionId: child.id,
+          agentType,
+          task,
+          parentToolCallId: toolCallId,
+          startedAt: Date.now(),
+        });
+
+        const startTime = Date.now();
+        let result: unknown;
+        let isError = false;
+        try {
+          result = await child.message({ content: task, abortSignal: ctx.abortSignal });
+          // §S3.3 — an inline spawn_subagent has NO independent driver to resume a
+          // human-in-the-loop suspension, and the child is auto-closed below. A
+          // default `message()` RESOLVES (not rejects) with finishReason
+          // 'suspended', so without this it would be reported as a successful
+          // `subagent_end{isError:false}` and the child closed mid-suspension.
+          // Treat it as an error result so the parent model gets an error-shaped
+          // tool output instead of a misleading completion.
+          if ((result as { finishReason?: string } | undefined)?.finishReason === 'suspended') {
+            isError = true;
+            result = {
+              isError: true,
+              errorName: 'HarnessSubagentSuspendedError',
+              reason: 'inline_subagent_suspended_unresumable',
+              message:
+                `Subagent "${agentType}" suspended for human input, but an inline spawn_subagent cannot be ` +
+                `resumed. Re-invoke it with self-contained context that does not require approval/input.`,
               subagentSessionId: child.id,
-              agentType,
-              innerToolCallId: event.toolCallId,
-              toolName: event.toolName,
-              depth: childDepth,
-            });
-            break;
-          case 'tool_end': {
-            const toolName = innerToolNames.get(event.toolCallId) ?? 'unknown';
-            innerToolNames.delete(event.toolCallId);
-            parent._emitSubagentEvent({
-              type: 'subagent_tool_end',
-              toolCallId,
-              subagentSessionId: child.id,
-              agentType,
-              innerToolCallId: event.toolCallId,
-              toolName,
-              output: event.result,
-              isError: event.isError ?? false,
-              depth: childDepth,
-            });
-            break;
+            };
+          }
+        } catch (err) {
+          isError = true;
+          result = err instanceof Error ? err.message : String(err);
+        } finally {
+          unsub();
+          activeMap.delete(toolCallId);
+          // Auto-close the subagent-tool child per §5.6. Best-effort: a
+          // failed close shouldn't mask the tool's own result.
+          try {
+            await child.close();
+          } catch {
+            // ignore
           }
         }
-      });
 
-      // Track the active subagent so `getDisplayState()` renders it.
+        const durationMs = Date.now() - startTime;
+        parent._emitSubagentEvent({
+          type: 'subagent_end',
+          toolCallId,
+          subagentSessionId: child.id,
+          agentType,
+          output: result,
+          isError,
+          durationMs,
+          depth: childDepth,
+        });
 
-      const activeMap = (parent as any)._activeSubagents as Map<
-        string,
-        {
-          subagentSessionId: string;
-          agentType: string;
-          task: string;
-          parentToolCallId: string;
-          startedAt: number;
-        }
-      >;
-      activeMap.set(toolCallId, {
-        subagentSessionId: child.id,
-        agentType,
-        task,
-        parentToolCallId: toolCallId,
-        startedAt: Date.now(),
-      });
-
-      const startTime = Date.now();
-      let result: unknown;
-      let isError = false;
-      try {
-        result = await child.message({ content: task, abortSignal: ctx.abortSignal });
-      } catch (err) {
-        isError = true;
-        result = err instanceof Error ? err.message : String(err);
+        return {
+          subagentSessionId: child.id,
+          result,
+          // §S3.3 — surface isError on the tool OUTPUT (not only on subagent_end)
+          // so the parent model receives an error-shaped result for a thrown OR
+          // suspended subagent, instead of a value that looks like success.
+          ...(isError ? { isError: true } : {}),
+        };
       } finally {
-        unsub();
-        activeMap.delete(toolCallId);
-        // Auto-close the subagent-tool child per §5.6. Best-effort: a
-        // failed close shouldn't mask the tool's own result.
-        try {
-          await child.close();
-        } catch {
-          // ignore
-        }
+        // Release the SA3 reservation on every exit path (create failure, run
+        // error, or normal completion).
+        parentInFlight._subagentSpawnInFlight -= 1;
       }
-
-      const durationMs = Date.now() - startTime;
-      parent._emitSubagentEvent({
-        type: 'subagent_end',
-        toolCallId,
-        subagentSessionId: child.id,
-        agentType,
-        output: result,
-        isError,
-        durationMs,
-        depth: childDepth,
-      });
-
-      return {
-        subagentSessionId: child.id,
-        result,
-      };
     },
   });
 }

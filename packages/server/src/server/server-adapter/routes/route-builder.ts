@@ -153,6 +153,7 @@ interface RouteConfig<
   path: TPath;
   responseType: TResponseType;
   streamFormat?: 'sse' | 'stream'; // Only used when responseType is 'stream'
+  sseFlushOnConnect?: boolean;
   handler: ServerRouteHandler<
     InferParams<TPathSchema, TQuerySchema, TBodySchema>,
     TResponseSchema extends z.ZodTypeAny ? z.infer<TResponseSchema> : unknown,
@@ -167,6 +168,13 @@ interface RouteConfig<
   tags?: string[];
   deprecated?: boolean;
   maxBodySize?: number;
+  /**
+   * When true, the adapter captures the raw body bytes but does NOT parse them
+   * (JSON/multipart) and does NOT reject on a parse failure. For routes that must
+   * verify a provider signature over the exact request bytes (e.g. channel
+   * webhooks). Flows through unchanged to the resulting ServerRoute.
+   */
+  skipBodyParse?: boolean;
   requiresAuth?: boolean; // Explicit auth requirement for this route
   /**
    * Permission required to access this route (EE feature).

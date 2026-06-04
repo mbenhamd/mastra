@@ -1,0 +1,310 @@
+import type {
+  ChannelDeliverySemantics,
+  ChannelIngressEnvelope,
+  ChannelOutboxItem,
+  ChannelProviderDeliveryReceipt,
+  HarnessChannelAdapter,
+  HarnessChannelDeliveryContext,
+  HarnessChannelRouteContext,
+  HarnessChannelTransportRequest,
+} from '@mastra/core/harness/v1';
+
+import { verifyWebhookChallenge, verifyWhatsAppSignature, type WebhookChallengeResult } from './crypto';
+import {
+  DEFAULT_GRAPH_API_BASE_URL,
+  DEFAULT_WHATSAPP_API_VERSION,
+  type WhatsAppAdapterConfig,
+  type WhatsAppSendBody,
+  type WhatsAppSendResponse,
+  type WhatsAppGraphErrorResponse,
+  type WhatsAppTextMessage,
+  type WhatsAppWebhookPayload,
+} from './types';
+
+/** The `platform` tag emitted on every WhatsApp ingress envelope. */
+export const WHATSAPP_PLATFORM = 'whatsapp';
+
+/**
+ * Harness channel adapter for the WhatsApp Cloud API (Meta Graph API).
+ *
+ * - Inbound: verifies `X-Hub-Signature-256` over the raw request bytes, then maps
+ *   the first inbound chat message (a `text` body, or an `interactive`
+ *   button/list reply) into a {@link ChannelIngressEnvelope}.
+ * - Outbound: POSTs a text message to `/<version>/<phone_number_id>/messages`.
+ *
+ * The GET webhook-verification handshake is NOT part of the harness POST inbound
+ * route; use {@link WhatsAppHarnessAdapter.verifyWebhookChallenge} from your GET
+ * route. See `crypto.ts` for details.
+ */
+export class WhatsAppHarnessAdapter implements HarnessChannelAdapter {
+  readonly #config: WhatsAppAdapterConfig;
+
+  /**
+   * §13/§14 delivery semantics. The Cloud API `/messages` send performs NO
+   * server-side dedupe — there is no client message id / idempotency key on the
+   * send call, and a retried POST produces a SECOND WhatsApp message with a new
+   * id. So the only honest contract is `at-least-once`: the harness outbox may
+   * deliver a message more than once under retry, and downstream must tolerate
+   * that. (We do not claim `native-idempotency` or `client-message-id`, which
+   * would be a correctness lie for this API.)
+   */
+  readonly deliverySemantics: ChannelDeliverySemantics = 'at-least-once';
+
+  constructor(config: WhatsAppAdapterConfig) {
+    if (!config.appSecret) throw new Error('WhatsAppHarnessAdapter: `appSecret` is required');
+    if (!config.accessToken) throw new Error('WhatsAppHarnessAdapter: `accessToken` is required');
+    if (!config.phoneNumberId) throw new Error('WhatsAppHarnessAdapter: `phoneNumberId` is required');
+    this.#config = config;
+  }
+
+  /**
+   * Verify + project an inbound WhatsApp webhook POST into a ChannelIngressEnvelope.
+   *
+   * THROWS on signature mismatch / malformed header / wrong app secret — the
+   * harness maps the throw to `verify_failed`/401. THROWS on a payload that
+   * carries no inbound chat message — i.e. status callbacks (`value.statuses[]`)
+   * and truly non-chat message types (image/audio/document/reaction/system/...) —
+   * so they are not admitted as a chat turn. A `text` body and an `interactive`
+   * button/list reply (the user tapping a reply button / picking a list row) ARE
+   * chat-turn ingress and ARE admitted.
+   */
+  async verifyInbound(
+    request: HarnessChannelTransportRequest,
+    _ctx: HarnessChannelRouteContext,
+  ): Promise<ChannelIngressEnvelope> {
+    const signature = this.#headerValue(request.headers, 'x-hub-signature-256');
+    const rawBody = this.#rawBody(request);
+
+    const valid = verifyWhatsAppSignature({ appSecret: this.#config.appSecret, rawBody, signature });
+    if (!valid) {
+      // Generic message — the harness redacts adapter error text on the public
+      // envelope anyway, but we avoid leaking secret/header hints regardless.
+      throw new Error('WhatsApp inbound signature verification failed');
+    }
+
+    const payload = this.#parsePayload(rawBody);
+    return this.#projectFirstChatMessage(payload);
+  }
+
+  /**
+   * Convenience wrapper for the GET webhook-verification handshake. Call this
+   * from your GET route; it is NOT part of the harness inbound (POST) contract.
+   * Returns the challenge to echo back on success.
+   */
+  verifyWebhookChallenge(request: HarnessChannelTransportRequest): WebhookChallengeResult {
+    if (!this.#config.verifyToken) {
+      return { ok: false, reason: 'token_mismatch' };
+    }
+    // Prefer parsed query; fall back to parsing the URL's search string.
+    const query = request.query ?? this.#queryFromUrl(request.url);
+    return verifyWebhookChallenge({ verifyToken: this.#config.verifyToken, query });
+  }
+
+  /**
+   * Deliver an outbound text message via the Graph API.
+   * POST `<base>/<version>/<phone_number_id>/messages`
+   * Authorization: Bearer <accessToken>
+   */
+  async deliver(
+    item: ChannelOutboxItem,
+    _ctx: HarnessChannelDeliveryContext,
+  ): Promise<{ providerMessageId?: string; providerReceipt?: ChannelProviderDeliveryReceipt }> {
+    const to = item.target.externalThreadId;
+    const text = this.#extractText(item.payload);
+
+    const body: WhatsAppSendBody = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'text',
+      text: { body: text },
+    };
+
+    const url = this.#sendUrl();
+    const doFetch = this.#config.fetch ?? globalThis.fetch;
+    const response = await doFetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.#config.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errText = await this.#safeReadGraphError(response);
+      throw new Error(`WhatsApp send failed (HTTP ${response.status}): ${errText}`);
+    }
+
+    const json = (await response.json()) as WhatsAppSendResponse;
+    const providerMessageId = json.messages?.[0]?.id;
+    return {
+      providerMessageId,
+      providerReceipt: { providerMessageId },
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  #sendUrl(): string {
+    const base = (this.#config.graphApiBaseUrl ?? DEFAULT_GRAPH_API_BASE_URL).replace(/\/+$/, '');
+    const version = this.#config.apiVersion ?? DEFAULT_WHATSAPP_API_VERSION;
+    return `${base}/${version}/${this.#config.phoneNumberId}/messages`;
+  }
+
+  #rawBody(request: HarnessChannelTransportRequest): Uint8Array | string {
+    if (request.rawBody !== undefined) return request.rawBody;
+    // No raw bytes available (e.g. a transport that only parsed JSON). Fall back
+    // to a canonical re-serialization; this can fail signature verification if
+    // the upstream JSON had different whitespace, so transports SHOULD provide
+    // rawBody for WhatsApp.
+    if (typeof request.body === 'string') return request.body;
+    return JSON.stringify(request.body ?? {});
+  }
+
+  /**
+   * Parse the payload STRICTLY from the signed bytes. The signature is verified
+   * over `rawBody`, so we never trust a pre-parsed `request.body`: middleware
+   * could mutate the parsed object so it diverges from the bytes we just
+   * authenticated, which would admit unsigned data as a chat turn.
+   */
+  #parsePayload(rawBody: Uint8Array | string): WhatsAppWebhookPayload {
+    const text = typeof rawBody === 'string' ? rawBody : Buffer.from(rawBody).toString('utf8');
+    return JSON.parse(text) as WhatsAppWebhookPayload;
+  }
+
+  #projectFirstChatMessage(payload: WhatsAppWebhookPayload): ChannelIngressEnvelope {
+    if (payload.object !== 'whatsapp_business_account') {
+      throw new Error(`WhatsApp inbound: unexpected object '${String(payload.object)}'`);
+    }
+    for (const entry of payload.entry ?? []) {
+      for (const change of entry.changes ?? []) {
+        // `field: 'messages'` carries both inbound messages and status callbacks.
+        if (change.field !== 'messages') continue;
+        const value = change.value ?? {};
+        // Reject inbound events addressed to a different business phone number.
+        // In shared-webhook setups (one endpoint fanning out to many numbers)
+        // this prevents cross-number admission: only events whose
+        // `metadata.phone_number_id` matches the configured one are admitted.
+        const metadataPhoneNumberId = value.metadata?.phone_number_id;
+        if (metadataPhoneNumberId !== this.#config.phoneNumberId) {
+          throw new Error('WhatsApp inbound: phone_number_id mismatch');
+        }
+        const messages = value.messages ?? [];
+        // A chat turn is either a `text` body or an `interactive` button/list
+        // reply (the user tapped a quick-reply button / picked a list row). Other
+        // message types (image/audio/document/reaction/system/...) are not chat
+        // ingress here.
+        const message = messages.find(m => this.#chatContent(m) !== undefined);
+        if (!message) continue;
+
+        const content = this.#chatContent(message)!;
+        const from = message.from;
+        const contact = value.contacts?.[0];
+        const displayName = contact?.profile?.name;
+        const tsSeconds = Number(message.timestamp);
+        const receivedAt = Number.isFinite(tsSeconds) ? tsSeconds * 1000 : Date.now();
+
+        return {
+          platform: WHATSAPP_PLATFORM,
+          // WhatsApp Cloud API conversations are strictly 1:1 (a user <-> business
+          // number), so the conversation is a direct message.
+          conversationKind: 'dm',
+          trigger: 'message',
+          externalTenantId: entry.id, // WhatsApp Business Account id
+          externalChannelId: metadataPhoneNumberId, // business phone-number id
+          externalThreadId: from, // per-user conversation == the user's wa_id
+          externalMessageId: message.id,
+          // The reply `title` is the user-facing turn content; the developer-set
+          // reply `id` rides along in `raw` (the full payload) for menu routing.
+          content,
+          actor: {
+            platformUserId: from,
+            ...(displayName !== undefined ? { displayName } : {}),
+          },
+          receivedAt,
+          raw: payload,
+        };
+      }
+    }
+
+    // No inbound chat message: status callbacks (value.statuses[]) and truly
+    // non-chat message types (image/audio/document/reaction/system/...) are NOT
+    // chat-turn ingress. We throw so the harness does not admit a turn. Status
+    // callbacks should be handled by a dedicated delivery-receipt path, not the
+    // ingress route.
+    throw new Error('WhatsApp inbound: no inbound chat message to admit');
+  }
+
+  /**
+   * The chat-turn content for an inbound message, or `undefined` if the message
+   * is not a chat turn we admit. A `text` message yields its body; an
+   * `interactive` button/list reply yields the reply `title` (with the
+   * developer-set reply `id` available on the raw payload for menu routing). All
+   * other message types (image/audio/document/reaction/system/...) yield
+   * `undefined`.
+   */
+  #chatContent(message: WhatsAppTextMessage): string | undefined {
+    if (message.type === 'text') {
+      return message.text?.body;
+    }
+    if (message.type === 'interactive') {
+      const interactive = message.interactive;
+      const reply = interactive?.button_reply ?? interactive?.list_reply;
+      return reply?.title;
+    }
+    return undefined;
+  }
+
+  #extractText(payload: ChannelOutboxItem['payload']): string {
+    if (typeof payload === 'string') return payload;
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const obj = payload as Record<string, unknown>;
+      // Common shapes: { text: '...' } or { text: { body: '...' } } or { body: '...' }.
+      if (typeof obj.text === 'string') return obj.text;
+      if (obj.text && typeof obj.text === 'object') {
+        const body = (obj.text as Record<string, unknown>).body;
+        if (typeof body === 'string') return body;
+      }
+      if (typeof obj.body === 'string') return obj.body;
+      if (typeof obj.content === 'string') return obj.content;
+    }
+    throw new Error('WhatsApp deliver: outbox payload has no text body');
+  }
+
+  #headerValue(headers: Record<string, string | string[]>, name: string): string | undefined {
+    // Transport header maps are not guaranteed lowercased — normalize.
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === name) {
+        return Array.isArray(value) ? value[0] : value;
+      }
+    }
+    return undefined;
+  }
+
+  #queryFromUrl(url: string | undefined): Record<string, string | string[]> | undefined {
+    if (!url) return undefined;
+    try {
+      const parsed = new URL(url, 'http://localhost');
+      const out: Record<string, string | string[]> = {};
+      for (const [k, v] of parsed.searchParams) out[k] = v;
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async #safeReadGraphError(response: Response): Promise<string> {
+    try {
+      const json = (await response.json()) as WhatsAppGraphErrorResponse;
+      if (json.error?.message) {
+        return `${json.error.message}${json.error.code !== undefined ? ` (code ${json.error.code})` : ''}`;
+      }
+      return JSON.stringify(json);
+    } catch {
+      return response.statusText || 'unknown error';
+    }
+  }
+}

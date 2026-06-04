@@ -1447,7 +1447,7 @@ function sampleWakeup(overrides: Partial<HarnessWakeupItem> = {}): HarnessWakeup
 
 function sampleWakeupChannelContext(
   overrides: Partial<{
-    origin: 'inbound' | 'binding';
+    origin: 'inbound' | 'scheduled' | 'proactive';
     harnessName: string;
     channelId: string;
     providerId: string;

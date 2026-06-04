@@ -9,12 +9,12 @@ import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-ada
 import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
+  isZodError,
   normalizeQueryParams,
   redactSensitiveQueryParams,
   redactStreamChunk,
 } from '@mastra/server/server-adapter';
 import type { Application, NextFunction, Request, Response } from 'express';
-import { ZodError } from 'zod';
 export { createAuthMiddleware } from './auth-middleware';
 export type { ExpressAuthMiddlewareOptions } from './auth-middleware';
 
@@ -157,6 +157,10 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
     res.setHeader('Transfer-Encoding', 'chunked');
     res.flushHeaders();
 
+    if (streamFormat === 'sse' && route.sseFlushOnConnect) {
+      res.write(': connected\n\n');
+    }
+
     const readableStream = result instanceof ReadableStream ? result : result.fullStream;
     const reader = readableStream.getReader();
 
@@ -166,6 +170,11 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
         if (done) break;
 
         if (value) {
+          if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+            res.write(value);
+            continue;
+          }
+
           // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
           const shouldRedact = this.streamOptions?.redact ?? true;
           const outputValue = shouldRedact ? redactStreamChunk(value) : value;
@@ -472,7 +481,7 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
             this.mastra.getLogger()?.error('Error parsing query params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'query');
               return res.status(status).json(body);
             }
@@ -490,7 +499,7 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
             this.mastra.getLogger()?.error('Error parsing body', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'body');
               return res.status(status).json(body);
             }
@@ -509,7 +518,7 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
             this.mastra.getLogger()?.error('Error parsing path params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'path');
               return res.status(status).json(body);
             }

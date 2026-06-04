@@ -1,9 +1,11 @@
 import type { JsonValue } from '../../storage/domains/harness';
+import type { PlanTaskSummary } from './plan-task-session';
 import type {
   ActiveSubagentState,
   ActiveToolState,
   SessionDisplayPending,
   SessionDisplayState,
+  SessionRunProjection,
   TokenUsage,
 } from './session';
 
@@ -49,6 +51,8 @@ export interface HarnessDisplayStateSnapshotV1 {
   currentRunId?: string;
   currentMessageId?: string;
   currentTraceId?: string;
+  // §5.1b structured in-flight run projection (JSON-safe; primitive fields only).
+  currentRun?: SessionRunProjection;
   activeTools: Record<string, HarnessDisplayActiveToolSnapshotV1>;
   toolInputBuffers: Record<string, HarnessDisplayToolInputBufferSnapshotV1>;
   activeSubagents: Record<string, HarnessDisplayActiveSubagentSnapshotV1>;
@@ -57,6 +61,13 @@ export interface HarnessDisplayStateSnapshotV1 {
   queueDepth: number;
   currentQueuedItemId?: string;
   goal?: HarnessDisplayJsonValue;
+  /**
+   * §5.1k / TM-5 bounded plan-task summary — counts + active `in_progress` ids +
+   * root count. NOT the full tree: UIs use the `papersflow.plan_task.updated`
+   * event deltas + the bounded `plan_task_check` read for detail. Already
+   * JSON-safe (numbers + a string-id array), so it is carried verbatim.
+   */
+  planTasks?: PlanTaskSummary;
 }
 
 /**
@@ -183,7 +194,18 @@ export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): Har
   if (state.currentMessageId !== undefined) snapshot.currentMessageId = state.currentMessageId;
   if (state.currentTraceId !== undefined) snapshot.currentTraceId = state.currentTraceId;
   if (state.currentQueuedItemId !== undefined) snapshot.currentQueuedItemId = state.currentQueuedItemId;
+  // SessionRunProjection is already JSON-safe (primitive fields only).
+  if (state.currentRun !== undefined) snapshot.currentRun = state.currentRun;
   if (state.goal !== undefined) snapshot.goal = toHarnessDisplayJsonValue(state.goal);
+  // §5.1k / TM-5 — already JSON-safe; copy so callers can't mutate internals.
+  if (state.planTasks !== undefined) {
+    snapshot.planTasks = {
+      total: state.planTasks.total,
+      byStatus: { ...state.planTasks.byStatus },
+      inProgressTaskIds: [...state.planTasks.inProgressTaskIds],
+      rootCount: state.planTasks.rootCount,
+    };
+  }
 
   return snapshot;
 }

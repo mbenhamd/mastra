@@ -28,6 +28,58 @@ export type VercelToolV5 = ToolV5;
 
 export type ToolInvocationOptions = ToolExecutionOptions | ToolCallOptions;
 
+/**
+ * Context passed to a global `requireToolApproval` function, evaluated per tool call.
+ */
+export type ToolApprovalContext = {
+  /** Name of the tool being called. */
+  toolName: string;
+  /** Arguments the model is passing to the tool. */
+  args: Record<string, unknown>;
+  /** Plain object view of the request context, when available. */
+  requestContext?: Record<string, unknown>;
+  /** Active workspace, when the run is bound to one. */
+  workspace?: Workspace;
+};
+
+/**
+ * Function form of the global `requireToolApproval` option. Evaluated per tool call;
+ * return `true` to require approval for that call, `false` to allow it. Enables
+ * conditional, per-call approval policies (e.g. regex matching on `toolName`).
+ */
+export type RequireToolApprovalFn = (ctx: ToolApprovalContext) => boolean | Promise<boolean>;
+
+/**
+ * Global tool approval setting. `true` requires approval for every tool call,
+ * `false`/omitted requires none, and a function decides per call.
+ */
+export type RequireToolApproval = boolean | RequireToolApprovalFn;
+
+/**
+ * Context passed to a per-tool `needsApprovalFn` alongside the parsed tool input.
+ * This is the same context surfaced to a tool-level `requireApproval` function.
+ */
+export type NeedsApprovalContext = {
+  /** Plain object view of the request context, when available. */
+  requestContext?: Record<string, unknown>;
+  /** Active workspace, when the run is bound to one. */
+  workspace?: Workspace;
+};
+
+/**
+ * Per-tool approval predicate attached to a tool instance.
+ *
+ * This is the runtime-resolved form of a tool's `requireApproval` function (or of an
+ * MCP server-level `requireToolApproval` function wrapped by the MCP client). It is
+ * evaluated per tool call with the parsed input and the available context; return
+ * `true` to require approval for that call, `false` to allow it.
+ *
+ * It is attached to the tool instance by {@link CoreToolBuilder} / the MCP client and
+ * read by the agent runtime. Prefer the public `requireApproval` option on
+ * `createTool` over setting this directly.
+ */
+export type NeedsApprovalFn = (input: any, ctx?: NeedsApprovalContext) => boolean | Promise<boolean>;
+
 export type ToolPayloadTransformTarget = 'display' | 'transcript';
 
 export type ToolPayloadTransformPhase =
@@ -213,6 +265,12 @@ export type MCPToolType = 'agent' | 'workflow';
 export interface McpMetadata {
   serverName: string;
   serverVersion?: string;
+  /** Instructions advertised by the MCP server during initialize. */
+  serverInstructions?: string;
+  /** Whether the agent should append these instructions to its system prompt. Defaults to false (opt-in). */
+  forwardInstructions?: boolean;
+  /** Maximum number of characters to forward into the agent system prompt. */
+  instructionsMaxLength?: number;
 }
 
 /**
@@ -452,6 +510,15 @@ export interface ToolExecutionContext<
   observe: ToolObserve;
 }
 
+/**
+ * Result of a conditional `requireApproval` predicate. Return a plain boolean for the
+ * historical contract, or `{ required, reason }` to additionally surface WHY the tool
+ * needs approval. A falsy result (`false` / `{ required: false }`) never lowers a static
+ * approval floor (`requireApproval: true` or the agent-level `requireToolApproval`); the
+ * optional `reason` is only meaningful when `required` is true.
+ */
+export type ToolApprovalDecision = boolean | { required: boolean; reason?: string };
+
 export interface ToolAction<
   TSchemaIn,
   TSchemaOut,
@@ -509,14 +576,17 @@ export interface ToolAction<
    * Whether the tool requires explicit user approval before execution.
    * Pass `true` to always require approval, or a function evaluated per-call
    * with the tool input (and optional request context/workspace) to require
-   * approval conditionally.
+   * approval conditionally. The function may return a plain boolean (historical
+   * contract) or a {@link ToolApprovalDecision} object to additionally surface
+   * WHY approval is required — the `reason` is threaded to the harness
+   * `tool_approval_required` event's `approvalReasons`.
    */
   requireApproval?:
     | boolean
     | ((
         input: TSchemaIn,
         ctx?: { requestContext?: Record<string, unknown>; workspace?: Workspace },
-      ) => boolean | Promise<boolean>);
+      ) => ToolApprovalDecision | Promise<ToolApprovalDecision>);
   /**
    * Enables strict tool input generation for providers that support it.
    * When enabled, supported providers will attempt to generate arguments

@@ -5,7 +5,8 @@ import type { StreamInternal } from '../../../loop/types';
 import type { Mastra } from '../../../mastra';
 import type { MastraMemory } from '../../../memory/memory';
 import { RequestContext } from '../../../request-context';
-import { resolveToolRequiresApproval } from '../../../tools/approval';
+import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from '../../../tools/approval';
+import type { ResolvedToolApproval } from '../../../tools/approval';
 import type { CoreTool } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
@@ -262,6 +263,32 @@ export async function toolRequiresApproval(
   },
 ): Promise<boolean> {
   return resolveToolRequiresApproval({
+    tool,
+    args,
+    requireToolApproval: globalRequireApproval,
+    requestContext: context?.requestContext,
+    workspace: context?.workspace,
+    logger: context?.logger,
+    toolName: context?.toolName,
+  });
+}
+
+/**
+ * Like {@link toolRequiresApproval} but also returns any reason(s) a conditional predicate
+ * surfaced, so the durable step can thread them to the harness `tool_approval_required` event.
+ */
+export async function toolApprovalRequirement(
+  tool: CoreTool,
+  globalRequireApproval?: boolean,
+  args?: Record<string, unknown>,
+  context?: {
+    requestContext?: Record<string, unknown> | { entries(): Iterable<[string, unknown]> };
+    workspace?: Workspace;
+    logger?: { error: (...args: any[]) => void };
+    toolName?: string;
+  },
+): Promise<ResolvedToolApproval> {
+  return resolveToolApprovalRequirement({
     tool,
     args,
     requireToolApproval: globalRequireApproval,

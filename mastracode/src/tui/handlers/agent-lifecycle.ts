@@ -5,6 +5,7 @@
 import { Spacer, Text } from '@mariozechner/pi-tui';
 
 import { getCurrentGitBranchAsync } from '../../utils/project.js';
+import { tryAutoSubscribeToBranchPR } from '../commands/github.js';
 import { JudgeDisplayComponent } from '../components/judge-display.js';
 import { GradientAnimator } from '../components/obi-loader.js';
 import { showInfo } from '../display.js';
@@ -13,6 +14,9 @@ import { clearPendingUserMessages, removePendingUserMessage } from '../render-me
 import { BOX_INDENT, theme } from '../theme.js';
 
 import type { EventHandlerContext } from './types.js';
+
+/** Thread IDs that have already been checked for branch-level PR auto-subscribe. */
+const autoSubscribeCheckedThreads = new Set<string>();
 
 export function handleAgentStart(ctx: EventHandlerContext): void {
   const { state } = ctx;
@@ -55,6 +59,15 @@ export function handleAgentEnd(ctx: EventHandlerContext): void {
     .catch(() => {
       // Best-effort status line refresh; keep lifecycle transitions moving.
     });
+
+  // Auto-subscribe to the current branch's PR when GitHub Signals are enabled.
+  // Runs once per thread (fire-and-forget).
+  const harness = state.harness as unknown as { getCurrentThreadId?: () => string | undefined };
+  const threadId = harness.getCurrentThreadId?.();
+  if (threadId && !autoSubscribeCheckedThreads.has(threadId)) {
+    autoSubscribeCheckedThreads.add(threadId);
+    tryAutoSubscribeToBranchPR(ctx).catch(() => {});
+  }
 
   if (state.streamingComponent) {
     state.streamingComponent = undefined;
@@ -113,6 +126,10 @@ function drainQueuedAction(ctx: EventHandlerContext): boolean {
       ],
       createdAt: new Date(),
     });
+    // Track the text so the subscription echo is suppressed in addUserMessage.
+    const key = nextMessage.content.trim();
+    const counts = (state.firedQueuedMessageTexts ??= new Map<string, number>());
+    counts.set(key, (counts.get(key) ?? 0) + 1);
     state.ui.requestRender();
     ctx.fireMessage(nextMessage.content, nextMessage.images);
     return true;

@@ -15,7 +15,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import type { Workspace } from '../../workspace';
 
-import { HarnessWorkspaceInUseError, HarnessWorkspaceLostError, HarnessWorkspaceProviderMismatchError } from './errors';
+import { HarnessResourceWorkspaceInUseError, HarnessWorkspaceLostError, HarnessWorkspaceProviderMismatchError } from './errors';
 import { Harness } from './harness';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
 import { nonDurableProvider } from './workspace-provider';
@@ -180,7 +180,7 @@ describe('WorkspaceRegistry — per-resource', () => {
     expect(created.length).toBe(2);
   });
 
-  it('destroyResourceWorkspace throws HarnessWorkspaceInUseError while refcount > 0 and succeeds when 0', async () => {
+  it('destroyResourceWorkspace throws HarnessResourceWorkspaceInUseError while refcount > 0 and succeeds when 0', async () => {
     const provider = nonDurableProvider(() => makeWorkspace());
     const harness = new Harness(baseConfig({ workspace: { kind: 'per-resource' as const, provider } }));
 
@@ -188,7 +188,7 @@ describe('WorkspaceRegistry — per-resource', () => {
     await s.getWorkspace();
 
     await expect(harness.destroyResourceWorkspace({ resourceId: 'u1' })).rejects.toBeInstanceOf(
-      HarnessWorkspaceInUseError,
+      HarnessResourceWorkspaceInUseError,
     );
 
     await s.close();
