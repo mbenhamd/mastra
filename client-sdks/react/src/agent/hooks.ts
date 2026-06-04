@@ -728,6 +728,10 @@ export const useChat = ({
       providerOptions: providerOptions as any,
       requireToolApproval,
       tracingOptions,
+      // Keep in sync with the sendMessage ifIdle.streamOptions below: the
+      // sendSignal fallback reuses this object, so omitting clientTools here
+      // would silently stop client-tool execution on the fallback path.
+      clientTools: resolvedClientTools,
     };
 
     try {
