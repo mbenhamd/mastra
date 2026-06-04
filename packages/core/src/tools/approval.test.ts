@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from './approval';
 
 describe('resolveToolRequiresApproval', () => {
-  it('treats static requireApproval as an approval floor', async () => {
+  it('lets needsApprovalFn override a static requireApproval seed (#17337 precedence)', async () => {
     await expect(
       resolveToolRequiresApproval({
         tool: {
@@ -11,10 +11,10 @@ describe('resolveToolRequiresApproval', () => {
         },
         args: { path: '/tmp/file.txt' },
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe(false);
   });
 
-  it('treats global requireToolApproval as an approval floor', async () => {
+  it('lets needsApprovalFn override the global requireToolApproval seed (#17337 precedence)', async () => {
     await expect(
       resolveToolRequiresApproval({
         tool: {
@@ -24,7 +24,7 @@ describe('resolveToolRequiresApproval', () => {
         requireToolApproval: true,
         args: { path: '/tmp/file.txt' },
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe(false);
   });
 
   it('lets dynamic-only approval skip safe calls', async () => {
@@ -123,12 +123,12 @@ describe('resolveToolApprovalRequirement', () => {
     ).resolves.toEqual({ required: false, reasons: [] });
   });
 
-  it('a static floor forces approval but contributes no reason text', async () => {
+  it('a predicate returning { required: false } overrides the static seed (#17337 precedence)', async () => {
     await expect(
       resolveToolApprovalRequirement({
         tool: { requireApproval: true, needsApprovalFn: vi.fn().mockReturnValue({ required: false, reason: 'x' }) },
       }),
-    ).resolves.toEqual({ required: true, reasons: [] });
+    ).resolves.toEqual({ required: false, reasons: [] });
   });
 
   it('supports a function-valued requireApproval returning an object', async () => {

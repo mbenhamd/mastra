@@ -197,14 +197,18 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
   if (msg.role === 'signal') {
     const signal = mastraDBMessageToSignal(msg as MastraDBMessage);
 
-    if (signal.type === 'user-message') {
+    // Upstream signals normalization (#merge): new rows store type 'user'
+    // (tagName 'user') / 'reactive' (tagName 'system-reminder'); legacy rows
+    // stored 'user-message' / 'system-reminder' verbatim. Match BOTH generations
+    // (mastraDBMessageToSignal returns the raw stored type).
+    if (signal.type === 'user-message' || signal.type === 'user') {
       const signalContent = signalContentsToHarnessContent(signal.contents);
       if (signalContent.length > 0) {
         return { id: msg.id, role: 'user', content: signalContent, createdAt: msg.createdAt };
       }
     }
 
-    if (signal.type === 'system-reminder') {
+    if (signal.type === 'system-reminder' || signal.type === 'reactive') {
       // `msg.role === 'signal'` rows parsed through `mastraDBMessageToSignal`
       // must not fall through to the parts loop; return a user message even
       // when `toSystemReminderContent` cannot build a reminder payload.

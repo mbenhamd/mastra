@@ -20,7 +20,7 @@ import {
   withToolPayloadTransformProviderMetadata,
 } from '../../../tools/payload-transform';
 import { findProviderToolByName } from '../../../tools/provider-tool-utils';
-import type { MastraToolInvocationOptions } from '../../../tools/types';
+import type { MastraToolInvocationOptions, RequireToolApproval } from '../../../tools/types';
 import { ensureSerializable } from '../../../utils';
 import type { SuspendOptions } from '../../../workflows/step';
 import { createStep } from '../../../workflows/workflow';
@@ -520,7 +520,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const approvalRequirement = await resolveToolApprovalRequirement({
           tool,
           args,
-          requireToolApproval: Boolean(requireToolApproval),
+          // #17337 — pass through unboxed: the global may be a per-call FUNCTION
+          // policy; resolveToolApprovalRequirement evaluates it (fail-safe true).
+          requireToolApproval: requireToolApproval as RequireToolApproval | undefined,
           requestContext,
           workspace: _internal?.stepWorkspace,
           logger,

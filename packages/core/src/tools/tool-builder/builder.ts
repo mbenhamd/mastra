@@ -24,7 +24,7 @@ import { executeWithContext } from '../../observability/utils';
 import { RequestContext } from '../../request-context';
 import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { StandardSchemaWithJSON } from '../../schema';
-import { isVercelTool, isProviderDefinedTool } from '../../tools/toolchecks';
+import { getNeedsApprovalFn, isVercelTool, isProviderDefinedTool } from '../../tools/toolchecks';
 import type { ToolOptions } from '../../utils';
 import { safeStringify } from '../../utils';
 import { isZodObject, safeExtendZodObject } from '../../utils/zod-utils';
@@ -35,6 +35,7 @@ import type {
   CoreTool,
   McpMetadata,
   MastraToolInvocationOptions,
+  NeedsApprovalFn,
   ToolAction,
   VercelTool,
   VercelToolV5,
@@ -601,12 +602,11 @@ export class CoreToolBuilder extends MastraBase {
             // Nest agent-specific properties under 'agent' key
             // Do NOT include workflow context even if workflow properties exist
             // (agents use workflows internally but tools should see agent context)
-            const { suspend, resumeData, runId, threadId, resourceId, ...restBaseContext } = baseContext;
+            const { suspend, resumeData, threadId, resourceId, ...restBaseContext } = baseContext;
             toolContext = {
               ...restBaseContext,
               agent: {
                 agentId: options.agentId || '',
-                runId,
                 toolCallId: execOptions.toolCallId || '',
                 messages: execOptions.messages || [],
                 suspend,
@@ -948,16 +948,14 @@ export class CoreToolBuilder extends MastraBase {
     // Map AI SDK's needsApproval to our requireApproval
     // needsApproval can be boolean or a function that takes input and returns boolean
     let requireApproval = false;
-    let needsApprovalFn: ((input: any, ctx?: any) => boolean | Promise<boolean>) | undefined =
-      typeof (this.originalTool as any).needsApprovalFn === 'function'
-        ? (this.originalTool as any).needsApprovalFn
-        : undefined;
+    let needsApprovalFn: NeedsApprovalFn | undefined;
 
     if (typeof this.options.requireApproval === 'function') {
-      // Dynamic approval is evaluated per call via needsApprovalFn.
+      requireApproval = true;
       needsApprovalFn = this.options.requireApproval;
     } else if (typeof this.options.requireApproval === 'boolean') {
       requireApproval = this.options.requireApproval;
+      needsApprovalFn = undefined;
     }
 
     if (isVercelTool(this.originalTool) && 'needsApproval' in this.originalTool) {
@@ -968,7 +966,22 @@ export class CoreToolBuilder extends MastraBase {
       } else if (typeof needsApproval === 'function') {
         // Store the function to evaluate it per-call
         needsApprovalFn = needsApproval;
+        // Set requireApproval to true so the tool-call-step knows to check the function
+        requireApproval = true;
       }
+    }
+
+    // Preserve a needsApprovalFn that was attached directly to the tool instance
+    // (e.g. MCP tools wrap a server-level `requireToolApproval` function and set
+    // `needsApprovalFn` on the tool while keeping `requireApproval` as a boolean).
+    // The branches above only derive needsApprovalFn from options/AI SDK shapes, so
+    // without this it would be dropped during conversion and conditional approval
+    // would silently fall back to the boolean flag.
+    const instanceNeedsApprovalFn = getNeedsApprovalFn(this.originalTool);
+    if (!needsApprovalFn && instanceNeedsApprovalFn) {
+      needsApprovalFn = instanceNeedsApprovalFn;
+      // Ensure the tool-call-step knows to evaluate the function per call.
+      requireApproval = true;
     }
 
     const definition = {

@@ -85,10 +85,14 @@ export const GET_SYSTEM_PACKAGES_ROUTE = createRoute({
       const observabilityStorageCapabilities = getObservabilityStorageCapabilities(observabilityStorage);
       const observabilityEnabled = !!mastra.observability.getDefaultInstance();
 
+      const editor = mastra.getEditor();
+      const editorSource = editor?.getSource?.();
+
       return {
         packages,
         isDev: process.env.MASTRA_DEV === 'true',
-        cmsEnabled: !!mastra.getEditor(),
+        cmsEnabled: !!editor,
+        editorSource,
         observabilityEnabled,
         storageType,
         observabilityStorageType,

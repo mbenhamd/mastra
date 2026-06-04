@@ -11830,7 +11830,8 @@ export class Session {
         filename: attachment.name,
       });
     }
-    return { role: 'user', content: parts } as AgentSignalContents;
+    // Upstream signals API (#merge): AgentSignalContents is a bare parts array.
+    return parts as AgentSignalContents;
   }
 
   private async _registerQuestion(

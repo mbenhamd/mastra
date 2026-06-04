@@ -12,6 +12,7 @@ import type {
   StorageFavoriteType,
   StorageWorkspaceType,
   StorageSkillType,
+  StorageToolProviderConnection,
   StorageWorkflowRun,
   ObservationalMemoryRecord,
   DatasetRecord,
@@ -142,6 +143,11 @@ export class InMemoryDB {
   >();
 
   /**
+   * Tool provider connections keyed by `${authorId}\u0000${providerId}\u0000${connectionId}`.
+   */
+  readonly toolProviderConnections = new Map<string, StorageToolProviderConnection>();
+
+  /**
    * Clears all data from all collections.
    * Useful for testing.
    */
@@ -205,5 +211,6 @@ export class InMemoryDB {
     this.harnessPlanTasks.clear();
     this.harnessRunSummaries.clear();
     this.harnessThreadDeleteFences.clear();
+    this.toolProviderConnections.clear();
   }
 }

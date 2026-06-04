@@ -38,6 +38,7 @@ import type {
   ChannelContext,
   ChannelHandlers,
   PostableMessage,
+  ResolveResourceId,
   StreamingConfig,
   ThreadHistoryMessage,
   ToolDisplay,
@@ -78,6 +79,8 @@ export class AgentChannels {
   private inlineLinkRules: InlineLinkRule[] | undefined;
   /** Whether channel tools (reactions, etc.) are enabled. */
   private toolsEnabled: boolean;
+  /** Optional hook to resolve the memory resourceId (owner) for newly-created channel threads. */
+  private resolveResourceId: ResolveResourceId | undefined;
   /**
    * The original `ChannelConfig` passed to the constructor.
    *
@@ -158,6 +161,7 @@ export class AgentChannels {
     this.shouldInline = buildInlineMediaCheck(config.inlineMedia);
     this.inlineLinkRules = normalizeInlineLinks(config.inlineLinks);
     this.toolsEnabled = config.tools !== false;
+    this.resolveResourceId = config.resolveResourceId;
     this.channelConfig = config;
     this.channelToolNames = new Set(Object.keys(this.getTools()));
   }
@@ -736,8 +740,8 @@ export class AgentChannels {
    *
    *   - `channelContext` — goes on `requestContext` under the 'channel' key, consumed by
    *     `ChatChannelProcessor` and other input processors.
-   *   - `attributes` — serialized as XML on the signal element the LLM sees (e.g. on
-   *     `<user-message messageId=... authorId=... />`). Strings only.
+   *   - `attributes` — serialized as XML on the user message element the LLM sees (e.g. on
+   *     `<user messageId=... authorId=... />`). Strings only.
    *   - `providerOptions` — written to the stored message's `content.providerMetadata`
    *     under `mastra.channels.<platform>` so UI/query callers can read author/channel
    *     facts off the message (e.g. show a Slack icon + author name) without unpacking
@@ -863,11 +867,16 @@ export class AgentChannels {
     // each Slack thread (including top-level DM, DM thread reply, channel mention, and
     // channel thread reply) gets its own mastra thread.
     const externalThreadId = chatThread.id;
+    const defaultResourceId = `${platform}:${message.author.userId}`;
     const mastraThread = await this.getOrCreateThread({
       externalThreadId,
       channelId: chatThread.channelId,
       platform,
-      resourceId: `${platform}:${message.author.userId}`,
+      // Lazily resolved: the hook only runs when we're actually creating a new
+      // thread, never when reusing an existing one (which keeps its stored owner).
+      resourceId: this.resolveResourceId
+        ? () => this.resolveResourceId!({ platform, thread: chatThread, message, defaultResourceId })
+        : defaultResourceId,
       mastra,
     });
 
@@ -907,7 +916,9 @@ export class AgentChannels {
     const text = [historyBlock, message.text].filter(Boolean).join('\n\n');
     // The channel message is built as the content parts of a single user
     // message (text + inline file parts), not as a list of separate messages.
-    const parts: Exclude<AIV5Type.UserContent, string> = [{ type: 'text', text }];
+    // Typed to the signal-contents shape (text/file parts only): image/* rides
+    // as file parts (the LLM adapter converts), matching AgentSignalContents.
+    const parts: Exclude<AgentSignalContents, string> = [{ type: 'text', text }];
     const attachments = message.attachments.filter(a => a.url || a.fetchData);
 
     // Route attachments based on `inlineMedia` config (see DEFAULT_INLINE_MEDIA_TYPES).
@@ -1035,38 +1046,28 @@ export class AgentChannels {
       platform,
     });
 
-    // Subscribe BEFORE sending the signal so the subscription metadata write
-    // happens before the agent run loads the thread snapshot. Otherwise the
-    // in-flight agent run can read the thread pre-subscribe and later
-    // overwrite the `channel_subscribed` field via its own thread persistence.
-    await chatThread.subscribe();
-
-    // Refresh the thread snapshot so the agent run sees the post-subscribe
-    // metadata. Without this, `prepareMemoryStep`'s deepEqual would detect a
-    // metadata mismatch and overwrite the freshly-written `channel_subscribed`
-    // with the stale pre-subscribe value.
-    const memoryStore = await mastra.getStorage()?.getStore('memory');
-    const refreshedThread = memoryStore ? await memoryStore.getThreadById({ threadId: mastraThread.id }) : null;
-    const threadForRun = refreshedThread ?? mastraThread;
+    void chatThread.subscribe().catch(err => {
+      this.log('debug', 'chatThread.subscribe failed', err);
+    });
 
     // Wrap the content parts in a single user message. `providerOptions` rides
     // on the message (not the signal envelope) so it lands on the stored
     // message's `content.providerMetadata` under `mastra.channels.<platform>`
     // for UI/query callers — see `buildEventContext` docs. Text-only messages
     // collapse to a bare string content; file parts stay as an array.
-    const userContent: AIV5Type.UserContent =
+    // Upstream signals API (#merge): `AgentSignalContents` is now a bare
+    // string | parts array, and `providerOptions` rides on the MESSAGE INPUT
+    // (AgentMessageInput.providerOptions) — the runtime stamps it onto the
+    // UserModelMessage + persisted `content.providerMetadata`, preserving the
+    // original intent of the fork's message wrapper.
+    const signalContents: AgentSignalContents =
       parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
-    const signalContents: AgentSignalContents = {
-      role: 'user',
-      content: userContent,
-      providerOptions,
-    } satisfies AIV5Type.UserModelMessage;
 
-    this.agent.sendSignal(
+    this.agent.sendMessage(
       {
-        type: 'user-message',
         contents: signalContents,
         attributes,
+        providerOptions,
       },
       {
         resourceId: threadResourceId,
@@ -1076,7 +1077,7 @@ export class AgentChannels {
           streamOptions: {
             requestContext,
             memory: {
-              thread: threadForRun,
+              thread: mastraThread.id,
               resource: threadResourceId,
             },
             // Without approval-button rendering, auto-approve tools to
@@ -1356,7 +1357,12 @@ export class AgentChannels {
     externalThreadId: string;
     channelId: string;
     platform: string;
-    resourceId: string;
+    /**
+     * The owner for a newly-created thread. Pass a function to defer resolution
+     * until we know a new thread is actually needed; it is never called when an
+     * existing thread is reused.
+     */
+    resourceId: string | (() => string | Promise<string>);
     mastra: Mastra;
   }): Promise<StorageThreadType> {
     const storage = mastra.getStorage();
@@ -1386,11 +1392,13 @@ export class AgentChannels {
       return threads[0]!;
     }
 
+    const resolvedResourceId = typeof resourceId === 'function' ? await resourceId() : resourceId;
+
     return memoryStore.saveThread({
       thread: {
         id: crypto.randomUUID(),
         title: `${platform} conversation`,
-        resourceId,
+        resourceId: resolvedResourceId,
         createdAt: new Date(),
         updatedAt: new Date(),
         metadata,
