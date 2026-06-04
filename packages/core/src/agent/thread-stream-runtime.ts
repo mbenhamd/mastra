@@ -64,6 +64,13 @@ type AgentThreadRunRecord<OUTPUT = unknown> = {
   threadId: string;
   resourceId?: string;
   streamOptions: AgentExecutionOptions<OUTPUT>;
+  // For local (same-runtime / EventEmitterPubSub) runs, a multicast factory that
+  // returns an independent ReadableStream per thread subscriber. The fork does not
+  // republish local runs through pubsub, so without this every subscriber (and the
+  // caller) would compete over the single `output.fullStream`, starving all but the
+  // first reader. Absent for remote runs, whose subscribers already get a dedicated
+  // per-subscription stream fed by `stream-part` pubsub events.
+  createSubscriberStream?: () => ReadableStream<unknown>;
 };
 
 type PreparedThreadRun = {
@@ -260,44 +267,116 @@ export class AgentThreadStreamRuntime {
     }
   }
 
-  // For local (EventEmitterPubSub) runs the fork does not republish the stream,
-  // so the broadcast part-loop that detects approval suspension never runs and
-  // the subscriber stream reads `output.fullStream` directly. Wrap that stream
-  // with an inline detection passthrough so the approval marker is recorded
-  // *before* each part is yielded to the local subscriber — matching upstream's
-  // always-running broadcast loop where `emitPart` sets the marker before the
-  // part is buffered for subscribers. An inline wrapper (not `tee`) keeps the
-  // marker write ordered ahead of the subscriber observing the part, avoiding a
-  // race where `getThreadState` is queried before a detached detector caught up.
-  #attachLocalApprovalDetection<OUTPUT>(output: MastraModelOutput<OUTPUT>, pubsub: PubSub | undefined) {
-    const source = output.fullStream as any;
-    if (!source) return;
-    if (!Object.prototype.hasOwnProperty.call(output, 'fullStream')) return;
-
+  // For local (EventEmitterPubSub) runs the fork does not republish the stream
+  // through pubsub, so thread subscribers cannot be fed by `stream-part` events
+  // like remote runs are. Historically the subscriber loop then read the run's
+  // single `output.fullStream` directly, which only one consumer can drain — every
+  // other subscriber (and the caller) starved or hung. This builds a multicast
+  // buffer that drains the source exactly once into a shared `parts[]` array and
+  // hands each subscriber an independent ReadableStream replaying that buffer,
+  // matching upstream's `#withBroadcastStream` fan-out. The single drain loop also
+  // records the approval-suspension marker before any subscriber observes the
+  // `tool-call-approval` part — folding in the former `#attachLocalApprovalDetection`
+  // so the marker is set strictly ahead of the part (keeping the thread blocked
+  // when `getThreadState` is queried) while the subscriber's reader stays unlocked.
+  #withLocalBroadcastStream<OUTPUT>(output: MastraModelOutput<OUTPUT>, pubsub: PubSub | undefined) {
     const runtime = this;
     const runId = output.runId;
 
-    const fullStream = (async function* () {
-      for await (const part of source) {
-        runtime.#markApprovalSuspendedFromPart(pubsub, runId, part);
-        yield part;
-      }
-    })();
-    Object.defineProperty(output, 'fullStream', {
-      configurable: true,
-      enumerable: true,
-      value: fullStream,
-    });
+    const parts: unknown[] = [];
+    const waiters = new Set<() => void>();
+    let started = false;
+    let done = false;
+    let error: unknown;
+
+    const wake = () => {
+      const pending = [...waiters];
+      waiters.clear();
+      for (const waiter of pending) waiter();
+    };
+
+    const start = () => {
+      if (started) return;
+      started = true;
+      void (async () => {
+        try {
+          // Read `output.fullStream` lazily so a real MastraModelOutput's evented
+          // getter yields a fresh stream for the drain loop, independent of the
+          // caller's own `output.fullStream` access.
+          const source = output.fullStream as any;
+          if (!source) return;
+          for await (const part of source) {
+            runtime.#markApprovalSuspendedFromPart(pubsub, runId, part);
+            parts.push(part);
+            wake();
+          }
+        } catch (caught) {
+          error = caught;
+        } finally {
+          done = true;
+          wake();
+        }
+      })();
+    };
+
+    const createSubscriberStream = (): ReadableStream<unknown> => {
+      let index = 0;
+      let closed = false;
+      let waiter: (() => void) | undefined;
+      return new ReadableStream({
+        async pull(controller) {
+          start();
+          while (!closed) {
+            if (index < parts.length) {
+              controller.enqueue(parts[index++]);
+              return;
+            }
+            if (error) {
+              controller.error(error);
+              return;
+            }
+            if (done) {
+              controller.close();
+              return;
+            }
+            await new Promise<void>(resolve => {
+              waiter = resolve;
+              waiters.add(resolve);
+            });
+            if (waiter) {
+              waiters.delete(waiter);
+              waiter = undefined;
+            }
+          }
+        },
+        cancel() {
+          closed = true;
+          if (waiter) {
+            waiters.delete(waiter);
+            waiter();
+            waiter = undefined;
+          }
+        },
+      });
+    };
+
+    return createSubscriberStream;
   }
 
-  #prepareBroadcastSource<OUTPUT>(output: MastraModelOutput<OUTPUT>, pubsub: PubSub | undefined, key: string) {
+  #prepareBroadcastSource<OUTPUT>(
+    output: MastraModelOutput<OUTPUT>,
+    pubsub: PubSub | undefined,
+    key: string,
+  ): {
+    source?: AsyncIterable<unknown> | ReadableStream<unknown>;
+    createSubscriberStream?: () => ReadableStream<unknown>;
+  } {
     if (this.#getPubSub(pubsub) instanceof EventEmitterPubSub) {
-      this.#attachLocalApprovalDetection(output, pubsub);
-      return;
+      return { createSubscriberStream: this.#withLocalBroadcastStream(output, pubsub) };
     }
 
     let source = output.fullStream as any;
-    if (!source) return;
+    if (!source) return {};
 
     if (Object.prototype.hasOwnProperty.call(output, 'fullStream')) {
       if (typeof source.tee === 'function') {
@@ -326,11 +405,11 @@ export class AgentThreadStreamRuntime {
           enumerable: true,
           value: fullStream,
         });
-        return;
+        return {};
       }
     }
 
-    return source;
+    return { source };
   }
 
   async #broadcastStream<OUTPUT>(
@@ -894,12 +973,13 @@ export class AgentThreadStreamRuntime {
       }),
       _waitUntilFinished: () => finished,
     } as MastraModelOutput<any>;
-    // Fork broadcast pattern: #prepareBroadcastSource tees `output.fullStream`
-    // in place (subscribers read the teed caller side via the record's `output`)
-    // and #broadcastStream publishes the broadcast side once registration lands —
-    // the same shape as registerThreadRun below. Replaces upstream's
-    // #withBroadcastStream helper, which does not exist in the fork runtime.
-    const broadcastSource = this.#prepareBroadcastSource(output, pubsub, key);
+    // Fork broadcast pattern: #prepareBroadcastSource either tees `output.fullStream`
+    // in place for remote pubsub (subscribers read the teed caller side via the
+    // record's `output`, #broadcastStream publishes the broadcast side once
+    // registration lands) or, for the local EventEmitterPubSub, returns a
+    // multicast `createSubscriberStream` factory so every same-runtime subscriber
+    // gets an independent fan-out view instead of competing over `output.fullStream`.
+    const { source: broadcastSource, createSubscriberStream } = this.#prepareBroadcastSource(output, pubsub, key);
     const startBroadcast = () => {
       void this.#broadcastStream(output, broadcastSource, pubsub, key).catch(() => {});
     };
@@ -910,6 +990,7 @@ export class AgentThreadStreamRuntime {
       threadId,
       resourceId,
       streamOptions: {},
+      createSubscriberStream,
     };
 
     state.threadRunsById.set(runId, record);
@@ -998,7 +1079,7 @@ export class AgentThreadStreamRuntime {
       state.inflightIdleThreadKeysByRunId.delete(output.runId);
       state.inflightIdleAgentIdsByRunId.delete(output.runId);
     }
-    const broadcastSource = this.#prepareBroadcastSource(output, pubsub, key);
+    const { source: broadcastSource, createSubscriberStream } = this.#prepareBroadcastSource(output, pubsub, key);
     const record: AgentThreadRunRecord<OUTPUT> = {
       agent,
       output,
@@ -1006,6 +1087,7 @@ export class AgentThreadStreamRuntime {
       threadId,
       resourceId,
       streamOptions: streamOptions as AgentThreadRunRecord<OUTPUT>['streamOptions'],
+      createSubscriberStream,
     };
 
     state.threadRunsById.set(output.runId, record);
@@ -1600,7 +1682,13 @@ export class AgentThreadStreamRuntime {
               continue;
             }
             const run = pendingRuns.shift()!;
-            for await (const part of run.output.fullStream) {
+            // Local registered runs expose a multicast `createSubscriberStream`
+            // giving this subscriber an independent fan-out view; remote runs are
+            // already per-subscription streams fed by pubsub `stream-part` events.
+            // Reading `output.fullStream` directly would let one subscriber lock
+            // and drain the shared stream, starving every other subscriber.
+            const subscriberStream = run.createSubscriberStream?.() ?? run.output.fullStream;
+            for await (const part of subscriberStream) {
               yield part as any;
               if (done) break;
             }
@@ -1893,7 +1981,19 @@ export class AgentThreadStreamRuntime {
     runId ??= randomUUID();
     if (idleBehavior !== 'wake') {
       if (idleBehavior === 'persist') {
-        const persisted = this.#persistSignal(
+        // Persist the signal AND broadcast it to thread subscribers (upstream
+        // parity). The fork previously only persisted, so idle-persist signals —
+        // e.g. low-priority notification summaries dispatched via
+        // `ifIdle: { behavior: 'persist' }` — never reached same-runtime
+        // subscribers. #persistAndBroadcastIdleSignal persists first, then emits
+        // a synthetic start/data/finish run through the (multicast) broadcast
+        // machinery without waking the agent.
+        key ??= this.#threadKey(resourceId, threadId);
+        const persisted = this.#persistAndBroadcastIdleSignal(
+          state,
+          pubsub,
+          key,
+          runId,
           agent,
           signal,
           resourceId,
