@@ -734,23 +734,28 @@ describe('§4.4c / C3 — tampered persisted app bag must NOT shadow the genuine
 // 6. EVENT PAYLOAD BOMB — pin the actual persistence behavior.
 // ===========================================================================
 
-describe('custom event payload bomb — pin persisted behavior + ledger contiguity', () => {
-  it('a multi-MB custom event payload persists IN FULL (the maxEventPayloadBytes cap is TOOL-event-only) and the ledger stays contiguous', async () => {
-    // The §13.x maxEventPayloadBytes projection (projectToolEventPayloadForJson) is applied
-    // ONLY to tool_start.input / tool_end.output / tool_approval input at emit-time. A custom
-    // (dotted) event emitted through the emitter is snapshot via snapshotHarnessEventForJson
-    // with NO size cap. Pin that the big payload survives the round-trip verbatim and does
-    // not corrupt later events.
+describe('custom event payload bomb — cap applied + ledger contiguity', () => {
+  it('a multi-MB custom event payload is replaced by the oversized sentinel AT EMIT (same cap as tool events) and the ledger stays contiguous', async () => {
+    // The §13.x maxEventPayloadBytes projection (projectToolEventPayloadForJson) now bounds
+    // CUSTOM (dotted) event payloads too, at emit-time, exactly as it bounds
+    // tool_start.input / tool_end.output. An oversized custom payload is replaced by the
+    // TOOL_PAYLOAD_TOO_LARGE sentinel BEFORE the durable row is written, so live === replay
+    // by construction and the cap can no longer be evaded via a custom event.
     const { harness, storage } = setup({ maxEventPayloadBytes: 64 });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
       await session.setState({ before: true });
 
-      const big = 'x'.repeat(3_000_000); // ~3 MB, far over the 64-byte tool cap.
+      const big = 'x'.repeat(3_000_000); // ~3 MB, far over the 64-byte cap.
       const bomb = (
         session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } }
       )._emitter.emit({ type: 'custom.bomb', payload: { blob: big } });
       const bombSeq = parseHarnessEventId(bomb.id).sequence;
+
+      // The LIVE emitted event is already capped (live === replay by construction).
+      expect((bomb as unknown as { payload: unknown }).payload).toEqual({
+        __mastraHarness: 'oversized-tool-payload',
+      });
 
       await session.setState({ after: true });
       await expect(session._flushEventPersistence()).resolves.toBeUndefined();
@@ -763,10 +768,10 @@ describe('custom event payload bomb — pin persisted behavior + ledger contigui
       const bombRow = ledger.find(r => r.sequence === bombSeq);
       expect(bombRow).toBeDefined();
       expect(bombRow!.event.type).toBe('custom.bomb');
-      // PIN: the payload is NOT replaced by the oversized-tool sentinel — custom events are
-      // not subject to the tool payload cap; the full blob is persisted verbatim.
-      expect(bombRow!.event.payload.blob).toHaveLength(big.length);
-      expect(bombRow!.event).not.toMatchObject({ payload: { __mastraHarness: 'oversized-tool-payload' } });
+      // The oversized payload is replaced by the bounded, detectable sentinel — the multi-MB
+      // blob never reaches the durable log.
+      expect(bombRow!.event).toMatchObject({ payload: { __mastraHarness: 'oversized-tool-payload' } });
+      expect(bombRow!.event.payload.blob).toBeUndefined();
       // The trailing state_changed still persisted after the bomb.
       const after = ledger.filter(r => r.sequence > bombSeq && r.event.type === 'state_changed');
       expect(after.length).toBeGreaterThanOrEqual(1);
