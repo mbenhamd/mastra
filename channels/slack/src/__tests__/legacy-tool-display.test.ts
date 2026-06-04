@@ -1,9 +1,17 @@
 import type { ToolDisplayContext, ToolDisplayEvent } from '@mastra/core/channels';
-import { describe, it, expect } from 'vitest';
+import { getChatModule } from '@mastra/core/channels';
+import { describe, it, expect, beforeAll } from 'vitest';
 
 import { SlackProvider, mapLegacyToolDisplay } from '../provider';
 
 const CTX: ToolDisplayContext = { mode: 'streaming', platform: 'slack' };
+
+// The built-in approval card is built via the lazily-loaded `chat` UI module
+// (the static driver primes it through `AgentChannels.initialize()`); prime it
+// here so the approval-card assertion can render the Block Kit card.
+beforeAll(async () => {
+  await getChatModule();
+});
 
 function resultEvent(over: Partial<Extract<ToolDisplayEvent, { kind: 'result' }>> = {}): ToolDisplayEvent {
   return {
@@ -48,8 +56,9 @@ describe('slack legacy tool-display back-compat', () => {
     expect(typeof fn).toBe('function');
     const toolDisplayFn = fn as Extract<typeof fn, (...a: never[]) => unknown>;
 
-    // result event → { kind: 'post', message }
-    expect(toolDisplayFn(resultEvent(), CTX)).toEqual({ kind: 'post', message: 'lookup:answer:ok' });
+    // result event → { kind: 'post', message }. 1.2.x passed the stripped
+    // display name ('Lookup'), not the raw tool id ('lookup').
+    expect(toolDisplayFn(resultEvent(), CTX)).toEqual({ kind: 'post', message: 'Lookup:answer:ok' });
 
     // error event → posts with the error value and isError true
     const errEvent: ToolDisplayEvent = {
@@ -63,9 +72,10 @@ describe('slack legacy tool-display back-compat', () => {
       errorText: 'boom',
       durationMs: 1,
     };
-    expect(toolDisplayFn(errEvent, CTX)).toEqual({ kind: 'post', message: 'lookup:boom:err' });
+    expect(toolDisplayFn(errEvent, CTX)).toEqual({ kind: 'post', message: 'Lookup:boom:err' });
 
-    // non-result/error events defer to the built-in renderer (undefined).
+    // `running` defers to the built-in renderer (undefined): 1.2.x
+    // `formatToolCall` fired only on result/error, so there was no running card.
     const runningEvent: ToolDisplayEvent = {
       kind: 'running',
       toolCallId: 'tc3',
@@ -75,6 +85,49 @@ describe('slack legacy tool-display back-compat', () => {
       args: {},
     };
     expect(toolDisplayFn(runningEvent, CTX)).toBeUndefined();
+  });
+
+  it('falls back to `toolName` when `displayName` is empty', () => {
+    const fn = mapLegacyToolDisplay({
+      formatToolCall: ({ toolName, result }) => `${toolName}:${String(result)}`,
+    });
+    const toolDisplayFn = fn as Extract<typeof fn, (...a: never[]) => unknown>;
+    // displayName: '' must not produce an empty tool name; fall back to toolName.
+    expect(toolDisplayFn(resultEvent({ displayName: '' }), CTX)).toEqual({ kind: 'post', message: 'lookup:answer' });
+  });
+
+  it('APPROVAL phase posts the built-in approval card (legacy API had no approval rendering)', () => {
+    // Regression for the stuck-approval bug: core treats ANY `toolDisplayFn` as
+    // approval-capable and does NOT auto-approve. The static driver SKIPS the
+    // approval post when the fn returns null/undefined. So a legacy
+    // `formatToolCall` (which returned undefined on approval) suppressed the
+    // approval card without auto-approving → the run stayed suspended forever.
+    // The shim must instead emit the built-in card so the approval IS posted.
+    const fn = mapLegacyToolDisplay({
+      formatToolCall: ({ toolName, result }) => `${toolName}:${String(result)}`,
+    });
+    const toolDisplayFn = fn as Extract<typeof fn, (...a: never[]) => unknown>;
+
+    const approvalEvent: ToolDisplayEvent = {
+      kind: 'approval',
+      toolCallId: 'tc-approve',
+      toolName: 'deleteFile',
+      displayName: 'Delete File',
+      argsSummary: '{ path: "/x" }',
+      args: { path: '/x' },
+    };
+
+    const result = toolDisplayFn(approvalEvent, { mode: 'static', platform: 'slack' });
+    // It must NOT skip (undefined) — that is the stuck-approval bug.
+    expect(result).not.toBeUndefined();
+    expect(result).toMatchObject({ kind: 'post' });
+    const message = (result as { kind: 'post'; message: unknown }).message;
+    expect(message).not.toBeNull();
+    // The built-in card carries Approve/Deny actions keyed to the toolCallId so
+    // the static driver posts a card with working buttons.
+    const serialized = JSON.stringify(message);
+    expect(serialized).toContain('tool_approve:tc-approve');
+    expect(serialized).toContain('tool_deny:tc-approve');
   });
 
   it('returns undefined from the shim (so the caller default wins) when no field applies', () => {

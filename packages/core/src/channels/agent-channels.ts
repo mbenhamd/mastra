@@ -32,6 +32,7 @@ import type { InlineLinkRule } from './inline-media';
 import { ChatChannelProcessor } from './processor';
 import { MastraStateAdapter } from './state-adapter';
 import type { PendingApprovalRecord } from './stream-helpers';
+import { renderBuiltInToolEvent } from './stream-helpers';
 import type {
   ChannelAdapterConfig,
   ChannelConfig,
@@ -1548,15 +1549,27 @@ export class AgentChannels {
     // Deprecated `formatToolCall` is shimmed into a `ToolDisplayFn`. The old
     // callback only fired on `tool-result`/`tool-error` and returned a
     // message (or `null` to skip), so the shim mirrors that contract: emit
-    // `{ kind: 'post', message }` for those two events and `undefined` for
-    // everything else so the built-in renderer handles the `running` /
-    // `approval` events.
+    // `{ kind: 'post', message }` for those two events and defer the `running`
+    // event (`undefined`).
+    //
+    // The `approval` event is the exception. Setting `fn` makes core treat
+    // this adapter as approval-capable (see `canRenderApprovalButtons`), so it
+    // does NOT auto-approve; but the static driver SKIPS the approval post when
+    // the fn returns `undefined`. A legacy `formatToolCall` (no approval
+    // rendering) would therefore suppress the card without auto-approving — a
+    // stuck approval. So we emit the built-in approval card here, which is the
+    // faithful legacy equivalent. Kept in sync with the slack
+    // `mapLegacyToolDisplay` shim.
     if (!fn && deprecatedFormatToolCall) {
       fn = event => {
+        if (event.kind === 'approval') {
+          return { kind: 'post', message: renderBuiltInToolEvent(event, 'cards') };
+        }
         if (event.kind !== 'result' && event.kind !== 'error') return undefined;
         const value = event.kind === 'result' ? event.result : event.error;
         const message = deprecatedFormatToolCall({
-          toolName: event.toolName,
+          // 1.2.x passed the stripped display name, not the raw tool id.
+          toolName: event.displayName || event.toolName,
           args: (event.args ?? {}) as Record<string, unknown>,
           result: value,
           isError: event.kind === 'error' ? true : event.isError,

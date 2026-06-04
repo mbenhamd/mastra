@@ -10,6 +10,7 @@ import {
   type ToolDisplay,
   type ToolDisplayEvent,
   AgentChannels,
+  renderBuiltInToolEvent,
 } from '@mastra/core/channels';
 import type { ApiRoute, ContextWithMastra } from '@mastra/core/server';
 import { type ChannelsStorage, type ChannelInstallation } from '@mastra/core/storage';
@@ -64,10 +65,23 @@ export function mapLegacyToolDisplay(opts: {
   if (opts.formatToolCall) {
     const formatToolCall = opts.formatToolCall;
     return (event: ToolDisplayEvent) => {
+      // APPROVAL phase: the 1.2.x `formatToolCall` API had no approval
+      // rendering, so the faithful equivalent is the built-in approval card
+      // (with Approve/Deny buttons). Core treats ANY `toolDisplayFn` as
+      // approval-capable, so it does NOT auto-approve when one is set; if this
+      // shim returned `undefined` here the static driver would skip posting the
+      // card while the run stays suspended — a stuck approval. Returning the
+      // built-in card keeps the approval flow working.
+      if (event.kind === 'approval') {
+        return { kind: 'post', message: renderBuiltInToolEvent(event, 'cards') };
+      }
+      // RUNNING phase: 1.2.x `formatToolCall` only fired on result/error, so
+      // there was no "Running…" card. Defer (skip) to preserve that.
       if (event.kind !== 'result' && event.kind !== 'error') return undefined;
       const value = event.kind === 'result' ? event.result : event.error;
       const message = formatToolCall({
-        toolName: event.toolName,
+        // 1.2.x passed the stripped display name, not the raw tool id.
+        toolName: event.displayName || event.toolName,
         args: (event.args ?? {}) as Record<string, unknown>,
         result: value,
         isError: event.kind === 'error' ? true : event.isError,
