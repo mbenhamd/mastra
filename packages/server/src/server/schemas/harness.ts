@@ -292,7 +292,9 @@ const channelInboxDiagnosticSchema = z
     signalId: z.string().optional(),
     queuedItemId: z.string().optional(),
     externalMessageId: z.string(),
-    delivery: z.enum(['message', 'queue']).optional(),
+    // Mirrors core's channel-ledger `delivery?: 'signal' | 'queue'` (PF-764 #2
+    // renamed pre-spec 'message' to 'signal'; this schema lagged the producer).
+    delivery: z.enum(['signal', 'queue']).optional(),
     mode: z.string().optional(),
     model: z.string().optional(),
     receivedAt: z.number(),
