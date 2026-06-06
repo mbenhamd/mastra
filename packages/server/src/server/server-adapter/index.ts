@@ -302,6 +302,34 @@ export function normalizeQueryParams(rawQuery: Record<string, unknown>): Record<
 }
 
 /**
+ * Returns true when a query parameter key appears to carry credentials or
+ * authorization material, including bracket-notation keys like auth[token].
+ */
+function isSensitiveQueryParamKey(key: string): boolean {
+  const normalized = key
+    .toLowerCase()
+    .replace(/[\[\]]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+
+  return (
+    normalized.includes('apikey') ||
+    normalized.includes('token') ||
+    normalized.includes('secret') ||
+    normalized.includes('password') ||
+    normalized.includes('authorization')
+  );
+}
+
+/**
+ * Returns a copy of query parameters with credential-like values redacted.
+ */
+export function redactSensitiveQueryParams(rawQuery: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(rawQuery).map(([key, value]) => [key, isSensitiveQueryParamKey(key) ? '[REDACTED]' : value]),
+  );
+}
+
+/**
  * Abstract base class for server adapters that handle HTTP requests.
  *
  * This class extends `MastraServerBase` to inherit app storage functionality
