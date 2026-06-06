@@ -240,6 +240,7 @@ describe('Agent signals', () => {
         attributes: { priority: 'high' },
         metadata: { source: 'test', signal: { userProvided: true } },
       },
+      transient: true,
     });
 
     const dbMessage = signal.toDBMessage({ threadId: 'thread-1', resourceId: 'resource-1' });
@@ -250,7 +251,6 @@ describe('Agent signals', () => {
         type: 'user',
         tagName: 'user',
         createdAt: '2026-01-01T00:00:00.000Z',
-        contents: 'Signal contents',
         attributes: { priority: 'high' },
         metadata: { source: 'test', signal: { userProvided: true } },
       },
@@ -269,13 +269,11 @@ describe('Agent signals', () => {
       attributes: { type: 'dynamic-agents-md', path: '/tmp/AGENTS.md', enabled: true, ignored: null },
     });
 
-    expect(reminderSignal.toLLMMessage()).toEqual([
-      {
-        role: 'user',
-        content:
-          '<system-reminder type="dynamic-agents-md" path="/tmp/AGENTS.md" enabled="true">Use &lt;safe&gt; content &amp; continue</system-reminder>',
-      },
-    ]);
+    expect(reminderSignal.toLLMMessage()).toEqual({
+      role: 'user',
+      content:
+        '<system-reminder type="dynamic-agents-md" path="/tmp/AGENTS.md" enabled="true">Use &lt;safe&gt; content &amp; continue</system-reminder>',
+    });
     expect(reminderSignal.toDataPart().data.attributes).toEqual({
       type: 'dynamic-agents-md',
       path: '/tmp/AGENTS.md',
@@ -289,18 +287,15 @@ describe('Agent signals', () => {
       ignored: null,
     });
 
-    const fileContents = {
-      role: 'user' as const,
-      content: [
-        { type: 'text' as const, text: 'Review this file' },
-        {
-          type: 'file' as const,
-          data: 'data:text/plain;base64,aGVsbG8=',
-          mediaType: 'text/plain',
-          filename: 'note.txt',
-        },
-      ],
-    };
+    const fileContents = [
+      { type: 'text' as const, text: 'Review this file' },
+      {
+        type: 'file' as const,
+        data: 'data:text/plain;base64,aGVsbG8=',
+        mediaType: 'text/plain',
+        filename: 'note.txt',
+      },
+    ];
     const fileSignal = createSignal({
       id: 'signal-3',
       type: 'user-message',
@@ -308,7 +303,19 @@ describe('Agent signals', () => {
       createdAt: new Date('2026-01-01T00:00:00.000Z'),
     });
 
-    expect(fileSignal.toLLMMessage()).toEqual(fileContents);
+    // toLLMMessage emits the v5 UserModelMessage shape (uses mediaType for FilePart).
+    expect(fileSignal.toLLMMessage()).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Review this file' },
+        {
+          type: 'file',
+          data: 'data:text/plain;base64,aGVsbG8=',
+          mediaType: 'text/plain',
+          filename: 'note.txt',
+        },
+      ],
+    });
     expect(fileSignal.toDataPart().data.contents).toEqual(fileContents);
     expect(mastraDBMessageToSignal(fileSignal.toDBMessage()).contents).toEqual(fileContents);
   });
@@ -4581,7 +4588,7 @@ describe('Agent signals', () => {
       memory: { thread: 'cross-agent-thread', resource: 'cross-agent-user' },
     });
     const firstText = firstStream.text;
-    await nextTick();
+    await waitForCondition(() => firstStarted);
     expect(firstStarted).toBe(true);
 
     const signalResult = await secondAgent.sendSignal(
