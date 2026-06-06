@@ -288,6 +288,7 @@ export class AgentThreadStreamRuntime {
     let started = false;
     let done = false;
     let error: unknown;
+    let hasError = false;
 
     const wake = () => {
       const pending = [...waiters];
@@ -324,6 +325,7 @@ export class AgentThreadStreamRuntime {
           }
         } catch (caught) {
           error = caught;
+          hasError = true;
         } finally {
           done = true;
           wake();
@@ -343,7 +345,10 @@ export class AgentThreadStreamRuntime {
               controller.enqueue(parts[index++]);
               return;
             }
-            if (error) {
+            if (hasError) {
+              // Presence-tracked separately: a source that throws a FALSY value
+              // (undefined/null/0/'') must still fail the subscriber stream
+              // rather than close it cleanly (PR #202 review).
               controller.error(error);
               return;
             }
@@ -1012,9 +1017,7 @@ export class AgentThreadStreamRuntime {
     // multicast `createSubscriberStream` factory so every same-runtime subscriber
     // gets an independent fan-out view instead of competing over `output.fullStream`.
     const { source: broadcastSource, createSubscriberStream } = this.#prepareBroadcastSource(output, pubsub, key);
-    const startBroadcast = () => {
-      void this.#broadcastStream(output, broadcastSource, pubsub, key).catch(() => {});
-    };
+    const startBroadcast = () => this.#broadcastStream(output, broadcastSource, pubsub, key);
     const record: AgentThreadRunRecord<any> = {
       agent: { id: `persisted-signal:${signal.id}` } as Agent<any, any, any, any>,
       output,
@@ -1028,8 +1031,15 @@ export class AgentThreadStreamRuntime {
     state.threadRunsById.set(runId, record);
     state.threadKeysByRunId.set(runId, key);
     const registered = this.#publishAndWait(pubsub, key, { type: 'run-registered', runId });
-    void registered.then(startBroadcast, startBroadcast);
-    void output._waitUntilFinished().finally(() => {
+    const broadcast = registered.then(startBroadcast, startBroadcast).catch(() => {});
+    // PR #202 review (P2): the synthetic output's `finish()` fires at stream
+    // CONSTRUCTION, long before an async pubsub has published the stream-parts.
+    // Publishing `run-completed` off `_waitUntilFinished()` alone let remote
+    // subscribers observe completion FIRST, delete the remote run, and ignore
+    // the late persisted-signal parts. Gate completion on registration + the
+    // stream-part broadcast settling (local multicast resolves immediately —
+    // `#broadcastStream` is a fast no-op without a remote source).
+    void Promise.allSettled([output._waitUntilFinished(), broadcast]).then(() => {
       setTimeout(() => {
         state.threadRunsById.delete(runId);
         state.threadKeysByRunId.delete(runId);
