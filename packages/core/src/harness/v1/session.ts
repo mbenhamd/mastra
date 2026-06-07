@@ -699,11 +699,14 @@ const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'
 
 /**
  * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate,
- * and the HITL suspension tools ask_user / submit_plan). These are harness
+ * and the HITL suspension tools ask_user / submit_plan). Most are harness
  * infrastructure, NOT user/agent tools, so the §4.2e permission gate never applies
  * to them — an engaged default 'deny'/'ask' must not block or suspend the harness's
  * own orchestration (denying ask_user/submit_plan would break the question /
- * plan-approval flows the gate itself relies on). Kept in sync with `_buildToolsets`.
+ * plan-approval flows the gate itself relies on). Escalation built-ins are
+ * different: they cross session/agent capability boundaries and therefore honor
+ * the engaged tool policy after anti-escalation allowlist checks. Kept in sync
+ * with `_buildToolsets`.
  */
 const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_ADD_TOOL_ID,
@@ -723,8 +726,7 @@ const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
  * The subset of harness built-ins that a per-subagent `toolAllowlist` does NOT
  * auto-keep (M4): `spawn_subagent` / `task_delegate` are capability-escalation
  * vectors — a scoped subagent could otherwise run a broader child. Under an
- * allowlist these must be listed explicitly to be available; without an allowlist
- * they bypass the gate as normal harness infrastructure. Everything else in
+ * allowlist these must be listed explicitly to be available. Everything else in
  * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
  */
 const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
@@ -7894,7 +7896,13 @@ export class Session {
       // source kinds. Caps keep the read-time projection server-bounded (§9).
       const MAX_DESCENDANTS = 50;
       const MAX_DEPTH = 4;
-      const collected: { id: string; threadId: string; parentSessionId: string; depth: number; lastActivityAt: number }[] = [];
+      const collected: {
+        id: string;
+        threadId: string;
+        parentSessionId: string;
+        depth: number;
+        lastActivityAt: number;
+      }[] = [];
       let frontier = [{ id: this.id, depth: 0 }];
       const visited = new Set<string>([this.id]);
       while (frontier.length > 0 && collected.length < MAX_DESCENDANTS) {
@@ -12899,8 +12907,9 @@ export class Session {
    * per-turn POLICY SNAPSHOT: a per-tool rule wins, else the tool's category rule,
    * else the harness default. A matching tool/category GRANT turns an `ask` into
    * `allow` (a grant suppresses only the policy-level ask; it never overrides a
-   * `deny`). Harness-owned built-ins always resolve to `allow` — they are
-   * infrastructure, never gated by the session policy.
+   * `deny`). Harness-owned non-escalation built-ins always resolve to `allow` —
+   * they are infrastructure, never gated by the session policy. Escalation
+   * built-ins fall through to the normal policy after the subagent allowlist cap.
    */
   private _resolveToolPolicy(
     toolName: string,
@@ -12916,9 +12925,6 @@ export class Session {
     // M4 — subagent capability scope: a tool outside the allowlist is a hard deny
     // (removed pre-exposure; refused at action time), regardless of permission rules.
     if (allowlist !== undefined && !allowlist.has(toolName)) return 'deny';
-    // Escalation builtins that are either un-scoped (no allowlist) or explicitly
-    // listed run as normal harness infrastructure.
-    if (ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
     const category = this._harness.getToolCategory({ toolName }) ?? undefined;
     let policy: PermissionPolicy =
       (rules.tools[toolName] as PermissionPolicy | undefined) ??
