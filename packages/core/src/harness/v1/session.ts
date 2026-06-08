@@ -1774,6 +1774,15 @@ export class Session {
     // `run_completed`) on a terminal `agent_end`. Runs AFTER emit so
     // `run_completed` follows its `agent_end`.
     this._trackRunSpanPostEmit(emitted);
+    if (
+      emitted.type === 'agent_end' &&
+      (emitted.finishReason === 'complete' ||
+        emitted.finishReason === 'aborted' ||
+        emitted.finishReason === 'error' ||
+        emitted.finishReason === 'suspended')
+    ) {
+      this._terminalizeAssistantDraft(emitted.runId, emitted.finishReason);
+    }
     return emitted;
   }
 
@@ -2463,7 +2472,6 @@ export class Session {
       finishReason: opts.finishReason,
       usage: this._runUsage(opts.full),
     });
-    this._terminalizeAssistantDraft(id, opts.finishReason);
   }
 
   /**
@@ -5243,7 +5251,6 @@ export class Session {
             runId,
             kind: 'reasoning',
             delta: payload.text,
-            ...(typeof payload.id === 'string' ? { messageId: payload.id } : {}),
           });
           this._emitTurnEvent({ type: 'reasoning_delta', runId, delta: payload.text });
         }

@@ -249,7 +249,75 @@ describe('Session.getDisplayState — shape', () => {
     expect(stored?.assistantDrafts?.['run-draft-reasoning']).toMatchObject({
       text: 'answer',
       reasoningText: 'thinking through',
+      messageId: 'message-1',
       status: 'completed',
+    });
+  });
+
+  it('does not use reasoning stream ids as assistant draft message ids', async () => {
+    const { harness, agent, storage } = setupHarness();
+    agent.enqueueRun({
+      runId: 'run-reasoning-id',
+      finishReason: 'stop',
+      text: '',
+      chunks: [
+        { type: 'reasoning-delta', payload: { id: 'reasoning-only-1', text: 'thinking' }, runId: 'run-reasoning-id' },
+      ],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-reasoning-id']).toMatchObject({
+      text: '',
+      reasoningText: 'thinking',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+    expect(stored?.assistantDrafts?.['run-reasoning-id']).not.toHaveProperty('messageId');
+  });
+
+  it('terminalizes drafts when agent_end is emitted directly', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'error';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+      _flushAssistantDraftsNow: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({
+      runId: 'run-direct-error',
+      kind: 'text',
+      delta: 'partial',
+      messageId: 'message-direct-error',
+    });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-direct-error',
+      finishReason: 'error',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+    await internals._flushAssistantDraftsNow();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-direct-error']).toMatchObject({
+      text: 'partial',
+      status: 'failed',
+      finishReason: 'error',
+      messageId: 'message-direct-error',
     });
   });
 

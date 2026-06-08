@@ -555,6 +555,7 @@ export interface HarnessRunOperationalState {
 }
 
 export type HarnessAssistantDraftStatus = 'streaming' | 'interrupted' | 'completed' | 'failed';
+export type HarnessAssistantDraftFinishReason = 'complete' | 'aborted' | 'error';
 
 /**
  * §5.1x — bounded durable projection of an assistant response that is still
@@ -578,7 +579,7 @@ export interface HarnessAssistantDraft {
   startedAt: number;
   updatedAt: number;
   terminalAt?: number;
-  finishReason?: string;
+  finishReason?: HarnessAssistantDraftFinishReason;
   truncated?: boolean;
 }
 

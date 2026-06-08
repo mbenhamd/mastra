@@ -134,7 +134,7 @@ const harnessAssistantDraftSchema = z.object({
   startedAt: z.number(),
   updatedAt: z.number(),
   terminalAt: z.number().optional(),
-  finishReason: z.string().optional(),
+  finishReason: z.enum(['complete', 'aborted', 'error']).optional(),
   truncated: z.boolean().optional(),
 });
 
