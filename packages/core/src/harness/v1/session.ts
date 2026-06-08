@@ -1121,6 +1121,7 @@ export class Session {
    * `_resume` path. Not persisted — these are run-only fields.
    */
   private _currentRunId?: string;
+  private readonly _currentAssistantDraftRunIds = new Set<string>();
   /** §5.1b run-start time for the SessionRunProjection; set at agent_start, cleared on turn reset. */
   private _currentRunStartedAt?: number;
   /**
@@ -2106,6 +2107,7 @@ export class Session {
    */
   private _resetTurnTracking(): void {
     this._currentRunId = undefined;
+    this._currentAssistantDraftRunIds.clear();
     this._currentRunStartedAt = undefined;
     this._currentRunModeId = undefined;
     this._currentRunModelId = undefined;
@@ -2223,6 +2225,7 @@ export class Session {
   }): void {
     if (opts.delta.length === 0) return;
     const now = Date.now();
+    this._currentAssistantDraftRunIds.add(opts.runId);
     const previous = this._assistantDrafts.get(opts.runId);
     const text =
       opts.kind === 'text'
@@ -2235,6 +2238,8 @@ export class Session {
             text: previous?.reasoningText ?? '',
             truncated: previous?.truncated === true,
           };
+    const previousIsTerminal =
+      previous?.status === 'completed' || previous?.status === 'interrupted' || previous?.status === 'failed';
     const draft: HarnessAssistantDraft = {
       runId: opts.runId,
       sessionId: this.id,
@@ -2245,9 +2250,11 @@ export class Session {
       ...((opts.messageId ?? previous?.messageId) ? { messageId: opts.messageId ?? previous?.messageId } : {}),
       text: text.text,
       ...(reasoningText.text.length > 0 ? { reasoningText: reasoningText.text } : {}),
-      status: 'streaming',
+      status: previousIsTerminal ? previous.status : 'streaming',
       startedAt: previous?.startedAt ?? this._currentRunStartedAt ?? now,
       updatedAt: now,
+      ...(previousIsTerminal && previous.terminalAt !== undefined ? { terminalAt: previous.terminalAt } : {}),
+      ...(previousIsTerminal && previous.finishReason !== undefined ? { finishReason: previous.finishReason } : {}),
       truncated: previous?.truncated === true || text.truncated || reasoningText.truncated || undefined,
     };
     this._assistantDrafts.set(opts.runId, draft);
@@ -2270,11 +2277,12 @@ export class Session {
     finishReason: 'complete' | 'aborted' | 'error' | 'suspended',
   ): void {
     if (runId === undefined || finishReason === 'suspended') return;
-    const fallback =
-      this._assistantDrafts.get(runId) === undefined
-        ? Array.from(this._assistantDrafts.values()).filter(draft => draft.status === 'streaming')
-        : [];
-    const draftRunId = this._assistantDrafts.has(runId) ? runId : fallback.length === 1 ? fallback[0]!.runId : runId;
+    const draftRunId = this._assistantDrafts.has(runId)
+      ? runId
+      : this._currentAssistantDraftRunIds.size === 1
+        ? this._currentAssistantDraftRunIds.values().next().value
+        : undefined;
+    if (draftRunId === undefined) return;
     const previous = this._assistantDrafts.get(draftRunId);
     if (previous === undefined) return;
     const now = Date.now();
@@ -2936,6 +2944,14 @@ export class Session {
       const completed = await waitUntilDeadline(chain);
       if (!completed) {
         throw new HarnessValidationError('shutdown()', 'Session storage writes did not flush before shutdown deadline');
+      }
+      const assistantDraftFlush = this._flushAssistantDraftsNow();
+      const assistantDraftsCompleted = await waitUntilDeadline(assistantDraftFlush);
+      if (!assistantDraftsCompleted) {
+        throw new HarnessValidationError(
+          'shutdown()',
+          'Session assistant drafts did not flush before shutdown deadline',
+        );
       }
       if (this._flushChain === chain && this._backgroundTurnCompletions.size === 0) break;
     }

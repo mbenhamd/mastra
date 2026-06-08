@@ -321,6 +321,111 @@ describe('Session.getDisplayState — shape', () => {
     });
   });
 
+  it('does not terminalize an unrelated stale draft for a different agent_end run', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _assistantDrafts: Map<string, Record<string, unknown>>;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'complete';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+    };
+
+    internals._assistantDrafts.set('run-stale', {
+      runId: 'run-stale',
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+      messageId: 'message-stale',
+      text: 'stale partial',
+      status: 'streaming',
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-other',
+      finishReason: 'complete',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+
+    expect(session.getDisplayState().assistantDrafts?.['run-stale']).toMatchObject({
+      text: 'stale partial',
+      status: 'streaming',
+    });
+    expect(session.getDisplayState().assistantDrafts?.['run-stale']).not.toHaveProperty('finishReason');
+  });
+
+  it('does not reopen terminal drafts when late deltas arrive', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'complete';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+      _flushAssistantDraftsNow: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({ runId: 'run-late', kind: 'text', delta: 'first' });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-late',
+      finishReason: 'complete',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+    internals._recordAssistantDraftDelta({ runId: 'run-late', kind: 'text', delta: ' late' });
+    await internals._flushAssistantDraftsNow();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-late']).toMatchObject({
+      text: 'first late',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+    expect(stored?.assistantDrafts?.['run-late']?.terminalAt).toBeTypeOf('number');
+  });
+
+  it('flushes pending assistant drafts when awaiting the session flush chain', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _internalAwaitFlushChain: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({
+      runId: 'run-flush-chain',
+      kind: 'text',
+      delta: 'flush me',
+      messageId: 'message-flush-chain',
+    });
+    await internals._internalAwaitFlushChain();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-flush-chain']).toMatchObject({
+      text: 'flush me',
+      status: 'streaming',
+      messageId: 'message-flush-chain',
+    });
+  });
+
   it('terminalizes an aborted in-flight assistant draft as interrupted', async () => {
     const { harness, agent, storage } = setupHarness();
     let release!: () => void;
