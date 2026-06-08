@@ -24,6 +24,9 @@ interface SessionSnapshot {
     // Route handle only. Clients obtain actual page cursors from
     // `/subagent-inbox` responses.
   };
+  // Includes `assistantDrafts` when recent in-progress or terminal assistant
+  // output has been coalesced for render recovery. Those drafts are display
+  // state, not transcript rows or event replay.
   displayState?: HarnessDisplayStateSnapshotV1;
   goal?: GoalState | null;
   channelBindings: SessionChannelBindingSummary[];

@@ -17,6 +17,7 @@ function makeDisplayState(overrides: Partial<SessionDisplayState> = {}): Session
     activeTools: {},
     toolInputBuffers: {},
     activeSubagents: {},
+    assistantDrafts: {},
     tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     pending: null,
     queueDepth: 0,
@@ -40,6 +41,7 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
       activeTools: {},
       toolInputBuffers: {},
       activeSubagents: {},
+      assistantDrafts: {},
       pending: null,
       queueDepth: 0,
     });
@@ -132,6 +134,20 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
         toolInputBuffers: {
           tool_1: { toolName: 'shell', text: 'npm test' },
         },
+        assistantDrafts: {
+          run_1: {
+            runId: 'run_1',
+            sessionId: 'session-1',
+            resourceId: 'resource-1',
+            threadId: 'thread-1',
+            messageId: 'message-1',
+            text: 'partial answer',
+            reasoningText: 'thinking',
+            status: 'streaming',
+            startedAt: 21,
+            updatedAt: 22,
+          },
+        },
         tokenUsage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
         queueDepth: 1,
         goal: {
@@ -159,9 +175,40 @@ describe('toHarnessDisplayStateSnapshotV1', () => {
       startedAt: 20,
     });
     expect(snapshot.toolInputBuffers.tool_1).toEqual({ toolName: 'shell', text: 'npm test' });
+    expect(snapshot.assistantDrafts.run_1).toEqual({
+      runId: 'run_1',
+      sessionId: 'session-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      messageId: 'message-1',
+      text: 'partial answer',
+      reasoningText: 'thinking',
+      status: 'streaming',
+      startedAt: 21,
+      updatedAt: 22,
+    });
     expect(snapshot.tokenUsage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
     expect(snapshot.queueDepth).toBe(1);
     expect(snapshot.goal).toMatchObject({ id: 'goal-1', status: 'active' });
+  });
+
+  it('copies assistant drafts so consumers cannot mutate source state', () => {
+    const assistantDrafts: NonNullable<SessionDisplayState['assistantDrafts']> = {
+      run_1: {
+        runId: 'run_1',
+        sessionId: 'session-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        text: 'hello',
+        status: 'streaming',
+        startedAt: 1,
+        updatedAt: 2,
+      },
+    };
+    const snapshot = toHarnessDisplayStateSnapshotV1(makeDisplayState({ assistantDrafts }));
+
+    snapshot.assistantDrafts.run_1!.text = 'mutated';
+    expect(assistantDrafts.run_1!.text).toBe('hello');
   });
 
   it('carries the bounded plan-task summary (counts/byStatus/inProgressTaskIds/rootCount), copied not shared', () => {

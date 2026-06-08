@@ -54,7 +54,11 @@ projection, queue item identifiers, session-owned pending inbox items, display
 snapshot, goal state, channel binding summary, token usage, the bounded
 durable-work summary, and a bounded message window or cursor for the persisted
 thread message log. It does not synthesize missed `text_delta`, tool, or channel
-events from storage.
+events from storage. The display snapshot may include
+`assistantDrafts`: bounded, coalesced assistant text/reasoning accumulated by
+the session while streaming. Clients use those drafts as render recovery for
+in-progress assistant output after a gap; they do not treat them as replayed
+events or transcript messages.
 Multi-session controllers apply this rule per affected session and rebuild their
 view through the §13.4 controller recovery recipe rather than through
 cross-session event replay.

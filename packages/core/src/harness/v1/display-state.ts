@@ -1,4 +1,4 @@
-import type { JsonValue } from '../../storage/domains/harness';
+import type { HarnessAssistantDraft, JsonValue } from '../../storage/domains/harness';
 import type { PlanTaskSummary } from './plan-task-session';
 import type {
   ActiveSubagentState,
@@ -56,6 +56,7 @@ export interface HarnessDisplayStateSnapshotV1 {
   activeTools: Record<string, HarnessDisplayActiveToolSnapshotV1>;
   toolInputBuffers: Record<string, HarnessDisplayToolInputBufferSnapshotV1>;
   activeSubagents: Record<string, HarnessDisplayActiveSubagentSnapshotV1>;
+  assistantDrafts: Record<string, HarnessAssistantDraft>;
   tokenUsage: TokenUsage;
   pending: HarnessDisplayPendingSnapshotV1 | null;
   queueDepth: number;
@@ -183,6 +184,16 @@ export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): Har
     ),
     activeSubagents: Object.fromEntries(
       Object.entries(state.activeSubagents).map(([id, subagent]) => [id, encodeActiveSubagent(subagent)]),
+    ),
+    assistantDrafts: Object.fromEntries(
+      Object.entries(state.assistantDrafts ?? {}).map(([runId, draft]) => [
+        runId,
+        {
+          ...draft,
+          text: draft.text,
+          ...(draft.reasoningText !== undefined ? { reasoningText: draft.reasoningText } : {}),
+        },
+      ]),
     ),
     tokenUsage: { ...state.tokenUsage },
     pending: encodePending(state.pending),

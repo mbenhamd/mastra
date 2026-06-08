@@ -35,4 +35,8 @@ restart all converge on the same snapshot-refetch path. Clients do not branch on
 the cause, synthesize missed `text_delta`, tool, channel, or lifecycle events,
 open a remote cross-session event stream, or treat activity timelines, durable
 work summaries, display snapshots, diagnostics, local gap markers, or
-pending-card projections as operation-settlement records.
+pending-card projections as operation-settlement records. A display snapshot's
+`assistantDrafts` field is the one first-party render recovery input for
+coalesced in-progress assistant text/reasoning; clients merge it with live
+overlay rows by run/message identity and replace it with persisted transcript
+messages when those become available.

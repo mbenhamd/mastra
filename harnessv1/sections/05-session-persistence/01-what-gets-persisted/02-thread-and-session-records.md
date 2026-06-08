@@ -241,6 +241,13 @@ interface SessionRecord {
   // interrupted run on this session. This is not an admission ledger, event
   // log, outbox receipt, or replacement for agent/workflow run storage.
   currentRun?: HarnessRunOperationalState;
+  // Bounded, coalesced assistant-output projection keyed by runId. This is the
+  // durable recovery source for in-progress assistant text/reasoning after a
+  // browser reload, process restart, SSE gap, or skipped transient delta. It is
+  // not a transcript row, not a replacement for `listMessages()`, and not a
+  // synthetic event-replay source. Terminal drafts may remain briefly for
+  // reconnect de-dupe and UI recovery, then are pruned by implementation bounds.
+  assistantDrafts?: Record<string, HarnessAssistantDraft>;
   // Debounced display snapshot used to rebuild `getDisplayState()` after
   // hydration. It is a cache of renderable session state, not durable event
   // replay; stale or missing snapshots are rebuilt from the record fields
