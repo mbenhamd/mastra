@@ -69,10 +69,7 @@ import { enforceThreadAccess, getEffectiveResourceId } from './utils';
 
 type SessionLifecycleStatus = 'active' | 'closing' | 'closed';
 type PendingInboxKind = 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
-type PublicPendingResume = Omit<
-  NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext'
->;
+type PublicPendingResume = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies' | 'requestContext'>;
 type ParsedHarnessEventId = { epoch: string; sequence: number };
 type UrlAttachmentInput = {
   kind: 'url';
@@ -1734,6 +1731,7 @@ function displayStateFromRecord(record: SessionRecord): SessionDisplayState {
     activeTools: {},
     toolInputBuffers: {},
     activeSubagents: {},
+    assistantDrafts: { ...(record.assistantDrafts ?? {}) },
     tokenUsage: { ...record.tokenUsage },
     pending: pendingResumeForDisplay(record.pendingResume),
     queueDepth: record.pendingQueue.length,
@@ -2107,10 +2105,9 @@ export const POST_HARNESS_CHANNEL_INBOUND_ROUTE = createPublicRoute({
     const forwardedContentType = headers['content-type'];
     const contentType = Array.isArray(forwardedContentType) ? forwardedContentType[0] : forwardedContentType;
     if (!isAllowedChannelContentType(contentType)) {
-      return jsonResponse(
-        toHarnessErrorBody('harness.bad_request', 'unsupported channel webhook content-type'),
-        { status: 415 },
-      );
+      return jsonResponse(toHarnessErrorBody('harness.bad_request', 'unsupported channel webhook content-type'), {
+        status: 415,
+      });
     }
     if (rawBody !== undefined && rawBodyByteLength(rawBody) > CHANNEL_INBOUND_MAX_BODY_BYTES) {
       return jsonResponse(toHarnessErrorBody('harness.bad_request', 'channel webhook payload too large'), {
@@ -2354,8 +2351,7 @@ export const GET_HARNESS_SESSION_EVENTS_ROUTE = createRoute({
       let closed = false;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       const heartbeatOverride = (handlerArgs as unknown as { heartbeatIntervalMs?: unknown }).heartbeatIntervalMs;
-      const heartbeatIntervalMs =
-        typeof heartbeatOverride === 'number' ? heartbeatOverride : SSE_HEARTBEAT_INTERVAL_MS;
+      const heartbeatIntervalMs = typeof heartbeatOverride === 'number' ? heartbeatOverride : SSE_HEARTBEAT_INTERVAL_MS;
       const cleanup = () => {
         if (closed) return;
         closed = true;

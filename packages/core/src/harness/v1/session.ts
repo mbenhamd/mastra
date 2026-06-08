@@ -49,6 +49,7 @@ import type {
   GoalState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
+  HarnessAssistantDraft,
   HarnessPlanTask,
   HarnessRunSummary,
   HarnessStorage,
@@ -699,11 +700,14 @@ const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'
 
 /**
  * Harness-OWNED built-in tools (plan-task tools, spawn_subagent, task_delegate,
- * and the HITL suspension tools ask_user / submit_plan). These are harness
+ * and the HITL suspension tools ask_user / submit_plan). Most are harness
  * infrastructure, NOT user/agent tools, so the §4.2e permission gate never applies
  * to them — an engaged default 'deny'/'ask' must not block or suspend the harness's
  * own orchestration (denying ask_user/submit_plan would break the question /
- * plan-approval flows the gate itself relies on). Kept in sync with `_buildToolsets`.
+ * plan-approval flows the gate itself relies on). Escalation built-ins are
+ * different: they cross session/agent capability boundaries and therefore honor
+ * the engaged tool policy after anti-escalation allowlist checks. Kept in sync
+ * with `_buildToolsets`.
  */
 const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_ADD_TOOL_ID,
@@ -723,8 +727,7 @@ const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
  * The subset of harness built-ins that a per-subagent `toolAllowlist` does NOT
  * auto-keep (M4): `spawn_subagent` / `task_delegate` are capability-escalation
  * vectors — a scoped subagent could otherwise run a broader child. Under an
- * allowlist these must be listed explicitly to be available; without an allowlist
- * they bypass the gate as normal harness infrastructure. Everything else in
+ * allowlist these must be listed explicitly to be available. Everything else in
  * HARNESS_BUILTIN_TOOL_IDS (HITL + local plan-task orchestration) is always kept.
  */
 const ESCALATION_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
@@ -963,6 +966,8 @@ interface OpenRunSpan {
 
 /** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
 const MAX_FINALIZED_RUN_IDS = 4096;
+const MAX_ASSISTANT_DRAFT_CHARS = 128_000;
+const ASSISTANT_DRAFT_FLUSH_DELAY_MS = 250;
 
 export interface SessionDisplayState {
   // Identity
@@ -990,6 +995,7 @@ export interface SessionDisplayState {
   activeTools: Record<string, ActiveToolState>;
   toolInputBuffers: Record<string, { toolName: string; text: string }>;
   activeSubagents: Record<string, ActiveSubagentState>;
+  assistantDrafts?: Record<string, HarnessAssistantDraft>;
 
   // Tokens
   tokenUsage: TokenUsage;
@@ -1115,6 +1121,7 @@ export class Session {
    * `_resume` path. Not persisted — these are run-only fields.
    */
   private _currentRunId?: string;
+  private readonly _currentAssistantDraftRunIds = new Set<string>();
   /** §5.1b run-start time for the SessionRunProjection; set at agent_start, cleared on turn reset. */
   private _currentRunStartedAt?: number;
   /**
@@ -1169,6 +1176,9 @@ export class Session {
   private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  private readonly _assistantDrafts = new Map<string, HarnessAssistantDraft>();
+  private _assistantDraftFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  private _assistantDraftFlushDirty = false;
   /** §SA3 — count of `spawn_subagent` children currently in flight from this parent
    *  (incremented at the spawn gate, decremented when the child settles). Used for
    *  the `subagents.maxConcurrent` backpressure check; counts the create window too. */
@@ -1326,6 +1336,9 @@ export class Session {
     this.createdAt = internals.record.createdAt;
 
     this._record = internals.record;
+    for (const [runId, draft] of Object.entries(internals.record.assistantDrafts ?? {})) {
+      this._assistantDrafts.set(runId, { ...draft });
+    }
     // Seed the live token-usage counter from the persisted aggregate so reopens
     // (after eviction / process restart) continue accumulating instead of
     // restarting at zero. Accept only non-negative integer fields because rows
@@ -1563,6 +1576,7 @@ export class Session {
         harnessName: this._record.harnessName,
       });
     }
+    await this._flushAssistantDraftsNow();
   }
 
   private _enqueueSessionEventPersistence(event: HarnessEvent): void {
@@ -1761,6 +1775,15 @@ export class Session {
     // `run_completed`) on a terminal `agent_end`. Runs AFTER emit so
     // `run_completed` follows its `agent_end`.
     this._trackRunSpanPostEmit(emitted);
+    if (
+      emitted.type === 'agent_end' &&
+      (emitted.finishReason === 'complete' ||
+        emitted.finishReason === 'aborted' ||
+        emitted.finishReason === 'error' ||
+        emitted.finishReason === 'suspended')
+    ) {
+      this._terminalizeAssistantDraft(emitted.runId, emitted.finishReason);
+    }
     return emitted;
   }
 
@@ -2084,6 +2107,7 @@ export class Session {
    */
   private _resetTurnTracking(): void {
     this._currentRunId = undefined;
+    this._currentAssistantDraftRunIds.clear();
     this._currentRunStartedAt = undefined;
     this._currentRunModeId = undefined;
     this._currentRunModelId = undefined;
@@ -2130,6 +2154,150 @@ export class Session {
       this._toolInputBuffers.clear();
     }
     this._notifyMaybeIdle();
+  }
+
+  private _assistantDraftSnapshot(): Record<string, HarnessAssistantDraft> {
+    return Object.fromEntries(
+      Array.from(this._assistantDrafts.entries()).map(([runId, draft]) => [runId, { ...draft }]),
+    );
+  }
+
+  private _persistedAssistantDrafts(snapshot: Record<string, HarnessAssistantDraft>): SessionRecord['assistantDrafts'] {
+    return Object.keys(snapshot).length > 0 ? snapshot : undefined;
+  }
+
+  private _appendBoundedDraftText(previous: string | undefined, delta: string): { text: string; truncated: boolean } {
+    const next = `${previous ?? ''}${delta}`;
+    if (next.length <= MAX_ASSISTANT_DRAFT_CHARS) {
+      return { text: next, truncated: false };
+    }
+    return { text: next.slice(next.length - MAX_ASSISTANT_DRAFT_CHARS), truncated: true };
+  }
+
+  private _pruneAssistantDrafts(): void {
+    if (this._assistantDrafts.size <= 8) return;
+    const ordered = Array.from(this._assistantDrafts.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+    const keep = new Set(ordered.slice(0, 8).map(draft => draft.runId));
+    for (const runId of this._assistantDrafts.keys()) {
+      if (!keep.has(runId)) this._assistantDrafts.delete(runId);
+    }
+  }
+
+  private _scheduleAssistantDraftFlush(delayMs = ASSISTANT_DRAFT_FLUSH_DELAY_MS): void {
+    if (this._state === 'closed' || this._state === 'deleted' || this._state === 'evicted') return;
+    this._assistantDraftFlushDirty = true;
+    if (this._assistantDraftFlushTimer !== undefined) {
+      if (delayMs > 0) return;
+      clearTimeout(this._assistantDraftFlushTimer);
+      this._assistantDraftFlushTimer = undefined;
+    }
+    this._assistantDraftFlushTimer = setTimeout(() => {
+      this._assistantDraftFlushTimer = undefined;
+      void this._flushAssistantDraftsNow().catch(() => {});
+    }, delayMs);
+    this._assistantDraftFlushTimer.unref?.();
+  }
+
+  private async _flushAssistantDraftsNow(): Promise<void> {
+    if (this._assistantDraftFlushTimer !== undefined) {
+      clearTimeout(this._assistantDraftFlushTimer);
+      this._assistantDraftFlushTimer = undefined;
+    }
+    if (!this._assistantDraftFlushDirty) return;
+    this._assistantDraftFlushDirty = false;
+    const assistantDrafts = this._persistedAssistantDrafts(this._assistantDraftSnapshot());
+    try {
+      await this._flushUpdate(prev => ({ ...prev, assistantDrafts }));
+    } catch (err) {
+      if (this._state !== 'closed' && this._state !== 'deleted' && this._state !== 'evicted') {
+        this._assistantDraftFlushDirty = true;
+        this._scheduleAssistantDraftFlush(ASSISTANT_DRAFT_FLUSH_DELAY_MS);
+      }
+      throw err;
+    }
+  }
+
+  private _recordAssistantDraftDelta(opts: {
+    runId: string;
+    kind: 'text' | 'reasoning';
+    delta: string;
+    messageId?: string;
+  }): void {
+    if (opts.delta.length === 0) return;
+    const now = Date.now();
+    this._currentAssistantDraftRunIds.add(opts.runId);
+    const previous = this._assistantDrafts.get(opts.runId);
+    const text =
+      opts.kind === 'text'
+        ? this._appendBoundedDraftText(previous?.text, opts.delta)
+        : { text: previous?.text ?? '', truncated: previous?.truncated === true };
+    const reasoningText =
+      opts.kind === 'reasoning'
+        ? this._appendBoundedDraftText(previous?.reasoningText, opts.delta)
+        : {
+            text: previous?.reasoningText ?? '',
+            truncated: previous?.truncated === true,
+          };
+    const previousIsTerminal =
+      previous?.status === 'completed' || previous?.status === 'interrupted' || previous?.status === 'failed';
+    const draft: HarnessAssistantDraft = {
+      runId: opts.runId,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      ...(this._currentRunSignalId !== undefined ? { signalId: this._currentRunSignalId } : {}),
+      ...(this._currentQueuedItemId !== undefined ? { queuedItemId: this._currentQueuedItemId } : {}),
+      ...((opts.messageId ?? previous?.messageId) ? { messageId: opts.messageId ?? previous?.messageId } : {}),
+      text: text.text,
+      ...(reasoningText.text.length > 0 ? { reasoningText: reasoningText.text } : {}),
+      status: previousIsTerminal ? previous.status : 'streaming',
+      startedAt: previous?.startedAt ?? this._currentRunStartedAt ?? now,
+      updatedAt: now,
+      ...(previousIsTerminal && previous.terminalAt !== undefined ? { terminalAt: previous.terminalAt } : {}),
+      ...(previousIsTerminal && previous.finishReason !== undefined ? { finishReason: previous.finishReason } : {}),
+      truncated: previous?.truncated === true || text.truncated || reasoningText.truncated || undefined,
+    };
+    this._assistantDrafts.set(opts.runId, draft);
+    this._pruneAssistantDrafts();
+    this._notifyDisplayRefresh();
+    this._scheduleAssistantDraftFlush();
+  }
+
+  private _setAssistantDraftMessageId(runId: string | undefined, messageId: string | undefined): void {
+    if (runId === undefined || messageId === undefined) return;
+    const previous = this._assistantDrafts.get(runId);
+    if (previous === undefined || previous.messageId === messageId) return;
+    this._assistantDrafts.set(runId, { ...previous, messageId, updatedAt: Date.now() });
+    this._notifyDisplayRefresh();
+    this._scheduleAssistantDraftFlush();
+  }
+
+  private _terminalizeAssistantDraft(
+    runId: string | undefined,
+    finishReason: 'complete' | 'aborted' | 'error' | 'suspended',
+  ): void {
+    if (runId === undefined || finishReason === 'suspended') return;
+    const draftRunId = this._assistantDrafts.has(runId)
+      ? runId
+      : this._currentAssistantDraftRunIds.size === 1
+        ? this._currentAssistantDraftRunIds.values().next().value
+        : undefined;
+    if (draftRunId === undefined) return;
+    const previous = this._assistantDrafts.get(draftRunId);
+    if (previous === undefined) return;
+    const now = Date.now();
+    const status: HarnessAssistantDraft['status'] =
+      finishReason === 'complete' ? 'completed' : finishReason === 'aborted' ? 'interrupted' : 'failed';
+    this._assistantDrafts.set(draftRunId, {
+      ...previous,
+      status,
+      finishReason,
+      updatedAt: now,
+      terminalAt: now,
+    });
+    this._pruneAssistantDrafts();
+    this._notifyDisplayRefresh();
+    this._scheduleAssistantDraftFlush(0);
   }
 
   /**
@@ -2776,6 +2944,14 @@ export class Session {
       const completed = await waitUntilDeadline(chain);
       if (!completed) {
         throw new HarnessValidationError('shutdown()', 'Session storage writes did not flush before shutdown deadline');
+      }
+      const assistantDraftFlush = this._flushAssistantDraftsNow();
+      const assistantDraftsCompleted = await waitUntilDeadline(assistantDraftFlush);
+      if (!assistantDraftsCompleted) {
+        throw new HarnessValidationError(
+          'shutdown()',
+          'Session assistant drafts did not flush before shutdown deadline',
+        );
       }
       if (this._flushChain === chain && this._backgroundTurnCompletions.size === 0) break;
     }
@@ -5054,11 +5230,18 @@ export class Session {
         // message id for the display snapshot.
         const payload = chunk.payload as { id: string };
         this._currentMessageId = payload.id;
+        this._setAssistantDraftMessageId(runId, payload.id);
         return;
       }
       case 'text-delta': {
         const payload = chunk.payload as { id: string; text?: string };
         if (runId !== undefined && typeof payload?.text === 'string' && payload.text.length > 0) {
+          this._recordAssistantDraftDelta({
+            runId,
+            kind: 'text',
+            delta: payload.text,
+            ...(typeof payload.id === 'string' ? { messageId: payload.id } : {}),
+          });
           this._emitTurnEvent({ type: 'text_delta', runId, delta: payload.text });
         }
         return;
@@ -5080,6 +5263,11 @@ export class Session {
         // provider `reasoning-delta.delta` into `payload.text`).
         const payload = chunk.payload as { id: string; text?: string };
         if (runId !== undefined && typeof payload?.text === 'string' && payload.text.length > 0) {
+          this._recordAssistantDraftDelta({
+            runId,
+            kind: 'reasoning',
+            delta: payload.text,
+          });
           this._emitTurnEvent({ type: 'reasoning_delta', runId, delta: payload.text });
         }
         return;
@@ -7685,6 +7873,7 @@ export class Session {
       activeTools: Object.fromEntries(this._activeTools.entries()),
       toolInputBuffers: Object.fromEntries(this._toolInputBuffers.entries()),
       activeSubagents: Object.fromEntries(this._activeSubagents.entries()),
+      assistantDrafts: this._assistantDraftSnapshot(),
 
       // Tokens — copy so the caller can't mutate the running aggregate
       tokenUsage: { ...this._tokenUsage },
@@ -7894,7 +8083,13 @@ export class Session {
       // source kinds. Caps keep the read-time projection server-bounded (§9).
       const MAX_DESCENDANTS = 50;
       const MAX_DEPTH = 4;
-      const collected: { id: string; threadId: string; parentSessionId: string; depth: number; lastActivityAt: number }[] = [];
+      const collected: {
+        id: string;
+        threadId: string;
+        parentSessionId: string;
+        depth: number;
+        lastActivityAt: number;
+      }[] = [];
       let frontier = [{ id: this.id, depth: 0 }];
       const visited = new Set<string>([this.id]);
       while (frontier.length > 0 && collected.length < MAX_DESCENDANTS) {
@@ -12899,8 +13094,9 @@ export class Session {
    * per-turn POLICY SNAPSHOT: a per-tool rule wins, else the tool's category rule,
    * else the harness default. A matching tool/category GRANT turns an `ask` into
    * `allow` (a grant suppresses only the policy-level ask; it never overrides a
-   * `deny`). Harness-owned built-ins always resolve to `allow` — they are
-   * infrastructure, never gated by the session policy.
+   * `deny`). Harness-owned non-escalation built-ins always resolve to `allow` —
+   * they are infrastructure, never gated by the session policy. Escalation
+   * built-ins fall through to the normal policy after the subagent allowlist cap.
    */
   private _resolveToolPolicy(
     toolName: string,
@@ -12916,9 +13112,6 @@ export class Session {
     // M4 — subagent capability scope: a tool outside the allowlist is a hard deny
     // (removed pre-exposure; refused at action time), regardless of permission rules.
     if (allowlist !== undefined && !allowlist.has(toolName)) return 'deny';
-    // Escalation builtins that are either un-scoped (no allowlist) or explicitly
-    // listed run as normal harness infrastructure.
-    if (ESCALATION_BUILTIN_TOOL_IDS.has(toolName)) return 'allow';
     const category = this._harness.getToolCategory({ toolName }) ?? undefined;
     let policy: PermissionPolicy =
       (rules.tools[toolName] as PermissionPolicy | undefined) ??

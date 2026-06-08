@@ -14,6 +14,7 @@ interface HarnessDisplayStateSnapshotV1 {
   pendingQuestion: HarnessDisplayPendingQuestionSnapshotV1 | null;
   pendingPlanApproval: HarnessDisplayPendingPlanSnapshotV1 | null;
   activeSubagents: HarnessDisplaySubagentSnapshotV1[];
+  assistantDrafts: Record<string, HarnessAssistantDraft>;
   // Display-only projection of file paths inferred from known tool/UI activity.
   // This is not a workspace audit log, not a filesystem mutation ledger, and
   // not an observational-memory ingestion source (§2.7).
@@ -108,6 +109,24 @@ interface HarnessDisplaySubagentSnapshotV1 {
   result?: string;
 }
 
+interface HarnessAssistantDraft {
+  runId: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  signalId?: string;
+  queuedItemId?: string;
+  messageId?: string;
+  text: string;
+  reasoningText?: string;
+  status: 'streaming' | 'interrupted' | 'completed' | 'failed';
+  startedAt: number;
+  updatedAt: number;
+  terminalAt?: number;
+  finishReason?: 'complete' | 'aborted' | 'error';
+  truncated?: boolean;
+}
+
 interface HarnessDisplayTaskSnapshotV1 {
   content: string;
   status: 'pending' | 'in_progress' | 'completed';
@@ -198,6 +217,19 @@ interface HarnessDisplayTaskSnapshotV1 {
 // parent. A stale parent display snapshot alone cannot prove a child is active
 // or keep a subagent-owned pending prompt visible; child-owned prompts are
 // recovered from the child session or `/subagent-inbox`.
+//
+// **`assistantDrafts`**
+//
+// Authoritative source when rebuilding: `SessionRecord.assistantDrafts`
+//
+// Rule: Direct bounded projection of coalesced assistant text and reasoning for
+// recent runs. This is the recovery surface for an in-progress assistant message
+// when the browser reloads, the process restarts, an SSE replay gap returns
+// `412`, or `persistTransientStreamingEvents=false` skipped raw `text_delta`
+// rows. It is not a transcript, does not synthesize missed events, and does not
+// settle operations. Completed, interrupted, and failed drafts are terminal
+// display evidence only; persisted messages and result lookup remain
+// authoritative for final history and operation settlement.
 //
 // **`modifiedFiles`**
 //

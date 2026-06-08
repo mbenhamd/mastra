@@ -1388,9 +1388,13 @@ instances; deterministic ordering for keyed arrays; malformed or unsupported
 snapshot versions are ignored and rebuilt through the §5.1 field-to-source
 projection rules; stale pending, active run/tool, subagent, file, and task
 display fields are cleared or recomputed from authoritative session/message
-records; and no `display_state_changed` event is emitted over SSE or used for
-durable replay. In-process `subscribeDisplayState(...)` tests, when implemented,
-assert the same snapshot shape but do not imply a separate RemoteSession display
+records; `assistantDrafts` recover coalesced in-progress assistant text and
+reasoning even when transient streaming deltas are not persisted; terminal
+drafts record completed/interrupted/failed status without becoming transcript
+authority; oversized drafts are bounded and marked `truncated`; and no
+`display_state_changed` event is emitted over SSE or used for durable replay.
+In-process `subscribeDisplayState(...)` tests, when implemented, assert the
+same snapshot shape but do not imply a separate RemoteSession display
 subscription endpoint.
 
 **Tool custom-event API boundary**

@@ -119,6 +119,16 @@ export function toHarnessDisplayStateSnapshotV1(state: SessionDisplayState): Har
     activeSubagents: Object.fromEntries(
       Object.entries(state.activeSubagents).map(([id, subagent]) => [id, encodeActiveSubagent(subagent)]),
     ),
+    assistantDrafts: Object.fromEntries(
+      Object.entries(state.assistantDrafts ?? {}).map(([runId, draft]) => [
+        runId,
+        {
+          ...draft,
+          text: draft.text,
+          ...(draft.reasoningText !== undefined ? { reasoningText: draft.reasoningText } : {}),
+        },
+      ]),
+    ),
     tokenUsage: { ...state.tokenUsage },
     pending: encodePending(state.pending),
     queueDepth: state.queueDepth,

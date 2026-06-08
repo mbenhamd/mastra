@@ -29,10 +29,14 @@
   // but public reads, local display-state subscriptions, storage snapshots, and
   // HTTP responses all normalize to the snapshot shape. On hydration this is
   // rebuilt from the persisted display snapshot when usable, plus durable
-  // queue/pending/currentRun/thread/message state. It is renderable state only,
-  // not durable SSE replay. `subscribeDisplayState(...)` is an in-process
-  // convenience; RemoteSession uses `getDisplayState()`, `subscribe(...)` SSE
-  // events, and snapshot refetch instead of a separate display subscription API.
+  // queue/pending/currentRun/thread/message state and the bounded
+  // `assistantDrafts` projection. `assistantDrafts` coalesces streamed assistant
+  // text/reasoning for recent runs so a reload or SSE `412` can recover an
+  // in-progress answer without replaying raw deltas. It is renderable state
+  // only, not transcript authority and not durable SSE replay.
+  // `subscribeDisplayState(...)` is an in-process convenience; RemoteSession
+  // uses `getDisplayState()`, `subscribe(...)` SSE events, and snapshot refetch
+  // instead of a separate display subscription API.
   getDisplayState(): Readonly<HarnessDisplayStateSnapshotV1>;
   subscribe(listener: HarnessListener): () => void;
   // Plan-task summary (TM-5). The snapshot carries an OPTIONAL bounded plan-task

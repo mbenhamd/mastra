@@ -120,6 +120,24 @@ const harnessDisplayActiveSubagentSnapshotV1Schema = z.object({
   startedAt: z.number(),
 });
 
+const harnessAssistantDraftSchema = z.object({
+  runId: z.string(),
+  sessionId: z.string(),
+  resourceId: z.string(),
+  threadId: z.string(),
+  signalId: z.string().optional(),
+  queuedItemId: z.string().optional(),
+  messageId: z.string().optional(),
+  text: z.string(),
+  reasoningText: z.string().optional(),
+  status: z.enum(['streaming', 'interrupted', 'completed', 'failed']),
+  startedAt: z.number(),
+  updatedAt: z.number(),
+  terminalAt: z.number().optional(),
+  finishReason: z.enum(['complete', 'aborted', 'error']).optional(),
+  truncated: z.boolean().optional(),
+});
+
 const harnessDisplayPendingSnapshotV1Schema = z.object({
   kind: z.enum(['tool-approval', 'tool-suspension', 'question', 'plan-approval', 'sandbox-access']),
   itemId: z.string().optional(),
@@ -156,6 +174,7 @@ export const harnessDisplayStateSnapshotV1Schema = z.object({
   activeTools: z.record(z.string(), harnessDisplayActiveToolSnapshotV1Schema),
   toolInputBuffers: z.record(z.string(), harnessDisplayToolInputBufferSnapshotV1Schema),
   activeSubagents: z.record(z.string(), harnessDisplayActiveSubagentSnapshotV1Schema),
+  assistantDrafts: z.record(z.string(), harnessAssistantDraftSchema),
   tokenUsage: z.object({
     promptTokens: z.number(),
     completionTokens: z.number(),

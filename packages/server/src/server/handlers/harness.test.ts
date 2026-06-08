@@ -84,6 +84,7 @@ function makeDisplayState(record: SessionRecord): SessionDisplayState {
     activeTools: {},
     toolInputBuffers: {},
     activeSubagents: {},
+    assistantDrafts: { ...(record.assistantDrafts ?? {}) },
     tokenUsage: record.tokenUsage,
     pending: null,
     queueDepth: record.pendingQueue.length,
@@ -608,7 +609,22 @@ describe('Harness server routes', () => {
   });
 
   it('returns a session snapshot response with an ETag from the session version', async () => {
-    const record = makeRecord();
+    const record = makeRecord({
+      assistantDrafts: {
+        'run-1': {
+          runId: 'run-1',
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          messageId: 'message-1',
+          text: 'recovered partial answer',
+          reasoningText: 'thinking',
+          status: 'streaming',
+          startedAt: 300,
+          updatedAt: 350,
+        },
+      },
+    });
     const session = {
       getRecord: () => record,
       getDisplayState: () => makeDisplayState(record),
@@ -640,6 +656,13 @@ describe('Harness server routes', () => {
       displayState: {
         version: 1,
         sessionId: 'session-1',
+        assistantDrafts: {
+          'run-1': {
+            text: 'recovered partial answer',
+            reasoningText: 'thinking',
+            status: 'streaming',
+          },
+        },
       },
       tokenUsage: { totalTokens: 3 },
     });

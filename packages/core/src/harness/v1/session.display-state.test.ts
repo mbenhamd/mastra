@@ -12,9 +12,17 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { setupHarness } from './__test-utils__/setup';
 import { MockAgent } from './__test-utils__/mock-agent';
+import { setupHarness } from './__test-utils__/setup';
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
+
+async function waitFor(condition: () => boolean | Promise<boolean>, label: string): Promise<void> {
+  for (let i = 0; i < 80; i++) {
+    if (await condition()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
 
 describe('Session.getDisplayState — shape', () => {
   it('reports the documented identity fields', async () => {
@@ -42,6 +50,7 @@ describe('Session.getDisplayState — shape', () => {
     expect(ds.activeTools).toEqual({});
     expect(ds.toolInputBuffers).toEqual({});
     expect(ds.activeSubagents).toEqual({});
+    expect(ds.assistantDrafts).toEqual({});
     expect(ds.tokenUsage).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
     expect(ds.pending).toBeNull();
     expect(ds.queueDepth).toBe(0);
@@ -98,6 +107,406 @@ describe('Session.getDisplayState — shape', () => {
     expect(after.currentRun).toBeUndefined();
     // Token usage accumulated from the run's totalUsage.
     expect(after.tokenUsage.totalTokens).toBeGreaterThanOrEqual(2);
+  });
+
+  it('projects coalesced assistant drafts while a response is streaming', async () => {
+    const { harness, agent } = setupHarness();
+    let release!: () => void;
+    const hold = new Promise<void>(r => {
+      release = r;
+    });
+    agent.enqueueRun({
+      runId: 'run-draft-live',
+      finishReason: 'stop',
+      text: 'hello world',
+      chunks: [
+        { type: 'text-start', payload: { id: 'msg-draft' }, runId: 'run-draft-live' },
+        { type: 'text-delta', payload: { id: 'msg-draft', text: 'hello ' }, runId: 'run-draft-live' },
+        { type: 'text-delta', payload: { id: 'msg-draft', text: 'world' }, runId: 'run-draft-live' },
+      ],
+      holdUntil: hold,
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const inFlight = session.message({ content: 'hi' });
+    await waitFor(
+      () => session.getDisplayState().assistantDrafts?.['run-draft-live']?.text === 'hello world',
+      'live assistant draft',
+    );
+
+    const draft = session.getDisplayState().assistantDrafts!['run-draft-live']!;
+    expect(draft).toMatchObject({
+      runId: 'run-draft-live',
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+      messageId: 'msg-draft',
+      text: 'hello world',
+      status: 'streaming',
+    });
+    expect(toHarnessDisplayStateSnapshotV1(session.getDisplayState()).assistantDrafts['run-draft-live']).toEqual(draft);
+
+    release();
+    await inFlight;
+  });
+
+  it('persists assistant drafts for reload recovery and terminalizes them on completion', async () => {
+    const { harness, agent, storage } = setupHarness();
+    agent.enqueueRun({
+      runId: 'run-draft-durable',
+      finishReason: 'stop',
+      text: 'durable answer',
+      chunks: [
+        { type: 'text-start', payload: { id: 'msg-durable' }, runId: 'run-draft-durable' },
+        { type: 'text-delta', payload: { id: 'msg-durable', text: 'durable ' }, runId: 'run-draft-durable' },
+        { type: 'text-delta', payload: { id: 'msg-durable', text: 'answer' }, runId: 'run-draft-durable' },
+      ],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+
+    await waitFor(async () => {
+      const stored = await storage.loadSession({ sessionId: session.id });
+      return stored?.assistantDrafts?.['run-draft-durable']?.status === 'completed';
+    }, 'durable assistant draft completion');
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-draft-durable']).toMatchObject({
+      runId: 'run-draft-durable',
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+      messageId: 'msg-durable',
+      text: 'durable answer',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+
+    const reloaded = await harness.session({ sessionId: session.id, resourceId: 'u' });
+    expect(reloaded.getDisplayState().assistantDrafts?.['run-draft-durable']?.text).toBe('durable answer');
+    expect(reloaded.getDisplayState().assistantDrafts?.['run-draft-durable']?.status).toBe('completed');
+  });
+
+  it('persists assistant drafts even when transient streaming deltas are not persisted', async () => {
+    const { harness, agent, storage } = setupHarness({ sessions: { persistTransientStreamingEvents: false } });
+    agent.enqueueRun({
+      runId: 'run-draft-no-deltas',
+      finishReason: 'stop',
+      text: 'overlay recovered',
+      chunks: [
+        { type: 'text-start', payload: { id: 'msg-no-deltas' }, runId: 'run-draft-no-deltas' },
+        { type: 'text-delta', payload: { id: 'msg-no-deltas', text: 'overlay ' }, runId: 'run-draft-no-deltas' },
+        { type: 'text-delta', payload: { id: 'msg-no-deltas', text: 'recovered' }, runId: 'run-draft-no-deltas' },
+      ],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const state = await storage.getSessionEventReplayState({
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+    });
+    const rows = await storage.listSessionEvents({
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+      epoch: state!.epoch,
+      afterSequence: 0,
+      limit: 100,
+    });
+    expect(rows.some(row => (row.event as { type?: string }).type === 'text_delta')).toBe(false);
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-draft-no-deltas']).toMatchObject({
+      text: 'overlay recovered',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+  });
+
+  it('preserves streamed reasoning text separately from assistant text', async () => {
+    const { harness, agent, storage } = setupHarness();
+    agent.enqueueRun({
+      runId: 'run-draft-reasoning',
+      finishReason: 'stop',
+      text: 'answer',
+      chunks: [
+        { type: 'reasoning-delta', payload: { id: 'reasoning-1', text: 'thinking ' }, runId: 'run-draft-reasoning' },
+        { type: 'reasoning-delta', payload: { id: 'reasoning-1', text: 'through' }, runId: 'run-draft-reasoning' },
+        { type: 'text-delta', payload: { id: 'message-1', text: 'answer' }, runId: 'run-draft-reasoning' },
+      ],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-draft-reasoning']).toMatchObject({
+      text: 'answer',
+      reasoningText: 'thinking through',
+      messageId: 'message-1',
+      status: 'completed',
+    });
+  });
+
+  it('does not use reasoning stream ids as assistant draft message ids', async () => {
+    const { harness, agent, storage } = setupHarness();
+    agent.enqueueRun({
+      runId: 'run-reasoning-id',
+      finishReason: 'stop',
+      text: '',
+      chunks: [
+        { type: 'reasoning-delta', payload: { id: 'reasoning-only-1', text: 'thinking' }, runId: 'run-reasoning-id' },
+      ],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-reasoning-id']).toMatchObject({
+      text: '',
+      reasoningText: 'thinking',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+    expect(stored?.assistantDrafts?.['run-reasoning-id']).not.toHaveProperty('messageId');
+  });
+
+  it('terminalizes drafts when agent_end is emitted directly', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'error';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+      _flushAssistantDraftsNow: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({
+      runId: 'run-direct-error',
+      kind: 'text',
+      delta: 'partial',
+      messageId: 'message-direct-error',
+    });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-direct-error',
+      finishReason: 'error',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+    await internals._flushAssistantDraftsNow();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-direct-error']).toMatchObject({
+      text: 'partial',
+      status: 'failed',
+      finishReason: 'error',
+      messageId: 'message-direct-error',
+    });
+  });
+
+  it('does not terminalize an unrelated stale draft for a different agent_end run', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _assistantDrafts: Map<string, Record<string, unknown>>;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'complete';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+    };
+
+    internals._assistantDrafts.set('run-stale', {
+      runId: 'run-stale',
+      sessionId: session.id,
+      resourceId: 'u',
+      threadId: session.threadId,
+      messageId: 'message-stale',
+      text: 'stale partial',
+      status: 'streaming',
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-other',
+      finishReason: 'complete',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+
+    expect(session.getDisplayState().assistantDrafts?.['run-stale']).toMatchObject({
+      text: 'stale partial',
+      status: 'streaming',
+    });
+    expect(session.getDisplayState().assistantDrafts?.['run-stale']).not.toHaveProperty('finishReason');
+  });
+
+  it('does not reopen terminal drafts when late deltas arrive', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _emitTurnEvent: (event: {
+        type: 'agent_end';
+        runId: string;
+        finishReason: 'complete';
+        usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      }) => void;
+      _flushAssistantDraftsNow: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({ runId: 'run-late', kind: 'text', delta: 'first' });
+    internals._emitTurnEvent({
+      type: 'agent_end',
+      runId: 'run-late',
+      finishReason: 'complete',
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    });
+    internals._recordAssistantDraftDelta({ runId: 'run-late', kind: 'text', delta: ' late' });
+    await internals._flushAssistantDraftsNow();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-late']).toMatchObject({
+      text: 'first late',
+      status: 'completed',
+      finishReason: 'complete',
+    });
+    expect(stored?.assistantDrafts?.['run-late']?.terminalAt).toBeTypeOf('number');
+  });
+
+  it('flushes pending assistant drafts when awaiting the session flush chain', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+      _internalAwaitFlushChain: () => Promise<void>;
+    };
+
+    internals._recordAssistantDraftDelta({
+      runId: 'run-flush-chain',
+      kind: 'text',
+      delta: 'flush me',
+      messageId: 'message-flush-chain',
+    });
+    await internals._internalAwaitFlushChain();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-flush-chain']).toMatchObject({
+      text: 'flush me',
+      status: 'streaming',
+      messageId: 'message-flush-chain',
+    });
+  });
+
+  it('terminalizes an aborted in-flight assistant draft as interrupted', async () => {
+    const { harness, agent, storage } = setupHarness();
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({
+      runId: 'run-draft-abort',
+      finishReason: 'stop',
+      text: 'partial',
+      chunks: [
+        { type: 'text-start', payload: { id: 'msg-abort' }, runId: 'run-draft-abort' },
+        { type: 'text-delta', payload: { id: 'msg-abort', text: 'partial' }, runId: 'run-draft-abort' },
+      ],
+      holdUntil: hold,
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const inFlight = session.message({ content: 'hi' });
+    await waitFor(
+      () => session.getDisplayState().assistantDrafts?.['run-draft-abort']?.text === 'partial',
+      'abort draft',
+    );
+
+    session.abort({ reason: 'user-stop' });
+    await inFlight;
+    release();
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-draft-abort']).toMatchObject({
+      text: 'partial',
+      status: 'interrupted',
+      finishReason: 'aborted',
+    });
+  });
+
+  it('bounds very large assistant drafts and marks truncation', async () => {
+    const { harness, agent, storage } = setupHarness();
+    const longText = 'x'.repeat(128_010);
+    agent.enqueueRun({
+      runId: 'run-draft-long',
+      finishReason: 'stop',
+      text: longText,
+      chunks: [{ type: 'text-delta', payload: { id: 'msg-long', text: longText }, runId: 'run-draft-long' }],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'hi' });
+    await session._flushEventPersistence();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    const draft = stored?.assistantDrafts?.['run-draft-long'];
+    expect(draft?.text).toHaveLength(128_000);
+    expect(draft?.text).toBe('x'.repeat(128_000));
+    expect(draft?.truncated).toBe(true);
+  });
+
+  it('notifies display subscribers when a draft terminalizes without another display event', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({
+      runId: 'run-draft-subscribe',
+      finishReason: 'stop',
+      text: 'done',
+      chunks: [{ type: 'text-delta', payload: { id: 'msg-subscribe', text: 'done' }, runId: 'run-draft-subscribe' }],
+    });
+
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const statuses: string[] = [];
+    const unsubscribe = session.subscribeDisplayState(state => {
+      const status = state.assistantDrafts['run-draft-subscribe']?.status;
+      if (status !== undefined) statuses.push(status);
+    });
+    try {
+      await session.message({ content: 'hi' });
+      await waitFor(() => statuses.includes('completed'), 'completed draft display refresh');
+    } finally {
+      unsubscribe();
+    }
+    expect(statuses).toContain('streaming');
+    expect(statuses).toContain('completed');
   });
 
   it('accumulates token usage across multiple turns', async () => {

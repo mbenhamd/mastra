@@ -92,7 +92,7 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
     }
   });
 
-  it('the HITL built-ins ask_user/submit_plan bypass the gate under a deny default', async () => {
+  it('HITL and local plan-task built-ins bypass the gate while escalation built-ins honor it', async () => {
     const { harness } = setupHarness({ modes: [{ id: 'm', agentId: 'default' }], defaultModeId: 'm' });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
@@ -100,14 +100,31 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
       const grants = { categories: [], tools: [] };
       // ask_user / submit_plan are harness HITL infrastructure — never gated, else a
       // deny default would break the question / plan-approval suspension flows.
-      for (const id of ['ask_user', 'submit_plan', 'task_add', 'spawn_subagent']) {
+      for (const id of ['ask_user', 'submit_plan', 'task_add']) {
         expect((session as any)._resolveToolPolicy(id, rules, grants, 'deny')).toBe('allow');
       }
       // A non-builtin user tool is still denied under the deny default.
       expect((session as any)._resolveToolPolicy('someUserTool', rules, grants, 'deny')).toBe('deny');
-      // Without an allowlist, escalation builtins (spawn_subagent/task_delegate)
-      // still bypass the gate even under a deny default (unchanged behavior).
-      expect((session as any)._resolveToolPolicy('task_delegate', rules, grants, 'deny')).toBe('allow');
+      // Escalation built-ins cross agent/session capability boundaries and honor
+      // the engaged policy unless the session/mode explicitly allows them.
+      expect((session as any)._resolveToolPolicy('spawn_subagent', rules, grants, 'deny')).toBe('deny');
+      expect((session as any)._resolveToolPolicy('task_delegate', rules, grants, 'deny')).toBe('deny');
+      expect(
+        (session as any)._resolveToolPolicy(
+          'spawn_subagent',
+          { categories: {}, tools: { spawn_subagent: 'allow' } },
+          grants,
+          'deny',
+        ),
+      ).toBe('allow');
+      expect(
+        (session as any)._resolveToolPolicy(
+          'task_delegate',
+          { categories: {}, tools: { task_delegate: 'ask' } },
+          { categories: [], tools: ['task_delegate'] },
+          'deny',
+        ),
+      ).toBe('allow');
     } finally {
       await harness.shutdown();
     }
@@ -135,7 +152,13 @@ describe('Mode-seeded base permission policy (§4.2e)', () => {
       expect(resolve('spawn_subagent', new Set(['spawn_subagent']))).toBe('allow');
       // The allowlist deny is HARD: a non-listed tool with an explicit allow rule is still denied.
       expect(
-        (session as any)._resolveToolPolicy('writeDoc', { categories: {}, tools: { writeDoc: 'allow' } }, grants, 'allow', allow),
+        (session as any)._resolveToolPolicy(
+          'writeDoc',
+          { categories: {}, tools: { writeDoc: 'allow' } },
+          grants,
+          'allow',
+          allow,
+        ),
       ).toBe('deny');
       // A subagent allowlist engages the gate on its own (so the resolver threads).
       expect((session as any)._toolPermissionGateEngaged()).toBe(false);

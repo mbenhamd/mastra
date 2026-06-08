@@ -418,6 +418,12 @@ export interface SessionRecord {
    * workspace surface.
    */
   currentRun?: HarnessRunOperationalState;
+  /**
+   * Bounded coalesced assistant drafts for active/recent runs. Keyed by
+   * `runId`. Durable snapshot consumers may render these as in-progress rows
+   * until thread messages or operation-result evidence supersede them.
+   */
+  assistantDrafts?: Record<string, HarnessAssistantDraft>;
   queueAdmissionReceipts?: Record<string, QueueAdmissionReceipt>;
   inboxResponseReceipts?: Record<string, InboxResponseReceipt>;
 
@@ -472,14 +478,7 @@ export interface SessionRecord {
 }
 
 /** §5.1e — lifecycle status of a `HarnessRunOperationalState`. */
-export type HarnessRunStatus =
-  | 'starting'
-  | 'running'
-  | 'waiting'
-  | 'resuming'
-  | 'completed'
-  | 'failed'
-  | 'interrupted';
+export type HarnessRunStatus = 'starting' | 'running' | 'waiting' | 'resuming' | 'completed' | 'failed' | 'interrupted';
 
 /** §5.1e — which entry-point operation a run is executing. */
 export type HarnessRunOperationRef =
@@ -553,6 +552,35 @@ export interface HarnessRunOperationalState {
   terminalAt?: number;
   finishReason?: string;
   error?: { code: HarnessRowErrorCode; message: string };
+}
+
+export type HarnessAssistantDraftStatus = 'streaming' | 'interrupted' | 'completed' | 'failed';
+export type HarnessAssistantDraftFinishReason = 'complete' | 'aborted' | 'error';
+
+/**
+ * §5.1x — bounded durable projection of an assistant response that is still
+ * being streamed or has just terminalized. This is not transcript history; the
+ * thread message log and operation-result evidence remain authoritative for
+ * completed content. It exists so first-party clients can reload/reconnect and
+ * still render the latest coalesced assistant draft without replaying every
+ * `text_delta`.
+ */
+export interface HarnessAssistantDraft {
+  runId: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  signalId?: string;
+  queuedItemId?: string;
+  messageId?: string;
+  text: string;
+  reasoningText?: string;
+  status: HarnessAssistantDraftStatus;
+  startedAt: number;
+  updatedAt: number;
+  terminalAt?: number;
+  finishReason?: HarnessAssistantDraftFinishReason;
+  truncated?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,13 +1659,7 @@ export interface SaveAttachmentReferenceInput extends AttachmentReference {
 // to TM-3 / TM-4 / TM-5; TM-2 ships only the durable storage layer.
 // ---------------------------------------------------------------------------
 
-export type HarnessPlanTaskStatus =
-  | 'pending'
-  | 'in_progress'
-  | 'blocked'
-  | 'completed'
-  | 'cancelled'
-  | 'failed';
+export type HarnessPlanTaskStatus = 'pending' | 'in_progress' | 'blocked' | 'completed' | 'cancelled' | 'failed';
 
 /**
  * Whether the current `status` was written by an explicit caller/model action
