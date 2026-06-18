@@ -505,7 +505,7 @@ export class Harness<TState = {}> {
           workspaceName: this.workspace.name,
         });
       } catch (error) {
-        const err = getErrorFromUnknown(error);
+        const err = getErrorFromUnknown(error, { serializeStack: false });
         this.workspace = undefined;
         this.workspaceInitialized = false;
 
@@ -1124,7 +1124,7 @@ export class Harness<TState = {}> {
       try {
         await memoryStorage.clearObservationalMemory(threadId, thread.resourceId);
       } catch (error) {
-        this.emit({ type: 'error', error: getErrorFromUnknown(error) });
+        this.emit({ type: 'error', error: getErrorFromUnknown(error, { serializeStack: false }) });
       }
     }
 
@@ -1860,7 +1860,7 @@ export class Harness<TState = {}> {
       }
       if (this.followUpQueue.length > 0) {
         void this.drainFollowUpQueue(options).catch(error => {
-          this.emit({ type: 'error', error: getErrorFromUnknown(error) });
+          this.emit({ type: 'error', error: getErrorFromUnknown(error, { serializeStack: false }) });
         });
       }
     }
@@ -1937,7 +1937,7 @@ export class Harness<TState = {}> {
         this.emit({ type: 'agent_end', reason: 'aborted' });
       }
     } else {
-      this.emit({ type: 'error', error: getErrorFromUnknown(error) });
+      this.emit({ type: 'error', error: getErrorFromUnknown(error, { serializeStack: false }) });
       this.emit({ type: 'agent_end', reason: 'error' });
     }
     this.agentThreadSubscription?.unsubscribe();
@@ -2730,7 +2730,7 @@ export class Harness<TState = {}> {
       }
 
       case 'error': {
-        const streamError = getErrorFromUnknown(chunk.payload.error);
+        const streamError = getErrorFromUnknown(chunk.payload.error, { serializeStack: false });
         this.emit({ type: 'error', error: streamError });
         break;
       }
@@ -3130,7 +3130,7 @@ export class Harness<TState = {}> {
       const abortError = new Error('aborted');
       abortError.name = 'AbortError';
       void this.handleSubscribedStreamError(abortError).catch(error => {
-        this.emit({ type: 'error', error: getErrorFromUnknown(error) });
+        this.emit({ type: 'error', error: getErrorFromUnknown(error, { serializeStack: false }) });
       });
     } else if (directStreamRunId) {
       this.abortFinalizedRunIds.add(directStreamRunId);
@@ -3347,7 +3347,7 @@ export class Harness<TState = {}> {
         requestContext,
       });
     } catch (error) {
-      const err = getErrorFromUnknown(error);
+      const err = getErrorFromUnknown(error, { serializeStack: false });
       this.emit({ type: 'error', error: err });
       this.emit({ type: 'agent_end', reason: 'error' });
     } finally {
