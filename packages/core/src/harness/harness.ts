@@ -3215,6 +3215,20 @@ export class Harness<TState = {}> {
     }
   }
 
+  private async waitForObservedThreadRunIdle(
+    subscription: AgentThreadSubscription<any> | null,
+    runId: string | null,
+  ): Promise<void> {
+    if (!subscription && runId === null) return;
+
+    while (
+      (runId !== null && subscription !== null && subscription.activeRunId() === runId) ||
+      (runId !== null && this.currentRunId === runId)
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
   getCurrentTraceId(): string | null {
     return this.currentTraceId;
   }
@@ -3407,6 +3421,8 @@ export class Harness<TState = {}> {
       const defaultMode = this.config.modes.find(m => m.default) ?? this.config.modes[0];
       if (defaultMode && defaultMode.id !== this.currentModeId) {
         await new Promise(resolveTimeout => setTimeout(resolveTimeout, 0));
+        const activePlanSubscription = this.agentThreadSubscription;
+        const activePlanRunId = activePlanSubscription?.activeRunId() ?? this.currentRunId;
         await this.switchMode({ modeId: defaultMode.id });
         // switchMode aborts the in-flight run but does not wait for it to
         // finalize. If the caller (e.g. mastracode's plan-approval handler)
@@ -3414,9 +3430,10 @@ export class Harness<TState = {}> {
         // the dying run's pending queue and later get drained with the run's
         // already-aborted abortSignal — manifesting as a hang where the agent
         // never resumes after "The user has approved the plan, begin
-        // executing.". Waiting for the stream to be fully idle here ensures
-        // the next sendSignal() always starts a fresh run.
-        await this.waitForCurrentThreadStreamIdle();
+        // executing.". Observing the pre-switch subscription/run avoids opening
+        // a fresh subscription that could replay buffered chunks under the new mode,
+        // ensuring the next sendSignal() always starts a fresh run.
+        await this.waitForObservedThreadRunIdle(activePlanSubscription, activePlanRunId);
       }
     }
   }

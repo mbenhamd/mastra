@@ -211,7 +211,7 @@ describe('Harness mode-model persistence across restarts', () => {
     (session as any).currentRunId = 'plan-run';
     (session as any).abortController = new AbortController();
     (session as any).agentThreadSubscription = {
-      activeRunId: () => 'plan-run',
+      activeRunId: () => activeRunId,
       abort: vi.fn(),
       unsubscribe: vi.fn(),
       stream: (async function* () {})(),
@@ -222,15 +222,17 @@ describe('Harness mode-model persistence across restarts', () => {
     });
 
     const approval = session.respondToPlanApproval({ planId: 'plan-1', response: { action: 'approved' } });
-    await vi.waitFor(() => expect(buildAgent.subscribeToThread).toHaveBeenCalled());
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(await settleWithinTicks(approval)).toEqual({ settled: false });
+    expect(buildAgent.subscribeToThread).not.toHaveBeenCalled();
 
     activeRunId = null;
     await approval;
+    expect(buildAgent.subscribeToThread).not.toHaveBeenCalled();
 
     const signal = session.sendSignal({ content: 'continue' });
     await expect(signal.accepted).resolves.toMatchObject({ accepted: true, runId: 'fresh-run' });
+    expect(buildAgent.subscribeToThread).toHaveBeenCalledTimes(1);
     expect(sendSignalSpy).toHaveBeenCalledTimes(1);
     expect(sendSignalSpy.mock.calls[0]?.[1]).toMatchObject({ ifIdle: expect.any(Object) });
     expect(sendSignalSpy.mock.calls[0]?.[1]).not.toHaveProperty('runId');
