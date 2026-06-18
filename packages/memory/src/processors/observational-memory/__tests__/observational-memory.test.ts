@@ -3344,35 +3344,53 @@ Line 2`;
 
 describe('didProviderChange', () => {
   it('returns false when either side is undefined', () => {
-    expect(didProviderChange(undefined, 'openai/gpt-4o')).toBe(false);
-    expect(didProviderChange('openai/gpt-4o', undefined)).toBe(false);
+    expect(didProviderChange(undefined, 'openai/__AI_SDK_OPENAI_MODEL_BASE__')).toBe(false);
+    expect(didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', undefined)).toBe(false);
     expect(didProviderChange(undefined, undefined)).toBe(false);
   });
 
   it('returns false when both sides are identical fully-formatted strings', () => {
-    expect(didProviderChange('openai/gpt-4o', 'openai/gpt-4o')).toBe(false);
+    expect(didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', 'openai/__AI_SDK_OPENAI_MODEL_BASE__')).toBe(false);
   });
 
   it('returns true when both sides are fully-formatted but differ', () => {
-    expect(didProviderChange('openai/gpt-4o', 'anthropic/claude-opus-4-7')).toBe(true);
-    expect(didProviderChange('openai.responses/gpt-5.4', 'openai/gpt-5.4')).toBe(true);
+    expect(didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', 'anthropic/__AI_SDK_ANTHROPIC_MODEL__')).toBe(true);
+    expect(didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', 'openai/__AI_SDK_OPENAI_MODEL_REALTIME__')).toBe(
+      true,
+    );
+    expect(
+      didProviderChange('openai.responses/__AI_SDK_OPENAI_MODEL_BASE__', 'openai/__AI_SDK_OPENAI_MODEL_REALTIME__'),
+    ).toBe(true);
+  });
+
+  it('returns false when provider subnamespaces differ but base provider and modelId match', () => {
+    expect(
+      didProviderChange('openai.responses/__AI_SDK_OPENAI_MODEL_BASE__', 'openai/__AI_SDK_OPENAI_MODEL_BASE__'),
+    ).toBe(false);
+    expect(
+      didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', 'openai.responses/__AI_SDK_OPENAI_MODEL_BASE__'),
+    ).toBe(false);
   });
 
   it('returns false when persisted history has bare modelId that matches actor modelId', () => {
-    // Legacy persisted metadata: { provider: null, modelId: 'gpt-5.4' } -> 'gpt-5.4'
-    // Current actor formatted: 'openai.responses/gpt-5.4'
+    // Legacy persisted metadata: { provider: null, modelId: '__AI_SDK_OPENAI_MODEL_BASE__' }
+    // Current actor formatted: 'openai.responses/__AI_SDK_OPENAI_MODEL_BASE__'
     // Should NOT trigger a provider change.
-    expect(didProviderChange('openai.responses/gpt-5.4', 'gpt-5.4')).toBe(false);
-    expect(didProviderChange('gpt-5.4', 'openai.responses/gpt-5.4')).toBe(false);
+    expect(didProviderChange('openai.responses/__AI_SDK_OPENAI_MODEL_BASE__', '__AI_SDK_OPENAI_MODEL_BASE__')).toBe(
+      false,
+    );
+    expect(didProviderChange('__AI_SDK_OPENAI_MODEL_BASE__', 'openai.responses/__AI_SDK_OPENAI_MODEL_BASE__')).toBe(
+      false,
+    );
   });
 
   it('returns true when bare modelId differs from actor modelId', () => {
-    expect(didProviderChange('openai/gpt-4o', 'gpt-5.4')).toBe(true);
-    expect(didProviderChange('gpt-5.4', 'openai/gpt-4o')).toBe(true);
+    expect(didProviderChange('openai/__AI_SDK_OPENAI_MODEL_BASE__', '__AI_SDK_OPENAI_MODEL_REALTIME__')).toBe(true);
+    expect(didProviderChange('__AI_SDK_OPENAI_MODEL_REALTIME__', 'openai/__AI_SDK_OPENAI_MODEL_BASE__')).toBe(true);
   });
 
   it('returns false when both sides are identical bare modelIds', () => {
-    expect(didProviderChange('gpt-5.4', 'gpt-5.4')).toBe(false);
+    expect(didProviderChange('__AI_SDK_OPENAI_MODEL_BASE__', '__AI_SDK_OPENAI_MODEL_BASE__')).toBe(false);
   });
 });
 
