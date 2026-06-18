@@ -3414,8 +3414,10 @@ export class Harness<TState = {}> {
         // the dying run's pending queue and later get drained with the run's
         // already-aborted abortSignal — manifesting as a hang where the agent
         // never resumes after "The user has approved the plan, begin
-        // executing.". Waiting for the stream to be fully idle here ensures
-        // the next sendSignal() always starts a fresh run.
+        // executing.". Reattaching the current mode's thread subscription
+        // before waiting lets the idle check observe the still-active run,
+        // ensuring the next sendSignal() always starts a fresh run.
+        await this.ensureCurrentAgentThreadSubscription();
         await this.waitForCurrentThreadStreamIdle();
       }
     }
