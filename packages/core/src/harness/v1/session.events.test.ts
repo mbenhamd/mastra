@@ -156,6 +156,28 @@ describe('Session.subscribe()', () => {
     expect(second.changedKeys).toEqual(['c']);
   });
 
+  it('does not emit state_changed when object keys are only reordered (§10.2)', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const events: HarnessEvent[] = [];
+    session.subscribe(e => {
+      if (e.type === 'state_changed') events.push(e);
+    });
+
+    await session.setState({ filters: { status: 'open', owner: 'u1' }, page: 1 });
+    await session.setState({ filters: { owner: 'u1', status: 'open' } });
+    await session.setState({ filters: { owner: 'u1', status: 'closed' } });
+
+    expect(events).toHaveLength(2);
+    const first = events[0] as { state: Record<string, unknown>; changedKeys: string[] };
+    expect(first.state).toEqual({ filters: { status: 'open', owner: 'u1' }, page: 1 });
+    expect(first.changedKeys.sort()).toEqual(['filters', 'page']);
+    const second = events[1] as { state: Record<string, unknown>; changedKeys: string[] };
+    expect(second.state).toEqual({ filters: { owner: 'u1', status: 'closed' }, page: 1 });
+    expect(second.changedKeys).toEqual(['filters']);
+  });
+
   it('emits state_changed with the "$" root sentinel for scalar/array root changes (§10.2)', async () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
