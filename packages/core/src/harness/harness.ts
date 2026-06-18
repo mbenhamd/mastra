@@ -3215,6 +3215,20 @@ export class Harness<TState = {}> {
     }
   }
 
+  private async waitForObservedThreadRunIdle(
+    subscription: AgentThreadSubscription<any> | null,
+    runId: string | null,
+  ): Promise<void> {
+    if (!subscription && runId === null) return;
+
+    while (
+      (runId !== null && subscription !== null && subscription.activeRunId() === runId) ||
+      (runId !== null && this.currentRunId === runId)
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
   getCurrentTraceId(): string | null {
     return this.currentTraceId;
   }
@@ -3406,6 +3420,8 @@ export class Harness<TState = {}> {
     if (response.action === 'approved') {
       const defaultMode = this.config.modes.find(m => m.default) ?? this.config.modes[0];
       if (defaultMode && defaultMode.id !== this.currentModeId) {
+        const activePlanSubscription = this.agentThreadSubscription;
+        const activePlanRunId = activePlanSubscription?.activeRunId() ?? this.currentRunId;
         await new Promise(resolveTimeout => setTimeout(resolveTimeout, 0));
         await this.switchMode({ modeId: defaultMode.id });
         // switchMode aborts the in-flight run but does not wait for it to
@@ -3414,11 +3430,10 @@ export class Harness<TState = {}> {
         // the dying run's pending queue and later get drained with the run's
         // already-aborted abortSignal — manifesting as a hang where the agent
         // never resumes after "The user has approved the plan, begin
-        // executing.". Reattaching the current mode's thread subscription
-        // before waiting lets the idle check observe the still-active run,
+        // executing.". Observing the pre-switch subscription/run avoids opening
+        // a fresh subscription that could replay buffered chunks under the new mode,
         // ensuring the next sendSignal() always starts a fresh run.
-        await this.ensureCurrentAgentThreadSubscription();
-        await this.waitForCurrentThreadStreamIdle();
+        await this.waitForObservedThreadRunIdle(activePlanSubscription, activePlanRunId);
       }
     }
   }
