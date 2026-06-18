@@ -1207,6 +1207,9 @@ export class Agent<
       type: 'processor',
       options: {
         validateInputs: false,
+        // Internal processor workflows are transient and non-resumable, so they must never
+        // write snapshot rows to the user's storage (mirrors the execution-workflow fix in #17344).
+        shouldPersistSnapshot: () => false,
         tracingPolicy: {
           // mark all workflow spans related to processor execution as internal
           internal: InternalSpans.WORKFLOW,
@@ -1242,6 +1245,14 @@ export class Agent<
     }
 
     const committedWorkflow = workflow.commit() as T;
+    // Register the parent Mastra instance on this internal processor workflow so that its
+    // createRun() -> getWorkflowRunById() can read configured storage instead of logging
+    // "Cannot get workflow run. Mastra storage is not initialized" on every run (then falling
+    // back to in-memory). Combined with shouldPersistSnapshot:()=>false above, this does not
+    // write any processor-workflow rows to storage. Mirrors the execution-workflow fix in #17344.
+    if (this.#mastra && isProcessorWorkflow(committedWorkflow)) {
+      committedWorkflow.__registerMastra(this.#mastra);
+    }
     if (stateSignalProcessors.length > 0 && isProcessorWorkflow(committedWorkflow)) {
       committedWorkflow.__stateSignalProcessors = stateSignalProcessors;
     }
@@ -5258,9 +5269,34 @@ export class Agent<
     autoResumeSuspendedTools?: boolean;
   }): Promise<Record<string, CoreTool>> {
     const requestContext = options.requestContext ?? new RequestContext();
+    const defaultOptions = await this.getDefaultOptions({ requestContext });
+    const mergedOptions = deepMerge(
+      defaultOptions as Record<string, unknown>,
+      { ...options, requestContext } as Record<string, unknown>,
+    ) as AgentExecutionOptions & typeof options;
+    const optionMemory = (options as { memory?: AgentExecutionOptionsBase<any>['memory'] }).memory;
+    const mergedMemory = mergedOptions.memory;
+    const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
+    const explicitThreadFromArgs = resolveThreadIdFromArgs({
+      memory: optionMemory,
+      threadId: options.threadId,
+      overrideId: threadIdFromContext,
+    });
+    const defaultThreadFromArgs = resolveThreadIdFromArgs({
+      memory: mergedMemory,
+      overrideId: threadIdFromContext,
+    });
+    const resourceIdFromContext = requestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
+
     return this.convertTools({
-      ...options,
+      toolsets: mergedOptions.toolsets,
+      clientTools: mergedOptions.clientTools,
+      threadId: explicitThreadFromArgs?.id ?? defaultThreadFromArgs?.id,
+      resourceId: resourceIdFromContext || options.resourceId || optionMemory?.resource || mergedMemory?.resource,
+      runId: mergedOptions.runId,
       requestContext,
+      memoryConfig: options.memoryConfig ?? mergedMemory?.options,
+      autoResumeSuspendedTools: mergedOptions.autoResumeSuspendedTools,
       methodType: 'stream',
       pubsub: this.getPubSub() ?? defaultAgentThreadPubSub,
     });
