@@ -4132,6 +4132,94 @@ describe('Agent signals', () => {
     subscription.unsubscribe();
   });
 
+  it('characterizes PF-802 active signal output as one aggregate run without segment markers', async () => {
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let streamCount = 0;
+
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        streamCount += 1;
+        const responseText = streamCount === 1 ? 'first response' : 'signal response';
+
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'response-metadata',
+                id: `id-${streamCount}`,
+                modelId: 'mock-model-id',
+                timestamp: new Date(0),
+              });
+              controller.enqueue({ type: 'text-start', id: `text-${streamCount}` });
+              controller.enqueue({ type: 'text-delta', id: `text-${streamCount}`, delta: responseText });
+              controller.enqueue({ type: 'text-end', id: `text-${streamCount}` });
+              if (streamCount === 1) {
+                await firstFinished;
+              }
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'pf-802-aggregate-signal-agent',
+      name: 'PF-802 Aggregate Signal Agent',
+      instructions: 'Test',
+      model,
+    });
+
+    const subscription = await agent.subscribeToThread({
+      threadId: 'pf-802-aggregate-thread',
+      resourceId: 'pf-802-aggregate-user',
+    });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const runPromise = readNextRunWithParts(iterator);
+
+    const stream = await agent.stream('Hello', {
+      memory: { thread: 'pf-802-aggregate-thread', resource: 'pf-802-aggregate-user' },
+    });
+    await expect(waitForActiveRun(subscription)).resolves.toBe(stream.runId);
+
+    const signalResult = await agent.sendSignal(
+      { type: 'user-message', contents: 'Hello while running' },
+      { resourceId: 'pf-802-aggregate-user', threadId: 'pf-802-aggregate-thread' },
+    );
+    expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+
+    releaseFirst();
+    const run = await runPromise;
+    const textDeltas = run.value.parts.filter(part => part.type === 'text-delta');
+
+    expect(run.value.runId).toBe(stream.runId);
+    expect(run.value.text).toBe('first responsesignal response');
+    expect(textDeltas.map(part => part.payload.text)).toEqual(['first response', 'signal response']);
+    expect(new Set(textDeltas.map(part => part.runId))).toEqual(new Set([stream.runId]));
+    const textDeltaMessageIds = textDeltas.map(part => part.messageId ?? part.payload?.messageId);
+    expect(textDeltaMessageIds).toEqual([undefined, undefined]);
+    expect(
+      run.value.parts.map(part => ({
+        segmentId: part.segmentId ?? part.payload?.segmentId,
+        segmentIndex: part.segmentIndex ?? part.payload?.segmentIndex,
+      })),
+    ).toEqual(run.value.parts.map(() => ({ segmentId: undefined, segmentIndex: undefined })));
+
+    await stream.consumeStream();
+    subscription.unsubscribe();
+  });
+
   it('drops a not-yet-visible current-step tool call when draining a follow-up signal', async () => {
     const prompts: any[][] = [];
     let callCount = 0;
