@@ -19,6 +19,33 @@ function createHarness() {
 }
 
 describe('Harness OM failure abort behavior', () => {
+  it('omits stack traces when error events are JSON stringified', async () => {
+    const harness = createHarness();
+    const events: HarnessEvent[] = [];
+    harness.subscribe(event => events.push(event));
+
+    const streamError = new Error('provider failed without leaking stack');
+    streamError.stack =
+      'Error: provider failed without leaking stack\n    at /private/customer/project/secret.ts:12:34';
+
+    await (harness as any).processStream({
+      fullStream: (async function* () {
+        yield {
+          type: 'error',
+          payload: { error: streamError },
+        };
+      })(),
+    });
+
+    const errorEvent = events.find(e => e.type === 'error');
+    expect(errorEvent?.type).toBe('error');
+    const serialized = JSON.stringify(errorEvent);
+    const parsed = JSON.parse(serialized);
+    expect(parsed.error.message).toBe('provider failed without leaking stack');
+    expect(parsed.error.stack).toBeUndefined();
+    expect(serialized).not.toContain('/private/customer/project/secret.ts');
+  });
+
   it('aborts stream and emits an error when OM buffering fails', async () => {
     const harness = createHarness();
     const events: HarnessEvent[] = [];
