@@ -3420,9 +3420,9 @@ export class Harness<TState = {}> {
     if (response.action === 'approved') {
       const defaultMode = this.config.modes.find(m => m.default) ?? this.config.modes[0];
       if (defaultMode && defaultMode.id !== this.currentModeId) {
+        await new Promise(resolveTimeout => setTimeout(resolveTimeout, 0));
         const activePlanSubscription = this.agentThreadSubscription;
         const activePlanRunId = activePlanSubscription?.activeRunId() ?? this.currentRunId;
-        await new Promise(resolveTimeout => setTimeout(resolveTimeout, 0));
         await this.switchMode({ modeId: defaultMode.id });
         // switchMode aborts the in-flight run but does not wait for it to
         // finalize. If the caller (e.g. mastracode's plan-approval handler)
