@@ -121,8 +121,12 @@ export async function acquireDevLock(dotMastraPath: string): Promise<void> {
       if (lock && isProcessRunning(lock.pid)) {
         printDuplicateError(lock);
       }
-      // If the PID is dead, overwrite as a last resort
-      await writeFile(lockPath, JSON.stringify(data), 'utf-8');
+      try {
+        await unlink(lockPath);
+      } catch (unlinkErr: unknown) {
+        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkErr;
+      }
+      await writeFile(lockPath, JSON.stringify(data), { encoding: 'utf-8', flag: 'wx' });
     }
   }
 }

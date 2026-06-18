@@ -330,7 +330,7 @@ export class MCPServer extends MCPServerBase {
     const hasUiTools = Object.values(this.convertedTools).some(
       tool => (tool.mcp?._meta as Record<string, any>)?.ui?.resourceUri,
     );
-    if (hasUiTools || opts.appResources) {
+    if (hasUiTools || this.hasUiResources) {
       capabilities.extensions = {
         ...capabilities.extensions,
         'io.modelcontextprotocol/ui': {},

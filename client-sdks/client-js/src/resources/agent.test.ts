@@ -61,6 +61,11 @@ describe('Agent signal routes', () => {
     ],
   });
 
+  const continuationToolResultOnlyMessage = (toolCallId: string, toolName: string, output: unknown) => ({
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId, toolName, output: { type: 'json', value: output } }],
+  });
+
   const mockSignalAndSubscriptionRequests = async (
     agent: Agent,
     runId: string,
@@ -796,9 +801,58 @@ describe('Agent signal routes', () => {
     const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
     expect(continuation.messages).toEqual([
       ...assistantMessages,
-      continuationToolResultMessage('call-1', 'myTool', { x: 'hi' }, { ok: true }),
+      continuationToolResultOnlyMessage('call-1', 'myTool', { ok: true }),
     ]);
     expect(continuation.streamOptions?.memory).toBeUndefined();
+  });
+
+  it('serializes stateless client-tool continuation results as JSON values', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: {} }],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-stateless-json',
+        payload: { toolCallId: 'call-1', toolName: 'myTool', args: {} },
+      },
+      {
+        type: 'finish',
+        runId: 'run-stateless-json',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const clientTools = {
+      myTool: {
+        id: 'myTool',
+        description: 'tool',
+        inputSchema: z.object({}),
+        execute: vi.fn(async () => circular),
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-stateless-json', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({} as SubscribeAgentThreadParams);
+    await subscribed.processDataStream({ onChunk: async () => {} });
+
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    expect(continuation.messages).toEqual([
+      ...assistantMessages,
+      continuationToolResultOnlyMessage('call-1', 'myTool', { error: 'Non-serializable client tool result' }),
+    ]);
   });
 
   it('executes multiple client tools after one tool-calls finish', async () => {
@@ -1052,7 +1106,7 @@ describe('Agent signal routes', () => {
     ]);
   });
 
-  it('continues receiving later run chunks through the same subscription stream', async () => {
+  it('uses returned continuation run IDs for later client-tool chunks in the same subscription stream', async () => {
     const agent = new Agent(mockClientOptions, 'test-agent');
     const assistantMessages = [
       {
@@ -1060,11 +1114,21 @@ describe('Agent signal routes', () => {
         content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: {} }],
       },
     ];
-    const continuationTextChunk = { type: 'text-delta', runId: 'run-continuation', payload: { text: 'done' } };
-    const continuationFinishChunk = {
+    const continuationAssistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-2', toolName: 'myTool', args: { step: 2 } }],
+      },
+    ];
+    const continuationToolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-continuation',
+      payload: { toolCallId: 'call-2', toolName: 'myTool', args: { step: 2 } },
+    };
+    const continuationToolFinishChunk = {
       type: 'finish',
       runId: 'run-continuation',
-      payload: { stepResult: { reason: 'stop' }, messages: { nonUser: [] } },
+      payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: continuationAssistantMessages } },
     };
     const chunks = [
       { type: 'tool-call', runId: 'run-first', payload: { toolCallId: 'call-1', toolName: 'myTool', args: {} } },
@@ -1073,20 +1137,22 @@ describe('Agent signal routes', () => {
         runId: 'run-first',
         payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
       },
-      continuationTextChunk,
-      continuationFinishChunk,
+      continuationToolCallChunk,
+      continuationToolFinishChunk,
     ];
     const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
     const sendToolApprovalSpy = vi
       .spyOn(agent, 'sendToolApproval')
-      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+      .mockResolvedValueOnce({ accepted: true, runId: 'run-continuation' } as never)
+      .mockResolvedValueOnce({ accepted: true, runId: 'run-final' } as never);
+    const executeSpy = vi.fn(async args => ({ args }));
 
     const clientTools = {
       myTool: {
         id: 'myTool',
         description: 'tool',
         inputSchema: z.object({}),
-        execute: vi.fn(async () => ({ ok: true })),
+        execute: executeSpy,
       },
     };
 
@@ -1106,9 +1172,12 @@ describe('Agent signal routes', () => {
     await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
 
     expect(streamUntilIdleSpy).not.toHaveBeenCalled();
-    expect(sendToolApprovalSpy).toHaveBeenCalledTimes(1);
-    expect(received).toContainEqual(continuationTextChunk);
-    expect(received).toContainEqual(continuationFinishChunk);
+    expect(sendToolApprovalSpy).toHaveBeenCalledTimes(2);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(received.filter(chunk => chunk.type === 'tool-result').map(chunk => chunk.payload.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+    ]);
   });
 
   it('uses send-owned runtime options for subscribed client-tool execution and continuation', async () => {

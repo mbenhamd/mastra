@@ -115,6 +115,16 @@ const deleteSignalRuntimeOptionsEntry = (store: Map<string, SignalRuntimeOptions
   store.delete(key);
 };
 
+const toClientToolJSONValue = (value: unknown): JSONValue => {
+  if (value === undefined) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? null : (JSON.parse(serialized) as JSONValue);
+  } catch {
+    return { error: 'Non-serializable client tool result' };
+  }
+};
+
 const noopClientToolObserve: ToolObserve = {
   async span<T>(_name: string, fn: () => Promise<T> | T): Promise<T> {
     return fn();
@@ -706,6 +716,7 @@ export class Agent extends BaseResource {
           const processedRequestContext = parseClientRequestContext(activeRequestContext);
 
           const toolResultMessages: AIV5Type.ModelMessage[] = [];
+          const toolResultOnlyMessages: AIV5Type.ModelMessage[] = [];
           for (const toolCall of pendingToolCalls) {
             const clientTool = activeClientTools[toolCall.toolName] as Tool | undefined;
             if (!clientTool || typeof clientTool.execute !== 'function') continue;
@@ -748,6 +759,7 @@ export class Agent extends BaseResource {
               args?: unknown;
               __mastraObservability?: ClientToolObservabilityEnvelope;
             };
+            const serializedResult = toClientToolJSONValue(result);
 
             await onChunk({
               type: 'tool-result',
@@ -765,7 +777,7 @@ export class Agent extends BaseResource {
               type: 'tool-result',
               toolCallId: toolCall.toolCallId,
               toolName: toolCall.toolName,
-              output: { type: 'json', value: result as JSONValue },
+              output: { type: 'json', value: serializedResult },
               ...(observability ? { __mastraObservability: observability } : {}),
             } satisfies AIV5Type.ToolResultPart & { __mastraObservability?: ClientToolObservabilityEnvelope };
 
@@ -773,6 +785,10 @@ export class Agent extends BaseResource {
               role: 'assistant',
               content: [continuationToolCall, continuationToolResult],
             });
+            toolResultOnlyMessages.push({
+              role: 'tool',
+              content: [continuationToolResult],
+            } as AIV5Type.ModelMessage);
           }
 
           if (toolResultMessages.length === 0) {
@@ -794,17 +810,25 @@ export class Agent extends BaseResource {
           });
 
           const continuationMessages = (
-            threadId ? toolResultMessages : [...(finishPayload.payload?.messages?.nonUser ?? []), ...toolResultMessages]
+            threadId
+              ? toolResultMessages
+              : [...(finishPayload.payload?.messages?.nonUser ?? []), ...toolResultOnlyMessages]
           ) as MessageListInput;
 
           try {
-            await agent.sendToolApproval({
+            const approval = await agent.sendToolApproval({
               resourceId: resourceId || agent.agentId,
               threadId,
               toolCallId: pendingToolCalls[0]!.toolCallId,
               approved: true,
               requestContext: processedRequestContext,
               messages: continuationMessages,
+              streamOptions: continuationStreamOptions,
+            });
+            agent.setSignalRuntimeOptions({
+              runId: approval.runId,
+              resourceId,
+              threadId,
               streamOptions: continuationStreamOptions,
             });
           } catch (error) {

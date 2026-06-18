@@ -591,6 +591,21 @@ describe('Workspace Safety Features', () => {
       await workspace.destroy();
     });
 
+    it('requires approval by default for resolver-backed sandboxes', async () => {
+      const workspace = new Workspace({
+        filesystem: new LocalFilesystem({ basePath: tempDir }),
+        sandbox: async () => new LocalSandbox({ workingDirectory: tempDir }),
+      });
+      await workspace.init();
+
+      const tools = await createWorkspaceTools(workspace);
+
+      expect(tools[WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND]).toBeDefined();
+      expect(tools[WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND].requireApproval).toBe(true);
+
+      await workspace.destroy();
+    });
+
     it('does NOT change the default for an isolated sandbox (isolation !== none)', async () => {
       // A sandbox that reports OS-level isolation (e.g. seatbelt/bwrap, or a
       // cloud/container provider) is safe by construction, so the command tool

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 
-import { MCPServer } from '../server';
+import { MCPServer } from './server';
 
 /**
  * Regression tests for cross-tenant resource leakage.

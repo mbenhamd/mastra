@@ -841,6 +841,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
                 response = {
                   ...otherMetadata,
+                  modelId:
+                    (chunk.payload.metadata?.modelId as string) || (chunk.payload.metadata?.model as string) || '',
                   messages: messageList.get.response.aiV5.model(),
                   uiMessages: messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
                 };
@@ -923,6 +925,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     const { providerMetadata, request, ...otherMetadata } = chunk.payload.metadata;
                     response = {
                       ...otherMetadata,
+                      modelId:
+                        (chunk.payload.metadata?.modelId as string) || (chunk.payload.metadata?.model as string) || '',
                       messages: messageList.get.response.aiV5.model(),
                       uiMessages: messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
                     };

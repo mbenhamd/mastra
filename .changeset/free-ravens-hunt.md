@@ -2,4 +2,4 @@
 '@mastra/otel-exporter': patch
 ---
 
-Fixed OpenTelemetry GenAI spans to include the conversation id from trace metadata.
+Fixed missing conversation IDs in exported traces. Spans now include the thread ID from metadata so related events are easier to follow.

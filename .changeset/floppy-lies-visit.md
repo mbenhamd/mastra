@@ -2,4 +2,4 @@
 '@mastra/posthog': patch
 ---
 
-Fixed PostHog group analytics not being populated for AI events. Events that include `metadata.$groups` are now correctly attached to their PostHog groups, so you can slice LLM analytics such as cost by group.
+Fixed missing PostHog group assignment for AI events. Events with `metadata.$groups` now include top-level groups, so analytics can be filtered by group.

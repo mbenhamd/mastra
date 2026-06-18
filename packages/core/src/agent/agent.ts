@@ -74,12 +74,6 @@ import { WorkspaceInstructionsProcessor } from '../processors/processors/workspa
 import type { ProcessorState } from '../processors/runner';
 import { ProcessorRunner } from '../processors/runner';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, MASTRA_VERSIONS_KEY } from '../request-context';
-import {
-  enforceChannelToolFence,
-  isHarnessChannelBoundTurn,
-  readChannelToolFence,
-  stampChannelToolFence,
-} from './channel-tool-fence';
 import type { InferStandardSchemaOutput } from '../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
 import { ChunkFrom } from '../stream';
@@ -115,6 +109,12 @@ import type {
   DelegationStartContext,
   DelegationCompleteContext,
 } from './agent.types';
+import {
+  enforceChannelToolFence,
+  isHarnessChannelBoundTurn,
+  readChannelToolFence,
+  stampChannelToolFence,
+} from './channel-tool-fence';
 import { buildMcpServerGuidance } from './mcp-guidance';
 import { MessageList } from './message-list';
 import type { MessageInput, MessageListInput, UIMessageWithMetadata, MastraDBMessage } from './message-list';
@@ -1014,7 +1014,6 @@ export class Agent<
         }
       }
 
-      if ((msg as { role: string }).role !== 'tool') continue;
       const content = (msg as { content?: unknown }).content;
       if (!Array.isArray(content)) continue;
 

@@ -923,20 +923,19 @@ describe('MastraLLM', () => {
         tracingContext: { currentSpan: mockCurrentSpan },
       };
 
-      // Use fake timers so the 10s delay completes instantly
       vi.useFakeTimers();
+      try {
+        const textPromise = llm.__text({
+          messages: [{ role: 'user', content: 'test' }],
+          requestContext: new RequestContext(),
+          ...tracingCtx,
+        });
 
-      const textPromise = llm.__text({
-        messages: [{ role: 'user', content: 'test' }],
-        requestContext: new RequestContext(),
-        ...tracingCtx,
-      });
-
-      // Advance past the 10s delay
-      await vi.advanceTimersByTimeAsync(11_000);
-      await textPromise;
-
-      vi.useRealTimers();
+        await vi.advanceTimersByTimeAsync(11_000);
+        await textPromise;
+      } finally {
+        vi.useRealTimers();
+      }
 
       expect(rateLimitMastra.logger.warn).toHaveBeenCalledWith(
         'Rate limit approaching, waiting 10 seconds',

@@ -545,6 +545,7 @@ export async function createWorkspaceTools(
   } else if (hasSandboxConfig(workspace)) {
     await addTool(WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND, executeCommandWithBackgroundTool, {
       targets: { sandbox: true },
+      defaults: { requireApproval: true },
     });
     await addTool(WORKSPACE_TOOLS.SANDBOX.GET_PROCESS_OUTPUT, getProcessOutputTool, { targets: { sandbox: true } });
     await addTool(WORKSPACE_TOOLS.SANDBOX.KILL_PROCESS, killProcessTool, { targets: { sandbox: true } });
