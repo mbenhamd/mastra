@@ -190,6 +190,30 @@ describe('handleHarnessChatStream', () => {
     expect(session.message).not.toHaveBeenCalled();
   });
 
+  it('rejects file parts instead of silently dropping them before Harness admission', async () => {
+    const session = createSession();
+    const messages = [
+      {
+        id: 'user-1',
+        role: 'user',
+        parts: [
+          { type: 'text', text: 'Summarize this' },
+          { type: 'file', mediaType: 'text/plain', url: 'data:text/plain;base64,SGk=' },
+        ],
+      },
+    ] as V5UIMessage[];
+
+    await expect(
+      handleHarnessChatStream({
+        session,
+        params: { messages },
+      }),
+    ).rejects.toMatchObject({
+      path: 'handleHarnessChatStream.params.messages.parts[1]',
+    });
+    expect(session.message).not.toHaveBeenCalled();
+  });
+
   it('does not turn consumer stream cancellation into a Harness abort', async () => {
     const session = createSession({
       fullStream: new ReadableStream({

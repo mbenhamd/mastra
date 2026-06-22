@@ -1,6 +1,8 @@
 export { chatRoute, handleChatStream, handleHarnessChatStream, HarnessChatStreamValidationError } from './chat-route';
 export type {
   chatRouteOptions,
+  HarnessChatAttachmentRef,
+  HarnessChatMessageOptions,
   HarnessChatSessionLike,
   HarnessChatStreamHandlerOptions,
   HarnessChatStreamHandlerParams,
