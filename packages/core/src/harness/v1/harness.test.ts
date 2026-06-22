@@ -1380,6 +1380,59 @@ describe('Harness v1 — construction', () => {
     expect(agent.getChannels()).toBeNull();
   });
 
+  it('rejects a direct-bound default Harness when Mastra already has one', () => {
+    const existingHarness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent('default') },
+      storage: new InMemoryStore(),
+      harnesses: { default: existingHarness },
+    });
+
+    expect(
+      () =>
+        new Harness({
+          mastra,
+          modes: [{ id: 'other', agentId: 'default' }],
+          defaultModeId: 'other',
+        }),
+    ).toThrow(/already registered/);
+    expect(mastra.getHarness()).toBe(existingHarness);
+  });
+
+  it('adds the wakeup worker when a direct-bound Harness registers after Mastra construction', () => {
+    const mastra = new Mastra({
+      agents: { default: makeAgent('default') },
+      storage: new InMemoryStore(),
+    });
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(false);
+
+    new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(true);
+  });
+
+  it('rejects AgentChannels registration after an agent is removed', () => {
+    const agent = makeAgent('default');
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+    });
+
+    expect(mastra.removeAgent('default')).toBe(true);
+    expect(() => agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(/removed/);
+    expect(
+      mastra.getServer()?.apiRoutes?.some(route => route.path === '/api/agents/default/channels/slack/webhook') ??
+        false,
+    ).toBe(false);
+  });
+
   it('replaces stale webhook routes when AgentChannels are rebuilt', () => {
     const agent = new Agent({
       id: 'default',

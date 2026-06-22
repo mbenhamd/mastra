@@ -1644,8 +1644,20 @@ export class Mastra<
   }
 
   /** @internal */
+  _assertDirectHarnessRegistrationAvailable(harnessName: string, harness: HarnessV1): void {
+    const registeredHarness = this.#harnesses[harnessName];
+    if (registeredHarness !== undefined && registeredHarness !== harness) {
+      throw new Error(
+        `Harness "${harnessName}" is already registered on this Mastra instance; direct-bound harnesses must use a unique harness name.`,
+      );
+    }
+  }
+
+  /** @internal */
   _registerDirectHarness(harnessName: string, harness: HarnessV1): void {
+    this._assertDirectHarnessRegistrationAvailable(harnessName, harness);
     this.#harnesses[harnessName] = harness;
+    this.#ensureHarnessWakeupWorker();
     this.#ensureHarnessChannelOutboxWorker();
   }
 
@@ -1661,6 +1673,9 @@ export class Mastra<
   /** @internal */
   _registerAgentChannelsForAgent(agentOrKey: { id: string } | string, agentChannelsInstance: AgentChannels): void {
     const agentKey = this.#resolveAgentKey(agentOrKey);
+    if (typeof agentOrKey !== 'string' && this.#agents[agentKey] === undefined) {
+      throw new Error(`Cannot register AgentChannels for removed or unregistered agent "${agentKey}"`);
+    }
     this.#assertNoHarnessAgentChannelToolCollisionForAgent(agentKey, agentChannelsInstance);
     if (
       typeof agentOrKey !== 'string' &&

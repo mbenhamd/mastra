@@ -1316,6 +1316,7 @@ export class Harness {
     //   3. Neither — defer; a parent Mastra will install itself via
     //      __registerMastra during its own construction.
     if (config.mastra) {
+      config.mastra._assertDirectHarnessRegistrationAvailable(this._harnessName, this);
       config.mastra._assertHarnessAgentChannelToolCollisionsForHarness(this, this._harnessName);
       this._bindMastra(config.mastra);
       config.mastra._registerDirectHarness(this._harnessName, this);
