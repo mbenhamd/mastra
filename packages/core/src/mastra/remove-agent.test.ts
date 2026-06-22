@@ -1,6 +1,30 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Agent } from '../agent';
+import { AgentChannels } from '../channels';
+import { InMemoryStore } from '../storage/mock';
 import { Mastra } from './index';
+
+function createMockAdapter(name: string) {
+  return {
+    name,
+    postMessage: vi.fn().mockResolvedValue({ id: 'sent-1', text: 'ok' }),
+    editMessage: vi.fn().mockResolvedValue(undefined),
+    deleteMessage: vi.fn().mockResolvedValue(undefined),
+    addReaction: vi.fn().mockResolvedValue(undefined),
+    removeReaction: vi.fn().mockResolvedValue(undefined),
+    handleWebhook: vi.fn().mockResolvedValue(new Response('ok', { status: 200 })),
+    initialize: vi.fn().mockResolvedValue(undefined),
+    fetchMessages: vi.fn().mockResolvedValue([]),
+    encodeThreadId: vi.fn((...parts: string[]) => parts.join(':')),
+    decodeThreadId: vi.fn((id: string) => id.split(':')),
+    channelIdFromThreadId: vi.fn((id: string) => id.split(':').slice(0, 2).join(':')),
+    renderFormatted: vi.fn((text: string) => text),
+    fetchThread: vi.fn().mockResolvedValue(null),
+    startTyping: vi.fn().mockResolvedValue(undefined),
+    parseMessage: vi.fn((raw: unknown) => raw),
+    userName: 'TestBot',
+  } as any;
+}
 
 describe('Mastra.removeAgent', () => {
   it('should remove an agent by key', () => {
@@ -177,5 +201,32 @@ describe('Mastra.removeAgent', () => {
 
     // Verify cache entry is also cleared
     expect(cache.has('cached-agent-id-2')).toBe(false);
+  });
+
+  it('rejects channel registration from a removed agent object', () => {
+    const agent = new Agent({
+      id: 'removed-channel-agent',
+      name: 'Removed Channel Agent',
+      instructions: 'You are a test agent',
+      model: 'openai/gpt-4o',
+      channels: { adapters: { slack: createMockAdapter('slack') }, tools: false },
+    });
+    const mastra = new Mastra({
+      logger: false,
+      agents: {
+        removed: agent,
+      },
+      storage: new InMemoryStore(),
+    });
+    const routePath = '/api/agents/removed-channel-agent/channels/slack/webhook';
+
+    expect(mastra.getServer()?.apiRoutes?.filter(route => route.path === routePath)).toHaveLength(1);
+    expect(mastra.removeAgent('removed')).toBe(true);
+    expect(mastra.getServer()?.apiRoutes?.filter(route => route.path === routePath)).toHaveLength(0);
+
+    expect(() =>
+      agent.setChannels(new AgentChannels({ adapters: { slack: createMockAdapter('slack') }, tools: false })),
+    ).toThrow(/removed or unregistered agent/);
+    expect(mastra.getServer()?.apiRoutes?.filter(route => route.path === routePath)).toHaveLength(0);
   });
 });

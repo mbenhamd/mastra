@@ -485,6 +485,51 @@ describe('Harness v1 — construction', () => {
     expect(mastra.getHarness()).toBe(harness);
   });
 
+  it('rejects direct-bound harnesses that would replace an existing default harness', () => {
+    const configuredHarness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      harness: configuredHarness,
+    });
+
+    expect(
+      () =>
+        new Harness({
+          mastra,
+          modes: [{ id: 'default', agentId: 'default' }],
+          defaultModeId: 'default',
+        }),
+    ).toThrow(/already registered/);
+    expect(mastra.getHarness()).toBe(configuredHarness);
+  });
+
+  it('starts wakeup and outbox workers for direct-bound channel harnesses', () => {
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(false);
+    expect(mastra.workers.some(worker => worker.name === 'harnessChannelOutbox')).toBe(false);
+
+    new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(true);
+    expect(mastra.workers.some(worker => worker.name === 'harnessChannelOutbox')).toBe(true);
+  });
+
   it('shuts down registered harnesses during Mastra shutdown', async () => {
     const alpha = new Harness({
       modes: [{ id: 'default', agentId: 'default' }],
