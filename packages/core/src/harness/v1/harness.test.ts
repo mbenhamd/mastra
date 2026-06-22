@@ -1497,13 +1497,14 @@ describe('Harness v1 — construction', () => {
       agents: { default: agent },
       storage: new InMemoryStore(),
     });
+    const routePath = '/api/agents/default/channels/slack/webhook';
 
+    agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }));
+
+    expect(mastra.getServer()?.apiRoutes?.some(route => route.path === routePath)).toBe(true);
     expect(mastra.removeAgent('default')).toBe(true);
     expect(() => agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(/removed/);
-    expect(
-      mastra.getServer()?.apiRoutes?.some(route => route.path === '/api/agents/default/channels/slack/webhook') ??
-        false,
-    ).toBe(false);
+    expect(mastra.getServer()?.apiRoutes?.some(route => route.path === routePath) ?? false).toBe(false);
   });
 
   it('replaces stale webhook routes when AgentChannels are rebuilt', () => {
