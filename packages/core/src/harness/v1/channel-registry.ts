@@ -97,9 +97,16 @@ export class HarnessChannelRegistry {
   }
 
   bind(mastra: Mastra, harnessName: string): void {
+    this.bindings = this.resolveBindings(mastra, harnessName);
+  }
+
+  preview(mastra: Mastra, harnessName: string): HarnessChannelBinding[] {
+    return Array.from(this.resolveBindings(mastra, harnessName).values()).map(binding => ({ ...binding }));
+  }
+
+  private resolveBindings(mastra: Mastra, harnessName: string): Map<string, HarnessChannelBinding> {
     if (this.pending.size === 0) {
-      this.bindings = new Map();
-      return;
+      return new Map();
     }
     assertNonEmptyString(harnessName, 'harnessName');
     assertDurableComponent(harnessName, 'harnessName');
@@ -154,7 +161,7 @@ export class HarnessChannelRegistry {
       });
     }
 
-    this.bindings = next;
+    return next;
   }
 
   list(): HarnessChannelBinding[] {

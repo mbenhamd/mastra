@@ -18,7 +18,7 @@ import type { MastraScorer } from '../evals';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import type { PubSub } from '../events/pubsub';
 import type { Event, EventCallback } from '../events/types';
-import type { Harness as HarnessV1 } from '../harness/v1';
+import type { Harness as HarnessV1, HarnessChannelBinding } from '../harness/v1';
 import { AvailableHooks, registerHook } from '../hooks';
 import type { MastraModelGateway } from '../llm/model/gateways';
 import { defaultGateways } from '../llm/model/router';
@@ -69,6 +69,11 @@ import { createOnScorerHook } from './hooks';
 import type { VersionOverrides, VersionSelector } from './types';
 
 const PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS = 30_000;
+
+type HarnessChannelBindingScope = {
+  agentIds: Set<string>;
+  bindings: HarnessChannelBinding[];
+};
 
 type PendingWorkerStart = {
   worker: MastraWorker;
@@ -646,8 +651,11 @@ export class Mastra<
   #channelInitializationPromise?: Promise<void>;
   #channelInitializationError?: unknown;
   #agentChannelInstances = new Map<string, AgentChannels>();
+  #agentChannelCollisionCandidates = new Map<string, AgentChannels>();
+  #agentChannelRoutes = new Map<string, Set<ApiRoute>>();
   #agentChannelInitializationPromises = new Map<string, Promise<void>>();
   #agentChannelInitializationErrors = new Map<string, unknown>();
+  #agentRegistryKeys = new WeakMap<object, string>();
   #environment?: string;
   #harnesses: Record<string, HarnessV1> = {};
   #toolPayloadTransform?: ToolPayloadTransformPolicy;
@@ -1358,6 +1366,16 @@ export class Mastra<
     // mode->agent validation succeeds. Each harness is single-bound; calling
     // __registerMastra a second time with a different parent throws.
     if (Object.keys(configuredHarnesses).length > 0) {
+      const channelBindingScopes: HarnessChannelBindingScope[] = [];
+      for (const [key, harness] of Object.entries(configuredHarnesses)) {
+        if (harness == null) continue;
+        channelBindingScopes.push({
+          agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
+          bindings: harness._previewChannelBindings(this, key),
+        });
+      }
+      this.#assertNoHarnessAgentChannelToolCollisions(channelBindingScopes);
+
       for (const [key, harness] of Object.entries(configuredHarnesses)) {
         if (harness == null) continue;
         harness.__registerMastra(this, key);
@@ -1411,7 +1429,11 @@ export class Mastra<
   }
 
   #deleteAgentChannelInitialization(agentKey: string): void {
+    const previous = this.#agentChannelInstances.get(agentKey);
+    previous?.close();
     this.#agentChannelInstances.delete(agentKey);
+    this.#agentChannelCollisionCandidates.delete(agentKey);
+    this.#removeAgentChannelRoutes(agentKey);
     this.#agentChannelInitializationPromises.delete(agentKey);
     this.#agentChannelInitializationErrors.delete(agentKey);
   }
@@ -1537,6 +1559,193 @@ export class Mastra<
       if (!hasGlobalHarnessStorage && harness._internalGetSessionStorage() === undefined) return false;
       return harness.listChannelBindings().some(binding => !channelFilter || channelFilter.has(binding.channelId));
     });
+  }
+
+  #listHarnessChannelBindingScopes(
+    harnesses: Record<string, HarnessV1 | undefined> = this.#harnesses,
+  ): HarnessChannelBindingScope[] {
+    const scopes: HarnessChannelBindingScope[] = [];
+    for (const harness of Object.values(harnesses)) {
+      if (harness == null) continue;
+      scopes.push({
+        agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
+        bindings: harness.listChannelBindings(),
+      });
+    }
+    return scopes;
+  }
+
+  #expandHarnessRunnableAgentIds(agentIds: Iterable<string>): Set<string> {
+    const expanded = new Set(agentIds);
+    for (const [key, agent] of Object.entries(this.#agents)) {
+      if (expanded.has(key) && agent?.id) {
+        expanded.add(agent.id);
+      }
+      if (agent?.id && expanded.has(agent.id)) {
+        expanded.add(key);
+      }
+    }
+    return expanded;
+  }
+
+  #resolveAgentKey(agentOrKey: { id: string } | string): string {
+    if (typeof agentOrKey === 'string') return agentOrKey;
+    const registeredKey = this.#agentRegistryKeys.get(agentOrKey);
+    if (registeredKey) return registeredKey;
+    for (const [key, agent] of Object.entries(this.#agents)) {
+      if (agent === agentOrKey) return key;
+    }
+    return agentOrKey.id;
+  }
+
+  #assertNoHarnessAgentChannelToolCollisions(harnessBindingScopes = this.#listHarnessChannelBindingScopes()): void {
+    if (harnessBindingScopes.length === 0) return;
+
+    const candidates = new Map(this.#agentChannelCollisionCandidates);
+    for (const [agentKey, agentChannels] of this.#agentChannelInstances) {
+      candidates.set(agentKey, agentChannels);
+    }
+
+    for (const [agentKey, agentChannels] of candidates) {
+      this.#assertNoHarnessAgentChannelToolCollisionForAgent(agentKey, agentChannels, harnessBindingScopes);
+    }
+  }
+
+  #assertNoHarnessAgentChannelToolCollisionForAgent(
+    agentKey: string,
+    agentChannels: AgentChannels,
+    harnessBindingScopes = this.#listHarnessChannelBindingScopes(),
+    platform?: string,
+  ): void {
+    const channelToolNames = agentChannels.__getChannelToolNames();
+    if (channelToolNames.length === 0) return;
+
+    for (const scope of harnessBindingScopes) {
+      if (!scope.agentIds.has(agentKey)) continue;
+      for (const binding of scope.bindings) {
+        if (platform !== undefined && binding.platform !== platform) continue;
+        if (platform === undefined && !agentChannels.hasAdapter(binding.platform)) continue;
+        throw new Error(
+          `Harness channel "${binding.harnessName}/${binding.channelId}" is bound to provider "${binding.providerId}" ` +
+            `platform "${binding.platform}", but agent "${agentKey}" has AgentChannels tools enabled for that platform. ` +
+            `Set channels.tools to false for the harness-bound AgentChannels target or mount it as a separate live-only provider/installation.`,
+        );
+      }
+    }
+  }
+
+  /** @internal */
+  _assertHarnessAgentChannelsAdapterAllowed(
+    agentOrKey: { id: string } | string,
+    agentChannels: AgentChannels,
+    platform?: string,
+  ): void {
+    this.#assertNoHarnessAgentChannelToolCollisionForAgent(
+      this.#resolveAgentKey(agentOrKey),
+      agentChannels,
+      undefined,
+      platform,
+    );
+  }
+
+  /** @internal */
+  _assertHarnessAgentChannelToolCollisionsForHarness(harness: HarnessV1, harnessName: string): void {
+    this.#assertNoHarnessAgentChannelToolCollisions([
+      {
+        agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
+        bindings: harness._previewChannelBindings(this, harnessName),
+      },
+    ]);
+  }
+
+  /** @internal */
+  _assertDirectHarnessRegistrationAvailable(harnessName: string, harness: HarnessV1): void {
+    const registeredHarness = this.#harnesses[harnessName];
+    if (registeredHarness !== undefined && registeredHarness !== harness) {
+      throw new Error(
+        `Harness "${harnessName}" is already registered on this Mastra instance; direct-bound harnesses must use a unique harness name.`,
+      );
+    }
+  }
+
+  /** @internal */
+  _registerDirectHarness(harnessName: string, harness: HarnessV1): void {
+    this._assertDirectHarnessRegistrationAvailable(harnessName, harness);
+    this.#harnesses[harnessName] = harness;
+    this.#ensureHarnessWakeupWorker();
+    this.#ensureHarnessChannelOutboxWorker();
+  }
+
+  /** @internal */
+  _unregisterDirectHarness(harness: HarnessV1): void {
+    for (const [key, registeredHarness] of Object.entries(this.#harnesses)) {
+      if (registeredHarness === harness) {
+        delete this.#harnesses[key];
+      }
+    }
+  }
+
+  /** @internal */
+  _registerAgentChannelsForAgent(agentOrKey: { id: string } | string, agentChannelsInstance: AgentChannels): void {
+    const agentKey = this.#resolveAgentKey(agentOrKey);
+    if (typeof agentOrKey !== 'string' && this.#agents[agentKey] === undefined) {
+      throw new Error(`Cannot register AgentChannels for removed or unregistered agent "${agentKey}"`);
+    }
+    this.#assertNoHarnessAgentChannelToolCollisionForAgent(agentKey, agentChannelsInstance);
+    if (
+      typeof agentOrKey !== 'string' &&
+      this.#agents[agentKey] !== undefined &&
+      this.#agents[agentKey] !== agentOrKey
+    ) {
+      this.#trackAgentChannelsForCollisionOnly(agentKey, agentChannelsInstance);
+      return;
+    }
+    agentChannelsInstance.__setLogger(this.#logger);
+    agentChannelsInstance.__setMastraOwner(this, agentKey);
+
+    const previous = this.#agentChannelInstances.get(agentKey);
+    const alreadyRegistered = previous === agentChannelsInstance;
+    const shouldRestartAgentChannels = alreadyRegistered && this.#lifecycleState === 'ready';
+
+    this.#removeAgentChannelRoutes(agentKey);
+    this.#agentChannelCollisionCandidates.delete(agentKey);
+    if (previous && (!alreadyRegistered || shouldRestartAgentChannels)) {
+      previous.close();
+    }
+    const channelRoutes = agentChannelsInstance.getWebhookRoutes();
+    if (channelRoutes.length > 0) {
+      this.#agentChannelRoutes.set(agentKey, new Set(channelRoutes));
+      this.#server = {
+        ...this.#server,
+        apiRoutes: [...(this.#server?.apiRoutes ?? []), ...channelRoutes],
+      };
+    } else {
+      this.#agentChannelRoutes.delete(agentKey);
+    }
+    this.#agentChannelInstances.set(agentKey, agentChannelsInstance);
+    if ((!alreadyRegistered || shouldRestartAgentChannels) && this.#lifecycleState === 'ready') {
+      this.#startAgentChannelInitialization(agentKey, agentChannelsInstance);
+    }
+  }
+
+  #trackAgentChannelsForCollisionOnly(agentKey: string, agentChannelsInstance: AgentChannels): void {
+    this.#assertNoHarnessAgentChannelToolCollisionForAgent(agentKey, agentChannelsInstance);
+    agentChannelsInstance.__setLogger(this.#logger);
+    agentChannelsInstance.__setMastraOwner(this, agentKey);
+    this.#agentChannelCollisionCandidates.set(agentKey, agentChannelsInstance);
+  }
+
+  #removeAgentChannelRoutes(agentKey: string): void {
+    const routes = this.#agentChannelRoutes.get(agentKey);
+    if (!routes || routes.size === 0 || !this.#server?.apiRoutes) {
+      this.#agentChannelRoutes.delete(agentKey);
+      return;
+    }
+    this.#server = {
+      ...this.#server,
+      apiRoutes: this.#server.apiRoutes.filter(route => !routes.has(route)),
+    };
+    this.#agentChannelRoutes.delete(agentKey);
   }
 
   #harnessChannelOutboxFilter(
@@ -2055,6 +2264,12 @@ export class Mastra<
         logger.debug(`Agent with key ${agentKey} already exists. Skipping addition.`);
         return;
       }
+      const underlyingAgentChannels = underlyingAgent.getChannels();
+      if (underlyingAgentChannels) {
+        this.#assertNoHarnessAgentChannelToolCollisionForAgent(String(agentKey), underlyingAgentChannels);
+      }
+      this.#agentRegistryKeys.set(durableAgent, String(agentKey));
+      this.#agentRegistryKeys.set(underlyingAgent, String(agentKey));
 
       // Set the Mastra instance on the durable agent for observability
       durableAgent.__setMastra?.(this);
@@ -2069,6 +2284,9 @@ export class Mastra<
         tts: this.#tts,
         vectors: this.#vectors,
       });
+      if (underlyingAgentChannels) {
+        this.#trackAgentChannelsForCollisionOnly(String(agentKey), underlyingAgentChannels);
+      }
 
       // Store the durable wrapper in #agents (not the underlying agent)
       // This ensures getAgentById returns the wrapper so .stream() uses durable execution.
@@ -2096,6 +2314,11 @@ export class Mastra<
     const agents = this.#agents as Record<string, Agent<any>>;
     if (agents[agentKey]) {
       return;
+    }
+    this.#agentRegistryKeys.set(mastraAgent, String(agentKey));
+    const prospectiveAgentChannels = mastraAgent.getChannels();
+    if (prospectiveAgentChannels) {
+      this.#assertNoHarnessAgentChannelToolCollisionForAgent(String(agentKey), prospectiveAgentChannels);
     }
 
     // Initialize the agent
@@ -2165,18 +2388,7 @@ export class Mastra<
     // Set up AgentChannels for manual adapter configurations
     const agentChannelsInstance = mastraAgent.getChannels();
     if (agentChannelsInstance) {
-      agentChannelsInstance.__setLogger(this.#logger);
-      const channelRoutes = agentChannelsInstance.getWebhookRoutes();
-      if (channelRoutes.length > 0) {
-        this.#server = {
-          ...this.#server,
-          apiRoutes: [...(this.#server?.apiRoutes ?? []), ...channelRoutes],
-        };
-      }
-      this.#agentChannelInstances.set(String(agentKey), agentChannelsInstance);
-      if (this.#lifecycleState === 'ready') {
-        this.#startAgentChannelInitialization(String(agentKey), agentChannelsInstance);
-      }
+      this._registerAgentChannelsForAgent(String(agentKey), agentChannelsInstance);
     }
   }
 

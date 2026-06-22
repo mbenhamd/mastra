@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Agent } from '../../agent';
+import { AgentChannels } from '../../channels';
 import type { ChannelProvider } from '../../channels';
 import { PubSub } from '../../events';
 import type { Event, EventCallback, SubscribeOptions } from '../../events';
@@ -24,6 +25,18 @@ import type {
   ChannelOutboxEnqueueOptions,
   ChannelOutboxItem,
 } from '../../storage/domains/harness';
+import {
+  HarnessStorage,
+  HarnessStorageChannelOutboxClaimConflictError,
+  HarnessStorageDeleteGuardConflictError,
+  HarnessStorageVersionConflictError,
+} from '../../storage/domains/harness';
+import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { InMemoryStore } from '../../storage/mock';
+import { MastraWorker } from '../../worker';
+
+import { extractSignalContents, MockAgent } from './__test-utils__';
 import {
   HarnessAbortedError,
   HarnessConfigError,
@@ -40,28 +53,18 @@ import {
   HarnessStorageError,
   HarnessValidationError,
 } from './errors';
-import {
-  HarnessStorage,
-  HarnessStorageChannelOutboxClaimConflictError,
-  HarnessStorageDeleteGuardConflictError,
-  HarnessStorageVersionConflictError,
-} from '../../storage/domains/harness';
-import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
-import { InMemoryDB } from '../../storage/domains/inmemory-db';
-import { InMemoryStore } from '../../storage/mock';
-import { MastraWorker } from '../../worker';
-
-import { extractSignalContents, MockAgent } from './__test-utils__';
 import type { HarnessSessionDeleteBlockedError } from './errors';
 import { Harness, createHarnessOperatorThreadController } from './harness';
 import type { HarnessChannelConfig } from './types';
+
+const TEST_MODEL = 'test/model' as any;
 
 function makeAgent(name = 'test-agent') {
   return new Agent({
     id: name,
     name,
     instructions: 'test',
-    model: 'openai/gpt-4o-mini' as any,
+    model: TEST_MODEL,
   });
 }
 
@@ -480,6 +483,51 @@ describe('Harness v1 — construction', () => {
     });
 
     expect(mastra.getHarness()).toBe(harness);
+  });
+
+  it('rejects direct-bound harnesses that would replace an existing default harness', () => {
+    const configuredHarness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      harness: configuredHarness,
+    });
+
+    expect(
+      () =>
+        new Harness({
+          mastra,
+          modes: [{ id: 'default', agentId: 'default' }],
+          defaultModeId: 'default',
+        }),
+    ).toThrow(/already registered/);
+    expect(mastra.getHarness()).toBe(configuredHarness);
+  });
+
+  it('starts wakeup and outbox workers for direct-bound channel harnesses', () => {
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(false);
+    expect(mastra.workers.some(worker => worker.name === 'harnessChannelOutbox')).toBe(false);
+
+    new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(true);
+    expect(mastra.workers.some(worker => worker.name === 'harnessChannelOutbox')).toBe(true);
   });
 
   it('shuts down registered harnesses during Mastra shutdown', async () => {
@@ -1018,6 +1066,545 @@ describe('Harness v1 — construction', () => {
     expect(harness.listChannelBindings()).toHaveLength(1);
   });
 
+  it('rejects AgentChannels tools on a harness-bound provider platform', () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            default: new Agent({
+              id: 'default',
+              name: 'default',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { slack: {} as any } },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).toThrow(/AgentChannels tools enabled/);
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            default: new Agent({
+              id: 'default',
+              name: 'default',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { slack: {} as any }, tools: false },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).not.toThrow();
+  });
+
+  it('rejects AgentChannels tools when the harness uses the agent id but Mastra uses a different key', () => {
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            support: new Agent({
+              id: 'assistant',
+              name: 'assistant',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { slack: {} as any } },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: {
+            primary: new Harness({
+              modes: [{ id: 'default', agentId: 'assistant' }],
+              defaultModeId: 'default',
+              channels: {
+                support: makeHarnessChannelConfig(),
+              },
+            }),
+          },
+        }),
+    ).toThrow(/AgentChannels tools enabled/);
+  });
+
+  it('rejects durable-agent AgentChannels tools on a harness-bound provider platform', () => {
+    const underlyingAgent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any } },
+    });
+    const durableAgent = {
+      id: 'default',
+      name: 'default',
+      agent: underlyingAgent,
+      stream: async () => ({}) as any,
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: { default: durableAgent as any },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).toThrow(/AgentChannels tools enabled/);
+  });
+
+  it('rejects rebuilt durable-agent AgentChannels using the harness registry key', () => {
+    const underlyingAgent = makeAgent('underlying');
+    const durableAgent = {
+      id: 'durable-default',
+      name: 'durable-default',
+      agent: underlyingAgent,
+      stream: async () => ({}) as any,
+      __setLogger: () => {},
+    };
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+    new Mastra({
+      agents: { default: durableAgent as any },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+
+    expect(() => underlyingAgent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(
+      /AgentChannels tools enabled/,
+    );
+    expect(underlyingAgent.getChannels()).toBeNull();
+  });
+
+  it('allows AgentChannels tools on live-only platforms outside harness bindings', () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            default: new Agent({
+              id: 'default',
+              name: 'default',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { discord: {} as any } },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).not.toThrow();
+  });
+
+  it('allows AgentChannels tools on same-platform agents not used by the harness', () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            default: makeAgent('default'),
+            live: new Agent({
+              id: 'live',
+              name: 'live',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { slack: {} as any } },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).not.toThrow();
+  });
+
+  it('allows AgentChannels tools when only another harness binds that platform', () => {
+    const liveAgent = new Agent({
+      id: 'live',
+      name: 'live',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any } },
+    });
+    const liveHarness = new Harness({
+      modes: [{ id: 'live', agentId: 'live' }],
+      defaultModeId: 'live',
+    });
+    const channelHarness = new Harness({
+      modes: [{ id: 'worker', agentId: 'worker' }],
+      defaultModeId: 'worker',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            live: liveAgent,
+            worker: makeAgent('worker'),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: {
+            live: liveHarness,
+            channel: channelHarness,
+          },
+        }),
+    ).not.toThrow();
+  });
+
+  it('allows harness-bound AgentChannels when generic channel tools are disabled', () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            default: new Agent({
+              id: 'default',
+              name: 'default',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: new AgentChannels({ adapters: { slack: {} as any }, tools: false }),
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: { primary: harness },
+        }),
+    ).not.toThrow();
+  });
+
+  it('allows dynamically added AgentChannels tools for agents not used by the harness', () => {
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+
+    expect(() =>
+      mastra.addAgent(
+        new Agent({
+          id: 'live',
+          name: 'live',
+          instructions: 'test',
+          model: TEST_MODEL,
+          channels: { adapters: { slack: {} as any } },
+        }),
+      ),
+    ).not.toThrow();
+    expect(mastra.getAgent('live' as never)).toBeDefined();
+  });
+
+  it('rejects provider-added AgentChannels adapters that would expose tools on a harness-bound platform', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: new AgentChannels({ adapters: { discord: {} as any } }),
+    });
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    const agentChannels = agent.getChannels();
+
+    expect(agentChannels).toBeInstanceOf(AgentChannels);
+    expect(() => agentChannels?.__registerAdapter('slack', {} as any)).toThrow(/AgentChannels tools enabled/);
+    expect(agentChannels?.hasAdapter('slack')).toBe(false);
+  });
+
+  it('rejects replacing a harness-bound agent with tool-enabled AgentChannels for that platform', () => {
+    const agent = makeAgent('default');
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+
+    expect(() => agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(
+      /AgentChannels tools enabled/,
+    );
+    expect(agent.getChannels()).toBeNull();
+  });
+
+  it('rejects direct-bound Harness AgentChannels tools on a harness-bound provider platform', () => {
+    const mastra = new Mastra({
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: TEST_MODEL,
+          channels: { adapters: { slack: {} as any } },
+        }),
+      },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+
+    expect(
+      () =>
+        new Harness({
+          mastra,
+          modes: [{ id: 'default', agentId: 'default' }],
+          defaultModeId: 'default',
+          channels: {
+            support: makeHarnessChannelConfig(),
+          },
+        }),
+    ).toThrow(/AgentChannels tools enabled/);
+  });
+
+  it('rejects replacing AgentChannels after a direct-bound Harness claims the platform', () => {
+    const agent = makeAgent('default');
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      channels: {
+        support: makeHarnessChannelConfig(),
+      },
+    });
+
+    expect(() => agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(
+      /AgentChannels tools enabled/,
+    );
+    expect(agent.getChannels()).toBeNull();
+  });
+
+  it('rejects a direct-bound default Harness when Mastra already has one', () => {
+    const existingHarness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent('default') },
+      storage: new InMemoryStore(),
+      harnesses: { default: existingHarness },
+    });
+
+    expect(
+      () =>
+        new Harness({
+          mastra,
+          modes: [{ id: 'other', agentId: 'default' }],
+          defaultModeId: 'other',
+        }),
+    ).toThrow(/already registered/);
+    expect(mastra.getHarness()).toBe(existingHarness);
+  });
+
+  it('adds the wakeup worker when a direct-bound Harness registers after Mastra construction', () => {
+    const mastra = new Mastra({
+      agents: { default: makeAgent('default') },
+      storage: new InMemoryStore(),
+    });
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(false);
+
+    new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+
+    expect(mastra.workers.some(worker => worker.name === 'harnessWakeups')).toBe(true);
+  });
+
+  it('rejects AgentChannels registration after an agent is removed', () => {
+    const agent = makeAgent('default');
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+    });
+    const routePath = '/api/agents/default/channels/slack/webhook';
+
+    agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }));
+
+    expect(mastra.getServer()?.apiRoutes?.some(route => route.path === routePath)).toBe(true);
+    expect(mastra.removeAgent('default')).toBe(true);
+    expect(() => agent.setChannels(new AgentChannels({ adapters: { slack: {} as any } }))).toThrow(/removed/);
+    expect(mastra.getServer()?.apiRoutes?.some(route => route.path === routePath) ?? false).toBe(false);
+  });
+
+  it('replaces stale webhook routes when AgentChannels are rebuilt', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any }, tools: false },
+    });
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    const routePath = '/api/agents/default/channels/slack/webhook';
+    const initialRoutes = mastra.getServer()?.apiRoutes?.filter(route => route.path === routePath) ?? [];
+    const replacement = new AgentChannels({ adapters: { slack: {} as any }, tools: false });
+
+    agent.setChannels(replacement);
+
+    const routes = mastra.getServer()?.apiRoutes?.filter(route => route.path === routePath) ?? [];
+    expect(initialRoutes).toHaveLength(1);
+    expect(routes).toHaveLength(1);
+    expect(routes[0]).not.toBe(initialRoutes[0]);
+  });
+
+  it('reconciles webhook routes when the same AgentChannels instance gains an adapter', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any }, tools: false },
+    });
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    const agentChannels = agent.getChannels();
+
+    expect(agentChannels).toBeInstanceOf(AgentChannels);
+    agentChannels?.__registerAdapter('discord', {} as any);
+    agent.setChannels(agentChannels as AgentChannels);
+
+    const routePaths = mastra.getServer()?.apiRoutes?.map(route => route.path) ?? [];
+    expect(routePaths.filter(path => path === '/api/agents/default/channels/slack/webhook')).toHaveLength(1);
+    expect(routePaths.filter(path => path === '/api/agents/default/channels/discord/webhook')).toHaveLength(1);
+  });
+
+  it('restarts initialized AgentChannels when the same instance gains an adapter', async () => {
+    const agentChannels = new AgentChannels({ adapters: { slack: {} as any }, tools: false });
+    const initialize = vi.spyOn(agentChannels, 'initialize').mockResolvedValue(undefined);
+    const close = vi.spyOn(agentChannels, 'close');
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: agentChannels,
+    });
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+
+    await mastra.init();
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    agentChannels.__registerAdapter('discord', {} as any);
+    agent.setChannels(agentChannels);
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(initialize).toHaveBeenCalledTimes(2);
+  });
+
+  it('closes replaced AgentChannels instances', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any }, tools: false },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    const original = agent.getChannels();
+    const close = vi.spyOn(original as AgentChannels, 'close');
+    const replacement = new AgentChannels({ adapters: { slack: {} as any }, tools: false });
+
+    agent.setChannels(replacement);
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('enqueues durable channel outbox rows before dispatching through the adapter', async () => {
     const storage = makeStorage();
     const delivered: string[] = [];
@@ -1204,7 +1791,9 @@ describe('Harness v1 — construction', () => {
       visibleSessionIds: expect.arrayContaining([root.id, child.id]),
       bindings: [{ channelId: 'support', providerId: 'slack', bindingId: 'support-binding' }],
       // §13.3f.1: bare row codes are projected to namespaced wire codes.
-      inbox: [{ id: 'inbox-1', status: 'received', lastError: { code: 'harness.worker_unavailable', retryable: true } }],
+      inbox: [
+        { id: 'inbox-1', status: 'received', lastError: { code: 'harness.worker_unavailable', retryable: true } },
+      ],
       actionTokens: [{ actionTokenId: 'action-token-1', owningSessionId: child.id, status: 'active' }],
       actionReceipts: [
         {
@@ -2275,7 +2864,11 @@ describe('Harness v1 — lifecycle', () => {
 
   it('Session.rename() updates the backing thread title (§4.1)', async () => {
     const harness = makeHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 't1', title: 'Original' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 't1',
+      title: 'Original',
+    });
     const s = await harness.session({ threadId: 't1', resourceId: 'r1' });
     await s.rename({ title: 'Renamed conversation' });
     const thread = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: 't1' });
@@ -2293,7 +2886,10 @@ describe('Harness v1 — lifecycle', () => {
     expect(cloned.resourceId).toBe('r1');
     expect(cloned.isClosed).toBe(false);
 
-    const clonedThread = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: cloned.threadId });
+    const clonedThread = await createHarnessOperatorThreadController(harness).get({
+      resourceId: 'r1',
+      threadId: cloned.threadId,
+    });
     expect(clonedThread?.title).toBe('Clone');
     // Cloning never tears down or mutates the source session.
     expect(s.isClosed).toBe(false);
@@ -2488,7 +3084,10 @@ describe('Harness v1 — lifecycle', () => {
   it('does not cascade thread delete after shutdown begins', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'delete-during-shutdown' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'delete-during-shutdown',
+    });
     const s = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const originalRelease = storage.releaseSessionLease.bind(storage);
     let releaseShutdown!: () => void;
@@ -2518,7 +3117,10 @@ describe('Harness v1 — lifecycle', () => {
   it('does not delete thread data when shutdown starts during a delete cascade', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'delete-cascade-during-shutdown' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'delete-cascade-during-shutdown',
+    });
     const s = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const originalSaveSession = storage.saveSession.bind(storage);
     let releaseTerminalSave!: () => void;
@@ -2544,7 +3146,9 @@ describe('Harness v1 — lifecycle', () => {
     releaseTerminalSave();
     await Promise.all([deleting, shutdown]);
 
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toMatchObject({
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toMatchObject({
       id: thread.id,
     });
     const stored = await storage.loadSession({ sessionId: s.id, harnessName: 'default' });
@@ -4330,9 +4934,11 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
 
   it('resolves a new active binding, deriving stable namespaced thread/session ids', async () => {
     const { harness } = setup();
-    const r = (await (harness as never as {
-      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    const r = (await (
+      harness as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
     expect(r.resolved.resourceId).toBe('resource-1');
     expect(r.resolved.threadId).toMatch(/^ch:/);
     expect(r.resolved.sessionId).toMatch(/^chs:/);
@@ -4341,17 +4947,23 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
 
     // Stability: a fresh harness with the same inputs derives the SAME ids.
     const { harness: h2 } = setup();
-    const r2 = (await (h2 as never as {
-      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    const r2 = (await (
+      h2 as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
     expect(r2.resolved.threadId).toBe(r.resolved.threadId);
     expect(r2.resolved.sessionId).toBe(r.resolved.sessionId);
 
     // Separation: a different resolved resourceId derives a DIFFERENT threadId.
-    const { harness: h3 } = setup({ ingress: { resolveResource: async () => ({ resourceId: 'other', mode: 'shared-resource' }) } });
-    const r3 = (await (h3 as never as {
-      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    const { harness: h3 } = setup({
+      ingress: { resolveResource: async () => ({ resourceId: 'other', mode: 'shared-resource' }) },
+    });
+    const r3 = (await (
+      h3 as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
     expect(r3.resolved.threadId).not.toBe(r.resolved.threadId);
   });
 
@@ -4362,9 +4974,11 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
     // an absent id and a literal space would derive the SAME thread/session id and
     // collide at the channel level even though storage keeps them distinct.
     const call = (h: Harness) =>
-      (h as never as {
-        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-      })._resolveChannelBindingForIngress.bind(h) as (c: never) => Promise<ResolveResult>;
+      (
+        h as never as {
+          _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+        }
+      )._resolveChannelBindingForIngress.bind(h) as (c: never) => Promise<ResolveResult>;
 
     const { harness: hMissing } = setup();
     const missing = await call(hMissing)(makeIngressCtx({ externalChannelId: undefined }));
@@ -4384,9 +4998,11 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
 
   it('idempotently reuses the active binding and advances lastInboundAt only forward', async () => {
     const { harness } = setup();
-    const call = (harness as never as {
-      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-    })._resolveChannelBindingForIngress.bind(harness) as (c: never) => Promise<ResolveResult>;
+    const call = (
+      harness as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      }
+    )._resolveChannelBindingForIngress.bind(harness) as (c: never) => Promise<ResolveResult>;
     const first = await call(makeIngressCtx({ receivedAt: 1000 }));
     const second = await call(makeIngressCtx({ receivedAt: 2000 }));
     expect(second.binding.id).toBe(first.binding.id); // same active binding, not a duplicate
@@ -4400,9 +5016,11 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
     const { harness } = setup({
       ingress: { resolveResource: async () => ({ resourceId: 'r', mode: 'custom' }) },
     });
-    const r = (await (harness as never as {
-      _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
-    })._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
+    const r = (await (
+      harness as never as {
+        _resolveChannelBindingForIngress: (c: never) => Promise<ResolveResult>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx())) as ResolveResult;
     expect(r.binding.mode).toBe('shared-resource');
   });
 
@@ -4411,9 +5029,9 @@ describe('Harness._resolveChannelBindingForIngress (§14.1 / C2b)', () => {
       ingress: { resolveResource: async () => ({ resourceId: 'r', sessionId: 's1', mode: 'shared-resource' }) },
     });
     await expect(
-      (harness as never as { _resolveChannelBindingForIngress: (c: never) => Promise<unknown> })._resolveChannelBindingForIngress(
-        makeIngressCtx(),
-      ),
+      (
+        harness as never as { _resolveChannelBindingForIngress: (c: never) => Promise<unknown> }
+      )._resolveChannelBindingForIngress(makeIngressCtx()),
     ).rejects.toBeInstanceOf(HarnessValidationError);
   });
 });
@@ -4484,9 +5102,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
       if (e.type.startsWith('channel_ingress_')) events.push(e as never);
     });
 
-    const r = (await (harness as never as {
-      admitChannelInbound: (c: never) => Promise<AdmitResult>;
-    }).admitChannelInbound(makeIngressCtx())) as AdmitResult;
+    const r = (await (
+      harness as never as {
+        admitChannelInbound: (c: never) => Promise<AdmitResult>;
+      }
+    ).admitChannelInbound(makeIngressCtx())) as AdmitResult;
 
     expect(r.status).toBe('queued');
     expect(r.duplicate).toBe(false);
@@ -4503,9 +5123,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
     harness.subscribe(e => {
       if (e.type.startsWith('channel_ingress_')) events.push(e.type);
     });
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
     const first = await call(makeIngressCtx());
     const second = await call(makeIngressCtx()); // same externalMessageId → same inbox row
     expect(second.duplicate).toBe(true);
@@ -4531,9 +5151,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
         }),
       },
     });
-    const r = (await (harness as never as {
-      admitChannelInbound: (c: never) => Promise<AdmitResult>;
-    }).admitChannelInbound(makeIngressCtx())) as AdmitResult;
+    const r = (await (
+      harness as never as {
+        admitChannelInbound: (c: never) => Promise<AdmitResult>;
+      }
+    ).admitChannelInbound(makeIngressCtx())) as AdmitResult;
     expect(r.status).toBe('queued');
     expect(typeof r.queuedItemId).toBe('string');
   });
@@ -4558,9 +5180,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
     harness.subscribe(e => {
       if (e.type.startsWith('channel_ingress_')) events.push(e as never);
     });
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
 
     await expect(call(makeIngressCtx())).rejects.toThrow();
     expect(events.map(e => e.type)).toEqual(['channel_ingress_received', 'channel_ingress_failed']);
@@ -4608,9 +5230,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
       if (e.type.startsWith('channel_ingress_')) events.push(e as never);
     });
 
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
 
     // The local thrown error still carries the raw resolver text (it stays a
     // local-only cause); only the PUBLIC projection is redacted.
@@ -4668,9 +5290,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
         },
       },
     });
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
 
     await expect(call(makeIngressCtx())).rejects.toThrow(/transient resolver outage/);
 
@@ -4709,9 +5331,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
       if (row.status === 'queued') throw new Error('crash before queued commit');
       return realUpdate(row, opts);
     };
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
     await expect(call(makeIngressCtx())).rejects.toThrow();
     // Heal storage so recovery can commit.
     (storage as { updateChannelInboxItem: unknown }).updateChannelInboxItem = realUpdate;
@@ -4734,9 +5356,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
         },
       },
     });
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
     await expect(call(makeIngressCtx())).rejects.toThrow(/resolver outage/);
 
     boom = false;
@@ -4789,9 +5411,9 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
         },
       },
     });
-    const call = (harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }).admitChannelInbound.bind(
-      harness,
-    ) as (c: never) => Promise<AdmitResult>;
+    const call = (
+      harness as never as { admitChannelInbound: (c: never) => Promise<AdmitResult> }
+    ).admitChannelInbound.bind(harness) as (c: never) => Promise<AdmitResult>;
     // First admission fails → durable 'failed' row (no admissionHash).
     await expect(call(makeIngressCtx())).rejects.toThrow();
     const failedEvents: Array<{ error?: { code: string; message: string } }> = [];
@@ -4817,7 +5439,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
   }
 
   it.each([
-    ['HarnessSessionLockedError', () => new HarnessSessionLockedError('chs:x', 'owner-y', WORKER_NOW + 1), 'session_locked'],
+    [
+      'HarnessSessionLockedError',
+      () => new HarnessSessionLockedError('chs:x', 'owner-y', WORKER_NOW + 1),
+      'session_locked',
+    ],
     ['HarnessLiveSessionLimitError', () => new HarnessLiveSessionLimitError(2, 2), 'live_session_limit'],
     ['HarnessQueueFullError', () => new HarnessQueueFullError('chs:x', 0, 0), 'queue_full'],
   ])('classifies %s as retryable failed with its bare code + backoff', async (_name, makeErr, code) => {
@@ -4831,7 +5457,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
 
   it.each([
     ['HarnessSessionClosedError', () => new HarnessSessionClosedError('chs:x'), 'session_closed'],
-    ['HarnessSessionDeletedError', () => new HarnessSessionDeletedError('chs:x', 'resource-1', 'thread-1'), 'session_deleted'],
+    [
+      'HarnessSessionDeletedError',
+      () => new HarnessSessionDeletedError('chs:x', 'resource-1', 'thread-1'),
+      'session_deleted',
+    ],
     [
       'HarnessOverrideConflictError',
       () => new HarnessOverrideConflictError('chs:x', 'run-1', ['mode']),
@@ -4923,9 +5553,13 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
 
   it('tick runs one recovery pass per configured channel', async () => {
     const harness = makeBoundHarness({ a: makeHarnessChannelConfig(), b: makeHarnessChannelConfig() });
-    probe(harness)._channelInboxRecoveryTimer && (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
+    probe(harness)._channelInboxRecoveryTimer &&
+      (harness as unknown as { _stopChannelInboxRecoveryLoop: () => void })._stopChannelInboxRecoveryLoop();
     const spy = vi
-      .spyOn(harness as unknown as { recoverChannelInboxOnce: (o: unknown) => Promise<unknown> }, 'recoverChannelInboxOnce')
+      .spyOn(
+        harness as unknown as { recoverChannelInboxOnce: (o: unknown) => Promise<unknown> },
+        'recoverChannelInboxOnce',
+      )
       .mockResolvedValue({ claimed: 0, queued: 0, failed: 0, dead: 0 });
     await probe(harness)._tickChannelInboxRecovery();
     const channelArgs = spy.mock.calls.map(c => (c[0] as { channelId: string }).channelId).sort();
@@ -4936,7 +5570,10 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
   it('tick is reentrancy-guarded (a concurrent pass is a no-op)', async () => {
     const { harness } = setup(); // loop already stopped by setup
     (harness as unknown as { _channelInboxRecoveryRunning: boolean })._channelInboxRecoveryRunning = true;
-    const spy = vi.spyOn(harness as unknown as { recoverChannelInboxOnce: () => Promise<unknown> }, 'recoverChannelInboxOnce');
+    const spy = vi.spyOn(
+      harness as unknown as { recoverChannelInboxOnce: () => Promise<unknown> },
+      'recoverChannelInboxOnce',
+    );
     await probe(harness)._tickChannelInboxRecovery();
     expect(spy).not.toHaveBeenCalled();
   });
@@ -5010,9 +5647,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
     harness.subscribe(e => {
       if (e.type.startsWith('channel_ingress_')) events.push(e.type);
     });
-    const admit = (harness as never as {
-      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
-    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    const admit = (
+      harness as never as {
+        admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+      }
+    ).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
 
     const r = await admit(makeIngressCtx(), { continueAdmission: false });
     expect(r.status).toBe('received');
@@ -5028,9 +5667,11 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
 
   it('record-only is idempotent: a duplicate provider retry reports the same received row, still un-admitted', async () => {
     const { harness } = setup();
-    const admit = (harness as never as {
-      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
-    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    const admit = (
+      harness as never as {
+        admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+      }
+    ).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
 
     const first = await admit(makeIngressCtx(), { continueAdmission: false }); // records + releases claim
     const events: string[] = [];
@@ -5137,7 +5778,7 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
       harness,
     ) as (c: never) => Promise<AdmitResult>;
 
-  it("queue delivery is the default — unchanged when the policy selects no delivery", async () => {
+  it('queue delivery is the default — unchanged when the policy selects no delivery', async () => {
     const { harness, rows } = setup();
     const r = await admit(harness)(makeIngressCtx());
     expect(r.status).toBe('queued');
@@ -5151,7 +5792,11 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
   it("signal delivery admits as a SIGNAL: idle-wake → status accepted, runId/signalId persisted, event delivery: 'signal'", async () => {
     const { harness, rows, agent } = setup({
       ingress: {
-        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal' },
+        }),
       },
     });
     const events: Array<{ type: string; delivery?: string; runId?: string; signalId?: string }> = [];
@@ -5187,7 +5832,11 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     // the pre-dispatch lost-signal window — see the next test for that.
     const { harness, storage, agent, rows } = setup({
       ingress: {
-        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal' },
+        }),
       },
     });
     const wrappedUpdate = storage.updateChannelInboxItem.bind(storage);
@@ -5233,7 +5882,11 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     // signalId, delivering exactly one run.
     const { harness, agent, rows } = setup({
       ingress: {
-        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal' },
+        }),
       },
     });
     // Crash the FIRST dispatch before any run is created: `signal()` calls
@@ -5288,7 +5941,11 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     });
     const { harness, rows, agent } = setup({
       ingress: {
-        resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+        resolveResource: async () => ({
+          resourceId: 'resource-1',
+          mode: 'shared-resource',
+          admission: { delivery: 'signal' },
+        }),
       },
     });
     // First inbound wakes a run that holds mid-flight, so the second inbound
@@ -5342,11 +5999,13 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     // the recovered turn carried ZERO attachments.
     const { harness, rows, agent } = setup();
     agent.enqueueRun({ text: 'ok' });
-    const { resolved } = await (harness as never as {
-      _resolveChannelBindingForIngress: (
-        c: never,
-      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
-    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const { resolved } = await (
+      harness as never as {
+        _resolveChannelBindingForIngress: (
+          c: never,
+        ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx());
     const sessionId = resolved.sessionId;
     const resourceId = resolved.resourceId;
     const session = await harness.session({
@@ -5360,9 +6019,11 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
       data: new TextEncoder().encode('attachment-bytes'),
     });
 
-    const recordOnly = (harness as never as {
-      admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
-    }).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+    const recordOnly = (
+      harness as never as {
+        admitChannelInbound: (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
+      }
+    ).admitChannelInbound.bind(harness) as (c: never, o: { continueAdmission: boolean }) => Promise<AdmitResult>;
 
     // Record + ACK before admission, carrying the inbound provider file refs.
     const r = await recordOnly(
@@ -5412,11 +6073,13 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     // Resolve the binding WITHOUT admitting a turn (no competing queue drain),
     // materialize that exact channel session via its threadId, then upload an
     // attachment owned by it and reference it on the single inbound under test.
-    const { resolved } = await (harness as never as {
-      _resolveChannelBindingForIngress: (
-        c: never,
-      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
-    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const { resolved } = await (
+      harness as never as {
+        _resolveChannelBindingForIngress: (
+          c: never,
+        ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx());
     const sessionId = resolved.sessionId;
     const resourceId = resolved.resourceId;
     const session = await harness.session({
@@ -5458,11 +6121,13 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
 
   it('the idempotency key distinguishes two inbound messages that differ only by their files', async () => {
     const { harness, rows } = setup();
-    const { resolved } = await (harness as never as {
-      _resolveChannelBindingForIngress: (
-        c: never,
-      ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
-    })._resolveChannelBindingForIngress(makeIngressCtx());
+    const { resolved } = await (
+      harness as never as {
+        _resolveChannelBindingForIngress: (
+          c: never,
+        ) => Promise<{ resolved: { sessionId: string; resourceId: string; threadId: string } }>;
+      }
+    )._resolveChannelBindingForIngress(makeIngressCtx());
     const sessionId = resolved.sessionId;
     const resourceId = resolved.resourceId;
     const session = await harness.session({
@@ -5470,16 +6135,32 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
       threadId: resolved.threadId,
       sessionId,
     } as never);
-    const a = await session.uploadAttachment({ name: 'a.txt', mimeType: 'text/plain', data: new TextEncoder().encode('A') });
-    const b = await session.uploadAttachment({ name: 'b.txt', mimeType: 'text/plain', data: new TextEncoder().encode('B') });
+    const a = await session.uploadAttachment({
+      name: 'a.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('A'),
+    });
+    const b = await session.uploadAttachment({
+      name: 'b.txt',
+      mimeType: 'text/plain',
+      data: new TextEncoder().encode('B'),
+    });
 
     // Same idempotency identity (same external ids/content) but different files →
     // a DIFFERENT payloadHash → a payload conflict, not a false duplicate.
     const withA = await admit(harness)(
-      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: a.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+      makeIngressCtx({
+        externalMessageId: 'M-files',
+        content: 'x',
+        files: [{ attachmentId: a.attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
     );
     const withB = await admit(harness)(
-      makeIngressCtx({ externalMessageId: 'M-files', content: 'x', files: [{ attachmentId: b.attachmentId, resourceId, ownerSessionId: sessionId }] }),
+      makeIngressCtx({
+        externalMessageId: 'M-files',
+        content: 'x',
+        files: [{ attachmentId: b.attachmentId, resourceId, ownerSessionId: sessionId }],
+      }),
     );
     expect(withA.inboxItemId).toBe(withB.inboxItemId);
     expect((withB as { conflict?: boolean }).conflict).toBe(true);
@@ -5641,11 +6322,9 @@ describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4
 
   it('200 and full admission when continueAdmission is true', async () => {
     const { harness } = setup();
-    const result = await harness.handleChannelInboundRequest(
-      'support',
-      inboundRequest({ content: 'hi' }),
-      { continueAdmission: true },
-    );
+    const result = await harness.handleChannelInboundRequest('support', inboundRequest({ content: 'hi' }), {
+      continueAdmission: true,
+    });
     expect(result).toMatchObject({ kind: 'ok', ackStatus: 200, status: 'queued', duplicate: false });
     expect((result as { sessionId?: string }).sessionId).toMatch(/^chs:/);
   });
@@ -5692,12 +6371,20 @@ describe('Harness.handleChannelInboundRequest (§13.2/§14.2 ingress bridge / C4
     // hash-covers-files contract is independent of that.)
     await harness.handleChannelInboundRequest(
       'support',
-      inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a1', resourceId: 'r1' }] }),
+      inboundRequest({
+        content: 'same',
+        externalMessageId: 'M-files',
+        files: [{ attachmentId: 'a1', resourceId: 'r1' }],
+      }),
       { continueAdmission: false },
     );
     const differentFiles = await harness.handleChannelInboundRequest(
       'support',
-      inboundRequest({ content: 'same', externalMessageId: 'M-files', files: [{ attachmentId: 'a2', resourceId: 'r1' }] }),
+      inboundRequest({
+        content: 'same',
+        externalMessageId: 'M-files',
+        files: [{ attachmentId: 'a2', resourceId: 'r1' }],
+      }),
       { continueAdmission: false },
     );
     // Same route + externalMessageId (same idempotency key) but a different attachment set must be a

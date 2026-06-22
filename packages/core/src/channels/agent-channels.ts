@@ -2,7 +2,6 @@ import type { Chat, Adapter, ChatConfig, Message, StateAdapter, Thread } from 'c
 import { z } from 'zod';
 
 import type { Agent } from '../agent/agent';
-import type { AIV5Type } from '../agent/message-list/types';
 import type { MastraProviderMetadata } from '../agent/message-list/state/types';
 import type { AgentSignalContents } from '../agent/signals';
 import type { AgentThreadSubscription } from '../agent/types';
@@ -112,6 +111,7 @@ export class AgentChannels {
   private channelToolNames!: Set<string>;
   /** Platforms whose routes are managed externally (e.g., by SlackProvider). */
   private externallyManagedPlatforms: Set<string> = new Set();
+  private mastraOwner?: { mastra: Mastra; agentKey: string };
   /**
    * Per-Mastra-thread subscriptions. We lazily open one `agent.subscribeToThread()` per channel
    * thread on the first message we route through it, so any signals we send (and any signals
@@ -191,6 +191,12 @@ export class AgentChannels {
       'child' in logger && typeof (logger as any).child === 'function' ? (logger as any).child('CHANNEL') : logger;
   }
 
+  /** @internal */
+  __setMastraOwner(mastra: Mastra, agentKey: string): void {
+    mastra._assertHarnessAgentChannelsAdapterAllowed(agentKey, this);
+    this.mastraOwner = { mastra, agentKey };
+  }
+
   /**
    * Register an adapter dynamically.
    * When `managesRoutes` is true, AgentChannels will NOT create webhook routes for this platform
@@ -203,6 +209,7 @@ export class AgentChannels {
     config?: ChannelAdapterConfig,
     options?: { managesRoutes?: boolean },
   ): void {
+    this.mastraOwner?.mastra._assertHarnessAgentChannelsAdapterAllowed(this.mastraOwner.agentKey, this, platform);
     if (this.adapters[platform]) {
       if (options?.managesRoutes) {
         this.externallyManagedPlatforms.add(platform);
@@ -221,6 +228,16 @@ export class AgentChannels {
    */
   hasAdapter(platform: string): boolean {
     return platform in this.adapters;
+  }
+
+  /**
+   * Return the generic channel tools that this AgentChannels instance can expose
+   * to the model. Mastra init uses this to detect Harness-bound ownership
+   * collisions without reaching into private AgentChannels state.
+   * @internal
+   */
+  __getChannelToolNames(): string[] {
+    return Array.from(this.channelToolNames);
   }
 
   /**
@@ -1076,8 +1093,7 @@ export class AgentChannels {
     // (AgentMessageInput.providerOptions) — the runtime stamps it onto the
     // UserModelMessage + persisted `content.providerMetadata`, preserving the
     // original intent of the fork's message wrapper.
-    const signalContents: AgentSignalContents =
-      parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
+    const signalContents: AgentSignalContents = parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
 
     this.agent.sendMessage(
       {
