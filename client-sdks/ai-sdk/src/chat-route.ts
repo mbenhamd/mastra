@@ -180,7 +180,9 @@ export type HarnessChatStreamHandlerParams<UI_MESSAGE extends SupportedUIMessage
 };
 
 export type HarnessChatSessionLike<OUTPUT = undefined> = {
-  message(options: HarnessChatMessageOptions): Promise<MastraModelOutput<OUTPUT>>;
+  // Keep overloaded Harness Session.message implementations assignable without
+  // importing the fork-only Harness option types into this SDK's public API.
+  message(options: any): Promise<MastraModelOutput<OUTPUT>>;
 };
 
 export type HarnessChatStreamHandlerOptions<
