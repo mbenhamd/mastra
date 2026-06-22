@@ -1067,6 +1067,34 @@ describe('Harness v1 — construction', () => {
     ).not.toThrow();
   });
 
+  it('rejects AgentChannels tools when the harness uses the agent id but Mastra uses a different key', () => {
+    expect(
+      () =>
+        new Mastra({
+          agents: {
+            support: new Agent({
+              id: 'assistant',
+              name: 'assistant',
+              instructions: 'test',
+              model: TEST_MODEL,
+              channels: { adapters: { slack: {} as any } },
+            }),
+          },
+          storage: new InMemoryStore(),
+          channels: { slack: makeChannelProvider('slack') },
+          harnesses: {
+            primary: new Harness({
+              modes: [{ id: 'default', agentId: 'assistant' }],
+              defaultModeId: 'default',
+              channels: {
+                support: makeHarnessChannelConfig(),
+              },
+            }),
+          },
+        }),
+    ).toThrow(/AgentChannels tools enabled/);
+  });
+
   it('rejects durable-agent AgentChannels tools on a harness-bound provider platform', () => {
     const underlyingAgent = new Agent({
       id: 'default',
@@ -1456,6 +1484,52 @@ describe('Harness v1 — construction', () => {
     expect(initialRoutes).toHaveLength(1);
     expect(routes).toHaveLength(1);
     expect(routes[0]).not.toBe(initialRoutes[0]);
+  });
+
+  it('reconciles webhook routes when the same AgentChannels instance gains an adapter', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any }, tools: false },
+    });
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    const agentChannels = agent.getChannels();
+
+    expect(agentChannels).toBeInstanceOf(AgentChannels);
+    agentChannels?.__registerAdapter('discord', {} as any);
+    agent.setChannels(agentChannels as AgentChannels);
+
+    const routePaths = mastra.getServer()?.apiRoutes?.map(route => route.path) ?? [];
+    expect(routePaths.filter(path => path === '/api/agents/default/channels/slack/webhook')).toHaveLength(1);
+    expect(routePaths.filter(path => path === '/api/agents/default/channels/discord/webhook')).toHaveLength(1);
+  });
+
+  it('closes replaced AgentChannels instances', () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: { adapters: { slack: {} as any }, tools: false },
+    });
+    new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+    const original = agent.getChannels();
+    const close = vi.spyOn(original as AgentChannels, 'close');
+    const replacement = new AgentChannels({ adapters: { slack: {} as any }, tools: false });
+
+    agent.setChannels(replacement);
+
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it('enqueues durable channel outbox rows before dispatching through the adapter', async () => {

@@ -1370,7 +1370,7 @@ export class Mastra<
       for (const [key, harness] of Object.entries(configuredHarnesses)) {
         if (harness == null) continue;
         channelBindingScopes.push({
-          agentIds: new Set(harness._listRunnableAgentIds()),
+          agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
           bindings: harness._previewChannelBindings(this, key),
         });
       }
@@ -1429,6 +1429,8 @@ export class Mastra<
   }
 
   #deleteAgentChannelInitialization(agentKey: string): void {
+    const previous = this.#agentChannelInstances.get(agentKey);
+    previous?.close();
     this.#agentChannelInstances.delete(agentKey);
     this.#agentChannelCollisionCandidates.delete(agentKey);
     this.#removeAgentChannelRoutes(agentKey);
@@ -1566,11 +1568,24 @@ export class Mastra<
     for (const harness of Object.values(harnesses)) {
       if (harness == null) continue;
       scopes.push({
-        agentIds: new Set(harness._listRunnableAgentIds()),
+        agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
         bindings: harness.listChannelBindings(),
       });
     }
     return scopes;
+  }
+
+  #expandHarnessRunnableAgentIds(agentIds: Iterable<string>): Set<string> {
+    const expanded = new Set(agentIds);
+    for (const [key, agent] of Object.entries(this.#agents)) {
+      if (expanded.has(key) && agent?.id) {
+        expanded.add(agent.id);
+      }
+      if (agent?.id && expanded.has(agent.id)) {
+        expanded.add(key);
+      }
+    }
+    return expanded;
   }
 
   #resolveAgentKey(agentOrKey: { id: string } | string): string {
@@ -1637,7 +1652,7 @@ export class Mastra<
   _assertHarnessAgentChannelToolCollisionsForHarness(harness: HarnessV1, harnessName: string): void {
     this.#assertNoHarnessAgentChannelToolCollisions([
       {
-        agentIds: new Set(harness._listRunnableAgentIds()),
+        agentIds: this.#expandHarnessRunnableAgentIds(harness._listRunnableAgentIds()),
         bindings: harness._previewChannelBindings(this, harnessName),
       },
     ]);
@@ -1688,12 +1703,14 @@ export class Mastra<
     agentChannelsInstance.__setLogger(this.#logger);
     agentChannelsInstance.__setMastraOwner(this, agentKey);
 
-    if (this.#agentChannelInstances.get(agentKey) === agentChannelsInstance) {
-      return;
-    }
+    const previous = this.#agentChannelInstances.get(agentKey);
+    const alreadyRegistered = previous === agentChannelsInstance;
 
     this.#removeAgentChannelRoutes(agentKey);
     this.#agentChannelCollisionCandidates.delete(agentKey);
+    if (previous && !alreadyRegistered) {
+      previous.close();
+    }
     const channelRoutes = agentChannelsInstance.getWebhookRoutes();
     if (channelRoutes.length > 0) {
       this.#agentChannelRoutes.set(agentKey, new Set(channelRoutes));
@@ -1705,7 +1722,7 @@ export class Mastra<
       this.#agentChannelRoutes.delete(agentKey);
     }
     this.#agentChannelInstances.set(agentKey, agentChannelsInstance);
-    if (this.#lifecycleState === 'ready') {
+    if (!alreadyRegistered && this.#lifecycleState === 'ready') {
       this.#startAgentChannelInitialization(agentKey, agentChannelsInstance);
     }
   }
