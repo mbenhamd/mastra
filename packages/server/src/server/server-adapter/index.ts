@@ -81,6 +81,8 @@ export interface MCPOptions {
   sessionIdGenerator?: () => string;
 }
 
+export type ServerRouteSelector = readonly ServerRoute[] | ((route: ServerRoute) => boolean);
+
 /**
  * Query parameter values parsed from HTTP requests.
  * Supports both single values and arrays (for repeated query params like ?tag=a&tag=b).
@@ -355,6 +357,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   protected httpLoggingConfig?: HttpLoggingConfig;
   protected customApiRoutes?: ApiRoute[];
   protected mcpOptions?: MCPOptions;
+  protected serverRoutes: readonly ServerRoute[];
   private customRouteHandler:
     | ((request: Request, env?: { requestContext?: RequestContext }) => Promise<Response>)
     | null = null;
@@ -371,6 +374,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     streamOptions,
     customApiRoutes,
     mcpOptions,
+    routes,
   }: {
     app: TApp;
     mastra: Mastra;
@@ -387,6 +391,11 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
      * Individual routes can override these via MCPHttpTransportResult.mcpOptions.
      */
     mcpOptions?: MCPOptions;
+    /**
+     * Built-in server routes to register. Omit to register every built-in route.
+     * Pass a route predicate to preserve the canonical SERVER_ROUTES order.
+     */
+    routes?: ServerRouteSelector;
   }) {
     super({ app, name: 'MastraServer' });
     this.mastra = mastra;
@@ -399,6 +408,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     this.streamOptions = { redact: true, ...streamOptions };
     this.customApiRoutes = customApiRoutes;
     this.mcpOptions = mcpOptions;
+    this.serverRoutes = this.resolveServerRoutes(routes);
 
     // Parse HTTP logging configuration
     const serverConfig = mastra.getServer();
@@ -406,6 +416,34 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
 
     // Automatically register this adapter with Mastra so getServerApp() works
     mastra.setMastraServer(this);
+  }
+
+  private resolveServerRoutes(routes?: ServerRouteSelector): readonly ServerRoute[] {
+    if (!routes) return SERVER_ROUTES;
+    if (typeof routes === 'function') return SERVER_ROUTES.filter(route => routes(route));
+
+    const builtInsByRoute = new Map(SERVER_ROUTES.map(route => [formatRoute(route), route] as const));
+    const seen = new Set<string>();
+
+    return routes.map(route => {
+      const routeKey = formatRoute(route);
+      const canonicalRoute = builtInsByRoute.get(routeKey);
+
+      if (!canonicalRoute) {
+        throw new Error(`routes selector can only include built-in Mastra server routes; unknown route: ${routeKey}`);
+      }
+
+      if (seen.has(routeKey)) {
+        throw new Error(`routes selector contains duplicate built-in route: ${routeKey}`);
+      }
+
+      seen.add(routeKey);
+      return canonicalRoute;
+    });
+  }
+
+  getServerRoutes(): readonly ServerRoute[] {
+    return [...this.serverRoutes];
   }
 
   /**
@@ -714,7 +752,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     const customRoutes = (this.customApiRoutes ?? serverConfig?.apiRoutes ?? []).filter(
       route => !route._mastraInternal,
     );
-    const routes = [...SERVER_ROUTES, ...customRoutes] as ServerRoute[];
+    const routes = [...this.serverRoutes, ...customRoutes] as ServerRoute[];
 
     if (fgaProvider.validatePermissions) {
       const permissions = [...new Set(routes.flatMap(route => getRoutePermissions(route)))];
@@ -957,7 +995,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
    * Builds the OpenAPI spec object with servers field and custom route paths.
    */
   private buildOpenAPISpec(config: { title: string; version: string; description: string }, prefix?: string): any {
-    const openApiSpec = generateOpenAPIDocument(SERVER_ROUTES, config);
+    const openApiSpec = generateOpenAPIDocument(this.serverRoutes, config);
 
     if (prefix) {
       openApiSpec.servers = [{ url: prefix }];
@@ -1004,7 +1042,7 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     // Register routes sequentially to maintain order - important for routers where
     // more specific routes (e.g., /versions/compare) must be registered before
     // parameterized routes (e.g., /versions/:versionId)
-    for (const route of SERVER_ROUTES) {
+    for (const route of this.serverRoutes) {
       await this.registerRoute(this.app, route, { prefix: this.prefix });
     }
 

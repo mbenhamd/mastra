@@ -14,6 +14,7 @@ import {
 import { Mastra } from '@mastra/core';
 import { registerApiRoute } from '@mastra/core/server';
 import type { ServerRoute } from '@mastra/server/server-adapter';
+import { SERVER_ROUTES } from '@mastra/server/server-adapter';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -35,6 +36,29 @@ async function waitFor(assertion: () => boolean, timeout = 500): Promise<void> {
 
 // Wrapper describe block so the factory can call describe() inside
 describe('Fastify Server Adapter', () => {
+  it('registers only selected built-in server routes', async () => {
+    const app = Fastify();
+    try {
+      const mastra = new Mastra({ logger: false });
+      const selectedRoutes = [SERVER_ROUTES[0], SERVER_ROUTES[2]].filter(Boolean) as ServerRoute[];
+      const selectedRouteKeys = new Set(selectedRoutes.map(route => `${route.method} ${route.path}`));
+      const adapter = new MastraServer({
+        app,
+        mastra,
+        routes: route => selectedRouteKeys.has(`${route.method} ${route.path}`),
+      });
+      const registerRoute = vi.spyOn(adapter, 'registerRoute');
+
+      await adapter.registerRoutes();
+
+      const expectedRoutes = SERVER_ROUTES.filter(route => selectedRouteKeys.has(`${route.method} ${route.path}`));
+      expect(registerRoute).toHaveBeenCalledTimes(expectedRoutes.length);
+      expect(registerRoute.mock.calls.map(call => call[1])).toEqual(expectedRoutes);
+    } finally {
+      await app.close();
+    }
+  });
+
   createRouteAdapterTestSuite({
     suiteName: 'Fastify Adapter Integration Tests',
 

@@ -6,7 +6,8 @@ import type { IFGAProvider } from '@mastra/core/auth/ee';
 import type { ChannelProvider } from '@mastra/core/channels';
 import { Mastra } from '@mastra/core/mastra';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { MastraServer } from './index';
+import type { ServerRoute } from './index';
+import { MastraServer, SERVER_ROUTES } from './index';
 
 class TestMastraServer extends MastraServer<any, any, any> {
   stream = vi.fn();
@@ -69,6 +70,12 @@ function createMockFGAProvider(authorized = true): IFGAProvider {
     require: vi.fn(),
     filterAccessible: vi.fn(),
   };
+}
+
+function getBuiltInRoute(method: string, path: string): ServerRoute {
+  const route = SERVER_ROUTES.find(candidate => candidate.method === method && candidate.path === path);
+  if (!route) throw new Error(`Missing test route: ${method} ${path}`);
+  return route;
 }
 
 describe('custom route forwarding', () => {
@@ -170,6 +177,149 @@ describe('server init readiness', () => {
     await expect(adapter.init()).rejects.toThrow('channel readiness failed');
 
     expect(registerRoutes).not.toHaveBeenCalled();
+  });
+});
+
+describe('built-in route selection', () => {
+  it('registers all built-in server routes by default', async () => {
+    const adapter = createTestAdapter();
+
+    await adapter.registerRoutes();
+
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(SERVER_ROUTES.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(SERVER_ROUTES);
+  });
+
+  it('registers only the provided built-in server route array', async () => {
+    const selectedRoutes = [SERVER_ROUTES[2], SERVER_ROUTES[0]].filter(Boolean) as ServerRoute[];
+    const expectedRoutes = [...selectedRoutes];
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: selectedRoutes,
+    });
+    selectedRoutes.length = 0;
+
+    await adapter.registerRoutes();
+
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(expectedRoutes.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(expectedRoutes);
+  });
+
+  it('canonicalizes array-selected routes to built-in route objects', async () => {
+    const selectedRoute = getBuiltInRoute('GET', '/agents');
+    const spoofedRoute = {
+      ...selectedRoute,
+      handler: vi.fn(async () => ({ spoofed: true })),
+      requiresAuth: false,
+    } as ServerRoute;
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: [spoofedRoute],
+    });
+
+    await adapter.registerRoutes();
+
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(1);
+    expect(adapter.registerRoute.mock.calls[0]?.[1]).toBe(selectedRoute);
+    expect(adapter.registerRoute.mock.calls[0]?.[1]).not.toBe(spoofedRoute);
+  });
+
+  it('rejects unknown and duplicate array-selected built-in routes', () => {
+    const selectedRoute = getBuiltInRoute('GET', '/agents');
+    const unknownRoute = { ...selectedRoute, path: '/not-a-built-in-route' } as ServerRoute;
+
+    expect(
+      () =>
+        new TestMastraServer({
+          app: {},
+          mastra: {
+            getServer: () => undefined,
+            setMastraServer: vi.fn(),
+          } as unknown as Mastra,
+          routes: [unknownRoute],
+        }),
+    ).toThrow(
+      'routes selector can only include built-in Mastra server routes; unknown route: GET /not-a-built-in-route',
+    );
+
+    expect(
+      () =>
+        new TestMastraServer({
+          app: {},
+          mastra: {
+            getServer: () => undefined,
+            setMastraServer: vi.fn(),
+          } as unknown as Mastra,
+          routes: [selectedRoute, selectedRoute],
+        }),
+    ).toThrow('routes selector contains duplicate built-in route: GET /agents');
+  });
+
+  it('returns a defensive copy of selected server routes', () => {
+    const selectedRoutes = [SERVER_ROUTES[0], SERVER_ROUTES[2]].filter(Boolean) as ServerRoute[];
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: selectedRoutes,
+    });
+
+    const exposedRoutes = adapter.getServerRoutes() as ServerRoute[];
+    exposedRoutes.length = 0;
+
+    expect(adapter.getServerRoutes()).toEqual(selectedRoutes);
+  });
+
+  it('registers predicate-selected built-in server routes in canonical order', async () => {
+    const selectedRoutes = [SERVER_ROUTES[0], SERVER_ROUTES[2]].filter(Boolean) as ServerRoute[];
+    const selectedRouteKeys = new Set(selectedRoutes.map(route => `${route.method} ${route.path}`));
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: route => selectedRouteKeys.has(`${route.method} ${route.path}`),
+    });
+
+    await adapter.registerRoutes();
+
+    const expectedRoutes = SERVER_ROUTES.filter(route => selectedRouteKeys.has(`${route.method} ${route.path}`));
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(expectedRoutes.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(expectedRoutes);
+  });
+
+  it('generates OpenAPI from selected built-in routes only', async () => {
+    const includedRoute = getBuiltInRoute('GET', '/agents');
+    const omittedRoute = getBuiltInRoute('GET', '/workflows');
+    expect(includedRoute.openapi).toBeDefined();
+    expect(omittedRoute.openapi).toBeDefined();
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: [includedRoute],
+    });
+
+    await adapter.registerOpenAPIRoute({}, { path: '/openapi.json' }, { prefix: '/api' });
+
+    const openApiRoute = adapter.registerRoute.mock.calls[0]?.[1] as ServerRoute | undefined;
+    const spec = await openApiRoute?.handler({} as any);
+
+    expect(spec.paths).toHaveProperty('/agents');
+    expect(spec.paths).not.toHaveProperty('/workflows');
   });
 });
 
@@ -843,6 +993,29 @@ describe('FGA policy coverage validation', () => {
     expect(validatePermissions.mock.calls[0]?.[0]).toContain('agents:create');
     expect(validatePermissions.mock.calls[0]?.[0]).toContain('agents:read');
     expect(validatePermissions.mock.calls[0]?.[0]).toContain('workflows:execute');
+  });
+
+  it('should validate permissions from selected built-in routes only', async () => {
+    const validatePermissions = vi.fn();
+    const mastra = new Mastra({
+      server: {
+        fga: {
+          ...createMockFGAProvider(),
+          validatePermissions,
+        },
+      },
+    });
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra,
+      routes: [getBuiltInRoute('GET', '/agents')],
+    });
+
+    await adapter.validateFGAPolicyCoverage();
+
+    expect(validatePermissions).toHaveBeenCalledTimes(1);
+    expect(validatePermissions.mock.calls[0]?.[0]).toContain('agents:read');
+    expect(validatePermissions.mock.calls[0]?.[0]).not.toContain('workflows:execute');
   });
 
   it('should warn about protected routes without FGA metadata when fail-closed mode is enabled', async () => {

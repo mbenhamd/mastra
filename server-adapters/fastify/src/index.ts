@@ -276,11 +276,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       // before the signature is checked. Mirrors the Hono adapter's getParams.
       if (route.skipBodyParse) {
         if (Buffer.isBuffer(request.body)) {
-          rawBody = new Uint8Array(
-            request.body.buffer,
-            request.body.byteOffset,
-            request.body.byteLength,
-          );
+          rawBody = new Uint8Array(request.body.buffer, request.body.byteOffset, request.body.byteLength);
         } else if (typeof request.body === 'string') {
           rawBody = request.body;
         } else if (request.body instanceof Uint8Array) {
@@ -677,6 +673,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         taskStore: request.taskStore,
         abortSignal: request.abortSignal,
         routePrefix: prefix,
+        serverRoutes: this.getServerRoutes(),
         getHeader: (name: string) => {
           const value = request.headers[name.toLowerCase()];
           return Array.isArray(value) ? value.join(',') : value;

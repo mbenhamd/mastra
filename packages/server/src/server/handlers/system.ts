@@ -20,10 +20,10 @@ export const GET_API_SCHEMA_ROUTE = createRoute({
   description: 'Returns the route-contract-derived API schema manifest for the machine-readable CLI',
   tags: ['System'],
   requiresAuth: true,
-  handler: async () => {
+  handler: async ({ serverRoutes }) => {
     // Dynamic import to avoid circular dependency issues
     const { buildApiSchemaManifest } = await import('../server-adapter/api-schema-manifest');
-    return buildApiSchemaManifest();
+    return buildApiSchemaManifest(serverRoutes);
   },
 });
 
