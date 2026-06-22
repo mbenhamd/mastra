@@ -1555,6 +1555,33 @@ describe('Harness v1 — construction', () => {
     expect(routePaths.filter(path => path === '/api/agents/default/channels/discord/webhook')).toHaveLength(1);
   });
 
+  it('restarts initialized AgentChannels when the same instance gains an adapter', async () => {
+    const agentChannels = new AgentChannels({ adapters: { slack: {} as any }, tools: false });
+    const initialize = vi.spyOn(agentChannels, 'initialize').mockResolvedValue(undefined);
+    const close = vi.spyOn(agentChannels, 'close');
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'test',
+      model: TEST_MODEL,
+      channels: agentChannels,
+    });
+    const mastra = new Mastra({
+      agents: { default: agent },
+      storage: new InMemoryStore(),
+      channels: { slack: makeChannelProvider('slack') },
+    });
+
+    await mastra.init();
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    agentChannels.__registerAdapter('discord', {} as any);
+    agent.setChannels(agentChannels);
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(initialize).toHaveBeenCalledTimes(2);
+  });
+
   it('closes replaced AgentChannels instances', () => {
     const agent = new Agent({
       id: 'default',

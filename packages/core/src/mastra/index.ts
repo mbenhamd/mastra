@@ -1705,10 +1705,11 @@ export class Mastra<
 
     const previous = this.#agentChannelInstances.get(agentKey);
     const alreadyRegistered = previous === agentChannelsInstance;
+    const shouldRestartAgentChannels = alreadyRegistered && this.#lifecycleState === 'ready';
 
     this.#removeAgentChannelRoutes(agentKey);
     this.#agentChannelCollisionCandidates.delete(agentKey);
-    if (previous && !alreadyRegistered) {
+    if (previous && (!alreadyRegistered || shouldRestartAgentChannels)) {
       previous.close();
     }
     const channelRoutes = agentChannelsInstance.getWebhookRoutes();
@@ -1722,7 +1723,7 @@ export class Mastra<
       this.#agentChannelRoutes.delete(agentKey);
     }
     this.#agentChannelInstances.set(agentKey, agentChannelsInstance);
-    if (!alreadyRegistered && this.#lifecycleState === 'ready') {
+    if ((!alreadyRegistered || shouldRestartAgentChannels) && this.#lifecycleState === 'ready') {
       this.#startAgentChannelInitialization(agentKey, agentChannelsInstance);
     }
   }
