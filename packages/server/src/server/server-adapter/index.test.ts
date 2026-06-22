@@ -6,7 +6,8 @@ import type { IFGAProvider } from '@mastra/core/auth/ee';
 import type { ChannelProvider } from '@mastra/core/channels';
 import { Mastra } from '@mastra/core/mastra';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { MastraServer } from './index';
+import type { ServerRoute } from './index';
+import { MastraServer, SERVER_ROUTES } from './index';
 
 class TestMastraServer extends MastraServer<any, any, any> {
   stream = vi.fn();
@@ -170,6 +171,55 @@ describe('server init readiness', () => {
     await expect(adapter.init()).rejects.toThrow('channel readiness failed');
 
     expect(registerRoutes).not.toHaveBeenCalled();
+  });
+});
+
+describe('built-in route selection', () => {
+  it('registers all built-in server routes by default', async () => {
+    const adapter = createTestAdapter();
+
+    await adapter.registerRoutes();
+
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(SERVER_ROUTES.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(SERVER_ROUTES);
+  });
+
+  it('registers only the provided built-in server route array', async () => {
+    const selectedRoutes = [SERVER_ROUTES[2], SERVER_ROUTES[0]].filter(Boolean) as ServerRoute[];
+    const expectedRoutes = [...selectedRoutes];
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: selectedRoutes,
+    });
+    selectedRoutes.length = 0;
+
+    await adapter.registerRoutes();
+
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(expectedRoutes.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(expectedRoutes);
+  });
+
+  it('registers predicate-selected built-in server routes in canonical order', async () => {
+    const selectedRoutes = [SERVER_ROUTES[0], SERVER_ROUTES[2]].filter(Boolean) as ServerRoute[];
+    const selectedRouteKeys = new Set(selectedRoutes.map(route => `${route.method} ${route.path}`));
+    const adapter = new TestMastraServer({
+      app: {},
+      mastra: {
+        getServer: () => undefined,
+        setMastraServer: vi.fn(),
+      } as unknown as Mastra,
+      routes: route => selectedRouteKeys.has(`${route.method} ${route.path}`),
+    });
+
+    await adapter.registerRoutes();
+
+    const expectedRoutes = SERVER_ROUTES.filter(route => selectedRouteKeys.has(`${route.method} ${route.path}`));
+    expect(adapter.registerRoute).toHaveBeenCalledTimes(expectedRoutes.length);
+    expect(adapter.registerRoute.mock.calls.map(call => call[1])).toEqual(expectedRoutes);
   });
 });
 

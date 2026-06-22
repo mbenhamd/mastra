@@ -8,8 +8,13 @@ import {
   observabilityStorageCapabilitiesSchema,
   systemPackagesResponseSchema,
 } from '../schemas/system';
+import type { ServerRoute } from '../server-adapter/routes';
 import { createRoute } from '../server-adapter/routes/route-builder';
 import { handleError } from './error';
+
+type RouteAwareMastraServer = {
+  getServerRoutes?: () => readonly ServerRoute[];
+};
 
 export const GET_API_SCHEMA_ROUTE = createRoute({
   method: 'GET',
@@ -20,10 +25,11 @@ export const GET_API_SCHEMA_ROUTE = createRoute({
   description: 'Returns the route-contract-derived API schema manifest for the machine-readable CLI',
   tags: ['System'],
   requiresAuth: true,
-  handler: async () => {
+  handler: async ({ mastra }) => {
     // Dynamic import to avoid circular dependency issues
     const { buildApiSchemaManifest } = await import('../server-adapter/api-schema-manifest');
-    return buildApiSchemaManifest();
+    const serverRoutes = (mastra.getMastraServer() as RouteAwareMastraServer | undefined)?.getServerRoutes?.();
+    return buildApiSchemaManifest(serverRoutes);
   },
 });
 
