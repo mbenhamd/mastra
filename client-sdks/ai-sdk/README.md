@@ -117,6 +117,45 @@ export async function POST(req: Request) {
 }
 ```
 
+### handleHarnessChatStream
+
+Use `handleHarnessChatStream` when your runtime already resolved a Harness v1
+session and needs to admit an AI SDK UI chat body through `session.message({
+stream: true })` instead of raw `agent.stream()`.
+
+```typescript
+import { handleHarnessChatStream } from '@mastra/ai-sdk';
+import { createUIMessageStreamResponse, type UIMessage } from 'ai';
+
+export async function POST(req: Request) {
+  const params = (await req.json()) as { messages: UIMessage[] };
+  const session = await harness.session({ resourceId, threadId });
+  const stream = await handleHarnessChatStream({
+    session,
+    params: {
+      messages: params.messages,
+      requestContext: { app: { requestId } },
+    },
+    version: 'v6',
+  });
+
+  return createUIMessageStreamResponse({ stream });
+}
+```
+
+Normal submit requests use the trailing user message ID as the Harness
+`admissionId`, preserving duplicate detection and durable result semantics.
+`trigger: "regenerate-message"` intentionally omits `admissionId` so Harness
+admits a fresh turn instead of replaying the original user message result.
+Per-turn `additionalTools` also require a fresh Harness turn and are rejected on
+normal submits because Harness does not allow them with `admissionId`.
+
+Direct callers may only provide `requestContext.app`; Harness-owned context keys
+such as `harness`, `channel`, or `user` are rejected before admission and are
+validated again by `session.message()`. Tool approvals, suspensions, and other
+resume-style HITL responses are not mapped by this helper; route those through
+native Harness inbox/session APIs.
+
 ### handleWorkflowStream
 
 ```typescript
