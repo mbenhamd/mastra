@@ -1316,7 +1316,9 @@ export class Harness {
     //   3. Neither — defer; a parent Mastra will install itself via
     //      __registerMastra during its own construction.
     if (config.mastra) {
+      config.mastra._assertHarnessAgentChannelToolCollisionsForHarness(this, this._harnessName);
       this._bindMastra(config.mastra);
+      config.mastra._registerDirectHarness(this._harnessName, this);
     } else if (config.agents !== undefined || config.storage !== undefined) {
       if (this._channelRegistry.hasPending()) {
         throw new HarnessConfigError(
@@ -1460,6 +1462,23 @@ export class Harness {
       this._guardPreboundDefaultNamespace = previousGuardPreboundDefaultNamespace;
       throw err;
     }
+  }
+
+  /** @internal — validate prospective channel bindings without mutating this Harness. */
+  _previewChannelBindings(mastra: Mastra, harnessName = this._harnessName): HarnessChannelBinding[] {
+    return this._channelRegistry.preview(mastra, harnessName);
+  }
+
+  /** @internal — agent ids this harness can execute through modes or subagent definitions. */
+  _listRunnableAgentIds(): string[] {
+    const agentIds = new Set<string>();
+    for (const mode of this._modesById.values()) {
+      agentIds.add(mode.agentId);
+    }
+    for (const def of this._subagentTypes.values()) {
+      agentIds.add(def.agentId);
+    }
+    return Array.from(agentIds);
   }
 
   /**
@@ -6070,6 +6089,7 @@ export class Harness {
     const mastra = this._mastra;
     if (mastra) {
       boundHarnessesByMastra.get(mastra)?.delete(this);
+      mastra._unregisterDirectHarness(this);
       this._untrackMemoryStorage(mastra.getStorage()?.stores?.memory);
     }
   }

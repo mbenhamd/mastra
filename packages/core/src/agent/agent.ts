@@ -847,11 +847,13 @@ export class Agent<
    * @internal
    */
   setChannels(agentChannels: AgentChannels): void {
+    this.#mastra?._assertHarnessAgentChannelsAdapterAllowed(this, agentChannels);
     if (this.#agentChannels && this.#agentChannels !== agentChannels) {
       this.logger?.debug(`Replacing existing AgentChannels on agent "${this.name}"`);
     }
-    this.#agentChannels = agentChannels;
     agentChannels.__setAgent(this);
+    this.#mastra?._registerAgentChannelsForAgent(this, agentChannels);
+    this.#agentChannels = agentChannels;
   }
 
   /**
