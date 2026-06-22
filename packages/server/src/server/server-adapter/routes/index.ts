@@ -56,6 +56,8 @@ export type ServerContext = {
   abortSignal: AbortSignal;
   /** The route prefix configured for the server (e.g., '/api') */
   routePrefix?: string;
+  /** Built-in server routes selected for the adapter serving this request. */
+  serverRoutes?: readonly ServerRoute[];
   /** Adapter-normalized request header lookup. */
   getHeader?: (name: string) => string | undefined;
   /**

@@ -421,11 +421,29 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   private resolveServerRoutes(routes?: ServerRouteSelector): readonly ServerRoute[] {
     if (!routes) return SERVER_ROUTES;
     if (typeof routes === 'function') return SERVER_ROUTES.filter(route => routes(route));
-    return [...routes];
+
+    const builtInsByRoute = new Map(SERVER_ROUTES.map(route => [formatRoute(route), route] as const));
+    const seen = new Set<string>();
+
+    return routes.map(route => {
+      const routeKey = formatRoute(route);
+      const canonicalRoute = builtInsByRoute.get(routeKey);
+
+      if (!canonicalRoute) {
+        throw new Error(`routes selector can only include built-in Mastra server routes; unknown route: ${routeKey}`);
+      }
+
+      if (seen.has(routeKey)) {
+        throw new Error(`routes selector contains duplicate built-in route: ${routeKey}`);
+      }
+
+      seen.add(routeKey);
+      return canonicalRoute;
+    });
   }
 
   getServerRoutes(): readonly ServerRoute[] {
-    return this.serverRoutes;
+    return [...this.serverRoutes];
   }
 
   /**

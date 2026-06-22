@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ObservabilityStorage } from '@mastra/core/storage';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { GET_SYSTEM_PACKAGES_ROUTE } from './system';
+import type { ServerRoute } from '../server-adapter';
+import { SERVER_ROUTES } from '../server-adapter';
+import { GET_API_SCHEMA_ROUTE, GET_SYSTEM_PACKAGES_ROUTE } from './system';
 
 type MockStorage = {
   name?: string;
@@ -47,6 +49,12 @@ const createMockMastra = (hasEditor: boolean, storage?: MockStorage, hasObservab
     },
   }) as any;
 
+function getBuiltInRoute(method: string, path: string): ServerRoute {
+  const route = SERVER_ROUTES.find(candidate => candidate.method === method && candidate.path === path);
+  if (!route) throw new Error(`Missing test route: ${method} ${path}`);
+  return route;
+}
+
 describe('System Handlers', () => {
   const originalEnv = process.env;
   let tempDir: string;
@@ -66,6 +74,23 @@ describe('System Handlers', () => {
     } catch {
       // File may not exist
     }
+  });
+
+  describe('GET_API_SCHEMA_ROUTE', () => {
+    it('should build the API schema manifest from the serving adapter route selection', async () => {
+      const selectedRoute = getBuiltInRoute('GET', '/agents');
+
+      const result = await GET_API_SCHEMA_ROUTE.handler({
+        mastra: {} as any,
+        requestContext: {} as any,
+        abortSignal: new AbortController().signal,
+        serverRoutes: [selectedRoute],
+      });
+      const routeKeys = result.routes.map(route => `${route.method} ${route.path}`);
+
+      expect(routeKeys).toContain('GET /agents');
+      expect(routeKeys).not.toContain('GET /workflows');
+    });
   });
 
   describe('GET_SYSTEM_PACKAGES_ROUTE', () => {
