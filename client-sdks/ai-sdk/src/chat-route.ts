@@ -13,6 +13,7 @@ import type { AgentExecutionOptions, AgentExecutionOptionsBase } from '@mastra/c
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import { registerApiRoute } from '@mastra/core/server';
+import type { MastraModelOutput } from '@mastra/core/stream';
 import { toAISdkStream } from './convert-streams';
 import { APPROVAL_ID_SEPARATOR } from './helpers';
 import type {
@@ -118,6 +119,227 @@ type ChatStreamHandlerOptionsV6<UI_MESSAGE extends V6UIMessage = V6UIMessage, OU
   version: 'v6';
   messageMetadata?: UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata'];
 };
+
+type JsonPrimitive = string | number | boolean | null;
+type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
+
+export type HarnessChatAttachmentRef = {
+  attachmentId: string;
+  resourceId: string;
+  ownerSessionId?: string;
+  bytes?: number;
+  sha256?: string;
+  source?: 'inline' | 'preupload' | 'url' | 'provider';
+  kind?: 'file' | 'primitive' | 'element';
+  name?: string;
+  mimeType?: string;
+  primitiveType?: 'text' | 'markdown' | 'json' | 'table' | 'chart-data' | 'selection' | 'citation';
+  elementType?: string;
+  renderer?: unknown;
+  schemaId?: string;
+  metadata?: Record<string, JsonValue>;
+  object?: unknown;
+};
+
+export type HarnessChatMessageOptions = {
+  content: string;
+  stream: true;
+  output?: undefined;
+  sync?: undefined;
+  admissionId?: string;
+  abortSignal?: AbortSignal;
+  mode?: string;
+  model?: string;
+  attachments?: HarnessChatAttachmentRef[];
+  additionalTools?: Record<string, unknown>;
+  requestContext?: { app: Record<string, JsonValue> };
+};
+
+export class HarnessChatStreamValidationError extends Error {
+  constructor(
+    public readonly path: string,
+    message: string,
+  ) {
+    super(`${path}: ${message}`);
+    this.name = 'HarnessChatStreamValidationError';
+  }
+}
+
+export type HarnessChatStreamTrigger = 'submit-message' | 'regenerate-message';
+
+export type HarnessChatStreamHandlerParams<UI_MESSAGE extends SupportedUIMessage = SupportedUIMessage> = {
+  messages: UI_MESSAGE[];
+  requestContext?: unknown;
+  trigger?: HarnessChatStreamTrigger;
+  admissionId?: HarnessChatMessageOptions['admissionId'];
+  abortSignal?: HarnessChatMessageOptions['abortSignal'];
+  mode?: HarnessChatMessageOptions['mode'];
+  model?: HarnessChatMessageOptions['model'];
+  attachments?: HarnessChatMessageOptions['attachments'];
+  additionalTools?: HarnessChatMessageOptions['additionalTools'];
+};
+
+export type HarnessChatSessionLike<OUTPUT = undefined> = {
+  // Keep overloaded Harness Session.message implementations assignable without
+  // importing the fork-only Harness option types into this SDK's public API.
+  message(options: any): Promise<MastraModelOutput<OUTPUT>>;
+};
+
+export type HarnessChatStreamHandlerOptions<
+  UI_MESSAGE extends SupportedUIMessage = SupportedUIMessage,
+  OUTPUT = undefined,
+> = {
+  session: HarnessChatSessionLike<OUTPUT>;
+  params: HarnessChatStreamHandlerParams<UI_MESSAGE>;
+  version?: 'v5' | 'v6';
+  sendStart?: boolean;
+  sendFinish?: boolean;
+  sendReasoning?: boolean;
+  sendSources?: boolean;
+  onError?: (error: unknown) => string;
+  messageMetadata?: UI_MESSAGE extends V6UIMessage
+    ? UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata']
+    : UI_MESSAGE extends V5UIMessage
+      ? UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata']
+      : never;
+};
+
+type HarnessChatStreamHandlerOptionsV5<UI_MESSAGE extends V5UIMessage = V5UIMessage, OUTPUT = undefined> = Omit<
+  HarnessChatStreamHandlerOptions<UI_MESSAGE, OUTPUT>,
+  'version' | 'messageMetadata'
+> & {
+  version?: 'v5';
+  messageMetadata?: UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata'];
+};
+
+type HarnessChatStreamHandlerOptionsV6<UI_MESSAGE extends V6UIMessage = V6UIMessage, OUTPUT = undefined> = Omit<
+  HarnessChatStreamHandlerOptions<UI_MESSAGE, OUTPUT>,
+  'version' | 'messageMetadata'
+> & {
+  version: 'v6';
+  messageMetadata?: UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata'];
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertJsonValue(value: unknown, path: string): JsonValue {
+  if (value === null) return value;
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return value;
+    case 'number':
+      if (Number.isFinite(value) && !Object.is(value, -0)) return value;
+      break;
+    case 'object':
+      if (Array.isArray(value)) {
+        const out: JsonValue[] = [];
+        for (let index = 0; index < value.length; index += 1) {
+          if (!(index in value)) {
+            throw new HarnessChatStreamValidationError(`${path}[${index}]`, 'sparse arrays are not allowed');
+          }
+          out.push(assertJsonValue(value[index], `${path}[${index}]`));
+        }
+        return out;
+      }
+      if (isPlainObject(value)) {
+        const out: Record<string, JsonValue> = {};
+        for (const [key, child] of Object.entries(value)) {
+          if (child !== undefined) out[key] = assertJsonValue(child, `${path}.${key}`);
+        }
+        return out;
+      }
+      break;
+  }
+  throw new HarnessChatStreamValidationError(path, 'must be JSON-serializable');
+}
+
+function validateHarnessChatRequestContext(input: unknown): { app: Record<string, JsonValue> } | undefined {
+  if (input === undefined) return undefined;
+  const path = 'handleHarnessChatStream.requestContext';
+  if (!isPlainObject(input)) {
+    throw new HarnessChatStreamValidationError(path, 'must be a plain object whose only allowed property is "app"');
+  }
+  for (const key of Reflect.ownKeys(input)) {
+    if (key !== 'app') {
+      throw new HarnessChatStreamValidationError(
+        `${path}.${typeof key === 'symbol' ? key.toString() : key}`,
+        'callers may only supply requestContext.app; all other keys are infrastructure-owned',
+      );
+    }
+  }
+  const app = input.app;
+  if (app === undefined) return undefined;
+  if (!isPlainObject(app)) {
+    throw new HarnessChatStreamValidationError(`${path}.app`, 'must be a JSON object');
+  }
+  return { app: assertJsonValue(app, `${path}.app`) as Record<string, JsonValue> };
+}
+
+function textFromUIMessage(message: SupportedUIMessage): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === 'string') return content;
+
+  const parts = (message as { parts?: unknown }).parts;
+  if (Array.isArray(parts)) {
+    let text = '';
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index];
+      if (isPlainObject(part) && part.type === 'text' && typeof part.text === 'string') {
+        text += part.text;
+        continue;
+      }
+      if (isPlainObject(part) && part.type === 'file') {
+        throw new HarnessChatStreamValidationError(
+          `handleHarnessChatStream.params.messages.parts[${index}]`,
+          'file parts must be uploaded as Harness attachments before session admission',
+        );
+      }
+      if (isPlainObject(part) && typeof part.type === 'string') {
+        throw new HarnessChatStreamValidationError(
+          `handleHarnessChatStream.params.messages.parts[${index}]`,
+          `unsupported UI message part "${part.type}"`,
+        );
+      }
+    }
+    if (text.length > 0) return text;
+  }
+
+  throw new Error('A Harness chat stream requires a user message with text content');
+}
+
+function resolveHarnessChatPrompt(messages: SupportedUIMessage[], trigger: HarnessChatStreamTrigger | undefined) {
+  if (!Array.isArray(messages)) {
+    throw new Error('Messages must be an array of UIMessage objects');
+  }
+  if (messages.length === 0) {
+    throw new Error('Messages must include at least one UIMessage');
+  }
+
+  const lastMessage = messages[messages.length - 1]!;
+  const lastMessageId = lastMessage.role === 'assistant' ? lastMessage.id : undefined;
+
+  if (trigger === 'regenerate-message') {
+    const search = lastMessage.role === 'assistant' ? messages.slice(0, -1) : messages;
+    const userMessage = [...search].reverse().find(message => message.role === 'user');
+    if (userMessage === undefined) {
+      throw new Error('Regenerate requests require a prior user message for Harness session admission');
+    }
+    return { content: textFromUIMessage(userMessage), lastMessageId, userMessage };
+  }
+
+  if (lastMessage.role !== 'user') {
+    throw new Error(
+      'Harness chat streams only support submit-message requests here; resume and human-in-the-loop (HITL) responses must use native Harness routes',
+    );
+  }
+
+  return { content: textFromUIMessage(lastMessage), lastMessageId, userMessage: lastMessage };
+}
 
 /**
  * Framework-agnostic handler for streaming agent chat in AI SDK-compatible format.
@@ -253,6 +475,97 @@ export async function handleChatStream<OUTPUT = undefined>({
       for await (const part of toAISdkStream(result, {
         from: 'agent',
         lastMessageId,
+        sendStart,
+        sendFinish,
+        sendReasoning,
+        sendSources,
+        onError,
+        messageMetadata: messageMetadata as UIMessageStreamOptionsV5<V5UIMessage>['messageMetadata'],
+      })) {
+        writer.write(part);
+      }
+    },
+  }) as ReadableStream<any>;
+}
+
+/**
+ * Framework-agnostic handler for admitting AI SDK UI chat through a Harness v1
+ * session while returning AI SDK-compatible UI message stream chunks.
+ *
+ * `trigger: "regenerate-message"` is supported as a fresh Harness admission
+ * with no reused `admissionId`. Human-in-the-loop (HITL) resume/approval
+ * requests are intentionally not mapped here; use the native Harness
+ * inbox/session routes so durable resume semantics stay owned by Harness.
+ */
+export function handleHarnessChatStream<UI_MESSAGE extends V5UIMessage = V5UIMessage, OUTPUT = undefined>(
+  options: HarnessChatStreamHandlerOptionsV5<UI_MESSAGE, OUTPUT>,
+): Promise<V5UIMessageStream<UI_MESSAGE>>;
+export function handleHarnessChatStream<UI_MESSAGE extends V6UIMessage = V6UIMessage, OUTPUT = undefined>(
+  options: HarnessChatStreamHandlerOptionsV6<UI_MESSAGE, OUTPUT>,
+): Promise<V6UIMessageStream<UI_MESSAGE>>;
+export async function handleHarnessChatStream<OUTPUT = undefined>({
+  session,
+  params,
+  version = 'v5',
+  sendStart = true,
+  sendFinish = true,
+  sendReasoning = false,
+  sendSources = false,
+  onError,
+  messageMetadata,
+}: HarnessChatStreamHandlerOptions<any, OUTPUT>): Promise<ReadableStream<any>> {
+  const { messages, requestContext, trigger, admissionId, abortSignal, mode, model, attachments, additionalTools } =
+    params;
+  const prompt = resolveHarnessChatPrompt(messages, trigger);
+  const normalizedRequestContext = validateHarnessChatRequestContext(requestContext);
+  if (additionalTools !== undefined && trigger !== 'regenerate-message') {
+    throw new HarnessChatStreamValidationError(
+      'handleHarnessChatStream.params.additionalTools',
+      'additionalTools require a fresh Harness turn and cannot be combined with normal submit admissionId',
+    );
+  }
+  const effectiveAdmissionId = trigger === 'regenerate-message' ? undefined : (admissionId ?? prompt.userMessage.id);
+
+  const messageOptions: HarnessChatMessageOptions = {
+    content: prompt.content,
+    stream: true,
+    ...(normalizedRequestContext !== undefined ? { requestContext: normalizedRequestContext } : {}),
+    ...(effectiveAdmissionId !== undefined ? { admissionId: effectiveAdmissionId } : {}),
+    ...(abortSignal !== undefined ? { abortSignal } : {}),
+    ...(mode !== undefined ? { mode } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(attachments !== undefined ? { attachments } : {}),
+    ...(additionalTools !== undefined ? { additionalTools } : {}),
+  };
+  const result = await session.message(messageOptions);
+
+  if (version === 'v6') {
+    return createUIMessageStreamV6<any>({
+      originalMessages: messages,
+      execute: async ({ writer }) => {
+        for await (const part of toAISdkStream(result, {
+          from: 'agent',
+          version: 'v6',
+          lastMessageId: prompt.lastMessageId,
+          sendStart,
+          sendFinish,
+          sendReasoning,
+          sendSources,
+          onError,
+          messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
+        })) {
+          writer.write(part);
+        }
+      },
+    }) as ReadableStream<any>;
+  }
+
+  return createUIMessageStreamV5<any>({
+    originalMessages: messages,
+    execute: async ({ writer }) => {
+      for await (const part of toAISdkStream(result, {
+        from: 'agent',
+        lastMessageId: prompt.lastMessageId,
         sendStart,
         sendFinish,
         sendReasoning,
