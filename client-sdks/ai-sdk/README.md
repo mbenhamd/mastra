@@ -153,8 +153,8 @@ normal submits because Harness does not allow them with `admissionId`.
 Direct callers may only provide `requestContext.app`; Harness-owned context keys
 such as `harness`, `channel`, or `user` are rejected before admission and are
 validated again by `session.message()`. Tool approvals, suspensions, and other
-resume-style HITL responses are not mapped by this helper; route those through
-native Harness inbox/session APIs.
+resume-style human-in-the-loop (HITL) responses are not mapped by this helper;
+route those through native Harness inbox/session APIs.
 
 ### handleWorkflowStream
 

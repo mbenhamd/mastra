@@ -286,7 +286,7 @@ function resolveHarnessChatPrompt(messages: SupportedUIMessage[], trigger: Harne
 
   if (lastMessage.role !== 'user') {
     throw new Error(
-      'Harness chat streams only support submit-message requests here; resume and HITL responses must use native Harness routes',
+      'Harness chat streams only support submit-message requests here; resume and human-in-the-loop (HITL) responses must use native Harness routes',
     );
   }
 
@@ -445,9 +445,9 @@ export async function handleChatStream<OUTPUT = undefined>({
  * session while returning AI SDK-compatible UI message stream chunks.
  *
  * `trigger: "regenerate-message"` is supported as a fresh Harness admission
- * with no reused `admissionId`. HITL resume/approval requests are intentionally
- * not mapped here; use the native Harness inbox/session routes so durable
- * resume semantics stay owned by Harness.
+ * with no reused `admissionId`. Human-in-the-loop (HITL) resume/approval
+ * requests are intentionally not mapped here; use the native Harness
+ * inbox/session routes so durable resume semantics stay owned by Harness.
  */
 export function handleHarnessChatStream<UI_MESSAGE extends V5UIMessage = V5UIMessage, OUTPUT = undefined>(
   options: HarnessChatStreamHandlerOptionsV5<UI_MESSAGE, OUTPUT>,
