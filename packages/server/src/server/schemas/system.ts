@@ -59,6 +59,20 @@ export const observabilityStorageCapabilitiesSchema = z.object({
 
 export const editorSourceSchema = z.enum(['code', 'db']);
 
+export const editorSourceCapabilitiesSchema = z.object({
+  source: editorSourceSchema,
+  storage: z.enum(['database', 'filesystem', 'source-provider', 'unavailable']),
+  provider: z
+    .object({
+      id: z.string(),
+      displayName: z.string(),
+    })
+    .optional(),
+  canSave: z.boolean(),
+  canOpenChangeRequest: z.boolean(),
+  unavailableReason: z.string().optional(),
+});
+
 export const systemPackagesResponseSchema = z.object({
   packages: z.array(mastraPackageSchema),
   isDev: z.boolean(),
@@ -69,6 +83,7 @@ export const systemPackagesResponseSchema = z.object({
    * Save/Publish flow. Omitted when the editor has no explicit source.
    */
   editorSource: editorSourceSchema.optional(),
+  editorSourceCapabilities: editorSourceCapabilitiesSchema.optional(),
   observabilityEnabled: z.boolean(),
   storageType: z.string().optional(),
   observabilityStorageType: z.string().optional(),

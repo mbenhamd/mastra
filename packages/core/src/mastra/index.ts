@@ -40,7 +40,7 @@ import { NoOpObservability, noOpLoggerContext, noOpMetricsContext } from '../obs
 import { initContextStorage } from '../observability/context-storage';
 import type { Processor } from '../processors';
 import type { MastraServerBase } from '../server/base';
-import type { ApiRoute, Middleware, ServerConfig } from '../server/types';
+import type { ApiRoute, Middleware, ServerConfig, StudioConfig } from '../server/types';
 import type { MastraCompositeStore, WorkflowRuns } from '../storage';
 import type { Schedule, ScheduleUpdate, SchedulesStorage } from '../storage/domains/schedules/base';
 import { augmentWithInit } from '../storage/storageWithInit';
@@ -333,6 +333,11 @@ export interface Config<
    * Server configuration for HTTP endpoints and middleware.
    */
   server?: ServerConfig;
+
+  /**
+   * Studio-specific authentication and authorization configuration.
+   */
+  studio?: StudioConfig;
 
   /**
    * MCP servers provide tools and resources that agents can use.
@@ -629,6 +634,7 @@ export class Mastra<
   #workspace?: Workspace;
   #workspaces: Record<string, RegisteredWorkspace> = {};
   #server?: ServerConfig;
+  #studio?: StudioConfig;
   #serverAdapter?: MastraServerBase;
   #mcpServers?: TMCPServers;
   #bundler?: BundlerConfig;
@@ -935,6 +941,13 @@ export class Mastra<
    */
   public setServer(server: ServerConfig): void {
     this.#server = server;
+  }
+
+  /**
+   * Sets the Studio-specific authentication and authorization configuration.
+   */
+  public setStudio(studio: StudioConfig): void {
+    this.#studio = studio;
   }
 
   /**
@@ -1322,6 +1335,10 @@ export class Mastra<
 
     if (config?.server) {
       this.#server = config.server;
+    }
+
+    if (config?.studio) {
+      this.#studio = config.studio;
     }
 
     // Register channels and merge their routes into server config
@@ -4207,6 +4224,10 @@ export class Mastra<
 
   public getServer() {
     return this.#server;
+  }
+
+  public getStudio() {
+    return this.#studio;
   }
 
   /**

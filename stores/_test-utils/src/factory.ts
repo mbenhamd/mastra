@@ -12,6 +12,7 @@ import { createFavoritesTests } from './domains/favorites';
 import { createSchedulesTests } from './domains/schedules';
 import { createChannelsTests } from './domains/channels';
 import { createToolProviderConnectionsTests } from './domains/tool-provider-connections';
+import { createSkillsTests } from './domains/skills';
 export * from './domains/memory/data';
 export * from './domains/harness/data';
 export * from './domains/workflows/data';
@@ -122,6 +123,7 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createExperimentsTests({ storage });
     createBackgroundTasksTests({ storage });
     createFavoritesTests({ storage });
+    createSkillsTests({ storage });
     createSchedulesTests({ storage });
     createChannelsTests({ storage });
     createToolProviderConnectionsTests({ storage });

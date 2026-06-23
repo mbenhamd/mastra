@@ -20,6 +20,15 @@ export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
 export const MASTRA_IS_STUDIO_KEY = 'mastra__isStudio';
 
+/**
+ * Tracks which auth mode was used for the current request.
+ * Set to 'studio' when studio auth was used, 'server' when server auth was used.
+ * Used to determine which RBAC/FGA provider to use for permission checks.
+ */
+export const MASTRA_AUTH_MODE_KEY = 'mastra__authMode';
+
+export type MastraAuthMode = 'studio' | 'server';
+
 export const MASTRA_CLIENT_TYPE_HEADER = 'x-mastra-client-type';
 
 export const MASTRA_STUDIO_CLIENT_TYPE = 'studio';

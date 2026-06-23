@@ -5,7 +5,7 @@
 
 import * as os from 'node:os';
 import * as path from 'node:path';
-import type { HarnessQuestionAnswer, HarnessRequestContext } from '@mastra/core/harness';
+import type { HarnessRequestContext } from '@mastra/core/harness';
 import { createTool } from '@mastra/core/tools';
 import { LocalFilesystem } from '@mastra/core/workspace';
 import { z } from 'zod';
@@ -172,9 +172,12 @@ export const requestSandboxAccessTool = createTool({
           });
         }
 
-        // Also update the workspace filesystem immediately so tools in the
-        // same turn can access the path without waiting for the next turn.
-        const fs = context?.workspace?.filesystem;
+        // Also update the live workspace filesystem immediately so tools in
+        // the same turn (e.g. `view`) can access the path without waiting for
+        // a fresh workspace build. The resolved workspace is carried on the
+        // harness request context — the tool-execution context does not expose
+        // it — so read the filesystem from there.
+        const fs = harnessCtx?.workspace?.filesystem ?? context?.workspace?.filesystem;
         if (fs instanceof LocalFilesystem) {
           fs.setAllowedPaths((prev: readonly string[]) => [...prev, absolutePath]);
         }

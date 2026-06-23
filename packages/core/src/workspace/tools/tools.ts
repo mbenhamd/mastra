@@ -35,6 +35,7 @@ import type {
   DynamicToolConfigValue,
   ToolConfigContext,
   ToolConfigWithArgsContext,
+  WorkspaceToolHooks,
 } from './types';
 export type {
   WorkspaceToolConfig,
@@ -46,6 +47,10 @@ export type {
   ToolConfigContext,
   ToolConfigWithArgsContext,
   DynamicToolConfigValue,
+  WorkspaceToolHookContext,
+  WorkspaceToolBeforeHookResult,
+  WorkspaceToolAfterHookContext,
+  WorkspaceToolHooks,
 } from './types';
 import { writeFileTool } from './write-file';
 
@@ -120,6 +125,7 @@ export interface ResolvedToolConfig {
   requireReadBeforeWrite?: DynamicToolConfigValue<ToolConfigWithArgsContext>;
   maxOutputTokens?: number;
   name?: string;
+  hooks?: WorkspaceToolHooks;
 }
 
 /**
@@ -160,6 +166,7 @@ export async function resolveToolConfig(
   let requireReadBeforeWrite: DynamicToolConfigValue<ToolConfigWithArgsContext> | undefined;
   let maxOutputTokens: number | undefined;
   let name: string | undefined;
+  const hooks = toolsConfig?.hooks;
 
   if (toolsConfig) {
     if (toolsConfig.enabled !== undefined) {
@@ -192,7 +199,7 @@ export async function resolveToolConfig(
   // Resolve `enabled` now (tool-listing time) — safe default: false (fail-closed)
   const resolvedEnabled = await resolveDynamicValue(enabled, context, false);
 
-  return { enabled: resolvedEnabled, requireApproval, requireReadBeforeWrite, maxOutputTokens, name };
+  return { enabled: resolvedEnabled, requireApproval, requireReadBeforeWrite, maxOutputTokens, name, hooks };
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +220,8 @@ async function resolveEffectiveWorkspace(
   context: any,
   targets: ResolveTargets,
 ): Promise<Workspace> {
+  workspace.lastAccessedAt = new Date();
+
   const needsFilesystem = !!(targets.filesystem && !workspace.filesystem && hasFilesystemConfig(workspace));
   const needsSandbox = !!(targets.sandbox && !workspace.sandbox && hasSandboxConfig(workspace));
   if (!needsFilesystem && !needsSandbox) return workspace;
@@ -344,6 +353,35 @@ function wrapWithReadTracker(
  * read-before-write checks) so concurrent calls to the same path
  * run one at a time.
  */
+function wrapWithToolHooks(
+  tool: any,
+  hooks: WorkspaceToolHooks,
+  toolName: string,
+  workspaceToolName: WorkspaceToolName,
+): any {
+  return {
+    ...tool,
+    execute: async (input: any, context: any = {}) => {
+      const hookContext = { toolName, workspaceToolName, input, context };
+      const beforeResult = await hooks.beforeToolCall?.(hookContext);
+      if (beforeResult?.proceed === false) {
+        return beforeResult.output;
+      }
+
+      let output: unknown;
+      try {
+        output = await tool.execute(input, context);
+      } catch (error) {
+        await hooks.afterToolCall?.({ ...hookContext, output, error });
+        throw error;
+      }
+
+      await hooks.afterToolCall?.({ ...hookContext, output });
+      return output;
+    },
+  };
+}
+
 function wrapWithWriteLock(tool: any, writeLock: FileWriteLock): any {
   return {
     ...tool,
@@ -439,11 +477,6 @@ export async function createWorkspaceTools(
       wrapped = wrapTool(wrapped, workspace, opts?.targets ?? {});
     }
 
-    // Write lock is outermost — serializes the entire enriched execute pipeline
-    if (opts?.useWriteLock) {
-      wrapped = wrapWithWriteLock(wrapped, writeLock);
-    }
-
     // Use custom name if provided, otherwise use the default constant name
     const exposedName = config.name ?? name;
     if (tools[exposedName]) {
@@ -458,6 +491,16 @@ export async function createWorkspaceTools(
     if (exposedName !== name && 'id' in wrapped) {
       wrapped = { ...wrapped, id: exposedName };
     }
+
+    if (config.hooks) {
+      wrapped = wrapWithToolHooks(wrapped, config.hooks, exposedName, name);
+    }
+
+    // Write lock is outermost — serializes the entire enriched execute pipeline
+    if (opts?.useWriteLock) {
+      wrapped = wrapWithWriteLock(wrapped, writeLock);
+    }
+
     tools[exposedName] = wrapped;
   };
 

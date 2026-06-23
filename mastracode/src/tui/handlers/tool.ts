@@ -33,7 +33,8 @@ type ToolApprovalResponseSurface = {
 };
 
 function getCurrentModeColor(ctx: EventHandlerContext): string | undefined {
-  return ctx.state.harness.getCurrentMode?.()?.color;
+  const color = ctx.state.session?.mode?.resolve?.()?.metadata?.color;
+  return typeof color === 'string' ? color : undefined;
 }
 
 export function isTaskMutationTool(toolName: string): boolean {
@@ -167,8 +168,8 @@ export function handleToolApprovalRequired(
     },
   });
 
-  // Set up Ctrl+C dismiss to decline
-  state.pendingApprovalDismiss = () => {
+  // Set up dismissal to decline
+  state.pendingApprovalDismiss = declineContext => {
     state.ui.hideOverlay();
     state.pendingApprovalDismiss = null;
     (state.harness as typeof state.harness & ToolApprovalResponseSurface).respondToToolApproval({
@@ -376,7 +377,7 @@ export function handleToolInputStart(ctx: EventHandlerContext, toolCallId: strin
  */
 export function handleToolInputDelta(ctx: EventHandlerContext, toolCallId: string, _argsTextDelta: string): void {
   const { state } = ctx;
-  const ds = state.harness.getDisplayState();
+  const ds = state.session.displayState.get();
   const buffer = ds.toolInputBuffers.get(toolCallId);
   if (buffer === undefined) return;
 

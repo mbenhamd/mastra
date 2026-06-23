@@ -12,7 +12,8 @@ import type { IsTaskCompleteConfig, OnIterationCompleteHandler } from '../agent/
 import type { MessageInput, MessageList } from '../agent/message-list';
 import type { SaveQueueManager } from '../agent/save-queue';
 import type { CreatedAgentSignal } from '../agent/signals';
-import type { StructuredOutputOptions } from '../agent/types';
+import type { GoalConfig, StructuredOutputOptions } from '../agent/types';
+import type { ActorSignal } from '../auth/ee';
 import type { AgentBackgroundConfig, BackgroundTaskManager, BackgroundTaskManagerConfig } from '../background-tasks';
 import type { ModelRouterModelId } from '../llm/model';
 import type { ModelMethodType } from '../llm/model/model.loop.types';
@@ -44,6 +45,8 @@ import type { OutputWriter } from '../workflows/types';
 import type { Workspace } from '../workspace/workspace';
 
 type StopCondition = StopConditionV5<any> | StopConditionV6<any>;
+
+export type GoalLoopConfig = GoalConfig;
 
 export type StreamInternal = {
   now?: () => number;
@@ -154,6 +157,8 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   toolCallConcurrency?: number;
   agentName?: string;
   requestContext?: RequestContext;
+  /** Trusted server-side signal for this loop's FGA checks. */
+  actor?: ActorSignal;
   methodType: ModelMethodType;
   /**
    * Maximum number of processor-triggered retries allowed for this generation.
@@ -170,6 +175,11 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
    * so the LLM can see why the task isn't complete and adjust its approach.
    */
   isTaskComplete?: IsTaskCompleteConfig;
+
+  /**
+   * Native goal configuration, resolved from the agent's `goal` config.
+   */
+  goal?: GoalLoopConfig;
 
   /**
    * Callback fired after each iteration completes.

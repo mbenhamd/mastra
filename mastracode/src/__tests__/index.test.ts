@@ -20,6 +20,7 @@ vi.mock('@mastra/core/agent', () => ({
       mockAgentConstructor(config);
     }
   },
+  SignalProvider: class {},
 }));
 
 const mockAgentConstructor = vi.fn();
@@ -142,7 +143,8 @@ vi.mock('../agents/memory.js', () => ({
 
 vi.mock('../agents/model.js', () => ({
   getDynamicModel: vi.fn(),
-  resolveModel: vi.fn(),
+  getGoalJudgeModel: vi.fn(),
+  resolveModel: resolveModelMock,
 }));
 
 vi.mock('../agents/subagents/execute.js', () => ({
@@ -159,6 +161,7 @@ vi.mock('../agents/subagents/plan.js', () => ({
 
 vi.mock('../agents/tools.js', () => ({
   createDynamicTools: vi.fn(),
+  createToolHooks: vi.fn(),
 }));
 
 vi.mock('../agents/workspace.js', () => ({
@@ -302,7 +305,57 @@ describe('createMastraCode', () => {
     }));
   });
 
-  it('enables dynamic provider registry loading before bootstrapping auth and models', async () => {
+  it('registers the MastraCode gateway and app-provided model hooks on Harness', async () => {
+    const { createMastraCode } = await import('../index.js');
+    const subagent = { id: 'review', name: 'Review', instructions: 'Review changes' };
+
+    await createMastraCode({ subagents: [subagent as any] });
+
+    expect(createMastraCodeGatewayMock).toHaveBeenCalledWith({
+      mastraGatewayBaseUrl: 'https://gateway-api.mastra.ai',
+      mastraGatewayApiKey: undefined,
+      routeThroughMastraGateway: false,
+      settingsPath: undefined,
+    });
+
+    const harnessConfig = harnessConstructorMock.mock.calls[0]?.[0] as
+      | {
+          gateways?: unknown[];
+          resolveModel?: unknown;
+          modelAuthChecker?: unknown;
+          customModelCatalogProvider?: unknown;
+          subagents?: unknown[];
+        }
+      | undefined;
+    expect(harnessConfig?.gateways).toEqual([mastraCodeGatewayMock]);
+    expect(harnessConfig?.subagents).toEqual([subagent]);
+    expect(harnessConfig?.resolveModel).toBe(resolveModelMock);
+    expect(createMastraCodeModelCatalogProviderMock).toHaveBeenCalledWith(mastraCodeGatewayMock);
+    expect(harnessConfig?.modelAuthChecker).toBeUndefined();
+    expect(harnessConfig?.customModelCatalogProvider).toBe(mastraCodeCatalogProviderMock);
+  }, 10_000);
+
+  it('uses configured memory gateway settings when creating the MastraCode gateway', async () => {
+    const settings = createMockSettings();
+    settings.memoryGateway = { baseUrl: 'https://gateway.example.com/v1' };
+    loadSettingsMock.mockReturnValue(settings);
+    const { createMastraCode } = await import('../index.js');
+
+    await createMastraCode({ settingsPath: '/tmp/settings.json' });
+
+    expect(createMastraCodeGatewayMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mastraGatewayBaseUrl: 'https://gateway.example.com',
+        settingsPath: '/tmp/settings.json',
+      }),
+    );
+  });
+
+  it('treats registry providers with any configured API-key env var as startup provider access', async () => {
+    providerRegistryMock['multi-env-provider'] = {
+      apiKeyEnvVar: ['MC_E2E_PRIMARY_KEY', 'MC_E2E_SECONDARY_KEY'],
+    };
+    process.env.MC_E2E_SECONDARY_KEY = 'configured';
     const { createMastraCode } = await import('../index.js');
 
     await createMastraCode();
@@ -443,7 +496,7 @@ describe('createMastraCode', () => {
     expect(mockLoadSettings).toHaveBeenLastCalledWith('/tmp/settings.json');
   });
 
-  it('enables OpenAI Responses stream error retries by default', async () => {
+  it('runs stream error retries before provider-specific error recovery processors', async () => {
     const { createMastraCode } = await import('../index.js');
 
     await createMastraCode();
@@ -452,7 +505,11 @@ describe('createMastraCode', () => {
     const agentConfig = mockAgentConstructor.mock.calls[0]?.[0] as
       | { errorProcessors?: Array<{ id?: string }> }
       | undefined;
-    expect(agentConfig?.errorProcessors?.map(processor => processor.id)).toContain('stream-error-retry-processor');
+    expect(agentConfig?.errorProcessors?.map(processor => processor.id)).toEqual([
+      'stream-error-retry-processor',
+      'prefill-error-handler',
+      'provider-history-compat',
+    ]);
   });
 
   it('configures ProviderHistoryCompat for prompt and API error compatibility', async () => {

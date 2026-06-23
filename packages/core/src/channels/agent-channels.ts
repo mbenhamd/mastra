@@ -16,7 +16,7 @@ import type { AgentChunkType } from '../stream/types';
 import { createTool } from '../tools/tool';
 import { runStaticDriver } from './chat-driver-static';
 import { runStreamingDriver } from './chat-driver-streaming';
-import { getChatModule } from './chat-lazy';
+import { chatModule, getChatModule } from './chat-lazy';
 import { resolveSlackTopLevelThreadId } from './compat/slack';
 
 import { formatArgsSummary, formatToolApproved, formatToolDenied, stripToolPrefix } from './formatting';
@@ -1139,11 +1139,12 @@ export class AgentChannels {
         // Skip the current message that triggered this request
         if (msg.id === currentMessageId) continue;
 
+        const historyText = msg.formatted ? chatModule().stringifyMarkdown(msg.formatted).trim() : undefined;
         messages.push({
           id: msg.id,
           author: msg.author.fullName || msg.author.userName || 'Unknown',
           userId: msg.author.userId,
-          text: msg.text,
+          text: historyText || msg.text,
           isBot: msg.author.isBot === true,
         });
 
