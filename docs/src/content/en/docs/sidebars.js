@@ -113,35 +113,31 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'agents/goals',
+          label: 'Goals',
+          customProps: {
+            tags: ['alpha'],
+          },
+        },
+        {
+          type: 'doc',
           id: 'agents/background-tasks',
           label: 'Background Tasks',
-          customProps: {
-            tags: ['new'],
-          },
         },
         {
           type: 'doc',
           id: 'agents/channels',
           label: 'Channels',
-          customProps: {
-            tags: ['new'],
-          },
         },
         {
           type: 'doc',
           id: 'agents/a2a',
           label: 'A2A',
-          customProps: {
-            tags: ['new'],
-          },
         },
         {
           type: 'doc',
           id: 'agents/acp',
           label: 'ACP',
-          customProps: {
-            tags: ['new'],
-          },
         },
         {
           type: 'doc',
@@ -168,6 +164,14 @@ const sidebars = {
           type: 'doc',
           id: 'agents/signals',
           label: 'Signals',
+          customProps: {
+            tags: ['alpha'],
+          },
+        },
+        {
+          type: 'doc',
+          id: 'agents/signal-providers',
+          label: 'Signal Providers',
           customProps: {
             tags: ['alpha'],
           },
@@ -319,6 +323,7 @@ const sidebars = {
             { type: 'doc', id: 'agent-builder/workspace', label: 'Workspace' },
             { type: 'doc', id: 'agent-builder/browser', label: 'Browser' },
             { type: 'doc', id: 'agent-builder/channels', label: 'Channels' },
+            { type: 'doc', id: 'agent-builder/integrations', label: 'Tool providers' },
             { type: 'doc', id: 'agent-builder/skill-registries', label: 'Skill registries' },
             { type: 'doc', id: 'agent-builder/deploying', label: 'Deploying' },
           ],
@@ -353,9 +358,6 @@ const sidebars = {
           type: 'doc',
           id: 'streaming/background-task-streaming',
           label: 'Background Task Streaming',
-          customProps: {
-            tags: ['new'],
-          },
         },
       ],
     },
@@ -373,9 +375,45 @@ const sidebars = {
           type: 'doc',
           id: 'mcp/mcp-apps',
           label: 'MCP Apps',
-          customProps: {
-            tags: ['new'],
-          },
+        },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Harness',
+      customProps: {
+        tags: ['alpha'],
+      },
+      items: [
+        {
+          type: 'doc',
+          id: 'harness/overview',
+          label: 'Overview',
+        },
+        {
+          type: 'doc',
+          id: 'harness/session',
+          label: 'Session',
+        },
+        {
+          type: 'doc',
+          id: 'harness/modes',
+          label: 'Modes',
+        },
+        {
+          type: 'doc',
+          id: 'harness/threads-and-state',
+          label: 'Threads and State',
+        },
+        {
+          type: 'doc',
+          id: 'harness/subagents',
+          label: 'Subagents',
+        },
+        {
+          type: 'doc',
+          id: 'harness/tool-approvals',
+          label: 'Tool Approvals',
         },
       ],
     },
@@ -418,9 +456,6 @@ const sidebars = {
     {
       type: 'category',
       label: 'Browser',
-      customProps: {
-        tags: ['new'],
-      },
       items: [
         {
           type: 'doc',
@@ -436,6 +471,11 @@ const sidebars = {
           type: 'doc',
           id: 'browser/stagehand',
           label: 'Stagehand',
+        },
+        {
+          type: 'doc',
+          id: 'browser/recording',
+          label: 'Recording',
         },
         {
           type: 'doc',
@@ -477,6 +517,9 @@ const sidebars = {
           type: 'doc',
           id: 'server/pubsub',
           label: 'PubSub',
+          customProps: {
+            tags: ['new'],
+          },
         },
         {
           type: 'doc',
@@ -609,113 +652,18 @@ const sidebars = {
         },
         {
           type: 'doc',
-          id: 'observability/logging',
-          label: 'Logging',
+          id: 'observability/config',
+          label: 'Config',
         },
         {
-          type: 'category',
-          label: 'Tracing',
-          items: [
-            {
-              type: 'doc',
-              id: 'observability/tracing/overview',
-              key: 'observability.tracing.overview',
-              label: 'Overview',
-            },
-            {
-              type: 'category',
-              label: 'Bridges',
-              items: [
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/bridges/datadog',
-                  label: 'Datadog',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/bridges/otel',
-                  label: 'OpenTelemetry',
-                },
-              ],
-            },
-            {
-              type: 'category',
-              label: 'Exporters',
-              items: [
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/mastra-storage',
-                  label: 'Mastra Storage',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/mastra-platform',
-                  label: 'Mastra platform',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/arize',
-                  label: 'Arize',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/arthur',
-                  label: 'Arthur',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/braintrust',
-                  label: 'Braintrust',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/datadog',
-                  label: 'Datadog',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/laminar',
-                  label: 'Laminar',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/langfuse',
-                  label: 'Langfuse',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/langsmith',
-                  label: 'LangSmith',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/otel',
-                  label: 'OpenTelemetry',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/posthog',
-                  label: 'PostHog',
-                },
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/exporters/sentry',
-                  label: 'Sentry',
-                },
-              ],
-            },
-            {
-              type: 'category',
-              label: 'Processors',
-              items: [
-                {
-                  type: 'doc',
-                  id: 'observability/tracing/processors/sensitive-data-filter',
-                  label: 'SensitiveDataFilter',
-                },
-              ],
-            },
-          ],
+          type: 'doc',
+          id: 'observability/storage',
+          label: 'Storage',
+        },
+        {
+          type: 'doc',
+          id: 'observability/logging',
+          label: 'Logging',
         },
         {
           type: 'category',
@@ -730,6 +678,122 @@ const sidebars = {
               type: 'doc',
               id: 'observability/metrics/querying',
               label: 'Querying metrics',
+            },
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Tracing',
+          items: [
+            {
+              type: 'doc',
+              id: 'observability/tracing/overview',
+              key: 'observability.tracing.overview',
+              label: 'Overview',
+            },
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Integrations',
+          items: [
+            {
+              type: 'doc',
+              id: 'observability/integrations/overview',
+              label: 'Overview',
+            },
+            {
+              type: 'category',
+              label: 'Bridges',
+              items: [
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/bridges/datadog',
+                  label: 'Datadog',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/bridges/otel',
+                  label: 'OpenTelemetry',
+                },
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Exporters',
+              items: [
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/mastra-storage',
+                  label: 'Mastra Storage',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/mastra-platform',
+                  label: 'Mastra platform',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/arize',
+                  label: 'Arize',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/arthur',
+                  label: 'Arthur',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/braintrust',
+                  label: 'Braintrust',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/datadog',
+                  label: 'Datadog',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/laminar',
+                  label: 'Laminar',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/langfuse',
+                  label: 'Langfuse',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/langsmith',
+                  label: 'LangSmith',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/otel',
+                  label: 'OpenTelemetry',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/posthog',
+                  label: 'PostHog',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/exporters/sentry',
+                  label: 'Sentry',
+                },
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Processors',
+              items: [
+                {
+                  type: 'doc',
+                  id: 'observability/integrations/processors/sensitive-data-filter',
+                  label: 'SensitiveDataFilter',
+                },
+              ],
             },
           ],
         },
@@ -785,9 +849,6 @@ const sidebars = {
     {
       type: 'category',
       label: 'Mastra platform',
-      customProps: {
-        tags: ['new'],
-      },
       items: [
         {
           type: 'doc',
@@ -808,6 +869,19 @@ const sidebars = {
           type: 'doc',
           id: 'mastra-platform/server',
           label: 'Server',
+        },
+        {
+          type: 'doc',
+          id: 'mastra-platform/github',
+          label: 'GitHub integration',
+          customProps: {
+            tags: ['new'],
+          },
+        },
+        {
+          type: 'doc',
+          id: 'mastra-platform/database',
+          label: 'Hosted databases',
         },
         {
           type: 'doc',

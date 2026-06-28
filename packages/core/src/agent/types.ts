@@ -59,7 +59,7 @@ import type { SkillFormat } from '../workspace/skills';
 import type { Agent } from './agent';
 import type { AgentExecutionOptions, NetworkOptions } from './agent.types';
 import type { MessageList } from './message-list/index';
-import type { CreatedAgentSignal } from './signals';
+import type { AgentSignalAttributes, CreatedAgentSignal } from './signals';
 import type { SubAgent } from './subagent';
 export type {
   MastraDBMessage,
@@ -126,6 +126,21 @@ export type AgentSignalActiveBehavior = 'deliver' | 'persist' | 'discard';
 export type AgentSignalIdleBehavior = 'wake' | 'persist' | 'discard';
 
 /**
+ * Options applied when a signal targets an idle thread.
+ *
+ * The default behavior is `wake`, which starts a new agent run for the target
+ * thread/resource and streams the signal into that run. `persist` stores the
+ * signal without waking the agent, and `discard` rejects idle delivery.
+ *
+ * @experimental Agent signals are experimental and may change in a future release.
+ */
+export type AgentSignalIfIdleOptions<OUTPUT = unknown> = {
+  behavior?: AgentSignalIdleBehavior;
+  streamOptions?: AgentExecutionOptions<OUTPUT>;
+  attributes?: AgentSignalAttributes;
+};
+
+/**
  * @experimental Agent signals are experimental and may change in a future release.
  */
 export type SendAgentSignalOptions<OUTPUT = unknown> =
@@ -148,7 +163,7 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       resourceId: string;
       threadId: string;
       ifActive?: { behavior?: AgentSignalActiveBehavior };
-      ifIdle?: { behavior?: AgentSignalIdleBehavior; streamOptions?: AgentExecutionOptions<OUTPUT> };
+      ifIdle?: AgentSignalIfIdleOptions<OUTPUT>;
     };
 
 /**
@@ -341,6 +356,22 @@ export type AgentEditorConfig =
       instructions?: boolean;
       tools?: boolean | { description?: boolean };
     };
+
+/**
+ * Agent-level goal configuration. When set, the agent gains a native goal
+ * mechanism: an objective set via `Agent.setObjective` is judged in the
+ * execution loop and the agent keeps working until the objective is complete
+ * or the run budget is exhausted.
+ *
+ * @experimental Agent goals are experimental and may change in a future release.
+ */
+export interface GoalConfig {
+  judge?: DynamicArgument<MastraModelConfig | undefined>;
+  maxRuns?: number;
+  prompt?: string;
+  tools?: DynamicArgument<ToolsInput | undefined>;
+  scorer?: MastraScorer | string;
+}
 
 interface AgentConfigBase<
   TAgentId extends string = string,

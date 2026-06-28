@@ -4,7 +4,7 @@
 import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 
-import type { Harness, HarnessEvent, HarnessMessage } from '@mastra/core/harness';
+import type { Harness, HarnessEvent, HarnessMessage, Session } from '@mastra/core/harness';
 
 import { setupDebugLogging } from './utils/debug-log.js';
 import { releaseAllThreadLocks } from './utils/thread-lock.js';
@@ -242,7 +242,7 @@ async function autoResolve<TState extends Record<string, unknown>>(
       }));
       return {
         resolved: true,
-        label: `[auto-answered] ${truncate(event.question, 100)}`,
+        label: `[auto-answered] ${truncate(String(payload.question ?? ''), 100)}`,
         json: { ...event, autoAnswered: true },
       };
     }
@@ -359,10 +359,10 @@ function aggregateIntoSummary(event: HarnessEvent, summary: HeadlessSummary): vo
 function finalizeSummary<TState extends Record<string, unknown>>(
   summary: HeadlessSummary,
   endEvent: Extract<HarnessEvent, { type: 'agent_end' }>,
-  harness: Harness<TState>,
+  session: Session<TState>,
 ): void {
   summary.finishReason = endEvent.reason;
-  summary.threadId = harness.getCurrentThreadId() ?? undefined;
+  summary.threadId = session.thread.getId() ?? undefined;
 }
 
 type HeadlessHarness<TState extends Record<string, unknown>> = Harness<TState> & {
@@ -371,10 +371,10 @@ type HeadlessHarness<TState extends Record<string, unknown>> = Harness<TState> &
 
 /** Resolve a thread by ID or title. Tries exact ID match first, then title. */
 async function resolveThread<TState extends Record<string, unknown>>(
-  harness: Harness<TState>,
+  session: Session<TState>,
   threadIdOrTitle: string,
 ): Promise<{ threadId: string; matchType: 'id' | 'title' } | { error: string }> {
-  const threads = await harness.listThreads();
+  const threads = await session.thread.list();
 
   const byId = threads.find(t => t.id === threadIdOrTitle);
   if (byId) return { threadId: byId.id, matchType: 'id' };
@@ -416,7 +416,7 @@ export async function runHeadless<TState extends Record<string, unknown>>(
       } else {
         process.stderr.write(`\nTimeout: ${args.timeout}s elapsed. Aborting.\n`);
       }
-      harness.abort();
+      session.abort();
     }, args.timeout * 1000);
   }
 
@@ -525,14 +525,14 @@ export async function runHeadless<TState extends Record<string, unknown>>(
 
   // --- Resource ID ---
   if (args.resourceId) {
-    harness.setResourceId({ resourceId: args.resourceId });
+    await harness.setResourceId(session, { resourceId: args.resourceId });
     if (!emit) process.stderr.write(`[resource] ${args.resourceId}\n`);
   }
 
   // --- Thread selection ---
   try {
     if (args.thread) {
-      const result = await resolveThread(harness, args.thread);
+      const result = await resolveThread(session, args.thread);
       if ('error' in result) {
         const msg = result.error;
         if (emit) emit({ type: 'error', error: { message: msg } });
@@ -540,13 +540,13 @@ export async function runHeadless<TState extends Record<string, unknown>>(
         if (timeoutId) clearTimeout(timeoutId);
         return 1;
       }
-      await harness.switchThread({ threadId: result.threadId });
+      await session.thread.switch({ threadId: result.threadId });
       if (!emit) process.stderr.write(`[thread] resumed ${result.threadId} (matched by ${result.matchType})\n`);
     } else if (args.continue_) {
-      const threads = await harness.listThreads();
+      const threads = await session.thread.list();
       if (threads.length > 0) {
         const sorted = [...threads].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
-        await harness.switchThread({ threadId: sorted[0]!.id });
+        await session.thread.switch({ threadId: sorted[0]!.id });
         if (!emit) process.stderr.write(`[continued] thread ${sorted[0]!.id}\n`);
       } else {
         const thread = await harness.createThread({ title: args.title });
@@ -567,7 +567,7 @@ export async function runHeadless<TState extends Record<string, unknown>>(
   // --- Clone ---
   if (args.cloneThread) {
     try {
-      const cloned = await harness.cloneThread();
+      const cloned = await session.thread.clone();
       if (emit) emit({ type: 'thread_cloned', threadId: cloned.id });
       else process.stderr.write(`[cloned] thread ${cloned.id}\n`);
     } catch (err) {
@@ -660,9 +660,11 @@ export async function headlessMain(predrainedInput?: string | null): Promise<nev
   const headlessHarness = harness as HeadlessHarness<Record<string, unknown>>;
 
   if (mcpManager?.hasServers()) {
-    mcpManager.initInBackground().catch(err => {
+    try {
+      await mcpManager.initInBackground();
+    } catch (err) {
       process.stderr.write(`Warning: MCP server initialization failed: ${(err as Error).message ?? err}\n`);
-    });
+    }
   }
 
   setupDebugLogging();

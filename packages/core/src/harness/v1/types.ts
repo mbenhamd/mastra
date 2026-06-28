@@ -1679,6 +1679,17 @@ export interface MessageOverrides {
    * already-active run (it could not become tool-visible there).
    */
   requestContext?: RequestContextInput;
+
+  /**
+   * Per-turn model generation settings (temperature, maxTokens, topP, …)
+   * applied on top of the resolved mode/model defaults for this turn. Mirrors
+   * {@link AgentExecutionOptionsBase.modelSettings}. Honored by structured
+   * sync turns and idle signal-routed turns; falls through to the
+   * model/provider defaults when unset, so omitting it preserves existing
+   * behavior. Does not change model selection — use
+   * {@link MessageOverrides.model} for that.
+   */
+  modelSettings?: AgentExecutionOptionsBase<unknown>['modelSettings'];
 }
 
 /**

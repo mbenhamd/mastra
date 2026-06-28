@@ -6,6 +6,7 @@ import type { ObservabilityContext } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
 
 import { omDebug } from './debug';
+import { withOmInternalThreadId } from './internal-request-context';
 import type { ModelByInputTokens } from './model-by-input-tokens';
 import type { ObserverAttachmentFilter } from './observer-agent';
 import {
@@ -171,6 +172,7 @@ export class ObserverRunner {
     const inputTokens = this.tokenCounter.countMessages(messagesToObserve);
     const resolvedModel = options?.model ? { model: options.model } : this.resolveModel(inputTokens);
     const agent = this.createAgent(resolvedModel.model);
+    const internalRequestContext = withOmInternalThreadId(options?.requestContext, agent.id);
     const attachmentFilter = await this.resolveAttachmentFilter(resolvedModel.model, options?.requestContext);
 
     const observerMessages = [
@@ -212,7 +214,7 @@ export class ObserverRunner {
                   modelSettings: { ...this.observationConfig.modelSettings },
                   providerOptions: this.observationConfig.providerOptions as any,
                   ...(abortSignal ? { abortSignal } : {}),
-                  ...(options?.requestContext ? { requestContext: options.requestContext } : {}),
+                  ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                   ...childObservabilityContext,
                 });
                 return streamResult.getFullOutput();
@@ -297,6 +299,7 @@ export class ObserverRunner {
     );
     const resolvedModel = model ? { model } : this.resolveModel(inputTokens);
     const agent = this.createAgent(resolvedModel.model, true);
+    const internalRequestContext = withOmInternalThreadId(requestContext, agent.id);
     const attachmentFilter = await this.resolveAttachmentFilter(resolvedModel.model, requestContext);
 
     const observerMessages = [
@@ -347,7 +350,7 @@ export class ObserverRunner {
                   modelSettings: { ...this.observationConfig.modelSettings },
                   providerOptions: this.observationConfig.providerOptions as any,
                   ...(abortSignal ? { abortSignal } : {}),
-                  ...(requestContext ? { requestContext } : {}),
+                  ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                   ...childObservabilityContext,
                 });
                 return streamResult.getFullOutput();

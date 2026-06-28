@@ -13,6 +13,7 @@ import {
   normalizeQueryParams,
   redactSensitiveQueryParams,
   redactStreamChunk,
+  serializeStreamChunk,
 } from '@mastra/server/server-adapter';
 import type { Application, NextFunction, Request, Response } from 'express';
 export { createAuthMiddleware } from './auth-middleware';
@@ -178,10 +179,20 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
           // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
           const shouldRedact = this.streamOptions?.redact ?? true;
           const outputValue = shouldRedact ? redactStreamChunk(value) : value;
+          // A chunk that can't be serialized must not kill the stream — skip it and keep streaming
+          const serialized = serializeStreamChunk(outputValue);
+          if (!serialized.ok) {
+            this.mastra.getLogger()?.error('Failed to serialize stream chunk, skipping', {
+              path: route.path,
+              chunkType: (outputValue as { type?: string })?.type,
+              error: serialized.error.message,
+            });
+            continue;
+          }
           if (streamFormat === 'sse') {
-            res.write(`data: ${JSON.stringify(outputValue)}\n\n`);
+            res.write(`data: ${serialized.json}\n\n`);
           } else {
-            res.write(JSON.stringify(outputValue) + '\x1E');
+            res.write(serialized.json + '\x1E');
           }
         }
       }

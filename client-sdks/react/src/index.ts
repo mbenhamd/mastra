@@ -17,3 +17,4 @@ export type {
 } from '@mastra/core/agent/message-list';
 export * from './ui';
 export * from './workflows'; // Workflow hooks
+export * from './voice'; // Voice helpers

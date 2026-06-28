@@ -1,6 +1,6 @@
 // Typescript tooling really sucks so we are going to do some transfomrations ourselves
 import { readFile, mkdir, copyFile, stat } from 'node:fs/promises';
-import { join, dirname, relative, resolve, extname } from 'node:path';
+import { join, dirname, relative, resolve, extname, sep } from 'node:path';
 import { Project, SyntaxKind } from 'ts-morph';
 import { getPackageInfo } from 'local-pkg';
 import { pathToFileURL } from 'node:url';
