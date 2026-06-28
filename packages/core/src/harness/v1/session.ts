@@ -5593,6 +5593,10 @@ export class Session {
       requestContext,
       ...(toolsets ? { toolsets } : {}),
       ...(mode.instructions ? { instructions: mode.instructions } : {}),
+      // §9 per-turn override: caller-supplied model generation settings
+      // (temperature, maxOutputTokens, …) layered onto the structured generate
+      // turn. Omitted → model/provider defaults, so existing turns are unchanged.
+      ...(opts.modelSettings ? { modelSettings: opts.modelSettings } : {}),
     };
 
     // Structured + sync path: agent.generate with structuredOutput.
