@@ -614,6 +614,21 @@ describe('Session.message() — default path', () => {
     expect(agent.calls).toHaveLength(1);
   });
 
+  it('treats different modelSettings as distinct admission identities', async () => {
+    const { harness, agent } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'hi', admissionId: 'admission-model-settings', modelSettings: { temperature: 0.2 } });
+    await expect(
+      session.message({
+        content: 'hi',
+        admissionId: 'admission-model-settings',
+        modelSettings: { temperature: 0.8 },
+      }),
+    ).rejects.toBeInstanceOf(HarnessAdmissionConflictError);
+    expect(agent.calls).toHaveLength(1);
+  });
+
   it('rejects legacy effective mode/model evidence after mode drift unless the original mode is explicit', async () => {
     const { harness, defaultAgent, otherAgent, storage } = setupTwoModes();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -1403,6 +1418,27 @@ describe('Session.message() — per-turn overrides', () => {
     // `harness:builtin` toolset (plan-task tools, §6.4) is also present.
     expect(agent.calls[0]!.options.toolsets['call:additional']).toEqual(tools);
     expect(agent.calls[0]!.options.toolsets['harness:builtin']).toBeDefined();
+  });
+
+  it('passes modelSettings to sync structured generation only when provided', async () => {
+    const { harness, agent } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const Schema = z.object({ ok: z.boolean() });
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      object: { ok: true },
+    };
+
+    await session.message({ content: 'compute', output: Schema, sync: true });
+    await session.message({
+      content: 'compute again',
+      output: Schema,
+      sync: true,
+      modelSettings: { temperature: 0.2, maxOutputTokens: 128 },
+    });
+
+    expect(agent.calls[0]!.options.modelSettings).toBeUndefined();
+    expect(agent.calls[1]!.options.modelSettings).toEqual({ temperature: 0.2, maxOutputTokens: 128 });
   });
 });
 
