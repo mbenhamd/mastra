@@ -1967,6 +1967,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             messageList,
             stepNumber,
             finishReason: immediateFinishReason,
+            providerMetadata: outputStream._getImmediateProviderMetadata(),
             toolCalls: toolCallInfos.length > 0 ? toolCallInfos : undefined,
             text: immediateText,
             usage: outputStream._getImmediateUsage(),

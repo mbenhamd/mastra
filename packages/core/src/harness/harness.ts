@@ -1820,7 +1820,6 @@ export class Harness<TState = {}> {
       maxSteps: 1000,
       savePerStep: false,
       requireToolApproval: !isYolo,
-      modelSettings: { temperature: 1 },
       ...(tracingContext && { tracingContext }),
       ...(tracingOptions && { tracingOptions }),
     };

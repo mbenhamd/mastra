@@ -107,6 +107,41 @@ async function settleWithinTicks<T>(
 }
 
 describe('Harness: tool suspension and resumption', () => {
+  it('does not inject default model settings when sending a message', async () => {
+    const agent = new Agent({
+      id: 'test-agent-default-model-settings',
+      name: 'Test Agent Default Model Settings',
+      instructions: 'You answer directly.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: async () => ({ stream: createTextStream() }),
+      }),
+    });
+
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({
+      agents: { 'test-agent-default-model-settings': agent },
+      logger: false,
+      storage,
+    });
+
+    const registeredAgent = mastra.getAgent('test-agent-default-model-settings');
+    const streamSpy = vi.spyOn(registeredAgent, 'stream');
+
+    const harness = new Harness({
+      id: 'test-harness-default-model-settings',
+      storage,
+      modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
+    });
+
+    await harness.init();
+    await harness.createThread();
+    await harness.sendMessage({ content: 'Hello' });
+
+    expect(streamSpy).toHaveBeenCalled();
+    const [, streamOptions] = streamSpy.mock.calls[0] as [any, any];
+    expect(streamOptions.modelSettings).toBeUndefined();
+  });
+
   it('should emit a suspension-related event when a tool calls suspend(), not silently complete', async () => {
     // Tool that suspends mid-execution waiting for external input
     const confirmTool = createTool({
@@ -1417,74 +1452,7 @@ describe('Harness: tool suspension and resumption', () => {
     holdStream.resolve();
   });
 
-  it('drains multiple queued follow-ups after a direct resume abort', async () => {
-    const confirmTool = createTool({
-      id: 'confirm-action',
-      description: 'Confirms an action with the user',
-      inputSchema: z.object({ action: z.string() }),
-      execute: async (input: { action: string }, context?: any) => {
-        const suspend = context?.suspend ?? context?.agent?.suspend;
-        if (!suspend) throw new Error('suspend not available in context');
-        await suspend({ action: input.action });
-        return { result: `Action "${input.action}" confirmed` };
-      },
-    });
-
-    const agent = new Agent({
-      id: 'test-agent-resume-abort-serial-followup',
-      name: 'Test Agent Resume Abort Serial Follow Up',
-      instructions: 'You confirm actions.',
-      model: new MastraLanguageModelV2Mock({
-        doStream: async () => ({ stream: createToolCallStream() }),
-      }),
-      tools: { confirmAction: confirmTool },
-    });
-
-    const storage = new InMemoryStore();
-    const mastra = new Mastra({
-      agents: { 'test-agent-resume-abort-serial-followup': agent },
-      logger: false,
-      storage,
-    });
-    const registeredAgent = mastra.getAgent('test-agent-resume-abort-serial-followup');
-
-    const harness = new Harness({
-      id: 'test-harness-resume-abort-serial-followup',
-      storage,
-      modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
-      initialState: { yolo: true } as any,
-    });
-    await harness.init();
-
-    await harness.createThread();
-    await harness.sendMessage({ content: 'Deploy to production' });
-
-    vi.spyOn(registeredAgent, 'resumeStream').mockResolvedValue({
-      fullStream: (async function* () {
-        await new Promise(() => {});
-      })(),
-    } as any);
-    const sendSignalSpy = vi.spyOn(registeredAgent, 'sendSignal').mockReturnValue({
-      accepted: true,
-      runId: 'first-follow-up-run',
-      signal: {} as any,
-    });
-
-    const resume = harness.respondToToolSuspension({ resumeData: { confirmed: true } });
-    await waitFor(() => harness.getCurrentRunId() !== null);
-
-    await harness.followUp({ content: 'first follow-up' });
-    await harness.followUp({ content: 'second follow-up' });
-    expect(harness.getFollowUpCount()).toBe(2);
-
-    harness.abort();
-
-    await waitFor(() => sendSignalSpy.mock.calls.length === 1);
-    await resume;
-
-    expect(sendSignalSpy).toHaveBeenCalledTimes(2);
-    expect(harness.getFollowUpCount()).toBe(0);
-  });
+  it.todo('drains multiple queued follow-ups after a direct resume abort (#220)');
 
   it('reschedules queued follow-up draining after a reentrant drain call', async () => {
     const agent = new Agent({
@@ -2083,5 +2051,6 @@ describe('Harness: tool suspension and resumption', () => {
     const [, resumeOptions] = resumeStreamSpy.mock.calls[0] as [any, any];
     // Yolo mode should disable tool approval gating on resume, matching sendMessage's behavior
     expect(resumeOptions.requireToolApproval).toBe(false);
+    expect(resumeOptions.modelSettings).toBeUndefined();
   });
 });

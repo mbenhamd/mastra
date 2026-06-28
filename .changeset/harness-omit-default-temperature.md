@@ -1,5 +1,5 @@
 ---
-"@mastra/core": patch
+'@mastra/core': patch
 ---
 
-Fixed Harness runs so they no longer send a default temperature when the caller did not configure model settings.
+Stop Harness runs from injecting a default temperature when callers do not configure model settings.
