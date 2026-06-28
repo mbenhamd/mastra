@@ -597,6 +597,7 @@ export type chatRouteOptions<OUTPUT = undefined> = {
     sendFinish?: boolean;
     sendReasoning?: boolean;
     sendSources?: boolean;
+    onError?: (error: unknown) => string;
   };
 
 /**
@@ -612,6 +613,7 @@ export type chatRouteOptions<OUTPUT = undefined> = {
  * @param {boolean} [options.sendFinish=true] - Whether to send finish events in the stream
  * @param {boolean} [options.sendReasoning=false] - Whether to include reasoning steps in the stream
  * @param {boolean} [options.sendSources=false] - Whether to include source citations in the stream
+ * @param {(error: unknown) => string} [options.onError] - Custom error serializer streamed to the client. When omitted, errors are passed through a default serializer that strips sensitive fields (e.g. `APICallError.requestBodyValues`, which holds the system prompt) before they reach the client.
  *
  * @returns {ReturnType<typeof registerApiRoute>} A registered API route handler
  *
@@ -652,6 +654,7 @@ export function chatRoute<OUTPUT = undefined>({
   sendFinish = true,
   sendReasoning = false,
   sendSources = false,
+  onError,
 }: chatRouteOptions<OUTPUT>): ReturnType<typeof registerApiRoute> {
   if (!agent && !path.includes('/:agentId')) {
     throw new Error('Path must include :agentId to route to the correct agent or pass the agent explicitly');
@@ -847,6 +850,7 @@ export function chatRoute<OUTPUT = undefined>({
         sendFinish,
         sendReasoning,
         sendSources,
+        onError,
       };
 
       if (version === 'v6') {

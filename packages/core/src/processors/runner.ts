@@ -18,7 +18,7 @@ import type { TracingContext } from '../observability/types';
 import type { RequestContext } from '../request-context';
 import type { ChunkType } from '../stream';
 import type { MastraModelOutput } from '../stream/base/output';
-import type { LanguageModelUsage } from '../stream/types';
+import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
 import { isProcessorWorkflow } from './is-processor-workflow';
 import { createProcessorSendSignal } from './send-signal';
 import {
@@ -382,7 +382,6 @@ export class ProcessorRunner {
       messageList,
       memory: resolvedMemory,
       threadId: resolvedThreadId,
-      resourceId: resolvedResourceId,
       stateId,
       tracking,
     });
@@ -1814,6 +1813,7 @@ export class ProcessorRunner {
       messageList: MessageList;
       stepNumber: number;
       finishReason?: string;
+      providerMetadata?: ProviderMetadata;
       toolCalls?: ToolCallInfo[];
       text?: string;
       usage?: LanguageModelUsage;
@@ -1827,6 +1827,7 @@ export class ProcessorRunner {
       messageList,
       stepNumber,
       finishReason,
+      providerMetadata,
       toolCalls,
       text,
       usage,
@@ -1853,6 +1854,7 @@ export class ProcessorRunner {
             messageList,
             stepNumber,
             finishReason,
+            providerMetadata,
             toolCalls,
             text,
             usage,
@@ -1920,6 +1922,7 @@ export class ProcessorRunner {
           messageList,
           stepNumber,
           finishReason,
+          providerMetadata,
           toolCalls,
           text,
           usage: usage ?? defaultUsage,
