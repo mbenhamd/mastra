@@ -9,6 +9,7 @@ import type {
 import type { EEUser } from '@mastra/core/auth/ee';
 import type { MastraAuthProviderOptions } from '@mastra/core/server';
 import { MastraAuthProvider } from '@mastra/core/server';
+import { createHmac, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { JWTPayload } from 'jose';
 
@@ -147,41 +148,11 @@ function verifyStateToken(stateToken: string, secret: string): { originalState: 
 }
 
 /**
- * Simple HMAC-SHA256 using Web Crypto (sync wrapper for predictable use).
+ * HMAC-SHA256 signature for OAuth state integrity.
  * Returns base64url-encoded signature.
  */
 function hmacSign(data: string, secret: string): string {
-  // Use a simple hash-based approach that works synchronously
-  // This is a simplified HMAC for state tokens (not for long-term secrets)
-  const encoder = new TextEncoder();
-  const keyBytes = encoder.encode(secret);
-  const dataBytes = encoder.encode(data);
-
-  // Simple HMAC: hash(key + data + key) — good enough for short-lived state tokens
-  const combined = new Uint8Array(keyBytes.length + dataBytes.length + keyBytes.length);
-  combined.set(keyBytes);
-  combined.set(dataBytes, keyBytes.length);
-  combined.set(keyBytes, keyBytes.length + dataBytes.length);
-
-  // Use a fast hash (FNV-1a inspired, but with larger output)
-  let h1 = 0x811c9dc5;
-  let h2 = 0x1000193;
-  for (let i = 0; i < combined.length; i++) {
-    h1 ^= combined[i]!;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= combined[i]!;
-    h2 = Math.imul(h2, 0x85ebca6b);
-  }
-
-  // Convert to base64url
-  const sigBytes = new Uint8Array(8);
-  const view = new DataView(sigBytes.buffer);
-  view.setUint32(0, h1 >>> 0);
-  view.setUint32(4, h2 >>> 0);
-  return btoa(String.fromCharCode(...sigBytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
+  return createHmac('sha256', secret).update(data).digest('base64url');
 }
 
 /**
@@ -191,11 +162,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) {
     return false;
   }
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  return nodeTimingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
 /**

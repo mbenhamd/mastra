@@ -272,6 +272,9 @@ describe('MastraAuthAuth0', () => {
       const redirectUri = 'http://localhost:4111/api/auth/sso/callback';
       const url = auth0.getLoginUrl(redirectUri, 'test-uuid|%2Fstudio');
       const signedState = new URL(url).searchParams.get('state')!;
+      const signature = signedState.split('.')[1]!;
+
+      expect(signature.length).toBeGreaterThan(40);
 
       // Mock token exchange
       mockFetch.mockResolvedValueOnce({

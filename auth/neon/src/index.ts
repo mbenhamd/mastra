@@ -47,6 +47,10 @@ function parseCookies(response: Response): string[] {
   return raw.split(/,(?=\s*\w+=)/);
 }
 
+function createCredentialsHeaders(): HeadersInit {
+  return { 'Content-Type': 'application/json' };
+}
+
 /**
  * Response shape from Neon Auth session endpoint.
  */
@@ -298,10 +302,7 @@ export class MastraAuthNeon
   async signIn(email: string, password: string, request: Request): Promise<CredentialsResult<EEUser>> {
     const response = await fetch(`${this.baseUrl}/auth/sign-in/email`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(request?.headers ? Object.fromEntries(request.headers.entries()) : {}),
-      },
+      headers: createCredentialsHeaders(),
       body: JSON.stringify({ email, password }),
     });
 
@@ -335,10 +336,7 @@ export class MastraAuthNeon
 
     const response = await fetch(`${this.baseUrl}/auth/sign-up/email`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(request?.headers ? Object.fromEntries(request.headers.entries()) : {}),
-      },
+      headers: createCredentialsHeaders(),
       body: JSON.stringify({ email, password, name: displayName }),
     });
 

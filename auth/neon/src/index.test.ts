@@ -305,12 +305,17 @@ describe('MastraAuthNeon', () => {
       });
 
       const auth = new MastraAuthNeon();
-      const result = await auth.signIn('test@example.com', 'password', mockRawRequest());
+      const result = await auth.signIn(
+        'test@example.com',
+        'password',
+        mockRawRequest({ Authorization: 'Bearer mastra-token', Cookie: 'mastra_session=abc' }),
+      );
 
       expect(mockFetch).toHaveBeenCalledWith(
         'https://test-project.neon.tech/auth/sign-in/email',
         expect.objectContaining({
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: 'test@example.com', password: 'password' }),
         }),
       );
@@ -349,12 +354,18 @@ describe('MastraAuthNeon', () => {
       });
 
       const auth = new MastraAuthNeon();
-      const result = await auth.signUp('new@example.com', 'password', 'New User', mockRawRequest());
+      const result = await auth.signUp(
+        'new@example.com',
+        'password',
+        'New User',
+        mockRawRequest({ Authorization: 'Bearer mastra-token', Cookie: 'mastra_session=abc' }),
+      );
 
       expect(mockFetch).toHaveBeenCalledWith(
         'https://test-project.neon.tech/auth/sign-up/email',
         expect.objectContaining({
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: 'new@example.com', password: 'password', name: 'New User' }),
         }),
       );
