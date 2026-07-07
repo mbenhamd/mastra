@@ -30,6 +30,11 @@ export interface HarnessDisplayActiveSubagentSnapshotV1 {
   task: string;
   parentToolCallId: string;
   startedAt: number;
+  status?: 'running' | 'completed' | 'failed';
+  currentToolName?: string;
+  toolCallCount?: number;
+  usage?: TokenUsage;
+  updatedAt?: number;
 }
 
 export interface HarnessDisplayPendingSnapshotV1 extends Omit<SessionDisplayPending, 'payload'> {
@@ -144,13 +149,23 @@ function encodeActiveTool(tool: ActiveToolState): HarnessDisplayActiveToolSnapsh
 }
 
 function encodeActiveSubagent(subagent: ActiveSubagentState): HarnessDisplayActiveSubagentSnapshotV1 {
-  return {
+  const encoded: HarnessDisplayActiveSubagentSnapshotV1 = {
     subagentSessionId: subagent.subagentSessionId,
     agentType: subagent.agentType,
     task: subagent.task,
     parentToolCallId: subagent.parentToolCallId,
     startedAt: subagent.startedAt,
   };
+  if (subagent.status !== undefined) encoded.status = subagent.status;
+  if (subagent.currentToolName !== undefined) encoded.currentToolName = subagent.currentToolName;
+  if (typeof subagent.toolCalls === 'number' && Number.isFinite(subagent.toolCalls) && subagent.toolCalls >= 0) {
+    encoded.toolCallCount = subagent.toolCalls;
+  }
+  if (subagent.usage !== undefined) encoded.usage = { ...subagent.usage };
+  if (typeof subagent.updatedAt === 'number' && Number.isFinite(subagent.updatedAt) && subagent.updatedAt >= 0) {
+    encoded.updatedAt = subagent.updatedAt;
+  }
+  return encoded;
 }
 
 function encodePending(pending: SessionDisplayPending | null): HarnessDisplayPendingSnapshotV1 | null {

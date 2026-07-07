@@ -562,6 +562,43 @@ describe('Session.getDisplayState — shape', () => {
     expect(a.tokenUsage).not.toBe(b.tokenUsage);
   });
 
+  it('preserves bounded active subagent progress in the v1 display snapshot', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    (session as any)._activeSubagents.set('tc-subagent-progress', {
+      subagentSessionId: 'child-session-1',
+      agentType: 'evidence_specialist',
+      task: 'Check the cited sources',
+      parentToolCallId: 'tc-subagent-progress',
+      startedAt: 1_778_760_000_000,
+      status: 'running',
+      currentToolName: 'search_papers',
+      toolCalls: 2,
+      usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 },
+      updatedAt: 1_778_760_010_000,
+      args: { should: 'not leak' },
+      output: { should: 'not leak' },
+    });
+
+    const snapshot = toHarnessDisplayStateSnapshotV1(session.getDisplayState());
+    const subagent = snapshot.activeSubagents['tc-subagent-progress'];
+    expect(subagent).toEqual({
+      subagentSessionId: 'child-session-1',
+      agentType: 'evidence_specialist',
+      task: 'Check the cited sources',
+      parentToolCallId: 'tc-subagent-progress',
+      startedAt: 1_778_760_000_000,
+      status: 'running',
+      currentToolName: 'search_papers',
+      toolCallCount: 2,
+      usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 },
+      updatedAt: 1_778_760_010_000,
+    });
+    expect(subagent).not.toHaveProperty('toolCalls');
+    expect(subagent).not.toHaveProperty('args');
+    expect(subagent).not.toHaveProperty('output');
+  });
+
   it('parentSessionId is omitted for top-level sessions', async () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
