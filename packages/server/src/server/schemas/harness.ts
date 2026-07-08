@@ -118,6 +118,17 @@ const harnessDisplayActiveSubagentSnapshotV1Schema = z.object({
   task: z.string(),
   parentToolCallId: z.string(),
   startedAt: z.number(),
+  status: z.enum(['running', 'completed', 'failed']).optional(),
+  currentToolName: z.string().optional(),
+  toolCallCount: z.number().optional(),
+  usage: z
+    .object({
+      promptTokens: z.number(),
+      completionTokens: z.number(),
+      totalTokens: z.number(),
+    })
+    .optional(),
+  updatedAt: z.number().optional(),
 });
 
 const harnessAssistantDraftSchema = z.object({

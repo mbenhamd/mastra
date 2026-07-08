@@ -296,6 +296,22 @@ describe('Harness server routes', () => {
         startedAt: 300,
       },
     };
+    displayState.activeSubagents = {
+      'tool-subagent-1': {
+        subagentSessionId: 'child-session-1',
+        agentType: 'evidence_specialist',
+        task: 'Check cited sources',
+        parentToolCallId: 'tool-subagent-1',
+        startedAt: 350,
+        status: 'running',
+        currentToolName: 'search_papers',
+        toolCalls: 2,
+        usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 },
+        updatedAt: 375,
+        args: { should: 'not leak' },
+        output: { should: 'not leak' },
+      } as SessionDisplayState['activeSubagents'][string],
+    };
     const session = {
       getRecord: () => record,
       getDisplayState: () => displayState,
@@ -336,11 +352,29 @@ describe('Harness server routes', () => {
               },
             },
           },
+          activeSubagents: {
+            'tool-subagent-1': {
+              subagentSessionId: 'child-session-1',
+              agentType: 'evidence_specialist',
+              task: 'Check cited sources',
+              parentToolCallId: 'tool-subagent-1',
+              startedAt: 350,
+              status: 'running',
+              currentToolName: 'search_papers',
+              toolCallCount: 2,
+              usage: { promptTokens: 4, completionTokens: 5, totalTokens: 9 },
+              updatedAt: 375,
+            },
+          },
         },
         messages: { cursor: { threadId: 'thread-1', route: 'thread-messages' } },
       },
     });
     expect(result.session.displayState.activeTools['tool-1'].args).not.toHaveProperty('omitted');
+    const subagent = result.session.displayState.activeSubagents['tool-subagent-1'] as Record<string, unknown>;
+    expect(subagent).not.toHaveProperty('toolCalls');
+    expect(subagent).not.toHaveProperty('args');
+    expect(subagent).not.toHaveProperty('output');
   });
 
   it('ignores create options supplied only through flattened query params', async () => {
