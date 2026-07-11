@@ -83,7 +83,7 @@ Both backends below deliver across processes and hosts and persist events for re
 
 The pub/sub backend owns workflow-event delivery identity and, when supported, the `deliveryAttempt` count. Mastra may execute the source workflow event while that count is within its bounded budget. After the budget is exhausted, later deliveries retry terminal failure propagation only; they don't run the source event again. This keeps the budget stable when another worker claims the event or the receiving process restarts. Backends that don't provide a tracked positive attempt value can't provide this cross-process guarantee.
 
-If terminal failure publication is temporarily unavailable, Mastra calls `nack` and leaves the source event with the backend. A `workflow.fail` event never publishes another `workflow.fail`; failure processing retries the existing terminal event instead.
+If terminal failure publication is temporarily unavailable, or a configured workflow store can't yet observe the durable run snapshot, Mastra calls `nack` and leaves the source event with the backend. A missing snapshot in a configured store is not treated as proof that the event is stale. When workflow storage isn't configured, Mastra publishes the terminal failure without this stale-state guard. A `workflow.fail` event never publishes another `workflow.fail`; failure processing retries the existing terminal event instead.
 
 This is an at-least-once transport contract. Broker-owned attempts prevent a fresh source budget, but exactly-once parent and finish notifications require a durable terminalization journal. Terminal notification consumers should remain idempotent.
 

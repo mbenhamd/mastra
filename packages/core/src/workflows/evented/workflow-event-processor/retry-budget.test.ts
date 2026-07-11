@@ -45,7 +45,12 @@ function makeWorkflow(id: string) {
     .commit();
 }
 
-async function persistRun(mastra: Mastra, workflowId: string, runId: string, status: 'running' | 'success' = 'running') {
+async function persistRun(
+  mastra: Mastra,
+  workflowId: string,
+  runId: string,
+  status: 'running' | 'success' = 'running',
+) {
   const workflowsStore = await mastra.getStorage()?.getStore('workflows');
   await workflowsStore?.persistWorkflowSnapshot({
     workflowName: workflowId,
@@ -264,7 +269,9 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
     expect(AlwaysThrowsProcessor.dispatchCalls).toBe(0);
     expect(pubsub.terminalPublishes).toBe(0);
 
-    const snapshot = await (await mastra.getStorage()?.getStore('workflows'))?.loadWorkflowSnapshot({
+    const snapshot = await (
+      await mastra.getStorage()?.getStore('workflows')
+    )?.loadWorkflowSnapshot({
       workflowName: 'wf',
       runId: 'completed-run',
     });
@@ -292,6 +299,55 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
     });
     expect(AlwaysThrowsProcessor.dispatchCalls).toBe(0);
     expect(pubsub.terminalPublishes).toBe(0);
+
+    await mastra.shutdown();
+  });
+
+  it('keeps an exhausted delivery retryable until its run snapshot is observable', async () => {
+    const pubsub = new FailingTerminalPubSub();
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { wf: makeWorkflow('wf') } as any,
+      pubsub,
+    });
+    AlwaysThrowsProcessor.dispatchCalls = 0;
+
+    const processor = new AlwaysThrowsProcessor({ mastra });
+    await expect(processor.handle(makeStartEvent('wf', 'missing-snapshot-run', 4))).resolves.toEqual({
+      ok: false,
+      retry: true,
+    });
+    expect(AlwaysThrowsProcessor.dispatchCalls).toBe(0);
+    expect(pubsub.terminalPublishes).toBe(0);
+
+    await persistRun(mastra, 'wf', 'missing-snapshot-run');
+    await expect(processor.handle(makeStartEvent('wf', 'missing-snapshot-run', 5))).resolves.toEqual({
+      ok: false,
+      retry: false,
+    });
+    expect(AlwaysThrowsProcessor.dispatchCalls).toBe(0);
+    expect(pubsub.terminalPublishes).toBe(1);
+
+    await mastra.shutdown();
+  });
+
+  it('publishes terminal failure without a state guard when workflow storage is not configured', async () => {
+    const pubsub = new FailingTerminalPubSub();
+    const mastra = new Mastra({
+      logger: false,
+      workflows: { wf: makeWorkflow('wf') } as any,
+      pubsub,
+    });
+    AlwaysThrowsProcessor.dispatchCalls = 0;
+
+    const processor = new AlwaysThrowsProcessor({ mastra });
+    await expect(processor.handle(makeStartEvent('wf', 'storage-free-run', 4))).resolves.toEqual({
+      ok: false,
+      retry: false,
+    });
+    expect(AlwaysThrowsProcessor.dispatchCalls).toBe(0);
+    expect(pubsub.terminalPublishes).toBe(1);
 
     await mastra.shutdown();
   });

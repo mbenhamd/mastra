@@ -2482,12 +2482,16 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     let currentState: WorkflowRunState | null | undefined;
+    let hasWorkflowsStore = false;
     try {
       const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
-      currentState = await workflowsStore?.loadWorkflowSnapshot({
-        workflowName: workflowData.workflowId,
-        runId: workflowData.runId,
-      });
+      if (workflowsStore) {
+        hasWorkflowsStore = true;
+        currentState = await workflowsStore.loadWorkflowSnapshot({
+          workflowName: workflowData.workflowId,
+          runId: workflowData.runId,
+        });
+      }
     } catch (stateError) {
       this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: failed to verify run before terminalization', {
         type: event.type,
@@ -2499,16 +2503,28 @@ export class WorkflowEventProcessor extends EventProcessor {
       return { ok: false, retry: true };
     }
 
+    // A missing snapshot is not evidence that the delivery is stale. Preserve
+    // the broker delivery so a later attempt can observe the snapshot or a
+    // downstream durable journal can admit the event. Acknowledging here would
+    // discard the only retained copy before either recovery path exists.
+    if (hasWorkflowsStore && !currentState) {
+      this.mastra.getLogger()?.warn('WorkflowEventProcessor.handle: run snapshot missing before terminalization', {
+        type: event.type,
+        runId: event.runId,
+        deliveryAttempt,
+        phase: 'terminalization-state-check',
+      });
+      return { ok: false, retry: true };
+    }
+
     // A delayed exhausted delivery must not overwrite a run that completed,
-    // failed, or was canceled through a newer event. Missing snapshots are not
-    // safe to terminalize either; the durable journal follow-up owns recovery
-    // for no-snapshot workflows.
-    if (!currentState || !WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES.has(currentState.status)) {
+    // failed, or was canceled through a newer event.
+    if (currentState && !WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES.has(currentState.status)) {
       this.mastra.getLogger()?.debug?.('WorkflowEventProcessor.handle: skipping stale terminal failure', {
         type: event.type,
         runId: event.runId,
         deliveryAttempt,
-        runStatus: currentState?.status ?? 'missing',
+        runStatus: currentState.status,
       });
       return { ok: false, retry: false };
     }
