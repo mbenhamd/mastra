@@ -11,20 +11,26 @@ import {
   advanceWorkflowTerminalizationRecord,
   claimWorkflowTerminalizationRecord,
   createStorageErrorId,
+  createWorkflowTerminalDestinationReceiptRecord,
   materializeWorkflowTerminalEffectDescriptor,
   materializeWorkflowTerminalEffectKind,
   observeWorkflowTerminalizationRecord,
   observeWorkflowTerminalEffectRecord,
+  copyWorkflowTerminalDestinationReceiptRecord,
+  getWorkflowTerminalDestinationReceiptRecord,
   persistWorkflowTerminalStateRecord,
   prepareWorkflowTerminalEffectRecord,
+  reserveWorkflowTerminalDestinationReceiptRecord,
   getWorkflowTerminalEffectForDispatchRecord,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
   validateWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalEffectJournalLink,
   validateWorkflowTerminalSnapshotJournalLink,
+  validateWorkflowTerminalDestinationReceiptIntegrity,
   validateWorkflowTerminalizationFence,
   validateWorkflowTerminalizationRunIdentity,
+  validateWorkflowTerminalizationIdentity,
 } from '@mastra/core/storage';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -37,10 +43,14 @@ import type {
   GetWorkflowTerminalizationResult,
   GetWorkflowTerminalEffectForDispatchInput,
   GetWorkflowTerminalEffectForDispatchResult,
+  GetWorkflowTerminalDestinationReceiptInput,
+  GetWorkflowTerminalDestinationReceiptResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
   PrepareWorkflowTerminalEffectInput,
   PrepareWorkflowTerminalEffectResult,
+  ReserveWorkflowTerminalDestinationReceiptInput,
+  ReserveWorkflowTerminalDestinationReceiptResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -54,6 +64,7 @@ import type {
   StepResult,
   WorkflowRunState,
   WorkflowTerminalEffectRecord,
+  WorkflowTerminalDestinationReceiptRecord,
   WorkflowTerminalSnapshotRecord,
   WorkflowTerminalizationRecord,
 } from '@mastra/core/workflows';
@@ -64,6 +75,7 @@ import type { PgDomainConfig } from '../../db';
 const TABLE_WORKFLOW_TERMINALIZATIONS = 'mastra_workflow_terminalizations';
 const TABLE_WORKFLOW_TERMINAL_EFFECTS = 'mastra_workflow_terminal_effects';
 const TABLE_WORKFLOW_TERMINAL_SNAPSHOTS = 'mastra_workflow_terminal_snapshots';
+const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_destination_receipts';
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -110,6 +122,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     TABLE_WORKFLOW_TERMINALIZATIONS,
     TABLE_WORKFLOW_TERMINAL_EFFECTS,
     TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+    TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
   ] as const;
 
   constructor(config: PgDomainConfig) {
@@ -131,7 +144,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
-    return { journalVersion: 1, producerOutboxVersion: 1 };
+    return { journalVersion: 1, producerOutboxVersion: 1, destinationReceiptVersion: 1 };
   }
 
   private terminalizationTableName(): string {
@@ -155,6 +168,13 @@ export class WorkflowsPG extends WorkflowsStorage {
   private terminalSnapshotTableName(): string {
     return getTableName({
       indexName: TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private terminalDestinationReceiptTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
       schemaName: getSchemaName(this.#schema),
     });
   }
@@ -487,6 +507,110 @@ export class WorkflowsPG extends WorkflowsStorage {
     return row ? this.decodeTerminalSnapshotRow(row, now) : undefined;
   }
 
+  private decodeTerminalDestinationReceiptRow(
+    row: Record<string, unknown>,
+    effect: WorkflowTerminalEffectRecord,
+    now: number,
+  ): WorkflowTerminalDestinationReceiptRecord {
+    const integer = (value: unknown, field: string, optional = false): number | undefined => {
+      if (optional && (value === null || value === undefined)) return undefined;
+      const parsed = typeof value === 'string' ? Number(value) : value;
+      if (typeof parsed !== 'number' || !Number.isSafeInteger(parsed) || parsed < 0 || parsed > now) {
+        throw new TypeError(`Invalid workflow terminal destination receipt ${field}`);
+      }
+      return parsed;
+    };
+    const appliedAt = integer(row.applied_at, 'applied_at', true);
+    const dispatchPendingAt = integer(row.dispatch_pending_at, 'dispatch_pending_at', true);
+    const destinationAppliedAt = integer(row.destination_applied_at, 'destination_applied_at', true);
+    const quarantinedAt = integer(row.quarantined_at, 'quarantined_at', true);
+    const record = {
+      version: integer(row.version, 'version'),
+      receiptKey: row.receipt_key,
+      workflowName: row.workflow_name,
+      runId: row.run_id,
+      effectKey: row.effect_key,
+      consumerId: row.consumer_id,
+      effectKind: row.effect_kind,
+      producerPayloadHash: row.producer_payload_hash,
+      destinationHash: row.destination_hash,
+      applicationState: row.application_state,
+      dispatchState: row.dispatch_state,
+      createdAt: integer(row.created_at, 'created_at'),
+      updatedAt: integer(row.updated_at, 'updated_at'),
+      ...(appliedAt === undefined ? {} : { appliedAt }),
+      ...(dispatchPendingAt === undefined ? {} : { dispatchPendingAt }),
+      ...(destinationAppliedAt === undefined ? {} : { destinationAppliedAt }),
+      ...(quarantinedAt === undefined ? {} : { quarantinedAt }),
+    } as WorkflowTerminalDestinationReceiptRecord;
+    if (
+      record.version !== 1 ||
+      typeof record.receiptKey !== 'string' ||
+      !/^wtr:v1:[a-f0-9]{64}$/.test(record.receiptKey) ||
+      typeof record.consumerId !== 'string' ||
+      typeof record.destinationHash !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(record.destinationHash)
+    ) {
+      throw new TypeError('Invalid workflow terminal destination receipt record');
+    }
+    validateWorkflowTerminalizationIdentity(record.consumerId, 'consumerId', 256);
+    validateWorkflowTerminalDestinationReceiptIntegrity(record, effect, now);
+    return record;
+  }
+
+  private async getTerminalDestinationReceiptRecord(
+    t: TxClient,
+    effect: WorkflowTerminalEffectRecord,
+    consumerId: string,
+    now: number,
+  ): Promise<WorkflowTerminalDestinationReceiptRecord | undefined> {
+    const expectedReceiptKey = createWorkflowTerminalDestinationReceiptRecord(effect, consumerId, now).receiptKey;
+    const rows = await t.manyOrNone<Record<string, unknown>>(
+      `SELECT * FROM ${this.terminalDestinationReceiptTableName()}
+       WHERE receipt_key = $1
+          OR (effect_key = $2 AND consumer_id = $3)
+          OR (workflow_name = $4 AND run_id = $5 AND effect_kind = $6 AND consumer_id = $3)
+       FOR UPDATE`,
+      [expectedReceiptKey, effect.effectKey, consumerId, effect.workflowName, effect.runId, effect.kind],
+    );
+    if (rows.length > 1) {
+      throw new TypeError('Conflicting workflow terminal destination receipt storage');
+    }
+    return rows[0] ? this.decodeTerminalDestinationReceiptRow(rows[0], effect, now) : undefined;
+  }
+
+  private async insertTerminalDestinationReceiptRecord(
+    t: TxClient,
+    receipt: WorkflowTerminalDestinationReceiptRecord,
+  ): Promise<void> {
+    await t.none(
+      `INSERT INTO ${this.terminalDestinationReceiptTableName()}
+       (version, workflow_name, run_id, effect_key, consumer_id, receipt_key, effect_kind,
+        producer_payload_hash, destination_hash, application_state, dispatch_state, created_at, updated_at,
+        applied_at, dispatch_pending_at, destination_applied_at, quarantined_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+      [
+        receipt.version,
+        receipt.workflowName,
+        receipt.runId,
+        receipt.effectKey,
+        receipt.consumerId,
+        receipt.receiptKey,
+        receipt.effectKind,
+        receipt.producerPayloadHash,
+        receipt.destinationHash,
+        receipt.applicationState,
+        receipt.dispatchState,
+        receipt.createdAt,
+        receipt.updatedAt,
+        receipt.appliedAt ?? null,
+        receipt.dispatchPendingAt ?? null,
+        receipt.destinationAppliedAt ?? null,
+        receipt.quarantinedAt ?? null,
+      ],
+    );
+  }
+
   private async saveTerminalWorkflowSnapshot(
     t: TxClient,
     input: PersistWorkflowTerminalStateInput,
@@ -677,6 +801,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         const count = result.rowCount ?? 0;
         if (count > 0) {
+          await t.none(
+            `DELETE FROM ${this.terminalDestinationReceiptTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
           await t.none(
             `DELETE FROM ${this.terminalEffectTableName()}
              WHERE workflow_name = $1 AND run_id = $2`,
@@ -902,6 +1031,145 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  async reserveWorkflowTerminalDestinationReceipt(
+    input: ReserveWorkflowTerminalDestinationReceiptInput,
+  ): Promise<ReserveWorkflowTerminalDestinationReceiptResult> {
+    const operation: ReserveWorkflowTerminalDestinationReceiptInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      effectKind: materializeWorkflowTerminalEffectKind(input.effectKind),
+      consumerId: input.consumerId,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const effect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          operation.effectKind,
+          context.now,
+        );
+        if (effect && context.record) {
+          validateWorkflowTerminalEffectJournalLink(effect, context.record, operation.workflowName, operation.runId);
+        }
+        const receipt = effect
+          ? await this.getTerminalDestinationReceiptRecord(t, effect, operation.consumerId, context.now)
+          : undefined;
+        const result = reserveWorkflowTerminalDestinationReceiptRecord(
+          context.record,
+          effect,
+          receipt,
+          operation,
+          context.now,
+        );
+        if (result.status === 'reserved' || result.status === 'already_exists') {
+          const retained = await this.getTerminalSnapshotRecord(
+            t,
+            operation.workflowName,
+            operation.runId,
+            context.now,
+          );
+          if (!retained) return { status: 'missing_terminal_state' };
+          validateWorkflowTerminalSnapshotJournalLink(
+            retained,
+            context.record!,
+            operation.workflowName,
+            operation.runId,
+          );
+          if (result.status === 'reserved') {
+            await this.insertTerminalDestinationReceiptRecord(t, result.receipt);
+          }
+          return { status: result.status, receipt: copyWorkflowTerminalDestinationReceiptRecord(result.receipt) };
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'RESERVE_WORKFLOW_TERMINAL_DESTINATION_RECEIPT',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async getWorkflowTerminalDestinationReceipt(
+    input: GetWorkflowTerminalDestinationReceiptInput,
+  ): Promise<GetWorkflowTerminalDestinationReceiptResult> {
+    const operation: GetWorkflowTerminalDestinationReceiptInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      effectKind: materializeWorkflowTerminalEffectKind(input.effectKind),
+      consumerId: input.consumerId,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const effect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          operation.effectKind,
+          context.now,
+        );
+        if (effect && context.record) {
+          validateWorkflowTerminalEffectJournalLink(effect, context.record, operation.workflowName, operation.runId);
+        }
+        const receipt = effect
+          ? await this.getTerminalDestinationReceiptRecord(t, effect, operation.consumerId, context.now)
+          : undefined;
+        const result = getWorkflowTerminalDestinationReceiptRecord(
+          context.record,
+          effect,
+          receipt,
+          operation,
+          context.now,
+        );
+        if (result.status === 'found') {
+          const retained = await this.getTerminalSnapshotRecord(
+            t,
+            operation.workflowName,
+            operation.runId,
+            context.now,
+          );
+          if (!retained) return { status: 'missing_terminal_state' };
+          validateWorkflowTerminalSnapshotJournalLink(
+            retained,
+            context.record!,
+            operation.workflowName,
+            operation.runId,
+          );
+          return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(result.receipt) };
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'GET_WORKFLOW_TERMINAL_DESTINATION_RECEIPT',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
   private parseWorkflowRun(row: Record<string, any>): WorkflowRun {
     let parsedSnapshot: WorkflowRunState | string = row.snapshot as string;
     if (typeof parsedSnapshot === 'string') {
@@ -940,6 +1208,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalDestinationReceiptTableDDL(schemaName));
     for (const index of WorkflowsPG.getDefaultIndexDefs(schemaName)) {
       statements.push(generateIndexSQL(index, schemaName));
     }
@@ -959,6 +1228,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         name: 'mastra_workflow_terminalizations_completed_idx',
         table: TABLE_WORKFLOW_TERMINALIZATIONS,
         columns: ['completed_at'],
+      },
+      {
+        name: 'mastra_workflow_terminal_destination_receipts_lookup_idx',
+        table: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
+        columns: ['workflow_name', 'run_id', 'effect_kind', 'consumer_id'],
       },
     ];
   }
@@ -1026,6 +1300,63 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  private static getTerminalDestinationReceiptTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "version" INTEGER NOT NULL,
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "effect_key" TEXT NOT NULL,
+      "consumer_id" TEXT NOT NULL,
+      "receipt_key" TEXT NOT NULL UNIQUE,
+      "effect_kind" TEXT NOT NULL,
+      "producer_payload_hash" TEXT NOT NULL,
+      "destination_hash" TEXT NOT NULL,
+      "application_state" TEXT NOT NULL,
+      "dispatch_state" TEXT NOT NULL,
+      "created_at" BIGINT NOT NULL,
+      "updated_at" BIGINT NOT NULL,
+      "applied_at" BIGINT,
+      "dispatch_pending_at" BIGINT,
+      "destination_applied_at" BIGINT,
+      "quarantined_at" BIGINT,
+      PRIMARY KEY ("effect_key", "consumer_id"),
+      CHECK ("version" = 1),
+      CHECK ("created_at" >= 0 AND "updated_at" >= "created_at"),
+      CHECK (
+        ("application_state" = 'reserved' AND "dispatch_state" = 'none'
+          AND "updated_at" = "created_at"
+          AND "applied_at" IS NULL AND "dispatch_pending_at" IS NULL
+          AND "destination_applied_at" IS NULL AND "quarantined_at" IS NULL)
+        OR
+        ("application_state" = 'applied' AND "dispatch_state" = 'none'
+          AND "applied_at" IS NOT NULL AND "applied_at" = "updated_at" AND "dispatch_pending_at" IS NULL
+          AND "destination_applied_at" IS NULL AND "quarantined_at" IS NULL)
+        OR
+        ("application_state" = 'applied' AND "dispatch_state" = 'pending'
+          AND "applied_at" IS NOT NULL AND "dispatch_pending_at" IS NOT NULL
+          AND "dispatch_pending_at" = "updated_at"
+          AND "created_at" <= "applied_at"
+          AND "applied_at" <= "dispatch_pending_at"
+          AND "destination_applied_at" IS NULL AND "quarantined_at" IS NULL)
+        OR
+        ("application_state" = 'applied' AND "dispatch_state" = 'destination_applied'
+          AND "applied_at" IS NOT NULL AND "dispatch_pending_at" IS NOT NULL
+          AND "destination_applied_at" IS NOT NULL AND "destination_applied_at" = "updated_at"
+          AND "created_at" <= "applied_at"
+          AND "applied_at" <= "dispatch_pending_at"
+          AND "dispatch_pending_at" <= "destination_applied_at" AND "quarantined_at" IS NULL)
+        OR
+        ("application_state" = 'quarantined' AND "dispatch_state" = 'none'
+          AND "quarantined_at" IS NOT NULL AND "quarantined_at" = "updated_at"
+          AND "applied_at" IS NULL AND "dispatch_pending_at" IS NULL AND "destination_applied_at" IS NULL)
+      )
+    );`;
+  }
+
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
     return WorkflowsPG.getDefaultIndexDefs(this.#schema);
   }
@@ -1049,6 +1380,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getTerminalizationTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalEffectTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalSnapshotTableDDL(this.#schema));
+    await this.#db.client.none(WorkflowsPG.getTerminalDestinationReceiptTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
@@ -1078,7 +1410,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.client.none(
-      `TRUNCATE TABLE ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
+      `TRUNCATE TABLE ${this.terminalDestinationReceiptTableName()}, ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
     );
   }
 

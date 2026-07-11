@@ -3,6 +3,7 @@ import type { ScoreRowData } from '../../evals/types';
 import type { StorageThreadType } from '../../memory/types';
 import type {
   WorkflowTerminalEffectRecord,
+  WorkflowTerminalDestinationReceiptRecord,
   WorkflowTerminalizationRecord,
   WorkflowTerminalSnapshotRecord,
 } from '../../workflows';
@@ -76,6 +77,8 @@ export class InMemoryDB {
   readonly workflowTerminalEffects = new Map<string, WorkflowTerminalEffectRecord>();
   /** Immutable terminal state retained while terminal protocol evidence remains incomplete. */
   readonly workflowTerminalSnapshots = new Map<string, WorkflowTerminalSnapshotRecord>();
+  /** Consumer-scoped destination receipt evidence, isolated from replaceable workflow runs. */
+  readonly workflowTerminalDestinationReceipts = new Map<string, WorkflowTerminalDestinationReceiptRecord>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -170,6 +173,7 @@ export class InMemoryDB {
     this.workflowTerminalizations.clear();
     this.workflowTerminalEffects.clear();
     this.workflowTerminalSnapshots.clear();
+    this.workflowTerminalDestinationReceipts.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;

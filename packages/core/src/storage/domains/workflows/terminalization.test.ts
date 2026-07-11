@@ -53,6 +53,26 @@ describe('WorkflowsStorage terminalization defaults', () => {
         snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
       }),
     ).resolves.toEqual({ status: 'unsupported' });
+    await expect(
+      workflows.reserveWorkflowTerminalDestinationReceipt({
+        ...run,
+        ownerId: 'worker',
+        claimToken: 'token',
+        claimGeneration: 1,
+        effectKind: 'workflow-finish',
+        consumerId: 'finish-dispatcher',
+      }),
+    ).resolves.toEqual({ status: 'unsupported' });
+    await expect(
+      workflows.getWorkflowTerminalDestinationReceipt({
+        ...run,
+        ownerId: 'worker',
+        claimToken: 'token',
+        claimGeneration: 1,
+        effectKind: 'workflow-finish',
+        consumerId: 'finish-dispatcher',
+      }),
+    ).resolves.toEqual({ status: 'unsupported' });
   });
 });
 

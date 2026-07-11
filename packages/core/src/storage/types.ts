@@ -12,6 +12,7 @@ import type {
   WorkflowTerminalizationClaimedRecord,
   WorkflowTerminalEffectKind,
   WorkflowTerminalEffectRecord,
+  WorkflowTerminalDestinationReceiptRecord,
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
@@ -222,6 +223,48 @@ export type GetWorkflowTerminalEffectForDispatchResult =
       record: WorkflowTerminalizationObservation;
     }
   | { status: 'missing_effect' | 'missing_terminal_state' | 'missing_record' | 'missing_run' | 'unsupported' };
+
+export interface ReserveWorkflowTerminalDestinationReceiptInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  effectKind: WorkflowTerminalEffectKind;
+  consumerId: string;
+}
+
+export type ReserveWorkflowTerminalDestinationReceiptResult =
+  | { status: 'reserved' | 'already_exists'; receipt: WorkflowTerminalDestinationReceiptRecord }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status: 'missing_effect' | 'missing_terminal_state' | 'missing_record' | 'missing_run' | 'unsupported';
+    };
+
+export interface GetWorkflowTerminalDestinationReceiptInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  effectKind: WorkflowTerminalEffectKind;
+  consumerId: string;
+}
+
+export type GetWorkflowTerminalDestinationReceiptResult =
+  | { status: 'found'; receipt: WorkflowTerminalDestinationReceiptRecord }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status:
+        | 'missing_receipt'
+        | 'missing_effect'
+        | 'missing_terminal_state'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
+    };
 
 export type PaginationInfo = {
   total: number;
