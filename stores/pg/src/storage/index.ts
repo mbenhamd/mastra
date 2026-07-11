@@ -13,7 +13,7 @@ import {
 } from '../shared/config';
 import type { PostgresStoreConfig } from '../shared/config';
 import { buildConnectionStringPoolConfig } from '../shared/pool-config';
-import { PoolAdapter } from './client';
+import { PinnedClientAdapter, PoolAdapter, RoutingDbClient } from './client';
 import type { DbClient } from './client';
 import type { PgDomainClientConfig } from './db';
 import { getSchemaName } from './db';
