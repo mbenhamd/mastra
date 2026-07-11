@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { RequestContext } from './index';
+import { describe, expect, it, vi } from 'vitest';
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from './index';
 
 describe('RequestContext', () => {
   describe('constructor', () => {
@@ -243,6 +243,49 @@ describe('RequestContext', () => {
       expect(elapsed).toBeLessThan(2000);
       const parsed = JSON.parse(serialized);
       expect(parsed).toEqual({ serializable: 'value' });
+    });
+  });
+
+  describe('serializeForSpan', () => {
+    it('redacts the reserved auth token while preserving safe primitives', () => {
+      const ctx = new RequestContext();
+      ctx.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer SECRET_AUTH_TOKEN');
+      ctx.set('userId', 'user-123');
+      ctx.set('attempt', 2);
+      ctx.set('enabled', true);
+      ctx.set('none', null);
+      ctx.set('missing', undefined);
+
+      expect(ctx.serializeForSpan()).toEqual({
+        [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
+        userId: 'user-123',
+        attempt: 2,
+        enabled: true,
+        none: null,
+        missing: undefined,
+      });
+    });
+
+    it('does not traverse nested values or execute their serialization hooks', () => {
+      const toJSON = vi.fn(() => ({ secret: 'SECRET_NESTED_VALUE' }));
+      const ctx = new RequestContext();
+      ctx.set('object', { toJSON });
+      ctx.set('array', ['SECRET_ARRAY_VALUE']);
+      ctx.set('callback', () => 'SECRET_FUNCTION_VALUE');
+      ctx.set('symbol', Symbol('SECRET_SYMBOL_VALUE'));
+
+      expect(ctx.serializeForSpan()).toEqual({
+        object: '[object]',
+        array: '[object]',
+        callback: '[function]',
+        symbol: '[symbol]',
+      });
+      expect(toJSON).not.toHaveBeenCalled();
+      expect(JSON.stringify(ctx.serializeForSpan())).not.toContain('SECRET_');
+    });
+
+    it('returns an empty object for an empty context', () => {
+      expect(new RequestContext().serializeForSpan()).toEqual({});
     });
   });
 });

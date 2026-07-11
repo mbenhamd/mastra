@@ -34,8 +34,18 @@ export function sanitizeToolCallInput(input: string): string {
     JSON.parse(input);
     return input;
   } catch {
-    // Input is not valid JSON — strip LLM-specific tokens and retry
-    return input.replace(/[\s]*<\|[^|]*\|>[\s]*/g, '').trim();
+    // Input is not valid JSON — strip LLM-specific tokens and retry.
+    // Find tokens from their literal delimiter to keep matching linear on long
+    // whitespace prefixes. Trim whitespace from each disjoint pre-token segment
+    // so a token inserted inside a JSON lexical value does not leave `1 2`.
+    const tokenPattern = /<\|[^|]*\|>\s*/g;
+    let sanitized = '';
+    let previousEnd = 0;
+    for (const token of input.matchAll(tokenPattern)) {
+      sanitized += input.slice(previousEnd, token.index).replace(/\s+$/, '');
+      previousEnd = token.index + token[0].length;
+    }
+    return `${sanitized}${input.slice(previousEnd)}`.trim();
   }
 }
 

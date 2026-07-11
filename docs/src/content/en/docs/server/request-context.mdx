@@ -291,6 +291,30 @@ requestContext.set(MASTRA_THREAD_ID_KEY, threadId)
 
 These keys are used to implement user isolation in multi-tenant applications. See [Authorization middleware](/docs/server/middleware#authorization-user-isolation) for usage examples.
 
+## Observability-safe serialization
+
+Use `serializeForSpan()` when a custom observability integration needs to include request context in span input. It returns a bounded snapshot instead of traversing stored objects:
+
+```typescript
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '@mastra/core/request-context'
+
+const requestContext = new RequestContext()
+requestContext.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer raw-token')
+requestContext.set('userId', 'user-123')
+requestContext.set('runtimeClient', { connected: true })
+
+const spanInput = requestContext.serializeForSpan()
+// {
+//   mastra__authToken: '[REDACTED]',
+//   userId: 'user-123',
+//   runtimeClient: '[object]'
+// }
+```
+
+The reserved raw auth token is always represented as `[REDACTED]`. String, number, boolean, `null`, and `undefined` values are preserved. Objects, arrays, functions, and other non-primitive values are replaced with type labels such as `[object]` or `[function]`; their properties and serialization hooks aren't evaluated.
+
+Mastra applies this bounded representation to scorer run and scorer step span input. `serializeForSpan()` doesn't change the original `RequestContext` passed to scorer execution.
+
 ## TypeScript support
 
 When you provide a type parameter to `RequestContext`, all methods are fully typed:
