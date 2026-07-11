@@ -76,6 +76,18 @@ export type ParentWorkflow = {
 };
 
 export class WorkflowEventProcessor extends EventProcessor {
+  /**
+   * Maximum number of source-event deliveries that may enter workflow
+   * dispatch. The transport owns the durable delivery count through
+   * `Event.deliveryAttempt`; do not mirror it in process-local state.
+   */
+  private static readonly MAX_DELIVERY_ATTEMPTS = 3;
+  private static readonly TERMINALIZABLE_RUN_STATUSES = new Set<WorkflowRunState['status']>([
+    'running',
+    'waiting',
+    'pending',
+    'suspended',
+  ]);
   private stepExecutor: StepExecutor;
   private stepExecutionStrategy?: StepExecutionStrategy;
   // Map of runId -> AbortController for active workflow runs
@@ -2364,8 +2376,8 @@ export class WorkflowEventProcessor extends EventProcessor {
    * - `ok: false, retry: true` — transient failure, the transport should
    *   nack/redeliver (or, for HTTP push, return 5xx so the broker retries).
    * - `ok: false, retry: false` — terminal/poison failure, the transport
-   *   should drop the event (or return 4xx for HTTP push).
-   */
+  *   should drop the event (or return 4xx for HTTP push).
+  */
   async handle(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
     const data = event.data as { workflowId?: unknown; runId?: unknown } | undefined;
     const workflowId = typeof data?.workflowId === 'string' ? data.workflowId : undefined;
@@ -2375,20 +2387,146 @@ export class WorkflowEventProcessor extends EventProcessor {
         ? this.mastra.__beginInternalWorkflowEvent(workflowId, runId)
         : undefined;
     let terminalEventHandled = false;
+    const deliveryAttempt = this.#getDeliveryAttempt(event);
     try {
+      // Once the transport-owned source budget is exhausted, later deliveries
+      // may retry terminal failure publication only. This remains true when a
+      // different worker or a new process receives the event because the broker
+      // carries `deliveryAttempt` with the logical event.
+      if (event.type !== 'workflow.fail' && deliveryAttempt > WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS) {
+        return this.#publishTerminalFailure(
+          event,
+          deliveryAttempt,
+          new MastraError({
+            id: 'MASTRA_WORKFLOW_EVENT_DELIVERY_EXHAUSTED',
+            text: `Workflow event delivery budget exhausted for ${event.type}`,
+            domain: ErrorDomain.MASTRA_WORKFLOW,
+            category: ErrorCategory.SYSTEM,
+          }),
+        );
+      }
+
       terminalEventHandled = await this.#dispatch(event);
       return { ok: true };
     } catch (err) {
+      const exhausted = deliveryAttempt >= WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS;
       this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: error processing event', {
         type: event.type,
         runId: event.runId,
+        deliveryAttempt,
+        maxDeliveryAttempts: WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS,
+        phase: exhausted ? 'terminalizing' : 'source-retry',
         error: err,
       });
-      return { ok: false, retry: true };
+
+      // A terminal event must never recursively publish another
+      // `workflow.fail`. Keep asking the transport to redeliver the existing
+      // event so terminalization can recover when its dependency does.
+      if (event.type === 'workflow.fail') {
+        return { ok: false, retry: true };
+      }
+
+      if (!exhausted) {
+        return { ok: false, retry: true };
+      }
+
+      return this.#publishTerminalFailure(event, deliveryAttempt, getErrorFromUnknown(err));
     } finally {
       if (internalEventGeneration !== undefined) {
         this.mastra.__endInternalWorkflowEvent(workflowId!, runId!, internalEventGeneration, terminalEventHandled);
       }
+    }
+  }
+
+  /**
+   * Normalize transport delivery metadata without letting malformed values
+   * reset the source-execution budget. Missing metadata and Google Pub/Sub's
+   * documented `0` sentinel mean "not tracked" and use the first-delivery
+   * fallback; other invalid metadata fails closed as exhausted.
+   */
+  #getDeliveryAttempt(event: Event): number {
+    if (event.deliveryAttempt === undefined || event.deliveryAttempt === 0) return 1;
+    if (Number.isSafeInteger(event.deliveryAttempt) && event.deliveryAttempt >= 1) {
+      return event.deliveryAttempt;
+    }
+
+    this.mastra.getLogger()?.warn('WorkflowEventProcessor.handle: invalid deliveryAttempt', {
+      type: event.type,
+      runId: event.runId,
+      deliveryAttempt: event.deliveryAttempt,
+      fallback: 'exhausted',
+    });
+    return WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS + 1;
+  }
+
+  /**
+   * Publish the terminal workflow failure. A publication error remains
+   * retryable so the broker retains the source event; later deliveries enter
+   * this method directly and never re-run source workflow dispatch.
+   */
+  async #publishTerminalFailure(
+    event: Event,
+    deliveryAttempt: number,
+    error: Error,
+  ): Promise<{ ok: false; retry: boolean }> {
+    const workflowData = event.data as Omit<ProcessorArgs, 'workflow'> | undefined;
+    if (!workflowData?.workflowId || !workflowData.runId) {
+      this.mastra
+        .getLogger()
+        ?.error('WorkflowEventProcessor.handle: cannot terminalize event without workflow identity', {
+          type: event.type,
+          runId: event.runId,
+          deliveryAttempt,
+        });
+      return { ok: false, retry: false };
+    }
+
+    let currentState: WorkflowRunState | null | undefined;
+    try {
+      const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
+      currentState = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: workflowData.workflowId,
+        runId: workflowData.runId,
+      });
+    } catch (stateError) {
+      this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: failed to verify run before terminalization', {
+        type: event.type,
+        runId: event.runId,
+        deliveryAttempt,
+        phase: 'terminalization-state-check',
+        error: stateError,
+      });
+      return { ok: false, retry: true };
+    }
+
+    // A delayed exhausted delivery must not overwrite a run that completed,
+    // failed, or was canceled through a newer event. Missing snapshots are not
+    // safe to terminalize either; the durable journal follow-up owns recovery
+    // for no-snapshot workflows.
+    if (!currentState || !WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES.has(currentState.status)) {
+      this.mastra.getLogger()?.debug?.('WorkflowEventProcessor.handle: skipping stale terminal failure', {
+        type: event.type,
+        runId: event.runId,
+        deliveryAttempt,
+        runStatus: currentState?.status ?? 'missing',
+      });
+      return { ok: false, retry: false };
+    }
+
+    try {
+      await this.errorWorkflow(workflowData, error);
+      return { ok: false, retry: false };
+    } catch (terminalError) {
+      this.mastra
+        .getLogger()
+        ?.error('WorkflowEventProcessor.handle: failed to publish workflow.fail after retry exhaustion', {
+          type: event.type,
+          runId: event.runId,
+          deliveryAttempt,
+          phase: 'terminalization-pending',
+          error: terminalError,
+        });
+      return { ok: false, retry: true };
     }
   }
 

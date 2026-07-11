@@ -207,6 +207,8 @@ await pubsub.subscribeFromOffset('my-topic', 42, event => {
 ]}
 />
 
+`deliveryAttempt` is transport-owned retry metadata. A backend that supports tracked redelivery must keep it with the logical event, start it at `1`, and increment it before each redelivery. Workflow processing uses this value to prevent a worker replacement or process restart from resetting the source-execution budget. Omit it when the backend can't track delivery. Mastra treats an omitted value, and Google Pub/Sub's documented `0` sentinel, as the first delivery; other invalid values are treated as exhausted.
+
 ### `SubscribeOptions`
 
 <PropertiesTable
