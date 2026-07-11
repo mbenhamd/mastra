@@ -41,8 +41,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent';
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
@@ -264,6 +264,324 @@ describe('Harness v1 real-agent E2E — S2 tool round-trip', () => {
   });
 });
 
+describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
+  it('excludes backing tools and restores the configured implementation after processor mutation', async () => {
+    const modeExecute = vi.fn(async () => 'mode');
+    const substitutedExecute = vi.fn(async () => 'substituted');
+    const hiddenExecute = vi.fn(async () => 'hidden');
+    const modeTool = createTool({
+      id: 'modeTool',
+      description: 'approved mode tool',
+      inputSchema: z.object({}),
+      execute: modeExecute,
+    });
+    const substitutedModeTool = createTool({
+      id: 'substitutedModeTool',
+      description: 'processor substitution attempt',
+      inputSchema: z.object({}),
+      execute: substitutedExecute,
+    });
+    const assignedHidden = createTool({
+      id: 'assignedHidden',
+      description: 'backing tool hidden by the mode',
+      inputSchema: z.object({}),
+      execute: hiddenExecute,
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        if (callCount === 1) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('mode-call', 'modeTool', '{}'),
+          };
+        }
+        if (callCount === 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('hidden-call', 'assignedHidden', '{}'),
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['done']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'replacement-agent',
+      name: 'replacement-agent',
+      instructions: 'test the replacement boundary',
+      model,
+      tools: { assignedHidden },
+      inputProcessors: [
+        {
+          id: 'attempt-replacement-expansion',
+          processInputStep: ({ tools }) => ({
+            tools: { ...tools, modeTool: substitutedModeTool, assignedHidden },
+          }),
+        },
+      ],
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { modeTool },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-user', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'run' })) as any;
+
+      expect(visibleTools).toEqual([['modeTool'], ['modeTool'], ['modeTool']]);
+      expect(modeExecute).toHaveBeenCalledOnce();
+      expect(substitutedExecute).not.toHaveBeenCalled();
+      expect(hiddenExecute).not.toHaveBeenCalled();
+      expect(result.text).toBe('done');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('captures, hides, and reapplies the replacement fence across approval suspend and resume', async () => {
+    const modeExecute = vi.fn(async () => 'approved');
+    const substitutedExecute = vi.fn(async () => 'substituted');
+    const modeTool = createTool({
+      id: 'modeTool',
+      description: 'approval-bearing mode tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: modeExecute,
+    });
+    const substitutedModeTool = createTool({
+      id: 'substitutedModeTool',
+      description: 'processor substitution attempt',
+      inputSchema: z.object({}),
+      execute: substitutedExecute,
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: callCount === 1 ? toolCallStream('approval-call', 'modeTool', '{}') : textStream(['resumed done']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'replacement-resume-agent',
+      name: 'replacement-resume-agent',
+      instructions: 'test replacement resume',
+      model,
+      inputProcessors: [
+        {
+          id: 'attempt-resume-substitution',
+          processInputStep: ({ tools }) => ({ tools: { ...tools, modeTool: substitutedModeTool } }),
+        },
+      ],
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { modeTool },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-resume-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'run approval tool' })) as any;
+
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['modeTool']);
+      expect(session.getDisplayState().pending).not.toHaveProperty('toolSurfaceFence');
+
+      const resumed = (await session.respondToToolApproval({ approved: true })) as any;
+
+      expect(resumed.text).toBe('resumed done');
+      expect(visibleTools).toEqual([['modeTool'], ['modeTool']]);
+      expect(modeExecute).toHaveBeenCalledOnce();
+      expect(substitutedExecute).not.toHaveBeenCalled();
+      expect(session.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('retains a per-call replacement tool implementation across approval suspend and resume', async () => {
+    const baseExecute = vi.fn(async () => 'base');
+    const ephemeralExecute = vi.fn(async () => 'approved ephemeral result');
+    const mutatedExecute = vi.fn(async () => 'mutated after suspension');
+    const baseTool = createTool({
+      id: 'baseTool',
+      description: 'replacement mode base tool',
+      inputSchema: z.object({}),
+      execute: baseExecute,
+    });
+    const ephemeralApproval = createTool({
+      id: 'ephemeralApproval',
+      description: 'per-call approval tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: ephemeralExecute,
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('ephemeral-call', 'ephemeralApproval', '{}')
+              : textStream(['ephemeral resumed']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'replacement-per-call-resume-agent',
+      name: 'replacement-per-call-resume-agent',
+      instructions: 'test per-call replacement resume',
+      model,
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { baseTool },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-per-call-user', threadId: { fresh: true } });
+      const suspended = (await session.message({
+        content: 'run ephemeral approval tool',
+        additionalTools: { ephemeralApproval },
+      })) as any;
+
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['baseTool', 'ephemeralApproval']);
+      ephemeralApproval.execute = mutatedExecute;
+
+      const resumed = (await session.respondToToolApproval({ approved: true })) as any;
+
+      expect(resumed.text).toBe('ephemeral resumed');
+      expect(visibleTools).toEqual([
+        ['baseTool', 'ephemeralApproval'],
+        ['baseTool', 'ephemeralApproval'],
+      ]);
+      expect(ephemeralExecute).toHaveBeenCalledOnce();
+      expect(mutatedExecute).not.toHaveBeenCalled();
+      expect(baseExecute).not.toHaveBeenCalled();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('fails closed after the suspended run loses its process-local replacement implementations', async () => {
+    const approvedExecute = vi.fn(async () => 'must not run');
+    const approvalTool = createTool({
+      id: 'approvalTool',
+      description: 'replacement approval tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: approvedExecute,
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: toolCallStream('approval-call', 'approvalTool', '{}'),
+      }),
+    });
+    const agent = new Agent({
+      id: 'replacement-registry-loss-agent',
+      name: 'replacement-registry-loss-agent',
+      instructions: 'test replacement registry loss',
+      model,
+    });
+    const storage = new InMemoryStore();
+    const modes = [
+      {
+        id: 'default',
+        agentId: 'default',
+        tools: { approvalTool },
+        harnessBuiltins: 'exclude' as const,
+      },
+    ];
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage,
+      modes,
+      defaultModeId: 'default',
+    });
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-loss-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'run approval tool' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = new Harness({
+        agents: { default: agent } as any,
+        storage,
+        modes,
+        defaultModeId: 'default',
+      });
+      const rehydrated = await rehydratedHarness.session({
+        resourceId: 'replacement-loss-user',
+        threadId,
+      });
+      expect(rehydrated.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+
+      await expect(rehydrated.respondToToolApproval({ approved: true })).rejects.toThrow(
+        /original tool implementations are no longer available/,
+      );
+      expect(approvedExecute).not.toHaveBeenCalled();
+      expect(rehydrated.getRecord().pendingResume?.resumedAt).toBeUndefined();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+});
+
 // ===========================================================================
 // S3 — real approval suspend → respondToToolApproval → resume terminalizes
 // ===========================================================================
@@ -324,9 +642,7 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       const preResumeTypes = events.map(e => e.type);
       expect(preResumeTypes).toContain('tool_start');
       expect(preResumeTypes).toContain('tool_approval_required');
-      expect(
-        events.some(e => e.type === 'agent_end' && (e as any).finishReason === 'suspended'),
-      ).toBe(true);
+      expect(events.some(e => e.type === 'agent_end' && (e as any).finishReason === 'suspended')).toBe(true);
       const toolStart = events.find(e => e.type === 'tool_start') as { toolName: string; input: unknown };
       expect(toolStart.toolName).toBe('findUser');
       expect(toolStart.input).toEqual({ name: 'Dero Israel' });
@@ -375,9 +691,7 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       expect(postResumeToolEnd!.output).toEqual({ name: 'Dero Israel', email: 'dero@mail.com' });
 
       // The post-approval model text surfaced as live `text_delta`s.
-      const postResumeText = (
-        postResumeEvents.filter(e => e.type === 'text_delta') as Array<{ delta: string }>
-      )
+      const postResumeText = (postResumeEvents.filter(e => e.type === 'text_delta') as Array<{ delta: string }>)
         .map(e => e.delta)
         .join('');
       expect(postResumeText).toBe('User is Dero Israel');
@@ -554,11 +868,7 @@ describe('Harness v1 real-agent E2E — S5 provider error', () => {
 
       await session.message({ content: 'hi' }).catch(() => {});
 
-      await waitFor(
-        () => events.some(e => e.type === 'agent_end'),
-        'agent_end (mid-stream error)',
-        4000,
-      );
+      await waitFor(() => events.some(e => e.type === 'agent_end'), 'agent_end (mid-stream error)', 4000);
       const textDeltas = events.filter(e => e.type === 'text_delta') as Array<{ delta: string }>;
       // The partial delta emitted before the error chunk must have surfaced.
       expect(textDeltas.map(e => e.delta).join('')).toContain('partial');
@@ -660,10 +970,7 @@ describe('Harness v1 real-agent E2E — S6 abort', () => {
       // No `.catch(()=>{})` swallow and no `if (ended)` guard — a missing or
       // wrong-reason terminal FAILS the test (this is the regression the
       // scenario is meant to catch).
-      await waitFor(
-        () => events.some(e => e.type === 'agent_end'),
-        'agent_end (mid-run abort)',
-      );
+      await waitFor(() => events.some(e => e.type === 'agent_end'), 'agent_end (mid-run abort)');
       const ended = events.find(e => e.type === 'agent_end') as { finishReason: string };
       expect(ended).toBeDefined();
       expect(ended.finishReason).toBe('aborted');
@@ -1097,11 +1404,7 @@ describe('Harness v1 real-agent E2E — S9 queue FIFO drain (real loop)', () => 
     const model = new MockLanguageModelV2({
       doStream: async _options => {
         const promptJson = JSON.stringify((_options as { prompt: unknown[] }).prompt);
-        const which = promptJson.includes('task-C')
-          ? 'reply-C'
-          : promptJson.includes('task-B')
-            ? 'reply-B'
-            : 'reply-A';
+        const which = promptJson.includes('task-C') ? 'reply-C' : promptJson.includes('task-B') ? 'reply-B' : 'reply-A';
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
@@ -1473,7 +1776,9 @@ describe('Harness v1 real-agent E2E — S12 resume runs a fresh tool', () => {
 
       // (b) the SECOND, fresh tool ran in the continuation: a recordResult
       // tool_start + tool_end appear AFTER the approved tool's tool_end.
-      const followStartIdx = postResume.findIndex(e => e.type === 'tool_start' && (e as any).toolName === 'recordResult');
+      const followStartIdx = postResume.findIndex(
+        e => e.type === 'tool_start' && (e as any).toolName === 'recordResult',
+      );
       const followEndIdx = postResume.findIndex(e => e.type === 'tool_end' && (e as any).toolName === 'recordResult');
       const approvedEndIdx = postResume.findIndex(e => e.type === 'tool_end' && (e as any).toolName === 'findUser');
       expect(followStartIdx).toBeGreaterThanOrEqual(0);
@@ -1684,11 +1989,23 @@ function toolTextToolStream(
   return convertArrayToReadableStream([
     { type: 'stream-start', warnings: [] },
     { type: 'response-metadata', id: 'id-ttt', modelId: 'mock-model-id', timestamp: new Date(0) },
-    { type: 'tool-call', toolCallId: firstCallId, toolName: firstToolName, input: firstInputJson, providerExecuted: false },
+    {
+      type: 'tool-call',
+      toolCallId: firstCallId,
+      toolName: firstToolName,
+      input: firstInputJson,
+      providerExecuted: false,
+    },
     { type: 'text-start', id: 'text-1' },
     ...textDeltas.map(delta => ({ type: 'text-delta', id: 'text-1', delta })),
     { type: 'text-end', id: 'text-1' },
-    { type: 'tool-call', toolCallId: secondCallId, toolName: secondToolName, input: secondInputJson, providerExecuted: false },
+    {
+      type: 'tool-call',
+      toolCallId: secondCallId,
+      toolName: secondToolName,
+      input: secondInputJson,
+      providerExecuted: false,
+    },
     { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
   ]);
 }
@@ -2339,10 +2656,7 @@ describe('Harness v1 real-agent E2E — S17 subagent interleaves tool→text→t
       // the real streamed tool→text→tool ordering.
       const subSeq = (
         events.filter(
-          e =>
-            e.type === 'subagent_tool_start' ||
-            e.type === 'subagent_tool_end' ||
-            e.type === 'subagent_text_delta',
+          e => e.type === 'subagent_tool_start' || e.type === 'subagent_tool_end' || e.type === 'subagent_text_delta',
         ) as Array<{ type: string; toolName?: string; innerToolCallId?: string; delta?: string }>
       ).map(e =>
         e.type === 'subagent_text_delta'

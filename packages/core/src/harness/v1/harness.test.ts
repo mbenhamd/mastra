@@ -2434,6 +2434,18 @@ describe('Harness v1 — construction', () => {
     ).toThrow(HarnessConfigError);
   });
 
+  it('throws HarnessConfigError for an unknown harnessBuiltins policy', () => {
+    expect(
+      () =>
+        new Harness({
+          agents: { default: makeAgent() },
+          modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'sometimes' as any }],
+          defaultModeId: 'default',
+          sessions: { storage: makeStorage() },
+        }),
+    ).toThrow(HarnessConfigError);
+  });
+
   it('mints a unique ownerId per Harness instance', () => {
     const a = makeHarness();
     const b = makeHarness();

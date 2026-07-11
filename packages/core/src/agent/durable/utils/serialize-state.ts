@@ -172,6 +172,7 @@ export function serializeDurableOptions(options: {
   maxSteps?: number;
   toolChoice?: any;
   activeTools?: string[];
+  toolSurfaceFence?: string[];
   temperature?: number;
   requireToolApproval?: boolean;
   toolCallConcurrency?: number;
@@ -203,6 +204,7 @@ export function serializeDurableOptions(options: {
     maxSteps: options.maxSteps,
     toolChoice: serializedToolChoice,
     activeTools: options.activeTools,
+    toolSurfaceFence: options.toolSurfaceFence,
     temperature: options.temperature,
     requireToolApproval: options.requireToolApproval,
     toolCallConcurrency: options.toolCallConcurrency,

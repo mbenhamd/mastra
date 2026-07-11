@@ -123,6 +123,14 @@ import { isCreatedAgentSignal } from './signals';
 import { runStreamUntilIdle, runResumeStreamUntilIdle, STREAM_UNTIL_IDLE_DEFAULT_OPTIONS } from './stream-until-idle';
 import type { SubAgent } from './subagent';
 import { agentThreadStreamRuntime, defaultAgentThreadPubSub } from './thread-stream-runtime';
+import {
+  clearToolSurfaceFence,
+  consumeToolSurfaceFenceRestore,
+  createToolSurfaceFence,
+  enforceToolSurfaceFence,
+  readToolSurfaceFence,
+  stampToolSurfaceFence,
+} from './tool-surface-fence';
 import { TripWire } from './trip-wire';
 import type {
   AgentConfig,
@@ -130,6 +138,7 @@ import type {
   AgentNotificationConfig,
   AgentStreamOptions,
   ToolsetsInput,
+  ToolsetsMode,
   ToolsInput,
   AgentModelManagerConfig,
   AgentCreateOptions,
@@ -1928,21 +1937,27 @@ export class Agent<
     requestContext,
     toolsets,
     clientTools,
+    toolsetsMode,
   }: {
     requestContext: RequestContext;
     toolsets?: ToolsetsInput;
     clientTools?: ToolsInput;
+    toolsetsMode?: ToolsetsMode;
   }): Promise<string | undefined> {
     const tools: Array<{ mcpMetadata?: McpMetadata } | undefined> = [];
 
-    const assignedTools = await this.listTools({ requestContext });
-    tools.push(...(Object.values(assignedTools || {}) as { mcpMetadata?: McpMetadata }[]));
+    if (toolsetsMode !== 'replace') {
+      const assignedTools = await this.listTools({ requestContext });
+      tools.push(...(Object.values(assignedTools || {}) as { mcpMetadata?: McpMetadata }[]));
+    }
 
     for (const toolset of Object.values(toolsets || {})) {
       tools.push(...(Object.values(toolset || {}) as { mcpMetadata?: McpMetadata }[]));
     }
 
-    tools.push(...(Object.values(clientTools || {}) as { mcpMetadata?: McpMetadata }[]));
+    if (toolsetsMode !== 'replace') {
+      tools.push(...(Object.values(clientTools || {}) as { mcpMetadata?: McpMetadata }[]));
+    }
 
     if (tools.length === 0) {
       return undefined;
@@ -3720,6 +3735,10 @@ export class Agent<
     if (channelToolFence) {
       enforceChannelToolFence(nextTools as Record<string, unknown>, channelToolFence, this.logger);
     }
+    const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
+    if (toolSurfaceFence) {
+      enforceToolSurfaceFence(nextTools as Record<string, unknown>, toolSurfaceFence, this.logger);
+    }
 
     return {
       messageList,
@@ -5261,6 +5280,7 @@ export class Agent<
    */
   async getToolsForExecution(options: {
     toolsets?: ToolsetsInput;
+    toolsetsMode?: ToolsetsMode;
     clientTools?: ToolsInput;
     threadId?: string;
     resourceId?: string;
@@ -5275,6 +5295,13 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       { ...options, requestContext } as Record<string, unknown>,
     ) as AgentExecutionOptions & typeof options;
+    if (mergedOptions.toolsetsMode === 'replace') {
+      if (options.toolsetsMode === 'replace') {
+        mergedOptions.toolsets = options.toolsets ?? {};
+      } else if (options.toolsets !== undefined) {
+        mergedOptions.toolsets = options.toolsets;
+      }
+    }
     const optionMemory = (options as { memory?: AgentExecutionOptionsBase<any>['memory'] }).memory;
     const mergedMemory = mergedOptions.memory;
     const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
@@ -5291,6 +5318,7 @@ export class Agent<
 
     return this.convertTools({
       toolsets: mergedOptions.toolsets,
+      toolsetsMode: mergedOptions.toolsetsMode,
       clientTools: mergedOptions.clientTools,
       threadId: explicitThreadFromArgs?.id ?? defaultThreadFromArgs?.id,
       resourceId: resourceIdFromContext || options.resourceId || optionMemory?.resource || mergedMemory?.resource,
@@ -5309,6 +5337,7 @@ export class Agent<
    */
   private async convertTools({
     toolsets,
+    toolsetsMode,
     clientTools,
     threadId,
     resourceId,
@@ -5325,6 +5354,7 @@ export class Agent<
     ...rest
   }: {
     toolsets?: ToolsetsInput;
+    toolsetsMode?: ToolsetsMode;
     clientTools?: ToolsInput;
     threadId?: string;
     resourceId?: string;
@@ -5345,6 +5375,60 @@ export class Agent<
 
     if (this.#mastra) {
       mastraProxy = createMastraProxy({ mastra: this.#mastra, logger });
+    }
+
+    const restoredToolSurfaceFence = consumeToolSurfaceFenceRestore(requestContext, runId);
+    clearToolSurfaceFence(requestContext, runId);
+    if (toolsetsMode === 'replace') {
+      const toolsetTools = await this.listToolsets({
+        runId,
+        resourceId,
+        threadId,
+        requestContext,
+        ...observabilityContext,
+        mastraProxy,
+        toolsets: toolsets ?? {},
+        autoResumeSuspendedTools,
+        backgroundTaskEnabled,
+      });
+      const formattedTools = this.formatTools(toolsetTools);
+      if (isHarnessChannelBoundTurn(requestContext)) {
+        // Replacement suppresses AgentChannels tools, but their normalized
+        // names remain reserved on a Harness-bound channel turn. Resolve only
+        // that reservation set so a caller cannot reintroduce a direct-provider
+        // channel tool through a replacement toolset and bypass the Harness
+        // durable outbox and permission boundary.
+        const channelTools = await this.listChannelTools({
+          runId,
+          resourceId,
+          threadId,
+          requestContext,
+          ...observabilityContext,
+          mastraProxy,
+          autoResumeSuspendedTools,
+          backgroundTaskEnabled,
+        });
+        const reservedChannelToolNames = new Set(Object.keys(channelTools));
+        if (reservedChannelToolNames.size > 0) {
+          stampChannelToolFence(requestContext, reservedChannelToolNames);
+          enforceChannelToolFence(formattedTools, reservedChannelToolNames, logger);
+        }
+      }
+      if (restoredToolSurfaceFence) {
+        const missingRestoredTools = [...restoredToolSurfaceFence].filter(name => formattedTools[name] === undefined);
+        if (missingRestoredTools.length > 0) {
+          throw new Error(
+            `Cannot reconstruct replacement tool implementations for resumed run ${runId ?? '<unknown>'}: ${missingRestoredTools.join(', ')}. Refusing to continue with a widened or incomplete tool surface.`,
+          );
+        }
+        enforceToolSurfaceFence(
+          formattedTools,
+          createToolSurfaceFence(formattedTools, restoredToolSurfaceFence),
+          logger,
+        );
+      }
+      stampToolSurfaceFence(requestContext, runId, formattedTools);
+      return formattedTools;
     }
 
     const assignedTools = await this.listAssignedTools({
@@ -6139,6 +6223,7 @@ export class Agent<
       requestContext,
       toolsets: options.toolsets,
       clientTools: options.clientTools,
+      toolsetsMode: options.toolsetsMode,
     });
 
     // Set Tracing context
@@ -6506,6 +6591,9 @@ export class Agent<
           }
         : {}),
     });
+    if (result.finishReason !== 'suspended') {
+      clearToolSurfaceFence(requestContext, runId);
+    }
   }
 
   /**
@@ -6821,10 +6909,29 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as AgentExecutionOptions<any> & { model?: DynamicArgument<MastraModelConfig> };
+    if (mergedOptions.toolsetsMode === 'replace') {
+      if (options?.toolsetsMode === 'replace') {
+        mergedOptions.toolsets = options.toolsets ?? {};
+      } else if (options?.toolsets !== undefined) {
+        mergedOptions.toolsets = options.toolsets;
+      }
+    }
     if (requestContextToUse) {
       mergedOptions.requestContext = requestContextToUse;
     } else {
       await this.#assertAgentExecutionPreflight(mergedOptions.requestContext, { authorize: false });
+    }
+
+    if (!mergedOptions.runId) {
+      const target = this.#getThreadTarget(mergedOptions);
+      mergedOptions.runId =
+        this.#mastra?.generateId({
+          idType: 'run',
+          source: 'agent',
+          entityId: this.id,
+          threadId: target.threadId,
+          resourceId: target.resourceId,
+        }) || randomUUID();
     }
 
     await this.#requireAgentExecutionFGA(mergedOptions);
@@ -6875,9 +6982,20 @@ export class Agent<
       maxProcessorRetries: mergedOptions.maxProcessorRetries ?? this.#maxProcessorRetries,
     } as unknown as InnerAgentExecutionOptions<any> & { _threadStreamPubSub?: PubSub };
 
-    const result = await this.#execute(executeOptions);
+    let result;
+    try {
+      result = await this.#execute(executeOptions);
+    } catch (error) {
+      if (mergedOptions.requestContext) {
+        clearToolSurfaceFence(mergedOptions.requestContext, mergedOptions.runId);
+      }
+      throw error;
+    }
 
     if (result.status !== 'success') {
+      if (mergedOptions.requestContext) {
+        clearToolSurfaceFence(mergedOptions.requestContext, mergedOptions.runId);
+      }
       if (result.status === 'failed') {
         throw new MastraError(
           {
@@ -6898,11 +7016,22 @@ export class Agent<
     }
 
     const output = result.result as MastraModelOutput<OUTPUT>;
-    const fullOutput = await output.getFullOutput();
+    let fullOutput: FullOutput<OUTPUT>;
+    try {
+      fullOutput = await output.getFullOutput();
+    } catch (error) {
+      if (mergedOptions.requestContext) {
+        clearToolSurfaceFence(mergedOptions.requestContext, mergedOptions.runId);
+      }
+      throw error;
+    }
 
     const error = fullOutput.error;
 
     if (error) {
+      if (mergedOptions.requestContext) {
+        clearToolSurfaceFence(mergedOptions.requestContext, mergedOptions.runId);
+      }
       throw error;
     }
 
@@ -7296,6 +7425,7 @@ export class Agent<
       ? (preflightedDefaultOptions?.requestContext ?? requestContextToUse)
       : undefined;
     let hasPreflightedRequestContext = skipExecutionPreflight;
+    let fenceRequestContext = requestContextToUse ?? staticDefaultOptions?.requestContext;
     const reserveAdmittedRun = () => {
       if (ownsReservation || !canReserveBeforeDefaults) return;
       releaseReservedRun = agentThreadStreamRuntime.reserveRun(
@@ -7342,6 +7472,13 @@ export class Agent<
         defaultOptions as Record<string, unknown>,
         streamOptionsWithRunId as Record<string, unknown>,
       ) as AgentExecutionOptions<OUTPUT> & { model?: DynamicArgument<MastraModelConfig> };
+      if (mergedOptions.toolsetsMode === 'replace') {
+        if (streamOptionsWithRunId.toolsetsMode === 'replace') {
+          mergedOptions.toolsets = streamOptionsWithRunId.toolsets ?? {};
+        } else if (streamOptionsWithRunId.toolsets !== undefined) {
+          mergedOptions.toolsets = streamOptionsWithRunId.toolsets;
+        }
+      }
       if (requestContextToUse) {
         mergedOptions.requestContext = requestContextToUse;
       } else if (
@@ -7353,6 +7490,7 @@ export class Agent<
           runId: mergedOptions.runId,
         });
       }
+      fenceRequestContext = mergedOptions.requestContext;
 
       const mergedThreadTarget = this.#getThreadTarget(mergedOptions);
       if (!mergedOptions.runId) {
@@ -7571,6 +7709,19 @@ export class Agent<
 
       const output = result.result as MastraModelOutput<OUTPUT>;
 
+      void output.getFullOutput().then(
+        full => {
+          if (full.finishReason !== 'suspended' && mergedOptions.requestContext) {
+            clearToolSurfaceFence(mergedOptions.requestContext, output.runId);
+          }
+        },
+        () => {
+          if (mergedOptions.requestContext) {
+            clearToolSurfaceFence(mergedOptions.requestContext, output.runId);
+          }
+        },
+      );
+
       const completion = agentThreadStreamRuntime.registerRun(
         this as Agent<any, any, any, any>,
         output,
@@ -7581,6 +7732,9 @@ export class Agent<
 
       return output;
     } catch (error) {
+      if (fenceRequestContext) {
+        clearToolSurfaceFence(fenceRequestContext, attemptedRunId);
+      }
       if (preparedOptionsWithPubSub) {
         this.#forgetThreadStreamPubSub(preparedOptionsWithPubSub);
       } else if (trackedThreadStreamPubSubTarget) {
@@ -7901,6 +8055,13 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (streamOptionsWithPubSub ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    if (ownershipOptions.toolsetsMode === 'replace') {
+      if (streamOptionsWithPubSub?.toolsetsMode === 'replace') {
+        ownershipOptions.toolsets = streamOptionsWithPubSub.toolsets ?? {};
+      } else if (streamOptionsWithPubSub?.toolsets !== undefined) {
+        ownershipOptions.toolsets = streamOptionsWithPubSub.toolsets;
+      }
+    }
     if (requestContextToUse) {
       ownershipOptions.requestContext = requestContextToUse;
     }
@@ -7949,15 +8110,24 @@ export class Agent<
       };
     }
     let preparedOptionsWithPubSub: (AgentExecutionOptionsBase<any> & { runId?: string; _pubsub: PubSub }) | undefined;
+    let fenceRequestContext = ownershipOptions.requestContext;
 
     try {
       let mergedStreamOptions = deepMerge(
         defaultOptions as Record<string, unknown>,
         (streamOptionsWithSnapshotTarget ?? {}) as Record<string, unknown>,
       ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+      if (mergedStreamOptions.toolsetsMode === 'replace') {
+        if (streamOptionsWithSnapshotTarget?.toolsetsMode === 'replace') {
+          mergedStreamOptions.toolsets = streamOptionsWithSnapshotTarget.toolsets ?? {};
+        } else if (streamOptionsWithSnapshotTarget?.toolsets !== undefined) {
+          mergedStreamOptions.toolsets = streamOptionsWithSnapshotTarget.toolsets;
+        }
+      }
       if (requestContextToUse) {
         mergedStreamOptions.requestContext = requestContextToUse;
       }
+      fenceRequestContext = mergedStreamOptions.requestContext;
 
       if (ownsReservation && reservedThreadTarget) {
         const mergedThreadTarget = this.#getThreadTarget(mergedStreamOptions);
@@ -8180,8 +8350,21 @@ export class Agent<
         completion,
       );
 
-      return result.result as unknown as MastraModelOutput<OUTPUT>;
+      const output = result.result as unknown as MastraModelOutput<OUTPUT>;
+      void output.getFullOutput().then(
+        full => {
+          if (full.finishReason !== 'suspended' && fenceRequestContext) {
+            clearToolSurfaceFence(fenceRequestContext, runId);
+          }
+        },
+        () => {
+          if (fenceRequestContext) clearToolSurfaceFence(fenceRequestContext, runId);
+        },
+      );
+
+      return output;
     } catch (error) {
+      if (fenceRequestContext) clearToolSurfaceFence(fenceRequestContext, runId);
       if (preparedOptionsWithPubSub) {
         this.#forgetThreadStreamPubSub(preparedOptionsWithPubSub);
       } else if (trackedThreadStreamPubSubTarget) {
@@ -8270,6 +8453,13 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    if (mergedOptions.toolsetsMode === 'replace') {
+      if (options?.toolsetsMode === 'replace') {
+        mergedOptions.toolsets = options.toolsets ?? {};
+      } else if (options?.toolsets !== undefined) {
+        mergedOptions.toolsets = options.toolsets;
+      }
+    }
     if (requestContextToUse) {
       mergedOptions.requestContext = requestContextToUse;
     }
@@ -8316,25 +8506,32 @@ export class Agent<
       });
     }
 
-    const result = await this.#execute({
-      ...mergedOptions,
-      structuredOutput: mergedOptions.structuredOutput
-        ? {
-            ...mergedOptions.structuredOutput,
-            schema: toStandardSchema(mergedOptions.structuredOutput.schema),
-          }
-        : undefined,
-      messages: [],
-      resumeContext: {
-        resumeData,
-        snapshot: existingSnapshot,
-      },
-      methodType: 'generate',
-      // Use agent's maxProcessorRetries as default, allow options to override
-      maxProcessorRetries: mergedOptions.maxProcessorRetries ?? this.#maxProcessorRetries,
-    } as unknown as InnerAgentExecutionOptions<OUTPUT> & { _threadStreamPubSub?: PubSub });
+    let result;
+    try {
+      result = await this.#execute({
+        ...mergedOptions,
+        structuredOutput: mergedOptions.structuredOutput
+          ? {
+              ...mergedOptions.structuredOutput,
+              schema: toStandardSchema(mergedOptions.structuredOutput.schema),
+            }
+          : undefined,
+        messages: [],
+        resumeContext: {
+          resumeData,
+          snapshot: existingSnapshot,
+        },
+        methodType: 'generate',
+        // Use agent's maxProcessorRetries as default, allow options to override
+        maxProcessorRetries: mergedOptions.maxProcessorRetries ?? this.#maxProcessorRetries,
+      } as unknown as InnerAgentExecutionOptions<OUTPUT> & { _threadStreamPubSub?: PubSub });
+    } catch (error) {
+      if (mergedOptions.requestContext) clearToolSurfaceFence(mergedOptions.requestContext, runId);
+      throw error;
+    }
 
     if (result.status !== 'success') {
+      if (mergedOptions.requestContext) clearToolSurfaceFence(mergedOptions.requestContext, runId);
       if (result.status === 'failed') {
         throw new MastraError(
           {
@@ -8355,14 +8552,23 @@ export class Agent<
     }
 
     const output = result.result as MastraModelOutput<OUTPUT>;
-    const fullOutput = (await output.getFullOutput()) as Awaited<
-      ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>
-    >;
+    let fullOutput: Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>;
+    try {
+      fullOutput = (await output.getFullOutput()) as Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>;
+    } catch (error) {
+      if (mergedOptions.requestContext) clearToolSurfaceFence(mergedOptions.requestContext, runId);
+      throw error;
+    }
 
     const error = fullOutput.error;
 
     if (error) {
+      if (mergedOptions.requestContext) clearToolSurfaceFence(mergedOptions.requestContext, runId);
       throw error;
+    }
+
+    if (fullOutput.finishReason !== 'suspended' && mergedOptions.requestContext) {
+      clearToolSurfaceFence(mergedOptions.requestContext, runId);
     }
 
     return fullOutput;

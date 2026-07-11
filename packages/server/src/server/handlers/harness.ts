@@ -69,7 +69,10 @@ import { enforceThreadAccess, getEffectiveResourceId } from './utils';
 
 type SessionLifecycleStatus = 'active' | 'closing' | 'closed';
 type PendingInboxKind = 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
-type PublicPendingResume = Omit<NonNullable<SessionRecord['pendingResume']>, 'runtimeDependencies' | 'requestContext'>;
+type PublicPendingResume = Omit<
+  NonNullable<SessionRecord['pendingResume']>,
+  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence'
+>;
 type ParsedHarnessEventId = { epoch: string; sequence: number };
 type UrlAttachmentInput = {
   kind: 'url';
@@ -1743,7 +1746,12 @@ function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): Publi
   if (!pending) return null;
   // Strip storage-internal recovery fields (runtimeDependencies) and the caller
   // app bag (requestContext) — restored on resume, never surfaced publicly.
-  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
+  const {
+    runtimeDependencies: _runtimeDependencies,
+    requestContext: _requestContext,
+    toolSurfaceFence: _toolSurfaceFence,
+    ...displayPending
+  } = pending;
   return displayPending;
 }
 

@@ -34,6 +34,14 @@ import { z } from 'zod';
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import type { AgentSignalContents } from '../../agent/signals';
+import {
+  clearToolSurfaceFence,
+  createToolSurfaceFence,
+  readToolSurfaceFence,
+  restoreToolSurfaceFenceImplementations,
+  stageToolSurfaceFenceRestore,
+} from '../../agent/tool-surface-fence';
+import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
@@ -707,7 +715,7 @@ const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'
  * plan-approval flows the gate itself relies on). Escalation built-ins are
  * different: they cross session/agent capability boundaries and therefore honor
  * the engaged tool policy after anti-escalation allowlist checks. Kept in sync
- * with `_buildToolsets`.
+ * with `_buildToolSurface`.
  */
 const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_ADD_TOOL_ID,
@@ -1019,14 +1027,19 @@ export interface SessionDisplayState {
 
 export type SessionDisplayPending = Omit<
   NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext'
+  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence'
 >;
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
   if (!pending) return null;
   // Strip storage-internal recovery fields (runtimeDependencies) and the caller
   // app bag (requestContext) — neither belongs on the public display projection.
-  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
+  const {
+    runtimeDependencies: _runtimeDependencies,
+    requestContext: _requestContext,
+    toolSurfaceFence: _toolSurfaceFence,
+    ...displayPending
+  } = pending;
   return displayPending;
 }
 
@@ -1149,6 +1162,21 @@ export class Session {
    * `item.requestContext`; resume previously dropped it). Cleared per turn.
    */
   private _currentTurnRequestContext?: PersistedRequestContextInput;
+  /** Live Agent RequestContext for capturing internal per-turn fences on suspend. */
+  private _currentAgentRequestContext?: RequestContext;
+  /** Process-local canonical replacement toolsets for the active turn. */
+  private _currentTurnReplacementToolSurface?: {
+    toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
+    fence: ToolSurfaceFence;
+  };
+  /** At most one suspended replacement surface per Session pending slot. */
+  private readonly _pendingReplacementToolSurfaces = new Map<
+    string,
+    {
+      toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
+      fence: ToolSurfaceFence;
+    }
+  >();
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
@@ -2113,6 +2141,8 @@ export class Session {
     this._currentRunModelId = undefined;
     this._currentRunSignalId = undefined;
     this._currentTurnRequestContext = undefined;
+    this._currentAgentRequestContext = undefined;
+    this._currentTurnReplacementToolSurface = undefined;
     this._currentMessageId = undefined;
     this._currentTraceId = undefined;
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
@@ -2148,6 +2178,8 @@ export class Session {
       this._currentRunModelId = undefined;
       this._currentRunSignalId = undefined;
       this._currentTurnRequestContext = undefined;
+      this._currentAgentRequestContext = undefined;
+      this._currentTurnReplacementToolSurface = undefined;
       this._currentMessageId = undefined;
       this._currentTraceId = undefined;
       this._activeTools.clear();
@@ -3863,7 +3895,7 @@ export class Session {
   /**
    * @internal — `SubagentDefinition.tools` for a spawned subagent session, set at
    * spawn/delegate time. Layered onto the subagent's tool surface in
-   * `_buildToolsets` (§9). Undefined for non-subagent sessions.
+   * `_buildToolSurface` (§9). Undefined for non-subagent sessions.
    */
   _subagentToolsOverride?: ToolsInput;
 
@@ -5505,7 +5537,7 @@ export class Session {
       opts.admissionId !== undefined ? this._messageAdmissionIdentity(opts.admissionId) : undefined;
 
     // Per-turn additionalTools merge with the mode's surface, never replace.
-    const toolsets = this._buildToolsets(mode, opts.additionalTools);
+    const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
 
     const admissionStart =
       opts.admissionId !== undefined
@@ -5542,6 +5574,7 @@ export class Session {
       modeId: effectiveModeId,
       modelId: effectiveModelId,
     });
+    this._setCurrentTurnReplacementToolSurface(toolSurface);
     const turnAbortSignal = turnAbortController.signal;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
@@ -5591,7 +5624,7 @@ export class Session {
       memory: { thread: this.threadId, resource: this.resourceId },
       abortSignal: turnAbortSignal,
       requestContext,
-      ...(toolsets ? { toolsets } : {}),
+      ...toolSurface,
       ...(mode.instructions ? { instructions: mode.instructions } : {}),
       // §9 per-turn override: caller-supplied model generation settings
       // (temperature, maxOutputTokens, …) layered onto the structured generate
@@ -6886,7 +6919,8 @@ export class Session {
       };
       let dispatched;
       try {
-        const toolsets = this._buildToolsets(mode, opts.additionalTools);
+        const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
+        this._setCurrentTurnReplacementToolSurface(toolSurface);
         const requestContext = await Promise.race([
           this._buildRequestContext({
             modeId: effectiveModeId,
@@ -6900,7 +6934,7 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
-          ...(toolsets ? { toolsets } : {}),
+          ...toolSurface,
           ...(mode.instructions ? { instructions: mode.instructions } : {}),
         };
         assertOwnedSignalTurnNotDeleted();
@@ -7203,7 +7237,8 @@ export class Session {
       };
       let dispatched;
       try {
-        const toolsets = this._buildToolsets(mode, undefined);
+        const toolSurface = this._buildToolSurface(mode, undefined);
+        this._setCurrentTurnReplacementToolSurface(toolSurface);
         const requestContext = await Promise.race([
           this._buildRequestContext({
             modeId: effectiveModeId,
@@ -7216,7 +7251,7 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
-          ...(toolsets ? { toolsets } : {}),
+          ...toolSurface,
           ...(mode.instructions ? { instructions: mode.instructions } : {}),
         };
         assertOwnedReminderTurnNotDeleted();
@@ -7372,10 +7407,16 @@ export class Session {
     const existing = this._record.pendingResume;
     if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
       await this._flushUpdate(prev => prev, { tokenUsageDelta: opts.tokenUsageDelta });
+      if (this._currentAgentRequestContext) {
+        clearToolSurfaceFence(this._currentAgentRequestContext, full.runId);
+      }
       this._clearPendingDurableTurnFlushErrorIfRepaired(full);
       return;
     }
     await this._flushUpdate(prev => ({ ...prev, pendingResume: pending }), { tokenUsageDelta: opts.tokenUsageDelta });
+    if (this._currentAgentRequestContext) {
+      clearToolSurfaceFence(this._currentAgentRequestContext, full.runId);
+    }
     this._clearPendingDurableTurnFlushErrorIfRepaired(full);
 
     // Emit the §10.2 pending event AFTER the durable-parking barrier (§5.4) so
@@ -7418,8 +7459,20 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(full.runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
+        : {}),
       payload: this._buildResumePayload(kind, payload),
     };
+
+    if (pending.toolSurfaceFence !== undefined && this._currentTurnReplacementToolSurface !== undefined) {
+      // A replacement fence persists only names. Keep the exact tool objects in
+      // process so a resume cannot silently bind those names to changed mode
+      // tools (and so per-call additionalTools survive the suspension). This is
+      // intentionally bounded by the Session's single pending-resume slot.
+      this._pendingReplacementToolSurfaces.clear();
+      this._pendingReplacementToolSurfaces.set(full.runId, this._currentTurnReplacementToolSurface);
+    }
 
     if (kind === 'plan-approval') {
       const mode = this._harness._getMode(modeId);
@@ -9359,6 +9412,18 @@ export class Session {
     const previousModeId = this._record.modeId;
     const resumeModeId = this._modeIdForPendingResume(pending);
     const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
+    let resumeToolSurface = this._buildToolSurface(this._harness._getMode(resumeModeId));
+    if (pending.toolSurfaceFence !== undefined) {
+      const retained = this._pendingReplacementToolSurfaces.get(pending.runId);
+      if (retained === undefined) {
+        throw new HarnessValidationError(
+          `respond[${expectedKind}]`,
+          'cannot resume the replacement tool surface because its original tool implementations are no longer available in this process',
+        );
+      }
+      restoreToolSurfaceFenceImplementations(retained.fence);
+      resumeToolSurface = retained.toolSurface;
+    }
     let agent: Agent;
     try {
       agent = this._harness._resolveAgentForRuntimeDependencies(
@@ -9496,6 +9561,7 @@ export class Session {
     // `session.abort()` can cancel an in-flight resume (e.g. ESC after the
     // user approved a tool that's now grinding through a long workflow).
     const turnAbortController = this._beginTurn(undefined);
+    this._setCurrentTurnReplacementToolSurface(resumeToolSurface);
     // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
     // Re-arm the transient so a re-suspend on this resumed run persists it again.
     this._currentTurnYolo = pending.yolo === true;
@@ -9548,11 +9614,15 @@ export class Session {
         ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
         yolo: pending.yolo === true,
       });
+      if (pending.toolSurfaceFence) {
+        stageToolSurfaceFenceRestore(resumeRequestContext, pending.runId, pending.toolSurfaceFence);
+      }
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
         abortSignal: turnAbortController.signal,
         requestContext: resumeRequestContext,
+        ...resumeToolSurface,
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
@@ -9790,6 +9860,9 @@ export class Session {
         ),
         activeTurnWaiter.promise,
       ]);
+      if (full.finishReason !== 'suspended') {
+        this._pendingReplacementToolSurfaces.delete(pending.runId);
+      }
 
       // §10.2 defines no suspension_resolved event — resolution is observed via
       // the inbox response transition + display snapshot. A mode flip on a plan
@@ -11505,7 +11578,7 @@ export class Session {
       }));
     }
 
-    const toolsets = this._buildToolsets(mode);
+    const toolSurface = this._buildToolSurface(mode);
     // Queued turns run under a session-owned AbortController so
     // `session.abort()` can cancel an in-flight queued run too.
     this._assertOpenForTurn('queue drain');
@@ -11513,6 +11586,7 @@ export class Session {
       modeId: effectiveModeId,
       modelId: item.model ?? this._record.modelId,
     });
+    this._setCurrentTurnReplacementToolSurface(toolSurface);
     // §4.2e — arm per-turn yolo for the drain so suspend-capture persists it onto
     // pendingResume (so a later resume keeps auto-granting). `_beginTurn` reset it.
     this._currentTurnYolo = item.yolo === true;
@@ -11547,7 +11621,7 @@ export class Session {
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext,
-        ...(toolsets ? { toolsets } : {}),
+        ...toolSurface,
         ...(mode.instructions ? { instructions: mode.instructions } : {}),
       };
 
@@ -12140,6 +12214,9 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
+        : {}),
       payload: {
         question: params.question,
         ...(params.options ? { options: params.options } : {}),
@@ -12204,6 +12281,9 @@ export class Session {
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
       payload: {
         sandboxAccess: {
@@ -12278,6 +12358,9 @@ export class Session {
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
       payload: {
         ...(params.title !== undefined ? { title: params.title } : {}),
@@ -12842,9 +12925,13 @@ export class Session {
    *   - mode.additionalTools merges with agent's tools
    *   - per-call additionalTools layer on top of whatever the mode produced
    *
-   * Returns undefined when no overrides apply (agent runs with its own tools).
+   * Returns the per-turn toolsets and replacement policy. With no mode or
+   * Harness overrides, both fields are omitted and the agent keeps its tools.
    */
-  private _buildToolsets(mode: HarnessMode, callAdditional?: ToolsInput): Record<string, ToolsInput> | undefined {
+  private _buildToolSurface(
+    mode: HarnessMode,
+    callAdditional?: ToolsInput,
+  ): Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'> {
     // §4.2e workspace tool profile: when the mode declares `workspaceTools.expose`,
     // withhold workspace-category tools (read/edit/execute) NOT in the list from
     // the harness-controlled toolsets (mode + per-call). mcp/other/uncategorized
@@ -12852,11 +12939,13 @@ export class Session {
     // `toolCategoryResolver`; with none, categories are null and nothing is hidden.
     const expose = mode.workspaceTools?.expose;
     const profile = (tools: ToolsInput): ToolsInput =>
-      expose ? this._applyWorkspaceToolProfile(tools, expose) : tools;
+      expose ? this._applyWorkspaceToolProfile(tools, expose) : { ...tools };
     const toolsets: Record<string, ToolsInput> = {};
-    if (mode.tools) toolsets[`mode:${mode.id}`] = profile(mode.tools);
-    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
-    if (callAdditional) toolsets[`call:additional`] = profile(callAdditional);
+    if (mode.tools && Object.keys(mode.tools).length > 0) toolsets[`mode:${mode.id}`] = profile(mode.tools);
+    if (mode.additionalTools && Object.keys(mode.additionalTools).length > 0) {
+      toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
+    }
+    if (callAdditional && Object.keys(callAdditional).length > 0) toolsets[`call:additional`] = profile(callAdditional);
     // §9 — a SubagentDefinition.tools override (set on the child session at spawn)
     // is layered onto the subagent's surface, subject to the same workspace-tool
     // profile + permission gate as any other tool.
@@ -12866,18 +12955,41 @@ export class Session {
     // `spawn_subagent` is conditional on subagent types being configured; the
     // plan-task tools are always available. Both close over this session so they
     // act on the calling session only (§6.4 ownership rule).
-    const builtins: ToolsInput = {};
-    const spawn = createSpawnSubagentTool(this);
-    if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
-    // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
-    // for the durable HarnessPlanTask tree; each write routes through this
-    // session under its lease.
-    Object.assign(builtins, createPlanTaskTools(this));
-    if (Object.keys(builtins).length > 0) {
-      toolsets['harness:builtin'] = builtins;
+    if (mode.harnessBuiltins !== 'exclude') {
+      const builtins: ToolsInput = {};
+      const spawn = createSpawnSubagentTool(this);
+      if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+      // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
+      // for the durable HarnessPlanTask tree; each write routes through this
+      // session under its lease.
+      Object.assign(builtins, createPlanTaskTools(this));
+      if (Object.keys(builtins).length > 0) {
+        toolsets['harness:builtin'] = builtins;
+      }
     }
 
-    return Object.keys(toolsets).length === 0 ? undefined : toolsets;
+    return {
+      ...(Object.keys(toolsets).length > 0 ? { toolsets } : {}),
+      ...(mode.tools !== undefined ? { toolsetsMode: 'replace' as const } : {}),
+    };
+  }
+
+  /** Capture the canonical per-turn replacement surface after `_beginTurn` resets transient state. */
+  private _setCurrentTurnReplacementToolSurface(
+    toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>,
+  ): void {
+    if (toolSurface.toolsetsMode !== 'replace') {
+      this._currentTurnReplacementToolSurface = undefined;
+      return;
+    }
+    const sourceTools = Object.assign({}, ...Object.values(toolSurface.toolsets ?? {})) as Record<string, unknown>;
+    this._currentTurnReplacementToolSurface = {
+      toolSurface,
+      // Snapshot source descriptors at turn admission. The toolset maps are
+      // already shallow copies, so later mode-map edits cannot swap values;
+      // this fence also restores in-place edits to a retained tool object.
+      fence: createToolSurfaceFence(sourceTools),
+    };
   }
 
   /**
@@ -13076,7 +13188,19 @@ export class Session {
     if (turn.yolo === true) {
       entries.push(['__mastra_yoloAutoApprove', true]);
     }
-    return new RequestContext(entries);
+    const requestContext = new RequestContext<unknown>(entries);
+    // Only the currently admitted turn owns the suspend snapshot. Auxiliary
+    // callers such as MCP listTools may also build a context; they must not
+    // overwrite the active turn's fence source.
+    if (this._currentTurnAbortController?.signal === turn.abortSignal) {
+      this._currentAgentRequestContext = requestContext;
+    }
+    return requestContext;
+  }
+
+  private _currentToolSurfaceFenceSnapshot(runId: string): string[] | undefined {
+    const fence = readToolSurfaceFence(this._currentAgentRequestContext, runId);
+    return fence ? [...fence.allowedNames] : undefined;
   }
 
   /**
@@ -13253,6 +13377,7 @@ export class Session {
     // that will never reach a terminal here) so they cannot accumulate.
     this._openRuns.clear();
     this._finalizedRunIds.clear();
+    this._pendingReplacementToolSurfaces.clear();
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
   }
@@ -13264,6 +13389,7 @@ export class Session {
     this._state = 'deleted';
     this._openRuns.clear();
     this._finalizedRunIds.clear();
+    this._pendingReplacementToolSurfaces.clear();
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
     const activeTurn = this._currentTurnAbortController;

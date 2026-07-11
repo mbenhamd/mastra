@@ -14,7 +14,9 @@ import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
 import type { AgentStreamEvent } from '../types';
+import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
 
 // ============================================================================
 // Helper Functions
@@ -198,6 +200,196 @@ describe('DurableAgent streaming execution', () => {
       expect(doStream.mock.calls[0]?.[0].tools.map((tool: { name: string }) => tool.name)).toEqual(['allowedTool']);
 
       cleanup();
+    });
+
+    it('should preserve replacement toolsets as a durable processor and execution ceiling', async () => {
+      const hiddenExecute = vi.fn(async () => 'hidden');
+      let callCount = 0;
+      const doStream = vi.fn(async (options: any) => {
+        callCount++;
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'hidden-call',
+                    toolName: 'hiddenTool',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  { type: 'finish', finishReason: 'tool-calls', usage: { inputTokens: 1, outputTokens: 1 } },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: options.tools.map((tool: any) => tool.name).join(',') },
+                  { type: 'text-end', id: 'text-1' },
+                  { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } },
+                ],
+          ),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+      const model = new MockLanguageModelV2({ doStream });
+      const hiddenTool = createTool({
+        id: 'hiddenTool',
+        description: 'hidden',
+        inputSchema: z.object({}),
+        execute: hiddenExecute,
+      });
+      const modeTool = createTool({
+        id: 'modeTool',
+        description: 'mode',
+        inputSchema: z.object({}),
+        execute: async () => 'mode',
+      });
+      const baseAgent = new Agent({
+        id: 'durable-replacement-agent',
+        name: 'Durable Replacement Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: { hiddenTool },
+        inputProcessors: [
+          {
+            id: 'expand-tools',
+            processInputStep: ({ tools }) => ({
+              tools: { ...tools, hiddenTool },
+              activeTools: ['modeTool', 'hiddenTool'],
+            }),
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const { output, cleanup } = await durableAgent.stream('test', {
+        maxSteps: 3,
+        toolsets: { mode: { modeTool } },
+        toolsetsMode: 'replace',
+      });
+      await output.consumeStream();
+
+      expect(doStream).toHaveBeenCalledTimes(2);
+      expect(doStream.mock.calls.map(call => call[0].tools.map((tool: any) => tool.name))).toEqual([
+        ['modeTool'],
+        ['modeTool'],
+      ]);
+      expect(hiddenExecute).not.toHaveBeenCalled();
+      cleanup();
+    });
+
+    it('should fail closed after registry loss instead of substituting same-named backing tools', async () => {
+      const model = createTextStreamModel('unused');
+      const baseAgent = new Agent({
+        id: 'durable-registry-loss-agent',
+        name: 'Durable Registry Loss Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: {
+          modeTool: createTool({
+            id: 'backing-modeTool',
+            description: 'same name, different backing implementation',
+            inputSchema: z.object({}),
+            execute: async () => 'wrong implementation',
+          }),
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'registry-loss-run',
+        toolsetsMode: 'replace',
+        toolsets: {
+          mode: {
+            modeTool: createTool({
+              id: 'replacement-modeTool',
+              description: 'approved replacement implementation',
+              inputSchema: z.object({}),
+              execute: async () => 'approved implementation',
+            }),
+          },
+        },
+      });
+      globalRunRegistry.delete('registry-loss-run');
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: 'registry-loss-run',
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).rejects.toThrow(/Cannot reconstruct replacement tool implementations/);
+    });
+
+    it('should reconstruct an empty replacement surface as tool-free after registry loss', async () => {
+      const model = createTextStreamModel('unused');
+      const baseAgent = new Agent({
+        id: 'durable-empty-replacement-agent',
+        name: 'Durable Empty Replacement Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: {
+          hiddenTool: createTool({
+            id: 'hiddenTool',
+            description: 'must stay hidden',
+            inputSchema: z.object({}),
+            execute: async () => 'hidden',
+          }),
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'empty-registry-loss-run',
+        toolsetsMode: 'replace',
+        toolsets: {},
+      });
+      globalRunRegistry.delete('empty-registry-loss-run');
+
+      const resolved = await resolveRuntimeDependencies({
+        runId: 'empty-registry-loss-run',
+        agentId: baseAgent.id,
+        input: prepared.workflowInput,
+        mastra: { getAgentById: () => baseAgent } as any,
+      });
+
+      expect(prepared.workflowInput.options.toolSurfaceFence).toEqual([]);
+      expect(resolved.tools).toEqual({});
+    });
+
+    it('should abort durable preparation when a replacement tool surface cannot be converted', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-invalid-replacement-agent',
+        name: 'Durable Invalid Replacement Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-replacement-run',
+          toolsetsMode: 'replace',
+          toolsets: {
+            invalid: {
+              'duplicate name': createTool({
+                id: 'first',
+                description: 'normalizes to duplicate_name',
+                inputSchema: z.object({}),
+                execute: async () => 'first',
+              }),
+              duplicate_name: createTool({
+                id: 'second',
+                description: 'collides after normalization',
+                inputSchema: z.object({}),
+                execute: async () => 'second',
+              }),
+            },
+          },
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(globalRunRegistry.has('invalid-replacement-run')).toBe(false);
     });
 
     it('should allow input processors to clear activeTools for LLM request and tool execution', async () => {

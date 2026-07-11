@@ -56,6 +56,21 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
+  it('threads replacement mode semantics through queue drain and recovery options', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      modes: [{ id: 'default', agentId: 'default', tools: { queueTool: {} as any } }],
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    await session.queue({ content: 'queued' });
+
+    expect(agent.streamCalls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.streamCalls[0]!.options.toolsets['mode:default']).toHaveProperty('queueTool');
+    await session.close();
+  });
+
   it('drained item settles with queue_completed carrying queuedItemId + signalId (§10.2)', async () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });

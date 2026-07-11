@@ -44,6 +44,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
 
       const convertedTools = await capabilities.convertTools({
         toolsets: options?.toolsets,
+        toolsetsMode: options?.toolsetsMode,
         clientTools: options?.clientTools,
         threadId,
         resourceId,

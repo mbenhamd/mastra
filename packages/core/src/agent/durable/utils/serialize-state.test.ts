@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CoreTool } from '../../../tools/types';
-import { serializeToolMetadata } from './serialize-state';
+import { serializeDurableOptions, serializeToolMetadata } from './serialize-state';
 
 type ApprovalMetadataToolFixture = CoreTool & {
   requireApproval?: boolean;
@@ -75,5 +75,11 @@ describe('serializeToolMetadata', () => {
     } as ApprovalMetadataToolFixture);
 
     expect(metadata.requireApproval).toBe(true);
+  });
+});
+
+describe('serializeDurableOptions', () => {
+  it('persists the immutable replacement tool ceiling', () => {
+    expect(serializeDurableOptions({ toolSurfaceFence: ['modeTool'] }).toolSurfaceFence).toEqual(['modeTool']);
   });
 });

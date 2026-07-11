@@ -43,6 +43,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   maxSteps?: number;
   /** Additional tool sets that can be used for this execution */
   toolsets?: AgentExecutionOptions<OUTPUT>['toolsets'];
+  /** Whether toolsets augment (default) or replace every other agent tool source */
+  toolsetsMode?: AgentExecutionOptions<OUTPUT>['toolsetsMode'];
   /** Client-side tools available during execution */
   clientTools?: AgentExecutionOptions<OUTPUT>['clientTools'];
   /** Tool selection strategy */

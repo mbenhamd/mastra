@@ -16,6 +16,7 @@ import type { AgentExecutionOptions } from '../agent.types';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
+import { clearToolSurfaceFence, readToolSurfaceFence } from '../tool-surface-fence';
 import type { AgentInstructions, AgentModelManagerConfig, ToolsetsInput, ToolsInput } from '../types';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import { createWorkflowInput } from './utils/serialize-state';
@@ -37,6 +38,7 @@ interface DurablePreparationAgent {
   }): Promise<Record<string, { scorer: unknown; sampling?: unknown }> | undefined>;
   getToolsForExecution(opts: {
     toolsets?: ToolsetsInput;
+    toolsetsMode?: AgentExecutionOptions['toolsetsMode'];
     clientTools?: ToolsInput;
     threadId?: string;
     resourceId?: string;
@@ -245,12 +247,12 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       logger?.warn?.(`[DurableAgent] Error running input processors: ${error}`);
     }
   }
-
   // 7. Convert tools to CoreTool format for execution
   let tools: Record<string, CoreTool> = {};
   try {
     tools = await typedAgent.getToolsForExecution({
       toolsets: execOptions?.toolsets,
+      toolsetsMode: execOptions?.toolsetsMode,
       clientTools: execOptions?.clientTools,
       threadId,
       resourceId,
@@ -261,7 +263,13 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     });
   } catch (error) {
     logger?.warn?.(`[DurableAgent] Error converting tools: ${error}`);
+    if (execOptions?.toolsetsMode === 'replace') {
+      throw error;
+    }
   }
+  const replacementFence = readToolSurfaceFence(requestContext, runId);
+  const toolSurfaceFence = replacementFence ? [...replacementFence.allowedNames] : undefined;
+  if (replacementFence) clearToolSurfaceFence(requestContext, runId);
 
   // 8. Get model (and model list if configured)
   const model = await typedAgent.getModel({ requestContext });
@@ -339,6 +347,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       maxSteps: execOptions?.maxSteps,
       toolChoice: execOptions?.toolChoice as any,
       activeTools: execOptions?.activeTools,
+      toolSurfaceFence,
       temperature: execOptions?.modelSettings?.temperature,
       // Durable runs serialize their options, so a function-valued global approval policy
       // can't be persisted. Degrade safely by requiring approval for every tool call.
@@ -387,7 +396,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     processorStates,
     backgroundTaskManager,
     backgroundTasksConfig,
-    cleanup: () => {},
+    cleanup: () => clearToolSurfaceFence(requestContext, runId),
   };
 
   return {

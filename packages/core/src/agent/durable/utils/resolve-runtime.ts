@@ -94,6 +94,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // If we found the entry in global registry, we already have model and tools
   if (globalEntry) {
     logger?.debug?.(`[DurableAgent:${agentId}] Using model and tools from global registry for run ${runId}`);
+  } else if ((input.options?.toolSurfaceFence?.length ?? 0) > 0) {
+    throw new Error(
+      `[DurableAgent:${agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
+    );
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
@@ -103,6 +107,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // Future: restore serialized version overrides from workflow input here
 
       tools = await agent.getToolsForExecution({
+        ...(input.options?.toolSurfaceFence ? { toolsets: {}, toolsetsMode: 'replace' as const } : {}),
         runId,
         threadId: input.state.threadId,
         resourceId: input.state.resourceId,

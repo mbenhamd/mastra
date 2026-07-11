@@ -87,6 +87,12 @@ export interface HarnessMode {
   additionalTools?: ToolsInput;
 
   /**
+   * Whether Harness-owned built-ins (plan-task tools and `spawn_subagent` when
+   * configured) are included in this mode. Defaults to `include`.
+   */
+  harnessBuiltins?: 'include' | 'exclude';
+
+  /**
    * Optional plan→build target. When `submit_plan` runs in this mode, the
    * registered `PendingResume` freezes this value as `transitionModeId`.
    * On approval, the session flips to this mode

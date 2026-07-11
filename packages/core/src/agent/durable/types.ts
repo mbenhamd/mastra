@@ -143,6 +143,8 @@ export interface SerializableDurableOptions {
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'tool'; toolName: string };
   /** Tool names enabled for this execution */
   activeTools?: string[];
+  /** Immutable tool-name ceiling for replacement toolset executions */
+  toolSurfaceFence?: string[];
   /** Temperature for LLM sampling */
   temperature?: number;
   /** Whether to require tool approval globally */

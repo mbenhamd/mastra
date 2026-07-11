@@ -631,6 +631,14 @@ const stream = await agent.stream('message for agent')
             description: 'Additional toolsets to make available to the agent during streaming.',
           },
           {
+            name: 'toolsetsMode',
+            type: "'merge' | 'replace'",
+            isOptional: true,
+            defaultValue: "'merge'",
+            description:
+              "Controls whether `toolsets` augment the agent's tool sources or replace all of them for this stream.",
+          },
+          {
             name: 'clientTools',
             type: 'ToolsInput',
             isOptional: true,

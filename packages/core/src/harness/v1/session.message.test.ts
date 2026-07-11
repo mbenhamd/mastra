@@ -618,7 +618,11 @@ describe('Session.message() — default path', () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
 
-    await session.message({ content: 'hi', admissionId: 'admission-model-settings', modelSettings: { temperature: 0.2 } });
+    await session.message({
+      content: 'hi',
+      admissionId: 'admission-model-settings',
+      modelSettings: { temperature: 0.2 },
+    });
     await expect(
       session.message({
         content: 'hi',
@@ -1418,6 +1422,42 @@ describe('Session.message() — per-turn overrides', () => {
     // `harness:builtin` toolset (plan-task tools, §6.4) is also present.
     expect(agent.calls[0]!.options.toolsets['call:additional']).toEqual(tools);
     expect(agent.calls[0]!.options.toolsets['harness:builtin']).toBeDefined();
+  });
+
+  it('marks mode.tools as replacement while additionalTools keeps merge semantics', async () => {
+    const agent = new FakeAgent('default');
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [
+        { id: 'replace', agentId: 'default', tools: { modeTool: { id: 'modeTool' } as any } },
+        { id: 'augment', agentId: 'default', additionalTools: { extraTool: { id: 'extraTool' } as any } },
+      ],
+      defaultModeId: 'replace',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'replace' });
+    await session.message({ content: 'augment', mode: 'augment' });
+
+    expect(agent.calls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.calls[1]!.options.toolsetsMode).toBeUndefined();
+  });
+
+  it('can exclude Harness built-ins, including from an explicitly empty replacement mode', async () => {
+    const agent = new FakeAgent('default');
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'empty', agentId: 'default', tools: {}, harnessBuiltins: 'exclude' }],
+      defaultModeId: 'empty',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.message({ content: 'empty' });
+
+    expect(agent.calls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.calls[0]!.options.toolsets).toBeUndefined();
   });
 
   it('passes modelSettings to sync structured generation only when provided', async () => {

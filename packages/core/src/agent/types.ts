@@ -272,6 +272,9 @@ export interface AgentThreadSubscription<OUTPUT = unknown> {
 
 export type ToolsetsInput = Record<string, ToolsInput>;
 
+/** Controls whether per-execution toolsets augment or replace every other agent tool source. */
+export type ToolsetsMode = 'merge' | 'replace';
+
 type FallbackFields<OUTPUT = undefined> =
   | { errorStrategy?: 'strict' | 'warn'; fallbackValue?: never }
   | { errorStrategy: 'fallback'; fallbackValue: OUTPUT };

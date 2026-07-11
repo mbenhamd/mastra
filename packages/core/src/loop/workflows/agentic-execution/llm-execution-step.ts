@@ -7,6 +7,12 @@ import type { StructuredOutputOptions } from '../../../agent';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../agent/channel-tool-fence';
 import type { MessageList } from '../../../agent/message-list';
 import type { CreatedAgentSignal } from '../../../agent/signals';
+import {
+  enforceActiveToolsFence,
+  enforceToolChoiceFence,
+  enforceToolSurfaceFence,
+  readToolSurfaceFence,
+} from '../../../agent/tool-surface-fence';
 import { TripWire } from '../../../agent/trip-wire';
 import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '../../../agent/utils';
 import { generateBackgroundTaskSystemPrompt } from '../../../background-tasks';
@@ -1112,6 +1118,18 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               logger?.error('Error in processInputStep processors:', error);
               throw error;
             }
+          }
+
+          const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
+          if (toolSurfaceFence) {
+            if (currentStep.tools) {
+              enforceToolSurfaceFence(currentStep.tools as Record<string, unknown>, toolSurfaceFence, logger);
+            }
+            currentStep.activeTools = enforceActiveToolsFence(
+              currentStep.activeTools as string[] | undefined,
+              toolSurfaceFence,
+            ) as typeof currentStep.activeTools;
+            enforceToolChoiceFence(currentStep.toolChoice as any, toolSurfaceFence);
           }
 
           // §4.2e PRE-EXPOSURE gate: when a session threads a per-tool permission

@@ -16,6 +16,12 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { MessageList } from '../../../message-list';
 import type { MastraDBMessage } from '../../../message-list';
+import {
+  createToolSurfaceFence,
+  enforceActiveToolsFence,
+  enforceToolChoiceFence,
+  enforceToolSurfaceFence,
+} from '../../../tool-surface-fence';
 import { isSupportedLanguageModel } from '../../../utils';
 import { DurableStepIds } from '../../constants';
 import { globalRunRegistry } from '../../run-registry';
@@ -198,6 +204,14 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             let currentTools = tools as unknown as ToolSet;
             let currentToolChoice = execOptions.toolChoice as ToolChoice<ToolSet> | undefined;
             let currentActiveTools = execOptions.activeTools;
+            const toolSurfaceFence = execOptions.toolSurfaceFence
+              ? createToolSurfaceFence(currentTools as unknown as Record<string, unknown>, execOptions.toolSurfaceFence)
+              : undefined;
+            if (toolSurfaceFence) {
+              enforceToolSurfaceFence(currentTools as unknown as Record<string, unknown>, toolSurfaceFence);
+              currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
+              enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+            }
             let currentModelSettings = { temperature: execOptions.temperature };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
               execOptions.providerOptions,
@@ -291,6 +305,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               currentToolChoice = processInputStepResult.toolChoice as ToolChoice<ToolSet> | undefined;
               currentProviderOptions = processInputStepResult.providerOptions ?? currentProviderOptions;
               currentActiveTools = processInputStepResult.activeTools;
+              if (toolSurfaceFence) {
+                enforceToolSurfaceFence(currentTools as unknown as Record<string, unknown>, toolSurfaceFence);
+                currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
+                enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+              }
               currentModelSettings = {
                 ...currentModelSettings,
                 ...(processInputStepResult.modelSettings ?? {}),

@@ -46,6 +46,23 @@ describe('Session.injectSystemReminder()', () => {
     expect(messages.contents).toBe('remember X');
   });
 
+  it('threads replacement mode semantics through an idle reminder wake', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      modes: [{ id: 'default', agentId: 'default', tools: { reminderTool: {} as any } }],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.injectSystemReminder('remember replacement boundary');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(agent.streamCalls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.streamCalls[0]!.options.toolsets['mode:default']).toHaveProperty('reminderTool');
+    await session.close();
+  });
+
   it('drains into an active run (willInterleave: true)', async () => {
     const agent = new MockAgent({ id: 'default' });
     let release!: () => void;
