@@ -703,7 +703,9 @@ export class Mastra<
   #events: {
     [topic: string]: ((event: Event, cb?: () => Promise<void>) => Promise<void>)[];
   } = {};
-  #internalMastraWorkflows: Record<string, Workflow> = {};
+  #internalMastraWorkflows: Record<string, AnyWorkflow> = {};
+  #runScopedWorkflowTimestamps = new Map<string, number>();
+  static readonly INTERNAL_WORKFLOW_TTL_MS = 30 * 60 * 1000;
   // Server cache for temporary persistence and durable agent resumable streams
   #serverCache: MastraServerCache;
   // Cache for stored agents to allow in-memory modifications (like model changes) to persist across requests
@@ -717,9 +719,49 @@ export class Mastra<
   #datasets?: DatasetsManager;
   // Global version overrides for primitives (agents, etc.)
   #versions?: VersionOverrides;
+  #pubsubProxy?: PubSub;
 
-  get pubsub() {
-    return this.#pubsub;
+  get pubsub(): PubSub {
+    if (!this.#pubsubProxy) {
+      const raw = this.#pubsub;
+      const self = this;
+      this.#pubsubProxy = new Proxy(raw, {
+        get(target, prop, _receiver) {
+          if (prop === 'publish') {
+            return function publish(
+              topic: string,
+              event: Omit<Event, 'id' | 'createdAt'>,
+              options?: { localOnly?: boolean },
+            ) {
+              if (topic === 'workflows' || topic === 'workflows-finish') {
+                const data = event.data as Record<string, unknown> | undefined;
+                const workflowId = data?.workflowId as string | undefined;
+                const runId = data?.runId as string | undefined;
+                const isOwnedHere =
+                  (workflowId !== undefined &&
+                    runId !== undefined &&
+                    self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow)) ||
+                  runId?.startsWith('sched_wf_') === true;
+
+                if (isOwnedHere) {
+                  return target.publish(topic, event, { ...options, localOnly: true });
+                }
+              } else if (topic.startsWith('workflow.events.v2.')) {
+                return target.publish(topic, event, { ...options, localOnly: true });
+              }
+
+              // Preserve caller-supplied transport options for portable and unrelated events.
+              return target.publish(topic, event, options);
+            };
+          }
+
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as PubSub;
+    }
+
+    return this.#pubsubProxy;
   }
 
   get agentThreadStreamRuntime() {
@@ -2947,20 +2989,37 @@ export class Mastra<
     return this.#lifecycleState === 'ready' && this.#harnesses[name] !== undefined;
   }
 
-  __registerInternalWorkflow(workflow: Workflow) {
+  __registerInternalWorkflow(workflow: AnyWorkflow, runId?: string) {
     workflow.__registerMastra(this);
     workflow.__registerPrimitives({
       logger: this.getLogger(),
     });
-    this.#internalMastraWorkflows[workflow.id] = workflow;
+    if (runId) {
+      const key = `${workflow.id}:${runId}`;
+      this.#internalMastraWorkflows[key] = workflow;
+      this.#runScopedWorkflowTimestamps.set(key, Date.now());
+      this.#sweepStaleRunScopedWorkflows();
+    } else {
+      this.#internalMastraWorkflows[workflow.id] = workflow;
+    }
   }
 
-  __hasInternalWorkflow(id: string): boolean {
-    return Object.values(this.#internalMastraWorkflows).some(workflow => workflow.id === id);
+  __unregisterInternalWorkflow(id: string, runId: string) {
+    const key = `${id}:${runId}`;
+    delete this.#internalMastraWorkflows[key];
+    this.#runScopedWorkflowTimestamps.delete(key);
   }
 
-  __getInternalWorkflow(id: string): Workflow {
-    const workflow = Object.values(this.#internalMastraWorkflows).find(a => a.id === id);
+  __hasInternalWorkflow(id: string, runId?: string): boolean {
+    return runId
+      ? !!this.#internalMastraWorkflows[`${id}:${runId}`] || !!this.#internalMastraWorkflows[id]
+      : !!this.#internalMastraWorkflows[id];
+  }
+
+  __getInternalWorkflow(id: string, runId?: string): AnyWorkflow {
+    const workflow = runId
+      ? (this.#internalMastraWorkflows[`${id}:${runId}`] ?? this.#internalMastraWorkflows[id])
+      : this.#internalMastraWorkflows[id];
     if (!workflow) {
       throw new MastraError({
         id: 'MASTRA_GET_INTERNAL_WORKFLOW_BY_ID_NOT_FOUND',
@@ -2975,6 +3034,55 @@ export class Mastra<
     }
 
     return workflow;
+  }
+
+  #ownsInternalWorkflow(workflowId: string, runId: string, parentWorkflow: unknown): boolean {
+    if (this.__hasInternalWorkflow(workflowId, runId)) return true;
+
+    let parent = parentWorkflow as { workflowId?: string; runId?: string; parentWorkflow?: unknown } | undefined;
+    const seen = new Set<unknown>();
+    let depth = 0;
+    while (parent && depth < 16 && !seen.has(parent)) {
+      seen.add(parent);
+      if (parent.workflowId && parent.runId && this.__hasInternalWorkflow(parent.workflowId, parent.runId)) {
+        return true;
+      }
+      parent = parent.parentWorkflow as typeof parent;
+      depth += 1;
+    }
+
+    return false;
+  }
+
+  #ownsWorkflow(workflowId: string, runId: string, parentWorkflow: unknown): boolean {
+    if (this.#ownsInternalWorkflow(workflowId, runId, parentWorkflow)) return true;
+
+    const workflows = this.#workflows as Record<string, AnyWorkflow> | undefined;
+    const ownsPublicWorkflow = (id: string) =>
+      !!workflows?.[id] || Object.values(workflows ?? {}).some(workflow => workflow.id === id);
+    if (ownsPublicWorkflow(workflowId)) return true;
+
+    let parent = parentWorkflow as { workflowId?: string; runId?: string; parentWorkflow?: unknown } | undefined;
+    const seen = new Set<unknown>();
+    let depth = 0;
+    while (parent && depth < 16 && !seen.has(parent)) {
+      seen.add(parent);
+      if (parent.workflowId && ownsPublicWorkflow(parent.workflowId)) return true;
+      parent = parent.parentWorkflow as typeof parent;
+      depth += 1;
+    }
+
+    return false;
+  }
+
+  #sweepStaleRunScopedWorkflows() {
+    const now = Date.now();
+    for (const [key, registeredAt] of this.#runScopedWorkflowTimestamps) {
+      if (now - registeredAt > Mastra.INTERNAL_WORKFLOW_TTL_MS) {
+        delete this.#internalMastraWorkflows[key];
+        this.#runScopedWorkflowTimestamps.delete(key);
+      }
+    }
   }
 
   /**
@@ -4748,6 +4856,21 @@ export class Mastra<
         const pushOnly = modes.includes('push') && !modes.includes('pull');
         if (pushOnly && !this.#pushSubscription) {
           const cb: EventCallback = (event, ack) => {
+            const data = event.data as Record<string, unknown> | undefined;
+            const workflowId = data?.workflowId as string | undefined;
+            const runId = data?.runId as string | undefined;
+            if (workflowId && runId && !this.#ownsWorkflow(workflowId, runId, data?.parentWorkflow)) {
+              this.#logger?.debug?.('Skipping workflow event not owned by this Mastra instance', {
+                workflowId,
+                eventType: event.type,
+                ownership: 'foreign',
+              });
+              if (ack) {
+                void ack().catch(error => this.#logger?.error?.('Error acking skipped workflow event', error));
+              }
+              return;
+            }
+
             void this.handleWorkflowEvent(event)
               .then(result => {
                 if (result.ok && ack) {

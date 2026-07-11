@@ -97,3 +97,21 @@ await pubsub.close()
 ## Broker election
 
 The first process to bind the socket becomes the broker and routes events between all connected clients. Other processes connect as clients. When the broker exits, an exclusive lock file serializes the next election so exactly one client becomes the new broker, and the remaining clients resubscribe to it. This avoids a split-brain state where two processes both act as broker.
+
+## Workflow ownership and local delivery
+
+Mastra keeps run-scoped internal workflow events in the process that owns the run. `Mastra.pubsub` publishes these events with `localOnly: true`, and `UnixSocketPubSub` delivers them directly to local subscribers without serializing them over the socket. This preserves live functions and class instances in workflow state.
+
+Ownership follows these rules:
+
+| Workflow event | Delivery |
+| - | - |
+| Run-scoped internal workflow owned by this Mastra instance | Local process only |
+| Nested workflow with an owned internal ancestor | Local process only |
+| Scheduler-spawned internal run or per-run `workflow.events.v2.*` stream | Local process only |
+| Public workflow registered on participating instances | Cross-process |
+| Unrelated topic | Uses the caller's `localOnly` option |
+
+Parent workflow traversal is depth-bounded and cycle-safe. A malformed parent chain can't block event routing.
+
+For push-only delivery, a Mastra instance acknowledges an event owned by another instance without running user workflow code. This routing skip isn't a workflow error: it doesn't emit `workflow.fail`, request redelivery, or throw a `MastraError`. The debug record includes only structural fields (`workflowId`, event type, and `ownership: "foreign"`), not the workflow payload.
