@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -176,6 +177,99 @@ describe('WorkflowsPG terminalization journal', () => {
       );
     } finally {
       await cleanup(workflowName);
+    }
+  });
+
+  it('fails closed when completed timestamps contradict the persisted phase transition', async () => {
+    const workflowName = `terminalization-invalid-completion-${randomUUID()}`;
+    const runId = 'run';
+    await pool.query(
+      `INSERT INTO mastra_workflow_terminalizations
+       (workflow_name, run_id, version, event_key, terminal_status, phase, owner_id, claim_token,
+        claim_generation, lease_expires_at, created_at, updated_at, completed_at)
+       VALUES ($1, $2, 1, 'event', 'failed', 'complete', NULL, NULL, 1, NULL, 1, 100, 50)`,
+      [workflowName, runId],
+    );
+
+    try {
+      await expect(workflowsA.getWorkflowTerminalization({ workflowName, runId })).rejects.toThrow(
+        'Invalid workflow terminalization record',
+      );
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('fails closed when an active lease exceeds the bounded lease contract', async () => {
+    const workflowName = `terminalization-invalid-lease-${randomUUID()}`;
+    const runId = 'run';
+    await pool.query(
+      `INSERT INTO mastra_workflow_terminalizations
+       (workflow_name, run_id, version, event_key, terminal_status, phase, owner_id, claim_token,
+        claim_generation, lease_expires_at, created_at, updated_at, completed_at)
+       VALUES ($1, $2, 1, 'event', 'failed', 'terminalization_pending', 'worker', 'token',
+        1, $3, 1, 1, NULL)`,
+      [workflowName, runId, Number.MAX_SAFE_INTEGER],
+    );
+
+    try {
+      await expect(workflowsA.getWorkflowTerminalization({ workflowName, runId })).rejects.toThrow(
+        'Invalid workflow terminalization record',
+      );
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('fails closed when persisted journal timestamps are ahead of database time', async () => {
+    const workflowName = `terminalization-invalid-future-${randomUUID()}`;
+    const runId = 'run';
+    const futureUpdatedAt = Date.now() + 30 * 86_400_000;
+    await pool.query(
+      `INSERT INTO mastra_workflow_terminalizations
+       (workflow_name, run_id, version, event_key, terminal_status, phase, owner_id, claim_token,
+        claim_generation, lease_expires_at, created_at, updated_at, completed_at)
+       VALUES ($1, $2, 1, 'event', 'failed', 'terminalization_pending', 'worker', 'token',
+        1, $3, 1, $4, NULL)`,
+      [workflowName, runId, futureUpdatedAt + 1_000, futureUpdatedAt],
+    );
+
+    try {
+      await expect(workflowsA.getWorkflowTerminalization({ workflowName, runId })).rejects.toThrow(
+        'Invalid workflow terminalization record',
+      );
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('accepts exact completion and maximum lease timestamp boundaries', async () => {
+    const completedWorkflow = `terminalization-valid-completion-${randomUUID()}`;
+    const leaseWorkflow = `terminalization-valid-lease-${randomUUID()}`;
+    const runId = 'run';
+    await pool.query(
+      `INSERT INTO mastra_workflow_terminalizations
+       (workflow_name, run_id, version, event_key, terminal_status, phase, owner_id, claim_token,
+        claim_generation, lease_expires_at, created_at, updated_at, completed_at)
+       VALUES ($1, $3, 1, 'complete-event', 'failed', 'complete', NULL, NULL, 1, NULL, 1, 50, 50),
+              ($2, $3, 1, 'lease-event', 'failed', 'terminalization_pending', 'worker', 'token',
+               1, 86400001, 1, 1, NULL)`,
+      [completedWorkflow, leaseWorkflow, runId],
+    );
+
+    try {
+      await expect(
+        workflowsA.getWorkflowTerminalization({ workflowName: completedWorkflow, runId }),
+      ).resolves.toMatchObject({ status: 'found', record: { phase: 'complete', completedAt: 50 } });
+      await expect(
+        workflowsA.getWorkflowTerminalization({ workflowName: leaseWorkflow, runId }),
+      ).resolves.toMatchObject({
+        status: 'found',
+        record: { phase: 'terminalization_pending', leaseExpiresAt: 86_400_001 },
+      });
+    } finally {
+      await cleanup(completedWorkflow);
+      await cleanup(leaseWorkflow);
     }
   });
 });

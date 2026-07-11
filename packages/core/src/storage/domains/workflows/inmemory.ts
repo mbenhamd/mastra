@@ -202,7 +202,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   private getTerminalizationKey(workflowName: string, runId: string): string {
-    return JSON.stringify([workflowName, runId]);
+    return this.getWorkflowKey(workflowName, runId);
   }
 
   async claimWorkflowTerminalization(
@@ -291,7 +291,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   private getWorkflowKey(workflowName: string, runId: string): string {
-    return `${workflowName}-${runId}`;
+    // A delimiter-joined key aliases distinct identities such as
+    // (`a-b`, `c`) and (`a`, `b-c`). Preserve the tuple boundary instead.
+    return JSON.stringify([workflowName, runId]);
   }
 
   async updateWorkflowResults({

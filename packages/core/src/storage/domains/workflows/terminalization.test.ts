@@ -393,4 +393,50 @@ describe('WorkflowsInMemory terminalization journal', () => {
       ),
     ).toThrow('terminalization lease expiry exceeds the safe integer range');
   });
+
+  it('keeps workflow/run tuple identities distinct when names contain delimiters', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const first = { workflowName: 'a-b', runId: 'c' };
+    const second = { workflowName: 'a', runId: 'b-c' };
+    await workflows.persistWorkflowSnapshot({
+      ...first,
+      snapshot: createEmptyWorkflowSnapshot('c'),
+    });
+    await workflows.persistWorkflowSnapshot({
+      ...second,
+      snapshot: createEmptyWorkflowSnapshot('b-c'),
+    });
+
+    const [firstClaim, secondClaim] = await Promise.all([
+      workflows.claimWorkflowTerminalization({
+        ...first,
+        eventKey,
+        terminalStatus: 'failed',
+        ownerId: 'worker-first',
+        leaseMs: 1_000,
+      }),
+      workflows.claimWorkflowTerminalization({
+        ...second,
+        eventKey: 'event-second',
+        terminalStatus: 'failed',
+        ownerId: 'worker-second',
+        leaseMs: 1_000,
+      }),
+    ]);
+    expect(firstClaim.status).toBe('acquired');
+    expect(secondClaim.status).toBe('acquired');
+
+    await workflows.deleteWorkflowRunById(first);
+    await expect(workflows.loadWorkflowSnapshot(first)).resolves.toBeNull();
+    await expect(workflows.loadWorkflowSnapshot(second)).resolves.toMatchObject({ runId: 'b-c' });
+    await expect(workflows.getWorkflowTerminalization(first)).resolves.toMatchObject({
+      status: 'found',
+      record: { eventKey },
+    });
+    await expect(workflows.getWorkflowTerminalization(second)).resolves.toMatchObject({
+      status: 'found',
+      record: { eventKey: 'event-second' },
+    });
+  });
 });

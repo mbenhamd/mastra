@@ -6,6 +6,7 @@ import {
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
   WorkflowsStorage,
+  MAX_WORKFLOW_TERMINALIZATION_LEASE_MS,
   advanceWorkflowTerminalizationRecord,
   claimWorkflowTerminalizationRecord,
   createStorageErrorId,
@@ -109,7 +110,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     return getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
   }
 
-  private decodeTerminalizationRow(row: Record<string, unknown>): WorkflowTerminalizationRecord {
+  private decodeTerminalizationRow(row: Record<string, unknown>, now: number): WorkflowTerminalizationRecord {
     const toSafeInteger = (value: unknown, field: string): number => {
       const parsed = typeof value === 'string' ? Number(value) : value;
       if (typeof parsed !== 'number' || !Number.isSafeInteger(parsed) || parsed < 0) {
@@ -158,17 +159,22 @@ export class WorkflowsPG extends WorkflowsStorage {
       record.claimGeneration <= 0 ||
       !validOptionalIdentity(record.ownerId, 256) ||
       !validOptionalIdentity(record.claimToken, 256) ||
+      record.createdAt > now ||
+      record.updatedAt > now ||
       record.createdAt > record.updatedAt ||
       (record.phase === 'complete' &&
         (record.ownerId !== undefined ||
           record.claimToken !== undefined ||
           record.leaseExpiresAt !== undefined ||
           record.completedAt === undefined ||
-          record.completedAt < record.createdAt)) ||
+          record.completedAt !== record.updatedAt)) ||
       (record.phase !== 'complete' &&
         (record.completedAt !== undefined ||
           (record.ownerId === undefined) !== (record.claimToken === undefined) ||
-          (record.claimToken === undefined) !== (record.leaseExpiresAt === undefined)))
+          (record.claimToken === undefined) !== (record.leaseExpiresAt === undefined) ||
+          (record.leaseExpiresAt !== undefined &&
+            (record.leaseExpiresAt <= record.updatedAt ||
+              record.leaseExpiresAt - record.updatedAt > MAX_WORKFLOW_TERMINALIZATION_LEASE_MS))))
     ) {
       throw new TypeError('Invalid workflow terminalization record');
     }
@@ -196,7 +202,11 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
     const now = Number(time.now_ms);
     if (!Number.isSafeInteger(now)) throw new TypeError('Invalid PostgreSQL terminalization clock');
-    return { record: row ? this.decodeTerminalizationRow(row) : undefined, snapshotExists: Boolean(snapshot), now };
+    return {
+      record: row ? this.decodeTerminalizationRow(row, now) : undefined,
+      snapshotExists: Boolean(snapshot),
+      now,
+    };
   }
 
   private async saveTerminalizationRecord(

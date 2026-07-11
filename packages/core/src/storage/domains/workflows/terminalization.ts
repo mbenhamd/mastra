@@ -37,6 +37,8 @@ const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTermina
   complete: [],
 };
 
+export const MAX_WORKFLOW_TERMINALIZATION_LEASE_MS = 86_400_000;
+
 export function validateWorkflowTerminalizationIdentity(
   value: string,
   field: 'eventKey' | 'ownerId' | 'claimToken',
@@ -48,7 +50,7 @@ export function validateWorkflowTerminalizationIdentity(
 }
 
 export function validateWorkflowTerminalizationLeaseMs(leaseMs: number): void {
-  if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || leaseMs > 86_400_000) {
+  if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || leaseMs > MAX_WORKFLOW_TERMINALIZATION_LEASE_MS) {
     throw new TypeError('leaseMs must be a positive safe integer no greater than 86400000');
   }
 }
