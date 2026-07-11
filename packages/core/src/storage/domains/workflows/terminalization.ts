@@ -1,14 +1,23 @@
-import type { WorkflowTerminalizationPhase, WorkflowTerminalizationRecord } from '../../../workflows';
+import type {
+  WorkflowTerminalizationClaimedRecord,
+  WorkflowTerminalizationPhase,
+  WorkflowTerminalizationRecord,
+} from '../../../workflows';
 import type {
   AdvanceWorkflowTerminalizationInput,
   ClaimWorkflowTerminalizationInput,
+  PersistWorkflowTerminalStateInput,
   ReleaseWorkflowTerminalizationInput,
   WorkflowTerminalizationObservation,
 } from '../../types';
 
 type InternalClaimWorkflowTerminalizationResult =
   | {
-      status: 'acquired' | 'renewed' | 'leased' | 'lease_expired' | 'fence_conflict' | 'terminal_conflict' | 'complete';
+      status: 'acquired' | 'renewed';
+      record: WorkflowTerminalizationClaimedRecord;
+    }
+  | {
+      status: 'leased' | 'lease_expired' | 'fence_conflict' | 'terminal_conflict' | 'complete';
       record: WorkflowTerminalizationRecord;
     }
   | { status: 'missing_record' };
@@ -27,12 +36,24 @@ type InternalReleaseWorkflowTerminalizationResult =
     }
   | { status: 'missing_record' };
 
+type InternalPersistWorkflowTerminalStateResult =
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | {
+      status: 'advanced';
+      record: WorkflowTerminalizationRecord;
+      snapshot: PersistWorkflowTerminalStateInput['snapshot'];
+    }
+  | { status: 'invalid_snapshot' | 'missing_record' };
+
 const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTerminalizationPhase[]> = {
-  terminalization_pending: ['run_state_persisted'],
-  run_state_persisted: ['parent_outbox_pending', 'finish_outbox_pending'],
-  parent_outbox_pending: ['parent_effect_recorded'],
-  parent_effect_recorded: ['finish_outbox_pending'],
-  finish_outbox_pending: ['finish_effect_recorded'],
+  terminalization_pending: [],
+  run_state_persisted: [],
+  parent_outbox_pending: [],
+  parent_effect_recorded: [],
+  finish_outbox_pending: [],
   finish_effect_recorded: ['complete'],
   complete: [],
 };
@@ -102,9 +123,9 @@ function getWorkflowTerminalizationLeaseExpiry(now: number, leaseMs: number): nu
   return expiresAt;
 }
 
-export function copyWorkflowTerminalizationRecord(
-  record: WorkflowTerminalizationRecord,
-): WorkflowTerminalizationRecord {
+export function copyWorkflowTerminalizationRecord<TRecord extends WorkflowTerminalizationRecord>(
+  record: TRecord,
+): TRecord {
   return { ...record };
 }
 
@@ -155,8 +176,10 @@ export function claimWorkflowTerminalizationRecord(
     if ((existing.leaseExpiresAt ?? 0) <= now) {
       return { status: 'lease_expired', record: copyWorkflowTerminalizationRecord(existing) };
     }
-    const renewed = {
+    const renewed: WorkflowTerminalizationClaimedRecord = {
       ...existing,
+      ownerId: existing.ownerId,
+      claimToken: existing.claimToken,
       leaseExpiresAt,
       updatedAt: now,
     };
@@ -171,7 +194,7 @@ export function claimWorkflowTerminalizationRecord(
     throw new RangeError('claimGeneration cannot be incremented safely');
   }
 
-  const record: WorkflowTerminalizationRecord = existing
+  const record: WorkflowTerminalizationClaimedRecord = existing
     ? {
         ...existing,
         ownerId: input.ownerId,
@@ -206,7 +229,7 @@ export function advanceWorkflowTerminalizationRecord(
   if (input.leaseMs !== undefined) validateWorkflowTerminalizationLeaseMs(input.leaseMs);
   const leaseExpiresAt =
     input.leaseMs === undefined ? undefined : getWorkflowTerminalizationLeaseExpiry(now, input.leaseMs);
-  const allowedPhases = NEXT_PHASES[input.expectedPhase];
+  const allowedPhases = Object.hasOwn(NEXT_PHASES, input.expectedPhase) ? NEXT_PHASES[input.expectedPhase] : undefined;
   if (!allowedPhases || !allowedPhases.includes(input.nextPhase)) return { status: 'invalid_transition' };
   if (!existing) return { status: 'missing_record' };
   if (existing.phase === 'complete') return { status: 'complete', record: copyWorkflowTerminalizationRecord(existing) };
@@ -232,6 +255,53 @@ export function advanceWorkflowTerminalizationRecord(
     ...(complete ? { ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined, completedAt: now } : {}),
   };
   return { status: 'advanced', record: copyWorkflowTerminalizationRecord(record) };
+}
+
+/** @internal Atomically certifies that the canonical run snapshot is terminal. */
+export function persistWorkflowTerminalStateRecord(
+  existing: WorkflowTerminalizationRecord | undefined,
+  input: PersistWorkflowTerminalStateInput,
+  now: number,
+  materializeSnapshot: (
+    snapshot: PersistWorkflowTerminalStateInput['snapshot'],
+  ) => PersistWorkflowTerminalStateInput['snapshot'],
+): InternalPersistWorkflowTerminalStateResult {
+  validateWorkflowTerminalizationFence(input);
+  validateWorkflowTerminalizationClock(now);
+  if (input.leaseMs !== undefined) validateWorkflowTerminalizationLeaseMs(input.leaseMs);
+  if (!existing) return { status: 'missing_record' };
+  if (existing.phase === 'complete') return { status: 'complete', record: copyWorkflowTerminalizationRecord(existing) };
+  if (existing.ownerId !== input.ownerId) {
+    return { status: 'not_owner', record: copyWorkflowTerminalizationRecord(existing) };
+  }
+  if (existing.claimToken !== input.claimToken || existing.claimGeneration !== input.claimGeneration) {
+    return { status: 'fence_conflict', record: copyWorkflowTerminalizationRecord(existing) };
+  }
+  if ((existing.leaseExpiresAt ?? 0) <= now) {
+    return { status: 'lease_expired', record: copyWorkflowTerminalizationRecord(existing) };
+  }
+  if (existing.phase !== 'terminalization_pending') {
+    return { status: 'phase_conflict', record: copyWorkflowTerminalizationRecord(existing) };
+  }
+  if (!input.snapshot || typeof input.snapshot !== 'object' || Array.isArray(input.snapshot)) {
+    return { status: 'invalid_snapshot' };
+  }
+  const snapshot = materializeSnapshot(input.snapshot);
+  if (!snapshot || snapshot.runId !== input.runId || snapshot.status !== existing.terminalStatus) {
+    return { status: 'invalid_snapshot' };
+  }
+  const leaseExpiresAt =
+    input.leaseMs === undefined ? undefined : getWorkflowTerminalizationLeaseExpiry(now, input.leaseMs);
+  return {
+    status: 'advanced',
+    snapshot,
+    record: {
+      ...existing,
+      phase: 'run_state_persisted',
+      updatedAt: now,
+      ...(leaseExpiresAt === undefined ? {} : { leaseExpiresAt }),
+    },
+  };
 }
 
 /** @internal Releases a live fenced claim inside an adapter-provided atomic section. */

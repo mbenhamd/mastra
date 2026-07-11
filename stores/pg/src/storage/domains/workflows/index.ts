@@ -11,6 +11,7 @@ import {
   claimWorkflowTerminalizationRecord,
   createStorageErrorId,
   observeWorkflowTerminalizationRecord,
+  persistWorkflowTerminalStateRecord,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
   validateWorkflowTerminalizationFence,
@@ -24,6 +25,8 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  PersistWorkflowTerminalStateInput,
+  PersistWorkflowTerminalStateResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -249,6 +252,36 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
   }
 
+  private async saveTerminalWorkflowSnapshot(
+    t: TxClient,
+    input: PersistWorkflowTerminalStateInput,
+    snapshot: WorkflowRunState,
+    now: number,
+  ): Promise<void> {
+    const timestamp = new Date(now);
+    const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
+    await t.none(
+      `INSERT INTO ${this.workflowSnapshotTableName()} AS current_snapshot
+       (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (workflow_name, run_id) DO UPDATE SET
+         "resourceId" = COALESCE(EXCLUDED."resourceId", current_snapshot."resourceId"),
+         snapshot = EXCLUDED.snapshot,
+         "updatedAt" = EXCLUDED."updatedAt",
+         "updatedAtZ" = EXCLUDED."updatedAtZ"`,
+      [
+        input.workflowName,
+        input.runId,
+        input.resourceId,
+        sanitizedSnapshot,
+        timestamp,
+        timestamp,
+        timestamp,
+        timestamp,
+      ],
+    );
+  }
+
   private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
     if (error instanceof TypeError || error instanceof RangeError) throw error;
     throw new MastraError(
@@ -265,14 +298,24 @@ export class WorkflowsPG extends WorkflowsStorage {
   async claimWorkflowTerminalization(
     input: ClaimWorkflowTerminalizationInput,
   ): Promise<ClaimWorkflowTerminalizationResult> {
-    validateWorkflowTerminalizationClaim(input);
+    const operation: ClaimWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      eventKey: input.eventKey,
+      terminalStatus: input.terminalStatus,
+      ownerId: input.ownerId,
+      leaseMs: input.leaseMs,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationClaim(operation);
     try {
       return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, input.workflowName, input.runId);
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
-        const result = claimWorkflowTerminalizationRecord(context.record, input, context.now, randomUUID());
+        const result = claimWorkflowTerminalizationRecord(context.record, operation, context.now, randomUUID());
         if (result.status === 'acquired' || result.status === 'renewed') {
-          await this.saveTerminalizationRecord(t, input.workflowName, input.runId, result.record);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
           return result;
         }
         return 'record' in result
@@ -280,86 +323,171 @@ export class WorkflowsPG extends WorkflowsStorage {
           : result;
       });
     } catch (error) {
-      return this.terminalizationError('CLAIM_WORKFLOW_TERMINALIZATION', input.workflowName, input.runId, error);
+      return this.terminalizationError(
+        'CLAIM_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
     }
   }
 
   async getWorkflowTerminalization(input: GetWorkflowTerminalizationInput): Promise<GetWorkflowTerminalizationResult> {
+    const operation: GetWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+    };
     try {
       return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, input.workflowName, input.runId);
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (context.record) return { status: 'found', record: observeWorkflowTerminalizationRecord(context.record) };
         return context.snapshotExists ? { status: 'missing_record' } : { status: 'missing_run' };
       });
     } catch (error) {
-      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', input.workflowName, input.runId, error);
+      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error);
     }
   }
 
   async advanceWorkflowTerminalization(
     input: AdvanceWorkflowTerminalizationInput,
   ): Promise<AdvanceWorkflowTerminalizationResult> {
-    validateWorkflowTerminalizationFence(input);
+    const operation: AdvanceWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      expectedPhase: input.expectedPhase,
+      nextPhase: input.nextPhase,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
     try {
       return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, input.workflowName, input.runId);
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
-        const result = advanceWorkflowTerminalizationRecord(context.record, input, context.now);
+        const result = advanceWorkflowTerminalizationRecord(context.record, operation, context.now);
         if (result.status === 'advanced') {
-          await this.saveTerminalizationRecord(t, input.workflowName, input.runId, result.record);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
         }
         return 'record' in result
           ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
           : result;
       });
     } catch (error) {
-      return this.terminalizationError('ADVANCE_WORKFLOW_TERMINALIZATION', input.workflowName, input.runId, error);
+      return this.terminalizationError(
+        'ADVANCE_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
     }
   }
 
   async releaseWorkflowTerminalization(
     input: ReleaseWorkflowTerminalizationInput,
   ): Promise<ReleaseWorkflowTerminalizationResult> {
-    validateWorkflowTerminalizationFence(input);
+    const operation: ReleaseWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationFence(operation);
     try {
       return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, input.workflowName, input.runId);
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
-        const result = releaseWorkflowTerminalizationRecord(context.record, input, context.now);
+        const result = releaseWorkflowTerminalizationRecord(context.record, operation, context.now);
         if (result.status === 'released') {
-          await this.saveTerminalizationRecord(t, input.workflowName, input.runId, result.record);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
         }
         return 'record' in result
           ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
           : result;
       });
     } catch (error) {
-      return this.terminalizationError('RELEASE_WORKFLOW_TERMINALIZATION', input.workflowName, input.runId, error);
+      return this.terminalizationError(
+        'RELEASE_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
     }
   }
 
   async deleteCompletedWorkflowTerminalizations(
     input: DeleteCompletedWorkflowTerminalizationsInput,
   ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
-    const olderThan = input.olderThan.getTime();
+    const operation: DeleteCompletedWorkflowTerminalizationsInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      olderThan: input.olderThan,
+    };
+    const olderThan = operation.olderThan.getTime();
     if (Number.isNaN(olderThan)) throw new TypeError('olderThan must be a valid Date');
     try {
       return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, input.workflowName, input.runId);
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (!context.record && !context.snapshotExists) return { status: 'missing_run', count: 0 };
         const result = await t.query(
           `DELETE FROM ${this.terminalizationTableName()}
            WHERE workflow_name = $1 AND run_id = $2 AND phase = 'complete'
              AND completed_at IS NOT NULL AND completed_at < $3`,
-          [input.workflowName, input.runId, olderThan],
+          [operation.workflowName, operation.runId, olderThan],
         );
         return { status: 'deleted', count: result.rowCount ?? 0 };
       });
     } catch (error) {
       return this.terminalizationError(
         'DELETE_COMPLETED_WORKFLOW_TERMINALIZATIONS',
-        input.workflowName,
-        input.runId,
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async persistWorkflowTerminalState(
+    input: PersistWorkflowTerminalStateInput,
+  ): Promise<PersistWorkflowTerminalStateResult> {
+    // Materialize the complete operation envelope before acquiring the
+    // transaction lock. A stateful accessor must not split one atomic call
+    // across different workflow identities or fences.
+    const operation: PersistWorkflowTerminalStateInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      snapshot: input.snapshot,
+      resourceId: input.resourceId,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const result = persistWorkflowTerminalStateRecord(context.record, operation, context.now, snapshot =>
+          JSON.parse(sanitizeJsonForPg(JSON.stringify(snapshot))),
+        );
+        if (result.status === 'advanced') {
+          if (!context.snapshotExists) return { status: 'missing_run' };
+          await this.saveTerminalWorkflowSnapshot(t, operation, result.snapshot, context.now);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+          return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'PERSIST_WORKFLOW_TERMINAL_STATE',
+        operation.workflowName,
+        operation.runId,
         error,
       );
     }
@@ -409,16 +537,15 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   /** Returns the terminalization recovery and retention indexes. */
-  static getDefaultIndexDefs(schemaName?: string): CreateIndexOptions[] {
-    const prefix = schemaName && schemaName !== 'public' ? `${schemaName}_` : '';
+  static getDefaultIndexDefs(_schemaName?: string): CreateIndexOptions[] {
     return [
       {
-        name: `${prefix}mastra_workflow_terminalizations_phase_lease_idx`,
+        name: 'mastra_workflow_terminalizations_phase_lease_idx',
         table: TABLE_WORKFLOW_TERMINALIZATIONS,
         columns: ['phase', 'lease_expires_at'],
       },
       {
-        name: `${prefix}mastra_workflow_terminalizations_completed_idx`,
+        name: 'mastra_workflow_terminalizations_completed_idx',
         table: TABLE_WORKFLOW_TERMINALIZATIONS,
         columns: ['completed_at'],
       },
@@ -497,8 +624,9 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   async dangerouslyClearAll(): Promise<void> {
-    await this.#db.client.none(`TRUNCATE TABLE ${this.terminalizationTableName()} CASCADE`);
-    await this.#db.clearTable({ tableName: TABLE_WORKFLOW_SNAPSHOT });
+    await this.#db.client.none(
+      `TRUNCATE TABLE ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
+    );
   }
 
   async updateWorkflowResults({

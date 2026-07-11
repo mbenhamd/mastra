@@ -23,3 +23,7 @@ const claim = await workflows.claimWorkflowTerminalization({
 ```
 
 Successful claims return a token and generation that fence stale workers during renewal, phase advancement, and release. This makes terminalization state durable; external effects still require a retained source event or durable outbox plus stable idempotency keys.
+
+The dedicated `persistWorkflowTerminalState` operation writes the canonical terminal snapshot and advances the journal to `run_state_persisted` atomically. Generic phase advancement cannot manufacture snapshot or effect evidence.
+
+`@mastra/pg` imports this journal contract from `@mastra/core`. Pack both packages from the same workspace release so the packed PostgreSQL peer resolves to the exact compatible Core version; update them atomically.

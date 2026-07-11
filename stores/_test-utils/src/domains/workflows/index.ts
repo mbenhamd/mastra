@@ -990,7 +990,20 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
           expectedPhase: 'terminalization_pending',
           nextPhase: 'run_state_persisted',
         }),
-      ).resolves.toMatchObject({ status: 'advanced', record: { phase: 'run_state_persisted' } });
+      ).resolves.toEqual({ status: 'invalid_transition' });
+      await expect(
+        workflowsStorage.persistWorkflowTerminalState({
+          workflowName,
+          runId,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot: { ...snapshot, runId, status: 'failed' },
+        }),
+      ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
+      await expect(workflowsStorage.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+        status: 'failed',
+      });
     });
   });
 }

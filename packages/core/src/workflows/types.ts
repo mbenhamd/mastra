@@ -393,6 +393,13 @@ export interface WorkflowTerminalizationRecord {
   completedAt?: number;
 }
 
+/** A live journal claim with every fencing credential present. */
+export type WorkflowTerminalizationClaimedRecord = WorkflowTerminalizationRecord & {
+  ownerId: string;
+  claimToken: string;
+  leaseExpiresAt: number;
+};
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;

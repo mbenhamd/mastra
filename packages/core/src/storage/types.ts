@@ -9,6 +9,7 @@ import type {
   WorkflowRunState,
   WorkflowRunStatus,
   WorkflowTerminalStatus,
+  WorkflowTerminalizationClaimedRecord,
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
@@ -79,7 +80,7 @@ export type WorkflowTerminalizationObservation = Omit<
 >;
 
 export type ClaimWorkflowTerminalizationResult =
-  | { status: 'acquired' | 'renewed'; record: WorkflowTerminalizationRecord }
+  | { status: 'acquired' | 'renewed'; record: WorkflowTerminalizationClaimedRecord }
   | {
       status: 'leased' | 'lease_expired' | 'fence_conflict' | 'terminal_conflict' | 'complete';
       record: WorkflowTerminalizationObservation;
@@ -135,6 +136,23 @@ export interface DeleteCompletedWorkflowTerminalizationsInput {
 export type DeleteCompletedWorkflowTerminalizationsResult =
   | { status: 'deleted'; count: number }
   | { status: 'missing_run' | 'unsupported'; count: 0 };
+
+export interface PersistWorkflowTerminalStateInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  snapshot: WorkflowRunState;
+  resourceId?: string;
+  leaseMs?: number;
+}
+
+export type PersistWorkflowTerminalStateResult =
+  | { status: 'persisted'; record: WorkflowTerminalizationObservation }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | { status: 'invalid_snapshot' | 'missing_record' | 'missing_run' | 'unsupported' };
 
 export type PaginationInfo = {
   total: number;

@@ -8,6 +8,8 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  PersistWorkflowTerminalStateInput,
+  PersistWorkflowTerminalStateResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -58,6 +60,12 @@ export abstract class WorkflowsStorage extends StorageDomain {
     _input: DeleteCompletedWorkflowTerminalizationsInput,
   ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
     return { status: 'unsupported', count: 0 };
+  }
+
+  async persistWorkflowTerminalState(
+    _input: PersistWorkflowTerminalStateInput,
+  ): Promise<PersistWorkflowTerminalStateResult> {
+    return { status: 'unsupported' };
   }
 
   abstract updateWorkflowResults({

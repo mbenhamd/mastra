@@ -10,6 +10,8 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  PersistWorkflowTerminalStateInput,
+  PersistWorkflowTerminalStateResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   StorageWorkflowRun,
@@ -26,7 +28,10 @@ import {
   claimWorkflowTerminalizationRecord,
   copyWorkflowTerminalizationRecord,
   observeWorkflowTerminalizationRecord,
+  persistWorkflowTerminalStateRecord,
   releaseWorkflowTerminalizationRecord,
+  validateWorkflowTerminalizationClaim,
+  validateWorkflowTerminalizationFence,
 } from './terminalization';
 
 /**
@@ -56,6 +61,21 @@ import {
 /** @internal Exported for testing only. */
 export function cloneRunData<T>(value: T): T {
   return deepCloneForRun(value, new WeakMap()) as T;
+}
+
+function materializeTerminalSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
+  const materialized = cloneRunData(snapshot);
+  const runId = materialized.runId;
+  const status = materialized.status;
+  // The canonical snapshot is data, not an executable wrapper. Flatten its
+  // top-level prototype so inherited accessors cannot change journal evidence
+  // after validation; nested values keep cloneRunData's richer semantics.
+  Object.setPrototypeOf(materialized, Object.prototype);
+  Object.defineProperties(materialized, {
+    runId: { configurable: true, enumerable: true, writable: true, value: runId },
+    status: { configurable: true, enumerable: true, writable: true, value: status },
+  });
+  return materialized;
 }
 
 function deepCloneForRun(value: unknown, seen: WeakMap<object, unknown>): unknown {
@@ -208,12 +228,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async claimWorkflowTerminalization(
     input: ClaimWorkflowTerminalizationInput,
   ): Promise<ClaimWorkflowTerminalizationResult> {
-    const key = this.getTerminalizationKey(input.workflowName, input.runId);
+    const operation: ClaimWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      eventKey: input.eventKey,
+      terminalStatus: input.terminalStatus,
+      ownerId: input.ownerId,
+      leaseMs: input.leaseMs,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationClaim(operation);
+    const key = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const existing = this.db.workflowTerminalizations.get(key);
-    if (!existing && !this.db.workflows.has(this.getWorkflowKey(input.workflowName, input.runId))) {
+    if (!existing && !this.db.workflows.has(this.getWorkflowKey(operation.workflowName, operation.runId))) {
       return { status: 'missing_run' };
     }
-    const result = claimWorkflowTerminalizationRecord(existing, input, Date.now(), randomUUID());
+    const result = claimWorkflowTerminalizationRecord(existing, operation, Date.now(), randomUUID());
     if (result.status === 'acquired' || result.status === 'renewed') {
       this.db.workflowTerminalizations.set(key, copyWorkflowTerminalizationRecord(result.record));
       return result;
@@ -224,9 +255,15 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   async getWorkflowTerminalization(input: GetWorkflowTerminalizationInput): Promise<GetWorkflowTerminalizationResult> {
-    const record = this.db.workflowTerminalizations.get(this.getTerminalizationKey(input.workflowName, input.runId));
+    const operation: GetWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+    };
+    const record = this.db.workflowTerminalizations.get(
+      this.getTerminalizationKey(operation.workflowName, operation.runId),
+    );
     if (record) return { status: 'found', record: observeWorkflowTerminalizationRecord(record) };
-    return this.db.workflows.has(this.getWorkflowKey(input.workflowName, input.runId))
+    return this.db.workflows.has(this.getWorkflowKey(operation.workflowName, operation.runId))
       ? { status: 'missing_record' }
       : { status: 'missing_run' };
   }
@@ -234,12 +271,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async advanceWorkflowTerminalization(
     input: AdvanceWorkflowTerminalizationInput,
   ): Promise<AdvanceWorkflowTerminalizationResult> {
-    const key = this.getTerminalizationKey(input.workflowName, input.runId);
+    const operation: AdvanceWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      expectedPhase: input.expectedPhase,
+      nextPhase: input.nextPhase,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const key = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const existing = this.db.workflowTerminalizations.get(key);
-    if (!existing && !this.db.workflows.has(this.getWorkflowKey(input.workflowName, input.runId))) {
+    if (!existing && !this.db.workflows.has(this.getWorkflowKey(operation.workflowName, operation.runId))) {
       return { status: 'missing_run' };
     }
-    const result = advanceWorkflowTerminalizationRecord(existing, input, Date.now());
+    const result = advanceWorkflowTerminalizationRecord(existing, operation, Date.now());
     if (result.status === 'advanced') {
       this.db.workflowTerminalizations.set(key, copyWorkflowTerminalizationRecord(result.record));
     }
@@ -251,12 +299,20 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async releaseWorkflowTerminalization(
     input: ReleaseWorkflowTerminalizationInput,
   ): Promise<ReleaseWorkflowTerminalizationResult> {
-    const key = this.getTerminalizationKey(input.workflowName, input.runId);
+    const operation: ReleaseWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const key = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const existing = this.db.workflowTerminalizations.get(key);
-    if (!existing && !this.db.workflows.has(this.getWorkflowKey(input.workflowName, input.runId))) {
+    if (!existing && !this.db.workflows.has(this.getWorkflowKey(operation.workflowName, operation.runId))) {
       return { status: 'missing_run' };
     }
-    const result = releaseWorkflowTerminalizationRecord(existing, input, Date.now());
+    const result = releaseWorkflowTerminalizationRecord(existing, operation, Date.now());
     if (result.status === 'released') {
       this.db.workflowTerminalizations.set(key, copyWorkflowTerminalizationRecord(result.record));
     }
@@ -268,13 +324,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async deleteCompletedWorkflowTerminalizations(
     input: DeleteCompletedWorkflowTerminalizationsInput,
   ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
-    const olderThan = input.olderThan.getTime();
+    const operation: DeleteCompletedWorkflowTerminalizationsInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      olderThan: input.olderThan,
+    };
+    const olderThan = operation.olderThan.getTime();
     if (Number.isNaN(olderThan)) throw new TypeError('olderThan must be a valid Date');
 
-    const key = this.getTerminalizationKey(input.workflowName, input.runId);
+    const key = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const record = this.db.workflowTerminalizations.get(key);
     if (!record) {
-      return this.db.workflows.has(this.getWorkflowKey(input.workflowName, input.runId))
+      return this.db.workflows.has(this.getWorkflowKey(operation.workflowName, operation.runId))
         ? { status: 'deleted', count: 0 }
         : { status: 'missing_run', count: 0 };
     }
@@ -283,6 +344,50 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       return { status: 'deleted', count: 1 };
     }
     return { status: 'deleted', count: 0 };
+  }
+
+  async persistWorkflowTerminalState(
+    input: PersistWorkflowTerminalStateInput,
+  ): Promise<PersistWorkflowTerminalStateResult> {
+    // Read the operation envelope exactly once. Accessor-backed inputs must not
+    // be able to point the journal lookup and snapshot write at different runs.
+    const operation: PersistWorkflowTerminalStateInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      snapshot: input.snapshot,
+      resourceId: input.resourceId,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const existingJournal = this.db.workflowTerminalizations.get(journalKey);
+    const existingRun = this.db.workflows.get(workflowKey);
+    if (!existingJournal && !existingRun) return { status: 'missing_run' };
+    const result = persistWorkflowTerminalStateRecord(
+      existingJournal,
+      operation,
+      Date.now(),
+      materializeTerminalSnapshot,
+    );
+    if (result.status === 'advanced') {
+      if (!existingRun) return { status: 'missing_run' };
+      const now = new Date(result.record.updatedAt);
+      this.db.workflows.set(workflowKey, {
+        ...existingRun,
+        resourceId: operation.resourceId ?? existingRun.resourceId,
+        snapshot: result.snapshot,
+        updatedAt: now,
+      });
+      this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(result.record));
+      return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
+    }
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result;
   }
 
   async dangerouslyClearAll(): Promise<void> {

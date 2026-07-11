@@ -26,6 +26,10 @@ export function getDefaultUpdatedPeerDependencies(): UpdatedPeerDependencies {
   };
 }
 
+function usesWorkspaceProtocol(range: string | undefined): boolean {
+  return range?.startsWith('workspace:') ?? false;
+}
+
 function getNextMajorVersion(version: string): string | null {
   return semver.inc(version, 'major');
 }
@@ -107,7 +111,10 @@ function collectDirectUpdates(versionBumps: VersionBumps, context: UpdateContext
     const pkgInfo = context.packagesByName.get(name);
     if (!pkgInfo) continue;
 
-    if (pkgInfo.packageJson?.peerDependencies?.[corePackage]) {
+    if (
+      pkgInfo.packageJson?.peerDependencies?.[corePackage] &&
+      !usesWorkspaceProtocol(pkgInfo.packageJson.peerDependencies[corePackage])
+    ) {
       const cloned = JSON.parse(JSON.stringify(pkgInfo.packageJson));
       cloned.peerDependencies[corePackage] = `>=${context.nextCoreVersion}-0 <${context.nextMajorVersion}-0`;
       if (cloned.peerDependencies[corePackage] !== pkgInfo.packageJson.peerDependencies?.[corePackage]) {
@@ -128,7 +135,11 @@ function collectIndirectUpdates(
   for (const pkg of context.packages) {
     if (pkg.packageJson.name === corePackage) continue;
 
-    if (!directUpdatedPackages.has(pkg.packageJson.name) && pkg.packageJson.peerDependencies?.[corePackage]) {
+    if (
+      !directUpdatedPackages.has(pkg.packageJson.name) &&
+      pkg.packageJson.peerDependencies?.[corePackage] &&
+      !usesWorkspaceProtocol(pkg.packageJson.peerDependencies[corePackage])
+    ) {
       const cloned = JSON.parse(JSON.stringify(pkg.packageJson));
       const [before] = cloned.peerDependencies[corePackage].split(' ');
       cloned.peerDependencies[corePackage] = `${before} <${context.nextMajorVersion}-0`;

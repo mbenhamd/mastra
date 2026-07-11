@@ -19,8 +19,14 @@ function findPackageJsonFiles(dir, basePath = '') {
 
   for (const entry of entries) {
     const fullPath = join(dir, entry);
-    const stat = statSync(fullPath);
     const relativePath = join(basePath, entry);
+    let stat;
+    try {
+      stat = statSync(fullPath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
 
     if (entry === 'node_modules' || entry === 'dist' || entry === 'build' || entry === '.pnpm') {
       continue;
@@ -58,9 +64,20 @@ function getRuntimeWorkspaceDeps(packageJson) {
   };
 }
 
+function resolveWorkspaceRange(range) {
+  if (!range.startsWith('workspace:')) return range;
+  const selector = range.slice('workspace:'.length);
+  if (selector === '*') return coreVersion;
+  if (selector === '^') return `^${coreVersion}`;
+  if (selector === '~') return `~${coreVersion}`;
+  return selector;
+}
+
 function coreRangeSubset(range, requiredRange) {
   try {
-    return semver.subset(range, requiredRange, { includePrerelease: true });
+    return semver.subset(resolveWorkspaceRange(range), resolveWorkspaceRange(requiredRange), {
+      includePrerelease: true,
+    });
   } catch {
     return false;
   }
@@ -97,7 +114,7 @@ for (const packageInfo of packages) {
   const corePeerDep = getCorePeerDep(packageInfo.json);
 
   if (corePeerDep) {
-    const isValid = semver.satisfies(coreVersion, corePeerDep, { includePrerelease: true });
+    const isValid = semver.satisfies(coreVersion, resolveWorkspaceRange(corePeerDep), { includePrerelease: true });
 
     versionResults.push({
       package: packageInfo.name,
