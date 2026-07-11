@@ -501,29 +501,16 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_THREADS', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            ...(filter?.resourceId && { resourceId: filter.resourceId }),
-            hasMetadataFilter: !!filter?.metadata,
-            page,
-          },
+    } catch {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_THREADS',
+        text: 'Failed to list PostgreSQL threads',
+        details: {
+          hasResourceIdFilter: Boolean(filter?.resourceId),
+          hasMetadataFilter: Boolean(filter?.metadata),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        threads: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      });
     }
   }
 
@@ -835,6 +822,30 @@ export class MemoryPG extends MemoryStorage {
     } satisfies MastraDBMessage;
   }
 
+  private createAndTrackSafeReadError({
+    operation,
+    text,
+    details,
+  }: {
+    operation: 'LIST_THREADS' | 'LIST_MESSAGES_BY_ID' | 'LIST_MESSAGES' | 'LIST_MESSAGES_BY_RESOURCE_ID';
+    text: string;
+    details: Record<string, string | number | boolean>;
+  }): MastraError {
+    const definition = {
+      id: createStorageErrorId('PG', operation, 'FAILED'),
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.THIRD_PARTY,
+      text,
+      details,
+    } as const;
+    // Do not retain the driver error as `cause`: Mastra error normalization can later add `toJSON` to a
+    // plain Error, which would make driver messages, query text, or connection details serializable.
+    const error = new MastraError(definition, new Error(text));
+    this.logger?.error?.(error.toString());
+    this.logger?.trackException(error);
+    return error;
+  }
+
   public async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messageIds.length === 0) return { messages: [] };
     const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
@@ -853,21 +864,12 @@ export class MemoryPG extends MemoryStorage {
         'memory',
       );
       return { messages: list.get.all.db() };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_ID', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            messageIds: JSON.stringify(messageIds),
-          },
-        },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return { messages: [] };
+    } catch {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES_BY_ID',
+        text: 'Failed to list PostgreSQL messages by ID',
+        details: { messageIdCount: messageIds.length },
+      });
     }
   }
 
@@ -1010,28 +1012,17 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            threadId: Array.isArray(threadId) ? threadId.join(',') : threadId,
-            resourceId: resourceId ?? '',
-          },
+    } catch {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES',
+        text: 'Failed to list PostgreSQL messages',
+        details: {
+          threadIdCount: threadIds.length,
+          hasResourceId: resourceId !== undefined,
+          hasIncludeTargets: Boolean(include?.length),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      });
     }
   }
 
@@ -1182,27 +1173,16 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            resourceId: resourceId ?? '',
-          },
+    } catch {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
+        text: 'Failed to list PostgreSQL messages by resource ID',
+        details: {
+          hasResourceId: Boolean(resourceId),
+          hasIncludeTargets: Boolean(include?.length),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      });
     }
   }
 
