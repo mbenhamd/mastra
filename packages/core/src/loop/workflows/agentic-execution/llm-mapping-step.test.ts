@@ -4,10 +4,15 @@ import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
 import { RequestContext } from '../../../request-context';
 import { ToolStream } from '../../../tools/stream';
-import { createStep } from '../../../workflows';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../../../workflows/constants';
 import type { ExecuteFunctionParams } from '../../../workflows/step';
+import { createStep } from '../../../workflows/workflow';
 import { createLLMMappingStep } from './llm-mapping-step';
+
+vi.mock('../../../workflows/workflow', () => ({
+  createStep: (config: unknown) => config,
+  Workflow: class {},
+}));
 
 type ToolCallOutput = {
   toolCallId: string;
@@ -17,6 +22,7 @@ type ToolCallOutput = {
   error?: Error;
   providerMetadata?: Record<string, any>;
   providerExecuted?: boolean;
+  approval?: { id: string; approved: boolean; reason?: string };
 };
 
 describe('createLLMMappingStep HITL behavior', () => {
@@ -653,6 +659,81 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     // Loop should continue for self-recovery
     expect(bail).not.toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('should persist a decline when it occurs alongside a tool execution error', async () => {
+    (messageList.updateToolInvocation as Mock).mockImplementation(
+      part => part.toolInvocation.toolCallId !== 'call-denied',
+    );
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-error',
+        toolName: 'failingTool',
+        args: {},
+        error: new Error('Tool failed'),
+      },
+      {
+        toolCallId: 'call-denied',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        approval: { id: 'call-denied', approved: false, reason: 'Not safe' },
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'output-denied',
+          toolCallId: 'call-denied',
+          approval: { id: 'call-denied', approved: false, reason: 'Not safe' },
+        }),
+      }),
+    );
+    expect(messageList.add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              toolInvocation: expect.objectContaining({
+                state: 'output-denied',
+                toolCallId: 'call-denied',
+              }),
+            }),
+          ],
+        }),
+      }),
+      'response',
+    );
+    expect(bail).not.toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('should persist approval provenance when an approved tool throws', async () => {
+    const approval = { id: 'call-approved', approved: true };
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-approved',
+        toolName: 'approvedTool',
+        args: {},
+        error: new Error('Tool failed after approval'),
+        approval,
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'call-approved',
+          approval,
+        }),
+      }),
+    );
   });
 
   it('should continue the loop when multiple tool execution errors occur in the same turn', async () => {

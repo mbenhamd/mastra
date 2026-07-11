@@ -286,7 +286,46 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         return withToolPayloadTransformMetadata(withToolPayloadTransformMetadata(chunk, inputTransform), transform);
       }
 
-      if (inputData?.some(toolCall => toolCall?.result === undefined && !toolCall.providerExecuted)) {
+      // A declined approval has no `result` but is fully resolved — it must not be mistaken for a
+      // pending HITL/deferred tool call (which would otherwise suspend or stall the loop).
+      const isDeniedApproval = (toolCall: { approval?: { approved?: boolean } }) =>
+        toolCall?.approval?.approved === false;
+      const persistDeniedApproval = (toolCall: z.infer<typeof toolCallOutputSchema>) => {
+        const deniedPart = {
+          type: 'tool-invocation' as const,
+          toolInvocation: {
+            state: 'output-denied' as const,
+            toolCallId: toolCall.toolCallId,
+            toolName: sanitizeToolName(toolCall.toolName),
+            args: toolCall.args,
+            approval: {
+              id: toolCall.approval!.id,
+              approved: false,
+              reason: toolCall.approval!.reason,
+            },
+          },
+        };
+
+        if (!rest.messageList.updateToolInvocation(deniedPart)) {
+          // A recalled or provider-shaped history can be missing the original call part. Retain
+          // the resolved denial as a response instead of silently dropping the user decision.
+          rest.messageList.add(
+            {
+              id: _internal?.generateId?.() ?? crypto.randomUUID(),
+              role: 'assistant',
+              content: { format: 2, parts: [deniedPart] },
+              createdAt: new Date(),
+            },
+            'response',
+          );
+        }
+      };
+
+      if (
+        inputData?.some(
+          toolCall => toolCall?.result === undefined && !toolCall.providerExecuted && !isDeniedApproval(toolCall),
+        )
+      ) {
         const errorResults = inputData.filter(toolCall => toolCall?.error && !toolCall.providerExecuted);
 
         if (errorResults?.length) {
@@ -318,6 +357,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 toolName: sanitizeToolName(toolCall.toolName),
                 args: toolCall.args,
                 result: toolCall.error?.message ?? toolCall.error,
+                ...(toolCall.approval ? { approval: toolCall.approval } : {}),
               },
               ...(withToolPayloadTransformProviderMetadata(
                 toolCall.providerMetadata as ProviderMetadata,
@@ -343,9 +383,17 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         // Check for pending HITL tool calls (tools with no result and no error).
         // In mixed turns with errors and pending HITL tools,
         // the HITL suspension path should take priority over continuing the loop.
-        const hasPendingHITL = inputData.some(tc => tc.result === undefined && !tc.error && !tc.providerExecuted);
+        const hasPendingHITL = inputData.some(
+          tc => tc.result === undefined && !tc.error && !tc.providerExecuted && !isDeniedApproval(tc),
+        );
 
         if (errorResults?.length > 0 && !hasPendingHITL) {
+          // A decline is resolved even though it has no result. Persist it before the early
+          // error-recovery return so mixed error + decline turns do not lose the decision.
+          for (const toolCall of inputData.filter(isDeniedApproval)) {
+            persistDeniedApproval(toolCall);
+          }
+
           // Process any successful tool results from this turn before continuing.
           // In a mixed turn (e.g., one valid tool + one hallucinated), the successful
           // results need their chunks emitted and messages added to the messageList.
@@ -393,6 +441,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                     toolName: sanitizeToolName(toolCall.toolName),
                     args: toolCall.args,
                     result: toolCall.result,
+                    // Preserve the approval decision for an approved approval-gated tool in a mixed
+                    // turn (one tool errored, another approved) so it round-trips on recall too.
+                    ...(toolCall.approval ? { approval: toolCall.approval } : {}),
                   },
                   ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
                     ? {
@@ -441,6 +492,13 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
 
       if (inputData?.length) {
         for (const toolCall of inputData) {
+          // A declined approval has no `result`: persist it as `output-denied` with the approval
+          // decision (rather than skipping it as a deferred call) and emit no tool-result chunk.
+          if (isDeniedApproval(toolCall)) {
+            persistDeniedApproval(toolCall);
+            continue;
+          }
+
           // No result yet — skip emitting a chunk. For deferred provider-executed tools
           // (e.g. Anthropic web_search), the result arrives in a later step and is handled
           // by processOutputStream's 'tool-result' case in llm-execution-step.
@@ -486,6 +544,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 toolName: sanitizeToolName(toolCall.toolName),
                 args: toolCall.args,
                 result: toolCall.result,
+                // Preserve the approval decision for an approved approval-gated tool so it
+                // round-trips on recall as `approval: { approved: true }`.
+                ...(toolCall.approval ? { approval: toolCall.approval } : {}),
               },
               ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
                 ? {

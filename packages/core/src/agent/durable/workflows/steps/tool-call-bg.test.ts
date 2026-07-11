@@ -4,6 +4,10 @@ import { createToolCallIdentityDigest } from '../../../tool-call-identity';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableToolCallStep } from './tool-call';
 
+vi.mock('../../../../workflows', () => ({
+  createStep: (config: unknown) => config,
+}));
+
 vi.mock('../../../../background-tasks/create', () => ({
   createBackgroundTask: vi.fn(),
 }));
@@ -14,7 +18,7 @@ vi.mock('../../../../background-tasks/resolve-config', () => ({
 
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
-  toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),
 }));
 
 vi.mock('../../stream-adapter', () => ({
@@ -62,6 +66,7 @@ function makeInitData(overrides: Record<string, any> = {}) {
 function makeMessageList() {
   return {
     updateToolInvocation: vi.fn().mockReturnValue(true),
+    updateMessageMetadataByToolCallId: vi.fn().mockReturnValue(true),
     add: vi.fn(),
   };
 }
@@ -315,7 +320,7 @@ describe('durable tool-call background task dispatch', () => {
     expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
   });
 
-  it('onExecution hook updates tool invocation metadata with startedAt/taskId', async () => {
+  it('onExecution hook updates message metadata with startedAt/taskId', async () => {
     const pubsub = mockPubsub();
     const { messageList } = setupRegistry();
     const initData = makeInitData();
@@ -349,14 +354,8 @@ describe('durable tool-call background task dispatch', () => {
       startedAt,
     });
 
-    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'tool-invocation',
-        toolInvocation: expect.objectContaining({
-          state: 'call',
-          toolCallId: TOOL_CALL_ID,
-        }),
-      }),
+    expect(messageList.updateMessageMetadataByToolCallId).toHaveBeenCalledWith(
+      TOOL_CALL_ID,
       expect.objectContaining({
         backgroundTasks: expect.objectContaining({
           [TOOL_CALL_ID]: expect.objectContaining({
@@ -366,6 +365,7 @@ describe('durable tool-call background task dispatch', () => {
         }),
       }),
     );
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
   });
 
   it('onChunk emits tool-call + tool-result chunks via PubSub on completion', async () => {
