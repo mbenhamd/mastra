@@ -15,6 +15,22 @@ export const isSupportedLanguageModel = (
   return supportedLanguageModelSpecifications.includes(model.specificationVersion);
 };
 
+export function notifyStreamObserver(
+  onStream: ((stream: Awaited<ReturnType<Agent['stream']>>) => void | Promise<void>) | undefined,
+  stream: Awaited<ReturnType<Agent['stream']>>,
+) {
+  if (!onStream) {
+    return;
+  }
+  try {
+    void Promise.resolve(onStream(stream)).catch(error => {
+      console.warn('Error in stream observer callback.', error);
+    });
+  } catch (error) {
+    console.warn('Error in stream observer callback.', error);
+  }
+}
+
 export async function tryGenerateWithJsonFallback<
   SCHEMA extends StandardSchemaWithJSON,
   OUTPUT extends InferStandardSchemaOutput<SCHEMA>,
@@ -54,6 +70,7 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
   prompt: MessageListInput,
   options: AgentExecutionOptionsBase<OUTPUT> & {
     structuredOutput: StructuredOutputOptions<OUTPUT>;
+    onStream?: (stream: Awaited<ReturnType<Agent['stream']>>) => void | Promise<void>;
   },
 ) {
   if (!options.structuredOutput?.schema) {
@@ -65,8 +82,11 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
     });
   }
 
+  const { onStream, ...streamOptions } = options;
+
   try {
-    const result = await agent.stream(prompt, options);
+    const result = await agent.stream(prompt, streamOptions);
+    notifyStreamObserver(onStream, result as unknown as Awaited<ReturnType<Agent['stream']>>);
     const object = await result.object;
     if (!object) {
       throw new MastraError({
@@ -79,10 +99,12 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
     return result;
   } catch (error) {
     console.warn('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
-    return await agent.stream(prompt, {
-      ...options,
-      structuredOutput: { ...options.structuredOutput, jsonPromptInjection: true },
+    const result = await agent.stream(prompt, {
+      ...streamOptions,
+      structuredOutput: { ...streamOptions.structuredOutput, jsonPromptInjection: true },
     });
+    notifyStreamObserver(onStream, result as unknown as Awaited<ReturnType<Agent['stream']>>);
+    return result;
   }
 }
 

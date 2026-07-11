@@ -289,6 +289,34 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
   }
 
   /**
+   * Returns a bounded snapshot for observability span input.
+   *
+   * Unlike `toJSON`, this method never traverses stored objects. It redacts the
+   * reserved raw auth token and replaces non-primitive values with type labels,
+   * preventing the internal registry from exposing auth or nested runtime state
+   * when observability serializers inspect a RequestContext instance.
+   */
+  public serializeForSpan(): Record<string, unknown> {
+    const safe: Record<string, unknown> = {};
+    for (const [key, value] of this.registry.entries()) {
+      if (key === MASTRA_AUTH_TOKEN_KEY) {
+        safe[key] = '[REDACTED]';
+      } else if (
+        value === null ||
+        value === undefined ||
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean'
+      ) {
+        safe[key] = value;
+      } else {
+        safe[key] = `[${typeof value}]`;
+      }
+    }
+    return safe;
+  }
+
+  /**
    * Get all values as a typed object for destructuring.
    * Returns Record<string, any> when untyped, or the Values type when typed.
    *

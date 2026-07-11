@@ -3,7 +3,7 @@ import { z } from 'zod/v4';
 import { Agent, isSupportedLanguageModel } from '../agent';
 import type { MastraDBMessage, MastraMessagePart, MastraToolInvocationPart } from '../agent/message-list';
 import type { AgentMemoryOption, ToolsInput } from '../agent/types';
-import { tryStreamWithJsonFallback } from '../agent/utils';
+import { notifyStreamObserver, tryStreamWithJsonFallback } from '../agent/utils';
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import { resolveModelConfig } from '../llm/model/resolve-model';
 import type { MastraModelConfig } from '../llm/model/shared.types';
@@ -553,7 +553,7 @@ class MastraScorer<
         output: prepared.output,
         groundTruth: prepared.groundTruth,
         expectedTrajectory: prepared.expectedTrajectory,
-        requestContext: normalizedRequestContext,
+        requestContext: normalizedRequestContext?.serializeForSpan(),
       },
       attributes: {
         scorerId: this.id,
@@ -574,6 +574,11 @@ class MastraScorer<
       runId,
       ...(evalSpan?.traceId ? { scoreTraceId: evalSpan.traceId } : {}),
     };
+    Object.defineProperty(run, 'serializeForSpan', {
+      configurable: true,
+      enumerable: false,
+      value: () => this.createScorerSpanRun(run),
+    });
     const scorerObservabilityContext = createObservabilityContext({ currentSpan: evalSpan });
 
     let workflow;
@@ -715,6 +720,7 @@ class MastraScorer<
           const { run } = getInitData<{ run: ScorerRun<TInput, TRunOutput> }>();
 
           const context = this.createScorerContext(scorerStep.name, run, accumulatedResults);
+          const spanContext = this.createScorerSpanContext(scorerStep.name, run, accumulatedResults);
           const currentSpan = observabilityContext.tracingContext.currentSpan;
           const scorerRunSpan =
             currentSpan?.type === SpanType.SCORER_RUN
@@ -725,7 +731,7 @@ class MastraScorer<
             name: `scorer step: '${scorerStep.name}'`,
             entityType: EntityType.SCORER,
             entityId: this.config.id ?? this.config.name,
-            input: context,
+            input: spanContext,
             attributes: {
               step: scorerStep.name,
               stepType: scorerStep.isPromptObject ? 'prompt' : 'function',
@@ -851,6 +857,21 @@ class MastraScorer<
     return { run, results: accumulatedResults };
   }
 
+  private createScorerSpanContext(
+    stepName: string,
+    run: ScorerRun<TInput, TRunOutput>,
+    accumulatedResults: Record<string, any>,
+  ) {
+    return this.createScorerContext(stepName, this.createScorerSpanRun(run), accumulatedResults);
+  }
+
+  private createScorerSpanRun(run: ScorerRun<TInput, TRunOutput>) {
+    return {
+      ...run,
+      requestContext: this.normalizeRunRequestContext(run.requestContext)?.serializeForSpan(),
+    };
+  }
+
   private async executeFunctionStep(scorerStep: ScorerStepDefinition, context: any) {
     return await scorerStep.definition(context);
   }
@@ -949,7 +970,7 @@ class MastraScorer<
       let result;
       if (isSupportedLanguageModel(resolvedModel)) {
         result = await judge.stream(prompt, judgeRunOptions);
-        void onStream?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
+        notifyStreamObserver(onStream, result as unknown as Awaited<ReturnType<Agent['stream']>>);
       } else {
         result = await judge.generateLegacy(prompt, judgeRunOptions);
       }

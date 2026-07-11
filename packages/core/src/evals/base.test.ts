@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../agent';
 import { SpanType } from '../observability';
+import { MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import { createMockModel } from '../test-utils/llm-mock';
 import { createScorer } from './base';
 import {
@@ -58,7 +59,10 @@ function createMockSpan(traceId: string, type: SpanType) {
   return span;
 }
 
-function createMockMastra(options?: { addScoreImpl?: ReturnType<typeof vi.fn>; startSpan?: () => unknown }) {
+function createMockMastra(options?: {
+  addScoreImpl?: ReturnType<typeof vi.fn>;
+  startSpan?: (options: any) => unknown;
+}) {
   const logger = {
     debug: vi.fn(),
     warn: vi.fn(),
@@ -351,6 +355,86 @@ describe('createScorer', () => {
       }
     });
 
+    it('does not retry the judge when the stream observer throws', async () => {
+      const judgeStream = {
+        object: Promise.resolve({ score: 1 }),
+        fullStream: new ReadableStream(),
+      } as any;
+      const streamSpy = vi.spyOn(Agent.prototype, 'stream').mockResolvedValue(judgeStream);
+      const observerError = new Error('observer failed');
+      const onStream = vi.fn(() => {
+        throw observerError;
+      });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const model = createMockModel({ mockText: { score: 1 }, version: 'v2' });
+        const scorer = createScorer({
+          id: 'judge-stream-observer-failure-scorer',
+          name: 'judge-stream-observer-failure-scorer',
+          description: 'Keeps observer failures outside structured-output fallback',
+          judge: {
+            model,
+            instructions: 'Test instructions',
+            onStream,
+          },
+        }).generateScore({
+          description: 'score',
+          createPrompt: () => 'score this',
+        });
+
+        const result = await scorer.run(testData.scoringInput);
+
+        expect(result.score).toBe(1);
+        expect(streamSpy).toHaveBeenCalledTimes(1);
+        expect(onStream).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith('Error in stream observer callback.', observerError);
+      } finally {
+        warnSpy.mockRestore();
+        streamSpy.mockRestore();
+      }
+    });
+
+    it('continues a reason judge when the stream observer throws', async () => {
+      const judgeStream = {
+        text: Promise.resolve('reason from judge'),
+        fullStream: new ReadableStream(),
+      } as any;
+      const streamSpy = vi.spyOn(Agent.prototype, 'stream').mockResolvedValue(judgeStream);
+      const observerError = new Error('reason observer failed');
+      const onStream = vi.fn(() => {
+        throw observerError;
+      });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const model = createMockModel({ mockText: 'reason from judge', version: 'v2' });
+        const scorer = createScorer({
+          id: 'reason-stream-observer-failure-scorer',
+          name: 'reason-stream-observer-failure-scorer',
+          description: 'Keeps reason stream observer failures outside scorer execution',
+          judge: {
+            model,
+            instructions: 'Test instructions',
+            onStream,
+          },
+        })
+          .generateScore(() => 1)
+          .generateReason({
+            description: 'reason',
+            createPrompt: () => 'explain the score',
+          });
+
+        const result = await scorer.run(testData.scoringInput);
+
+        expect(result.reason).toBe('reason from judge');
+        expect(streamSpy).toHaveBeenCalledTimes(1);
+        expect(onStream).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith('Error in stream observer callback.', observerError);
+      } finally {
+        warnSpy.mockRestore();
+        streamSpy.mockRestore();
+      }
+    });
+
     it('lets the per-step judge override the scorer-level jsonPromptInjection', async () => {
       const streamSpy = vi.spyOn(Agent.prototype, 'stream');
       try {
@@ -620,6 +704,78 @@ describe('createScorer', () => {
           },
         }),
       });
+    });
+
+    it('redacts auth and bounds RequestContext values in scorer span input', async () => {
+      const scorerRunSpan = createMockSpan('score-trace-safe', SpanType.SCORER_RUN);
+      const startSpan = vi.fn((_options: unknown) => scorerRunSpan);
+      const mockMastra = createMockMastra({ startSpan });
+      const requestContext = {
+        [MASTRA_AUTH_TOKEN_KEY]: 'Bearer SECRET_SCORER_AUTH',
+        userId: 'user-123',
+        nested: { secret: 'SECRET_NESTED_CONTEXT' },
+      };
+      let executionRun: Record<string, any> | undefined;
+
+      const scorer = createScorer({
+        id: 'safe-context-scorer',
+        description: 'Safe context scorer',
+      }).generateScore(({ run }) => {
+        executionRun = run;
+        expect(run.requestContext).toBe(requestContext);
+        expect((run.requestContext as Record<string, unknown>)[MASTRA_AUTH_TOKEN_KEY]).toBe(
+          'Bearer SECRET_SCORER_AUTH',
+        );
+        return 1;
+      });
+      scorer.__registerMastra(mockMastra as any);
+
+      await scorer.run({ ...testData.scoringInput, requestContext });
+
+      expect(startSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            requestContext: {
+              [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
+              userId: 'user-123',
+              nested: '[object]',
+            },
+          }),
+        }),
+      );
+      expect(JSON.stringify(startSpan.mock.calls)).not.toContain('SECRET_');
+
+      const scorerStepCall = scorerRunSpan.createChildSpan.mock.calls.find(
+        ([options]: [{ type: SpanType }]) => options.type === SpanType.SCORER_STEP,
+      );
+      expect(scorerStepCall?.[0]).toEqual(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            run: expect.objectContaining({
+              requestContext: {
+                [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
+                userId: 'user-123',
+                nested: '[object]',
+              },
+            }),
+          }),
+        }),
+      );
+      expect(JSON.stringify(scorerStepCall)).not.toContain('SECRET_');
+
+      expect(executionRun?.requestContext).toBe(requestContext);
+      expect(Object.keys(executionRun ?? {})).not.toContain('serializeForSpan');
+      const internalSpanInput = executionRun?.serializeForSpan();
+      expect(internalSpanInput).toEqual(
+        expect.objectContaining({
+          requestContext: {
+            [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
+            userId: 'user-123',
+            nested: '[object]',
+          },
+        }),
+      );
+      expect(JSON.stringify(internalSpanInput)).not.toContain('SECRET_');
     });
 
     it('should include hasGroundTruth metadata when ground truth is provided', async () => {

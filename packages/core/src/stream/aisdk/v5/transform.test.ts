@@ -493,6 +493,12 @@ describe('convertFullStreamChunkToMastra', () => {
       expect(sanitizeToolCallInput('{"x":1}  <|call|>  ')).toBe('{"x":1}');
     });
 
+    it('should remove surrounding whitespace when a token splits a JSON lexical value', () => {
+      const sanitized = sanitizeToolCallInput('{"value": 1 <|call|> 2}');
+      expect(sanitized).toBe('{"value": 12}');
+      expect(JSON.parse(sanitized)).toEqual({ value: 12 });
+    });
+
     it('should preserve <|...|> patterns inside JSON string values', () => {
       const input = '{"text": "use <|call|> token"}';
       expect(sanitizeToolCallInput(input)).toBe('{"text": "use <|call|> token"}');
@@ -501,6 +507,19 @@ describe('convertFullStreamChunkToMastra', () => {
     it('should preserve multiple <|...|> patterns inside JSON string values', () => {
       const input = '{"prompt": "tokens: <|endoftext|> and <|call|> are special"}';
       expect(sanitizeToolCallInput(input)).toBe('{"prompt": "tokens: <|endoftext|> and <|call|> are special"}');
+    });
+
+    it('anchors token stripping at the delimiter for long whitespace prefixes', () => {
+      const input = `${' '.repeat(100_000)}<|unterminated`;
+      const matchAllSpy = vi.spyOn(String.prototype, 'matchAll');
+
+      try {
+        expect(sanitizeToolCallInput(input)).toBe('<|unterminated');
+        const pattern = matchAllSpy.mock.calls.find(([searchValue]) => searchValue instanceof RegExp)?.[0] as RegExp;
+        expect(pattern.source).toBe('<\\|[^|]*\\|>\\s*');
+      } finally {
+        matchAllSpy.mockRestore();
+      }
     });
   });
 
