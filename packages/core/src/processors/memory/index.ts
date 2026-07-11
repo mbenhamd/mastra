@@ -1,5 +1,5 @@
 export { MessageHistory } from './message-history';
-export type { MessageHistoryOptions } from './message-history';
+export type { MessageHistoryOptions, MessageHistoryToolCallFilterOptions } from './message-history';
 
 export { WorkingMemory } from './working-memory';
 export type { WorkingMemoryTemplate, WorkingMemoryConfig } from './working-memory';

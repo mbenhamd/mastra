@@ -59,7 +59,7 @@ export {
   type RegexPreset,
   type RegexFilterTripwireMetadata,
 } from './regex-filter';
-export { ToolCallFilter } from './tool-call-filter';
+export { ToolCallFilter, type ToolCallFilterOptions } from './tool-call-filter';
 
 export { AgentsMDInjector, type ToolResultReminderOptions } from '../tool-result-reminder';
 

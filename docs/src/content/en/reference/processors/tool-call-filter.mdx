@@ -30,6 +30,7 @@ const filterAfterRecentTools = new ToolCallFilter({
 // Preserve compact model-facing output for filtered completed tool results
 const filterWithCompactToolHistory = new ToolCallFilter({
   preserveModelOutput: true,
+  maxModelOutputBytes: 4096,
 })
 ```
 
@@ -67,6 +68,13 @@ const filterWithCompactToolHistory = new ToolCallFilter({
               'Preserves compact model-facing output from completed filtered tool results with providerMetadata.mastra.modelOutput. Raw tool args and raw results are removed',
             isOptional: true,
             defaultValue: 'false',
+          },
+          {
+            name: 'maxModelOutputBytes',
+            type: 'number',
+            description:
+              'Maximum UTF-8 bytes retained from each preserved model output. Oversized output is truncated with a [truncated] suffix. If the limit cannot fit the suffix, the output is omitted',
+            isOptional: true,
           },
         ],
       },
@@ -125,11 +133,14 @@ const filter = new ToolCallFilter({
 
 Set `preserveModelOutput: true` to retain compact `toModelOutput` history for completed tool results that the filter removes. This keeps the model-facing output as text in the prompt while removing the raw `toolInvocation.args` and raw `toolInvocation.result` payloads.
 
-Only completed tool results with `providerMetadata.mastra.modelOutput` are preserved. Tool calls, incomplete results, and results without stored model output are still filtered.
+Only completed tool results with `providerMetadata.mastra.modelOutput` are preserved. Tool calls, incomplete results, denied or failed results, and results without stored model output are still filtered.
+
+Mastra preserves text, JSON, error text, and error JSON output shapes stored on a completed result. "Denied or failed results" above refers to the tool invocation state, which is never compacted. For content output, Mastra preserves text parts and omits media parts. Unknown output shapes are omitted instead of serialized.
 
 ```typescript
 const filter = new ToolCallFilter({
   preserveModelOutput: true,
+  maxModelOutputBytes: 4096,
 })
 ```
 

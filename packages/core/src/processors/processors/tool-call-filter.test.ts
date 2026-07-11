@@ -38,6 +38,10 @@ describe('ToolCallFilter', () => {
   }) as (reason?: string) => never;
 
   describe('exclude all tool calls (default)', () => {
+    it('keeps runtime compatibility when null options are supplied', () => {
+      expect(() => new ToolCallFilter(null as any)).not.toThrow();
+    });
+
     it('should exclude all tool calls and tool results', async () => {
       const filter = new ToolCallFilter();
 
@@ -1334,6 +1338,148 @@ describe('ToolCallFilter', () => {
       expect(serialized).not.toContain('CIRCULAR_RAW');
     });
 
+    it('preserves text content while dropping media from model output', async () => {
+      const filter = new ToolCallFilter({ preserveModelOutput: true });
+      const messages: MastraDBMessage[] = [
+        toolMessages[0]!,
+        {
+          id: 'msg-media-output',
+          role: 'assistant',
+          content: {
+            format: 2,
+            content: '',
+            parts: [
+              {
+                type: 'tool-invocation' as const,
+                toolInvocation: {
+                  state: 'result' as const,
+                  toolCallId: 'call-media',
+                  toolName: 'mediaTool',
+                  args: { secret: 'MEDIA_ARGS' },
+                  result: { raw: 'MEDIA_RAW' },
+                },
+                providerMetadata: {
+                  mastra: {
+                    modelOutput: {
+                      type: 'content',
+                      value: [
+                        { type: 'text', text: 'Safe caption' },
+                        { type: 'media', data: 'BASE64_SENTINEL', mediaType: 'image/png' },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+          createdAt: new Date(),
+        },
+      ];
+
+      const result = await filter.processInput({
+        messages,
+        messageList: createMessageList(messages),
+        abort: mockAbort,
+      });
+
+      const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
+      expect(serialized).toContain('mediaTool result:\\nSafe caption');
+      expect(serialized).not.toContain('BASE64_SENTINEL');
+      expect(serialized).not.toContain('MEDIA_ARGS');
+      expect(serialized).not.toContain('MEDIA_RAW');
+    });
+
+    it('bounds preserved model output by UTF-8 bytes', async () => {
+      const filter = new ToolCallFilter({ preserveModelOutput: true, maxModelOutputBytes: 18 });
+      const messages: MastraDBMessage[] = [
+        toolMessages[0]!,
+        {
+          id: 'msg-bounded-output',
+          role: 'assistant',
+          content: {
+            format: 2,
+            content: '',
+            parts: [
+              {
+                type: 'tool-invocation' as const,
+                toolInvocation: {
+                  state: 'result' as const,
+                  toolCallId: 'call-bounded',
+                  toolName: 'boundedTool',
+                  args: {},
+                  result: 'raw',
+                },
+                providerMetadata: {
+                  mastra: { modelOutput: { type: 'text', value: 'éééééééééééééééé' } },
+                },
+              },
+            ],
+          },
+          createdAt: new Date(),
+        },
+      ];
+
+      const result = await filter.processInput({
+        messages,
+        messageList: createMessageList(messages),
+        abort: mockAbort,
+      });
+      const resultMessages = Array.isArray(result) ? result : result.get.all.db();
+      const text = resultMessages[1]!.content.parts.find((part: any) => part.type === 'text') as {
+        text: string;
+      };
+      const preservedOutput = text.text.replace('boundedTool result:\n', '');
+
+      expect(new TextEncoder().encode(preservedOutput).byteLength).toBeLessThanOrEqual(18);
+      expect(preservedOutput.endsWith('\n[truncated]')).toBe(true);
+      expect(preservedOutput).not.toContain('�');
+    });
+
+    it.each(['call', 'partial-call', 'approval-requested', 'approval-responded', 'output-error', 'output-denied'])(
+      'does not preserve model output for %s tool state',
+      async state => {
+        const filter = new ToolCallFilter({ preserveModelOutput: true });
+        const messages: MastraDBMessage[] = [
+          toolMessages[0]!,
+          {
+            id: `msg-${state}`,
+            role: 'assistant',
+            content: {
+              format: 2,
+              content: '',
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    state,
+                    toolCallId: `call-${state}`,
+                    toolName: 'stateTool',
+                    args: { secret: 'STATE_ARGS' },
+                    result: 'STATE_RAW',
+                  },
+                  providerMetadata: {
+                    mastra: { modelOutput: { type: 'text', value: 'STATE_MODEL_OUTPUT' } },
+                  },
+                } as any,
+              ],
+            },
+            createdAt: new Date(),
+          },
+        ];
+
+        const result = await filter.processInput({
+          messages,
+          messageList: createMessageList(messages),
+          abort: mockAbort,
+        });
+        const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
+
+        expect(serialized).not.toContain('STATE_MODEL_OUTPUT');
+        expect(serialized).not.toContain('STATE_ARGS');
+        expect(serialized).not.toContain('STATE_RAW');
+      },
+    );
+
     it('does not transform messages when exclude is empty', async () => {
       const filter = new ToolCallFilter({ exclude: [], preserveModelOutput: true });
       const messageList = createMessageList(toolMessages);
@@ -1352,10 +1498,56 @@ describe('ToolCallFilter', () => {
       expect(serialized).not.toContain('search result:\\nCompact search summary');
     });
 
+    it('filters matching legacy content.toolInvocations when no tool parts exist', async () => {
+      const filter = new ToolCallFilter({ exclude: ['search'] });
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'legacy-top-level-tools',
+          role: 'assistant',
+          content: {
+            format: 2,
+            content: 'Tool summary',
+            parts: [{ type: 'text', text: 'Tool summary' }],
+            toolInvocations: [
+              {
+                state: 'result',
+                toolCallId: 'legacy-search',
+                toolName: 'search',
+                args: { query: 'LEGACY_SEARCH_ARGS' },
+                result: 'LEGACY_SEARCH_RESULT',
+              },
+              {
+                state: 'result',
+                toolCallId: 'legacy-calculator',
+                toolName: 'calculator',
+                args: { expression: '2+2' },
+                result: 4,
+              },
+            ],
+          },
+          createdAt: new Date(),
+        },
+      ];
+
+      const result = await filter.processInput({
+        messages,
+        messageList: createMessageList(messages),
+        abort: mockAbort,
+      });
+
+      const resultMessages = Array.isArray(result) ? result : result.get.all.db();
+      const serialized = JSON.stringify(resultMessages);
+      expect(serialized).not.toContain('LEGACY_SEARCH_ARGS');
+      expect(serialized).not.toContain('LEGACY_SEARCH_RESULT');
+      expect(serialized).toContain('legacy-calculator');
+      expect(resultMessages[0]!.content.toolInvocations).toHaveLength(1);
+    });
+
     it('exposes filterAfterToolSteps and preserveModelOutput through the processor provider config', async () => {
       const parsedConfig = toolCallFilterProvider.configSchema.parse({
         filterAfterToolSteps: 0,
         preserveModelOutput: true,
+        maxModelOutputBytes: 256,
       });
       const processor = toolCallFilterProvider.createProcessor(parsedConfig);
       const messageList = createMessageList(toolMessages);
@@ -1382,6 +1574,13 @@ describe('ToolCallFilter', () => {
 
       const resultMessages = Array.isArray(result) ? result : result?.get.all.db();
       expect(JSON.stringify(resultMessages)).toContain('Compact search summary');
+    });
+
+    it('rejects non-finite model output byte limits in provider configuration', () => {
+      expect(() =>
+        toolCallFilterProvider.configSchema.parse({ maxModelOutputBytes: Number.POSITIVE_INFINITY }),
+      ).toThrow();
+      expect(() => toolCallFilterProvider.configSchema.parse({ maxModelOutputBytes: -1 })).toThrow();
     });
   });
 
@@ -1438,6 +1637,64 @@ describe('ToolCallFilter', () => {
       const result = await filter.processInputStep(mockStepArgs(messageList));
 
       expect(result.messages).toBeUndefined();
+    });
+
+    it('does not crash on legacy response messages with string content', async () => {
+      const filter = new ToolCallFilter({ filterAfterToolSteps: 1 });
+      const messages = [
+        {
+          id: 'legacy-string-response',
+          role: 'assistant',
+          content: 'Legacy assistant text',
+          createdAt: new Date(),
+        } as unknown as MastraDBMessage,
+      ];
+      const messageList = {
+        get: {
+          all: { db: () => messages },
+          response: { db: () => messages },
+        },
+      } as unknown as MessageList;
+
+      const result = await filter.processInputStep(mockStepArgs(messageList));
+
+      expect(result.messages).toEqual(messages);
+    });
+
+    it('preserves recent legacy content.toolInvocations', async () => {
+      const filter = new ToolCallFilter({ filterAfterToolSteps: 1 });
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'legacy-top-level-response',
+          role: 'assistant',
+          content: {
+            format: 2,
+            content: '',
+            parts: [],
+            toolInvocations: [
+              {
+                state: 'result',
+                toolCallId: 'recent-legacy-tool',
+                toolName: 'search',
+                args: { query: 'RECENT_LEGACY_ARGS' },
+                result: 'RECENT_LEGACY_RESULT',
+              },
+            ],
+          },
+          createdAt: new Date(),
+        },
+      ];
+      const messageList = {
+        get: {
+          all: { db: () => messages },
+          response: { db: () => messages },
+        },
+      } as unknown as MessageList;
+
+      const result = await filter.processInputStep(mockStepArgs(messageList));
+
+      expect(JSON.stringify(result.messages)).toContain('RECENT_LEGACY_ARGS');
+      expect(JSON.stringify(result.messages)).toContain('RECENT_LEGACY_RESULT');
     });
 
     it('should filter tool calls from tool steps older than filterAfterToolSteps', async () => {

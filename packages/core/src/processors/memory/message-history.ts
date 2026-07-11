@@ -6,6 +6,13 @@ import { SpanType, EntityType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
+import { filterToolCallMessages } from '../tool-call-filter-utils';
+import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
+
+export type MessageHistoryToolCallFilterOptions = Pick<
+  ToolCallFilteringOptions,
+  'exclude' | 'preserveModelOutput' | 'maxModelOutputBytes'
+>;
 
 /**
  * Options for the MessageHistory processor
@@ -13,6 +20,11 @@ import type { MemoryStorage } from '../../storage';
 export interface MessageHistoryOptions {
   storage: MemoryStorage;
   lastMessages?: number;
+  /**
+   * Opt-in filtering applied only to messages written by MessageHistory.
+   * Omit this option to preserve the existing persistence behavior.
+   */
+  toolCallFilter?: MessageHistoryToolCallFilterOptions;
 }
 
 /**
@@ -28,10 +40,12 @@ export class MessageHistory implements Processor {
   readonly name = 'MessageHistory';
   private storage: MemoryStorage;
   private lastMessages?: number;
+  private toolCallFilter?: MessageHistoryToolCallFilterOptions;
 
   constructor(options: MessageHistoryOptions) {
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
+    this.toolCallFilter = options.toolCallFilter;
   }
 
   /**
@@ -173,7 +187,7 @@ export class MessageHistory implements Processor {
    * - For client-side tools (no execute function), 'call' is the final state from the server's perspective
    */
   private filterMessagesForPersistence(messages: MastraDBMessage[]): MastraDBMessage[] {
-    return messages
+    const filteredMessages = messages
       .filter(m => m.role !== 'system')
       .map(m => {
         const newMessage = { ...m };
@@ -222,6 +236,10 @@ export class MessageHistory implements Processor {
         return newMessage;
       })
       .filter((m): m is NonNullable<typeof m> => Boolean(m));
+
+    return this.toolCallFilter === undefined
+      ? filteredMessages
+      : filterToolCallMessages(filteredMessages, this.toolCallFilter);
   }
 
   async processOutputResult(
