@@ -10,6 +10,8 @@ import type {
   WorkflowRunStatus,
   WorkflowTerminalStatus,
   WorkflowTerminalizationClaimedRecord,
+  WorkflowTerminalEffectKind,
+  WorkflowTerminalEffectRecord,
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
@@ -68,6 +70,13 @@ export interface ClaimWorkflowTerminalizationInput {
   claimToken?: string;
   /** Required with claimToken. Monotonic fencing generation returned by the original claim. */
   claimGeneration?: number;
+}
+
+export interface WorkflowTerminalizationCapabilities {
+  journalVersion?: 1;
+  producerOutboxVersion?: 1;
+  destinationReceiptVersion?: 1;
+  recoveryVersion?: 1;
 }
 
 /**
@@ -153,6 +162,66 @@ export type PersistWorkflowTerminalStateResult =
       record: WorkflowTerminalizationObservation;
     }
   | { status: 'invalid_snapshot' | 'missing_record' | 'missing_run' | 'unsupported' };
+
+export type WorkflowTerminalEffectDescriptor =
+  | {
+      kind: 'parent-workflow-step-end';
+      parentWorkflowName: string;
+      parentRunId: string;
+      parentStepId: string;
+      parentExecutionPath: number[];
+    }
+  | { kind: 'workflow-finish' };
+
+export interface PrepareWorkflowTerminalEffectInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  expectedPhase: 'run_state_persisted' | 'parent_effect_recorded';
+  effect: WorkflowTerminalEffectDescriptor;
+  leaseMs?: number;
+}
+
+export type WorkflowTerminalEffectObservation = Pick<
+  WorkflowTerminalEffectRecord,
+  'version' | 'effectKey' | 'kind' | 'payloadHash' | 'createdAt'
+>;
+
+export type PrepareWorkflowTerminalEffectResult =
+  | { status: 'prepared' | 'already_prepared'; effect: WorkflowTerminalEffectRecord }
+  | {
+      status: 'effect_conflict';
+      effect: WorkflowTerminalEffectObservation;
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status:
+        | 'invalid_transition'
+        | 'missing_effect'
+        | 'missing_terminal_state'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
+    };
+
+export interface GetWorkflowTerminalEffectForDispatchInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  kind: WorkflowTerminalEffectKind;
+}
+
+export type GetWorkflowTerminalEffectForDispatchResult =
+  | { status: 'found'; effect: WorkflowTerminalEffectRecord; snapshot: WorkflowRunState }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | { status: 'missing_effect' | 'missing_terminal_state' | 'missing_record' | 'missing_run' | 'unsupported' };
 
 export type PaginationInfo = {
   total: number;

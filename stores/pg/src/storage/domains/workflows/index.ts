@@ -7,13 +7,22 @@ import {
   TABLE_SCHEMAS,
   WorkflowsStorage,
   MAX_WORKFLOW_TERMINALIZATION_LEASE_MS,
+  MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH,
   advanceWorkflowTerminalizationRecord,
   claimWorkflowTerminalizationRecord,
   createStorageErrorId,
+  materializeWorkflowTerminalEffectDescriptor,
+  materializeWorkflowTerminalEffectKind,
   observeWorkflowTerminalizationRecord,
+  observeWorkflowTerminalEffectRecord,
   persistWorkflowTerminalStateRecord,
+  prepareWorkflowTerminalEffectRecord,
+  getWorkflowTerminalEffectForDispatchRecord,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
+  validateWorkflowTerminalEffectIntegrity,
+  validateWorkflowTerminalEffectJournalLink,
+  validateWorkflowTerminalSnapshotJournalLink,
   validateWorkflowTerminalizationFence,
 } from '@mastra/core/storage';
 import type {
@@ -25,8 +34,12 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  GetWorkflowTerminalEffectForDispatchInput,
+  GetWorkflowTerminalEffectForDispatchResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
+  PrepareWorkflowTerminalEffectInput,
+  PrepareWorkflowTerminalEffectResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -34,13 +47,22 @@ import type {
   WorkflowRun,
   WorkflowRuns,
   CreateIndexOptions,
+  WorkflowTerminalizationCapabilities,
 } from '@mastra/core/storage';
-import type { StepResult, WorkflowRunState, WorkflowTerminalizationRecord } from '@mastra/core/workflows';
+import type {
+  StepResult,
+  WorkflowRunState,
+  WorkflowTerminalEffectRecord,
+  WorkflowTerminalSnapshotRecord,
+  WorkflowTerminalizationRecord,
+} from '@mastra/core/workflows';
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
 
 const TABLE_WORKFLOW_TERMINALIZATIONS = 'mastra_workflow_terminalizations';
+const TABLE_WORKFLOW_TERMINAL_EFFECTS = 'mastra_workflow_terminal_effects';
+const TABLE_WORKFLOW_TERMINAL_SNAPSHOTS = 'mastra_workflow_terminal_snapshots';
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -82,7 +104,12 @@ export class WorkflowsPG extends WorkflowsStorage {
   #indexes?: CreateIndexOptions[];
 
   /** Tables managed by this domain */
-  static readonly MANAGED_TABLES = [TABLE_WORKFLOW_SNAPSHOT, TABLE_WORKFLOW_TERMINALIZATIONS] as const;
+  static readonly MANAGED_TABLES = [
+    TABLE_WORKFLOW_SNAPSHOT,
+    TABLE_WORKFLOW_TERMINALIZATIONS,
+    TABLE_WORKFLOW_TERMINAL_EFFECTS,
+    TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+  ] as const;
 
   constructor(config: PgDomainConfig) {
     super();
@@ -102,6 +129,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     return true;
   }
 
+  getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
+    return { journalVersion: 1, producerOutboxVersion: 1 };
+  }
+
   private terminalizationTableName(): string {
     return getTableName({
       indexName: TABLE_WORKFLOW_TERMINALIZATIONS,
@@ -111,6 +142,20 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   private workflowSnapshotTableName(): string {
     return getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
+  }
+
+  private terminalEffectTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_EFFECTS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private terminalSnapshotTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+      schemaName: getSchemaName(this.#schema),
+    });
   }
 
   private decodeTerminalizationRow(row: Record<string, unknown>, now: number): WorkflowTerminalizationRecord {
@@ -182,6 +227,75 @@ export class WorkflowsPG extends WorkflowsStorage {
       throw new TypeError('Invalid workflow terminalization record');
     }
     return record;
+  }
+
+  private decodeTerminalEffectRow(row: Record<string, unknown>, now: number): WorkflowTerminalEffectRecord {
+    const toSafeInteger = (value: unknown, field: string): number => {
+      const parsed = typeof value === 'string' ? Number(value) : value;
+      if (typeof parsed !== 'number' || !Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new TypeError(`Invalid workflow terminal effect ${field}`);
+      }
+      return parsed;
+    };
+    const common = {
+      version: toSafeInteger(row.version, 'version'),
+      effectKey: row.effect_key,
+      kind: row.effect_kind,
+      workflowName: row.workflow_name,
+      runId: row.run_id,
+      sourceEventKey: row.source_event_key,
+      terminalStatus: row.terminal_status,
+      payloadHash: row.payload_hash,
+      createdAt: toSafeInteger(row.created_at, 'created_at'),
+    };
+    const validIdentity = (value: unknown, maxLength: number) =>
+      typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+    const parentFields = [row.parent_workflow_name, row.parent_run_id, row.parent_step_id];
+    const parentExecutionPath = row.parent_execution_path;
+    if (
+      common.version !== 1 ||
+      !['parent-workflow-step-end', 'workflow-finish'].includes(common.kind as string) ||
+      !validIdentity(common.workflowName, 512) ||
+      !validIdentity(common.runId, 512) ||
+      !validIdentity(common.sourceEventKey, 1024) ||
+      !['success', 'failed', 'canceled'].includes(common.terminalStatus as string) ||
+      typeof common.effectKey !== 'string' ||
+      !/^wte:v1:[a-f0-9]{64}$/.test(common.effectKey) ||
+      typeof common.payloadHash !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(common.payloadHash) ||
+      common.createdAt > now ||
+      (common.kind === 'parent-workflow-step-end' && !parentFields.every(value => validIdentity(value, 512))) ||
+      (common.kind === 'parent-workflow-step-end' &&
+        (!Array.isArray(parentExecutionPath) ||
+          parentExecutionPath.length === 0 ||
+          parentExecutionPath.length > MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH ||
+          !parentExecutionPath.every(value => Number.isSafeInteger(value) && value >= 0))) ||
+      (common.kind === 'workflow-finish' &&
+        (!parentFields.every(value => value === null || value === undefined) ||
+          (parentExecutionPath !== null && parentExecutionPath !== undefined)))
+    ) {
+      throw new TypeError('Invalid workflow terminal effect record');
+    }
+    const effect =
+      common.kind === 'parent-workflow-step-end'
+        ? ({
+            ...common,
+            version: 1,
+            kind: common.kind,
+            terminalStatus: common.terminalStatus,
+            parentWorkflowName: row.parent_workflow_name,
+            parentRunId: row.parent_run_id,
+            parentStepId: row.parent_step_id,
+            parentExecutionPath: [...(parentExecutionPath as number[])],
+          } as WorkflowTerminalEffectRecord)
+        : ({
+            ...common,
+            version: 1,
+            kind: common.kind,
+            terminalStatus: common.terminalStatus,
+          } as WorkflowTerminalEffectRecord);
+    validateWorkflowTerminalEffectIntegrity(effect);
+    return effect;
   }
 
   private async getTerminalizationContext(
@@ -279,6 +393,96 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
   }
 
+  private async getTerminalEffectRecord(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    kind: string,
+    now: number,
+  ): Promise<WorkflowTerminalEffectRecord | undefined> {
+    const row = await t.oneOrNone<Record<string, unknown>>(
+      `SELECT * FROM ${this.terminalEffectTableName()}
+       WHERE workflow_name = $1 AND run_id = $2 AND effect_kind = $3
+       FOR UPDATE`,
+      [workflowName, runId, kind],
+    );
+    return row ? this.decodeTerminalEffectRow(row, now) : undefined;
+  }
+
+  private async insertTerminalEffectRecord(t: TxClient, effect: WorkflowTerminalEffectRecord): Promise<void> {
+    await t.none(
+      `INSERT INTO ${this.terminalEffectTableName()}
+       (workflow_name, run_id, effect_kind, version, effect_key, source_event_key, terminal_status,
+        parent_workflow_name, parent_run_id, parent_step_id, parent_execution_path, payload_hash, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        effect.workflowName,
+        effect.runId,
+        effect.kind,
+        effect.version,
+        effect.effectKey,
+        effect.sourceEventKey,
+        effect.terminalStatus,
+        effect.kind === 'parent-workflow-step-end' ? effect.parentWorkflowName : null,
+        effect.kind === 'parent-workflow-step-end' ? effect.parentRunId : null,
+        effect.kind === 'parent-workflow-step-end' ? effect.parentStepId : null,
+        effect.kind === 'parent-workflow-step-end' ? JSON.stringify(effect.parentExecutionPath) : null,
+        effect.payloadHash,
+        effect.createdAt,
+      ],
+    );
+  }
+
+  private decodeTerminalSnapshotRow(row: Record<string, unknown>, now: number): WorkflowTerminalSnapshotRecord {
+    const version = typeof row.version === 'string' ? Number(row.version) : row.version;
+    const createdAt = typeof row.created_at === 'string' ? Number(row.created_at) : row.created_at;
+    let snapshot = row.snapshot;
+    if (typeof snapshot === 'string') snapshot = JSON.parse(snapshot);
+    if (
+      version !== 1 ||
+      typeof row.workflow_name !== 'string' ||
+      row.workflow_name.length === 0 ||
+      row.workflow_name.length > 512 ||
+      typeof row.run_id !== 'string' ||
+      row.run_id.length === 0 ||
+      row.run_id.length > 512 ||
+      !['success', 'failed', 'canceled'].includes(row.terminal_status as string) ||
+      typeof createdAt !== 'number' ||
+      !Number.isSafeInteger(createdAt) ||
+      createdAt < 0 ||
+      createdAt > now ||
+      !snapshot ||
+      typeof snapshot !== 'object' ||
+      Array.isArray(snapshot) ||
+      (snapshot as WorkflowRunState).runId !== row.run_id ||
+      (snapshot as WorkflowRunState).status !== row.terminal_status
+    ) {
+      throw new TypeError('Invalid workflow terminal snapshot record');
+    }
+    return {
+      version: 1,
+      workflowName: row.workflow_name,
+      runId: row.run_id,
+      terminalStatus: row.terminal_status as WorkflowTerminalSnapshotRecord['terminalStatus'],
+      snapshot: snapshot as WorkflowRunState,
+      createdAt,
+    };
+  }
+
+  private async getTerminalSnapshotRecord(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    now: number,
+  ): Promise<WorkflowTerminalSnapshotRecord | undefined> {
+    const row = await t.oneOrNone<Record<string, unknown>>(
+      `SELECT * FROM ${this.terminalSnapshotTableName()}
+       WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+      [workflowName, runId],
+    );
+    return row ? this.decodeTerminalSnapshotRow(row, now) : undefined;
+  }
+
   private async saveTerminalWorkflowSnapshot(
     t: TxClient,
     input: PersistWorkflowTerminalStateInput,
@@ -306,6 +510,12 @@ export class WorkflowsPG extends WorkflowsStorage {
         timestamp,
         timestamp,
       ],
+    );
+    await t.none(
+      `INSERT INTO ${this.terminalSnapshotTableName()}
+       (workflow_name, run_id, version, terminal_status, snapshot, created_at)
+       VALUES ($1, $2, 1, $3, $4, $5)`,
+      [input.workflowName, input.runId, snapshot.status, sanitizedSnapshot, now],
     );
   }
 
@@ -460,7 +670,20 @@ export class WorkflowsPG extends WorkflowsStorage {
              AND completed_at IS NOT NULL AND completed_at < $3`,
           [operation.workflowName, operation.runId, olderThan],
         );
-        return { status: 'deleted', count: result.rowCount ?? 0 };
+        const count = result.rowCount ?? 0;
+        if (count > 0) {
+          await t.none(
+            `DELETE FROM ${this.terminalEffectTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
+          await t.none(
+            `DELETE FROM ${this.terminalSnapshotTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
+        }
+        return { status: 'deleted', count };
       });
     } catch (error) {
       return this.terminalizationError(
@@ -516,6 +739,151 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  async prepareWorkflowTerminalEffect(
+    input: PrepareWorkflowTerminalEffectInput,
+  ): Promise<PrepareWorkflowTerminalEffectResult> {
+    const operation: PrepareWorkflowTerminalEffectInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      expectedPhase: input.expectedPhase,
+      effect: materializeWorkflowTerminalEffectDescriptor(input.effect),
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const existingEffect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          operation.effect.kind,
+          context.now,
+        );
+        if (existingEffect && context.record) {
+          if (existingEffect.kind !== operation.effect.kind) {
+            throw new TypeError('Invalid workflow terminal effect kind');
+          }
+          validateWorkflowTerminalEffectJournalLink(
+            existingEffect,
+            context.record,
+            operation.workflowName,
+            operation.runId,
+          );
+        }
+        const result = prepareWorkflowTerminalEffectRecord(context.record, existingEffect, operation, context.now);
+        if (result.status === 'prepared' || result.status === 'already_prepared') {
+          const retained = await this.getTerminalSnapshotRecord(
+            t,
+            operation.workflowName,
+            operation.runId,
+            context.now,
+          );
+          if (!retained) return { status: 'missing_terminal_state' };
+          validateWorkflowTerminalSnapshotJournalLink(retained, result.record, operation.workflowName, operation.runId);
+        }
+        if (result.status === 'prepared') {
+          await this.insertTerminalEffectRecord(t, result.effect);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+          return { status: result.status, effect: result.effect };
+        }
+        if (result.status === 'already_prepared') {
+          return { status: result.status, effect: result.effect };
+        }
+        if (result.status === 'effect_conflict') {
+          return {
+            status: result.status,
+            effect: observeWorkflowTerminalEffectRecord(result.effect),
+            record: observeWorkflowTerminalizationRecord(result.record),
+          };
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'PREPARE_WORKFLOW_TERMINAL_EFFECT',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async getWorkflowTerminalEffectForDispatch(
+    input: GetWorkflowTerminalEffectForDispatchInput,
+  ): Promise<GetWorkflowTerminalEffectForDispatchResult> {
+    const operation: GetWorkflowTerminalEffectForDispatchInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      kind: materializeWorkflowTerminalEffectKind(input.kind),
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const existingEffect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          operation.kind,
+          context.now,
+        );
+        if (existingEffect && context.record) {
+          if (existingEffect.kind !== operation.kind) {
+            throw new TypeError('Invalid workflow terminal effect kind');
+          }
+          validateWorkflowTerminalEffectJournalLink(
+            existingEffect,
+            context.record,
+            operation.workflowName,
+            operation.runId,
+          );
+        }
+        const result = getWorkflowTerminalEffectForDispatchRecord(
+          context.record,
+          existingEffect,
+          operation,
+          context.now,
+        );
+        const retained =
+          result.status === 'found'
+            ? await this.getTerminalSnapshotRecord(t, operation.workflowName, operation.runId, context.now)
+            : undefined;
+        if (result.status === 'found' && !retained) return { status: 'missing_terminal_state' };
+        if (result.status === 'found') {
+          validateWorkflowTerminalSnapshotJournalLink(
+            retained!,
+            context.record!,
+            operation.workflowName,
+            operation.runId,
+          );
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result.status === 'found'
+            ? { ...result, snapshot: retained!.snapshot }
+            : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'GET_WORKFLOW_TERMINAL_EFFECT_FOR_DISPATCH',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
   private parseWorkflowRun(row: Record<string, any>): WorkflowRun {
     let parsedSnapshot: WorkflowRunState | string = row.snapshot as string;
     if (typeof parsedSnapshot === 'string') {
@@ -552,6 +920,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       }),
     );
     statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
     for (const index of WorkflowsPG.getDefaultIndexDefs(schemaName)) {
       statements.push(generateIndexSQL(index, schemaName));
     }
@@ -598,6 +968,45 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  private static getTerminalEffectTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_EFFECTS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "effect_kind" TEXT NOT NULL,
+      "version" INTEGER NOT NULL,
+      "effect_key" TEXT NOT NULL UNIQUE,
+      "source_event_key" TEXT NOT NULL,
+      "terminal_status" TEXT NOT NULL,
+      "parent_workflow_name" TEXT,
+      "parent_run_id" TEXT,
+      "parent_step_id" TEXT,
+      "parent_execution_path" JSONB,
+      "payload_hash" TEXT NOT NULL,
+      "created_at" BIGINT NOT NULL,
+      PRIMARY KEY ("workflow_name", "run_id", "effect_kind")
+    );`;
+  }
+
+  private static getTerminalSnapshotTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "version" INTEGER NOT NULL,
+      "terminal_status" TEXT NOT NULL,
+      "snapshot" JSONB NOT NULL,
+      "created_at" BIGINT NOT NULL,
+      PRIMARY KEY ("workflow_name", "run_id")
+    );`;
+  }
+
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
     return WorkflowsPG.getDefaultIndexDefs(this.#schema);
   }
@@ -619,6 +1028,8 @@ export class WorkflowsPG extends WorkflowsStorage {
   async init(): Promise<void> {
     await this.#db.createTable({ tableName: TABLE_WORKFLOW_SNAPSHOT, schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT] });
     await this.#db.client.none(WorkflowsPG.getTerminalizationTableDDL(this.#schema));
+    await this.#db.client.none(WorkflowsPG.getTerminalEffectTableDDL(this.#schema));
+    await this.#db.client.none(WorkflowsPG.getTerminalSnapshotTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
@@ -648,7 +1059,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.client.none(
-      `TRUNCATE TABLE ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
+      `TRUNCATE TABLE ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
     );
   }
 

@@ -1,7 +1,11 @@
 import type { BackgroundTask } from '../../background-tasks/types';
 import type { ScoreRowData } from '../../evals/types';
 import type { StorageThreadType } from '../../memory/types';
-import type { WorkflowTerminalizationRecord } from '../../workflows';
+import type {
+  WorkflowTerminalEffectRecord,
+  WorkflowTerminalizationRecord,
+  WorkflowTerminalSnapshotRecord,
+} from '../../workflows';
 import type {
   StorageAgentType,
   StorageMCPClientType,
@@ -68,6 +72,10 @@ export class InMemoryDB {
   readonly workflows = new Map<string, StorageWorkflowRun>();
   /** Terminal workflow-event coordination, isolated from replaceable workflow snapshots. */
   readonly workflowTerminalizations = new Map<string, WorkflowTerminalizationRecord>();
+  /** Immutable terminal producer intents, isolated from workflow snapshots and journal claims. */
+  readonly workflowTerminalEffects = new Map<string, WorkflowTerminalEffectRecord>();
+  /** Immutable terminal state retained while terminal protocol evidence remains incomplete. */
+  readonly workflowTerminalSnapshots = new Map<string, WorkflowTerminalSnapshotRecord>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -160,6 +168,8 @@ export class InMemoryDB {
     this.resources.clear();
     this.workflows.clear();
     this.workflowTerminalizations.clear();
+    this.workflowTerminalEffects.clear();
+    this.workflowTerminalSnapshots.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;

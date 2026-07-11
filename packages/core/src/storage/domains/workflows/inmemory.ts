@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { StepResult, WorkflowRunState } from '../../../workflows';
+import type { StepResult, WorkflowRunState, WorkflowTerminalSnapshotRecord } from '../../../workflows';
 import { normalizePerPage } from '../../base';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -10,8 +10,12 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  GetWorkflowTerminalEffectForDispatchInput,
+  GetWorkflowTerminalEffectForDispatchResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
+  PrepareWorkflowTerminalEffectInput,
+  PrepareWorkflowTerminalEffectResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   StorageWorkflowRun,
@@ -19,6 +23,7 @@ import type {
   WorkflowRuns,
   StorageListWorkflowRunsInput,
   UpdateWorkflowStateOptions,
+  WorkflowTerminalizationCapabilities,
 } from '../../types';
 import { createEmptyWorkflowSnapshot, mergeWorkflowStepResult } from '../../workflow-snapshot';
 import type { InMemoryDB } from '../inmemory-db';
@@ -27,11 +32,20 @@ import {
   advanceWorkflowTerminalizationRecord,
   claimWorkflowTerminalizationRecord,
   copyWorkflowTerminalizationRecord,
+  copyWorkflowTerminalEffectRecord,
+  getWorkflowTerminalEffectForDispatchRecord,
+  materializeWorkflowTerminalEffectDescriptor,
+  materializeWorkflowTerminalEffectKind,
   observeWorkflowTerminalizationRecord,
+  observeWorkflowTerminalEffectRecord,
   persistWorkflowTerminalStateRecord,
+  prepareWorkflowTerminalEffectRecord,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
+  validateWorkflowTerminalEffectIntegrity,
+  validateWorkflowTerminalEffectJournalLink,
   validateWorkflowTerminalizationFence,
+  validateWorkflowTerminalSnapshotJournalLink,
 } from './terminalization';
 
 /**
@@ -221,8 +235,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return true;
   }
 
+  getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
+    return { journalVersion: 1, producerOutboxVersion: 1 };
+  }
+
   private getTerminalizationKey(workflowName: string, runId: string): string {
     return this.getWorkflowKey(workflowName, runId);
+  }
+
+  private getTerminalEffectKey(workflowName: string, runId: string, kind: string): string {
+    return JSON.stringify([workflowName, runId, kind]);
   }
 
   async claimWorkflowTerminalization(
@@ -341,6 +363,13 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     }
     if (record.phase === 'complete' && record.completedAt !== undefined && record.completedAt < olderThan) {
       this.db.workflowTerminalizations.delete(key);
+      this.db.workflowTerminalEffects.delete(
+        this.getTerminalEffectKey(operation.workflowName, operation.runId, 'parent-workflow-step-end'),
+      );
+      this.db.workflowTerminalEffects.delete(
+        this.getTerminalEffectKey(operation.workflowName, operation.runId, 'workflow-finish'),
+      );
+      this.db.workflowTerminalSnapshots.delete(key);
       return { status: 'deleted', count: 1 };
     }
     return { status: 'deleted', count: 0 };
@@ -376,12 +405,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (result.status === 'advanced') {
       if (!existingRun) return { status: 'missing_run' };
       const now = new Date(result.record.updatedAt);
+      if (this.db.workflowTerminalSnapshots.has(journalKey)) {
+        throw new TypeError('Workflow terminal state already retained');
+      }
+      const retained: WorkflowTerminalSnapshotRecord = {
+        version: 1,
+        workflowName: operation.workflowName,
+        runId: operation.runId,
+        terminalStatus: result.record.terminalStatus,
+        snapshot: cloneRunData(result.snapshot),
+        createdAt: result.record.updatedAt,
+      };
       this.db.workflows.set(workflowKey, {
         ...existingRun,
         resourceId: operation.resourceId ?? existingRun.resourceId,
         snapshot: result.snapshot,
         updatedAt: now,
       });
+      this.db.workflowTerminalSnapshots.set(journalKey, retained);
       this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(result.record));
       return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
     }
@@ -390,9 +431,113 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       : result;
   }
 
+  async prepareWorkflowTerminalEffect(
+    input: PrepareWorkflowTerminalEffectInput,
+  ): Promise<PrepareWorkflowTerminalEffectResult> {
+    const operation: PrepareWorkflowTerminalEffectInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      expectedPhase: input.expectedPhase,
+      effect: materializeWorkflowTerminalEffectDescriptor(input.effect),
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const effectKey = this.getTerminalEffectKey(operation.workflowName, operation.runId, operation.effect.kind);
+    const existingJournal = this.db.workflowTerminalizations.get(journalKey);
+    if (!existingJournal && !this.db.workflows.has(workflowKey)) return { status: 'missing_run' };
+    const existingEffect = this.db.workflowTerminalEffects.get(effectKey);
+    if (existingEffect && existingJournal) {
+      if (existingEffect.kind !== operation.effect.kind) {
+        throw new TypeError('Invalid workflow terminal effect kind');
+      }
+      validateWorkflowTerminalEffectIntegrity(existingEffect);
+      validateWorkflowTerminalEffectJournalLink(
+        existingEffect,
+        existingJournal,
+        operation.workflowName,
+        operation.runId,
+      );
+    }
+    const result = prepareWorkflowTerminalEffectRecord(existingJournal, existingEffect, operation, Date.now());
+    if (result.status === 'prepared' || result.status === 'already_prepared') {
+      const retained = this.db.workflowTerminalSnapshots.get(journalKey);
+      if (!retained) return { status: 'missing_terminal_state' };
+      validateWorkflowTerminalSnapshotJournalLink(retained, result.record, operation.workflowName, operation.runId);
+    }
+    if (result.status === 'prepared') {
+      this.db.workflowTerminalEffects.set(effectKey, copyWorkflowTerminalEffectRecord(result.effect));
+      this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(result.record));
+      return { status: result.status, effect: copyWorkflowTerminalEffectRecord(result.effect) };
+    }
+    if (result.status === 'already_prepared') {
+      return { status: result.status, effect: copyWorkflowTerminalEffectRecord(result.effect) };
+    }
+    if (result.status === 'effect_conflict') {
+      return {
+        status: result.status,
+        effect: observeWorkflowTerminalEffectRecord(result.effect),
+        record: observeWorkflowTerminalizationRecord(result.record),
+      };
+    }
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result;
+  }
+
+  async getWorkflowTerminalEffectForDispatch(
+    input: GetWorkflowTerminalEffectForDispatchInput,
+  ): Promise<GetWorkflowTerminalEffectForDispatchResult> {
+    const operation: GetWorkflowTerminalEffectForDispatchInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      kind: materializeWorkflowTerminalEffectKind(input.kind),
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const existingJournal = this.db.workflowTerminalizations.get(journalKey);
+    if (!existingJournal && !this.db.workflows.has(workflowKey)) return { status: 'missing_run' };
+    const existingEffect = this.db.workflowTerminalEffects.get(
+      this.getTerminalEffectKey(operation.workflowName, operation.runId, operation.kind),
+    );
+    if (existingEffect && existingJournal) {
+      if (existingEffect.kind !== operation.kind) {
+        throw new TypeError('Invalid workflow terminal effect kind');
+      }
+      validateWorkflowTerminalEffectIntegrity(existingEffect);
+      validateWorkflowTerminalEffectJournalLink(
+        existingEffect,
+        existingJournal,
+        operation.workflowName,
+        operation.runId,
+      );
+    }
+    const result = getWorkflowTerminalEffectForDispatchRecord(existingJournal, existingEffect, operation, Date.now());
+    const retained = result.status === 'found' ? this.db.workflowTerminalSnapshots.get(journalKey) : undefined;
+    if (result.status === 'found' && !retained) return { status: 'missing_terminal_state' };
+    if (result.status === 'found') {
+      validateWorkflowTerminalSnapshotJournalLink(retained!, existingJournal!, operation.workflowName, operation.runId);
+    }
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result.status === 'found'
+        ? { ...result, snapshot: cloneRunData(retained!.snapshot) }
+        : result;
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     this.db.workflows.clear();
     this.db.workflowTerminalizations.clear();
+    this.db.workflowTerminalEffects.clear();
+    this.db.workflowTerminalSnapshots.clear();
   }
 
   private getWorkflowKey(workflowName: string, runId: string): string {

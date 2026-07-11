@@ -8,14 +8,19 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  GetWorkflowTerminalEffectForDispatchInput,
+  GetWorkflowTerminalEffectForDispatchResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
+  PrepareWorkflowTerminalEffectInput,
+  PrepareWorkflowTerminalEffectResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
   WorkflowRun,
   WorkflowRuns,
   StorageListWorkflowRunsInput,
+  WorkflowTerminalizationCapabilities,
 } from '../../types';
 import { StorageDomain } from '../base';
 
@@ -32,6 +37,11 @@ export abstract class WorkflowsStorage extends StorageDomain {
   /** Whether this adapter provides atomic terminalization claim/phase CAS. */
   supportsWorkflowTerminalizationJournal(): boolean {
     return false;
+  }
+
+  /** Exact protocol versions implemented by this adapter. */
+  getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
+    return {};
   }
 
   async claimWorkflowTerminalization(
@@ -65,6 +75,18 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async persistWorkflowTerminalState(
     _input: PersistWorkflowTerminalStateInput,
   ): Promise<PersistWorkflowTerminalStateResult> {
+    return { status: 'unsupported' };
+  }
+
+  async prepareWorkflowTerminalEffect(
+    _input: PrepareWorkflowTerminalEffectInput,
+  ): Promise<PrepareWorkflowTerminalEffectResult> {
+    return { status: 'unsupported' };
+  }
+
+  async getWorkflowTerminalEffectForDispatch(
+    _input: GetWorkflowTerminalEffectForDispatchInput,
+  ): Promise<GetWorkflowTerminalEffectForDispatchResult> {
     return { status: 'unsupported' };
   }
 

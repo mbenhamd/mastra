@@ -400,6 +400,48 @@ export type WorkflowTerminalizationClaimedRecord = WorkflowTerminalizationRecord
   leaseExpiresAt: number;
 };
 
+export type WorkflowTerminalEffectKind = 'parent-workflow-step-end' | 'workflow-finish';
+
+interface WorkflowTerminalEffectRecordBase {
+  version: 1;
+  effectKey: string;
+  kind: WorkflowTerminalEffectKind;
+  workflowName: string;
+  runId: string;
+  sourceEventKey: string;
+  terminalStatus: WorkflowTerminalStatus;
+  payloadHash: string;
+  createdAt: number;
+}
+
+/** @internal Minimal structural intent for applying a nested run's terminal result to its parent. */
+export interface WorkflowTerminalParentEffectRecord extends WorkflowTerminalEffectRecordBase {
+  kind: 'parent-workflow-step-end';
+  parentWorkflowName: string;
+  parentRunId: string;
+  parentStepId: string;
+  /** Exact structural path of the nested workflow step in the parent graph. */
+  parentExecutionPath: number[];
+}
+
+/** @internal Minimal structural intent for notifying the canonical run-finish destination. */
+export interface WorkflowTerminalFinishEffectRecord extends WorkflowTerminalEffectRecordBase {
+  kind: 'workflow-finish';
+}
+
+/** @internal Durable producer intent. It intentionally contains no workflow result or request context. */
+export type WorkflowTerminalEffectRecord = WorkflowTerminalParentEffectRecord | WorkflowTerminalFinishEffectRecord;
+
+/** @internal Immutable terminal state retained independently from the replaceable workflow run row. */
+export interface WorkflowTerminalSnapshotRecord {
+  version: 1;
+  workflowName: string;
+  runId: string;
+  terminalStatus: WorkflowTerminalStatus;
+  snapshot: WorkflowRunState;
+  createdAt: number;
+}
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;
