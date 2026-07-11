@@ -6,6 +6,8 @@ import {
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
   WorkflowsStorage,
+  applyWorkflowTerminalParentContinuationPatch,
+  copyWorkflowTerminalParentContinuationContract,
   MAX_WORKFLOW_TERMINALIZATION_LEASE_MS,
   MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH,
   advanceWorkflowTerminalizationRecord,
@@ -16,8 +18,11 @@ import {
   materializeWorkflowTerminalEffectKind,
   observeWorkflowTerminalizationRecord,
   observeWorkflowTerminalEffectRecord,
+  copyWorkflowTerminalEffectRecord,
   copyWorkflowTerminalDestinationReceiptRecord,
+  copyWorkflowTerminalContinuationPlanRecord,
   getWorkflowTerminalDestinationReceiptRecord,
+  getWorkflowTerminalContinuationPlanRecord,
   persistWorkflowTerminalStateRecord,
   prepareWorkflowTerminalEffectRecord,
   reserveWorkflowTerminalDestinationReceiptRecord,
@@ -31,6 +36,11 @@ import {
   validateWorkflowTerminalizationFence,
   validateWorkflowTerminalizationRunIdentity,
   validateWorkflowTerminalizationIdentity,
+  prepareWorkflowTerminalParentApplicationRecords,
+  finalizeWorkflowTerminalParentApplicationRecords,
+  observeWorkflowTerminalContinuationPlanRecord,
+  validateWorkflowTerminalContinuationPlanIntegrity,
+  WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
 } from '@mastra/core/storage';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -45,12 +55,18 @@ import type {
   GetWorkflowTerminalEffectForDispatchResult,
   GetWorkflowTerminalDestinationReceiptInput,
   GetWorkflowTerminalDestinationReceiptResult,
+  GetWorkflowTerminalParentContextInput,
+  GetWorkflowTerminalParentContextResult,
+  GetWorkflowTerminalContinuationPlanInput,
+  GetWorkflowTerminalContinuationPlanResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
   PrepareWorkflowTerminalEffectInput,
   PrepareWorkflowTerminalEffectResult,
   ReserveWorkflowTerminalDestinationReceiptInput,
   ReserveWorkflowTerminalDestinationReceiptResult,
+  ApplyWorkflowTerminalParentEffectInput,
+  ApplyWorkflowTerminalParentEffectResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -58,6 +74,7 @@ import type {
   WorkflowRun,
   WorkflowRuns,
   CreateIndexOptions,
+  WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
 } from '@mastra/core/storage';
 import type {
@@ -76,6 +93,8 @@ const TABLE_WORKFLOW_TERMINALIZATIONS = 'mastra_workflow_terminalizations';
 const TABLE_WORKFLOW_TERMINAL_EFFECTS = 'mastra_workflow_terminal_effects';
 const TABLE_WORKFLOW_TERMINAL_SNAPSHOTS = 'mastra_workflow_terminal_snapshots';
 const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_destination_receipts';
+const TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS = 'mastra_workflow_terminal_continuation_plans';
+const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -123,6 +142,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     TABLE_WORKFLOW_TERMINAL_EFFECTS,
     TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
     TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
+    TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
+    TABLE_WORKFLOW_PARENT_REVISIONS,
   ] as const;
 
   constructor(config: PgDomainConfig) {
@@ -144,7 +165,12 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
-    return { journalVersion: 1, producerOutboxVersion: 1, destinationReceiptVersion: 1 };
+    return {
+      journalVersion: 1,
+      producerOutboxVersion: 1,
+      destinationReceiptVersion: 1,
+      parentApplicationVersion: 1,
+    };
   }
 
   private terminalizationTableName(): string {
@@ -177,6 +203,60 @@ export class WorkflowsPG extends WorkflowsStorage {
       indexName: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
       schemaName: getSchemaName(this.#schema),
     });
+  }
+
+  private terminalContinuationPlanTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private workflowParentRevisionTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private async lockWorkflowParentRevision(t: TxClient, workflowName: string, runId: string): Promise<number> {
+    await t.none(
+      `INSERT INTO ${this.workflowParentRevisionTableName()}
+       (workflow_name, run_id, generation, updated_at)
+       VALUES ($1, $2, 0, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+       ON CONFLICT (workflow_name, run_id) DO NOTHING`,
+      [workflowName, runId],
+    );
+    const row = await t.one<{ generation: number | string }>(
+      `SELECT generation FROM ${this.workflowParentRevisionTableName()}
+       WHERE workflow_name = $1 AND run_id = $2
+       FOR UPDATE`,
+      [workflowName, runId],
+    );
+    const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError('Invalid workflow parent revision generation');
+    }
+    return generation;
+  }
+
+  private async bumpWorkflowParentRevision(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    generation: number,
+  ): Promise<number> {
+    const next = generation + 1;
+    if (!Number.isSafeInteger(next)) throw new TypeError('Workflow parent revision exhausted');
+    const result = await t.query(
+      `UPDATE ${this.workflowParentRevisionTableName()}
+       SET generation = $1,
+           updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+       WHERE workflow_name = $2 AND run_id = $3 AND generation = $4`,
+      [next, workflowName, runId, generation],
+    );
+    if ((result.rowCount ?? 0) !== 1) throw new TypeError('Workflow parent revision conflict');
+    return next;
   }
 
   private decodeTerminalizationRow(row: Record<string, unknown>, now: number): WorkflowTerminalizationRecord {
@@ -629,6 +709,169 @@ export class WorkflowsPG extends WorkflowsStorage {
     return count;
   }
 
+  private decodeTerminalContinuationPlanRow(
+    row: Record<string, unknown>,
+    effect: WorkflowTerminalEffectRecord,
+    receipt: WorkflowTerminalDestinationReceiptRecord,
+    now: number,
+  ): WorkflowTerminalContinuationPlanRecord {
+    const createdAt = typeof row.created_at === 'string' ? Number(row.created_at) : row.created_at;
+    if (row.version !== 1 && row.version !== '1') {
+      throw new TypeError('Invalid workflow terminal continuation plan version');
+    }
+    if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt < 0 || createdAt > now) {
+      throw new TypeError('Invalid workflow terminal continuation plan created_at');
+    }
+    const contract = typeof row.contract === 'string' ? JSON.parse(row.contract) : row.contract;
+    const frameworkActionKey =
+      row.framework_action_key === null || row.framework_action_key === undefined
+        ? undefined
+        : row.framework_action_key;
+    const record = {
+      version: 1 as const,
+      planKey: row.plan_key,
+      planHash: row.plan_hash,
+      receiptKey: row.receipt_key,
+      effectKey: row.effect_key,
+      consumerId: row.consumer_id,
+      workflowName: row.workflow_name,
+      runId: row.run_id,
+      parentWorkflowName: row.parent_workflow_name,
+      parentRunId: row.parent_run_id,
+      parentRevision: row.parent_revision,
+      contract,
+      ...(frameworkActionKey === undefined ? {} : { frameworkActionKey }),
+      createdAt,
+    } as WorkflowTerminalContinuationPlanRecord;
+    if (
+      typeof record.planKey !== 'string' ||
+      !/^wtp:v1:[a-f0-9]{64}$/.test(record.planKey) ||
+      typeof record.planHash !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(record.planHash) ||
+      typeof record.parentRevision !== 'string' ||
+      typeof record.contract !== 'object' ||
+      record.contract === null ||
+      typeof row.contract_hash !== 'string' ||
+      row.contract_hash !== record.contract.contractHash ||
+      (frameworkActionKey !== undefined &&
+        (typeof frameworkActionKey !== 'string' || !/^wta:v1:[a-f0-9]{64}$/.test(frameworkActionKey)))
+    ) {
+      throw new TypeError('Invalid workflow terminal continuation plan record');
+    }
+    validateWorkflowTerminalContinuationPlanIntegrity(record, effect, receipt, now);
+    return record;
+  }
+
+  private async getTerminalContinuationPlanRecord(
+    t: TxClient,
+    effect: Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }>,
+    receipt: WorkflowTerminalDestinationReceiptRecord,
+    now: number,
+  ): Promise<WorkflowTerminalContinuationPlanRecord | undefined> {
+    const row = await t.oneOrNone<Record<string, unknown>>(
+      `SELECT * FROM ${this.terminalContinuationPlanTableName()}
+       WHERE receipt_key = $1
+          OR (effect_key = $2 AND consumer_id = $5)
+          OR (workflow_name = $3 AND run_id = $4 AND consumer_id = $5)
+       FOR UPDATE`,
+      [
+        receipt.receiptKey,
+        effect.effectKey,
+        effect.workflowName,
+        effect.runId,
+        WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+      ],
+    );
+    return row ? this.decodeTerminalContinuationPlanRow(row, effect, receipt, now) : undefined;
+  }
+
+  private async insertTerminalContinuationPlanRecord(
+    t: TxClient,
+    plan: WorkflowTerminalContinuationPlanRecord,
+  ): Promise<void> {
+    await t.none(
+      `INSERT INTO ${this.terminalContinuationPlanTableName()}
+       (version, plan_key, plan_hash, receipt_key, effect_key, consumer_id, workflow_name, run_id,
+        parent_workflow_name, parent_run_id, parent_revision, contract_hash, contract,
+        framework_action_key, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      [
+        plan.version,
+        plan.planKey,
+        plan.planHash,
+        plan.receiptKey,
+        plan.effectKey,
+        plan.consumerId,
+        plan.workflowName,
+        plan.runId,
+        plan.parentWorkflowName,
+        plan.parentRunId,
+        plan.parentRevision,
+        plan.contract.contractHash,
+        sanitizeJsonForPg(JSON.stringify(plan.contract)),
+        plan.frameworkActionKey ?? null,
+        plan.createdAt,
+      ],
+    );
+  }
+
+  private async saveTerminalDestinationReceiptRecord(
+    t: TxClient,
+    receipt: WorkflowTerminalDestinationReceiptRecord,
+    existing: boolean,
+  ): Promise<void> {
+    if (existing) {
+      await t.none(
+        `UPDATE ${this.terminalDestinationReceiptTableName()} SET
+           application_state = $1,
+           dispatch_state = $2,
+           updated_at = $3,
+           applied_at = $4,
+           dispatch_pending_at = $5,
+           destination_applied_at = $6,
+           quarantined_at = $7
+         WHERE receipt_key = $8`,
+        [
+          receipt.applicationState,
+          receipt.dispatchState,
+          receipt.updatedAt,
+          receipt.appliedAt ?? null,
+          receipt.dispatchPendingAt ?? null,
+          receipt.destinationAppliedAt ?? null,
+          receipt.quarantinedAt ?? null,
+          receipt.receiptKey,
+        ],
+      );
+      return;
+    }
+    await t.none(
+      `INSERT INTO ${this.terminalDestinationReceiptTableName()}
+       (version, workflow_name, run_id, effect_key, consumer_id, receipt_key, effect_kind,
+        producer_payload_hash, destination_hash, application_state, dispatch_state, created_at, updated_at,
+        applied_at, dispatch_pending_at, destination_applied_at, quarantined_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+      [
+        receipt.version,
+        receipt.workflowName,
+        receipt.runId,
+        receipt.effectKey,
+        receipt.consumerId,
+        receipt.receiptKey,
+        receipt.effectKind,
+        receipt.producerPayloadHash,
+        receipt.destinationHash,
+        receipt.applicationState,
+        receipt.dispatchState,
+        receipt.createdAt,
+        receipt.updatedAt,
+        receipt.appliedAt ?? null,
+        receipt.dispatchPendingAt ?? null,
+        receipt.destinationAppliedAt ?? null,
+        receipt.quarantinedAt ?? null,
+      ],
+    );
+  }
+
   private async saveTerminalWorkflowSnapshot(
     t: TxClient,
     input: PersistWorkflowTerminalStateInput,
@@ -636,6 +879,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     now: number,
   ): Promise<void> {
     const timestamp = new Date(now);
+    const revision = await this.lockWorkflowParentRevision(t, input.workflowName, input.runId);
     const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
     const canonical = await t.one<{ resource_id: string | null }>(
       `INSERT INTO ${this.workflowSnapshotTableName()} AS current_snapshot
@@ -664,6 +908,7 @@ export class WorkflowsPG extends WorkflowsStorage {
        VALUES ($1, $2, 1, $3, $4, $5, $6)`,
       [input.workflowName, input.runId, canonical.resource_id, snapshot.status, sanitizedSnapshot, now],
     );
+    await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, revision);
   }
 
   private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
@@ -819,6 +1064,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         const count = result.rowCount ?? 0;
         if (count > 0) {
+          await t.none(
+            `DELETE FROM ${this.terminalContinuationPlanTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
           await t.none(
             `DELETE FROM ${this.terminalDestinationReceiptTableName()}
              WHERE workflow_name = $1 AND run_id = $2`,
@@ -1192,6 +1442,324 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  async getWorkflowTerminalParentContext(
+    input: GetWorkflowTerminalParentContextInput,
+  ): Promise<GetWorkflowTerminalParentContextResult> {
+    const operation = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      kind: 'parent-workflow-step-end' as const,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const effect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          operation.kind,
+          context.now,
+        );
+        const result = getWorkflowTerminalEffectForDispatchRecord(context.record, effect, operation, context.now);
+        if (result.status !== 'found') {
+          return 'record' in result
+            ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+            : result;
+        }
+        if (result.effect.kind !== 'parent-workflow-step-end') return { status: 'missing_effect' };
+        if (context.record?.phase !== 'parent_outbox_pending') {
+          return context.record
+            ? { status: 'phase_conflict', record: observeWorkflowTerminalizationRecord(context.record) }
+            : { status: 'missing_record' };
+        }
+        validateWorkflowTerminalEffectJournalLink(
+          result.effect,
+          context.record,
+          operation.workflowName,
+          operation.runId,
+        );
+        const retained = await this.getTerminalSnapshotRecord(t, operation.workflowName, operation.runId, context.now);
+        if (!retained) return { status: 'missing_terminal_state' };
+        validateWorkflowTerminalSnapshotJournalLink(retained, context.record, operation.workflowName, operation.runId);
+        const row = await t.oneOrNone<{
+          snapshot: WorkflowRunState | string;
+          generation: number | string | null;
+        }>(
+          `SELECT snapshot.snapshot, revision.generation
+           FROM ${this.workflowSnapshotTableName()} AS snapshot
+           LEFT JOIN ${this.workflowParentRevisionTableName()} AS revision
+             ON revision.workflow_name = snapshot.workflow_name AND revision.run_id = snapshot.run_id
+           WHERE snapshot.workflow_name = $1 AND snapshot.run_id = $2`,
+          [result.effect.parentWorkflowName, result.effect.parentRunId],
+        );
+        if (!row) return { status: 'missing_parent' };
+        const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
+        if (!Number.isSafeInteger(generation) || (generation as number) < 1) {
+          throw new TypeError('Workflow parent snapshot is missing revision evidence');
+        }
+        const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+        return {
+          status: 'found',
+          effect: copyWorkflowTerminalEffectRecord(result.effect) as Extract<
+            WorkflowTerminalEffectRecord,
+            { kind: 'parent-workflow-step-end' }
+          >,
+          retainedChild: structuredClone(retained),
+          parentWorkflowName: result.effect.parentWorkflowName,
+          parentRunId: result.effect.parentRunId,
+          revision: `pg:v1:${generation}`,
+          snapshot: structuredClone(snapshot),
+        };
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'GET_WORKFLOW_TERMINAL_PARENT_CONTEXT',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async getWorkflowTerminalContinuationPlan(
+    input: GetWorkflowTerminalContinuationPlanInput,
+  ): Promise<GetWorkflowTerminalContinuationPlanResult> {
+    const operation: GetWorkflowTerminalContinuationPlanInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const effect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          'parent-workflow-step-end',
+          context.now,
+        );
+        const receipt =
+          effect?.kind === 'parent-workflow-step-end'
+            ? await this.getTerminalDestinationReceiptRecord(
+                t,
+                effect,
+                WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+                context.now,
+              )
+            : undefined;
+        const plan =
+          effect?.kind === 'parent-workflow-step-end' && receipt
+            ? await this.getTerminalContinuationPlanRecord(t, effect, receipt, context.now)
+            : undefined;
+        const result = getWorkflowTerminalContinuationPlanRecord(
+          context.record,
+          effect,
+          receipt,
+          plan,
+          operation,
+          context.now,
+        );
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'GET_WORKFLOW_TERMINAL_CONTINUATION_PLAN',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async applyWorkflowTerminalParentEffect(
+    input: ApplyWorkflowTerminalParentEffectInput,
+  ): Promise<ApplyWorkflowTerminalParentEffectResult> {
+    let contract: ApplyWorkflowTerminalParentEffectInput['contract'];
+    try {
+      contract = copyWorkflowTerminalParentContinuationContract(input.contract);
+    } catch {
+      return { status: 'invalid_contract' };
+    }
+    const operation: ApplyWorkflowTerminalParentEffectInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      contract,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const effect = await this.getTerminalEffectRecord(
+          t,
+          operation.workflowName,
+          operation.runId,
+          'parent-workflow-step-end',
+          context.now,
+        );
+        const receipt =
+          effect?.kind === 'parent-workflow-step-end'
+            ? await this.getTerminalDestinationReceiptRecord(
+                t,
+                effect,
+                WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+                context.now,
+              )
+            : undefined;
+        const existingPlan =
+          effect?.kind === 'parent-workflow-step-end' && receipt
+            ? await this.getTerminalContinuationPlanRecord(t, effect, receipt, context.now)
+            : undefined;
+        let prepared = prepareWorkflowTerminalParentApplicationRecords(
+          context.record,
+          effect,
+          receipt,
+          existingPlan,
+          operation,
+          context.now,
+        );
+        if (prepared.status === 'contract_conflict') {
+          return { status: prepared.status, plan: observeWorkflowTerminalContinuationPlanRecord(prepared.plan) };
+        }
+        if ('record' in prepared) {
+          return { status: prepared.status, record: observeWorkflowTerminalizationRecord(prepared.record) };
+        }
+        if (!('journal' in prepared)) return { status: prepared.status };
+        if (prepared.status === 'already_applied' || prepared.status === 'already_quarantined') {
+          return { status: prepared.status, plan: copyWorkflowTerminalContinuationPlanRecord(prepared.plan) };
+        }
+        if (!effect || effect.kind !== 'parent-workflow-step-end') {
+          throw new TypeError('Parent application became ready without a parent effect');
+        }
+
+        const retained = await this.getTerminalSnapshotRecord(t, operation.workflowName, operation.runId, context.now);
+        if (!retained) return { status: 'missing_child_terminal_state' };
+        validateWorkflowTerminalSnapshotJournalLink(
+          retained,
+          prepared.journal,
+          operation.workflowName,
+          operation.runId,
+        );
+        const revisionRow = await t.oneOrNone<{ generation: number | string }>(
+          `SELECT generation FROM ${this.workflowParentRevisionTableName()}
+           WHERE workflow_name = $1 AND run_id = $2
+           FOR UPDATE`,
+          [effect.parentWorkflowName, effect.parentRunId],
+        );
+        const parentRow = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
+          `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          [effect.parentWorkflowName, effect.parentRunId],
+        );
+        if (!parentRow) return { status: 'missing_parent' };
+        if (!revisionRow) throw new TypeError('Workflow parent snapshot is missing revision evidence');
+        const parentGeneration =
+          typeof revisionRow.generation === 'string' ? Number(revisionRow.generation) : revisionRow.generation;
+        if (!Number.isSafeInteger(parentGeneration) || parentGeneration < 1) {
+          throw new TypeError('Invalid workflow parent revision generation');
+        }
+        const parentSnapshot = structuredClone(
+          typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot,
+        );
+
+        const finalClock = await t.one<{ now_ms: string }>(
+          `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms`,
+        );
+        const finalNow = Number(finalClock.now_ms);
+        if (!Number.isSafeInteger(finalNow)) throw new TypeError('Invalid PostgreSQL terminalization clock');
+        const revalidated = prepareWorkflowTerminalParentApplicationRecords(
+          context.record,
+          effect,
+          receipt,
+          existingPlan,
+          operation,
+          finalNow,
+        );
+        if (revalidated.status === 'contract_conflict') {
+          return {
+            status: revalidated.status,
+            plan: observeWorkflowTerminalContinuationPlanRecord(revalidated.plan),
+          };
+        }
+        if ('record' in revalidated) {
+          return { status: revalidated.status, record: observeWorkflowTerminalizationRecord(revalidated.record) };
+        }
+        if (!('journal' in revalidated)) return { status: revalidated.status };
+        if (revalidated.status === 'already_applied' || revalidated.status === 'already_quarantined') {
+          return {
+            status: revalidated.status,
+            plan: copyWorkflowTerminalContinuationPlanRecord(revalidated.plan),
+          };
+        }
+        prepared = revalidated;
+
+        if (`pg:v1:${parentGeneration}` !== operation.contract.expectedParentRevision) {
+          return { status: 'parent_conflict' };
+        }
+        const storageTimestamp = finalNow;
+        let patchedParent: WorkflowRunState;
+        try {
+          patchedParent = applyWorkflowTerminalParentContinuationPatch({
+            contract: prepared.plan.contract,
+            effect,
+            parentRevision: operation.contract.expectedParentRevision,
+            parentWorkflowName: effect.parentWorkflowName,
+            parentSnapshot,
+            retainedChild: retained,
+            storageTimestamp,
+            executionMode: 'continuous',
+          });
+        } catch {
+          return { status: 'invalid_contract' };
+        }
+        const finalized = finalizeWorkflowTerminalParentApplicationRecords(
+          prepared.journal,
+          prepared.receipt,
+          prepared.plan,
+          storageTimestamp,
+        );
+        if (finalized.status === 'applied' && finalized.plan.contract.patch.kind !== 'none') {
+          const serializedParent = sanitizeJsonForPg(JSON.stringify(patchedParent));
+          const timestamp = new Date(storageTimestamp);
+          const update = await t.query(
+            `UPDATE ${this.workflowSnapshotTableName()}
+             SET snapshot = $1, "updatedAt" = $2, "updatedAtZ" = $3
+             WHERE workflow_name = $4 AND run_id = $5`,
+            [serializedParent, timestamp, timestamp, effect.parentWorkflowName, effect.parentRunId],
+          );
+          if ((update.rowCount ?? 0) !== 1) return { status: 'parent_conflict' };
+          await this.bumpWorkflowParentRevision(t, effect.parentWorkflowName, effect.parentRunId, parentGeneration);
+        }
+        await this.saveTerminalDestinationReceiptRecord(t, finalized.receipt, receipt !== undefined);
+        await this.insertTerminalContinuationPlanRecord(t, finalized.plan);
+        await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, finalized.journal);
+        return { status: finalized.status, plan: copyWorkflowTerminalContinuationPlanRecord(finalized.plan) };
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'APPLY_WORKFLOW_TERMINAL_PARENT_EFFECT',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
   private parseWorkflowRun(row: Record<string, any>): WorkflowRun {
     let parsedSnapshot: WorkflowRunState | string = row.snapshot as string;
     if (typeof parsedSnapshot === 'string') {
@@ -1231,6 +1799,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     statements.push(WorkflowsPG.getTerminalEffectTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalSnapshotTableDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalDestinationReceiptTableDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowParentRevisionTableDDL(schemaName));
+    statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
     for (const index of WorkflowsPG.getDefaultIndexDefs(schemaName)) {
       statements.push(generateIndexSQL(index, schemaName));
     }
@@ -1255,6 +1825,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         name: 'mastra_workflow_terminal_destination_receipts_lookup_idx',
         table: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
         columns: ['workflow_name', 'run_id', 'effect_kind', 'consumer_id'],
+      },
+      {
+        name: 'mastra_workflow_terminal_continuation_plans_run_idx',
+        table: TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
+        columns: ['workflow_name', 'run_id'],
       },
     ];
   }
@@ -1318,6 +1893,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       "terminal_status" TEXT NOT NULL,
       "snapshot" JSONB NOT NULL,
       "created_at" BIGINT NOT NULL,
+      CHECK ("version" = 1),
+      CHECK ("created_at" >= 0),
       PRIMARY KEY ("workflow_name", "run_id")
     );`;
   }
@@ -1379,6 +1956,79 @@ export class WorkflowsPG extends WorkflowsStorage {
     );`;
   }
 
+  private static getWorkflowParentRevisionTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "generation" BIGINT NOT NULL,
+      "updated_at" BIGINT NOT NULL,
+      PRIMARY KEY ("workflow_name", "run_id"),
+      CHECK ("generation" >= 0),
+      CHECK ("updated_at" >= 0)
+    );`;
+  }
+
+  private static getTerminalContinuationPlanTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
+      schemaName: getSchemaName(schemaName),
+    });
+    const receiptTableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS,
+      schemaName: getSchemaName(schemaName),
+    });
+    const effectTableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINAL_EFFECTS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "version" INTEGER NOT NULL,
+      "plan_key" TEXT NOT NULL UNIQUE,
+      "plan_hash" TEXT NOT NULL,
+      "receipt_key" TEXT NOT NULL PRIMARY KEY,
+      "effect_key" TEXT NOT NULL,
+      "consumer_id" TEXT NOT NULL,
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "parent_workflow_name" TEXT NOT NULL,
+      "parent_run_id" TEXT NOT NULL,
+      "parent_revision" TEXT NOT NULL,
+      "contract_hash" TEXT NOT NULL,
+      "contract" JSONB NOT NULL,
+      "framework_action_key" TEXT,
+      "created_at" BIGINT NOT NULL,
+      UNIQUE ("effect_key", "consumer_id"),
+      FOREIGN KEY ("effect_key") REFERENCES ${effectTableName} ("effect_key") ON DELETE CASCADE,
+      FOREIGN KEY ("effect_key", "consumer_id")
+        REFERENCES ${receiptTableName} ("effect_key", "consumer_id") ON DELETE CASCADE,
+      FOREIGN KEY ("receipt_key") REFERENCES ${receiptTableName} ("receipt_key") ON DELETE CASCADE,
+      CHECK ("version" = 1),
+      CHECK ("consumer_id" = 'mastra.parent-application.v1'),
+      CHECK ("plan_key" ~ '^wtp:v1:[a-f0-9]{64}$'),
+      CHECK ("plan_hash" ~ '^sha256:[a-f0-9]{64}$'),
+      CHECK ("contract_hash" ~ '^sha256:[a-f0-9]{64}$'),
+      CHECK (length("parent_revision") BETWEEN 1 AND 256),
+      CHECK ((jsonb_typeof("contract") = 'object') IS TRUE),
+      CHECK (("contract"->>'version' = '1') IS TRUE),
+      CHECK (("contract"->>'contractHash' = "contract_hash") IS TRUE),
+      CHECK (("contract"->>'executionMode' = 'continuous') IS TRUE),
+      CHECK (("contract"->>'expectedParentRevision' = "parent_revision") IS TRUE),
+      CHECK (("contract"->>'terminalEffectKey' = "effect_key") IS TRUE),
+      CHECK (
+        ((("contract"#>>'{action,kind}') IN ('wait', 'noop', 'quarantine')
+          AND "framework_action_key" IS NULL) IS TRUE)
+        OR ((("contract"#>>'{action,kind}') IN
+          ('run-entry', 'complete-entry', 'fail-parent', 'finish-parent', 'cancel-parent', 'suspend-parent')
+          AND "framework_action_key" ~ '^wta:v1:[a-f0-9]{64}$') IS TRUE)
+      ),
+      CHECK ("created_at" >= 0)
+    );`;
+  }
+
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
     return WorkflowsPG.getDefaultIndexDefs(this.#schema);
   }
@@ -1403,6 +2053,16 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getTerminalEffectTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalSnapshotTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalDestinationReceiptTableDDL(this.#schema));
+    await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionTableDDL(this.#schema));
+    await this.#db.client.none(
+      `INSERT INTO ${this.workflowParentRevisionTableName()}
+       (workflow_name, run_id, generation, updated_at)
+       SELECT workflow_name, run_id, 1,
+         floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+       FROM ${this.workflowSnapshotTableName()}
+       ON CONFLICT (workflow_name, run_id) DO NOTHING`,
+    );
+    await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
@@ -1432,7 +2092,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.client.none(
-      `TRUNCATE TABLE ${this.terminalDestinationReceiptTableName()}, ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
+      `TRUNCATE TABLE ${this.terminalContinuationPlanTableName()}, ${this.terminalDestinationReceiptTableName()}, ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()}, ${this.workflowParentRevisionTableName()} CASCADE`,
     );
   }
 
@@ -1453,6 +2113,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
+        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
 
         // Load existing snapshot within transaction with FOR UPDATE to lock the row
         // This prevents concurrent updates from reading stale data
@@ -1499,6 +2160,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            SET snapshot = $3, "updatedAt" = $5, "updatedAtZ" = $7`,
           [workflowName, runId, sanitizedSnapshot, now, now, now, now],
         );
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
 
         return snapshot.context;
       });
@@ -1531,6 +2193,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
+        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
 
         // Load existing snapshot within transaction with FOR UPDATE to lock the row
         // This prevents concurrent updates from reading stale data
@@ -1563,6 +2226,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            WHERE workflow_name = $4 AND run_id = $5`,
           [sanitizedSnapshot, now, now, workflowName, runId],
         );
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
 
         return updatedSnapshot;
       });
@@ -1603,23 +2267,27 @@ export class WorkflowsPG extends WorkflowsStorage {
       const updatedAtValue = updatedAt ? updatedAt : now;
       // Sanitize the snapshot JSON to remove problematic Unicode sequences
       const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
-      await this.#db.client.none(
-        `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
+      await this.#db.client.tx(async t => {
+        const revision = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        await t.none(
+          `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
                  (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (workflow_name, run_id) DO UPDATE
                  SET "resourceId" = $3, snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
-        [
-          workflowName,
-          runId,
-          resourceId,
-          sanitizedSnapshot,
-          createdAtValue,
-          updatedAtValue,
-          createdAtValue,
-          updatedAtValue,
-        ],
-      );
+          [
+            workflowName,
+            runId,
+            resourceId,
+            sanitizedSnapshot,
+            createdAtValue,
+            updatedAtValue,
+            createdAtValue,
+            updatedAtValue,
+          ],
+        );
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision);
+      });
     } catch (error) {
       throw new MastraError(
         {
@@ -1717,10 +2385,17 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
     try {
-      await this.#db.client.none(
-        `DELETE FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })} WHERE run_id = $1 AND workflow_name = $2`,
-        [runId, workflowName],
-      );
+      await this.#db.client.tx(async t => {
+        const generation = await this.lockWorkflowParentRevision(t, workflowName, runId);
+        const result = await t.query(
+          `DELETE FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
+           WHERE run_id = $1 AND workflow_name = $2`,
+          [runId, workflowName],
+        );
+        if ((result.rowCount ?? 0) > 0) {
+          await this.bumpWorkflowParentRevision(t, workflowName, runId, generation);
+        }
+      });
     } catch (error) {
       throw new MastraError(
         {

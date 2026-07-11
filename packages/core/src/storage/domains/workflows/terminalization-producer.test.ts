@@ -92,6 +92,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       journalVersion: 1,
       producerOutboxVersion: 1,
       destinationReceiptVersion: 1,
+      parentApplicationVersion: 1,
     });
     const canonical = db.workflows.get(runKey(run))?.snapshot;
     const retained = db.workflowTerminalSnapshots.get(runKey(run));

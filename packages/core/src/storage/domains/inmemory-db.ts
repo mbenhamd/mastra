@@ -20,6 +20,7 @@ import type {
   StorageSkillType,
   StorageToolProviderConnection,
   StorageWorkflowRun,
+  WorkflowTerminalContinuationPlanRecord,
   ObservationalMemoryRecord,
   DatasetRecord,
   DatasetItemRow,
@@ -174,6 +175,10 @@ export class InMemoryDB {
   readonly workflowTerminalSnapshots = new Map<string, WorkflowTerminalSnapshotRecord>();
   /** Consumer-scoped destination receipt evidence, isolated from replaceable workflow runs. */
   readonly workflowTerminalDestinationReceipts = new WorkflowTerminalDestinationReceiptMap();
+  /** Immutable continuation plans keyed by their canonical receipt identity. */
+  readonly workflowTerminalContinuationPlans = new Map<string, WorkflowTerminalContinuationPlanRecord>();
+  /** Opaque monotonic revisions for atomic parent-application compare-and-set. */
+  readonly workflowTerminalParentRevisions = new Map<string, number>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -269,6 +274,8 @@ export class InMemoryDB {
     this.workflowTerminalEffects.clear();
     this.workflowTerminalSnapshots.clear();
     this.workflowTerminalDestinationReceipts.clear();
+    this.workflowTerminalContinuationPlans.clear();
+    this.workflowTerminalParentRevisions.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;

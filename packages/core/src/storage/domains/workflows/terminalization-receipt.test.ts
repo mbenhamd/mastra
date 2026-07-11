@@ -156,6 +156,7 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       journalVersion: 1,
       producerOutboxVersion: 1,
       destinationReceiptVersion: 1,
+      parentApplicationVersion: 1,
     });
     const first = await workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'finish-dispatcher'));
     expect(first).toMatchObject({

@@ -9,20 +9,32 @@ import type {
   WorkflowTerminalizationRecord,
 } from '../../../workflows';
 import {
+  copyWorkflowTerminalParentContinuationContract,
   getWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalEffectIntegrity,
+  validateWorkflowTerminalParentContinuationIntegrity,
 } from '../../../workflows/terminal-continuation';
-export { validateWorkflowTerminalEffectIntegrity } from '../../../workflows/terminal-continuation';
+export {
+  applyWorkflowTerminalParentContinuationPatch,
+  copyWorkflowTerminalParentContinuationContract,
+  createWorkflowTerminalGraphFingerprint,
+  createWorkflowTerminalParentContinuationContract,
+  validateWorkflowTerminalEffectIntegrity,
+} from '../../../workflows/terminal-continuation';
 import type {
   AdvanceWorkflowTerminalizationInput,
+  ApplyWorkflowTerminalParentEffectInput,
   ClaimWorkflowTerminalizationInput,
   GetWorkflowTerminalEffectForDispatchInput,
   GetWorkflowTerminalDestinationReceiptInput,
+  GetWorkflowTerminalContinuationPlanInput,
   PersistWorkflowTerminalStateInput,
   PrepareWorkflowTerminalEffectInput,
   WorkflowTerminalEffectDescriptor,
   ReleaseWorkflowTerminalizationInput,
   ReserveWorkflowTerminalDestinationReceiptInput,
+  WorkflowTerminalContinuationPlanObservation,
+  WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalEffectObservation,
   WorkflowTerminalizationObservation,
 } from '../../types';
@@ -103,6 +115,49 @@ type InternalGetWorkflowTerminalDestinationReceiptResult =
       record: WorkflowTerminalizationRecord;
     }
   | { status: 'missing_receipt' | 'missing_effect' | 'missing_record' };
+
+export type InternalPrepareWorkflowTerminalParentApplicationResult =
+  | {
+      status: 'ready';
+      journal: WorkflowTerminalizationRecord;
+      receipt: WorkflowTerminalDestinationReceiptRecord;
+      plan: WorkflowTerminalContinuationPlanRecord;
+    }
+  | {
+      status: 'already_applied' | 'already_quarantined';
+      journal: WorkflowTerminalizationRecord;
+      receipt: WorkflowTerminalDestinationReceiptRecord;
+      plan: WorkflowTerminalContinuationPlanRecord;
+    }
+  | {
+      status: 'contract_conflict';
+      plan: WorkflowTerminalContinuationPlanRecord;
+    }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | { status: 'invalid_contract' | 'missing_effect' | 'missing_record' };
+
+export interface WorkflowTerminalParentApplicationFinalRecords {
+  journal: WorkflowTerminalizationRecord;
+  receipt: WorkflowTerminalDestinationReceiptRecord;
+  plan: WorkflowTerminalContinuationPlanRecord;
+  status: 'applied' | 'quarantined';
+}
+
+export type InternalGetWorkflowTerminalContinuationPlanResult =
+  | {
+      status: 'found';
+      plan: WorkflowTerminalContinuationPlanRecord;
+      applicationState: 'applied' | 'quarantined';
+      dispatchState: 'none' | 'pending' | 'destination_applied';
+    }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | { status: 'missing_effect' | 'missing_receipt' | 'missing_plan' | 'missing_record' };
 
 const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTerminalizationPhase[]> = {
   terminalization_pending: [],
@@ -845,6 +900,387 @@ export function getWorkflowTerminalDestinationReceiptRecord(
     throw new TypeError('Conflicting workflow terminal destination receipt identity');
   }
   return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt) };
+}
+
+/** @internal The only receipt consumer allowed to mutate a parent workflow. */
+export const WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID = 'mastra.parent-application.v1' as const;
+
+function workflowTerminalActionNeedsDispatch(
+  action: ApplyWorkflowTerminalParentEffectInput['contract']['action'],
+): boolean {
+  return action.kind !== 'wait' && action.kind !== 'noop' && action.kind !== 'quarantine';
+}
+
+export function createWorkflowTerminalContinuationPlanRecord(
+  effect: WorkflowTerminalEffectRecord,
+  receipt: WorkflowTerminalDestinationReceiptRecord,
+  parentRevision: string,
+  contractInput: ApplyWorkflowTerminalParentEffectInput['contract'],
+  now: number,
+): WorkflowTerminalContinuationPlanRecord {
+  validateWorkflowTerminalEffectIntegrity(effect);
+  if (effect.kind !== 'parent-workflow-step-end') {
+    throw new TypeError('parent continuation plans require a parent-workflow-step-end effect');
+  }
+  validateWorkflowTerminalDestinationReceiptIntegrity(receipt, effect, now);
+  validateWorkflowTerminalizationIdentity(parentRevision, 'parentRevision', 256);
+  validateWorkflowTerminalizationClock(now);
+  const contract = copyWorkflowTerminalParentContinuationContract(contractInput);
+  validateWorkflowTerminalParentContinuationIntegrity(contract);
+  if (
+    receipt.consumerId !== WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID ||
+    receipt.effectKey !== effect.effectKey ||
+    contract.terminalEffectKey !== effect.effectKey ||
+    contract.terminalEffectPayloadHash !== effect.payloadHash ||
+    contract.childTerminalStatus !== effect.terminalStatus ||
+    contract.expectedParentRevision !== parentRevision ||
+    contract.executionMode !== 'continuous' ||
+    now < receipt.createdAt ||
+    now < effect.createdAt
+  ) {
+    throw new TypeError('Invalid parent continuation contract binding');
+  }
+
+  const parts = [
+    '1',
+    effect.effectKey,
+    receipt.receiptKey,
+    WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+    effect.parentWorkflowName,
+    effect.parentRunId,
+    parentRevision,
+    contract.contractHash,
+  ];
+  const planKey = `wtp:v1:${hashFramedParts('mastra.workflow-terminal-continuation-plan.identity.v1', parts)}`;
+  const planHash = `sha256:${hashFramedParts('mastra.workflow-terminal-continuation-plan.payload.v1', [
+    ...parts,
+    String(now),
+  ])}`;
+  const frameworkActionKey = workflowTerminalActionNeedsDispatch(contract.action)
+    ? `wta:v1:${hashFramedParts('mastra.workflow-terminal-framework-action.identity.v1', [
+        planKey,
+        contract.contractHash,
+        contract.action.kind,
+        contract.action.reason,
+      ])}`
+    : undefined;
+
+  return {
+    version: 1,
+    planKey,
+    planHash,
+    receiptKey: receipt.receiptKey,
+    effectKey: effect.effectKey,
+    consumerId: WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+    workflowName: effect.workflowName,
+    runId: effect.runId,
+    parentWorkflowName: effect.parentWorkflowName,
+    parentRunId: effect.parentRunId,
+    parentRevision,
+    contract,
+    ...(frameworkActionKey === undefined ? {} : { frameworkActionKey }),
+    createdAt: now,
+  };
+}
+
+export function copyWorkflowTerminalContinuationPlanRecord(
+  plan: WorkflowTerminalContinuationPlanRecord,
+): WorkflowTerminalContinuationPlanRecord {
+  return {
+    ...plan,
+    contract: copyWorkflowTerminalParentContinuationContract(plan.contract),
+  };
+}
+
+export function observeWorkflowTerminalContinuationPlanRecord(
+  plan: WorkflowTerminalContinuationPlanRecord,
+): WorkflowTerminalContinuationPlanObservation {
+  return {
+    version: 1,
+    planKey: plan.planKey,
+    planHash: plan.planHash,
+    contractHash: plan.contract.contractHash,
+    actionKind: plan.contract.action.kind,
+    actionReason: plan.contract.action.reason,
+    createdAt: plan.createdAt,
+  };
+}
+
+export function validateWorkflowTerminalContinuationPlanIntegrity(
+  plan: WorkflowTerminalContinuationPlanRecord,
+  effect: WorkflowTerminalEffectRecord,
+  receipt: WorkflowTerminalDestinationReceiptRecord,
+  now: number,
+): void {
+  const expected = createWorkflowTerminalContinuationPlanRecord(
+    effect,
+    receipt,
+    plan.parentRevision,
+    plan.contract,
+    plan.createdAt,
+  );
+  if (
+    plan.version !== expected.version ||
+    plan.planKey !== expected.planKey ||
+    plan.planHash !== expected.planHash ||
+    plan.receiptKey !== expected.receiptKey ||
+    plan.effectKey !== expected.effectKey ||
+    plan.consumerId !== expected.consumerId ||
+    plan.workflowName !== expected.workflowName ||
+    plan.runId !== expected.runId ||
+    plan.parentWorkflowName !== expected.parentWorkflowName ||
+    plan.parentRunId !== expected.parentRunId ||
+    plan.parentRevision !== expected.parentRevision ||
+    plan.contract.contractHash !== expected.contract.contractHash ||
+    plan.frameworkActionKey !== expected.frameworkActionKey ||
+    !Number.isSafeInteger(plan.createdAt) ||
+    plan.createdAt < effect.createdAt ||
+    plan.createdAt < receipt.createdAt ||
+    plan.createdAt > now
+  ) {
+    throw new TypeError('Invalid workflow terminal continuation plan integrity');
+  }
+}
+
+function sameWorkflowTerminalContinuationPlan(
+  left: WorkflowTerminalContinuationPlanRecord,
+  right: WorkflowTerminalContinuationPlanRecord,
+): boolean {
+  return (
+    left.planKey === right.planKey &&
+    left.planHash === right.planHash &&
+    left.contract.contractHash === right.contract.contractHash
+  );
+}
+
+export function getWorkflowTerminalContinuationPlanRecord(
+  journal: WorkflowTerminalizationRecord | undefined,
+  effect: WorkflowTerminalEffectRecord | undefined,
+  receipt: WorkflowTerminalDestinationReceiptRecord | undefined,
+  plan: WorkflowTerminalContinuationPlanRecord | undefined,
+  input: GetWorkflowTerminalContinuationPlanInput,
+  now: number,
+): InternalGetWorkflowTerminalContinuationPlanResult {
+  if (effect) {
+    validateWorkflowTerminalEffectIntegrity(effect);
+    if (!journal) throw new TypeError('Workflow terminal effect exists without its journal');
+    validateWorkflowTerminalEffectJournalLink(effect, journal, input.workflowName, input.runId);
+  }
+  if (receipt) {
+    if (!effect) throw new TypeError('Workflow terminal receipt exists without its effect');
+    validateWorkflowTerminalDestinationReceiptIntegrity(receipt, effect, now);
+  }
+  if (plan) {
+    if (!effect || !receipt) throw new TypeError('Workflow terminal continuation exists without receipt evidence');
+    validateWorkflowTerminalContinuationPlanIntegrity(plan, effect, receipt, now);
+  }
+  const fence = checkLiveWorkflowTerminalizationFence(journal, input, now);
+  if (fence.status !== 'ok') return fence;
+  if (!effect || effect.kind !== 'parent-workflow-step-end') return { status: 'missing_effect' };
+  if (!receipt) return { status: 'missing_receipt' };
+  if (receipt.consumerId !== WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID) {
+    throw new TypeError('Invalid canonical parent-application receipt');
+  }
+  if (!plan) return { status: 'missing_plan' };
+
+  const actionable = workflowTerminalActionNeedsDispatch(plan.contract.action);
+  const applied =
+    receipt.applicationState === 'applied' &&
+    plan.contract.action.kind !== 'quarantine' &&
+    (actionable
+      ? (receipt.dispatchState === 'pending' && fence.record.phase === 'parent_outbox_pending') ||
+        (receipt.dispatchState === 'destination_applied' && fence.record.phase === 'parent_effect_recorded')
+      : receipt.dispatchState === 'none' && fence.record.phase === 'parent_effect_recorded');
+  const quarantined =
+    receipt.applicationState === 'quarantined' &&
+    receipt.dispatchState === 'none' &&
+    fence.record.phase === 'parent_outbox_pending' &&
+    plan.contract.action.kind === 'quarantine';
+  if (!applied && !quarantined) {
+    throw new TypeError('Contradictory workflow terminal parent application evidence');
+  }
+  return {
+    status: 'found',
+    plan: copyWorkflowTerminalContinuationPlanRecord(plan),
+    applicationState: receipt.applicationState,
+    dispatchState: receipt.dispatchState,
+  };
+}
+
+export function prepareWorkflowTerminalParentApplicationRecords(
+  journal: WorkflowTerminalizationRecord | undefined,
+  effect: WorkflowTerminalEffectRecord | undefined,
+  existingReceipt: WorkflowTerminalDestinationReceiptRecord | undefined,
+  existingPlan: WorkflowTerminalContinuationPlanRecord | undefined,
+  input: ApplyWorkflowTerminalParentEffectInput,
+  now: number,
+): InternalPrepareWorkflowTerminalParentApplicationResult {
+  if (effect) {
+    validateWorkflowTerminalEffectIntegrity(effect);
+    if (!journal) throw new TypeError('Workflow terminal effect exists without its journal');
+    validateWorkflowTerminalEffectJournalLink(effect, journal, input.workflowName, input.runId);
+  }
+  if (existingReceipt) {
+    if (!effect) throw new TypeError('Workflow terminal receipt exists without its effect');
+    validateWorkflowTerminalDestinationReceiptIntegrity(existingReceipt, effect, now);
+  }
+  if (existingPlan) {
+    if (!effect || !existingReceipt) {
+      throw new TypeError('Workflow terminal continuation exists without receipt evidence');
+    }
+    validateWorkflowTerminalContinuationPlanIntegrity(existingPlan, effect, existingReceipt, now);
+  }
+  const fence = checkLiveWorkflowTerminalizationFence(journal, input, now);
+  if (fence.status !== 'ok') return fence;
+  try {
+    validateWorkflowTerminalParentContinuationIntegrity(input.contract);
+  } catch {
+    return { status: 'invalid_contract' };
+  }
+  if (!effect || effect.kind !== 'parent-workflow-step-end') return { status: 'missing_effect' };
+  if (
+    input.contract.terminalEffectKey !== effect.effectKey ||
+    input.contract.terminalEffectPayloadHash !== effect.payloadHash ||
+    input.contract.childTerminalStatus !== effect.terminalStatus ||
+    input.contract.executionMode !== 'continuous'
+  ) {
+    return { status: 'invalid_contract' };
+  }
+  if (fence.record.phase !== 'parent_outbox_pending' && fence.record.phase !== 'parent_effect_recorded') {
+    return { status: 'phase_conflict', record: copyWorkflowTerminalizationRecord(fence.record) };
+  }
+  const desiredReceipt = createWorkflowTerminalDestinationReceiptRecord(
+    effect,
+    WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
+    now,
+  );
+  const receipt = existingReceipt ?? desiredReceipt;
+  if (existingReceipt) {
+    if (
+      existingReceipt.receiptKey !== desiredReceipt.receiptKey ||
+      existingReceipt.consumerId !== WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID
+    ) {
+      throw new TypeError('Conflicting canonical parent-application receipt');
+    }
+  }
+  let desiredPlan: WorkflowTerminalContinuationPlanRecord;
+  try {
+    desiredPlan = createWorkflowTerminalContinuationPlanRecord(
+      effect,
+      receipt,
+      input.contract.expectedParentRevision,
+      input.contract,
+      existingPlan?.createdAt ?? now,
+    );
+  } catch {
+    return { status: 'invalid_contract' };
+  }
+  if (existingPlan) {
+    if (!sameWorkflowTerminalContinuationPlan(existingPlan, desiredPlan)) {
+      return { status: 'contract_conflict', plan: copyWorkflowTerminalContinuationPlanRecord(existingPlan) };
+    }
+    const actionable = workflowTerminalActionNeedsDispatch(existingPlan.contract.action);
+    const exactAppliedEvidence =
+      receipt.applicationState === 'applied' &&
+      existingPlan.contract.action.kind !== 'quarantine' &&
+      (actionable
+        ? (receipt.dispatchState === 'pending' && fence.record.phase === 'parent_outbox_pending') ||
+          (receipt.dispatchState === 'destination_applied' && fence.record.phase === 'parent_effect_recorded')
+        : receipt.dispatchState === 'none' && fence.record.phase === 'parent_effect_recorded');
+    if (exactAppliedEvidence) {
+      return {
+        status: 'already_applied',
+        journal: copyWorkflowTerminalizationRecord(fence.record),
+        receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt),
+        plan: copyWorkflowTerminalContinuationPlanRecord(existingPlan),
+      };
+    }
+    if (
+      receipt.applicationState === 'quarantined' &&
+      receipt.dispatchState === 'none' &&
+      existingPlan.contract.action.kind === 'quarantine' &&
+      fence.record.phase === 'parent_outbox_pending'
+    ) {
+      return {
+        status: 'already_quarantined',
+        journal: copyWorkflowTerminalizationRecord(fence.record),
+        receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt),
+        plan: copyWorkflowTerminalContinuationPlanRecord(existingPlan),
+      };
+    }
+    throw new TypeError('Contradictory workflow terminal parent application evidence');
+  }
+  if (receipt.applicationState !== 'reserved' || receipt.dispatchState !== 'none') {
+    throw new TypeError('Workflow terminal parent receipt has state without a plan');
+  }
+  if (fence.record.phase !== 'parent_outbox_pending') {
+    throw new TypeError('Workflow terminal parent journal has applied phase without evidence');
+  }
+  return {
+    status: 'ready',
+    journal: copyWorkflowTerminalizationRecord(fence.record),
+    receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt),
+    plan: copyWorkflowTerminalContinuationPlanRecord(desiredPlan),
+  };
+}
+
+export function finalizeWorkflowTerminalParentApplicationRecords(
+  journal: WorkflowTerminalizationRecord,
+  receipt: WorkflowTerminalDestinationReceiptRecord,
+  plan: WorkflowTerminalContinuationPlanRecord,
+  now: number,
+): WorkflowTerminalParentApplicationFinalRecords {
+  validateWorkflowTerminalizationClock(now);
+  if (now < receipt.createdAt || now < plan.createdAt || journal.phase !== 'parent_outbox_pending') {
+    throw new TypeError('Invalid workflow terminal parent application finalization');
+  }
+  const {
+    applicationState: _applicationState,
+    dispatchState: _dispatchState,
+    appliedAt: _appliedAt,
+    dispatchPendingAt: _dispatchPendingAt,
+    destinationAppliedAt: _destinationAppliedAt,
+    quarantinedAt: _quarantinedAt,
+    ...receiptBase
+  } = receipt;
+  if (plan.contract.action.kind === 'quarantine') {
+    return {
+      status: 'quarantined',
+      journal: copyWorkflowTerminalizationRecord(journal),
+      receipt: {
+        ...receiptBase,
+        applicationState: 'quarantined',
+        dispatchState: 'none',
+        updatedAt: now,
+        quarantinedAt: now,
+      },
+      plan: copyWorkflowTerminalContinuationPlanRecord(plan),
+    };
+  }
+  const dispatchPending = workflowTerminalActionNeedsDispatch(plan.contract.action);
+  return {
+    status: 'applied',
+    journal: dispatchPending
+      ? copyWorkflowTerminalizationRecord(journal)
+      : { ...journal, phase: 'parent_effect_recorded', updatedAt: now },
+    receipt: dispatchPending
+      ? {
+          ...receiptBase,
+          applicationState: 'applied',
+          dispatchState: 'pending',
+          updatedAt: now,
+          appliedAt: now,
+          dispatchPendingAt: now,
+        }
+      : {
+          ...receiptBase,
+          applicationState: 'applied',
+          dispatchState: 'none',
+          updatedAt: now,
+          appliedAt: now,
+        },
+    plan: copyWorkflowTerminalContinuationPlanRecord(plan),
+  };
 }
 
 /** @internal Atomically certifies that the canonical run snapshot is terminal. */

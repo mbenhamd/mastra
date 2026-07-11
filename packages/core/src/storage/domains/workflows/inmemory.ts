@@ -7,6 +7,10 @@ import type {
   WorkflowTerminalSnapshotRecord,
   WorkflowTerminalizationRecord,
 } from '../../../workflows';
+import {
+  applyWorkflowTerminalParentContinuationPatch,
+  copyWorkflowTerminalParentContinuationContract,
+} from '../../../workflows/terminal-continuation';
 import { normalizePerPage } from '../../base';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -21,12 +25,18 @@ import type {
   GetWorkflowTerminalEffectForDispatchResult,
   GetWorkflowTerminalDestinationReceiptInput,
   GetWorkflowTerminalDestinationReceiptResult,
+  GetWorkflowTerminalParentContextInput,
+  GetWorkflowTerminalParentContextResult,
+  GetWorkflowTerminalContinuationPlanInput,
+  GetWorkflowTerminalContinuationPlanResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
   PrepareWorkflowTerminalEffectInput,
   PrepareWorkflowTerminalEffectResult,
   ReserveWorkflowTerminalDestinationReceiptInput,
   ReserveWorkflowTerminalDestinationReceiptResult,
+  ApplyWorkflowTerminalParentEffectInput,
+  ApplyWorkflowTerminalParentEffectResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   StorageWorkflowRun,
@@ -34,6 +44,7 @@ import type {
   WorkflowRuns,
   StorageListWorkflowRunsInput,
   UpdateWorkflowStateOptions,
+  WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
 } from '../../types';
 import { createEmptyWorkflowSnapshot, mergeWorkflowStepResult } from '../../workflow-snapshot';
@@ -45,15 +56,20 @@ import {
   copyWorkflowTerminalizationRecord,
   copyWorkflowTerminalEffectRecord,
   copyWorkflowTerminalDestinationReceiptRecord,
+  copyWorkflowTerminalContinuationPlanRecord,
   getWorkflowTerminalDestinationReceiptRecord,
   getWorkflowTerminalEffectForDispatchRecord,
+  getWorkflowTerminalContinuationPlanRecord,
   materializeWorkflowTerminalEffectDescriptor,
   materializeWorkflowTerminalEffectKind,
   observeWorkflowTerminalizationRecord,
   observeWorkflowTerminalEffectRecord,
+  observeWorkflowTerminalContinuationPlanRecord,
   persistWorkflowTerminalStateRecord,
   prepareWorkflowTerminalEffectRecord,
   reserveWorkflowTerminalDestinationReceiptRecord,
+  prepareWorkflowTerminalParentApplicationRecords,
+  finalizeWorkflowTerminalParentApplicationRecords,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
   validateWorkflowTerminalEffectIntegrity,
@@ -63,6 +79,7 @@ import {
   validateWorkflowTerminalizationRunIdentity,
   validateWorkflowTerminalizationIdentity,
   validateWorkflowTerminalSnapshotJournalLink,
+  WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
 } from './terminalization';
 
 /**
@@ -253,7 +270,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
-    return { journalVersion: 1, producerOutboxVersion: 1, destinationReceiptVersion: 1 };
+    return {
+      journalVersion: 1,
+      producerOutboxVersion: 1,
+      destinationReceiptVersion: 1,
+      parentApplicationVersion: 1,
+    };
   }
 
   private getTerminalizationKey(workflowName: string, runId: string): string {
@@ -309,6 +331,36 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       }
     }
     return { status: 'found', journalKey, journal, effect, receipt };
+  }
+
+  private getTerminalContinuationPlan(
+    effect: WorkflowTerminalEffectRecord,
+    receipt: WorkflowTerminalDestinationReceiptRecord,
+  ): WorkflowTerminalContinuationPlanRecord | undefined {
+    const matches: WorkflowTerminalContinuationPlanRecord[] = [];
+    for (const [physicalKey, plan] of this.db.workflowTerminalContinuationPlans) {
+      if (
+        physicalKey === receipt.receiptKey ||
+        plan.receiptKey === receipt.receiptKey ||
+        (plan.effectKey === effect.effectKey && plan.consumerId === WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID)
+      ) {
+        matches.push(plan);
+      }
+    }
+    if (matches.length > 1) {
+      throw new TypeError('Conflicting workflow terminal continuation plan storage');
+    }
+    return matches[0];
+  }
+
+  private getParentRevision(key: string): string {
+    const revision = this.db.workflowTerminalParentRevisions.get(key) ?? 1;
+    this.db.workflowTerminalParentRevisions.set(key, revision);
+    return `mem:v1:${revision}`;
+  }
+
+  private bumpParentRevision(key: string): void {
+    this.db.workflowTerminalParentRevisions.set(key, (this.db.workflowTerminalParentRevisions.get(key) ?? 0) + 1);
   }
 
   async claimWorkflowTerminalization(
@@ -439,6 +491,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
           this.db.workflowTerminalDestinationReceipts.delete(receiptKey);
         }
       }
+      for (const [planKey, plan] of this.db.workflowTerminalContinuationPlans) {
+        if (plan.workflowName === operation.workflowName && plan.runId === operation.runId) {
+          this.db.workflowTerminalContinuationPlans.delete(planKey);
+        }
+      }
       return { status: 'deleted', count: 1 };
     }
     return { status: 'deleted', count: 0 };
@@ -493,6 +550,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         snapshot: result.snapshot,
         updatedAt: now,
       });
+      this.bumpParentRevision(workflowKey);
       this.db.workflowTerminalSnapshots.set(journalKey, retained);
       this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(result.record));
       return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
@@ -682,12 +740,200 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       : result;
   }
 
+  async getWorkflowTerminalParentContext(
+    input: GetWorkflowTerminalParentContextInput,
+  ): Promise<GetWorkflowTerminalParentContextResult> {
+    const operation = { ...input, kind: 'parent-workflow-step-end' as const };
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const childKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const journal = this.db.workflowTerminalizations.get(journalKey);
+    if (!journal && !this.db.workflows.has(childKey)) return { status: 'missing_run' };
+    const effect = this.db.workflowTerminalEffects.get(
+      this.getTerminalEffectKey(operation.workflowName, operation.runId, operation.kind),
+    );
+    const result = getWorkflowTerminalEffectForDispatchRecord(journal, effect, operation, Date.now());
+    if (result.status !== 'found') {
+      return 'record' in result
+        ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+        : result;
+    }
+    if (result.effect.kind !== 'parent-workflow-step-end') return { status: 'missing_effect' };
+    if (journal?.phase !== 'parent_outbox_pending') {
+      return journal
+        ? { status: 'phase_conflict', record: observeWorkflowTerminalizationRecord(journal) }
+        : { status: 'missing_record' };
+    }
+    validateWorkflowTerminalEffectJournalLink(result.effect, journal, operation.workflowName, operation.runId);
+    const retained = this.db.workflowTerminalSnapshots.get(journalKey);
+    if (!retained) return { status: 'missing_terminal_state' };
+    validateWorkflowTerminalSnapshotJournalLink(retained, journal, operation.workflowName, operation.runId);
+    const parentKey = this.getWorkflowKey(result.effect.parentWorkflowName, result.effect.parentRunId);
+    const parent = this.db.workflows.get(parentKey);
+    if (!parent?.snapshot) return { status: 'missing_parent' };
+    const snapshot = typeof parent.snapshot === 'string' ? JSON.parse(parent.snapshot) : parent.snapshot;
+    return {
+      status: 'found',
+      effect: copyWorkflowTerminalEffectRecord(result.effect) as Extract<
+        WorkflowTerminalEffectRecord,
+        { kind: 'parent-workflow-step-end' }
+      >,
+      retainedChild: cloneRunData(retained),
+      parentWorkflowName: result.effect.parentWorkflowName,
+      parentRunId: result.effect.parentRunId,
+      revision: this.getParentRevision(parentKey),
+      snapshot: cloneRunData(snapshot),
+    };
+  }
+
+  async getWorkflowTerminalContinuationPlan(
+    input: GetWorkflowTerminalContinuationPlanInput,
+  ): Promise<GetWorkflowTerminalContinuationPlanResult> {
+    const operation: GetWorkflowTerminalContinuationPlanInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const journal = this.db.workflowTerminalizations.get(journalKey);
+    if (!journal && !this.db.workflows.has(workflowKey)) return { status: 'missing_run' };
+    const now = Date.now();
+    const effect = this.db.workflowTerminalEffects.get(
+      this.getTerminalEffectKey(operation.workflowName, operation.runId, 'parent-workflow-step-end'),
+    );
+    const receipt =
+      effect?.kind === 'parent-workflow-step-end'
+        ? this.getTerminalDestinationReceipt(effect, WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID)
+        : undefined;
+    const plan =
+      effect?.kind === 'parent-workflow-step-end' && receipt
+        ? this.getTerminalContinuationPlan(effect, receipt)
+        : undefined;
+    const result = getWorkflowTerminalContinuationPlanRecord(journal, effect, receipt, plan, operation, now);
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result;
+  }
+
+  async applyWorkflowTerminalParentEffect(
+    input: ApplyWorkflowTerminalParentEffectInput,
+  ): Promise<ApplyWorkflowTerminalParentEffectResult> {
+    let contract: ApplyWorkflowTerminalParentEffectInput['contract'];
+    try {
+      contract = copyWorkflowTerminalParentContinuationContract(input.contract);
+    } catch {
+      return { status: 'invalid_contract' };
+    }
+    const operation: ApplyWorkflowTerminalParentEffectInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      contract,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const childRunKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const journal = this.db.workflowTerminalizations.get(journalKey);
+    if (!journal && !this.db.workflows.has(childRunKey)) return { status: 'missing_run' };
+    const now = Date.now();
+    const effect = this.db.workflowTerminalEffects.get(
+      this.getTerminalEffectKey(operation.workflowName, operation.runId, 'parent-workflow-step-end'),
+    );
+    const receipt = effect
+      ? this.getTerminalDestinationReceipt(effect, WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID)
+      : undefined;
+    const existingPlan = effect && receipt ? this.getTerminalContinuationPlan(effect, receipt) : undefined;
+    const prepared = prepareWorkflowTerminalParentApplicationRecords(
+      journal,
+      effect,
+      receipt,
+      existingPlan,
+      operation,
+      now,
+    );
+    if (prepared.status === 'contract_conflict') {
+      return { status: prepared.status, plan: observeWorkflowTerminalContinuationPlanRecord(prepared.plan) };
+    }
+    if ('record' in prepared) {
+      return { status: prepared.status, record: observeWorkflowTerminalizationRecord(prepared.record) };
+    }
+    if (!('journal' in prepared)) return { status: prepared.status };
+    if (prepared.status === 'already_applied' || prepared.status === 'already_quarantined') {
+      return { status: prepared.status, plan: copyWorkflowTerminalContinuationPlanRecord(prepared.plan) };
+    }
+    if (!effect || effect.kind !== 'parent-workflow-step-end') {
+      throw new TypeError('Parent application became ready without a parent effect');
+    }
+
+    const retained = this.db.workflowTerminalSnapshots.get(journalKey);
+    if (!retained) return { status: 'missing_child_terminal_state' };
+    validateWorkflowTerminalSnapshotJournalLink(retained, prepared.journal, operation.workflowName, operation.runId);
+    const parentKey = this.getWorkflowKey(effect.parentWorkflowName, effect.parentRunId);
+    const parentRun = this.db.workflows.get(parentKey);
+    if (!parentRun?.snapshot) return { status: 'missing_parent' };
+    const parentSnapshot = cloneRunData(
+      typeof parentRun.snapshot === 'string' ? JSON.parse(parentRun.snapshot) : parentRun.snapshot,
+    );
+
+    if (this.getParentRevision(parentKey) !== operation.contract.expectedParentRevision) {
+      return { status: 'parent_conflict' };
+    }
+    const storageTimestamp = now;
+    let patchedParent: WorkflowRunState;
+    try {
+      patchedParent = applyWorkflowTerminalParentContinuationPatch({
+        contract: prepared.plan.contract,
+        effect,
+        parentRevision: operation.contract.expectedParentRevision,
+        parentWorkflowName: effect.parentWorkflowName,
+        parentSnapshot,
+        retainedChild: retained,
+        storageTimestamp,
+        executionMode: 'continuous',
+      });
+    } catch {
+      return { status: 'invalid_contract' };
+    }
+    const finalized = finalizeWorkflowTerminalParentApplicationRecords(
+      prepared.journal,
+      prepared.receipt,
+      prepared.plan,
+      storageTimestamp,
+    );
+    if (finalized.status === 'applied' && finalized.plan.contract.patch.kind !== 'none') {
+      this.db.workflows.set(parentKey, {
+        ...parentRun,
+        snapshot: patchedParent,
+        updatedAt: new Date(storageTimestamp),
+      });
+      this.bumpParentRevision(parentKey);
+    }
+    const receiptStorageKey = JSON.stringify([effect.effectKey, WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID]);
+    this.db.workflowTerminalDestinationReceipts.set(
+      receiptStorageKey,
+      copyWorkflowTerminalDestinationReceiptRecord(finalized.receipt),
+    );
+    this.db.workflowTerminalContinuationPlans.set(
+      finalized.receipt.receiptKey,
+      copyWorkflowTerminalContinuationPlanRecord(finalized.plan),
+    );
+    this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(finalized.journal));
+    return { status: finalized.status, plan: copyWorkflowTerminalContinuationPlanRecord(finalized.plan) };
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     this.db.workflows.clear();
     this.db.workflowTerminalizations.clear();
     this.db.workflowTerminalEffects.clear();
     this.db.workflowTerminalSnapshots.clear();
     this.db.workflowTerminalDestinationReceipts.clear();
+    this.db.workflowTerminalContinuationPlans.clear();
+    this.db.workflowTerminalParentRevisions.clear();
   }
 
   private getWorkflowKey(workflowName: string, runId: string): string {
@@ -732,14 +978,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       throw new Error(`Snapshot not found for runId ${runId}`);
     }
 
-    const context = mergeWorkflowStepResult({ snapshot, stepId, result, requestContext });
+    mergeWorkflowStepResult({ snapshot, stepId, result, requestContext });
+    const storedSnapshot = cloneRunData(snapshot);
 
     this.db.workflows.set(key, {
       ...run,
-      snapshot: snapshot,
+      snapshot: storedSnapshot,
     });
+    this.bumpParentRevision(key);
 
-    return cloneRunData(context);
+    return cloneRunData(storedSnapshot.context);
   }
 
   async updateWorkflowState({
@@ -775,12 +1023,14 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     }
 
     snapshot = { ...snapshot, ...opts };
+    const storedSnapshot = cloneRunData(snapshot);
     this.db.workflows.set(key, {
       ...run,
-      snapshot: snapshot,
+      snapshot: storedSnapshot,
     });
+    this.bumpParentRevision(key);
 
-    return snapshot;
+    return cloneRunData(storedSnapshot);
   }
 
   async persistWorkflowSnapshot({
@@ -805,7 +1055,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       workflow_name: workflowName,
       run_id: runId,
       resourceId,
-      snapshot,
+      snapshot: cloneRunData(snapshot),
       // Preserve the original creation time when re-persisting an existing run; only set it
       // on first insert. Otherwise listWorkflowRuns ordering and date filters drift to the
       // last activity time. Matches the persistent stores (pg/mysql/mongodb/libsql).
@@ -814,6 +1064,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     };
 
     this.db.workflows.set(key, data);
+    this.bumpParentRevision(key);
   }
 
   async loadWorkflowSnapshot({
@@ -943,6 +1194,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
 
   async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
     const key = this.getWorkflowKey(workflowName, runId);
-    this.db.workflows.delete(key);
+    if (this.db.workflows.delete(key)) {
+      // Keep the tombstone revision so deleting and recreating the same logical
+      // run cannot make an older parent context current again (ABA).
+      this.bumpParentRevision(key);
+    }
   }
 }
