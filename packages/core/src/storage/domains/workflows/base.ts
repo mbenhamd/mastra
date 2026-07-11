@@ -1,5 +1,20 @@
 import type { StepResult, WorkflowRunState } from '../../../workflows';
-import type { UpdateWorkflowStateOptions, WorkflowRun, WorkflowRuns, StorageListWorkflowRunsInput } from '../../types';
+import type {
+  AdvanceWorkflowTerminalizationInput,
+  AdvanceWorkflowTerminalizationResult,
+  ClaimWorkflowTerminalizationInput,
+  ClaimWorkflowTerminalizationResult,
+  DeleteCompletedWorkflowTerminalizationsInput,
+  DeleteCompletedWorkflowTerminalizationsResult,
+  GetWorkflowTerminalizationInput,
+  GetWorkflowTerminalizationResult,
+  ReleaseWorkflowTerminalizationInput,
+  ReleaseWorkflowTerminalizationResult,
+  UpdateWorkflowStateOptions,
+  WorkflowRun,
+  WorkflowRuns,
+  StorageListWorkflowRunsInput,
+} from '../../types';
 import { StorageDomain } from '../base';
 
 export abstract class WorkflowsStorage extends StorageDomain {
@@ -11,6 +26,39 @@ export abstract class WorkflowsStorage extends StorageDomain {
   }
 
   abstract supportsConcurrentUpdates(): boolean;
+
+  /** Whether this adapter provides atomic terminalization claim/phase CAS. */
+  supportsWorkflowTerminalizationJournal(): boolean {
+    return false;
+  }
+
+  async claimWorkflowTerminalization(
+    _input: ClaimWorkflowTerminalizationInput,
+  ): Promise<ClaimWorkflowTerminalizationResult> {
+    return { status: 'unsupported' };
+  }
+
+  async getWorkflowTerminalization(_input: GetWorkflowTerminalizationInput): Promise<GetWorkflowTerminalizationResult> {
+    return { status: 'unsupported' };
+  }
+
+  async advanceWorkflowTerminalization(
+    _input: AdvanceWorkflowTerminalizationInput,
+  ): Promise<AdvanceWorkflowTerminalizationResult> {
+    return { status: 'unsupported' };
+  }
+
+  async releaseWorkflowTerminalization(
+    _input: ReleaseWorkflowTerminalizationInput,
+  ): Promise<ReleaseWorkflowTerminalizationResult> {
+    return { status: 'unsupported' };
+  }
+
+  async deleteCompletedWorkflowTerminalizations(
+    _input: DeleteCompletedWorkflowTerminalizationsInput,
+  ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
+    return { status: 'unsupported', count: 0 };
+  }
 
   abstract updateWorkflowResults({
     workflowName,

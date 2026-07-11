@@ -1,6 +1,7 @@
 import type { BackgroundTask } from '../../background-tasks/types';
 import type { ScoreRowData } from '../../evals/types';
 import type { StorageThreadType } from '../../memory/types';
+import type { WorkflowTerminalizationRecord } from '../../workflows';
 import type {
   StorageAgentType,
   StorageMCPClientType,
@@ -65,6 +66,8 @@ export class InMemoryDB {
   readonly messages = new Map<string, StorageMessageType>();
   readonly resources = new Map<string, StorageResourceType>();
   readonly workflows = new Map<string, StorageWorkflowRun>();
+  /** Terminal workflow-event coordination, isolated from replaceable workflow snapshots. */
+  readonly workflowTerminalizations = new Map<string, WorkflowTerminalizationRecord>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -156,6 +159,7 @@ export class InMemoryDB {
     this.messages.clear();
     this.resources.clear();
     this.workflows.clear();
+    this.workflowTerminalizations.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;

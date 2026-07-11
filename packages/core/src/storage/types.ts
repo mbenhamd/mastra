@@ -5,7 +5,13 @@ import type { ScoringSamplingConfig } from '../evals/types';
 import type { MastraDBMessage, StorageThreadType, SerializedMemoryConfig } from '../memory/types';
 import type { ProcessorPhase } from '../processor-provider';
 import { getZodInnerType, getZodTypeName } from '../utils/zod-utils';
-import type { WorkflowRunState, WorkflowRunStatus } from '../workflows';
+import type {
+  WorkflowRunState,
+  WorkflowRunStatus,
+  WorkflowTerminalStatus,
+  WorkflowTerminalizationPhase,
+  WorkflowTerminalizationRecord,
+} from '../workflows';
 
 export type StoragePagination = {
   page: number;
@@ -49,6 +55,86 @@ export interface WorkflowRun {
   updatedAt: Date;
   resourceId?: string;
 }
+
+export interface ClaimWorkflowTerminalizationInput {
+  workflowName: string;
+  runId: string;
+  eventKey: string;
+  terminalStatus: WorkflowTerminalStatus;
+  ownerId: string;
+  leaseMs: number;
+  /** Required to renew an existing claim. Omit to acquire or take over an expired claim. */
+  claimToken?: string;
+  /** Required with claimToken. Monotonic fencing generation returned by the original claim. */
+  claimGeneration?: number;
+}
+
+/**
+ * Observable terminalization state with live fencing credentials removed.
+ * Only a successful acquisition or renewal returns the full claim record.
+ */
+export type WorkflowTerminalizationObservation = Omit<
+  WorkflowTerminalizationRecord,
+  'ownerId' | 'claimToken' | 'claimGeneration'
+>;
+
+export type ClaimWorkflowTerminalizationResult =
+  | { status: 'acquired' | 'renewed'; record: WorkflowTerminalizationRecord }
+  | {
+      status: 'leased' | 'lease_expired' | 'fence_conflict' | 'terminal_conflict' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | { status: 'missing_record' | 'missing_run' | 'unsupported' };
+
+export interface GetWorkflowTerminalizationInput {
+  workflowName: string;
+  runId: string;
+}
+
+export type GetWorkflowTerminalizationResult =
+  | { status: 'found'; record: WorkflowTerminalizationObservation }
+  | { status: 'missing_record' | 'missing_run' | 'unsupported' };
+
+export interface AdvanceWorkflowTerminalizationInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  expectedPhase: WorkflowTerminalizationPhase;
+  nextPhase: WorkflowTerminalizationPhase;
+  leaseMs?: number;
+}
+
+export type AdvanceWorkflowTerminalizationResult =
+  | { status: 'advanced'; record: WorkflowTerminalizationObservation }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | { status: 'invalid_transition' | 'missing_record' | 'missing_run' | 'unsupported' };
+
+export interface ReleaseWorkflowTerminalizationInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+}
+
+export type ReleaseWorkflowTerminalizationResult =
+  | { status: 'released'; record: WorkflowTerminalizationObservation }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | { status: 'missing_record' | 'missing_run' | 'unsupported' };
+
+export interface DeleteCompletedWorkflowTerminalizationsInput {
+  workflowName: string;
+  runId: string;
+  olderThan: Date;
+}
+
+export type DeleteCompletedWorkflowTerminalizationsResult =
+  | { status: 'deleted'; count: number }
+  | { status: 'missing_run' | 'unsupported'; count: 0 };
 
 export type PaginationInfo = {
   total: number;

@@ -940,4 +940,57 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
       });
     });
   });
+
+  describe('terminalization journal capability', () => {
+    it('is explicit when unsupported and fenced when supported', async () => {
+      const workflowName = 'terminalization-contract';
+      const runId = `run-${randomUUID()}`;
+      const claimInput = {
+        workflowName,
+        runId,
+        eventKey: `event-${randomUUID()}`,
+        terminalStatus: 'failed' as const,
+        ownerId: 'contract-worker',
+        leaseMs: 10_000,
+      };
+
+      if (!workflowsStorage.supportsWorkflowTerminalizationJournal()) {
+        await expect(workflowsStorage.claimWorkflowTerminalization(claimInput)).resolves.toEqual({
+          status: 'unsupported',
+        });
+        return;
+      }
+
+      const { snapshot } = createSampleWorkflowSnapshot('running');
+      await workflowsStorage.persistWorkflowSnapshot({ workflowName, runId, snapshot: { ...snapshot, runId } });
+      const claim = await workflowsStorage.claimWorkflowTerminalization(claimInput);
+      expect(claim.status).toBe('acquired');
+      if (claim.status !== 'acquired') throw new Error(`Expected acquired, received ${claim.status}`);
+
+      const leased = await workflowsStorage.claimWorkflowTerminalization(claimInput);
+      expect(leased).toMatchObject({ status: 'leased' });
+      if (leased.status !== 'leased') throw new Error(`Expected leased, received ${leased.status}`);
+      expect(leased.record).not.toHaveProperty('ownerId');
+      expect(leased.record).not.toHaveProperty('claimToken');
+      expect(leased.record).not.toHaveProperty('claimGeneration');
+      await expect(
+        workflowsStorage.claimWorkflowTerminalization({
+          ...claimInput,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+        }),
+      ).resolves.toMatchObject({ status: 'renewed' });
+      await expect(
+        workflowsStorage.advanceWorkflowTerminalization({
+          workflowName,
+          runId,
+          ownerId: claim.record.ownerId!,
+          claimToken: claim.record.claimToken!,
+          claimGeneration: claim.record.claimGeneration,
+          expectedPhase: 'terminalization_pending',
+          nextPhase: 'run_state_persisted',
+        }),
+      ).resolves.toMatchObject({ status: 'advanced', record: { phase: 'run_state_persisted' } });
+    });
+  });
 }
