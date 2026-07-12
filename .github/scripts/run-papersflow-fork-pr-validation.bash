@@ -5,16 +5,120 @@ set -euo pipefail
 : "${BASE_SHA:?BASE_SHA is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 
+validation_started_at=$SECONDS
+validation_budget_seconds=$((50 * 60))
+validation_reserve_seconds=120
+
+remaining_validation_seconds() {
+  local maximum_seconds="$1"
+  local elapsed_seconds=$((SECONDS - validation_started_at))
+  local available_seconds=$((validation_budget_seconds - elapsed_seconds - validation_reserve_seconds))
+
+  if (( available_seconds <= 0 )); then
+    return 1
+  fi
+  if (( available_seconds < maximum_seconds )); then
+    printf '%s\n' "$available_seconds"
+  else
+    printf '%s\n' "$maximum_seconds"
+  fi
+}
+
+run_with_validation_budget() {
+  local maximum_seconds="$1"
+  shift
+  local timeout_seconds
+
+  if ! timeout_seconds="$(remaining_validation_seconds "$maximum_seconds")"; then
+    echo "Validation budget exhausted before: $*" >&2
+    return 124
+  fi
+  timeout --kill-after=30s "${timeout_seconds}s" "$@"
+}
+
 changed_files="$(mktemp)"
+changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
-skipped_e2e_tests="$(mktemp)"
-skipped_playwright_tests="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_tests" "$skipped_e2e_tests" "$skipped_playwright_tests"' EXIT
+delegated_docs_tests="$(mktemp)"
+unowned_files="$(mktemp)"
+unsupported_inputs="$(mktemp)"
+unsupported_tests="$(mktemp)"
+unsupported_workspaces="$(mktemp)"
+workspace_candidates="$(mktemp)"
+trap 'rm -f "$changed_files" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$unowned_files" "$unsupported_inputs" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 git diff --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "$changed_files"
 
 echo "Changed files:"
 cat "$changed_files"
+
+while IFS= read -r file; do
+  workspace_found=false
+  search_dir="$(dirname "$file")"
+  while [[ "$search_dir" != "." && "$search_dir" != "/" ]]; do
+    manifest_path="${search_dir}/package.json"
+    if [[ -f "$manifest_path" ]] ||
+      git cat-file -e "${HEAD_SHA}:${manifest_path}" 2>/dev/null ||
+      git cat-file -e "${BASE_SHA}:${manifest_path}" 2>/dev/null; then
+      printf '%s\n' "$search_dir" >> "$workspace_candidates"
+      workspace_found=true
+      break
+    fi
+    search_dir="$(dirname "$search_dir")"
+  done
+  if [[ "$workspace_found" == false ]]; then
+    printf '%s\n' "$file" >> "$unowned_files"
+  fi
+done < "$changed_files"
+
+sort -u "$workspace_candidates" > "$changed_workspaces"
+
+echo "Changed workspaces:"
+cat "$changed_workspaces"
+
+while IFS= read -r workspace; do
+  case "$workspace" in
+    packages/_internal-core | packages/core | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
+    *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
+  esac
+done < "$changed_workspaces"
+
+while IFS= read -r file; do
+  case "$file" in
+    .changeset/* | \
+      .github/scripts/run-papersflow-fork-pr-validation.bash | \
+      .github/workflows/README.md | \
+      .github/workflows/e2e-docs.yml | \
+      .github/workflows/labeler.yml | \
+      .github/workflows/lint-docs.yml | \
+      .github/workflows/lint.yml | \
+      .github/workflows/mastracode-e2e.yml | \
+      .github/workflows/papersflow-fork-pr.yml) ;;
+    *) printf '%s\n' "$file" >> "$unsupported_inputs" ;;
+  esac
+done < "$unowned_files"
+
+grep -E '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|patches/)' "$changed_files" \
+  >> "$unsupported_inputs" || true
+
+sort -u -o "$unsupported_inputs" "$unsupported_inputs"
+
+if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" ]]; then
+  if [[ -s "$unsupported_workspaces" ]]; then
+    echo "These changed workspaces do not have an owned fork-safe validation target:" >&2
+    cat "$unsupported_workspaces" >&2
+  fi
+  if [[ -s "$unsupported_inputs" ]]; then
+    echo "These non-workspace or root dependency-graph changes require dedicated validation:" >&2
+    cat "$unsupported_inputs" >&2
+  fi
+  echo "Failing closed instead of reporting Core-only validation as workspace coverage." >&2
+  exit 1
+fi
+
+workspace_changed() {
+  grep -Fxq "$1" "$changed_workspaces"
+}
 
 mapfile -t prettier_files < <(
   while IFS= read -r file; do
@@ -25,30 +129,39 @@ mapfile -t prettier_files < <(
 )
 
 if (( ${#prettier_files[@]} > 0 )); then
-  pnpm exec prettier --check "${prettier_files[@]}"
+  run_with_validation_budget 300 pnpm exec prettier --check "${prettier_files[@]}"
 fi
 
-pnpm build:core
-pnpm --filter @mastra/core check
+run_with_validation_budget 900 pnpm build:core
+run_with_validation_budget 600 pnpm --filter @mastra/core check
 
-if grep -qE '^(packages/memory/|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|package\.json$)' "$changed_files"; then
-  pnpm --filter @mastra/memory check
-  pnpm --filter @mastra/memory build:lib
+if workspace_changed packages/_internal-core; then
+  run_with_validation_budget 600 pnpm --dir packages/_internal-core typecheck
 fi
 
-if grep -qE '^(client-sdks/ai-sdk/|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|package\.json$)' "$changed_files"; then
-  pnpm --filter @mastra/ai-sdk exec tsc --noEmit
-  pnpm --filter @mastra/ai-sdk build:lib
+if workspace_changed packages/memory; then
+  run_with_validation_budget 600 pnpm --filter @mastra/memory check
+  run_with_validation_budget 900 pnpm --filter @mastra/memory build:lib
 fi
 
-if grep -qE '^(stores/pg/|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|package\.json$)' "$changed_files"; then
-  pnpm --filter @mastra/pg exec tsc --noEmit
-  pnpm turbo build --filter ./stores/pg
+if workspace_changed client-sdks/ai-sdk; then
+  run_with_validation_budget 600 pnpm --filter @mastra/ai-sdk exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter @mastra/ai-sdk build:lib
 fi
 
-if grep -qE '^mastracode/' "$changed_files"; then
-  pnpm run build:mastracode
-  pnpm --filter ./mastracode run e2e:test -- --reporter=dot
+if workspace_changed stores/pg; then
+  run_with_validation_budget 600 pnpm --filter @mastra/pg exec tsc --noEmit
+  run_with_validation_budget 900 pnpm turbo build --filter ./stores/pg
+fi
+
+if workspace_changed stores/redis; then
+  run_with_validation_budget 600 pnpm --dir stores/redis exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --dir stores/redis build:lib
+fi
+
+if workspace_changed mastracode; then
+  run_with_validation_budget 900 pnpm run build:mastracode
+  run_with_validation_budget 1200 pnpm --filter ./mastracode run e2e:test -- --reporter=dot
 fi
 
 mapfile -t detected_tests < <(
@@ -63,24 +176,37 @@ mapfile -t detected_tests < <(
 
 if (( ${#detected_tests[@]} > 0 )); then
   for file in "${detected_tests[@]}"; do
-    if [[ "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
-      printf '%s\n' "$file" >> "$skipped_e2e_tests"
-    elif grep -Eq "['\"]@playwright/test['\"]" "$file"; then
-      printf '%s\n' "$file" >> "$skipped_playwright_tests"
+    if [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+      printf '%s\n' "$file" >> "$delegated_docs_tests"
+    elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
+      "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]] || \
+      grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" =~ integration\.(test|spec)\. && \
+      "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == stores/* && "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == stores/pg/* && \
+      ( "$file" =~ \.pooler\.test\. || "$file" =~ \.performance\.test\. || \
+        "$file" == */performance-indexes/* || "$file" == */row-number-performance.test.* ) ]]; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
     else
       printf '%s\n' "$file" >> "$changed_tests"
     fi
   done
 fi
 
-if [[ -s "$skipped_e2e_tests" ]]; then
-  echo "Skipping explicit E2E files in the secretless fork lane:"
-  cat "$skipped_e2e_tests"
+if [[ -s "$delegated_docs_tests" ]]; then
+  echo "Delegating docs Playwright files to the fork-enabled Docs E2E workflow:"
+  cat "$delegated_docs_tests"
 fi
 
-if [[ -s "$skipped_playwright_tests" ]]; then
-  echo "Skipping Playwright files in the Vitest selector; dedicated Playwright workflows must validate them:"
-  cat "$skipped_playwright_tests"
+if [[ -s "$unsupported_tests" ]]; then
+  echo "These changed tests require a dedicated fork-safe workflow or suite-specific infrastructure:" >&2
+  cat "$unsupported_tests" >&2
+  echo "Failing closed instead of reporting incomplete validation as successful." >&2
+  exit 1
 fi
 
 if [[ ! -s "$changed_tests" ]]; then
@@ -93,6 +219,7 @@ cat "$changed_tests"
 
 test_status=0
 while IFS= read -r file; do
+  status=0
   test_dir=""
   search_dir="$(dirname "$file")"
 
@@ -111,114 +238,35 @@ while IFS= read -r file; do
   if [[ -n "$test_dir" ]]; then
     relative_file="${file#"$test_dir"/}"
     if [[ "$file" == *.test-d.ts ]]; then
+      if ! timeout_seconds="$(remaining_validation_seconds 600)"; then
+        echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
+        test_status=124
+        break
+      fi
       set +e
-      timeout --kill-after=30s 10m \
-        pnpm --dir "$test_dir" exec vitest typecheck --reporter=dot "$relative_file"
+      timeout --kill-after=30s "${timeout_seconds}s" \
+        pnpm --dir "$test_dir" exec vitest run --typecheck.only --reporter=dot "$relative_file"
       status=$?
       set -e
     else
-      test_diff="$(mktemp)"
-      test_list="$(mktemp)"
-      test_patterns="$(mktemp)"
-      git diff --unified=0 "${BASE_SHA}...${HEAD_SHA}" -- "$file" > "$test_diff"
-
+      if ! timeout_seconds="$(remaining_validation_seconds 900)"; then
+        echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
+        test_status=124
+        break
+      fi
+      echo "Running changed test file in full: $file"
+      test_result="$(mktemp)"
       set +e
-      pnpm --dir "$test_dir" exec vitest list "$relative_file" \
-        --json="$test_list" --includeTaskLocation
-      list_status=$?
+      timeout --kill-after=30s "${timeout_seconds}s" \
+        pnpm --dir "$test_dir" exec vitest run \
+          --reporter=dot --reporter=json --outputFile.json="$test_result" \
+          "$relative_file"
+      status=$?
       set -e
 
-      if (( list_status == 0 )); then
-        node - "$test_diff" "$test_list" <<'NODE' > "$test_patterns"
-const fs = require('node:fs');
-
-const [diffPath, listPath] = process.argv.slice(2);
-const addedLines = new Set();
-let newLine = null;
-
-for (const line of fs.readFileSync(diffPath, 'utf8').split('\n')) {
-  const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
-  if (hunk) {
-    newLine = Number(hunk[1]);
-    continue;
-  }
-
-  if (newLine === null) continue;
-  if (line.startsWith('+')) {
-    addedLines.add(newLine);
-    newLine += 1;
-  } else if (line.startsWith('-') || line.startsWith('\\')) {
-    // Removed lines and "no newline" markers do not advance the new file.
-  } else if (line.startsWith(' ')) {
-    newLine += 1;
-  } else {
-    newLine = null;
-  }
-}
-
-const tests = JSON.parse(fs.readFileSync(listPath, 'utf8'));
-const names = new Set(
-  tests
-    .filter(test => test.location && addedLines.has(test.location.line))
-    .map(test => test.name),
-);
-
-for (const name of names) {
-  // Vitest's list command displays suite separators as " > ", while
-  // testNamePattern matches the runtime full name with spaces.
-  const runtimeName = name.replaceAll(' > ', ' ');
-  const escaped = runtimeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  console.log(`^${escaped}$`);
-}
-NODE
-      fi
-
-      if [[ -s "$test_patterns" ]]; then
-        status=0
-        while IFS= read -r pattern; do
-          echo "Running added or renamed test: $pattern"
-          test_result="$(mktemp)"
-          set +e
-          timeout --kill-after=30s 10m \
-            pnpm --dir "$test_dir" exec vitest run \
-              --reporter=dot --reporter=json --outputFile.json="$test_result" \
-              "$relative_file" -t "$pattern"
-          pattern_status=$?
-          set -e
-
-          if (( pattern_status == 0 )); then
-            set +e
-            node - "$test_result" <<'NODE'
-const fs = require('node:fs');
-const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (result.numPassedTests < 1) {
-  console.error('The selected test pattern did not execute a passing test.');
-  process.exit(1);
-}
-NODE
-            pattern_status=$?
-            set -e
-          fi
-
-          rm -f "$test_result"
-          if (( pattern_status != 0 )); then
-            status=$pattern_status
-          fi
-        done < "$test_patterns"
-      else
-        echo "No added or renamed test declaration detected; running $file in full."
-        test_result="$(mktemp)"
+      if (( status == 0 )); then
         set +e
-        timeout --kill-after=30s 15m \
-          pnpm --dir "$test_dir" exec vitest run \
-            --reporter=dot --reporter=json --outputFile.json="$test_result" \
-            "$relative_file"
-        status=$?
-        set -e
-
-        if (( status == 0 )); then
-          set +e
-          node - "$test_result" <<'NODE'
+        node - "$test_result" <<'NODE'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 if (result.numPassedTests < 1) {
@@ -226,24 +274,31 @@ if (result.numPassedTests < 1) {
   process.exit(1);
 }
 NODE
-          status=$?
-          set -e
-        fi
-
-        rm -f "$test_result"
+        status=$?
+        set -e
       fi
-
-      rm -f "$test_diff" "$test_list" "$test_patterns"
+      rm -f "$test_result"
     fi
   elif [[ "$file" == *.test-d.ts ]]; then
+    if ! timeout_seconds="$(remaining_validation_seconds 600)"; then
+      echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
+      test_status=124
+      break
+    fi
     set +e
-    timeout --kill-after=30s 10m pnpm exec vitest typecheck --reporter=dot "$file"
+    timeout --kill-after=30s "${timeout_seconds}s" pnpm exec vitest run --typecheck.only --reporter=dot "$file"
     status=$?
     set -e
   else
+    if ! timeout_seconds="$(remaining_validation_seconds 900)"; then
+      echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
+      test_status=124
+      break
+    fi
+    echo "Running changed test file in full: $file"
     test_result="$(mktemp)"
     set +e
-    timeout --kill-after=30s 15m \
+    timeout --kill-after=30s "${timeout_seconds}s" \
       pnpm exec vitest run \
         --reporter=dot --reporter=json --outputFile.json="$test_result" \
         "$file"

@@ -24,13 +24,21 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 
 - PR code runs only in the unprivileged `pull_request` sandbox on ephemeral
   GitHub-hosted `ubuntu-24.04` runners.
-- `.github/workflows/papersflow-fork-pr.yml` builds and type-checks the core
-  package, runs baseline-clean checks for other affected fork packages, and
-  executes newly added tests. A changed test file without a new or renamed
-  test declaration runs in full. PostgreSQL changes run the package typecheck,
-  build, and their changed tests. Explicit `*.e2e.test.*` files stay in
-  package-specific or manual validation because this lane intentionally has no
-  provider credentials.
+- `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
+  runs explicit affected-package checks for Internal Core, Memory, AI SDK,
+  PostgreSQL, and Redis, and executes each supported changed Vitest file in
+  full. It discovers workspace ownership from the nearest `package.json` and
+  fails closed when a changed workspace has no owned fork-safe validation
+  target. Root dependency graph changes also fail closed until broad workspace
+  validation is available. Non-workspace changes must match the explicit
+  CI-rollout or changeset-metadata allowlist; other root paths fail closed.
+- Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
+  Other Playwright files, `e2e-tests/**`, nested integration-test packages,
+  integration-test filename variants, explicit provider E2E files, and
+  PostgreSQL pooler/performance suites fail closed until a dedicated fork-safe
+  workflow provides their required setup.
+  Store-provider tests other than the provisioned PostgreSQL and Redis suites
+  fail closed for the same reason.
 - Actual `mastracode/**` changes run the MastraCode build and E2E suite in the
   targeted validator. The canonical MastraCode workflow stays available by
   manual dispatch in the fork, but Core-only fork PRs do not run its broad
@@ -39,8 +47,8 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   checks out with persisted credentials disabled. Its validation script is
   loaded from the PR's trusted base commit. The first same-repository rollout
   may bootstrap that script from its head commit; external PRs may not.
-- Redis and PostgreSQL are disposable job services, not shared runtime
-  infrastructure.
+- Redis and PostgreSQL are disposable job services matching the repository test
+  ports and credentials, not shared runtime infrastructure.
 - `pull_request_target` metadata workflows may use GitHub-hosted runners only
   when they check out trusted default-branch automation rather than PR code.
 - Starsling remains available only to same-repository branches in the canonical

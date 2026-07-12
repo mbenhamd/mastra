@@ -22,8 +22,8 @@ jobs:
     # The fork's targeted validator runs this build only for actual MastraCode
     # changes. Core-only fork PRs must not inherit unrelated package-build
     # failures from the fork baseline. Manual dispatch remains diagnostic.
-    if: github.repository != 'mbenhamd/mastra' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ (github.repository == 'mbenhamd/mastra' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'starsling-ubuntu-24.04' }}
+    if: github.repository == 'mastra-ai/mastra' || (github.repository == 'mbenhamd/mastra' && github.event_name == 'workflow_dispatch')
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
