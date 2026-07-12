@@ -1,0 +1,86 @@
+name: PapersFlow Fork PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Fork build, typecheck, and changed tests
+    if: github.repository == 'mbenhamd/mastra'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      TURBO_CACHE: local:rw
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mastra
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6381:6379
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22.13.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          run_install: false
+          package_json_file: package.json
+          cache: true
+          cache_dependency_path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate fork PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
+          if /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}"; then
+            /usr/bin/git show "${BASE_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" ]]; then
+            echo "Bootstrapping the validator from this same-repository PR."
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          else
+            echo "The trusted base commit does not contain the fork validator." >&2
+            exit 1
+          fi
+          /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
