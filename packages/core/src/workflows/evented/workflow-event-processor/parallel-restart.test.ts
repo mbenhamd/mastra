@@ -61,16 +61,23 @@ describe('processWorkflowParallel restart branch routing', () => {
     ],
   ] as const)('restarts %s at original graph coordinates', async (_label, activeStepsPath, expected) => {
     const { published, pubsub } = recorder();
+    const step = makeParallelStep(['A', 'B', 'C']);
 
     await processWorkflowParallel(
       makeArgs({
         executionPath: [0, 2],
         restart: { activeStepsPath, isParallelOrConditionalRestarted: false },
       }),
-      { pubsub, step: makeParallelStep(['A', 'B', 'C']) },
+      { pubsub, step },
     );
 
     expect(runPaths(published)).toEqual(expected);
+    expect(
+      published.map(event => {
+        const branchIndex = event.data.executionPath.at(-1) as number;
+        return step.steps[branchIndex]!.step.id;
+      }),
+    ).toEqual(Object.keys(activeStepsPath));
     expect(published.every(event => event.data.restart?.isParallelOrConditionalRestarted === true)).toBe(true);
   });
 
