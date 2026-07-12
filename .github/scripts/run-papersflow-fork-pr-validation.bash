@@ -8,7 +8,8 @@ set -euo pipefail
 changed_files="$(mktemp)"
 changed_tests="$(mktemp)"
 skipped_e2e_tests="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_tests" "$skipped_e2e_tests"' EXIT
+skipped_playwright_tests="$(mktemp)"
+trap 'rm -f "$changed_files" "$changed_tests" "$skipped_e2e_tests" "$skipped_playwright_tests"' EXIT
 
 git diff --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "$changed_files"
 
@@ -61,15 +62,25 @@ mapfile -t detected_tests < <(
 )
 
 if (( ${#detected_tests[@]} > 0 )); then
-  printf '%s\n' "${detected_tests[@]}" | \
-    grep -E '\.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$' > "$skipped_e2e_tests" || true
-  printf '%s\n' "${detected_tests[@]}" | \
-    grep -Ev '\.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$' > "$changed_tests" || true
+  for file in "${detected_tests[@]}"; do
+    if [[ "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
+      printf '%s\n' "$file" >> "$skipped_e2e_tests"
+    elif grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+      printf '%s\n' "$file" >> "$skipped_playwright_tests"
+    else
+      printf '%s\n' "$file" >> "$changed_tests"
+    fi
+  done
 fi
 
 if [[ -s "$skipped_e2e_tests" ]]; then
   echo "Skipping explicit E2E files in the secretless fork lane:"
   cat "$skipped_e2e_tests"
+fi
+
+if [[ -s "$skipped_playwright_tests" ]]; then
+  echo "Skipping Playwright files in the Vitest selector; dedicated Playwright workflows must validate them:"
+  cat "$skipped_playwright_tests"
 fi
 
 if [[ ! -s "$changed_tests" ]]; then
@@ -196,12 +207,30 @@ NODE
         done < "$test_patterns"
       else
         echo "No added or renamed test declaration detected; running $file in full."
+        test_result="$(mktemp)"
         set +e
         timeout --kill-after=30s 15m \
-          pnpm --dir "$test_dir" exec vitest run --passWithNoTests \
-            --reporter=dot "$relative_file"
+          pnpm --dir "$test_dir" exec vitest run \
+            --reporter=dot --reporter=json --outputFile.json="$test_result" \
+            "$relative_file"
         status=$?
         set -e
+
+        if (( status == 0 )); then
+          set +e
+          node - "$test_result" <<'NODE'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.numPassedTests < 1) {
+  console.error('The changed test file did not execute a passing Vitest test.');
+  process.exit(1);
+}
+NODE
+          status=$?
+          set -e
+        fi
+
+        rm -f "$test_result"
       fi
 
       rm -f "$test_diff" "$test_list" "$test_patterns"
@@ -212,11 +241,30 @@ NODE
     status=$?
     set -e
   else
+    test_result="$(mktemp)"
     set +e
     timeout --kill-after=30s 15m \
-      pnpm exec vitest run --passWithNoTests --reporter=dot "$file"
+      pnpm exec vitest run \
+        --reporter=dot --reporter=json --outputFile.json="$test_result" \
+        "$file"
     status=$?
     set -e
+
+    if (( status == 0 )); then
+      set +e
+      node - "$test_result" <<'NODE'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.numPassedTests < 1) {
+  console.error('The changed test file did not execute a passing Vitest test.');
+  process.exit(1);
+}
+NODE
+      status=$?
+      set -e
+    fi
+
+    rm -f "$test_result"
   fi
 
   if (( status != 0 )); then
