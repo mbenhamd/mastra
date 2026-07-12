@@ -10,13 +10,13 @@ It separates three facts that are not equivalent:
 2. The terminal workflow snapshot and a producer intent were persisted.
 3. A destination durably applied that intent.
 
-The version 1 journal and fenced terminal-snapshot transition are the prerequisite storage contract. Producer outbox version 1 extends that foundation with retained terminal state and immutable delivery intents. Destination receipts and recovery orchestration are separate capability versions.
+The version 1 journal and fenced terminal-snapshot transition are the prerequisite storage contract. Producer outbox version 1 extends that foundation with authenticated recovery evidence and immutable delivery intents. Destination receipts, recovery evidence, and recovery orchestration remain independently negotiated capabilities.
 
 ## Why the snapshot is insufficient
 
 Workflow snapshots are mutable execution state. Existing APIs may replace or delete them, and concurrent terminal workers can observe the same broker event. Storing claim or outbox state only inside the snapshot would allow stale workers to overwrite a newer owner or lose the evidence needed for replay.
 
-The journal, retained terminal state, effect records, and destination receipts therefore use storage-owned tables or maps with separate lifecycle rules. On stores advertising producer outbox version 1, the existing `persistWorkflowTerminalState()` journal operation also writes an isolated retained terminal artifact from the same adapter-materialized snapshot in the same atomic section. The canonical workflow row remains replaceable; the retained artifact is immutable protocol evidence. Deleting a workflow run removes only the normal row, so the artifact remains available to the fenced dispatcher. Explicit completed-record retention cleanup deletes the journal, terminal artifact, associated producer intents, and destination receipts together.
+The journal, pre-terminal ancestry, authenticated terminal envelope, effect records, and destination receipts therefore use storage-owned tables or maps with separate lifecycle rules. A nested child captures one immutable data-only ancestry chain before execution. `persistWorkflowTerminalState()` later canonicalizes the supplied recovery envelope once in Core, verifies that ancestry, hashes the canonical envelope, and atomically writes the same exact terminal result/final state/request-context patch into the replaceable workflow row and the retained artifact. Adapters do not interpret rich JavaScript values independently. Deleting a normal workflow row does not delete protocol evidence. Completed-record retention is dependency-aware and deletes leaf evidence before the journal only after descendant handoffs and dispatches are settled.
 
 ## Capability negotiation
 
@@ -29,7 +29,8 @@ if (
   capabilities.journalVersion !== 1 ||
   capabilities.producerOutboxVersion !== 1 ||
   capabilities.destinationReceiptVersion !== 1 ||
-  capabilities.parentApplicationVersion !== 1
+  capabilities.parentApplicationVersion !== 1 ||
+  capabilities.recoveryVersion !== 1
 ) {
   throw new Error('The workflow store does not support atomic parent terminal application');
 }
@@ -42,11 +43,14 @@ if (
 The live claim owner performs these storage operations:
 
 1. `claimWorkflowTerminalization()` accepts the first `(eventKey, terminalStatus)` for a run and returns an owner ID, opaque claim token, generation, and bounded lease.
-2. `persistWorkflowTerminalState()` atomically replaces the normal terminal snapshot, retains an immutable terminal artifact, and advances `terminalization_pending` to `run_state_persisted`.
-3. `prepareWorkflowTerminalEffect()` atomically inserts one immutable intent and advances to `parent_outbox_pending` or `finish_outbox_pending`.
-4. `getWorkflowTerminalEffectForDispatch()` returns the full intent, retained terminal snapshot, and retained resource identity only to the current live fenced owner.
+2. For nested runs, `admitWorkflowNestedRun()` atomically records the scalar child ID or one foreach `iterationRunIds[index]` together with the bounded child-to-root recovery ancestry before child execution. It validates the immediate source and graph under the parent lock and requires the ancestry tail to equal the parent's retained chain. A conflict writes neither half; a replay with the same ownership and ancestry identity returns stored state without reapplying the caller's running-result/request-context projection or changing the parent revision. The lower-level ownership and ancestry methods remain adapter contract probes and must not be composed as runtime admission.
+3. `persistWorkflowTerminalState()` atomically replaces both canonical final-state views, retains an authenticated canonical recovery envelope, and advances `terminalization_pending` to `run_state_persisted`.
+4. `prepareWorkflowTerminalEffect()` verifies that a parent destination exactly matches the immediate ancestry frame, binds the envelope hash into one immutable intent, and advances to `parent_outbox_pending` or `finish_outbox_pending`.
+5. `getWorkflowTerminalEffectForDispatch()` returns the full intent and retained recovery evidence, including the retained resource identity, only to the current live fenced owner.
 
 The generic phase compare-and-set cannot create `run_state_persisted`, either `*_outbox_pending` phase, or either `*_effect_recorded` phase. Those transitions belong to specialized atomic methods. A later domain-application capability is responsible for proving application and is the only contract allowed to enter an `*_effect_recorded` phase.
+
+Ancestry admission and completed-evidence cleanup share the same identity lock boundary. PostgreSQL locks the child and every parent identity in deterministic order before inserting the normalized immediate-parent edge; cleanup locks the recovery root before traversing those edges. If cleanup wins, later admission against the now-terminal parent fails closed instead of creating an orphan dependency. If ancestry wins, cleanup observes the pending descendant and retains the parent evidence.
 
 ## Destination receipt reservation
 
@@ -94,7 +98,7 @@ The committed record stores the canonical contract, contract hash, effect and re
 
 Atomicity requires the child journal, retained child state, parent run, revision evidence, receipt, and continuation record to share one physical transaction domain: the same `InMemoryDB`, or the same PostgreSQL database and schema. The capability must not be advertised by an adapter that routes those rows across stores, schemas, databases, or shards without an equivalent atomic primitive.
 
-PF-1782 remains responsible for durable recursive recovery envelopes, exact final-state production, foreach `iterationRunIds`, and strict retained-payload serialization/integrity. PF-1780 must capability-gate runtime activation on that envelope instead of treating this storage primitive as authorization to dispatch unauthenticated retained payloads. This storage layer fails closed when PF-1781 cannot validate the retained state; it does not backfill the rejected pre-contract plan format or infer missing final state.
+PF-1782 supplies durable recursive recovery envelopes, exact final-state production, foreach `iterationRunIds`, and strict retained-payload serialization/integrity. PF-1780 must still capability-gate runtime action dispatch instead of treating authenticated storage evidence as cross-process execution authorization. This storage layer fails closed when PF-1781 cannot validate retained state; it does not backfill the rejected pre-contract plan format or infer missing final state.
 
 ## Intent identity and payload boundary
 
@@ -106,7 +110,7 @@ Each intent contains only:
 - parent workflow name, parent run ID, parent step ID, and exact bounded structural execution path for a nested-run effect;
 - deterministic effect key, deterministic payload hash, and creation time.
 
-The key and payload hash use SHA-256 over length-prefixed UTF-8 fields with separate domain strings. Length framing prevents delimiter ambiguity. The payload hash binds the structural intent fields; it deliberately does not hash or authenticate the separately retained snapshot payload. Version 1 checks only the retained snapshot's structural workflow/run/status/creation-time link to the journal; PF-1782 owns payload authentication. PostgreSQL recomputes both effect hashes while decoding persisted rows and fails closed if the structural fields and hashes disagree. It also verifies that the intent's source event, terminal status, run identity, and creation time agree with the owning journal.
+The key and payload hash use SHA-256 over length-prefixed UTF-8 fields with separate domain strings. Length framing prevents delimiter ambiguity. The effect identity remains structural, while its payload hash also binds the canonical recovery-envelope hash. The retained envelope hash covers the normalized terminal result/error, exact final state, selected request-context patch, child graph fingerprint, and recursive ancestry. Every read recomputes envelope and effect integrity before returning evidence. PostgreSQL and InMemory therefore authenticate the same canonical bytes instead of relying on adapter-specific snapshot cloning or JSON serialization.
 
 Intents must never persist raw request context, processor arguments, complete workflow results, errors, tools, executable functions, or live object graphs. A finish intent references the separately retained terminal artifact by workflow name and run ID instead of copying the result. Parent execution paths contain 1-256 non-negative safe integers and are included in both deterministic hashes. Structural text identity fields are bounded, must contain well-formed Unicode, and cannot contain the null character rejected by PostgreSQL text storage.
 
@@ -119,7 +123,9 @@ The producer protocol guarantees:
 - first-terminal-wins journal identity per workflow run;
 - monotonic claim generations and permanent fencing of stale workers;
 - the journal capability's atomic canonical terminal snapshot plus phase persistence;
-- one adapter-materialized terminal snapshot value driving both canonical and retained writes;
+- one Core-canonicalized recovery envelope driving both canonical and retained writes;
+- exact event-local final state replacing both `context.__state` and `value`;
+- authenticated recursive ancestry and per-iteration nested-run ownership;
 - retention of the exact terminal artifact independently from the normal run row;
 - retention of the effective resource identity needed to reconstruct finish delivery after normal run deletion;
 - one immutable producer intent per run and effect kind;

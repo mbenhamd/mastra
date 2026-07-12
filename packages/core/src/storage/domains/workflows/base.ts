@@ -24,6 +24,13 @@ import type {
   ReserveWorkflowTerminalDestinationReceiptResult,
   ApplyWorkflowTerminalParentEffectInput,
   ApplyWorkflowTerminalParentEffectResult,
+  BindWorkflowNestedRunOwnershipInput,
+  BindWorkflowNestedRunOwnershipResult,
+  PersistWorkflowTerminalRecoveryAncestryInput,
+  PersistWorkflowTerminalRecoveryAncestryResult,
+  GetWorkflowTerminalRecoveryAncestryResult,
+  AdmitWorkflowNestedRunInput,
+  AdmitWorkflowNestedRunResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -85,6 +92,28 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async persistWorkflowTerminalState(
     _input: PersistWorkflowTerminalStateInput,
   ): Promise<PersistWorkflowTerminalStateResult> {
+    return { status: 'unsupported' };
+  }
+
+  async persistWorkflowTerminalRecoveryAncestry(
+    _input: PersistWorkflowTerminalRecoveryAncestryInput,
+  ): Promise<PersistWorkflowTerminalRecoveryAncestryResult> {
+    return { status: 'unsupported' };
+  }
+
+  async getWorkflowTerminalRecoveryAncestry(
+    _input: GetWorkflowTerminalizationInput,
+  ): Promise<GetWorkflowTerminalRecoveryAncestryResult> {
+    return { status: 'unsupported' };
+  }
+
+  async bindWorkflowNestedRunOwnership(
+    _input: BindWorkflowNestedRunOwnershipInput,
+  ): Promise<BindWorkflowNestedRunOwnershipResult> {
+    return { status: 'unsupported' };
+  }
+
+  async admitWorkflowNestedRun(_input: AdmitWorkflowNestedRunInput): Promise<AdmitWorkflowNestedRunResult> {
     return { status: 'unsupported' };
   }
 

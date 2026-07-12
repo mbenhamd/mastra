@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { WorkflowTerminalDestinationReceiptRecord } from '../../../workflows';
+import type { WorkflowRunState, WorkflowTerminalDestinationReceiptRecord } from '../../../workflows';
+import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
 import type {
   GetWorkflowTerminalDestinationReceiptInput,
   ReserveWorkflowTerminalDestinationReceiptInput,
@@ -13,6 +14,7 @@ import {
   getWorkflowTerminalDestinationReceiptRecord,
   validateWorkflowTerminalDestinationReceiptIntegrity,
 } from './terminalization';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 
 describe('WorkflowsInMemory terminal destination receipts', () => {
   const now = new Date('2026-01-01T00:00:00.000Z');
@@ -58,9 +60,67 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       claimToken: claim.record.claimToken,
       claimGeneration: claim.record.claimGeneration,
     };
+    const snapshot = { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' as const };
+    const parentGraph: WorkflowRunState['serializedStepGraph'] =
+      effect.kind === 'parent-workflow-step-end'
+        ? Array.from({ length: effect.parentExecutionPath[0]! + 1 }, (_, rootIndex) =>
+            rootIndex === effect.parentExecutionPath[0]
+              ? effect.parentExecutionPath.length === 1
+                ? { type: 'step' as const, step: { id: effect.parentStepId, component: 'WORKFLOW' } }
+                : {
+                    type: 'parallel' as const,
+                    steps: Array.from({ length: effect.parentExecutionPath[1]! + 1 }, (_, branchIndex) => ({
+                      type: 'step' as const,
+                      step: {
+                        id:
+                          branchIndex === effect.parentExecutionPath[1]
+                            ? effect.parentStepId
+                            : `filler-${rootIndex}-${branchIndex}`,
+                        component: branchIndex === effect.parentExecutionPath[1] ? 'WORKFLOW' : 'STEP',
+                      },
+                    })),
+                  }
+              : { type: 'sleep' as const, id: `filler-${rootIndex}`, duration: 1 },
+          )
+        : [];
+    const ancestry =
+      effect.kind === 'parent-workflow-step-end'
+        ? [
+            {
+              version: 1 as const,
+              childWorkflowName: run.workflowName,
+              childRunId: run.runId,
+              parentWorkflowName: effect.parentWorkflowName,
+              parentRunId: effect.parentRunId,
+              parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentGraph),
+              source: {
+                kind: 'step' as const,
+                stepId: effect.parentStepId,
+                executionPath: effect.parentExecutionPath,
+              },
+              inputPointer: { kind: 'parent-source-payload' as const, stepId: effect.parentStepId },
+              resultPointer: {
+                kind: 'retained-terminal-result' as const,
+                workflowName: run.workflowName,
+                runId: run.runId,
+              },
+              resumeMetadata: { wasResume: false, resumeSteps: [] },
+            },
+          ]
+        : [];
+    if (ancestry.length > 0) {
+      const immediate = ancestry[0]!;
+      await workflows.persistWorkflowSnapshot({
+        workflowName: immediate.parentWorkflowName,
+        runId: immediate.parentRunId,
+        snapshot: { ...createEmptyWorkflowSnapshot(immediate.parentRunId), serializedStepGraph: parentGraph },
+      });
+      await workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry });
+    }
     await workflows.persistWorkflowTerminalState({
       ...fence,
-      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
+      snapshot,
+      recoveryEnvelope: createTerminalRecoveryEnvelope({ ...run, snapshot, terminalStatus: 'failed', ancestry }),
     });
     const prepared = await workflows.prepareWorkflowTerminalEffect({
       ...fence,
@@ -157,6 +217,7 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       producerOutboxVersion: 1,
       destinationReceiptVersion: 1,
       parentApplicationVersion: 1,
+      recoveryVersion: 1,
     });
     const first = await workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'finish-dispatcher'));
     expect(first).toMatchObject({
@@ -459,7 +520,7 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
         parentWorkflowName: 'parent',
         parentRunId: 'parent-run',
         parentStepId: 'nested',
-        parentExecutionPath: [1, 3, 2],
+        parentExecutionPath: [1, 3],
       },
     );
     const second = await createReadyRun(
@@ -470,7 +531,7 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
         parentWorkflowName: 'parent',
         parentRunId: 'parent-run',
         parentStepId: 'nested',
-        parentExecutionPath: [1, 3, 4],
+        parentExecutionPath: [1, 4],
       },
     );
     const firstReceipt = await workflows.reserveWorkflowTerminalDestinationReceipt(

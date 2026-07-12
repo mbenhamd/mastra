@@ -398,11 +398,11 @@ function terminalResultFromRetained(
   storageTimestamp: number,
   childBudget: ContinuationDataBudget,
 ): ParentStepResult {
-  const childSnapshot = retained.snapshot;
-  const terminalResult =
-    childSnapshot.result === undefined
-      ? {}
-      : dataRecord(childSnapshot.result, 'retained child snapshot result', childBudget);
+  const terminalResult = dataRecord(
+    retained.envelope.terminalResult,
+    'retained child terminal result',
+    childBudget,
+  );
   const status = retained.terminalStatus;
   if (terminalResult.status !== undefined && terminalResult.status !== status) {
     throw new TypeError('retained child result status conflicts with its terminal snapshot');
@@ -410,13 +410,9 @@ function terminalResultFromRetained(
   if (status === 'success' && terminalResult.status !== 'success') {
     throw new TypeError('successful retained child snapshot is missing a successful result');
   }
-  const rawError = terminalResult.error ?? childSnapshot.error;
+  const rawError = terminalResult.error;
   const error =
-    rawError === undefined
-      ? undefined
-      : terminalResult.error !== undefined
-        ? terminalResult.error
-        : canonicalJsonValue(rawError, 'retained child error', childBudget);
+    rawError === undefined ? undefined : canonicalJsonValue(rawError, 'retained child error', childBudget);
   if (status === 'failed' && error === undefined) {
     throw new TypeError('failed retained child snapshot is missing an error');
   }
@@ -517,8 +513,10 @@ function validateRetainedBinding(
     retained.runId !== effect.runId ||
     retained.terminalStatus !== childStatus ||
     retained.terminalStatus !== effect.terminalStatus ||
-    retained.snapshot.runId !== effect.runId ||
-    retained.snapshot.status !== retained.terminalStatus ||
+    retained.envelope.workflowName !== effect.workflowName ||
+    retained.envelope.runId !== effect.runId ||
+    retained.envelope.terminalStatus !== retained.terminalStatus ||
+    retained.envelopeHash !== effect.recoveryEnvelopeHash ||
     !Number.isSafeInteger(retained.createdAt) ||
     retained.createdAt < 0
   ) {
@@ -980,21 +978,14 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
   readContinuationStoredState('child', () =>
     validateRetainedBinding(retainedChild, effect, contract.childTerminalStatus),
   );
-  const retainedState = retainedChild.snapshot.context?.__state;
-  if (retainedState === undefined) {
-    throw new WorkflowTerminalContinuationStoredStateError(
-      'child',
-      'retained child snapshot is missing final context.__state',
-    );
-  }
   const parentNormalizationBudget = createContinuationDataBudget();
   const childNormalizationBudget = createContinuationDataBudget();
   const finalState = readContinuationStoredState('child', () =>
-    dataRecord(retainedState, 'retained child final context.__state', childNormalizationBudget),
+    dataRecord(retainedChild.envelope.finalState, 'retained child final context.__state', childNormalizationBudget),
   );
   const childRequestContext = readContinuationStoredState('child', () =>
     optionalDataRecord(
-      retainedChild.snapshot.requestContext,
+      retainedChild.envelope.requestContextPatch,
       'retained child requestContext',
       childNormalizationBudget,
     ),

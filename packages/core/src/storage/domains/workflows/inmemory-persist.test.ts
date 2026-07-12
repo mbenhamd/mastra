@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import { InMemoryStore } from '../../mock';
 
@@ -18,6 +18,10 @@ const makeSnapshot = (runId: string, status: WorkflowRunState['status']): Workfl
   }) as WorkflowRunState;
 
 describe('WorkflowsInMemory persistWorkflowSnapshot', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   // Regression test for https://github.com/mastra-ai/mastra/issues/18003
   // The reference in-memory store previously reset createdAt on every re-persist, so the
   // canonical semantics disagreed with the persistent stores. Re-persisting an existing run
@@ -40,5 +44,34 @@ describe('WorkflowsInMemory persistWorkflowSnapshot', () => {
 
     expect(new Date(second!.createdAt).getTime()).toBe(createdAtBefore);
     expect(new Date(second!.updatedAt).getTime()).toBeGreaterThan(createdAtBefore);
+  });
+
+  it('atomically replaces both terminal state views with a storage-clock timestamp', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-12T15:00:00.000Z'));
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'terminal-final-state';
+    const runId = 'run-final-state';
+    const snapshot = makeSnapshot(runId, 'running');
+    snapshot.context.__state = { stale: true } as never;
+    snapshot.value = { stale: true };
+    snapshot.timestamp = 1;
+    await workflows.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+
+    const finalState = { exact: { answer: 42 } };
+    await workflows.updateWorkflowState({
+      workflowName,
+      runId,
+      opts: { status: 'success', finalState },
+    });
+    finalState.exact.answer = 0;
+
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+      status: 'success',
+      context: { __state: { exact: { answer: 42 } } },
+      value: { exact: { answer: 42 } },
+      timestamp: Date.now(),
+    });
   });
 });

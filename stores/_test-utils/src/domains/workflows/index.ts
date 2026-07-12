@@ -1,3 +1,4 @@
+import { createWorkflowTerminalGraphFingerprint } from '@mastra/core/storage';
 import type { MastraStorage, WorkflowsStorage } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { randomUUID } from 'node:crypto';
@@ -999,6 +1000,18 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
           claimToken: claim.record.claimToken,
           claimGeneration: claim.record.claimGeneration,
           snapshot: { ...snapshot, runId, status: 'failed' },
+          recoveryEnvelope: {
+            version: 1,
+            workflowName,
+            runId,
+            terminalStatus: 'failed',
+            executionMode: 'continuous',
+            terminalResult: { status: 'failed', error: 'terminal test failure' },
+            finalState: snapshot.value ?? {},
+            requestContextPatch: snapshot.requestContext ?? {},
+            childGraphFingerprint: createWorkflowTerminalGraphFingerprint(snapshot.serializedStepGraph),
+            ancestry: [],
+          },
         }),
       ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
       await expect(workflowsStorage.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({

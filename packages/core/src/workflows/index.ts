@@ -6,6 +6,7 @@ export * from './types';
 export * from './utils';
 export * from './scheduler';
 export * from './state-reader';
+export * from './terminal-recovery';
 
 // Load after the base workflow exports so EventedWorkflow can extend Workflow
 // without hitting an ESM init-time cycle.

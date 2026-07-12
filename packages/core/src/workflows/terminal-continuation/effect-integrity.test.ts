@@ -3,6 +3,8 @@ import { validateWorkflowTerminalEffectIntegrity as validateLegacyStorageExport 
 import type { WorkflowTerminalEffectRecord } from '../types';
 import { getWorkflowTerminalEffectIntegrity, validateWorkflowTerminalEffectIntegrity } from './effect-integrity';
 
+const RECOVERY_ENVELOPE_HASH = `sha256:${'1'.repeat(64)}` as const;
+
 function effect(): Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }> {
   const identity = {
     version: 1 as const,
@@ -11,6 +13,7 @@ function effect(): Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflo
     sourceEventKey: 'event-1',
     kind: 'parent-workflow-step-end' as const,
     terminalStatus: 'success' as const,
+    recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
     parentWorkflowName: 'parent',
     parentRunId: 'parent-run',
     parentStepId: 'nested',
@@ -53,9 +56,10 @@ describe('workflow terminal effect integrity', () => {
       runId: 'run:1',
       sourceEventKey: 'evt/✓',
       terminalStatus: 'failed' as const,
+      recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
       createdAt: 7,
       effectKey: 'wte:v1:3596b803a4c8fd49eec6d4b43851ce46bf8c27d86cf7f02263c3aab3b3f5e705',
-      payloadHash: 'sha256:dcd205eeff01012b906062de9b2aae3506e3adff0ae22431ab35cc7079615fba',
+      payloadHash: 'sha256:6e30dabb6e83ba46780d40df60146c6ddcc0b6458f1f0b1f6bff1f54770aff70',
     };
     const parent = {
       version: 1 as const,
@@ -64,13 +68,14 @@ describe('workflow terminal effect integrity', () => {
       runId: 'run:2',
       sourceEventKey: 'evt/✓',
       terminalStatus: 'success' as const,
+      recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
       parentWorkflowName: 'parent-δ',
       parentRunId: 'parent:1',
       parentStepId: 'nested-λ',
       parentExecutionPath: [12, 3],
       createdAt: 8,
       effectKey: 'wte:v1:a2259834ba6e16c819189443c3eb7061a81fa56ca03ec58d5197b5f09d961034',
-      payloadHash: 'sha256:4fe17da0cdfda7c1cfdde4b659ac63f00ef64f604ef4bdfc6083cb763b0f6982',
+      payloadHash: 'sha256:0238cfee8559a4fbb56b34e6ad2b9905888aae53d57d0456bf3fd87a17bb3fab',
     };
     expect(getWorkflowTerminalEffectIntegrity(root)).toEqual({
       effectKey: root.effectKey,

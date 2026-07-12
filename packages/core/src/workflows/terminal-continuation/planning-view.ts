@@ -132,6 +132,7 @@ function materializeEffect(
     'runId',
     'sourceEventKey',
     'terminalStatus',
+    'recoveryEnvelopeHash',
     'parentWorkflowName',
     'parentRunId',
     'parentStepId',
@@ -147,7 +148,16 @@ function materializeEffect(
   if (!CHILD_STATUSES.has(terminalStatus)) throw new TypeError('effect terminalStatus is invalid');
   const effectKey = structuralString(read(descriptors, 'effectKey'), 'effect.effectKey', 256);
   const payloadHash = structuralString(read(descriptors, 'payloadHash'), 'effect.payloadHash', 256);
-  if (!/^wte:v1:[a-f0-9]{64}$/.test(effectKey) || !/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
+  const recoveryEnvelopeHash = structuralString(
+    read(descriptors, 'recoveryEnvelopeHash'),
+    'effect.recoveryEnvelopeHash',
+    256,
+  );
+  if (
+    !/^wte:v1:[a-f0-9]{64}$/.test(effectKey) ||
+    !/^sha256:[a-f0-9]{64}$/.test(payloadHash) ||
+    !/^sha256:[a-f0-9]{64}$/.test(recoveryEnvelopeHash)
+  ) {
     throw new TypeError('effect hashes are invalid');
   }
   return {
@@ -158,6 +168,7 @@ function materializeEffect(
     runId: structuralString(read(descriptors, 'runId'), 'effect.runId', 512),
     sourceEventKey: structuralString(read(descriptors, 'sourceEventKey'), 'effect.sourceEventKey', 1024),
     terminalStatus: terminalStatus as 'success' | 'failed' | 'canceled',
+    recoveryEnvelopeHash: recoveryEnvelopeHash as `sha256:${string}`,
     parentWorkflowName: structuralString(read(descriptors, 'parentWorkflowName'), 'effect.parentWorkflowName', 512),
     parentRunId: structuralString(read(descriptors, 'parentRunId'), 'effect.parentRunId', 512),
     parentStepId: structuralString(read(descriptors, 'parentStepId'), 'effect.parentStepId', 512),

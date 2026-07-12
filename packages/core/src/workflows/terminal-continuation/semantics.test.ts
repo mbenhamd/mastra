@@ -12,6 +12,8 @@ import {
   WORKFLOW_TERMINAL_FOREACH_STATE_KEY,
 } from './semantics';
 
+const RECOVERY_ENVELOPE_HASH = `sha256:${'e'.repeat(64)}` as const;
+
 const mergePatch = {
   kind: 'merge-child-terminal',
   resultWrite: 'source-coordinate',
@@ -90,6 +92,7 @@ function effect(
     runId: 'child-run',
     sourceEventKey: 'event',
     terminalStatus,
+    recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
     payloadHash: `sha256:${'d'.repeat(64)}`,
     createdAt: 20,
     parentWorkflowName: 'parent',
@@ -115,21 +118,18 @@ function retained(
     runId: 'child-run',
     terminalStatus,
     createdAt: 20,
-    snapshot: {
+    envelopeHash: RECOVERY_ENVELOPE_HASH,
+    envelope: {
+      version: 1,
+      workflowName: 'child',
       runId: 'child-run',
-      status: terminalStatus,
-      result,
-      ...(terminalStatus === 'failed' ? { error: { message: 'boom', name: 'Error' } } : {}),
-      value: {},
-      context: { __state: { final: true } } as WorkflowRunState['context'],
-      serializedStepGraph: [],
-      activePaths: [],
-      activeStepsPath: {},
-      suspendedPaths: {},
-      resumeLabels: {},
-      waitingPaths: {},
-      requestContext: { child: true, shared: 'child' },
-      timestamp: 20,
+      terminalStatus,
+      executionMode: 'continuous',
+      terminalResult: result as never,
+      finalState: { final: true },
+      requestContextPatch: { child: true, shared: 'child' },
+      childGraphFingerprint: createWorkflowTerminalGraphFingerprint([]),
+      ancestry: [],
     },
   };
 }
@@ -443,7 +443,7 @@ describe('workflow terminal parent patch semantics', () => {
   it('fails closed when exact retained final state is unavailable', () => {
     const parent = parentSnapshot();
     const child = retained();
-    delete child.snapshot.context.__state;
+    delete (child.envelope as { finalState?: unknown }).finalState;
     expect(() =>
       applyWorkflowTerminalParentContinuationPatch({
         contract: contractFor(parent),
@@ -455,18 +455,18 @@ describe('workflow terminal parent patch semantics', () => {
         storageTimestamp: 30,
         executionMode: 'continuous',
       }),
-    ).toThrow(/missing final context.__state/);
+    ).toThrow(/final context.__state must be a data object/);
   });
 
   it('normalizes touched data to JSON semantics before merging request context and state', () => {
     const parent = parentSnapshot();
     parent.requestContext = { tenantId: 'tenant-a', parent: true };
     const child = retained();
-    child.snapshot.requestContext = {
+    child.envelope.requestContextPatch = {
       tenantId: undefined,
       observedAt: new Date('2026-01-01T00:00:00.000Z'),
     };
-    child.snapshot.context.__state = {
+    child.envelope.finalState = {
       nested: { missing: undefined, observedAt: new Date('2026-01-01T00:00:00.000Z') },
     } as WorkflowRunState['context'][string];
     const next = applyWorkflowTerminalParentContinuationPatch({
@@ -787,7 +787,7 @@ describe('workflow terminal parent patch semantics', () => {
   it('rejects a non-record retained final state', () => {
     const parent = parentSnapshot();
     const child = retained();
-    child.snapshot.context.__state = [] as unknown as WorkflowRunState['context'][string];
+    child.envelope.finalState = [] as never;
     expect(() =>
       applyWorkflowTerminalParentContinuationPatch({
         contract: contractFor(parent),
@@ -806,7 +806,7 @@ describe('workflow terminal parent patch semantics', () => {
     const parent = parentSnapshot();
     for (const requestContext of [{ value: 'a\0b' }, { ['key\0collision']: true }, { value: '\ud800' }]) {
       const child = retained();
-      child.snapshot.requestContext = requestContext;
+      child.envelope.requestContextPatch = requestContext as never;
       expect(() =>
         applyWorkflowTerminalParentContinuationPatch({
           contract: contractFor(parent),

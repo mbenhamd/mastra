@@ -12,6 +12,7 @@ import type { WorkflowsStorage } from './base';
 import { WorkflowsStorage as WorkflowsStorageBase } from './base';
 import { WorkflowsInMemory } from './inmemory';
 import { claimWorkflowTerminalizationRecord } from './terminalization';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 
 describe('WorkflowsStorage terminalization defaults', () => {
   it('reports unsupported explicitly when an adapter has not implemented the capability', async () => {
@@ -29,6 +30,19 @@ describe('WorkflowsStorage terminalization defaults', () => {
       }),
     ).resolves.toEqual({ status: 'unsupported' });
     await expect(workflows.getWorkflowTerminalization(run)).resolves.toEqual({ status: 'unsupported' });
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry: [] })).resolves.toEqual({
+      status: 'unsupported',
+    });
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(run)).resolves.toEqual({ status: 'unsupported' });
+    await expect(
+      workflows.bindWorkflowNestedRunOwnership({
+        ...run,
+        stepId: 'nested',
+        nestedRunId: 'child-run',
+        result: { status: 'running' },
+        requestContext: {},
+      }),
+    ).resolves.toEqual({ status: 'unsupported' });
     await expect(
       workflows.advanceWorkflowTerminalization({
         ...run,
@@ -57,6 +71,11 @@ describe('WorkflowsStorage terminalization defaults', () => {
         claimToken: 'token',
         claimGeneration: 1,
         snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...run,
+          snapshot: createEmptyWorkflowSnapshot(run.runId),
+          terminalStatus: 'failed',
+        }),
       }),
     ).resolves.toEqual({ status: 'unsupported' });
     await expect(
@@ -162,6 +181,14 @@ describe('WorkflowsInMemory terminalization journal', () => {
     };
   }
 
+  function recoveryEnvelope(
+    snapshot: WorkflowRunState,
+    identity: { workflowName: string; runId: string } = run,
+    terminalStatus: 'success' | 'failed' | 'canceled' = 'failed',
+  ) {
+    return createTerminalRecoveryEnvelope({ ...identity, snapshot, terminalStatus });
+  }
+
   function withStatefulIdentity<T extends { workflowName: string; runId: string }>(
     operation: T,
     alternate: { workflowName: string; runId: string },
@@ -183,9 +210,11 @@ describe('WorkflowsInMemory terminalization journal', () => {
   }
 
   async function persistFailedState(workflows: WorkflowsStorage, claim: Awaited<ReturnType<typeof acquire>>) {
+    const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
     return workflows.persistWorkflowTerminalState({
       ...fence(claim),
-      snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+      snapshot,
+      recoveryEnvelope: recoveryEnvelope(snapshot),
     });
   }
 
@@ -317,7 +346,10 @@ describe('WorkflowsInMemory terminalization journal', () => {
       requestContext: { parent: true, shared: 'parent' },
       timestamp: now - 20,
     };
-    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: mode === 'noop' ? { ...parentSnapshot, status: 'running' } : parentSnapshot,
+    });
     await workflows.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
     const claimed = await workflows.claimWorkflowTerminalization({
       ...child,
@@ -354,12 +386,51 @@ describe('WorkflowsInMemory terminalization journal', () => {
       requestContext: { child: true, shared: 'child' },
       timestamp: now,
     };
+    const ancestry = [
+      {
+        version: 1 as const,
+        childWorkflowName: child.workflowName,
+        childRunId: child.runId,
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+        parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+        source:
+          foreachSuspendedCount === undefined
+            ? ({ kind: 'step', stepId: sourceStepId, executionPath: sourcePath } as const)
+            : ({
+                kind: 'foreach-iteration',
+                stepId: sourceStepId,
+                containerPath: [0],
+                iterationIndex: foreachSuspendedCount,
+              } as const),
+        inputPointer: { kind: 'parent-source-payload' as const, stepId: sourceStepId },
+        resultPointer: {
+          kind: 'retained-terminal-result' as const,
+          workflowName: child.workflowName,
+          runId: child.runId,
+        },
+        resumeMetadata: { wasResume: false, resumeSteps: [] },
+      },
+    ];
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry })).resolves.toMatchObject({
+      status: 'persisted',
+    });
+    if (mode === 'noop') await workflows.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
     await workflows.persistWorkflowTerminalState({
       ...child,
       ownerId: claimed.record.ownerId,
       claimToken: claimed.record.claimToken,
       claimGeneration: claimed.record.claimGeneration,
       snapshot: childSnapshot,
+      recoveryEnvelope: {
+        ...createTerminalRecoveryEnvelope({
+          ...child,
+          snapshot: childSnapshot,
+          terminalStatus,
+          ancestry,
+        }),
+        terminalResult,
+      },
     });
     const prepared = await workflows.prepareWorkflowTerminalEffect({
       ...child,
@@ -1070,15 +1141,44 @@ describe('WorkflowsInMemory terminalization journal', () => {
         claimToken: claim.record.claimToken,
         claimGeneration: claim.record.claimGeneration,
       };
+      const snapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'success',
+        result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
+        context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
+        value: { [stepId]: true },
+        timestamp: now,
+      };
+      const ancestry = [
+        {
+          version: 1 as const,
+          childWorkflowName: child.workflowName,
+          childRunId: child.runId,
+          parentWorkflowName: parent.workflowName,
+          parentRunId: parent.runId,
+          parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+          source: { kind: 'step' as const, stepId, executionPath: path },
+          inputPointer: { kind: 'parent-source-payload' as const, stepId },
+          resultPointer: {
+            kind: 'retained-terminal-result' as const,
+            workflowName: child.workflowName,
+            runId: child.runId,
+          },
+          resumeMetadata: { wasResume: false, resumeSteps: [] },
+        },
+      ];
+      await workflows.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
       await workflows.persistWorkflowTerminalState({
         ...childFence,
-        snapshot: {
-          ...createEmptyWorkflowSnapshot(runId),
-          status: 'success',
-          result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
-          context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
-          value: { [stepId]: true },
-          timestamp: now,
+        snapshot,
+        recoveryEnvelope: {
+          ...createTerminalRecoveryEnvelope({
+            ...child,
+            snapshot,
+            terminalStatus: 'success',
+            ancestry,
+          }),
+          terminalResult: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
         },
       });
       const effect = await workflows.prepareWorkflowTerminalEffect({
@@ -1215,6 +1315,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       claimToken: claim.claimToken!,
       claimGeneration: claim.claimGeneration,
     };
+    const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
 
     await expect(
       workflows.advanceWorkflowTerminalization({
@@ -1242,7 +1343,8 @@ describe('WorkflowsInMemory terminalization journal', () => {
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
-        snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot),
       }),
     ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
     await expect(
@@ -1258,23 +1360,31 @@ describe('WorkflowsInMemory terminalization journal', () => {
     const workflows = await setup();
     const claim = await acquire(workflows);
     const fenced = fence(claim);
+    const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+    const validRecoveryEnvelope = recoveryEnvelope(validSnapshot);
 
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
         snapshot: { ...createEmptyWorkflowSnapshot('other-run'), status: 'failed' },
+        recoveryEnvelope: validRecoveryEnvelope,
       }),
     ).resolves.toEqual({ status: 'invalid_snapshot' });
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
         snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'paused' } as never,
+        recoveryEnvelope: validRecoveryEnvelope,
       }),
     ).resolves.toEqual({ status: 'invalid_snapshot' });
     for (const snapshot of [null, undefined, 'invalid', 1, []]) {
-      await expect(workflows.persistWorkflowTerminalState({ ...fenced, snapshot: snapshot as never })).resolves.toEqual(
-        { status: 'invalid_snapshot' },
-      );
+      await expect(
+        workflows.persistWorkflowTerminalState({
+          ...fenced,
+          snapshot: snapshot as never,
+          recoveryEnvelope: validRecoveryEnvelope,
+        }),
+      ).resolves.toEqual({ status: 'invalid_snapshot' });
     }
     await expect(workflows.getWorkflowTerminalization(run)).resolves.toMatchObject({
       status: 'found',
@@ -1287,7 +1397,11 @@ describe('WorkflowsInMemory terminalization journal', () => {
       context: { marker: { status: 'success' as const, output: { value: 'retained' } } },
     };
     await expect(
-      workflows.persistWorkflowTerminalState({ ...fenced, snapshot: terminalSnapshot }),
+      workflows.persistWorkflowTerminalState({
+        ...fenced,
+        snapshot: terminalSnapshot,
+        recoveryEnvelope: recoveryEnvelope(terminalSnapshot),
+      }),
     ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
 
     terminalSnapshot.context.marker.output.value = 'caller-mutated';
@@ -1319,7 +1433,13 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
     Object.setPrototypeOf(snapshot, prototype);
 
-    await expect(workflows.persistWorkflowTerminalState({ ...fence(claim), snapshot })).resolves.toMatchObject({
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...fence(claim),
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot as WorkflowRunState),
+      }),
+    ).resolves.toMatchObject({
       status: 'persisted',
       record: { phase: 'run_state_persisted' },
     });
@@ -1339,6 +1459,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       ...fence(claim),
       snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const },
     };
+    Object.assign(operation, { recoveryEnvelope: recoveryEnvelope(operation.snapshot) });
     let workflowNameReads = 0;
     let runIdReads = 0;
     Object.defineProperties(operation, {
@@ -1617,6 +1738,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
         claimToken: originalToken!,
         claimGeneration: originalGeneration,
         snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+        recoveryEnvelope: recoveryEnvelope({ ...createEmptyWorkflowSnapshot(runId), status: 'failed' }),
       }),
     ).resolves.toMatchObject({ status: 'persisted' });
   });

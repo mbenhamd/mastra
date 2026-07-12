@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 import {
   MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT,
   createEmptyWorkflowSnapshot,
+  createWorkflowTerminalGraphFingerprint,
 } from '@mastra/core/storage';
+import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 import { WorkflowsPG } from '.';
 
 describe('WorkflowsPG terminal destination receipts', () => {
@@ -30,8 +33,11 @@ describe('WorkflowsPG terminal destination receipts', () => {
     await pool.query(`DELETE FROM mastra_workflow_terminal_destination_receipts WHERE workflow_name = $1`, [
       workflowName,
     ]);
-    await pool.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
+    await pool.query(`DELETE FROM mastra_workflow_terminal_effects_v2 WHERE workflow_name = $1`, [workflowName]);
+    await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots_v2 WHERE workflow_name = $1`, [workflowName]);
+    await pool.query(`DELETE FROM mastra_workflow_terminal_recovery_ancestries WHERE workflow_name = $1`, [
+      workflowName,
+    ]);
     await pool.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
     await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
   }
@@ -64,9 +70,67 @@ describe('WorkflowsPG terminal destination receipts', () => {
       claimToken: claim.record.claimToken,
       claimGeneration: claim.record.claimGeneration,
     };
+    const snapshot = { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' as const };
+    const parentGraph: WorkflowRunState['serializedStepGraph'] =
+      effect.kind === 'parent-workflow-step-end'
+        ? Array.from({ length: effect.parentExecutionPath[0]! + 1 }, (_, rootIndex) =>
+            rootIndex === effect.parentExecutionPath[0]
+              ? effect.parentExecutionPath.length === 1
+                ? { type: 'step' as const, step: { id: effect.parentStepId, component: 'WORKFLOW' } }
+                : {
+                    type: 'parallel' as const,
+                    steps: Array.from({ length: effect.parentExecutionPath[1]! + 1 }, (_, branchIndex) => ({
+                      type: 'step' as const,
+                      step: {
+                        id:
+                          branchIndex === effect.parentExecutionPath[1]
+                            ? effect.parentStepId
+                            : `filler-${rootIndex}-${branchIndex}`,
+                        component: branchIndex === effect.parentExecutionPath[1] ? 'WORKFLOW' : 'STEP',
+                      },
+                    })),
+                  }
+              : { type: 'sleep' as const, id: `filler-${rootIndex}`, duration: 1 },
+          )
+        : [];
+    const ancestry =
+      effect.kind === 'parent-workflow-step-end'
+        ? [
+            {
+              version: 1 as const,
+              childWorkflowName: run.workflowName,
+              childRunId: run.runId,
+              parentWorkflowName: effect.parentWorkflowName,
+              parentRunId: effect.parentRunId,
+              parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentGraph),
+              source: {
+                kind: 'step' as const,
+                stepId: effect.parentStepId,
+                executionPath: effect.parentExecutionPath,
+              },
+              inputPointer: { kind: 'parent-source-payload' as const, stepId: effect.parentStepId },
+              resultPointer: {
+                kind: 'retained-terminal-result' as const,
+                workflowName: run.workflowName,
+                runId: run.runId,
+              },
+              resumeMetadata: { wasResume: false, resumeSteps: [] },
+            },
+          ]
+        : [];
+    if (ancestry.length > 0) {
+      const immediate = ancestry[0]!;
+      await workflows.persistWorkflowSnapshot({
+        workflowName: immediate.parentWorkflowName,
+        runId: immediate.parentRunId,
+        snapshot: { ...createEmptyWorkflowSnapshot(immediate.parentRunId), serializedStepGraph: parentGraph },
+      });
+      await workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry });
+    }
     await workflows.persistWorkflowTerminalState({
       ...fence,
-      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
+      snapshot,
+      recoveryEnvelope: createTerminalRecoveryEnvelope({ ...run, snapshot, terminalStatus: 'failed', ancestry }),
     });
     const prepared = await workflows.prepareWorkflowTerminalEffect({
       ...fence,
@@ -116,6 +180,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
         producerOutboxVersion: 1,
         destinationReceiptVersion: 1,
         parentApplicationVersion: 1,
+        recoveryVersion: 1,
       });
       const results = await Promise.all([
         workflowsA.reserveWorkflowTerminalDestinationReceipt(input),
@@ -267,7 +332,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
 
     try {
       await pool.query(
-        `UPDATE mastra_workflow_terminal_effects SET payload_hash = $1
+        `UPDATE mastra_workflow_terminal_effects_v2 SET payload_hash = $1
          WHERE workflow_name = $2 AND run_id = $3 AND effect_kind = $4`,
         [`sha256:${'0'.repeat(64)}`, workflowName, ready.run.runId, ready.effect.kind],
       );
@@ -275,7 +340,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
         'Invalid workflow terminal effect integrity',
       );
       await pool.query(
-        `UPDATE mastra_workflow_terminal_effects SET payload_hash = $1
+        `UPDATE mastra_workflow_terminal_effects_v2 SET payload_hash = $1
          WHERE workflow_name = $2 AND run_id = $3 AND effect_kind = $4`,
         [ready.effect.payloadHash, workflowName, ready.run.runId, ready.effect.kind],
       );
@@ -346,7 +411,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
       { workflowName, runId: 'first' },
       {
         kind: 'parent-workflow-step-end',
-        parentWorkflowName: 'parent',
+        parentWorkflowName: workflowName,
         parentRunId: 'parent-run',
         parentStepId: 'nested',
         parentExecutionPath: [1, 23],
@@ -357,7 +422,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
       { workflowName, runId: 'second' },
       {
         kind: 'parent-workflow-step-end',
-        parentWorkflowName: 'parent',
+        parentWorkflowName: workflowName,
         parentRunId: 'parent-run',
         parentStepId: 'nested',
         parentExecutionPath: [12, 3],
@@ -366,7 +431,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
     const missing = await createReadyRun(workflowsA, { workflowName, runId: 'missing' });
 
     try {
-      await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1 AND run_id = $2`, [
+      await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots_v2 WHERE workflow_name = $1 AND run_id = $2`, [
         workflowName,
         missing.run.runId,
       ]);
@@ -429,8 +494,8 @@ describe('WorkflowsPG terminal destination receipts', () => {
       ).rejects.toThrow('PF1770 cleanup failure');
       for (const table of [
         'mastra_workflow_terminalizations',
-        'mastra_workflow_terminal_effects',
-        'mastra_workflow_terminal_snapshots',
+        'mastra_workflow_terminal_effects_v2',
+        'mastra_workflow_terminal_snapshots_v2',
         'mastra_workflow_terminal_destination_receipts',
       ]) {
         const count = await pool.query<{ count: string }>(
@@ -439,6 +504,12 @@ describe('WorkflowsPG terminal destination receipts', () => {
         );
         expect(count.rows[0]?.count).toBe('1');
       }
+      const ancestryCount = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM mastra_workflow_terminal_recovery_ancestries
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, ready.run.runId],
+      );
+      expect(ancestryCount.rows[0]?.count).toBe('0');
       await pool.query(`DROP TRIGGER ${triggerName} ON mastra_workflow_terminal_destination_receipts`);
       await pool.query(`DROP FUNCTION ${functionName}()`);
       await expect(
@@ -454,7 +525,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
     }
   });
 
-  it('exports final receipt DDL and clears all five tables in one custom-schema reset', async () => {
+  it('exports final receipt DDL and clears all terminal tables in one custom-schema reset', async () => {
     const schemaName = `receipt_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
     await pool.query(`CREATE SCHEMA "${schemaName}"`);
     const workflows = new WorkflowsPG({ pool, schemaName });
@@ -464,6 +535,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
       await workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready));
       const ddl = WorkflowsPG.getExportDDL(schemaName).join('\n');
       expect(ddl).toContain(`"${schemaName}"."mastra_workflow_terminal_destination_receipts"`);
+      expect(ddl).toContain(`"${schemaName}"."mastra_workflow_terminal_recovery_ancestries"`);
       expect(ddl).toContain('"mastra_workflow_terminal_destination_receipts_lookup_idx"');
       expect(ddl).not.toContain(`"${schemaName}_mastra_workflow_terminal_destination_receipts_lookup_idx"`);
       expect(WorkflowsPG.prototype.init.toString()).not.toContain('ADD COLUMN IF NOT EXISTS "parent_execution_path"');
@@ -480,8 +552,9 @@ describe('WorkflowsPG terminal destination receipts', () => {
       for (const table of [
         'mastra_workflow_snapshot',
         'mastra_workflow_terminalizations',
-        'mastra_workflow_terminal_effects',
-        'mastra_workflow_terminal_snapshots',
+        'mastra_workflow_terminal_effects_v2',
+        'mastra_workflow_terminal_snapshots_v2',
+        'mastra_workflow_terminal_recovery_ancestries',
         'mastra_workflow_terminal_destination_receipts',
       ]) {
         const count = await pool.query<{ count: string }>(

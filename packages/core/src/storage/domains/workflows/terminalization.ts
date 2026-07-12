@@ -14,6 +14,19 @@ import {
   validateWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalParentContinuationIntegrity,
 } from '../../../workflows/terminal-continuation';
+import {
+  copyWorkflowTerminalRecoveryAncestry,
+  copyWorkflowTerminalRecoveryEnvelope,
+  getWorkflowTerminalRecoveryAncestryHash,
+  getWorkflowTerminalRecoveryEnvelopeHash,
+  materializeWorkflowTerminalRecoveryEnvelope,
+  validateWorkflowTerminalRecoveryEnvelopeIntegrity,
+  validateWorkflowTerminalRecoveryGraphBinding,
+} from '../../../workflows/terminal-recovery';
+import type {
+  WorkflowTerminalRecoveryAncestryV1,
+  WorkflowTerminalRecoveryEnvelopeRecordV1,
+} from '../../../workflows/terminal-recovery';
 export {
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -21,6 +34,7 @@ export {
   createWorkflowTerminalParentContinuationContract,
   validateWorkflowTerminalEffectIntegrity,
   WorkflowTerminalContinuationStoredStateError,
+  WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
 } from '../../../workflows/terminal-continuation';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -38,6 +52,7 @@ import type {
   WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalEffectObservation,
   WorkflowTerminalizationObservation,
+  WorkflowTerminalRecoveryAncestryRecord,
 } from '../../types';
 
 type InternalClaimWorkflowTerminalizationResult =
@@ -74,8 +89,11 @@ type InternalPersistWorkflowTerminalStateResult =
       status: 'advanced';
       record: WorkflowTerminalizationRecord;
       snapshot: PersistWorkflowTerminalStateInput['snapshot'];
+      recovery: WorkflowTerminalRecoveryEnvelopeRecordV1;
     }
-  | { status: 'invalid_snapshot' | 'missing_record' };
+  | {
+      status: 'invalid_snapshot' | 'invalid_recovery_envelope' | 'missing_recovery_ancestry' | 'missing_record';
+    };
 
 type InternalPrepareWorkflowTerminalEffectResult =
   | {
@@ -88,7 +106,7 @@ type InternalPrepareWorkflowTerminalEffectResult =
       status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
       record: WorkflowTerminalizationRecord;
     }
-  | { status: 'invalid_transition' | 'missing_effect' | 'missing_record' };
+  | { status: 'invalid_transition' | 'missing_effect' | 'missing_terminal_state' | 'missing_record' };
 
 type InternalGetWorkflowTerminalEffectForDispatchResult =
   | { status: 'found'; effect: WorkflowTerminalEffectRecord }
@@ -273,6 +291,63 @@ export function copyWorkflowTerminalEffectRecord(effect: WorkflowTerminalEffectR
     : { ...effect };
 }
 
+export function createWorkflowTerminalRecoveryAncestryRecord(
+  workflowName: string,
+  runId: string,
+  ancestry: WorkflowTerminalRecoveryAncestryV1,
+  now: number,
+): WorkflowTerminalRecoveryAncestryRecord {
+  validateWorkflowTerminalizationIdentity(workflowName, 'workflowName', 512);
+  validateWorkflowTerminalizationIdentity(runId, 'runId', 512);
+  validateWorkflowTerminalizationClock(now);
+  const materialized = copyWorkflowTerminalRecoveryAncestry(ancestry);
+  if (materialized[0] && (materialized[0].childWorkflowName !== workflowName || materialized[0].childRunId !== runId)) {
+    throw new TypeError('Workflow terminal recovery ancestry does not start at the child run');
+  }
+  return {
+    version: 1,
+    workflowName,
+    runId,
+    ancestryHash: getWorkflowTerminalRecoveryAncestryHash(materialized),
+    ancestry: materialized,
+    createdAt: now,
+  };
+}
+
+export function copyWorkflowTerminalRecoveryAncestryRecord(
+  record: WorkflowTerminalRecoveryAncestryRecord,
+): WorkflowTerminalRecoveryAncestryRecord {
+  return { ...record, ancestry: copyWorkflowTerminalRecoveryAncestry(record.ancestry) };
+}
+
+export function validateWorkflowTerminalRecoveryAncestryRecord(
+  record: WorkflowTerminalRecoveryAncestryRecord,
+  expected: { workflowName: string; runId: string; now: number },
+): void {
+  const materialized = createWorkflowTerminalRecoveryAncestryRecord(
+    record.workflowName,
+    record.runId,
+    record.ancestry,
+    record.createdAt,
+  );
+  if (
+    record.version !== 1 ||
+    record.workflowName !== expected.workflowName ||
+    record.runId !== expected.runId ||
+    record.createdAt > expected.now ||
+    record.ancestryHash !== materialized.ancestryHash
+  ) {
+    throw new TypeError('Invalid workflow terminal recovery ancestry record');
+  }
+}
+
+export function sameWorkflowTerminalRecoveryAncestry(
+  left: WorkflowTerminalRecoveryAncestryRecord,
+  right: WorkflowTerminalRecoveryAncestryRecord,
+): boolean {
+  return left.ancestryHash === right.ancestryHash;
+}
+
 export function observeWorkflowTerminalEffectRecord(
   effect: WorkflowTerminalEffectRecord,
 ): WorkflowTerminalEffectObservation {
@@ -449,6 +524,10 @@ export function validateWorkflowTerminalSnapshotJournalLink(
   workflowName: string,
   runId: string,
 ): void {
+  validateWorkflowTerminalRecoveryEnvelopeIntegrity(
+    { version: retained.version, envelopeHash: retained.envelopeHash, envelope: retained.envelope },
+    { workflowName, runId, terminalStatus: journal.terminalStatus },
+  );
   if (
     ![retained.createdAt, journal.createdAt, journal.updatedAt].every(
       value => Number.isSafeInteger(value) && value >= 0,
@@ -456,12 +535,25 @@ export function validateWorkflowTerminalSnapshotJournalLink(
     retained.workflowName !== workflowName ||
     retained.runId !== runId ||
     retained.terminalStatus !== journal.terminalStatus ||
-    retained.snapshot.runId !== runId ||
-    retained.snapshot.status !== journal.terminalStatus ||
     retained.createdAt < journal.createdAt ||
     retained.createdAt > journal.updatedAt
   ) {
     throw new TypeError('Invalid workflow terminal snapshot journal link');
+  }
+}
+
+/** @internal Binds the structural producer intent to the authenticated retained payload. */
+export function validateWorkflowTerminalEffectRecoveryLink(
+  effect: WorkflowTerminalEffectRecord,
+  retained: WorkflowTerminalSnapshotRecord,
+): void {
+  if (
+    effect.workflowName !== retained.workflowName ||
+    effect.runId !== retained.runId ||
+    effect.terminalStatus !== retained.terminalStatus ||
+    effect.recoveryEnvelopeHash !== retained.envelopeHash
+  ) {
+    throw new TypeError('Invalid workflow terminal effect recovery link');
   }
 }
 
@@ -559,6 +651,7 @@ function validateWorkflowTerminalEffectInput(
 
 export function createWorkflowTerminalEffectRecord(
   journal: WorkflowTerminalizationRecord,
+  retained: WorkflowTerminalSnapshotRecord,
   input: PrepareWorkflowTerminalEffectInput,
   now: number,
 ): WorkflowTerminalEffectRecord {
@@ -571,6 +664,7 @@ export function createWorkflowTerminalEffectRecord(
     runId: input.runId,
     sourceEventKey: journal.eventKey,
     terminalStatus: journal.terminalStatus,
+    recoveryEnvelopeHash: retained.envelopeHash,
     createdAt: now,
   };
   const effect =
@@ -596,6 +690,7 @@ function sameWorkflowTerminalEffect(left: WorkflowTerminalEffectRecord, right: W
     left.runId !== right.runId ||
     left.sourceEventKey !== right.sourceEventKey ||
     left.terminalStatus !== right.terminalStatus ||
+    left.recoveryEnvelopeHash !== right.recoveryEnvelopeHash ||
     left.payloadHash !== right.payloadHash
   ) {
     return false;
@@ -642,6 +737,7 @@ function checkLiveWorkflowTerminalizationFence(
 export function prepareWorkflowTerminalEffectRecord(
   existingJournal: WorkflowTerminalizationRecord | undefined,
   existingEffect: WorkflowTerminalEffectRecord | undefined,
+  retained: WorkflowTerminalSnapshotRecord | undefined,
   input: PrepareWorkflowTerminalEffectInput,
   now: number,
 ): InternalPrepareWorkflowTerminalEffectResult {
@@ -656,8 +752,31 @@ export function prepareWorkflowTerminalEffectRecord(
     (input.effect.kind === 'workflow-finish' &&
       (input.expectedPhase === 'run_state_persisted' || input.expectedPhase === 'parent_effect_recorded'));
   if (!validTransition) return { status: 'invalid_transition' };
+  if (!retained) return { status: 'missing_terminal_state' };
+  validateWorkflowTerminalSnapshotJournalLink(retained, fence.record, input.workflowName, input.runId);
 
-  const desired = createWorkflowTerminalEffectRecord(fence.record, input, now);
+  const descriptor = materializeWorkflowTerminalEffectDescriptor(input.effect);
+  const immediate = retained.envelope.ancestry[0];
+  if (descriptor.kind === 'workflow-finish') {
+    if (immediate) throw new TypeError('Nested workflow recovery envelope requires a parent terminal effect');
+  } else {
+    if (!immediate) throw new TypeError('Root workflow recovery envelope cannot prepare a parent terminal effect');
+    const sourcePath =
+      immediate.source.kind === 'step'
+        ? immediate.source.executionPath
+        : [...immediate.source.containerPath, immediate.source.iterationIndex];
+    if (
+      immediate.parentWorkflowName !== descriptor.parentWorkflowName ||
+      immediate.parentRunId !== descriptor.parentRunId ||
+      immediate.source.stepId !== descriptor.parentStepId ||
+      sourcePath.length !== descriptor.parentExecutionPath.length ||
+      sourcePath.some((entry, index) => entry !== descriptor.parentExecutionPath[index])
+    ) {
+      throw new TypeError('Workflow terminal parent effect does not match retained recovery ancestry');
+    }
+  }
+
+  const desired = createWorkflowTerminalEffectRecord(fence.record, retained, input, now);
   if (fence.record.phase === targetPhase) {
     if (!existingEffect) return { status: 'missing_effect' };
     const leaseExpiresAt =
@@ -1287,6 +1406,7 @@ export function finalizeWorkflowTerminalParentApplicationRecords(
 /** @internal Atomically certifies that the canonical run snapshot is terminal. */
 export function persistWorkflowTerminalStateRecord(
   existing: WorkflowTerminalizationRecord | undefined,
+  existingAncestry: WorkflowTerminalRecoveryAncestryRecord | undefined,
   input: PersistWorkflowTerminalStateInput,
   now: number,
   materializeSnapshot: (
@@ -1313,7 +1433,49 @@ export function persistWorkflowTerminalStateRecord(
   if (!input.snapshot || typeof input.snapshot !== 'object' || Array.isArray(input.snapshot)) {
     return { status: 'invalid_snapshot' };
   }
-  const snapshot = materializeSnapshot(input.snapshot);
+  let recovery: WorkflowTerminalRecoveryEnvelopeRecordV1;
+  try {
+    const envelope = materializeWorkflowTerminalRecoveryEnvelope(input.recoveryEnvelope);
+    validateWorkflowTerminalRecoveryGraphBinding(envelope, {
+      childSerializedStepGraph: input.snapshot.serializedStepGraph,
+    });
+    recovery = {
+      version: 1 as const,
+      envelopeHash: getWorkflowTerminalRecoveryEnvelopeHash(envelope),
+      envelope: copyWorkflowTerminalRecoveryEnvelope(envelope),
+    };
+    validateWorkflowTerminalRecoveryEnvelopeIntegrity(recovery, {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      terminalStatus: existing.terminalStatus,
+    });
+    if (envelope.ancestry.length > 0) {
+      if (!existingAncestry) return { status: 'missing_recovery_ancestry' };
+      validateWorkflowTerminalRecoveryAncestryRecord(existingAncestry, {
+        workflowName: input.workflowName,
+        runId: input.runId,
+        now,
+      });
+      if (existingAncestry.ancestryHash !== getWorkflowTerminalRecoveryAncestryHash(envelope.ancestry)) {
+        return { status: 'invalid_recovery_envelope' };
+      }
+    } else if (existingAncestry && existingAncestry.ancestry.length > 0) {
+      return { status: 'invalid_recovery_envelope' };
+    }
+  } catch {
+    return { status: 'invalid_recovery_envelope' };
+  }
+  const inputSnapshot = materializeSnapshot(input.snapshot);
+  const snapshot = materializeSnapshot({
+    ...inputSnapshot,
+    result: recovery.envelope.terminalResult,
+    context: {
+      ...inputSnapshot.context,
+      __state: recovery.envelope.finalState as never,
+    } as unknown as PersistWorkflowTerminalStateInput['snapshot']['context'],
+    value: recovery.envelope.finalState as PersistWorkflowTerminalStateInput['snapshot']['value'],
+    requestContext: recovery.envelope.requestContextPatch,
+  });
   if (!snapshot || snapshot.runId !== input.runId || snapshot.status !== existing.terminalStatus) {
     return { status: 'invalid_snapshot' };
   }
@@ -1322,6 +1484,7 @@ export function persistWorkflowTerminalStateRecord(
   return {
     status: 'advanced',
     snapshot,
+    recovery,
     record: {
       ...existing,
       phase: 'run_state_persisted',

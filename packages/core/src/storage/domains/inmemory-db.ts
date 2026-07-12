@@ -21,6 +21,7 @@ import type {
   StorageToolProviderConnection,
   StorageWorkflowRun,
   WorkflowTerminalContinuationPlanRecord,
+  WorkflowTerminalRecoveryAncestryRecord,
   ObservationalMemoryRecord,
   DatasetRecord,
   DatasetItemRow,
@@ -173,6 +174,8 @@ export class InMemoryDB {
   readonly workflowTerminalEffects = new Map<string, WorkflowTerminalEffectRecord>();
   /** Immutable terminal state retained while terminal protocol evidence remains incomplete. */
   readonly workflowTerminalSnapshots = new Map<string, WorkflowTerminalSnapshotRecord>();
+  /** Immutable ancestry captured before a nested child begins execution. */
+  readonly workflowTerminalRecoveryAncestries = new Map<string, WorkflowTerminalRecoveryAncestryRecord>();
   /** Consumer-scoped destination receipt evidence, isolated from replaceable workflow runs. */
   readonly workflowTerminalDestinationReceipts = new WorkflowTerminalDestinationReceiptMap();
   /** Immutable continuation plans keyed by their canonical receipt identity. */
@@ -273,6 +276,7 @@ export class InMemoryDB {
     this.workflowTerminalizations.clear();
     this.workflowTerminalEffects.clear();
     this.workflowTerminalSnapshots.clear();
+    this.workflowTerminalRecoveryAncestries.clear();
     this.workflowTerminalDestinationReceipts.clear();
     this.workflowTerminalContinuationPlans.clear();
     this.workflowTerminalParentRevisions.clear();

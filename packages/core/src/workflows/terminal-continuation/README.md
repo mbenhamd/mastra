@@ -112,25 +112,25 @@ parity, bounded CAS/replan, capability gating, and cutover.
 The current evented processor is the behavioral reference, not an authority for
 known unsafe recovery behavior. PF-1781 intentionally exposes these differences:
 
-- Retained PF-1770 terminal state does not yet guarantee the exact event-local
-  final `context.__state`. The pure patch fails closed when it is absent. The
-  producer integration must make this evidence durable before runtime adoption.
+- PF-1782 recovery evidence carries the exact event-local final state and
+  atomically replaces both persisted state views. The pure patch continues to
+  fail closed when a caller supplies unauthenticated or incomplete evidence.
 - Current nested completion can forward the child's `activeStepsPath` instead of
   the parent's map. Planner and runtime adoption must use the locked parent
   snapshot.
 - Current nested cancellation can persist the child as canceled but continue or
   finish the parent inconsistently. The contract chooses explicit parent
   cancellation; runtime adoption must update the evented behavior and its tests.
-- In-memory workflow snapshots can preserve richer JavaScript values than JSON
-  adapters. The patch normalizes every touched payload/state/context value to a
-  JSON-observable form, but the terminal producer must serialize native errors
-  before a JSON adapter can discard their diagnostics.
+- PF-1782 canonicalizes terminal result/error, final state, request-context
+  patch, graph identity, and ancestry in Core before either InMemory or a JSON
+  adapter sees them. Native Error diagnostics and rejection behavior are now
+  adapter-independent.
 - The foreach sidecar is not consumed by the current evented processor. PF-1779
   planning and PF-1780 dispatch must use the shared sidecar key instead of the
   current raw-`null` pending heuristic before runtime adoption.
-- Current producers do not populate `iterationRunIds` per foreach index. PF-1782
-  must make that ownership evidence durable before the contract can accept a
-  recovered concurrent iteration.
+- Evented nested starts populate `iterationRunIds` per foreach index through an
+  adapter-atomic ownership write. The planner still validates the selected
+  child against the locked parent snapshot before accepting recovery.
 - Current label-directed foreach resume consumers read only the aggregate
   step-level suspend payload. PF-1780/PF-1769 must select the exact
   `iterationSuspendPayloads[foreachIndex]` entry before runtime adoption; until

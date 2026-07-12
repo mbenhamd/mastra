@@ -50,6 +50,7 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
     'runId',
     'sourceEventKey',
     'terminalStatus',
+    'recoveryEnvelopeHash',
     'payloadHash',
     'createdAt',
     ...(parent ? ['parentWorkflowName', 'parentRunId', 'parentStepId', 'parentExecutionPath'] : []),
@@ -61,6 +62,7 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
     'runId',
     'sourceEventKey',
     'terminalStatus',
+    'recoveryEnvelopeHash',
     ...(parent ? ['parentWorkflowName', 'parentRunId', 'parentStepId', 'parentExecutionPath'] : []),
   ];
   if (
@@ -88,7 +90,15 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
       1_024,
     ),
     terminalStatus,
+    recoveryEnvelopeHash: validateWorkflowTerminalStructuralString(
+      descriptors.recoveryEnvelopeHash!.value,
+      'workflow terminal effect recoveryEnvelopeHash',
+      256,
+    ) as `sha256:${string}`,
   };
+  if (!/^sha256:[a-f0-9]{64}$/.test(common.recoveryEnvelopeHash)) {
+    throw new TypeError('workflow terminal effect recovery envelope hash is invalid');
+  }
   if (!parent) return common as IntegrityInput;
   return {
     ...common,
@@ -142,7 +152,7 @@ export function getWorkflowTerminalEffectIntegrity(input: unknown): { effectKey:
     effect.kind,
     ...destinationParts,
   ];
-  const payloadParts = [...identityParts, effect.terminalStatus];
+  const payloadParts = [...identityParts, effect.terminalStatus, effect.recoveryEnvelopeHash];
   return {
     effectKey: `wte:v1:${hashFramedParts('mastra.workflow-terminal-effect.identity.v1', identityParts)}`,
     payloadHash: `sha256:${hashFramedParts('mastra.workflow-terminal-effect.payload.v1', payloadParts)}`,
