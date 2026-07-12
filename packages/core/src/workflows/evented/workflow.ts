@@ -1980,12 +1980,15 @@ export class EventedRun<
    */
   resumeStream<TResume>({
     step,
+    label,
     resumeData,
     requestContext,
+    forEachIndex,
     perStep,
     outputOptions,
   }: {
     resumeData?: TResume;
+    label?: string;
     step?:
       | Step<string, any, any, any, TResume, any, TEngineType>
       | [
@@ -1995,6 +1998,7 @@ export class EventedRun<
       | string
       | string[];
     requestContext?: RequestContext;
+    forEachIndex?: number;
     perStep?: boolean;
     outputOptions?: {
       includeState?: boolean;
@@ -2034,7 +2038,9 @@ export class EventedRun<
           const executionResults = await self.resume({
             resumeData,
             step,
+            label,
             requestContext,
+            forEachIndex,
             perStep,
             outputOptions,
           });
@@ -2099,15 +2105,67 @@ export class EventedRun<
       throw new Error('This workflow run was not suspended');
     }
 
-    // Resolve label to step path if provided
-    const snapshotResumeLabel = params.label ? snapshot?.resumeLabels?.[params.label] : undefined;
+    if (params.label !== undefined && (typeof params.label !== 'string' || params.label.length === 0)) {
+      throw new Error('Resume label must be a non-empty string');
+    }
 
-    // Validate label exists if provided
-    if (params.label && !snapshotResumeLabel) {
-      const availableLabels = Object.keys(snapshot?.resumeLabels ?? {});
-      throw new Error(
-        `Resume label "${params.label}" not found. ` + `Available labels: [${availableLabels.join(', ')}]`,
-      );
+    // Resolve only own data properties. A plain-object label map inherits keys such as
+    // "__proto__", which must not be treated as stored resume metadata.
+    const hasSnapshotResumeLabel =
+      params.label !== undefined && Object.prototype.hasOwnProperty.call(snapshot?.resumeLabels ?? {}, params.label);
+    const snapshotResumeLabel = hasSnapshotResumeLabel ? snapshot?.resumeLabels?.[params.label!] : undefined;
+    const hasSnapshotResumePath =
+      snapshotResumeLabel?.stepId !== undefined &&
+      Object.prototype.hasOwnProperty.call(snapshot?.suspendedPaths ?? {}, snapshotResumeLabel.stepId);
+    const snapshotResumePath = hasSnapshotResumePath
+      ? snapshot?.suspendedPaths?.[snapshotResumeLabel!.stepId]
+      : undefined;
+    const snapshotResumeRootEntry = Array.isArray(snapshotResumePath)
+      ? this.executionGraph.steps[snapshotResumePath[0]!]
+      : undefined;
+    const isValidSnapshotResumePathLength =
+      snapshotResumeRootEntry?.type === 'parallel' || snapshotResumeRootEntry?.type === 'conditional'
+        ? snapshotResumePath?.length === 2
+        : snapshotResumePath?.length === 1;
+    const snapshotResumeEntry = (() => {
+      if (!Array.isArray(snapshotResumePath) || !isValidSnapshotResumePathLength) return undefined;
+      let entry = snapshotResumeRootEntry;
+      if (entry?.type === 'parallel' || entry?.type === 'conditional') {
+        entry = entry.steps[snapshotResumePath[1]!];
+      }
+      return entry;
+    })();
+    const snapshotResumeStepId =
+      snapshotResumeEntry?.type === 'step' ||
+      snapshotResumeEntry?.type === 'loop' ||
+      snapshotResumeEntry?.type === 'foreach'
+        ? snapshotResumeEntry.step.id
+        : undefined;
+    const snapshotForEachResult =
+      snapshotResumeLabel?.stepId !== undefined ? (snapshot?.context?.[snapshotResumeLabel.stepId] as any) : undefined;
+    const isValidLocalForEachTarget =
+      snapshotResumeEntry?.type !== 'foreach' ||
+      (snapshotResumeLabel?.foreachIndex !== undefined &&
+        Array.isArray(snapshotForEachResult?.output) &&
+        snapshotResumeLabel.foreachIndex < snapshotForEachResult.output.length &&
+        snapshotForEachResult.output[snapshotResumeLabel.foreachIndex]?.status === 'suspended');
+    const isValidSnapshotResumeLabel =
+      snapshotResumeLabel !== null &&
+      typeof snapshotResumeLabel === 'object' &&
+      typeof snapshotResumeLabel.stepId === 'string' &&
+      snapshotResumeLabel.stepId.length > 0 &&
+      (snapshotResumeLabel.foreachIndex === undefined ||
+        (Number.isInteger(snapshotResumeLabel.foreachIndex) && snapshotResumeLabel.foreachIndex >= 0)) &&
+      Array.isArray(snapshotResumePath) &&
+      isValidSnapshotResumePathLength &&
+      snapshotResumePath.every(index => Number.isInteger(index) && index >= 0) &&
+      snapshotResumeStepId === snapshotResumeLabel.stepId &&
+      isValidLocalForEachTarget;
+
+    // Do not echo caller-provided or stored label data into errors. Labels may contain
+    // sensitive values and can be arbitrarily large when this API is called dynamically.
+    if (params.label !== undefined && !isValidSnapshotResumeLabel) {
+      throw new Error('Resume label was not found for this workflow run');
     }
 
     // Label takes precedence over step param
@@ -2166,6 +2224,9 @@ export class EventedRun<
     const isStepSuspended = suspendedStepIds.includes(steps?.[0] ?? '');
 
     if (!isStepSuspended) {
+      if (params.label !== undefined) {
+        throw new Error('Resume label was not found for this workflow run');
+      }
       throw new Error(
         `This workflow step "${steps?.[0]}" was not suspended. Available suspended steps: [${suspendedStepIds.join(', ')}]`,
       );
@@ -2215,6 +2276,7 @@ export class EventedRun<
           resumePayload: resumeDataToUse,
           resumePath,
           forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+          label: params.label,
         },
         pubsub: this.mastra.pubsub,
         requestContext,

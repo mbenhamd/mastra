@@ -37,6 +37,8 @@ export type ProcessorArgs = {
   timeTravel?: TimeTravelExecutionParams;
   restart?: RestartExecutionParams;
   resumeData?: any;
+  /** Original public resume label, retained while routing through nested workflow boundaries. */
+  resumeLabel?: string;
   parentWorkflow?: ParentWorkflow;
   parentContext?: {
     workflowId: string;
@@ -74,6 +76,21 @@ export type ParentWorkflow = {
     input: any;
   };
 };
+
+function resolveWorkflowStepPath(workflow: Workflow, executionPath: number[] | undefined) {
+  if (!Array.isArray(executionPath) || executionPath.length === 0) return undefined;
+
+  let entry = workflow.stepGraph[executionPath[0]!];
+  if (entry?.type === 'parallel' || entry?.type === 'conditional') {
+    if (executionPath.length !== 2) return undefined;
+    entry = entry.steps[executionPath[1]!];
+  } else if (executionPath.length !== 1) {
+    return undefined;
+  }
+
+  if (entry?.type !== 'step' && entry?.type !== 'loop' && entry?.type !== 'foreach') return undefined;
+  return entry;
+}
 
 export class WorkflowEventProcessor extends EventProcessor {
   /**
@@ -234,6 +251,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     resumeSteps,
     prevResult,
     resumeData,
+    resumeLabel,
     timeTravel,
     restart,
     executionPath,
@@ -337,6 +355,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         restart,
         requestContext,
         resumeData,
+        resumeLabel,
         activeStepsPath: {},
         perStep,
         state: initialState,
@@ -516,6 +535,17 @@ export class WorkflowEventProcessor extends EventProcessor {
       const suspendedStepId = workflow && executionPath ? getStep(workflow, executionPath)?.id : undefined;
       const propagatedPath =
         suspendedStepId && existingPath[0] !== suspendedStepId ? [suspendedStepId, ...existingPath] : existingPath;
+
+      const resumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
+      const nestedResumeLabels = prevResult.suspendPayload?.__workflow_meta?.resumeLabels ?? {};
+
+      for (const label of Object.keys(nestedResumeLabels)) {
+        resumeLabels[label] = {
+          stepId: parentWorkflow.stepId,
+          foreachIndex: nestedResumeLabels[label].foreachIndex,
+        };
+      }
+
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.step.end',
         runId: parentWorkflow.runId, // Use parent's runId for event routing
@@ -532,6 +562,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               __workflow_meta: {
                 // keep resumeLabels / foreachIndex etc. — only the runId and path change as we propagate up
                 ...(prevResult.suspendPayload?.__workflow_meta ?? {}),
+                resumeLabels: Object.keys(resumeLabels).length > 0 ? resumeLabels : undefined,
                 runId: runId,
                 path: propagatedPath,
               },
@@ -650,6 +681,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     restart,
     prevResult,
     resumeData,
+    resumeLabel,
     parentWorkflow,
     requestContext,
     retryCount = 0,
@@ -674,6 +706,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           resumeSteps,
           prevResult,
           resumeData,
+          resumeLabel,
           parentWorkflow,
           requestContext,
         },
@@ -857,6 +890,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           restart,
           prevResult,
           resumeData,
+          resumeLabel,
           parentWorkflow,
           requestContext,
           perStep,
@@ -901,9 +935,14 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // Run nested workflow - check for both EventedWorkflow and regular Workflow
     if (step.step instanceof EventedWorkflow || (step.step as any).component === 'WORKFLOW') {
+      const storedStepResult = stepResults[step.step.id] as any;
+      const stepData =
+        step.type === 'foreach' && executionPath[1] !== undefined
+          ? storedStepResult?.output?.[executionPath[1]]
+          : storedStepResult;
+
       // Handle resume with only nested workflow ID specified (auto-detect suspended inner step)
       if (resumeSteps?.length === 1 && resumeSteps[0] === step.step.id) {
-        const stepData = stepResults[step.step.id];
         const nestedRunId = stepData?.suspendPayload?.__workflow_meta?.runId;
         if (!nestedRunId) {
           return this.errorWorkflow(
@@ -933,9 +972,45 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId: nestedRunId,
         });
 
-        // Auto-detect the suspended step within the nested workflow
-        const suspendedStepId = Object.keys(snapshot?.suspendedPaths ?? {})?.[0];
-        if (!suspendedStepId) {
+        const hasNestedResumeLabel =
+          resumeLabel !== undefined && Object.prototype.hasOwnProperty.call(snapshot?.resumeLabels ?? {}, resumeLabel);
+        const nestedResumeLabel = hasNestedResumeLabel ? snapshot?.resumeLabels?.[resumeLabel!] : undefined;
+        const isValidNestedResumeLabel =
+          nestedResumeLabel !== null &&
+          typeof nestedResumeLabel === 'object' &&
+          typeof nestedResumeLabel.stepId === 'string' &&
+          nestedResumeLabel.stepId.length > 0 &&
+          (nestedResumeLabel.foreachIndex === undefined ||
+            (Number.isInteger(nestedResumeLabel.foreachIndex) && nestedResumeLabel.foreachIndex >= 0));
+
+        // A label selects the exact suspended inner step. Without one, retain the
+        // established single-step auto-detection behavior.
+        const suspendedStepId = isValidNestedResumeLabel
+          ? nestedResumeLabel.stepId
+          : resumeLabel === undefined
+            ? Object.keys(snapshot?.suspendedPaths ?? {})?.[0]
+            : undefined;
+        const hasNestedExecutionPath =
+          suspendedStepId !== undefined &&
+          Object.prototype.hasOwnProperty.call(snapshot?.suspendedPaths ?? {}, suspendedStepId);
+        const nestedExecutionPath = hasNestedExecutionPath ? snapshot?.suspendedPaths?.[suspendedStepId] : undefined;
+        const nestedResumeEntry = resolveWorkflowStepPath(step.step as Workflow, nestedExecutionPath);
+        const nestedResumeStepId = nestedResumeEntry?.step.id;
+        const nestedForEachResult =
+          nestedResumeLabel?.stepId !== undefined ? (snapshot?.context?.[nestedResumeLabel.stepId] as any) : undefined;
+        const isValidNestedForEachTarget =
+          resumeLabel === undefined ||
+          nestedResumeEntry?.type !== 'foreach' ||
+          (nestedResumeLabel?.foreachIndex !== undefined &&
+            Array.isArray(nestedForEachResult?.output) &&
+            nestedResumeLabel.foreachIndex < nestedForEachResult.output.length &&
+            nestedForEachResult.output[nestedResumeLabel.foreachIndex]?.status === 'suspended');
+        const isValidNestedExecutionPath =
+          Array.isArray(nestedExecutionPath) &&
+          nestedExecutionPath.every(index => Number.isInteger(index) && index >= 0) &&
+          nestedResumeStepId === suspendedStepId &&
+          isValidNestedForEachTarget;
+        if (snapshot?.status !== 'suspended' || !suspendedStepId || !isValidNestedExecutionPath) {
           return this.errorWorkflow(
             {
               workflowId,
@@ -951,14 +1026,13 @@ export class WorkflowEventProcessor extends EventProcessor {
             },
             new MastraError({
               id: 'MASTRA_WORKFLOW',
-              text: `No suspended step found in nested workflow: ${step.step.id}`,
+              text: 'No matching suspended step found in nested workflow',
               domain: ErrorDomain.MASTRA_WORKFLOW,
               category: ErrorCategory.SYSTEM,
             }),
           );
         }
 
-        const nestedExecutionPath = snapshot?.suspendedPaths?.[suspendedStepId];
         const nestedStepResults = snapshot?.context;
         // The resumed inner step's input is the output of the step that ran before it
         // inside the nested workflow (i.e. the suspended step's stored payload), not the
@@ -992,6 +1066,8 @@ export class WorkflowEventProcessor extends EventProcessor {
             stepResults: nestedStepResults,
             prevResult: nestedPrevResult,
             resumeData,
+            resumeLabel,
+            forEachIndex: nestedResumeLabel?.foreachIndex ?? forEachIndex,
             activeStepsPath,
             requestContext,
             perStep,
@@ -1001,7 +1077,6 @@ export class WorkflowEventProcessor extends EventProcessor {
           },
         });
       } else if (resumeSteps?.length > 1 && resumeSteps[0] === step.step.id) {
-        const stepData = stepResults[step.step.id];
         const nestedRunId = stepData?.suspendPayload?.__workflow_meta?.runId;
         if (!nestedRunId) {
           return this.errorWorkflow(
@@ -1033,6 +1108,39 @@ export class WorkflowEventProcessor extends EventProcessor {
 
         const nestedStepResults = snapshot?.context;
         const nestedSteps = resumeSteps.slice(1);
+        const nestedExecutionPath = snapshot?.suspendedPaths?.[nestedSteps[0]!];
+        const nestedResumeEntry = resolveWorkflowStepPath(step.step as Workflow, nestedExecutionPath);
+        const canDescendIntoNestedStep =
+          nestedResumeEntry?.step instanceof EventedWorkflow || nestedResumeEntry?.step.component === 'WORKFLOW';
+        const isValidNestedExecutionPath =
+          snapshot?.status === 'suspended' &&
+          Object.prototype.hasOwnProperty.call(snapshot?.suspendedPaths ?? {}, nestedSteps[0]!) &&
+          Array.isArray(nestedExecutionPath) &&
+          nestedExecutionPath.every(index => Number.isInteger(index) && index >= 0) &&
+          nestedResumeEntry?.step.id === nestedSteps[0] &&
+          (nestedSteps.length === 1 || canDescendIntoNestedStep);
+        if (!isValidNestedExecutionPath) {
+          return this.errorWorkflow(
+            {
+              workflowId,
+              runId,
+              executionPath,
+              stepResults,
+              activeStepsPath,
+              resumeSteps,
+              prevResult,
+              resumeData,
+              parentWorkflow,
+              requestContext,
+            },
+            new MastraError({
+              id: 'MASTRA_WORKFLOW',
+              text: 'No matching suspended step found in nested workflow',
+              domain: ErrorDomain.MASTRA_WORKFLOW,
+              category: ErrorCategory.SYSTEM,
+            }),
+          );
+        }
         // The step the nested workflow resumes into receives the output of the step that
         // ran before it (its stored payload), not the input to the nested-workflow step.
         const nestedPrevResult = {
@@ -1058,12 +1166,14 @@ export class WorkflowEventProcessor extends EventProcessor {
               activeStepsPath,
               resumeData,
             },
-            executionPath: snapshot?.suspendedPaths?.[nestedSteps[0]!] as any,
+            executionPath: nestedExecutionPath,
             runId: nestedRunId,
             resumeSteps: nestedSteps,
             stepResults: nestedStepResults,
             prevResult: nestedPrevResult,
             resumeData,
+            resumeLabel,
+            forEachIndex,
             activeStepsPath,
             requestContext,
             perStep,
@@ -1636,7 +1746,16 @@ export class WorkflowEventProcessor extends EventProcessor {
           resumeSteps,
           parentWorkflow,
           stepResults,
-          prevResult: { status: 'suspended' } as any,
+          // Preserve the complete branch-label map while bubbling a nested
+          // parallel/conditional suspension to its parent workflow.
+          prevResult: {
+            status: 'suspended',
+            suspendPayload: {
+              __workflow_meta: {
+                resumeLabels,
+              },
+            },
+          } as any,
           activeStepsPath,
           requestContext,
           timeTravel,
@@ -1934,7 +2053,12 @@ export class WorkflowEventProcessor extends EventProcessor {
             if (iterResult && typeof iterResult === 'object' && iterResult.status === 'suspended') {
               // Collect resume labels
               if (iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-                Object.assign(collectedResumeLabels, iterResult.suspendPayload.__workflow_meta.resumeLabels);
+                for (const [label, target] of Object.entries(iterResult.suspendPayload.__workflow_meta.resumeLabels)) {
+                  collectedResumeLabels[label] = {
+                    ...(target as { stepId: string; foreachIndex?: number }),
+                    foreachIndex: i,
+                  };
+                }
               }
             }
           }

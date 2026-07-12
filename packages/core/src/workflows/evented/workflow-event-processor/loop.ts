@@ -135,6 +135,7 @@ export async function processWorkflowForEach(
     timeTravel,
     restart,
     resumeData,
+    resumeLabel,
     parentWorkflow,
     requestContext,
     perStep,
@@ -216,6 +217,7 @@ export async function processWorkflowForEach(
           stepResults,
           prevResult: iterationPrevResult,
           resumeData,
+          resumeLabel,
           activeStepsPath,
           requestContext,
           perStep,
@@ -236,7 +238,12 @@ export async function processWorkflowForEach(
       for (let i = 0; i < currentResult.output.length; i++) {
         const iterResult = currentResult.output[i];
         if (iterResult?.status === 'suspended' && iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-          Object.assign(collectedResumeLabels, iterResult.suspendPayload.__workflow_meta.resumeLabels);
+          for (const [label, target] of Object.entries(iterResult.suspendPayload.__workflow_meta.resumeLabels)) {
+            collectedResumeLabels[label] = {
+              ...(target as { stepId: string; foreachIndex?: number }),
+              foreachIndex: i,
+            };
+          }
         }
       }
 

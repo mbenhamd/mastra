@@ -24,6 +24,7 @@ const result = await stream.result
 
 if (result!.status === 'suspended') {
   const resumedStream = await run.resumeStream({
+    label: 'approve-order',
     resumeData: {
       value: 'resume data',
     },
@@ -35,6 +36,13 @@ if (result!.status === 'suspended') {
 
 <PropertiesTable
   content={[
+  {
+    name: 'label',
+    type: 'string',
+    description:
+      'The resume label recorded when the step suspended. Use a label to select the matching suspended step, including a step inside a nested workflow, parallel branch, or foreach iteration.',
+    isOptional: true,
+  },
   {
     name: 'resumeData',
     type: 'z.infer<TInput>',

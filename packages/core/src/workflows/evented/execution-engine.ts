@@ -73,6 +73,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
       resumePayload: any;
       resumePath: number[];
       forEachIndex?: number;
+      label?: string;
     };
     pubsub?: PubSub; // Not used - evented engine uses this.mastra.pubsub directly
     requestContext: RequestContext;
@@ -157,6 +158,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
             state: resumeState,
             outputOptions: params.outputOptions,
             forEachIndex: params.resume.forEachIndex,
+            resumeLabel: params.resume.label,
           },
         });
       } else if (params.timeTravel) {
