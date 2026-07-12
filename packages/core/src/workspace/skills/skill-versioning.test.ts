@@ -270,6 +270,35 @@ describe('collectSkillForPublish', () => {
     expect(result.snapshot.references).toEqual(['deep/nested/file.md']);
   });
 
+  it('preserves a long non-matching slash run in a skill path', async () => {
+    const skillMd = createSkillMd({ name: 'edge-path-skill', description: 'Edge path test' }, '# Edge Path');
+    const skillDir = `skill/${'/'.repeat(20_000)}nested`;
+    const source: SkillSource = {
+      exists: vi.fn(async () => true),
+      stat: vi.fn(async () => ({
+        name: 'skill',
+        type: 'directory' as const,
+        size: 0,
+        createdAt: new Date('2024-01-01'),
+        modifiedAt: new Date('2024-01-01'),
+      })),
+      readdir: vi.fn(async path => {
+        expect(path).toBe(skillDir);
+        return [{ name: 'SKILL.md', type: 'file' as const }];
+      }),
+      readFile: vi.fn(async path => {
+        expect(path).toBe(`${skillDir}/SKILL.md`);
+        return skillMd;
+      }),
+    };
+
+    const result = await collectSkillForPublish(source, skillDir);
+
+    expect(result.snapshot.name).toBe('edge-path-skill');
+    expect(result.tree.entries['SKILL.md']).toBeDefined();
+    expect(source.readFile).toHaveBeenCalledTimes(1);
+  });
+
   it('should parse frontmatter fields correctly', async () => {
     const skillMd = createSkillMd(
       {
@@ -635,6 +664,23 @@ describe('VersionedSkillSource', () => {
 
     // Leading '/' should be stripped
     expect(await source.exists('/SKILL.md')).toBe(true);
+  });
+
+  it('normalizes adversarially long path-edge runs', async () => {
+    const { source, skillMdContent } = createVersionedSource();
+    const leadingEdges = './\\'.repeat(40_000);
+    const trailingSeparators = '/\\'.repeat(40_000);
+    const path = `${leadingEdges}SKILL.md${trailingSeparators}`;
+
+    expect(await source.exists(path)).toBe(true);
+    expect(await source.readFile(path)).toBe(skillMdContent);
+  });
+
+  it('preserves an adversarially long internal separator run', async () => {
+    const { source } = createVersionedSource();
+    const internalPath = `references/${'\\'.repeat(20_000)}api.md`;
+
+    expect(await source.exists(internalPath)).toBe(false);
   });
 });
 

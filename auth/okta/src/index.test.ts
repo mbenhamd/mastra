@@ -113,6 +113,24 @@ describe('MastraAuthOkta', () => {
       expect(url).not.toContain('default//');
     });
 
+    test('normalizes an adversarially long trailing slash run', () => {
+      const issuer = `https://example.oktapreview.com/oauth2/default${'/'.repeat(100_000)}`;
+      const auth = new MastraAuthOkta({ issuer });
+
+      expect(auth['issuer']).toBe('https://example.oktapreview.com/oauth2/default');
+      expect(auth.getLoginUrl('http://localhost/cb', 'test-state')).toMatch(
+        /^https:\/\/example\.oktapreview\.com\/oauth2\/default\/v1\/authorize\?/,
+      );
+    });
+
+    test('preserves an adversarially long internal slash run', () => {
+      const issuer = `https://example.oktapreview.com/oauth2/${'/'.repeat(20_000)}custom`;
+      const auth = new MastraAuthOkta({ issuer });
+
+      expect(auth['issuer']).toBe(issuer);
+      expect(auth.getLoginUrl('http://localhost/cb', 'test-state').startsWith(`${issuer}/v1/authorize?`)).toBe(true);
+    });
+
     test('JWT iss-claim validation still uses raw issuer for org server', async () => {
       const mockJWKS = vi.fn();
       (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
