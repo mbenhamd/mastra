@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod/v4';
+import { createWorkflow } from '../create';
 import type { SerializedStepFlowEntry } from '../types';
+import { createStep } from '../workflow';
 import {
   createWorkflowTerminalGraphFingerprint,
   resolveWorkflowTerminalGraphCoordinate,
@@ -54,6 +57,48 @@ function countingProxy<T extends object>(target: T, increment: () => void): T {
 }
 
 describe('workflow terminal graph fingerprint', () => {
+  it.each(['dowhile', 'dountil'] as const)('accepts the real Workflow.%s serialized condition identity', method => {
+    const schema = z.object({ value: z.number() });
+    const step = createStep({
+      id: 'real-loop',
+      inputSchema: schema,
+      outputSchema: schema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const condition = async ({ iterationCount }: { iterationCount: number }) => iterationCount < 2;
+    const workflow = createWorkflow({ id: `real-${method}`, inputSchema: schema, outputSchema: schema });
+    const committed = workflow[method](step, condition as never).commit();
+    const entry = committed.serializedStepGraph[0];
+    expect(entry).toMatchObject({
+      type: 'loop',
+      step: { id: 'real-loop' },
+      serializedCondition: { id: 'real-loop-condition' },
+    });
+    expect(() => createWorkflowTerminalGraphFingerprint(committed.serializedStepGraph)).not.toThrow();
+  });
+
+  it('rejects bound and proxied workflow callbacks at the durable graph boundary', () => {
+    const schema = z.object({ value: z.number() });
+    const step = createStep({
+      id: 'unsafe-loop',
+      inputSchema: schema,
+      outputSchema: schema,
+      execute: async ({ inputData }) => inputData,
+    });
+    const condition = async () => true;
+    const build = (callback: typeof condition) =>
+      createWorkflow({ id: 'unsafe-condition', inputSchema: schema, outputSchema: schema }).dowhile(
+        step,
+        callback as never,
+      );
+    expect(() =>
+      createWorkflowTerminalGraphFingerprint(build(condition.bind(null)).commit().serializedStepGraph),
+    ).toThrow(/native|bound/);
+    expect(() =>
+      createWorkflowTerminalGraphFingerprint(build(new Proxy(condition, {})).commit().serializedStepGraph),
+    ).toThrow(/native|bound/);
+  });
+
   it('is stable across JSON storage and ignores descriptive fields', () => {
     const original = graph();
     const stored = JSON.parse(JSON.stringify(original)) as SerializedStepFlowEntry[];

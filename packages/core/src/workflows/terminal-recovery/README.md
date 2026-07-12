@@ -88,11 +88,14 @@ is read-only. An ancestry, graph, or ownership mismatch writes neither half.
 
 Recovery v1 accepts continuous execution only. PF-1780 owns planner invocation,
 bounded CAS/replan, committed framework-action dispatch, and runtime cutover.
-PF-1783 owns iteration-scoped nested-loop ownership and loop callback retry
-semantics; durable nested workflow loop execution fails before child dispatch
-until that coordinate contract exists. PF-1800 owns durable per-step recovery.
-No callback exactly-once, broker ACK, publication, merge, package release, or
-deployment behavior is introduced here.
+PF-1783 now derives loop callback input only from authenticated recovery evidence
+and the locked parent snapshot. It uses retained final state, terminal output,
+request-context patch, projected step results, and persisted source
+`resumePayload`; process-local raw resume data is not reconstructed. A callback
+may run again after a crash before atomic apply or a parent CAS conflict, and
+side-effecting callbacks remain unsupported. PF-1800 owns durable per-step
+recovery. No callback exactly-once, broker ACK, publication, merge, package
+release, or deployment behavior is introduced here.
 
 ## Verification
 

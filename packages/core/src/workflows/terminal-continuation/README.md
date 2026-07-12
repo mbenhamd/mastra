@@ -65,6 +65,7 @@ only the committed action.
 | PF-1781 contract | canonicalization, hashing, graph binding, action/patch matrix, pure parent patch | planning, storage CAS, callback execution, event dispatch |
 | PF-1771 storage  | atomic parent patch plus committed plan/receipt evidence                         | choosing a new action during replay                       |
 | PF-1779 planner  | selecting the one immediate action from locked state and pre-evaluated decisions | persistence or publication                                |
+| PF-1783 decision | restartable callback frame, one-attempt evaluator, re-evaluation policy          | storage CAS, committed-plan lookup, or event dispatch     |
 | PF-1780 runtime  | bounded replan, committed-action execution, recovery and acknowledgement         | adapter-specific semantic rewrites                        |
 
 ## Pure planner
@@ -95,11 +96,63 @@ graph fingerprint, exact source, loop type, and previous iteration count. A CAS
 retry must discard the old decision and derive a new request; exact committed
 replay never evaluates the callback again.
 
-PF-1783 owns whether side-effecting loop conditions remain supported or are
-prohibited, including mutation parity and crash/CAS re-evaluation policy.
+## Durable loop decision evaluation
+
+PF-1783 defines the corrected restartable callback subset without switching the
+live processor. `materializeWorkflowTerminalLoopConditionFrame()` validates the
+locked graph, effect, ancestry, retained recovery hash, and parent revision. It
+reuses the pure child-merge semantics to expose isolated canonical `inputData`,
+final `state`, merged request context, projected step results, a persisted source
+`resumePayload` when present, and the next iteration count. Raw process-local
+`ParentWorkflow.resumeData` is not recovery evidence and is never inferred.
+The callback still receives own `inputData` and `resumeData` properties with an
+`undefined` value when that canonical evidence is absent, matching the live
+evented callback shape.
+Parent CAS replans are not workflow-step retries, so the callback-visible
+`retryCount` remains zero while the decision key changes with the parent revision.
+
+The frame also binds the serialized condition ID and a hash of its well-formed
+source. The evented evaluator compares these with the registered callback before
+invoking it and rejects proxied, bound, native, malformed, or changed source.
+Stored source text is evidence, not semantic function identity: closure captures
+remain unsupported and must not influence a durable predicate. Actor-dependent
+conditions remain unsupported until actor propagation is composed separately.
+
+`evaluateEventedWorkflowTerminalLoopDecision()` runs exactly one callback
+attempt. It composes caller cancellation with a bounded cooperative timeout,
+requires a boolean, and reports throw, abort, timeout, registration mismatch,
+invalid return, denied capability use, input mutation, or capacity exhaustion as
+a typed non-decision. None of those outcomes can be passed to the planner or
+storage as `false`. Native abort intrinsics prevent hostile own `AbortSignal`
+properties from executing. A decision-key-local evaluator coalesces concurrent
+work in one process, retains successful decisions, and retains non-cooperative
+timeouts so redelivery cannot overlap the same callback there. The cache is
+bounded; aborts, failures, invalid results, registration mismatches, and
+unexpected evaluator rejections are evicted rather than poisoning a later
+same-key attempt.
+
+Durable loop conditions must be pure predicates. Direct mutation of isolated
+state, request context, or step results is rejected and never leaks into retained
+evidence. The evaluator supplies denied Mastra, writer, PubSub, engine, and bail
+capabilities so those framework side effects cannot run through the callback
+context. Network, database, global, and closure effects still cannot be detected
+or rolled back for arbitrary JavaScript and are unsupported. A separate durable
+decision primitive is required for them. The known framework auth token is
+rejected from callback request context, and the complete frame shares one bounded
+canonical byte budget.
+
+A fresh parent revision produces a fresh decision key and permits at most three
+live attempts (`MAX_WORKFLOW_TERMINAL_LOOP_DECISION_ATTEMPTS`: one initial plus
+two replans). A crash before atomic apply
+loses the process-local cache and may execute the callback again. PF-1780 must
+look up committed plan evidence first; a crash after commit therefore replays the
+stored decision without invoking this evaluator. The bound is not a durable or
+global callback execution count.
 
 The planner is synchronous and side-effect free. Invalid or unfingerprintable
-graphs throw. A fingerprintable effect/graph coordinate mismatch produces a
+graphs throw. Durable graph validation follows Mastra's real serialized callback
+identity convention (`<step-id>-condition`) and treats optional serialized
+fields whose values are `undefined` as absent. A fingerprintable effect/graph coordinate mismatch produces a
 deterministic `graph-conflict` quarantine. Contradictory ownership or sibling
 state produces a structural-only `plan-conflict` quarantine whose digest never
 contains output, errors, request context, or complete snapshots.
@@ -154,6 +207,7 @@ Focused contract verification:
 
 ```sh
 pnpm --filter @mastra/core test -- --run src/workflows/terminal-continuation
+pnpm --dir packages/core exec vitest run src/workflows/evented/workflow-event-processor/terminal-loop-decision-evaluator.test.ts --config vitest.config.ts
 pnpm --filter @mastra/core check
 ```
 

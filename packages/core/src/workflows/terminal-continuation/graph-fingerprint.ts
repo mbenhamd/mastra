@@ -101,6 +101,16 @@ function hashSource(domain: string, value: unknown, field: string, state: GraphS
   return hashFramedParts(domain, [source]);
 }
 
+function hashExecutableSource(domain: string, value: unknown, field: string, state: GraphState): string {
+  const source = validateWorkflowTerminalStructuralString(value, field, MAX_TERMINAL_GRAPH_BYTES, true);
+  if (source.includes('[native code]')) {
+    throw new TypeError(`${field} must not contain native or bound callback source`);
+  }
+  state.bytes += Buffer.byteLength(source, 'utf8');
+  if (state.bytes > MAX_TERMINAL_GRAPH_BYTES) throw new TypeError('serialized workflow graph exceeds byte limit');
+  return hashFramedParts(domain, [source]);
+}
+
 interface GraphState {
   nodes: number;
   bytes: number;
@@ -173,7 +183,7 @@ function normalizeCondition(value: unknown, parts: string[], state: GraphState, 
     state,
     parts,
     id,
-    hashSource(
+    hashExecutableSource(
       'mastra.workflow-terminal-parent-graph.condition-source.v1',
       descriptors.fn!.value,
       `${field}.fn`,
@@ -243,9 +253,9 @@ function normalizeGraph(
         }
       }
       const fn =
-        descriptors.fn === undefined
+        descriptors.fn?.value === undefined
           ? ''
-          : hashSource(
+          : hashExecutableSource(
               'mastra.workflow-terminal-parent-graph.sleep-source.v1',
               descriptors.fn.value,
               `${entryField}.fn`,
