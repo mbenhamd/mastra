@@ -54,7 +54,7 @@ fi
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
     if [[ -f "$file" ]] && grep -Eq \
-      '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$|\.test-d\.ts$|\.typetest\.ts$' \
+      '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$|\.test-d\.ts$' \
       <<< "$file"; then
       printf '%s\n' "$file"
     fi
