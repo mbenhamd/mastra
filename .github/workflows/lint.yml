@@ -14,9 +14,9 @@ permissions: {}
 jobs:
   changes:
     name: Detect code changes
-    # This detector always runs for fork PRs; downstream canonical-repo jobs
-    # remain gated and PapersFlow-specific validation lives in its own workflow.
-    runs-on: ${{ (github.repository == 'mbenhamd/mastra' || github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || 'starsling-ubuntu-24.04' }}
+    # Public fork code always uses ephemeral GitHub-hosted runners. Starsling is
+    # reserved for same-repository PRs in the canonical Mastra repository.
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     permissions:
       contents: read
     outputs:
@@ -50,7 +50,7 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     if: needs.changes.outputs.has_code == 'true' && github.repository == 'mastra-ai/mastra'
     env:
@@ -76,7 +76,7 @@ jobs:
   check-bundle:
     name: Validate build outputs
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     if: needs.changes.outputs.has_code == 'true' && github.repository == 'mastra-ai/mastra'
     env:
@@ -111,7 +111,7 @@ jobs:
   validator:
     name: Validate examples packages.json
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     if: needs.changes.outputs.has_examples == 'true' && github.repository == 'mastra-ai/mastra'
     permissions:
@@ -137,7 +137,7 @@ jobs:
   agents-md-check:
     name: Validate AGENTS.md files
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     if: github.repository == 'mastra-ai/mastra'
     permissions:
@@ -158,7 +158,7 @@ jobs:
 
   peerdeps-check:
     name: Validate peer dependencies
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     # Run on main repository or for trusted bot PRs
     if: ${{ github.repository == 'mastra-ai/mastra' }}
@@ -209,7 +209,7 @@ jobs:
   validate-pkg-json:
     name: Validate package.json files
     needs: changes
-    runs-on: starsling-ubuntu-24.04
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     if: needs.changes.outputs.has_code == 'true' && github.repository == 'mastra-ai/mastra'
     permissions:

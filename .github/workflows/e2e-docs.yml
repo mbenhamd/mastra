@@ -18,7 +18,7 @@ jobs:
     name: Docs E2E tests
     # Fork and external PR code must run on an ephemeral GitHub-hosted runner.
     # Preserve Starsling only for trusted same-repository canonical branches.
-    runs-on: ${{ (github.repository == 'mbenhamd/mastra' || github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || 'starsling-ubuntu-24.04' }}
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04' || 'ubuntu-24.04' }}
     timeout-minutes: 20
 
     steps:

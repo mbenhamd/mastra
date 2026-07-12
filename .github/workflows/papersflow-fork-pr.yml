@@ -37,11 +37,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      redis:
-        image: redis:7
-        ports:
-          - 6381:6379
-
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -64,6 +59,19 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Start Redis test service
+        run: |
+          docker run --detach --name mastra-fork-redis --publish 6380:6379 \
+            redis:8-alpine redis-server --requirepass redis_password
+          for attempt in {1..30}; do
+            if docker exec mastra-fork-redis redis-cli -a redis_password ping 2>/dev/null | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-fork-redis
+          exit 1
 
       - name: Validate fork PR
         env:
