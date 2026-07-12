@@ -27,6 +27,7 @@ const PROJECT_GLOBS = [
   'signals/*/vitest.config.ts',
   'workflows/*/vitest.config.ts',
   'mastracode/vitest.config.ts',
+  'scripts/vitest.config.ts',
 ];
 
 /**

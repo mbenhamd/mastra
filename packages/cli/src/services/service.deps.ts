@@ -47,10 +47,15 @@ export class DepsService {
     const pm = this.packageManager;
     const installCommand = getPackageManagerAddCommand(pm);
 
-    const packageList = packages.join(' ');
-    return execa(`${pm} ${installCommand} ${packageList}`, {
+    const optionLikePackage = packages.find(packageSpec => packageSpec.startsWith('-'));
+    if (optionLikePackage) {
+      throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
+    }
+
+    // Keep package specs as discrete arguments so neither a shell nor the
+    // package manager can reinterpret them as command-line options.
+    return execa(pm, [...installCommand.split(' '), ...packages], {
       all: true,
-      shell: true,
       stdio: 'pipe',
     });
   }
