@@ -159,6 +159,20 @@ export abstract class MemoryStorage extends StorageDomain {
     );
   }
 
+  /**
+   * Delete a resource record and its resource-scoped working memory.
+   *
+   * This operation does not delete threads or messages associated with the
+   * resource. Storage adapters can implement those lifecycle operations
+   * separately when their application requires them.
+   */
+  async deleteResource(_args: { resourceId: string }): Promise<void> {
+    throw new Error(
+      `Resource deletion is not implemented by this storage adapter (${this.constructor.name}). ` +
+        `The deleteResource method needs to be implemented in the storage adapter.`,
+    );
+  }
+
   protected parseOrderBy(
     orderBy?: StorageOrderBy,
     defaultDirection: ThreadSortDirection = 'DESC',

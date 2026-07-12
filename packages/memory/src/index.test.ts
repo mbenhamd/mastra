@@ -2391,6 +2391,21 @@ describe('Memory', () => {
       await expect(memory.deleteMessages(['msg-789'])).resolves.not.toThrow();
     });
 
+    it('deletes resource-scoped working memory through the public API', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({ storage });
+      const memoryStore = (await storage.getStore('memory'))!;
+
+      await memoryStore.updateResource({
+        resourceId: 'resource-delete',
+        workingMemory: 'private working memory',
+      });
+
+      await memory.deleteResource('resource-delete');
+      await expect(memory.deleteResource('resource-delete')).resolves.toBeUndefined();
+      await expect(memoryStore.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
+    });
+
     it('passes observation options to the ObservationalMemory engine', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({

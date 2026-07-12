@@ -359,6 +359,7 @@ The system automatically detects configuration changes and only rebuilds indexes
 - `getResourceById({ resourceId })`: Get a resource by ID
 - `saveResource({ resource })`: Create or save a resource
 - `updateResource({ resourceId, workingMemory })`: Update resource working memory
+- `deleteResource({ resourceId })`: Delete a resource record and its working memory without deleting threads or messages
 
 ### Workflow Operations
 
