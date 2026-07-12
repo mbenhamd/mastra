@@ -1439,6 +1439,49 @@ describe('MCPServer', () => {
       await client.disconnect();
     });
 
+    it('should redact outer-handler errors in unsent-header serverless 500 responses', async () => {
+      const internalMessage = 'database password leaked during server setup';
+      const internalCause = 'provider cause with signing key material';
+      const internalStack = 'stack trace with internal source paths';
+      const internalError = new Error(internalMessage, { cause: new Error(internalCause) });
+      internalError.stack = internalStack;
+      sessionServer = new MCPServer({
+        name: 'ServerlessErrorServer',
+        version: '1.0.0',
+        tools: minimalTestTool,
+      });
+      vi.spyOn(sessionServer as any, 'createServerInstance').mockImplementation(() => {
+        throw internalError;
+      });
+
+      sessionHttpServer = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
+        const url = new URL(req.url || '', `http://localhost:${currentTestPort}`);
+        await sessionServer.startHTTP({
+          url,
+          httpPath: '/http',
+          req,
+          res,
+          options: { serverless: true },
+        });
+      });
+      currentTestPort = await listenOnEphemeralPort(sessionHttpServer);
+
+      const response = await fetch(`http://localhost:${currentTestPort}/http`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(500);
+      expect(response.headers.get('content-type')).toContain('application/json');
+      expect(body).toMatchObject({ jsonrpc: '2.0' });
+      expect(body.error).toEqual({ code: -32603, message: 'Internal server error' });
+      expect(JSON.stringify(body)).not.toContain(internalMessage);
+      expect(JSON.stringify(body)).not.toContain(internalCause);
+      expect(JSON.stringify(body)).not.toContain(internalStack);
+    });
+
     it('should use custom sessionIdGenerator when provided', async () => {
       const customSessionIds: string[] = [];
       let sessionIdCounter = 0;
