@@ -212,7 +212,10 @@ function normalizeGraph(
     const entryField = `${field}[${index}]`;
     const descriptors = getDataDescriptors(entries[index], entryField);
     const type = descriptors.type?.value;
-    append(state, parts, 'entry', String(index), String(type));
+    if (!['step', 'sleep', 'sleepUntil', 'parallel', 'conditional', 'loop', 'foreach'].includes(type as string)) {
+      throw new TypeError(`${entryField}.type is invalid`);
+    }
+    append(state, parts, 'entry', String(index), type as string);
     if (type === 'step') {
       validateKeys(descriptors, ['type', 'step'], ['type', 'step'], entryField);
       normalizeStep(descriptors.step!.value, parts, state, scopeStepIds, depth, `${entryField}.step`);

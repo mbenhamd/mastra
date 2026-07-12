@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { WorkflowTerminalEffectRecord } from '../types';
 import { MAX_TERMINAL_PATH_LENGTH, validateWorkflowTerminalStructuralString } from './graph-fingerprint';
 
@@ -11,7 +12,7 @@ type IntegrityInput =
   | Omit<Extract<WorkflowTerminalEffectRecord, { kind: 'workflow-finish' }>, 'effectKey' | 'payloadHash' | 'createdAt'>;
 
 function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) {
     throw new TypeError('workflow terminal effect must be a plain data object');
   }
   const prototype = Object.getPrototypeOf(value);
@@ -28,7 +29,9 @@ function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
 }
 
 function canonicalPath(value: unknown): number[] {
-  if (!Array.isArray(value)) throw new TypeError('parentExecutionPath must be a dense data-only path');
+  if (!Array.isArray(value) || isProxy(value)) {
+    throw new TypeError('parentExecutionPath must be a dense data-only path');
+  }
   const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
   const length = descriptors.length?.value;
   if (!Number.isSafeInteger(length) || length < 1 || length > MAX_TERMINAL_PATH_LENGTH) {

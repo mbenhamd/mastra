@@ -5,11 +5,12 @@ terminal evidence and the later durable application/recovery work. It exists so
 storage adapters and runtime recovery do not independently invent how a nested
 workflow result changes its parent.
 
-PF-1781 deliberately adds no public API, storage capability, runtime call site,
+PF-1781 deliberately added no public API, storage capability, runtime call site,
 event publication, or compatibility path. It accepts continuous parent
-execution only; PF-1800 owns durable per-step pause/resume semantics. PF-1771 will consume the structural
-contract inside atomic storage operations; PF-1779 will choose one contract from
-locked parent state; PF-1780 will execute only the committed action.
+execution only; PF-1800 owns durable per-step pause/resume semantics. PF-1771
+consumes the structural contract inside atomic storage operations; PF-1779's
+pure planner chooses one contract from locked parent state; PF-1780 will execute
+only the committed action.
 
 ## Invariants
 
@@ -66,6 +67,46 @@ locked parent state; PF-1780 will execute only the committed action.
 | PF-1779 planner  | selecting the one immediate action from locked state and pre-evaluated decisions | persistence or publication                                |
 | PF-1780 runtime  | bounded replan, committed-action execution, recovery and acknowledgement         | adapter-specific semantic rewrites                        |
 
+## Pure planner
+
+`planWorkflowTerminalParentContinuation()` accepts only a versioned parent
+effect, opaque parent revision, payload-free structural planning view of the
+locked parent snapshot, and an optional bound loop decision. It derives the
+parent/source identity, graph fingerprint, action, and patch; creates the
+canonical contract; and validates the final binding before returning.
+
+It does not accept retained child output, state, request context, workflow
+definitions, callbacks, tools, storage, PubSub, clocks, randomness,
+caller-selected source coordinates, or caller-selected actions/patches. The planning
+view preserves only topology and control facts required by PF-1781: parent
+status, graph, source ownership, active paths, sibling states, loop iteration
+count, and foreach ownership/terminal sidecars.
+
+Structural readers reject proxies before invoking reflection, never coerce
+unvalidated values, and cap planner-only collection/map materialization. Fields
+outside the selected control projection are ignored without reading their
+descriptors, so user payloads and unrelated accessors cannot affect planning.
+
+Loop callbacks remain outside the planner. The runtime first derives a
+`WorkflowTerminalLoopDecisionRequestV1` from the locked context, evaluates the
+callback, and returns only a boolean attached to that request's deterministic
+decision key. The key binds the effect key/payload hash, parent revision/status,
+graph fingerprint, exact source, loop type, and previous iteration count. A CAS
+retry must discard the old decision and derive a new request; exact committed
+replay never evaluates the callback again.
+
+PF-1783 owns whether side-effecting loop conditions remain supported or are
+prohibited, including mutation parity and crash/CAS re-evaluation policy.
+
+The planner is synchronous and side-effect free. Invalid or unfingerprintable
+graphs throw. A fingerprintable effect/graph coordinate mismatch produces a
+deterministic `graph-conflict` quarantine. Contradictory ownership or sibling
+state produces a structural-only `plan-conflict` quarantine whose digest never
+contains output, errors, request context, or complete snapshots.
+
+PF-1779 does not change the live evented processor. PF-1780 owns characterization
+parity, bounded CAS/replan, capability gating, and cutover.
+
 ## Known source gaps exposed by the contract
 
 The current evented processor is the behavioral reference, not an authority for
@@ -117,8 +158,8 @@ pnpm --filter @mastra/core check
 ```
 
 The tests cover graph sensitivity and JSON stability, hostile structural input,
-hash integrity, effect/revision/status/coordinate binding, action/patch matrices,
-scalar and foreach application, loop metadata, final state and request context,
-input immutability, and missing-evidence failure. PF-1771 must add the same cases
-against both InMemory and PostgreSQL atomic implementations before advertising a
-storage capability.
+negative-zero normalization, hash integrity, effect/revision/status/coordinate
+binding, every planner action/patch family, scalar and foreach ownership, bound
+loop decisions, structural conflict digests, exact successor targeting, input
+immutability, and missing-evidence failure. PF-1771 separately exercises the
+InMemory and PostgreSQL atomic/CAS boundaries.
