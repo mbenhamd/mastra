@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
 import { Writable } from 'node:stream';
 import type { IMastraLogger } from '@mastra/core/logger';
+import { execa } from 'execa';
 
 export const createPinoStream = (logger: IMastraLogger) => {
   return new Writable({
@@ -23,42 +23,27 @@ export function createChildProcessLogger({ logger, root }: { logger: IMastraLogg
   const pinoStream = createPinoStream(logger);
   return async ({ cmd, args, env }: { cmd: string; args: string[]; env: Record<string, string> }) => {
     try {
-      const subprocess = spawn(cmd, args, {
-        cwd: root,
-        shell: true,
+      const subprocess = execa(cmd, args, {
+        ...(root ? { cwd: root } : {}),
         env,
-        // No stdin for the child process — it doesn't need interactive input
-        stdio: ['ignore', 'pipe', 'pipe'],
+        buffer: false,
+        extendEnv: false,
+        shell: false,
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
       });
 
-      // Pipe stdout and stderr through the logging stream.
-      // { end: false } prevents the first stream to close from ending pinoStream
-      // while the other may still be writing.
       subprocess.stdout?.pipe(pinoStream, { end: false });
       subprocess.stderr?.pipe(pinoStream, { end: false });
 
-      // Wait for the process to complete
-      return new Promise((resolve, reject) => {
-        subprocess.on('close', code => {
-          pinoStream.end();
-          if (code === 0) {
-            resolve({ success: true });
-          } else {
-            reject(new Error(`Process exited with code ${code}`));
-          }
-        });
-
-        subprocess.on('error', error => {
-          pinoStream.end();
-          logger.error('Process failed', { error });
-          reject(error);
-        });
-      });
+      await subprocess;
+      pinoStream.end();
+      return { success: true };
     } catch (error) {
-      console.error(error);
       logger.error('Process failed', { error });
       pinoStream.end();
-      return { success: false, error };
+      throw error;
     }
   };
 }

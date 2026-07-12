@@ -1,0 +1,130 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  createChildProcessLogger: vi.fn(),
+  runProcess: vi.fn(),
+}));
+
+vi.mock('../deploy/log.js', () => ({
+  createChildProcessLogger: mocks.createChildProcessLogger,
+}));
+
+import { Deps } from './deps.js';
+
+type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
+
+const fixtures: string[] = [];
+
+async function createDeps(packageManager: PackageManager) {
+  const root = await mkdtemp(join(tmpdir(), 'mastra-deployer-deps-'));
+  fixtures.push(root);
+  const deps = new Deps(root);
+  Object.defineProperty(deps, 'packageManager', { value: packageManager });
+  return { deps, root };
+}
+
+afterEach(async () => {
+  await Promise.all(fixtures.splice(0).map(root => rm(root, { recursive: true, force: true })));
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.runProcess.mockResolvedValue({ success: true });
+  mocks.createChildProcessLogger.mockReturnValue(mocks.runProcess);
+});
+
+describe('Deps process arguments', () => {
+  it.each(['npm', 'pnpm', 'yarn', 'bun'] satisfies PackageManager[])(
+    'passes %s pack values as absolute, discrete arguments',
+    async pm => {
+      const { deps, root } = await createDeps(pm);
+      const destination = '-output path; $(not-a-command)';
+      const resolvedDestination = resolve(root, destination);
+      const sanitizedName = pm === 'yarn' ? 'scope-package' : '';
+      const expectedArgs =
+        pm === 'yarn'
+          ? ['pack', '--out', join(resolvedDestination, 'scope-package-%v.tgz')]
+          : pm === 'bun'
+            ? ['pm', 'pack', '--destination', resolvedDestination]
+            : ['pack', '--pack-destination', resolvedDestination];
+
+      await deps.pack({ dir: root, destination, sanitizedName });
+
+      expect(mocks.runProcess).toHaveBeenCalledWith({
+        cmd: pm,
+        args: expectedArgs,
+        env: { PATH: process.env.PATH! },
+      });
+    },
+  );
+
+  it.each(['', '.', '..', '../outside', String.raw`..\outside`])(
+    'rejects an unsafe sanitized package name: %j',
+    async sanitizedName => {
+      const { deps, root } = await createDeps('yarn');
+
+      await expect(deps.pack({ dir: root, destination: 'output', sanitizedName })).rejects.toThrow(
+        'must be a filename segment',
+      );
+
+      expect(mocks.createChildProcessLogger).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      'npm',
+      ['add', '--audit=false', '--fund=false', '--loglevel=error', '--progress=false', '--update-notifier=false'],
+    ],
+    ['pnpm', ['add', '--loglevel=error']],
+    ['yarn', ['add']],
+    ['bun', ['add']],
+  ] satisfies Array<[PackageManager, string[]]>)(
+    'passes %s package specs as data after add flags',
+    async (pm, args) => {
+      const { deps } = await createDeps(pm);
+      const packageSpec = '@scope/package@1.0.0; echo not-a-command';
+
+      await deps.installPackages([packageSpec]);
+
+      expect(mocks.runProcess).toHaveBeenCalledWith({
+        cmd: pm,
+        args: [...args, packageSpec],
+        env: expect.objectContaining({ PATH: process.env.PATH! }),
+      });
+    },
+  );
+
+  it.each([
+    [
+      'npm',
+      ['install', '--audit=false', '--fund=false', '--loglevel=error', '--progress=false', '--update-notifier=false'],
+    ],
+    ['pnpm', ['install', '--loglevel=error']],
+    ['yarn', ['install']],
+    ['bun', ['install']],
+  ] satisfies Array<[PackageManager, string[]]>)('passes %s install flags as discrete arguments', async (pm, args) => {
+    const { deps, root } = await createDeps(pm);
+
+    await deps.install({ dir: root });
+
+    expect(mocks.runProcess).toHaveBeenCalledWith({
+      cmd: pm,
+      args,
+      env: process.env,
+    });
+  });
+
+  it('rejects package-manager options presented as package specs', async () => {
+    const { deps } = await createDeps('npm');
+
+    await expect(deps.installPackages(['--script-shell=/tmp/attacker'])).rejects.toThrow(
+      'Package specs cannot start with "-"',
+    );
+
+    expect(mocks.createChildProcessLogger).not.toHaveBeenCalled();
+  });
+});

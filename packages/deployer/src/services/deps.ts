@@ -62,28 +62,40 @@ export class Deps extends MastraBase {
   }
 
   public async pack({ dir, destination, sanitizedName }: { dir: string; destination: string; sanitizedName: string }) {
+    // Package-manager option parsers can reinterpret a relative destination
+    // beginning with `-`. Resolve it against the child process cwd so it stays
+    // a value while preserving the previous cwd-relative behavior.
+    const resolvedDestination = path.resolve(dir, destination);
+    let args = ['pack', '--pack-destination', resolvedDestination];
+    if (this.packageManager === 'yarn') {
+      if (
+        !sanitizedName ||
+        sanitizedName === '.' ||
+        sanitizedName === '..' ||
+        path.posix.basename(sanitizedName) !== sanitizedName ||
+        path.win32.basename(sanitizedName) !== sanitizedName
+      ) {
+        throw new Error(`Sanitized package name must be a filename segment: ${JSON.stringify(sanitizedName)}`);
+      }
+
+      // %s includes an '@' at the start of packages names with an '@'
+      // so we need to use our sanitizedName instead.
+      args = ['pack', '--out', path.join(resolvedDestination, `${sanitizedName}-%v.tgz`)];
+    }
+    if (this.packageManager === 'bun') {
+      // bun uses `pm pack` instead of `pack`
+      // bun uses --destination instead of --pack-destination
+      args = ['pm', 'pack', '--destination', resolvedDestination];
+    }
+
     const cpLogger = createChildProcessLogger({
       logger: this.logger,
       root: dir,
     });
 
-    let packCmd = 'pack';
-    let destinationFlag = `--pack-destination ${destination}`;
-    if (this.packageManager === 'yarn') {
-      // %s includes an '@' at the start of packages names with an '@'
-      // so we need to use our sanitizedName instead.
-      destinationFlag = `--out ${destination}/${sanitizedName}-%v.tgz`;
-    }
-    if (this.packageManager === 'bun') {
-      // bun uses `pm pack` instead of `pack`
-      packCmd = 'pm pack';
-      // bun uses --destination instead of --pack-destination
-      destinationFlag = `--destination ${destination}`;
-    }
-
     return cpLogger({
-      cmd: `${this.packageManager} ${packCmd} ${destinationFlag}`,
-      args: [],
+      cmd: this.packageManager,
+      args,
       env: {
         PATH: process.env.PATH!,
       },
@@ -154,20 +166,27 @@ export class Deps extends MastraBase {
    * Depending on whether we want to install or add a package, this function returns the appropriate commands.
    * All package managers support both commands (e.g. npm install has an alias on "add")
    */
-  private getPackageManagerCommand(pm: PackageManager, type: 'install' | 'add'): string {
+  private getPackageManagerArgs(pm: PackageManager, type: 'install' | 'add'): string[] {
     const cmd = type === 'install' ? 'install' : 'add';
 
     switch (pm) {
       case 'npm':
-        return `${cmd} --audit=false --fund=false --loglevel=error --progress=false --update-notifier=false`;
+        return [
+          cmd,
+          '--audit=false',
+          '--fund=false',
+          '--loglevel=error',
+          '--progress=false',
+          '--update-notifier=false',
+        ];
       case 'yarn':
-        return `${cmd}`;
+        return [cmd];
       case 'pnpm':
-        return cmd === 'install' ? `${cmd} --loglevel=error` : `${cmd} --loglevel=error`;
+        return [cmd, '--loglevel=error'];
       case 'bun':
-        return cmd;
+        return [cmd];
       default:
-        return cmd;
+        return [cmd];
     }
   }
 
@@ -176,8 +195,7 @@ export class Deps extends MastraBase {
     architecture,
   }: { dir?: string; architecture?: ArchitectureOptions } = {}) {
     const pm = this.packageManager;
-    const installCommand = this.getPackageManagerCommand(pm, 'install');
-    let args: string[] = [];
+    const args = this.getPackageManagerArgs(pm, 'install');
 
     switch (pm) {
       case 'pnpm':
@@ -194,7 +212,7 @@ export class Deps extends MastraBase {
         break;
       case 'npm':
         if (architecture) {
-          args = this.getNpmArgs(architecture);
+          args.push(...this.getNpmArgs(architecture));
         }
         break;
       default:
@@ -207,7 +225,7 @@ export class Deps extends MastraBase {
     });
 
     return cpLogger({
-      cmd: `${pm} ${installCommand}`,
+      cmd: pm,
       args,
       env: process.env as Record<string, string>,
     });
@@ -215,7 +233,12 @@ export class Deps extends MastraBase {
 
   public async installPackages(packages: string[]) {
     const pm = this.packageManager;
-    const installCommand = this.getPackageManagerCommand(pm, 'add');
+    const installArgs = this.getPackageManagerArgs(pm, 'add');
+
+    const optionLikePackage = packages.find(packageSpec => packageSpec.startsWith('-'));
+    if (optionLikePackage) {
+      throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
+    }
 
     const env: Record<string, string> = {
       PATH: process.env.PATH!,
@@ -231,8 +254,8 @@ export class Deps extends MastraBase {
     });
 
     return cpLogger({
-      cmd: `${pm} ${installCommand}`,
-      args: packages,
+      cmd: pm,
+      args: [...installArgs, ...packages],
       env,
     });
   }

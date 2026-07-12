@@ -4030,6 +4030,9 @@ importers:
       esbuild:
         specifier: ^0.28.0
         version: 0.28.1
+      execa:
+        specifier: ^9.6.1
+        version: 9.6.1
       find-workspaces:
         specifier: ^0.3.1
         version: 0.3.1
