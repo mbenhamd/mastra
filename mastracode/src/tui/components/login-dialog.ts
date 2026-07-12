@@ -2,12 +2,49 @@
  * Login dialog component - handles OAuth login flow UI
  */
 
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { Box, Container, getKeybindings, Spacer, Text } from '@earendil-works/pi-tui';
 import type { Focusable, TUI } from '@earendil-works/pi-tui';
 import { getOAuthProviders } from '../../auth/index.js';
 import { theme } from '../theme.js';
 import { MaskedInput } from './masked-input.js';
+
+/**
+ * Open a URL in the default browser without going through a shell.
+ * Only well-formed http(s) URLs are opened; anything else is ignored
+ * (the URL is still displayed for the user to open manually).
+ */
+function parseBrowserUrl(url: string): URL | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed;
+    }
+  } catch {
+    // Ignore malformed URLs.
+  }
+  return undefined;
+}
+
+function openUrlInBrowser(parsed: URL): void {
+  const url = parsed.href;
+
+  const [cmd, args]: [string, string[]] =
+    process.platform === 'darwin'
+      ? ['open', [url]]
+      : process.platform === 'win32'
+        ? ['rundll32', ['url.dll,FileProtocolHandler', url]]
+        : ['xdg-open', [url]];
+
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    // Opening the browser is best-effort — the URL is shown in the dialog.
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // Ignore synchronous argument/spawn failures too.
+  }
+}
 
 export class LoginDialogComponent extends Box implements Focusable {
   private contentContainer: Container;
@@ -83,20 +120,28 @@ export class LoginDialogComponent extends Box implements Focusable {
   showAuth(url: string, instructions?: string): void {
     this.contentContainer.clear();
 
-    this.contentContainer.addChild(new Text(theme.fg('accent', url)));
+    const parsedUrl = parseBrowserUrl(url);
+    const displayUrl = parsedUrl?.href ?? url.replace(/[\u0000-\u001F\u007F-\u009F]/g, '\uFFFD');
+    this.contentContainer.addChild(new Text(theme.fg('accent', displayUrl)));
 
-    const clickHint = process.platform === 'darwin' ? 'Cmd+click to open' : 'Ctrl+click to open';
-    const hyperlink = `\x1b]8;;${url}\x07${clickHint}\x1b]8;;\x07`;
-    this.contentContainer.addChild(new Text(theme.fg('muted', hyperlink)));
+    if (parsedUrl) {
+      const clickHint = process.platform === 'darwin' ? 'Cmd+click to open' : 'Ctrl+click to open';
+      const hyperlink = `\x1b]8;;${parsedUrl.href}\x07${clickHint}\x1b]8;;\x07`;
+      this.contentContainer.addChild(new Text(theme.fg('muted', hyperlink)));
+    }
 
     if (instructions) {
       this.contentContainer.addChild(new Spacer(1));
       this.contentContainer.addChild(new Text(theme.fg('warning', instructions)));
     }
 
-    // Try to open browser
-    const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-    exec(`${openCmd} "${url}"`);
+    // Try to open browser. The URL comes from the auth provider, so treat it
+    // as untrusted: only open well-formed http(s) URLs, and spawn without a
+    // shell so it can't be used for command injection (CodeQL
+    // js/shell-command-constructed-from-input).
+    if (parsedUrl) {
+      openUrlInBrowser(parsedUrl);
+    }
 
     this.tui.requestRender();
   }
