@@ -31,17 +31,25 @@ export async function processWorkflowParallel(
     step: Extract<StepFlowEntry, { type: 'parallel' }>;
   },
 ) {
-  const pathsToRun: Record<string, boolean> = {};
+  const pathsToRun = new Set<string>();
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
+  const restartContainerPath = restart
+    ? executionPath.length === 1
+      ? executionPath
+      : executionPath.slice(0, -1)
+    : undefined;
   for (let i = 0; i < step.steps.length; i++) {
     const nestedStep = step.steps[i];
     if (nestedStep?.type === 'step') {
       //if restart, only run the step if it's in the active steps path
       if (restart) {
-        pathsToRun[nestedStep.step.id] = !!restart.activeStepsPath[nestedStep.step.id];
+        const descriptor = Object.getOwnPropertyDescriptor(restart.activeStepsPath, nestedStep.step.id);
+        if (descriptor && 'value' in descriptor && descriptor.value) {
+          pathsToRun.add(nestedStep.step.id);
+        }
       } else {
-        pathsToRun[nestedStep.step.id] = true;
+        pathsToRun.add(nestedStep.step.id);
       }
       if (perStep) {
         break;
@@ -50,31 +58,33 @@ export async function processWorkflowParallel(
   }
 
   await Promise.all(
-    step.steps
-      ?.filter(step => pathsToRun[step.step.id])
-      .map(async (_step, idx) => {
-        return pubsub.publish('workflows', {
-          type: 'workflow.step.run',
+    // Keep the original branch index when only a subset is restarted. Filtering
+    // first would renumber B/C to 0/1 and route persisted coordinates to the
+    // wrong graph branch. This translates official fix d5c11e3ba5045969caa7272a7bd1fd141c93ab6c.
+    step.steps?.map(async (nestedStep, idx) => {
+      if (!pathsToRun.has(nestedStep.step.id)) return;
+      return pubsub.publish('workflows', {
+        type: 'workflow.step.run',
+        runId,
+        data: {
+          workflowId,
           runId,
-          data: {
-            workflowId,
-            runId,
-            executionPath: restart ? executionPath.slice(0, -1).concat([idx]) : executionPath.concat([idx]),
-            resumeSteps,
-            stepResults,
-            prevResult,
-            resumeData,
-            timeTravel,
-            restart: restart ? { ...restart, isParallelOrConditionalRestarted: true } : undefined,
-            parentWorkflow,
-            activeStepsPath,
-            requestContext,
-            perStep,
-            state: currentState,
-            outputOptions,
-          },
-        });
-      }),
+          executionPath: restart ? restartContainerPath!.concat([idx]) : executionPath.concat([idx]),
+          resumeSteps,
+          stepResults,
+          prevResult,
+          resumeData,
+          timeTravel,
+          restart: restart ? { ...restart, isParallelOrConditionalRestarted: true } : undefined,
+          parentWorkflow,
+          activeStepsPath,
+          requestContext,
+          perStep,
+          state: currentState,
+          outputOptions,
+        },
+      });
+    }),
   );
 }
 
