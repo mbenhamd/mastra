@@ -500,3 +500,74 @@ describe('InMemoryStore - listMessagesById', () => {
     expect(result.messages.some(msg => msg.resourceId === threads[2]?.resourceId)).toBe(true);
   });
 });
+
+describe('InMemoryStore - resource deletion', () => {
+  it('deletes only the requested resource record and is idempotent', async () => {
+    const store = new InMemoryStore();
+    const memory = (await store.getStore('memory'))!;
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+
+    await memory.saveResource({
+      resource: {
+        id: 'resource-delete',
+        workingMemory: 'private working memory',
+        metadata: { owner: 'delete' },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await memory.saveResource({
+      resource: {
+        id: 'resource-keep',
+        workingMemory: 'keep working memory',
+        metadata: { owner: 'keep' },
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    await memory.saveThread({
+      thread: {
+        id: 'thread-delete-resource',
+        resourceId: 'resource-delete',
+        title: 'Preserved thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const messages = new MessageList()
+      .add(
+        [
+          {
+            id: 'message-delete-resource',
+            threadId: 'thread-delete-resource',
+            resourceId: 'resource-delete',
+            role: 'user',
+            content: 'Preserved message',
+            type: 'text',
+            createdAt,
+          },
+        ],
+        'memory',
+      )
+      .get.all.db();
+    await memory.saveMessages({ messages });
+
+    await memory.deleteResource({ resourceId: 'resource-delete' });
+    await expect(memory.deleteResource({ resourceId: 'resource-delete' })).resolves.toBeUndefined();
+
+    await expect(memory.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
+    await expect(memory.getResourceById({ resourceId: 'resource-keep' })).resolves.toMatchObject({
+      id: 'resource-keep',
+      workingMemory: 'keep working memory',
+    });
+    await expect(memory.getThreadById({ threadId: 'thread-delete-resource' })).resolves.toMatchObject({
+      id: 'thread-delete-resource',
+      resourceId: 'resource-delete',
+    });
+    await expect(memory.listMessagesById({ messageIds: ['message-delete-resource'] })).resolves.toMatchObject({
+      messages: [expect.objectContaining({ id: 'message-delete-resource', resourceId: 'resource-delete' })],
+    });
+  });
+});

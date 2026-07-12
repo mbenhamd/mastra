@@ -640,6 +640,10 @@ export class InMemoryMemory extends MemoryStorage {
     return resource;
   }
 
+  async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
+    this.db.resources.delete(resourceId);
+  }
+
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
     const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
 

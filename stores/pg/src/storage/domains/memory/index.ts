@@ -1630,6 +1630,28 @@ export class MemoryPG extends MemoryStorage {
     return updatedResource;
   }
 
+  async deleteResource({ resourceId }: { resourceId: string }): Promise<void> {
+    try {
+      const tableName = getTableName({ indexName: TABLE_RESOURCES, schemaName: getSchemaName(this.#schema) });
+      await this.#db.client.none(`DELETE FROM ${tableName} WHERE id = $1`, [resourceId]);
+    } catch {
+      const text = 'Failed to delete PostgreSQL memory resource';
+      const error = new MastraError(
+        {
+          id: createStorageErrorId('PG', 'DELETE_RESOURCE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          text,
+          details: { operation: 'delete-resource' },
+        },
+        new Error(text),
+      );
+      this.logger?.error?.(error.toString());
+      this.logger?.trackException(error);
+      throw error;
+    }
+  }
+
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
     const { sourceThreadId, newThreadId: providedThreadId, resourceId, title, metadata, options } = args;
 

@@ -681,6 +681,15 @@ export class Memory extends MastraMemory {
   }
 
   /**
+   * Delete a resource record and its resource-scoped working memory.
+   * Threads and messages associated with the resource are preserved.
+   */
+  async deleteResource(resourceId: string): Promise<void> {
+    const memoryStore = await this.getMemoryStore();
+    await memoryStore.deleteResource({ resourceId });
+  }
+
+  /**
    * Lists all vector indexes that match the memory messages prefix.
    * Handles separator differences across vector store backends (e.g. '_' vs '-').
    */

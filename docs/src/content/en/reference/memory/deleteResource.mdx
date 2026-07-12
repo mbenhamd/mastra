@@ -1,0 +1,52 @@
+---
+title: "Reference: Memory.deleteResource() | Memory"
+description: "API reference for `Memory.deleteResource()`, which deletes resource-scoped working memory."
+packages:
+  - "@mastra/core"
+  - "@mastra/memory"
+---
+
+# Memory.deleteResource()
+
+The `.deleteResource()` method deletes a resource record and its resource-scoped working memory. It doesn't delete threads or messages associated with the resource.
+
+## Usage example
+
+```typescript
+const memory = await agent.getMemory()
+
+await memory?.deleteResource('resource-123')
+```
+
+Calling the method for a resource that doesn't exist resolves successfully.
+
+## Parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'resourceId',
+    type: 'string',
+    description: 'Resource ID to delete',
+    isOptional: false,
+  },
+]}
+/>
+
+## Returns
+
+<PropertiesTable
+  content={[
+  {
+    name: 'void',
+    type: 'Promise<void>',
+    description: 'A promise that resolves when the resource record is deleted or already absent',
+  },
+]}
+/>
+
+## Related
+
+- [Memory class reference](/reference/memory/memory-class)
+- [Working memory](/docs/memory/working-memory)
+- [deleteMessages](/reference/memory/deleteMessages)

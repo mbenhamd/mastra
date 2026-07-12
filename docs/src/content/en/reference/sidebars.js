@@ -333,6 +333,7 @@ const sidebars = {
         { type: 'doc', id: 'memory/cloneThread', label: '.cloneThread()' },
         { type: 'doc', id: 'memory/createThread', label: '.createThread()' },
         { type: 'doc', id: 'memory/deleteMessages', label: '.deleteMessages()' },
+        { type: 'doc', id: 'memory/deleteResource', label: '.deleteResource()' },
         { type: 'doc', id: 'memory/getThreadById', label: '.getThreadById()' },
         { type: 'doc', id: 'memory/listThreads', label: '.listThreads()' },
         { type: 'doc', id: 'memory/recall', label: '.recall()' },
