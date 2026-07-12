@@ -8,6 +8,11 @@ import type {
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../../../workflows';
+import {
+  getWorkflowTerminalEffectIntegrity,
+  validateWorkflowTerminalEffectIntegrity,
+} from '../../../workflows/terminal-continuation';
+export { validateWorkflowTerminalEffectIntegrity } from '../../../workflows/terminal-continuation';
 import type {
   AdvanceWorkflowTerminalizationInput,
   ClaimWorkflowTerminalizationInput,
@@ -359,51 +364,6 @@ function hashFramedParts(domain: string, parts: readonly string[]): string {
   return hash.digest('hex');
 }
 
-function getWorkflowTerminalEffectIntegrity(input: {
-  version: 1;
-  workflowName: string;
-  runId: string;
-  sourceEventKey: string;
-  kind: WorkflowTerminalEffectRecord['kind'];
-  terminalStatus: WorkflowTerminalEffectRecord['terminalStatus'];
-  parentWorkflowName?: string;
-  parentRunId?: string;
-  parentStepId?: string;
-  parentExecutionPath?: readonly number[];
-}): { effectKey: string; payloadHash: string } {
-  const destinationParts =
-    input.kind === 'parent-workflow-step-end'
-      ? [
-          input.parentWorkflowName!,
-          input.parentRunId!,
-          input.parentStepId!,
-          String(input.parentExecutionPath!.length),
-          ...input.parentExecutionPath!.map(String),
-        ]
-      : [input.workflowName, input.runId];
-  const identityParts = [
-    String(input.version),
-    input.workflowName,
-    input.runId,
-    input.sourceEventKey,
-    input.kind,
-    ...destinationParts,
-  ];
-  const payloadParts = [...identityParts, input.terminalStatus];
-  return {
-    effectKey: `wte:v1:${hashFramedParts('mastra.workflow-terminal-effect.identity.v1', identityParts)}`,
-    payloadHash: `sha256:${hashFramedParts('mastra.workflow-terminal-effect.payload.v1', payloadParts)}`,
-  };
-}
-
-/** @internal Fails closed when a persisted intent does not match its canonical framed identity. */
-export function validateWorkflowTerminalEffectIntegrity(effect: WorkflowTerminalEffectRecord): void {
-  const expected = getWorkflowTerminalEffectIntegrity(effect);
-  if (effect.effectKey !== expected.effectKey || effect.payloadHash !== expected.payloadHash) {
-    throw new TypeError('Invalid workflow terminal effect integrity');
-  }
-}
-
 /** @internal Fails closed when a persisted intent is not evidence for its owning journal. */
 export function validateWorkflowTerminalEffectJournalLink(
   effect: WorkflowTerminalEffectRecord,
@@ -483,7 +443,7 @@ function getValidatedWorkflowTerminalParentExecutionPath(value: unknown): number
       `parentExecutionPath must contain 1-${MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH} non-negative safe integers`,
     );
   }
-  return path as number[];
+  return path.map(item => (item === 0 ? 0 : item)) as number[];
 }
 
 export function materializeWorkflowTerminalEffectKind(value: unknown): WorkflowTerminalEffectRecord['kind'] {
