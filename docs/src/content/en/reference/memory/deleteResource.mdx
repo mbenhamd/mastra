@@ -1,6 +1,6 @@
 ---
 title: "Reference: Memory.deleteResource() | Memory"
-description: "API reference for `Memory.deleteResource()`, which deletes resource-scoped working memory."
+description: "API reference for `Memory.deleteResource()`, which deletes a resource record and the working memory stored on it."
 packages:
   - "@mastra/core"
   - "@mastra/memory"
@@ -8,7 +8,7 @@ packages:
 
 # Memory.deleteResource()
 
-The `.deleteResource()` method deletes a resource record and its resource-scoped working memory. It doesn't delete threads or messages associated with the resource.
+The `.deleteResource()` method deletes a resource record and the working memory stored on that record. It doesn't inspect or mutate associated threads, messages, or thread metadata.
 
 ## Usage example
 
@@ -26,7 +26,9 @@ Calling the method for a resource that doesn't exist resolves successfully.
 
 ## Deletion scope
 
-This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record. For account-erasure workflows, stop new writers and drain in-flight work before calling this method, then verify that the record remains absent.
+This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record.
+
+Only the resource record is affected. If an application also stored working-memory content in preserved thread metadata, remove that content through the application's bounded thread lifecycle. For account-erasure workflows, stop new writers, drain in-flight work, compose the required thread and message operations, call this method, and then verify that all targeted records remain absent.
 
 ## Parameters
 

@@ -160,11 +160,11 @@ export abstract class MemoryStorage extends StorageDomain {
   }
 
   /**
-   * Delete a resource record and its resource-scoped working memory.
+   * Delete a resource record, including working memory stored on that record.
    *
-   * This operation does not delete threads or messages associated with the
-   * resource. Storage adapters can implement those lifecycle operations
-   * separately when their application requires them.
+   * This operation does not inspect or mutate associated thread or message
+   * records, including thread metadata. Storage adapters can implement those
+   * lifecycle operations separately when their application requires them.
    */
   async deleteResource(_args: { resourceId: string }): Promise<void> {
     throw new Error(

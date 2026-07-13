@@ -43,7 +43,7 @@ export function createResourceDeletionTest({ storage }: { storage: MastraStorage
             id: threadId,
             resourceId,
             title: 'Preserved thread',
-            metadata: { marker },
+            metadata: { marker, workingMemory: 'preserved thread metadata' },
             createdAt,
             updatedAt: createdAt,
           },
@@ -69,7 +69,11 @@ export function createResourceDeletionTest({ storage }: { storage: MastraStorage
           id: survivorId,
           workingMemory: 'surviving working memory',
         });
-        await expect(memory.getThreadById({ threadId })).resolves.toMatchObject({ id: threadId, resourceId });
+        await expect(memory.getThreadById({ threadId })).resolves.toMatchObject({
+          id: threadId,
+          resourceId,
+          metadata: { marker, workingMemory: 'preserved thread metadata' },
+        });
         await expect(memory.listMessagesById({ messageIds: [messageId] })).resolves.toMatchObject({
           messages: [expect.objectContaining({ id: messageId, resourceId })],
         });
