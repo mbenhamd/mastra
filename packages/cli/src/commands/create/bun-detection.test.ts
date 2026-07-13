@@ -141,7 +141,11 @@ describe('Bun Runtime Detection', () => {
     });
 
     // Check if bun init was called
-    expect(mocks.mockExeca).toHaveBeenCalledWith('bun', ['init', '-y']);
+    expect(mocks.mockExeca).toHaveBeenCalledWith('bun', ['init', '-y'], {
+      timeout: undefined,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: 1_000,
+    });
 
     // Check if bun add was used for dependencies
     expect(mocks.mockInstallPackages).toHaveBeenCalledWith(['zod@^4'], { timeout: undefined });
@@ -155,13 +159,18 @@ describe('Bun Runtime Detection', () => {
     await createMastraProject({
       projectName: 'test-npm-project',
       needsInteractive: false,
+      timeout: 12_345,
     });
 
     // Check if npm init was called
-    expect(mocks.mockExeca).toHaveBeenCalledWith('npm', ['init', '-y']);
+    expect(mocks.mockExeca).toHaveBeenCalledWith('npm', ['init', '-y'], {
+      timeout: 12_345,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: 1_000,
+    });
 
     // Check if npm install was used for dependencies
-    expect(mocks.mockInstallPackages).toHaveBeenCalledWith(['zod@^4'], { timeout: undefined });
+    expect(mocks.mockInstallPackages).toHaveBeenCalledWith(['zod@^4'], { timeout: 12_345 });
   });
 
   it('should clean up directory on failure', async () => {

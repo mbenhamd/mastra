@@ -30,15 +30,24 @@ setInterval(() => {}, 1_000);
       await chmod(executable, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${fixture}${path.delimiter}${previousPath ?? ''}`;
+      let childPid: number | undefined;
 
       try {
         await expect(new DepsService('npm').installPackages([pidFile], { timeout: 500 })).rejects.toMatchObject({
           timedOut: true,
         });
-        const childPid = Number(await readFile(pidFile, 'utf8'));
+        childPid = Number(await readFile(pidFile, 'utf8'));
         expect(() => process.kill(childPid, 0)).toThrow();
       } finally {
         process.env.PATH = previousPath;
+        const pid = childPid ?? Number(await readFile(pidFile, 'utf8').catch(() => ''));
+        if (Number.isSafeInteger(pid) && pid > 0) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // The child already exited.
+          }
+        }
       }
     },
   );

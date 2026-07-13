@@ -27,7 +27,10 @@ describe('jscodeshift process integration', () => {
       verbose: true,
       jscodeshift: ['--run-in-band'],
     });
-    const { stdout } = await run(process.execPath, [getJscodeshiftBin(), ...args], { encoding: 'utf8' });
+    const { stdout } = await run(process.execPath, [getJscodeshiftBin(), ...args], {
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
 
     expect(stdout).toContain('All done.');
     expect(stdout).toContain('1 unmodified');

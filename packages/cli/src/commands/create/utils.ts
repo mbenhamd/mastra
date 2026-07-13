@@ -26,8 +26,12 @@ function getInitArgs(pm: PackageManager): string[] {
   }
 }
 
-async function initializePackageJson(pm: PackageManager): Promise<void> {
-  await execa(pm, getInitArgs(pm));
+async function initializePackageJson(pm: PackageManager, timeout?: number): Promise<void> {
+  await execa(pm, getInitArgs(pm), {
+    timeout,
+    killSignal: 'SIGTERM',
+    forceKillAfterDelay: 1_000,
+  });
 
   // Read and update package.json directly (more reliable than pkg set)
   const packageJsonPath = path.join(process.cwd(), 'package.json');
@@ -213,7 +217,7 @@ export const createMastraProject = async ({
 
     s.message('Initializing project structure');
     try {
-      await initializePackageJson(pm);
+      await initializePackageJson(pm, timeout);
       await depsService.addScriptsToPackageJson({
         dev: 'mastra dev',
         build: 'mastra build',

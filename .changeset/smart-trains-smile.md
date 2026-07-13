@@ -2,4 +2,4 @@
 'mastra': patch
 ---
 
-Hardened CLI dependency installation by passing package specs as process arguments instead of shell command strings. Installs now share native timeout and cancellation handling, and package specs cannot be reinterpreted as package-manager options.
+Create projects more safely when dependency specs contain spaces or special characters. `mastra create --timeout=60000` now applies the timeout to package-manager initialization and dependency installs; when the timeout is reached, the CLI terminates the package-manager process and reports project creation failure. Package specs can no longer be interpreted as package-manager options.
