@@ -6,7 +6,7 @@ import { SpanType, EntityType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
-import { filterToolCallMessages } from '../tool-call-filter-utils';
+import { filterToolCallMessages, normalizeToolCallFilterExclude } from '../tool-call-filter-utils';
 import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
 
 const DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES = 16 * 1024;
@@ -191,10 +191,18 @@ export class MessageHistory implements Processor {
    * - For client-side tools (no execute function), 'call' is the final state from the server's perspective
    */
   private filterMessagesForPersistence(messages: MastraDBMessage[]): MastraDBMessage[] {
+    const normalizedToolCallFilterExclude =
+      this.toolCallFilter === undefined
+        ? undefined
+        : normalizeToolCallFilterExclude((this.toolCallFilter as { exclude?: unknown }).exclude);
+    const policyFiltersTool = (toolName: string): boolean =>
+      normalizedToolCallFilterExclude === 'all' || normalizedToolCallFilterExclude?.includes(toolName) === true;
+
     const filteredMessages = messages
       .filter(m => m.role !== 'system')
       .map(m => {
         const newMessage = { ...m };
+        let removedToolInvocationCoveredByPolicy = false;
         // Only spread content if it's a proper V2 object
         if (m.content && typeof m.content === 'object' && !Array.isArray(m.content)) {
           newMessage.content = { ...m.content };
@@ -210,13 +218,13 @@ export class MessageHistory implements Processor {
         if (Array.isArray(newMessage.content?.parts)) {
           newMessage.content.parts = newMessage.content.parts
             .map(p => {
-              // Filter out streaming tool calls (partial-call is an intermediate state during streaming)
-              if (p.type === `tool-invocation` && p.toolInvocation.state === `partial-call`) {
-                return null;
-              }
-              // Filter out updateWorkingMemory tool invocations (hide args from message history)
-              if (p.type === `tool-invocation` && p.toolInvocation.toolName === `updateWorkingMemory`) {
-                return null;
+              if (p.type === `tool-invocation`) {
+                const shouldRemove =
+                  p.toolInvocation.state === `partial-call` || p.toolInvocation.toolName === `updateWorkingMemory`;
+                if (shouldRemove) {
+                  removedToolInvocationCoveredByPolicy ||= policyFiltersTool(p.toolInvocation.toolName);
+                  return null;
+                }
               }
               // Strip working memory tags from text parts
               if (p.type === `text`) {
@@ -230,6 +238,10 @@ export class MessageHistory implements Processor {
               return p;
             })
             .filter((p): p is NonNullable<typeof p> => Boolean(p));
+
+          if (removedToolInvocationCoveredByPolicy) {
+            delete newMessage.content.providerMetadata;
+          }
 
           // If all parts were filtered out, skip the whole message
           if (newMessage.content.parts.length === 0) {

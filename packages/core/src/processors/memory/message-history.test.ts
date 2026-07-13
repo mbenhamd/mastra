@@ -990,6 +990,32 @@ describe('MessageHistory', () => {
       createdAt: new Date('2024-01-01T00:00:01Z'),
     });
 
+    const createPrefilteredToolMessage = (toolName: string, state: 'call' | 'partial-call'): MastraDBMessage =>
+      ({
+        role: 'assistant',
+        content: {
+          format: 2,
+          content: 'Keep this answer',
+          providerMetadata: {
+            mastra: { rawToolPayload: 'PREFILTERED_PROVIDER_SECRET' },
+          },
+          parts: [
+            { type: 'text', text: 'Keep this answer' },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state,
+                toolCallId: `call-${toolName}`,
+                toolName,
+                args: { secret: 'PREFILTERED_ARGS_SECRET' },
+              },
+            },
+          ],
+        },
+        id: `msg-${toolName}`,
+        createdAt: new Date('2024-01-01T00:00:01Z'),
+      }) as MastraDBMessage;
+
     it('filters direct persistMessages writes without mutating the source message', async () => {
       const storage = createPersistenceStorage();
       const processor = new MessageHistory({
@@ -1046,6 +1072,36 @@ describe('MessageHistory', () => {
       expect(serialized).toContain('search result:\\nCompact result');
       expect(serialized).not.toContain('RAW_RESULT_SENTINEL');
       expect(messageList.get.response.db()).toEqual([message]);
+    });
+
+    it.each([
+      ['streaming tool call', 'search', 'partial-call'],
+      ['working-memory tool call', 'updateWorkingMemory', 'call'],
+    ] as const)('strips provider metadata when the policy covers a prefiltered %s', async (_label, toolName, state) => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: {} });
+      const message = createPrefilteredToolMessage(toolName, state);
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('Keep this answer');
+      expect(serialized).not.toContain('PREFILTERED_PROVIDER_SECRET');
+      expect(serialized).not.toContain('PREFILTERED_ARGS_SECRET');
+    });
+
+    it('preserves existing metadata behavior when exclude is an empty no-op policy', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: { exclude: [] } });
+      const message = createPrefilteredToolMessage('search', 'partial-call');
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('PREFILTERED_PROVIDER_SECRET');
+      expect(serialized).not.toContain('PREFILTERED_ARGS_SECRET');
     });
 
     it('applies a finite model-output bound when persistence filtering omits one', async () => {
