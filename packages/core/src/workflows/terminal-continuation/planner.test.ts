@@ -92,7 +92,7 @@ describe('workflow terminal parent continuation planner', () => {
       {
         type: 'conditional',
         steps: [{ type: 'step', step: { id: 'conditional-child' } }],
-        serializedConditions: [{ id: 'conditional-child', fn: '() => true' }],
+        serializedConditions: [{ id: 'conditional-child-condition', fn: '() => true' }],
       } as SerializedStepFlowEntry,
       { kind: 'container', containerType: 'conditional', executionPath: [1] },
     ],
@@ -102,7 +102,7 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'loop-child' },
         loopType: 'dowhile',
-        serializedCondition: { id: 'loop-child', fn: '() => false' },
+        serializedCondition: { id: 'loop-child-condition', fn: '() => false' },
       } as SerializedStepFlowEntry,
       { kind: 'container', containerType: 'loop', executionPath: [1] },
     ],
@@ -179,8 +179,8 @@ describe('workflow terminal parent continuation planner', () => {
                 { type: 'step', step: { id: 'right' } },
               ],
               serializedConditions: [
-                { id: 'left', fn: '() => true' },
-                { id: 'right', fn: '() => false' },
+                { id: 'left-condition', fn: '() => true' },
+                { id: 'right-condition', fn: '() => false' },
               ],
             },
           ] as SerializedStepFlowEntry[]);
@@ -234,7 +234,7 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'nested', component: 'WORKFLOW' },
         loopType,
-        serializedCondition: { id: 'nested', fn: '() => true' },
+        serializedCondition: { id: 'nested-condition', fn: '() => true' },
       },
     ];
     const parent = snapshot(graph);
@@ -259,7 +259,7 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'nested', component: 'WORKFLOW' },
         loopType: 'dowhile',
-        serializedCondition: { id: 'nested', fn: '() => true' },
+        serializedCondition: { id: 'nested-condition', fn: '() => true' },
       },
     ];
     const parent = snapshot(graph);
@@ -296,7 +296,7 @@ describe('workflow terminal parent continuation planner', () => {
           type: 'loop',
           step: { id: 'nested', component: 'WORKFLOW' },
           loopType: 'dowhile',
-          serializedCondition: { id: 'nested', fn: '() => true' },
+          serializedCondition: { id: 'nested-condition', fn: '() => true' },
         },
       ];
       const validParent = snapshot(graph);
@@ -331,7 +331,7 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'nested', component: 'WORKFLOW' },
         loopType: 'dowhile',
-        serializedCondition: { id: 'nested', fn: '() => true' },
+        serializedCondition: { id: 'nested-condition', fn: '() => true' },
       },
     ];
     const parent = snapshot(graph);
@@ -551,7 +551,7 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'nested', component: 'WORKFLOW' },
         loopType: 'dowhile',
-        serializedCondition: { id: 'nested', fn: '() => true' },
+        serializedCondition: { id: 'nested-condition', fn: '() => true' },
       },
     ];
     const runningInput = input(snapshot(graph));
@@ -611,7 +611,7 @@ describe('workflow terminal parent continuation planner', () => {
           type: 'loop',
           step: { id: 'nested', component: 'WORKFLOW' },
           loopType: 'dowhile',
-          serializedCondition: { id: 'nested', fn: '() => true' },
+          serializedCondition: { id: 'nested-condition', fn: '() => true' },
         },
       ]);
       terminalEffect = effect([0], 'nested', terminalStatus);
@@ -644,7 +644,7 @@ describe('workflow terminal parent continuation planner', () => {
           type: 'step' as const,
           step: { id, ...(id === 'left' ? { component: 'WORKFLOW' as const } : {}) },
         })),
-        serializedConditions: ['left', 'middle', 'right'].map(id => ({ id, fn: '() => true' })),
+        serializedConditions: ['left', 'middle', 'right'].map(id => ({ id: `${id}-condition`, fn: '() => true' })),
       },
     ];
     const parent = snapshot(graph, 'left', [0, 0]);
@@ -655,9 +655,9 @@ describe('workflow terminal parent continuation planner', () => {
     });
 
     delete parent.context.middle;
-    expect(planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')))).toMatchObject({
-      action: { kind: 'wait', reason: 'conditional-aggregation' },
-    });
+    expect(() => planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')))).toThrow(
+      /sibling middle must be a data object/,
+    );
 
     parent.context.middle = { status: 'unknown' } as any;
     expect(planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')))).toMatchObject({
@@ -795,7 +795,12 @@ describe('workflow terminal parent continuation planner', () => {
       loopType: 'dowhile' | 'dountil' = 'dowhile',
       fn = '() => true',
     ): SerializedStepFlowEntry[] => [
-      { type: 'loop', step: { id, component: 'WORKFLOW' }, loopType, serializedCondition: { id, fn } },
+      {
+        type: 'loop',
+        step: { id, component: 'WORKFLOW' },
+        loopType,
+        serializedCondition: { id: `${id}-condition`, fn },
+      },
     ];
     const requestKey = (
       parent: WorkflowRunState,
@@ -826,13 +831,13 @@ describe('workflow terminal parent continuation planner', () => {
         type: 'loop',
         step: { id: 'nested', component: 'WORKFLOW' },
         loopType: 'dowhile',
-        serializedCondition: { id: 'nested', fn: '() => true' },
+        serializedCondition: { id: 'nested-condition', fn: '() => true' },
       },
     ];
     const parent = snapshot(graph);
     (parent.context.nested as any).metadata.iterationCount = 3;
     expect(createWorkflowTerminalLoopDecisionRequest(input(parent)).decisionKey).toBe(
-      'sha256:986a627a89d71212470156b75800eda23955f46fc5589af5235cd84a43c49a94',
+      'sha256:c564d80db1626e30649a21b1156e92d69db9716d4baf0d4a194ea2715972708f',
     );
 
     const wrongOwner = structuredClone(parent);
@@ -841,7 +846,7 @@ describe('workflow terminal parent continuation planner', () => {
       action: {
         kind: 'quarantine',
         reason: 'plan-conflict',
-        conflictDigest: 'sha256:f6611b3cb73affb223e7dbf26a98b74e28ed42dfc0cef155c3b53099972e1e87',
+        conflictDigest: 'sha256:39cfb9639cb7062c9e509786d432f8a2e7875b6a42ee46a9b9e02e39a09b9136',
       },
     });
   });
@@ -892,7 +897,7 @@ describe('workflow terminal parent continuation planner', () => {
         },
       }),
     ];
-    expect(() => planWorkflowTerminalParentContinuation(input(parent))).toThrow(/data object/);
+    expect(() => planWorkflowTerminalParentContinuation(input(parent))).toThrow(/must not be a proxy/);
     expect(graphTrap).not.toHaveBeenCalled();
 
     const coercion = vi.fn(() => 'running');
