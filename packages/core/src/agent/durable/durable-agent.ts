@@ -3,6 +3,7 @@ import { InMemoryServerCache } from '../../cache/inmemory';
 import { CachingPubSub } from '../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { PubSub } from '../../events/pubsub';
+import { validateMaxSteps } from '../../llm/model/max-steps';
 import type { Mastra } from '../../mastra';
 import type { MastraModelOutput } from '../../stream/base/output';
 import type { ChunkType } from '../../stream/types';
@@ -244,7 +245,10 @@ export class DurableAgent<
       // Delegate to wrapped agent's instructions
       instructions: ({ requestContext }) => agent.getInstructions({ requestContext }),
       // We need to provide model to satisfy the base class, but we'll delegate to wrapped agent
-      model: (agent as any).__model ?? agent.getModel(),
+      model: (() => {
+        validateMaxSteps(maxSteps);
+        return (agent as any).__model ?? agent.getModel();
+      })(),
     });
 
     this.#wrappedAgent = agent;
@@ -416,9 +420,12 @@ export class DurableAgent<
    * @internal
    */
   protected createWorkflow(): ReturnType<typeof createDurableAgenticWorkflow> {
-    return createDurableAgenticWorkflow({
-      maxSteps: this.#maxSteps,
-    });
+    return createDurableAgenticWorkflow(
+      {
+        maxSteps: this.#maxSteps,
+      },
+      this.logger,
+    );
   }
 
   /**
@@ -451,6 +458,7 @@ export class DurableAgent<
       options: options as AgentExecutionOptions<TOutput>,
       runId: options?.runId,
       requestContext: options?.requestContext,
+      logger: this.logger,
       mastra: this.#mastra,
     });
 
@@ -811,6 +819,7 @@ export class DurableAgent<
       messages,
       options,
       requestContext: options?.requestContext,
+      logger: this.logger,
       mastra: this.#mastra,
     });
 

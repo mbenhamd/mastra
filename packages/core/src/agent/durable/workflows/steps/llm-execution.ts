@@ -1,7 +1,6 @@
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import type { ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod';
-import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import type { PubSub } from '../../../../events/pubsub';
 import { mergeProviderOptions } from '../../../../llm/model/provider-options';
 import type { SharedProviderOptions } from '../../../../llm/model/shared.types';
@@ -14,6 +13,7 @@ import { MastraModelOutput } from '../../../../stream/base/output';
 import type { TextDeltaPayload, ToolCallPayload } from '../../../../stream/types';
 import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { MessageList } from '../../../message-list';
 import type { MastraDBMessage } from '../../../message-list';
 import { isSupportedLanguageModel } from '../../../utils';
@@ -638,6 +638,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   stepNumber: (inputData as any).stepIndex ?? 0,
                   steps: [],
                   requestContext,
+                  tracingContext,
                 });
                 if (retry) {
                   logger?.debug?.(`processAPIError requested retry for model ${modelId}`, { runId });

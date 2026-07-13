@@ -1983,6 +1983,27 @@ export class Workflow<
             requestContextPath: m.requestContextPath,
             schema: m.schema,
           };
+        } else if (m.step !== undefined) {
+          // Workflows also implement Step. Keep only step ids in the serialized
+          // map description so a workflow used as a source cannot deep-walk its
+          // live graph during JSON.stringify(). Runtime execution still reads
+          // the original mappingConfig closure below.
+          a[key] = {
+            step: Array.isArray(m.step) ? m.step.map((step: Step<string, any, any, any>) => step.id) : m.step.id,
+            path: m.path,
+          };
+        } else if (m.initData !== undefined) {
+          // `mapVariable({ initData: <workflow> })` keeps a live Workflow instance
+          // by reference. Serializing it here would deep-walk the whole workflow
+          // (logger, nested step graph, …) into `mapConfig` — a multi-hundred-MB
+          // string that OOMs at .commit() before the length guard below can trim
+          // it (#19018). The execute path only reads `m.initData` for truthiness
+          // (it calls getInitData()), so a slim id reference is behaviourally
+          // identical at runtime.
+          a[key] = {
+            initData: m.initData?.id ?? true,
+            path: m.path,
+          };
         } else {
           a[key] = m;
         }

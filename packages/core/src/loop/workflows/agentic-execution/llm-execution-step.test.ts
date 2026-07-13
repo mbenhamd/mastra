@@ -1537,6 +1537,95 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     expect(firstModelStream).toHaveBeenCalledTimes(1);
   });
 
+  it('emits a processor_run span when an error processor handles an API error', async () => {
+    const processorSpan = {
+      id: 'processor-span',
+      type: SpanType.PROCESSOR_RUN,
+      end: vi.fn(),
+      error: vi.fn(),
+      update: vi.fn(),
+    };
+    const agentRunSpan = {
+      id: 'agent-span',
+      type: SpanType.AGENT_RUN,
+      createChildSpan: vi.fn(() => processorSpan),
+      findParent: vi.fn(),
+    };
+
+    const failingStream = vi.fn(async () => {
+      throw new APICallError({
+        message: 'model rejected the request',
+        url: 'https://primary.example.com/v1/messages',
+        requestBodyValues: {},
+        statusCode: 400,
+        isRetryable: false,
+      });
+    });
+    const processAPIError = vi.fn(async () => ({ retry: false }));
+
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      maxProcessorRetries: 1,
+      errorProcessors: [
+        {
+          id: 'observe-api-error',
+          processAPIError,
+        },
+      ],
+      models: [
+        {
+          id: 'primary-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'primary-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: failingStream,
+          } as any,
+        },
+      ],
+      tools: {},
+      streamState: {
+        serialize: vi.fn(),
+        deserialize: vi.fn(),
+      },
+      _internal: {
+        generateId: () => 'generated-id',
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        debug: vi.fn(),
+      } as any,
+    } as unknown as OuterLLMRun<{}>);
+
+    const executeParams = createExecuteParams(createIterationInput());
+    executeParams.tracingContext = { currentSpan: agentRunSpan } as any;
+
+    await llmExecutionStep.execute(executeParams);
+
+    expect(agentRunSpan.createChildSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SpanType.PROCESSOR_RUN,
+        name: 'request error processor: observe-api-error',
+      }),
+    );
+    expect(processAPIError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tracingContext: expect.objectContaining({ currentSpan: processorSpan }),
+      }),
+    );
+  });
+
   it('re-stamps MODEL_GENERATION span attributes when a fallback model takes over', async () => {
     const primaryStream = vi.fn(async () => {
       throw new APICallError({

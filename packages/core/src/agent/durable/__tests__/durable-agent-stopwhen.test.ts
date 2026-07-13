@@ -9,10 +9,13 @@ import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
+import { ErrorCategory, ErrorDomain } from '../../../error';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
+import { createDurableAgenticWorkflow } from '../workflows';
 
 // ============================================================================
 // Helper Functions
@@ -234,6 +237,135 @@ describe('DurableAgent stopWhen callback', () => {
       expect(result.runId).toBeDefined();
       expect(result.workflowInput.options.maxSteps).toBe(5);
     });
+
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects invalid per-run maxSteps %s before calling the provider',
+      async maxSteps => {
+        const doStream = vi.fn();
+        const baseAgent = new Agent({
+          id: 'durable-max-steps-validation',
+          name: 'Durable maxSteps validation',
+          instructions: 'Respond to questions.',
+          model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        });
+        const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+        await expect(durableAgent.stream('Hello', { maxSteps })).rejects.toMatchObject({
+          id: 'LLM_INVALID_MAX_STEPS',
+          message: 'maxSteps must be a positive safe integer',
+          domain: ErrorDomain.LLM,
+          category: ErrorCategory.USER,
+          details: { maxSteps },
+        });
+        expect(doStream).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects invalid configured maxSteps %s before creating a runnable durable agent',
+      maxSteps => {
+        const doStream = vi.fn();
+        const baseAgent = new Agent({
+          id: 'durable-config-max-steps-validation',
+          name: 'Durable configured maxSteps validation',
+          instructions: 'Respond to questions.',
+          model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        });
+        let thrownError: unknown;
+
+        try {
+          createDurableAgent({ agent: baseAgent, pubsub, maxSteps });
+        } catch (error) {
+          thrownError = error;
+        }
+
+        expect(thrownError).toMatchObject({
+          id: 'LLM_INVALID_MAX_STEPS',
+          message: 'maxSteps must be a positive safe integer',
+          domain: ErrorDomain.LLM,
+          category: ErrorCategory.USER,
+          details: { maxSteps },
+        });
+        expect(doStream).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects invalid workflow maxSteps %s and tracks the typed error',
+      maxSteps => {
+        const trackException = vi.fn();
+        let thrownError: unknown;
+
+        try {
+          createDurableAgenticWorkflow({ maxSteps }, { trackException } as any);
+        } catch (error) {
+          thrownError = error;
+        }
+
+        expect(thrownError).toMatchObject({
+          id: 'LLM_INVALID_MAX_STEPS',
+          message: 'maxSteps must be a positive safe integer',
+          domain: ErrorDomain.LLM,
+          category: ErrorCategory.USER,
+          details: { maxSteps },
+        });
+        expect(trackException).toHaveBeenCalledTimes(1);
+        expect(trackException).toHaveBeenCalledWith(thrownError);
+      },
+    );
+
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects invalid direct-workflow maxSteps %s before the first LLM iteration',
+      async maxSteps => {
+        const trackException = vi.fn();
+        const doStream = vi.fn();
+        const runId = `direct-workflow-max-steps-${String(maxSteps)}`;
+        globalRunRegistry.set(runId, {
+          tools: {},
+          model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        });
+        const workflow = createDurableAgenticWorkflow(undefined, { trackException } as any);
+        const run = await workflow.createRun();
+
+        const result = await run
+          .start({
+            inputData: {
+              __workflowKind: 'durable-agent',
+              runId,
+              agentId: 'direct-workflow-agent',
+              messageListState: {},
+              toolsMetadata: [],
+              modelConfig: { provider: 'test', modelId: 'test-model' },
+              options: { maxSteps },
+              state: {},
+              messageId: 'direct-workflow-message',
+            },
+          })
+          .finally(() => globalRunRegistry.delete(runId));
+
+        expect(result.status).toBe('failed');
+        if (result.status === 'failed') {
+          expect(result.error).toMatchObject({
+            code: 'LLM_INVALID_MAX_STEPS',
+            message: 'maxSteps must be a positive safe integer',
+            domain: ErrorDomain.LLM,
+            category: ErrorCategory.USER,
+            details: { maxSteps },
+          });
+        }
+        expect(trackException).toHaveBeenCalledTimes(1);
+        expect(trackException).toHaveBeenCalledWith(
+          expect.objectContaining({
+            id: 'LLM_INVALID_MAX_STEPS',
+            message: 'maxSteps must be a positive safe integer',
+            domain: ErrorDomain.LLM,
+            category: ErrorCategory.USER,
+            details: { maxSteps },
+          }),
+        );
+        expect(doStream).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('stopWhen with tools', () => {

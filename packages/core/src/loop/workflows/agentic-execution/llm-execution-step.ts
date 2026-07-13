@@ -15,8 +15,8 @@ import { mergeProviderOptions } from '../../../llm/model/provider-options';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
 import type { IMastraLogger } from '../../../logger';
-import type { Mastra } from '../../../mastra';
 import { ConsoleLogger } from '../../../logger';
+import type { Mastra } from '../../../mastra';
 import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
 import type { AnySpan, ModelInferenceContext, TracingContext } from '../../../observability';
 import { executeWithContextSync, getStepAvailableToolNames } from '../../../observability/utils';
@@ -1689,6 +1689,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 steps: inputData.output?.steps || [],
                 retryCount: currentRetryCount,
                 requestContext,
+                tracingContext: modelSpanTracker?.getTracingContext() ?? tracingContext,
                 writer: apiErrorWriter,
                 abortSignal: options?.abortSignal,
                 messageId: currentMessageId,
@@ -1826,6 +1827,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           steps: inputData.output?.steps || [],
           retryCount: currentRetryCount,
           requestContext,
+          tracingContext: modelSpanTracker?.getTracingContext() ?? tracingContext,
           writer: apiErrorWriter2,
           abortSignal: options?.abortSignal,
           messageId: currentMessageId,

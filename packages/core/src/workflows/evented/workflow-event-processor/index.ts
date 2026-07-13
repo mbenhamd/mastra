@@ -1394,6 +1394,19 @@ export class WorkflowEventProcessor extends EventProcessor {
       // output). Propagate the suspend like any other step; the body re-runs on resume,
       // at which point processWorkflowLoop evaluates the condition with its output.
       const updatedState = (stepResult as any).__state ?? currentState;
+      const suspendedStepResult = {
+        ...stepResult,
+        // A suspended body has not completed the current iteration yet.
+        // Preserve the number of previously completed iterations so the
+        // resumed body evaluates its condition at the same count instead
+        // of resetting to one (or incrementing twice). This must be present
+        // on both stepResults and prevResult because the step-end processor
+        // persists prevResult before it builds the suspended snapshot.
+        metadata: {
+          ...stepResult.metadata,
+          iterationCount: stepResults[step.step.id]?.metadata?.iterationCount ?? 0,
+        },
+      };
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.step.end',
         runId,
@@ -1407,10 +1420,10 @@ export class WorkflowEventProcessor extends EventProcessor {
           restart,
           stepResults: {
             ...stepResults,
-            [step.step.id]: stepResult,
+            [step.step.id]: suspendedStepResult,
             __state: updatedState,
           },
-          prevResult: stepResult,
+          prevResult: suspendedStepResult,
           activeStepsPath,
           requestContext,
           perStep,
@@ -2026,12 +2039,14 @@ export class WorkflowEventProcessor extends EventProcessor {
 
       // handle nested workflow
       if (parentContext) {
+        const priorMetadata = stepResults[step.step.id]?.metadata ?? {};
         prevResult = stepResults[step.step.id] = {
           ...prevResult,
           payload: parentContext.input?.output ?? {},
           // Store nestedRunId in metadata for getWorkflowRunById retrieval
           ...(nestedRunId && {
             metadata: {
+              ...priorMetadata,
               ...(prevResult as any).metadata,
               nestedRunId,
             },

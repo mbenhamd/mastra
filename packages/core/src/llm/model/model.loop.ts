@@ -1,4 +1,3 @@
-import { stepCountIs } from '@internal/ai-sdk-v5';
 import type { ModelMessage, ToolSet } from '@internal/ai-sdk-v5';
 import type { MastraPrimitives } from '../../action';
 import { MastraBase } from '../../base';
@@ -12,9 +11,15 @@ import type { MastraModelOutput } from '../../stream/base/output';
 import type { ModelManagerModelConfig } from '../../stream/types';
 import { delay } from '../../utils';
 
+import { validateMaxSteps } from './max-steps';
 import type { ModelLoopStreamArgs } from './model.loop.types';
 import { resolveResponseModelId } from './server-side-fallback';
 import type { MastraModelOptions } from './shared.types';
+
+const stepCountAtLeast =
+  (stepCount: number) =>
+  ({ steps }: { steps: unknown[] }) =>
+    steps.length >= stepCount;
 
 export class MastraLLMVNext extends MastraBase {
   #models: ModelManagerModelConfig[];
@@ -106,7 +111,7 @@ export class MastraLLMVNext extends MastraBase {
   stream<Tools extends ToolSet, OUTPUT = undefined>({
     resumeContext,
     runId,
-    stopWhen = stepCountIs(5),
+    stopWhen,
     maxSteps,
     tools = {} as Tools,
     modelSettings,
@@ -143,12 +148,17 @@ export class MastraLLMVNext extends MastraBase {
     ...rest
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     const observabilityContext = resolveObservabilityContext(rest);
+    validateMaxSteps(maxSteps, this.logger);
+    // `maxSteps` is sugar for the stop condition `stepCountIs(maxSteps)`. When a
+    // custom `stopWhen` is also provided, compose the two (the loop ORs stop
+    // conditions) instead of letting the maxSteps cap replace the user's
+    // condition. The default cap only applies when neither is set.
     let stopWhenToUse;
-
-    if (maxSteps && typeof maxSteps === 'number') {
-      stopWhenToUse = stepCountIs(maxSteps);
+    if (typeof maxSteps === 'number') {
+      const userConditions = stopWhen ? (Array.isArray(stopWhen) ? stopWhen : [stopWhen]) : [];
+      stopWhenToUse = [stepCountAtLeast(maxSteps), ...userConditions];
     } else {
-      stopWhenToUse = stopWhen;
+      stopWhenToUse = stopWhen ?? stepCountAtLeast(5);
     }
 
     const messages = messageList.get.all.aiV5.model();
