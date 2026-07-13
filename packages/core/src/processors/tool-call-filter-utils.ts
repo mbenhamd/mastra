@@ -23,9 +23,18 @@ type ModelOutputTraversal = {
   exhausted: boolean;
 };
 
+type OwnDataProperty = { kind: 'missing' } | { kind: 'accessor' } | { kind: 'data'; value: unknown };
+
 type ToolCallMessageFilterBehavior = {
   stripMessageProviderMetadata?: boolean;
 };
+
+function getOwnDataProperty(value: object, key: PropertyKey): OwnDataProperty {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor) return { kind: 'missing' };
+  if (!('value' in descriptor)) return { kind: 'accessor' };
+  return { kind: 'data', value: descriptor.value };
+}
 
 function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedToolCallFilteringOptions {
   const resolvedOptions = options ?? {};
@@ -349,11 +358,16 @@ function modelOutputToText(
 
   try {
     if (Array.isArray(modelOutput)) {
+      const lengthProperty = getOwnDataProperty(modelOutput, 'length');
+      if (lengthProperty.kind !== 'data' || typeof lengthProperty.value !== 'number') return null;
+
       const text: string[] = [];
       let textLength = 0;
-      for (const part of modelOutput) {
+      for (let index = 0; index < lengthProperty.value; index += 1) {
+        const partProperty = getOwnDataProperty(modelOutput, String(index));
+        if (partProperty.kind === 'accessor') return null;
         const converted = modelOutputToText(
-          part,
+          partProperty.kind === 'data' ? partProperty.value : undefined,
           maxTextCodeUnits === undefined ? undefined : Math.max(0, maxTextCodeUnits - textLength),
           traversal,
         );
@@ -374,30 +388,64 @@ function modelOutputToText(
     }
 
     const output = modelOutput as Record<string, unknown>;
-    switch (output.type) {
+    const typeProperty = getOwnDataProperty(output, 'type');
+    if (typeProperty.kind === 'accessor') return null;
+
+    switch (typeProperty.kind === 'data' ? typeProperty.value : undefined) {
       case 'text':
-      case 'error-text':
-        if (typeof output.value === 'string')
-          return maxTextCodeUnits === undefined ? output.value : output.value.slice(0, maxTextCodeUnits);
-        if (typeof output.text === 'string')
-          return maxTextCodeUnits === undefined ? output.text : output.text.slice(0, maxTextCodeUnits);
+      case 'error-text': {
+        const valueProperty = getOwnDataProperty(output, 'value');
+        if (valueProperty.kind === 'accessor') return null;
+        if (valueProperty.kind === 'data' && typeof valueProperty.value === 'string') {
+          return maxTextCodeUnits === undefined ? valueProperty.value : valueProperty.value.slice(0, maxTextCodeUnits);
+        }
+
+        const textProperty = getOwnDataProperty(output, 'text');
+        if (textProperty.kind === 'accessor') return null;
+        if (textProperty.kind === 'data' && typeof textProperty.value === 'string') {
+          return maxTextCodeUnits === undefined ? textProperty.value : textProperty.value.slice(0, maxTextCodeUnits);
+        }
         return null;
+      }
       case 'json':
-      case 'error-json':
-        return Object.hasOwn(output, 'value') && isBoundedJsonValue(output.value, traversal)
-          ? boundedJsonStringify(output.value, maxTextCodeUnits)
+      case 'error-json': {
+        const valueProperty = getOwnDataProperty(output, 'value');
+        return valueProperty.kind === 'data' && isBoundedJsonValue(valueProperty.value, traversal)
+          ? boundedJsonStringify(valueProperty.value, maxTextCodeUnits)
           : null;
+      }
       case 'content': {
-        if (!Array.isArray(output.value)) return null;
+        const contentValueProperty = getOwnDataProperty(output, 'value');
+        if (contentValueProperty.kind !== 'data' || !Array.isArray(contentValueProperty.value)) return null;
         if (!visitModelOutputNode(traversal)) return null;
+
+        const lengthProperty = getOwnDataProperty(contentValueProperty.value, 'length');
+        if (lengthProperty.kind !== 'data' || typeof lengthProperty.value !== 'number') return null;
+
         const text: string[] = [];
         let textLength = 0;
-        for (const part of output.value) {
+        for (let index = 0; index < lengthProperty.value; index += 1) {
           if (!visitModelOutputNode(traversal)) return null;
+          const partProperty = getOwnDataProperty(contentValueProperty.value, String(index));
+          if (partProperty.kind === 'accessor') return null;
+          const part = partProperty.kind === 'data' ? partProperty.value : undefined;
           if (!part || typeof part !== 'object') continue;
           const contentPart = part as Record<string, unknown>;
-          if (contentPart.type !== 'text') continue;
-          const value = typeof contentPart.text === 'string' ? contentPart.text : contentPart.value;
+
+          const contentTypeProperty = getOwnDataProperty(contentPart, 'type');
+          if (contentTypeProperty.kind === 'accessor') return null;
+          if (contentTypeProperty.kind !== 'data' || contentTypeProperty.value !== 'text') continue;
+
+          const textProperty = getOwnDataProperty(contentPart, 'text');
+          if (textProperty.kind === 'accessor') return null;
+          const contentPartValueProperty = getOwnDataProperty(contentPart, 'value');
+          if (contentPartValueProperty.kind === 'accessor') return null;
+          const value =
+            textProperty.kind === 'data' && typeof textProperty.value === 'string'
+              ? textProperty.value
+              : contentPartValueProperty.kind === 'data'
+                ? contentPartValueProperty.value
+                : undefined;
           if (typeof value !== 'string') continue;
           if (text.length > 0) {
             text.push('\n');
@@ -414,10 +462,17 @@ function modelOutputToText(
       default:
         // Preserve the two legacy wrapper shapes ToolCallFilter already accepted, but never stringify
         // arbitrary objects. This fails closed for media and unknown provider-specific output.
-        if (typeof output.text === 'string')
-          return maxTextCodeUnits === undefined ? output.text : output.text.slice(0, maxTextCodeUnits);
-        if (!Object.hasOwn(output, 'type') && Object.hasOwn(output, 'value')) {
-          return modelOutputToText(output.value, maxTextCodeUnits, traversal);
+        const textProperty = getOwnDataProperty(output, 'text');
+        if (textProperty.kind === 'accessor') return null;
+        if (textProperty.kind === 'data' && typeof textProperty.value === 'string') {
+          return maxTextCodeUnits === undefined ? textProperty.value : textProperty.value.slice(0, maxTextCodeUnits);
+        }
+        if (typeProperty.kind === 'missing') {
+          const valueProperty = getOwnDataProperty(output, 'value');
+          if (valueProperty.kind === 'accessor') return null;
+          if (valueProperty.kind === 'data') {
+            return modelOutputToText(valueProperty.value, maxTextCodeUnits, traversal);
+          }
         }
         return null;
     }
@@ -455,16 +510,30 @@ function getPreservedModelOutputPart(
   }
 
   try {
-    const mastraMetadata = part.providerMetadata?.mastra;
-    if (!mastraMetadata || !Object.hasOwn(mastraMetadata, 'modelOutput')) {
+    const providerMetadataProperty = getOwnDataProperty(part, 'providerMetadata');
+    if (
+      providerMetadataProperty.kind !== 'data' ||
+      !providerMetadataProperty.value ||
+      typeof providerMetadataProperty.value !== 'object'
+    )
       return null;
-    }
+
+    const mastraMetadataProperty = getOwnDataProperty(providerMetadataProperty.value, 'mastra');
+    if (
+      mastraMetadataProperty.kind !== 'data' ||
+      !mastraMetadataProperty.value ||
+      typeof mastraMetadataProperty.value !== 'object'
+    )
+      return null;
+
+    const modelOutputProperty = getOwnDataProperty(mastraMetadataProperty.value, 'modelOutput');
+    if (modelOutputProperty.kind !== 'data') return null;
 
     const maxTextCodeUnits =
       options.maxModelOutputBytes === undefined
         ? undefined
         : Math.min(Number.MAX_SAFE_INTEGER, options.maxModelOutputBytes + 1);
-    const text = modelOutputToText(mastraMetadata.modelOutput, maxTextCodeUnits);
+    const text = modelOutputToText(modelOutputProperty.value, maxTextCodeUnits);
     if (!text) return null;
 
     const boundedText = truncateUtf8(text, options.maxModelOutputBytes);

@@ -12,6 +12,7 @@ import type { MastraDBMessage } from '../../memory/types';
 import { toolCallFilterProvider } from '../../processor-provider/providers';
 import { InMemoryStore } from '../../storage';
 import type { ProcessInputStepArgs } from '../index';
+import { filterToolCallMessages } from '../tool-call-filter-utils';
 
 import { ToolCallFilter } from './tool-call-filter';
 
@@ -1421,6 +1422,101 @@ describe('ToolCallFilter', () => {
       );
       expect(serialized).not.toContain('SHARED_JSON_ARGS');
       expect(serialized).not.toContain('SHARED_JSON_RAW');
+    });
+
+    it('does not invoke accessor-backed model-output fields or array elements', () => {
+      const accessor = vi.fn();
+      const messages: MastraDBMessage[] = [];
+
+      const addMessage = (id: string, mastraMetadata: Record<string, unknown>) => {
+        messages.push({
+          id,
+          role: 'assistant',
+          content: {
+            format: 2,
+            content: '',
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: `call-${id}`,
+                  toolName: `tool-${id}`,
+                  args: { secret: 'ACCESSOR_ARGS' },
+                  result: 'ACCESSOR_RAW',
+                },
+                providerMetadata: { mastra: mastraMetadata },
+              },
+            ],
+          },
+          createdAt: new Date(),
+        });
+      };
+
+      const metadataAccessor: Record<string, unknown> = {};
+      Object.defineProperty(metadataAccessor, 'modelOutput', {
+        enumerable: true,
+        get() {
+          accessor('modelOutput');
+          return 'METADATA_ACCESSOR_TEXT';
+        },
+      });
+      addMessage('metadata-accessor', metadataAccessor);
+
+      const typeAccessor = { value: 'TYPE_ACCESSOR_TEXT' } as Record<string, unknown>;
+      Object.defineProperty(typeAccessor, 'type', {
+        enumerable: true,
+        get() {
+          accessor('type');
+          return 'text';
+        },
+      });
+      addMessage('type-accessor', { modelOutput: typeAccessor });
+
+      const valueAccessor = { type: 'text' } as Record<string, unknown>;
+      Object.defineProperty(valueAccessor, 'value', {
+        enumerable: true,
+        get() {
+          accessor('value');
+          return 'VALUE_ACCESSOR_TEXT';
+        },
+      });
+      addMessage('value-accessor', { modelOutput: valueAccessor });
+
+      const indexAccessor: unknown[] = [];
+      Object.defineProperty(indexAccessor, '0', {
+        enumerable: true,
+        get() {
+          accessor('array index');
+          return 'INDEX_ACCESSOR_TEXT';
+        },
+      });
+      addMessage('index-accessor', { modelOutput: indexAccessor });
+
+      const iteratorAccessor = ['ITERATOR_ACCESSOR_TEXT'];
+      Object.defineProperty(iteratorAccessor, Symbol.iterator, {
+        get() {
+          accessor('array iterator');
+          return Array.prototype[Symbol.iterator];
+        },
+      });
+      addMessage('iterator-accessor', { modelOutput: iteratorAccessor });
+
+      const contentPart = { type: 'text' } as Record<string, unknown>;
+      Object.defineProperty(contentPart, 'text', {
+        enumerable: true,
+        get() {
+          accessor('content text');
+          return 'CONTENT_ACCESSOR_TEXT';
+        },
+      });
+      addMessage('content-accessor', { modelOutput: { type: 'content', value: [contentPart] } });
+
+      const result = filterToolCallMessages(messages, { preserveModelOutput: true });
+
+      expect(result).toHaveLength(1);
+      expect(JSON.stringify(result)).toContain('tool-iterator-accessor result:\\nITERATOR_ACCESSOR_TEXT');
+      expect(accessor).not.toHaveBeenCalled();
     });
 
     it.each([
