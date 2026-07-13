@@ -1914,9 +1914,9 @@ export class DurableAgent<
     if (
       hasFga &&
       (typeof contextResourceId !== 'string' ||
-        contextResourceId.length === 0 ||
+        contextResourceId.trim().length === 0 ||
         typeof contextThreadId !== 'string' ||
-        contextThreadId.length === 0)
+        contextThreadId.trim().length === 0)
     ) {
       throw new MastraError({
         id: 'AGENT_RESUME_OWNER_UNVERIFIED',

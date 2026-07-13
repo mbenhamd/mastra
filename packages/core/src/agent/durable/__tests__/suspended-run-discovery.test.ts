@@ -1134,6 +1134,28 @@ describe('DurableAgent suspended-run discovery', () => {
     ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_UNVERIFIED' });
     expect(getStore).not.toHaveBeenCalled();
 
+    for (const [resourceId, threadId] of [
+      ['   ', 'thread-1'],
+      ['resource-1', '   '],
+    ] as const) {
+      const whitespaceReservedIdentity = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, resourceId],
+        [MASTRA_THREAD_ID_KEY, threadId],
+      ]);
+      await expect(
+        restarted.agent.resume(
+          runId,
+          { approved: false },
+          {
+            requestContext: whitespaceReservedIdentity,
+            memory: { thread: 'thread-1', resource: 'resource-1' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_UNVERIFIED' });
+    }
+    expect(getStore).not.toHaveBeenCalled();
+
     await expect(
       restarted.agent.sendToolApproval({
         threadId: 'thread-1',

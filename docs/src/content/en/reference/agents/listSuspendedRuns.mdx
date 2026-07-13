@@ -20,31 +20,35 @@ Discover the pending run for a conversation and continue it. Check `requiresAppr
 ```typescript
 const threadId = 'thread-123'
 const resourceId = 'user-456'
+const expectedRunId = 'run-123'
+const expectedToolCallId = 'call-123'
 
 const { runs } = await agent.listSuspendedRuns({
   threadId,
   resourceId,
 })
 
-const run = runs[0]
-const toolCall = run?.toolCalls[0]
+const run = runs.find(candidate => candidate.runId === expectedRunId)
+const toolCall = run?.toolCalls.find(candidate => candidate.toolCallId === expectedToolCallId)
 
-if (run && toolCall) {
-  const stream = toolCall.requiresApproval
-    ? await agent.approveToolCall({
+if (!run || !toolCall) {
+  throw new Error('Expected suspended tool call was not found')
+}
+
+const stream = toolCall.requiresApproval
+  ? await agent.approveToolCall({
+      runId: run.runId,
+      toolCallId: toolCall.toolCallId,
+      memory: { thread: threadId, resource: resourceId },
+    })
+  : await agent.resumeStream(
+      { name: 'San Francisco' },
+      {
         runId: run.runId,
         toolCallId: toolCall.toolCallId,
         memory: { thread: threadId, resource: resourceId },
-      })
-    : await agent.resumeStream(
-        { name: 'San Francisco' },
-        {
-          runId: run.runId,
-          toolCallId: toolCall.toolCallId,
-          memory: { thread: threadId, resource: resourceId },
-        },
-      )
-}
+      },
+    )
 ```
 
 `DurableAgent` uses the same method and result types. Its results have `workflowName: 'durable-agentic-loop'`. When `sendToolApproval()` finds a durable run after process loss, it re-resolves the live agent's tools, model, memory, and workspace with the caller's request context. Recovery rejects changed version selectors and structural drift that Mastra can observe in tool, model, memory, and workspace metadata. Function-source fingerprints can't identify closed-over values, private service configuration, provider accounts, or endpoints; deploy immutable versioned dependencies and don't treat this check as a security boundary.
