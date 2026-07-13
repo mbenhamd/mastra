@@ -9,9 +9,9 @@
  * → processWorkflowFail → workflows-finish, erroneously terminating the
  * correct instance's run.
  */
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
-import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 
 import { Agent } from '../agent';
 import { EventEmitterPubSub } from '../events/event-emitter';

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { createWorkflow } from '../workflows/create';
 import { createStep } from '../workflows/workflow';
@@ -138,6 +138,24 @@ describe('internal workflow registry', () => {
 
       m.__unregisterInternalWorkflow('loop', 'suspended-run');
       expect(m.__hasInternalWorkflow('loop', 'suspended-run')).toBe(false);
+    });
+
+    it('lazily evicts abandoned run-scoped workflows after the TTL', () => {
+      vi.useFakeTimers();
+      try {
+        const m = makeMastra();
+        const stale = makeWorkflow('stale-loop');
+        const fresh = makeWorkflow('fresh-loop');
+        m.__registerInternalWorkflow(stale, 'stale-run');
+
+        vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
+        m.__registerInternalWorkflow(fresh, 'fresh-run');
+
+        expect(m.__hasInternalWorkflow('stale-loop', 'stale-run')).toBe(false);
+        expect(m.__getInternalWorkflow('fresh-loop', 'fresh-run')).toBe(fresh);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

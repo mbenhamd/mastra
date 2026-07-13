@@ -705,6 +705,8 @@ export class Mastra<
   } = {};
   #internalMastraWorkflows: Record<string, AnyWorkflow> = {};
   #runScopedInternalWorkflows = new Map<string, Map<string, AnyWorkflow>>();
+  #runScopedWorkflowTimestamps = new Map<string, Map<string, number>>();
+  static readonly INTERNAL_WORKFLOW_TTL_MS = 30 * 60 * 1000;
   // Server cache for temporary persistence and durable agent resumable streams
   #serverCache: MastraServerCache;
   // Cache for stored agents to allow in-memory modifications (like model changes) to persist across requests
@@ -3004,6 +3006,14 @@ export class Mastra<
         this.#runScopedInternalWorkflows.set(workflow.id, runs);
       }
       runs.set(runId, workflow);
+
+      let timestamps = this.#runScopedWorkflowTimestamps.get(workflow.id);
+      if (!timestamps) {
+        timestamps = new Map();
+        this.#runScopedWorkflowTimestamps.set(workflow.id, timestamps);
+      }
+      timestamps.set(runId, Date.now());
+      this.#sweepStaleRunScopedWorkflows();
     } else {
       this.#internalMastraWorkflows[workflow.id] = workflow;
     }
@@ -3013,6 +3023,10 @@ export class Mastra<
     const runs = this.#runScopedInternalWorkflows.get(id);
     runs?.delete(runId);
     if (runs?.size === 0) this.#runScopedInternalWorkflows.delete(id);
+
+    const timestamps = this.#runScopedWorkflowTimestamps.get(id);
+    timestamps?.delete(runId);
+    if (timestamps?.size === 0) this.#runScopedWorkflowTimestamps.delete(id);
   }
 
   __hasInternalWorkflow(id: string, runId?: string): boolean {
@@ -3039,6 +3053,17 @@ export class Mastra<
     }
 
     return workflow;
+  }
+
+  #sweepStaleRunScopedWorkflows() {
+    const now = Date.now();
+    for (const [workflowId, timestamps] of this.#runScopedWorkflowTimestamps) {
+      for (const [runId, registeredAt] of timestamps) {
+        if (now - registeredAt > Mastra.INTERNAL_WORKFLOW_TTL_MS) {
+          this.__unregisterInternalWorkflow(workflowId, runId);
+        }
+      }
+    }
   }
 
   #ownsInternalWorkflow(workflowId: string, runId: string, parentWorkflow: unknown): boolean {

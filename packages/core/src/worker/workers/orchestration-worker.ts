@@ -110,7 +110,11 @@ export class OrchestrationWorker extends MastraWorker {
     }
 
     if (this.deps?.mastra && !this.deps.mastra.__shouldProcessWorkflowEvent(event)) {
-      await ack?.();
+      try {
+        await ack?.();
+      } catch (e) {
+        this.deps.logger?.error('OrchestrationWorker: error acking foreign event', { error: e });
+      }
       return;
     }
 
