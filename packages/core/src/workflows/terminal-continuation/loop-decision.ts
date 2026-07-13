@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
+import { isInfrastructureRequestContextKey } from '../../request-context';
 import {
   materializeWorkflowTerminalCanonicalJson,
   materializeWorkflowTerminalCanonicalJsonObject,
@@ -7,6 +8,10 @@ import {
   validateWorkflowTerminalRecoveryParentFrameGraphBinding,
 } from '../terminal-recovery';
 import type { WorkflowTerminalCanonicalJsonObject, WorkflowTerminalCanonicalJsonValue } from '../terminal-recovery';
+import {
+  validateWorkflowTerminalEffectRecoveryLink,
+  validateWorkflowTerminalSnapshotRecordIntegrity,
+} from '../terminal-recovery/record-integrity';
 import type { WorkflowRunState, WorkflowTerminalSnapshotRecord } from '../types';
 import {
   isWorkflowTerminalNativeFunctionSource,
@@ -37,7 +42,6 @@ export const DEFAULT_WORKFLOW_TERMINAL_LOOP_DECISION_TIMEOUT_MS = 30_000;
 
 /** The largest callback deadline accepted by the internal evaluator. */
 export const MAX_WORKFLOW_TERMINAL_LOOP_DECISION_TIMEOUT_MS = 5 * 60_000;
-const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
 /**
  * Restartable data supplied to one loop-condition callback attempt.
@@ -236,8 +240,8 @@ export function copyWorkflowTerminalLoopConditionFrame(input: unknown): Workflow
     retryCount,
     iterationCount,
   };
-  if (Object.hasOwn(frame.requestContext, MASTRA_AUTH_TOKEN_KEY)) {
-    throw new TypeError('loop condition frame requestContext contains a framework credential');
+  if (Object.keys(frame.requestContext).some(isInfrastructureRequestContextKey)) {
+    throw new TypeError('loop condition frame requestContext contains an infrastructure-owned key');
   }
   // Enforce one aggregate frame bound rather than allowing every large field
   // to independently consume the full recovery-envelope budget.
@@ -287,6 +291,7 @@ export function materializeWorkflowTerminalLoopConditionFrame(
     read(inputDescriptors, 'retainedChild'),
     'loop condition retained child',
   ) as unknown as WorkflowTerminalSnapshotRecord;
+  validateWorkflowTerminalSnapshotRecordIntegrity(retainedChild);
   const request = createWorkflowTerminalLoopDecisionRequest(plannerInput);
   const { effect, parentRevision, parentSnapshot } = plannerInput;
   if (effect.terminalStatus !== 'success' || retainedChild.terminalStatus !== 'success') {
@@ -301,24 +306,9 @@ export function materializeWorkflowTerminalLoopConditionFrame(
       envelopeHash: effect.recoveryEnvelopeHash,
     },
   );
-  if (
-    retainedChild.version !== 1 ||
-    retainedChild.workflowName !== effect.workflowName ||
-    retainedChild.runId !== effect.runId ||
-    retainedChild.envelopeHash !== effect.recoveryEnvelopeHash ||
-    !Number.isSafeInteger(retainedChild.createdAt) ||
-    retainedChild.createdAt < 0
-  ) {
-    throw new TypeError('Retained child does not match the loop terminal effect');
-  }
+  validateWorkflowTerminalEffectRecoveryLink(effect, retainedChild);
   const parentFrame = retainedChild.envelope.ancestry[0];
-  if (
-    !parentFrame ||
-    parentFrame.childWorkflowName !== effect.workflowName ||
-    parentFrame.childRunId !== effect.runId ||
-    parentFrame.parentWorkflowName !== effect.parentWorkflowName ||
-    parentFrame.parentRunId !== effect.parentRunId
-  ) {
+  if (!parentFrame) {
     throw new TypeError('Retained child ancestry does not match the loop parent effect');
   }
   validateWorkflowTerminalRecoveryParentFrameGraphBinding(parentFrame, parentSnapshot.serializedStepGraph);
@@ -368,7 +358,9 @@ export function materializeWorkflowTerminalLoopConditionFrame(
     conditionSourceHash: getWorkflowTerminalLoopConditionSourceHash(loopEntry.serializedCondition.fn),
     ...(inputData.present ? { inputData: inputData.value } : {}),
     state: preview.value,
-    requestContext: preview.requestContext ?? {},
+    requestContext: Object.fromEntries(
+      Object.entries(preview.requestContext ?? {}).filter(([key]) => !isInfrastructureRequestContextKey(key)),
+    ),
     stepResults: preview.context,
     ...(resumeData.present ? { resumeData: resumeData.value } : {}),
     // Parent CAS replans are not workflow step retries and must not change a

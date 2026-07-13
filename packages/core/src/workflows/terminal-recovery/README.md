@@ -93,9 +93,12 @@ and the locked parent snapshot. It uses retained final state, terminal output,
 request-context patch, projected step results, and persisted source
 `resumePayload`; process-local raw resume data is not reconstructed. A callback
 may run again after a crash before atomic apply or a parent CAS conflict, and
-side-effecting callbacks remain unsupported. PF-1800 owns durable per-step
-recovery. No callback exactly-once, broker ACK, publication, merge, package
-release, or deployment behavior is introduced here.
+side-effecting callbacks remain unsupported. Callback frames use the same
+canonical request-context classifier as recovery envelopes, rejecting framework
+namespaces and known bare infrastructure slots while preserving application
+keys. PF-1800 owns durable per-step recovery. No callback exactly-once, broker
+ACK, publication, merge, package release, or deployment behavior is introduced
+here.
 
 ## Verification
 

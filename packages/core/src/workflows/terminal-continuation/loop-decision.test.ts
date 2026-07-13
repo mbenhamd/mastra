@@ -3,6 +3,7 @@ import {
   getWorkflowTerminalRecoveryEnvelopeHash,
   materializeWorkflowTerminalRecoveryEnvelope,
 } from '../terminal-recovery';
+import { getWorkflowTerminalSnapshotRecordHash } from '../terminal-recovery/record-integrity';
 import type { SerializedStepFlowEntry, WorkflowRunState, WorkflowTerminalSnapshotRecord } from '../types';
 import { getWorkflowTerminalEffectIntegrity } from './effect-integrity';
 import { createWorkflowTerminalGraphFingerprint } from './graph-fingerprint';
@@ -17,7 +18,7 @@ import {
 
 function fixture(
   loopType: 'dowhile' | 'dountil' = 'dowhile',
-  options: { output?: boolean; resumePayload?: boolean } = {},
+  options: { output?: boolean; resumePayload?: boolean; effectSource?: 'first' | 'second' } = {},
 ) {
   const parentGraph: SerializedStepFlowEntry[] = [
     {
@@ -26,6 +27,16 @@ function fixture(
       loopType,
       serializedCondition: { id: 'nested-condition', fn: 'async ({ state }) => state.keepGoing' },
     },
+    ...(options.effectSource === 'second'
+      ? [
+          {
+            type: 'loop' as const,
+            step: { id: 'other-loop', component: 'WORKFLOW' as const },
+            loopType,
+            serializedCondition: { id: 'other-loop-condition', fn: 'async ({ state }) => state.keepGoing' },
+          },
+        ]
+      : []),
   ];
   const childGraph: SerializedStepFlowEntry[] = [{ type: 'step', step: { id: 'child-step' } }];
   const envelope = materializeWorkflowTerminalRecoveryEnvelope({
@@ -60,6 +71,18 @@ function fixture(
     ],
   });
   const envelopeHash = getWorkflowTerminalRecoveryEnvelopeHash(envelope);
+  const retainedRecordBase = {
+    version: 1 as const,
+    workflowName: 'child',
+    runId: 'child-run',
+    resourceId: 'resource-1',
+    terminalStatus: 'success' as const,
+    envelopeHash,
+    createdAt: 20,
+  };
+  const recordHash = getWorkflowTerminalSnapshotRecordHash(retainedRecordBase);
+  const effectStepId = options.effectSource === 'second' ? 'other-loop' : 'nested';
+  const effectPath = options.effectSource === 'second' ? [1] : [0];
   const identity = {
     version: 1 as const,
     kind: 'parent-workflow-step-end' as const,
@@ -68,10 +91,12 @@ function fixture(
     sourceEventKey: 'event-1',
     terminalStatus: 'success' as const,
     recoveryEnvelopeHash: envelopeHash,
+    retainedRecordHash: recordHash,
+    resourceId: retainedRecordBase.resourceId,
     parentWorkflowName: 'parent',
     parentRunId: 'parent-run',
-    parentStepId: 'nested',
-    parentExecutionPath: [0],
+    parentStepId: effectStepId,
+    parentExecutionPath: effectPath,
   };
   const effect = { ...identity, ...getWorkflowTerminalEffectIntegrity(identity), createdAt: 20 };
   const parentSnapshot: WorkflowRunState = {
@@ -88,24 +113,31 @@ function fixture(
         startedAt: 1,
         metadata: { nestedRunId: 'child-run', iterationCount: 2, parent: true },
       },
+      ...(options.effectSource === 'second'
+        ? {
+            'other-loop': {
+              status: 'running',
+              payload: { original: true },
+              ...(options.resumePayload === false ? {} : { resumePayload: { approval: 'yes' } }),
+              startedAt: 1,
+              metadata: { nestedRunId: 'child-run', iterationCount: 2, parent: true },
+            },
+          }
+        : {}),
       __state: { keepGoing: false },
     } as WorkflowRunState['context'],
     serializedStepGraph: parentGraph,
-    activePaths: [0],
-    activeStepsPath: { nested: [0] },
+    activePaths: effectPath,
+    activeStepsPath: { [effectStepId]: effectPath },
     suspendedPaths: {},
     resumeLabels: {},
     waitingPaths: {},
     timestamp: 10,
   };
   const retainedChild: WorkflowTerminalSnapshotRecord = {
-    version: 1,
-    workflowName: 'child',
-    runId: 'child-run',
-    terminalStatus: 'success',
-    envelopeHash,
+    ...retainedRecordBase,
+    recordHash,
     envelope,
-    createdAt: 20,
   };
   return {
     plannerInput: { version: 1 as const, effect, parentRevision: 'revision-1', parentSnapshot },
@@ -165,7 +197,33 @@ describe('workflow terminal loop decision frame', () => {
 
     const wrong = fixture();
     wrong.retainedChild.runId = 'different-child';
-    expect(() => materializeWorkflowTerminalLoopConditionFrame(wrong)).toThrow(/does not match/);
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(wrong)).toThrow(/record integrity/);
+  });
+
+  it('binds the authenticated retained record hash, resource identity, and creation time', () => {
+    const invalidHash = fixture();
+    invalidHash.retainedChild.recordHash = `sha256:${'0'.repeat(64)}`;
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(invalidHash)).toThrow(/record integrity/);
+
+    const changedResource = fixture();
+    changedResource.retainedChild.resourceId = 'different-resource';
+    changedResource.retainedChild.recordHash = getWorkflowTerminalSnapshotRecordHash(changedResource.retainedChild);
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(changedResource)).toThrow(/effect recovery link/);
+
+    const changedCreatedAt = fixture();
+    changedCreatedAt.retainedChild.createdAt += 1;
+    changedCreatedAt.retainedChild.recordHash = getWorkflowTerminalSnapshotRecordHash(changedCreatedAt.retainedChild);
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(changedCreatedAt)).toThrow(/effect recovery link/);
+
+    const unauthenticatedCreatedAt = fixture();
+    unauthenticatedCreatedAt.retainedChild.createdAt += 1;
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(unauthenticatedCreatedAt)).toThrow(/record integrity/);
+  });
+
+  it('rejects an effect coordinate that differs from authenticated recovery ancestry', () => {
+    expect(() => materializeWorkflowTerminalLoopConditionFrame(fixture('dowhile', { effectSource: 'second' }))).toThrow(
+      /effect recovery link/,
+    );
   });
 
   it('materializes absent terminal output and persisted resume payload as absent frame values', () => {
@@ -187,7 +245,7 @@ describe('workflow terminal loop decision frame', () => {
     expect(() => copyWorkflowTerminalLoopConditionFrame({ ...frame, iterationCount: 9 })).toThrow(/does not follow/);
   });
 
-  it('rejects malformed callback source, aggregate oversize, credentials, and materialization accessors', () => {
+  it('rejects malformed callback source, aggregate oversize, and materialization accessors', () => {
     expect(() => getWorkflowTerminalLoopConditionSourceHash('function bad() { /* \ud800 */ }')).toThrow(/well-formed/);
     expect(() => getWorkflowTerminalLoopConditionSourceHash('function () { [native code] }')).toThrow(/unsupported/);
     expect(() =>
@@ -203,15 +261,69 @@ describe('workflow terminal loop decision frame', () => {
       }),
     ).toThrow(/byte limit/);
 
-    const credential = fixture();
-    credential.plannerInput.parentSnapshot.requestContext = { mastra__authToken: 'secret' };
-    expect(() => materializeWorkflowTerminalLoopConditionFrame(credential)).toThrow(/framework credential/);
-
     const getter = vi.fn(() => fixture().plannerInput);
     const hostile = { retainedChild: fixture().retainedChild } as Record<string, unknown>;
     Object.defineProperty(hostile, 'plannerInput', { enumerable: true, get: getter });
     expect(() => materializeWorkflowTerminalLoopConditionFrame(hostile as never)).toThrow(/data fields/);
     expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'harness',
+    'channel',
+    'MastraMemory',
+    'browser',
+    'user',
+    'userPermissions',
+    'userRoles',
+    'mastra__custom',
+    'mastra:custom',
+    '__mastraCustom',
+    '__harnessCustom',
+  ])('rejects infrastructure-owned request-context key %s', key => {
+    const valid = materializeWorkflowTerminalLoopConditionFrame(fixture());
+    expect(() =>
+      copyWorkflowTerminalLoopConditionFrame({
+        ...valid,
+        requestContext: { tenantId: 'application-owned', [key]: 'infrastructure-owned' },
+      }),
+    ).toThrow(/infrastructure-owned key/);
+  });
+
+  it('preserves application-owned request context in restartable callback frames', () => {
+    const valid = materializeWorkflowTerminalLoopConditionFrame(fixture());
+    expect(
+      copyWorkflowTerminalLoopConditionFrame({
+        ...valid,
+        requestContext: { tenantId: 'tenant-1', feature: 'durable-loops' },
+      }).requestContext,
+    ).toEqual({ feature: 'durable-loops', tenantId: 'tenant-1' });
+  });
+
+  it('withholds trusted parent infrastructure context while preserving application keys', () => {
+    const input = fixture();
+    input.plannerInput.parentSnapshot.requestContext = {
+      parentContext: 'locked',
+      childContext: 'old',
+      tenantId: 'tenant-1',
+      mastra__authToken: 'token',
+      mastra__resourceId: 'resource-1',
+      mastra__threadId: 'thread-1',
+      mastra__versions: { agents: {} },
+      harness: { id: 'harness-1' },
+      channel: 'web',
+      MastraMemory: { thread: 'thread-1' },
+      browser: { id: 'browser-1' },
+      user: { id: 'user-1' },
+      userPermissions: ['read'],
+      userRoles: ['member'],
+    };
+
+    expect(materializeWorkflowTerminalLoopConditionFrame(input).requestContext).toEqual({
+      childContext: 'retained',
+      parentContext: 'locked',
+      tenantId: 'tenant-1',
+    });
   });
 
   it('defines a bounded live replan count without claiming a durable execution bound', () => {

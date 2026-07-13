@@ -105,6 +105,10 @@ reuses the pure child-merge semantics to expose isolated canonical `inputData`,
 final `state`, merged request context, projected step results, a persisted source
 `resumePayload` when present, and the next iteration count. Raw process-local
 `ParentWorkflow.resumeData` is not recovery evidence and is never inferred.
+The projected source result includes the just-completed child output before the
+condition runs, matching the default engine's merge-before-condition ordering.
+This intentionally corrects the current evented helper's pre-merge
+`stepResults`; PF-1780 activation must preserve that cutover explicitly.
 The callback still receives own `inputData` and `resumeData` properties with an
 `undefined` value when that canonical evidence is absent, matching the live
 evented callback shape.
@@ -121,29 +125,40 @@ conditions remain unsupported until actor propagation is composed separately.
 `evaluateEventedWorkflowTerminalLoopDecision()` runs exactly one callback
 attempt. It composes caller cancellation with a bounded cooperative timeout,
 requires a boolean, and reports throw, abort, timeout, registration mismatch,
-invalid return, denied capability use, input mutation, or capacity exhaustion as
-a typed non-decision. None of those outcomes can be passed to the planner or
-storage as `false`. Native abort intrinsics prevent hostile own `AbortSignal`
-properties from executing. A decision-key-local evaluator coalesces concurrent
-work in one process and retains successful decisions. When abort or timeout wins
+same-key frame mismatch, invalid return, denied capability use, input mutation,
+or capacity exhaustion as a typed non-decision. None of those outcomes can be
+passed to the planner or storage as `false`. Native abort intrinsics prevent
+hostile own `AbortSignal` properties from executing. A decision-key-local
+evaluator validates callback registration and canonical frame identity before
+every cache lookup, coalesces concurrent work in one process, and retains
+successful decisions. The first admitted attempt owns the coalesced cancellation
+signal and deadline; followers observe that attempt's result. A same-key frame
+mismatch leaves the existing valid entry untouched. When abort or timeout wins
 after callback invocation, the key remains occupied until the underlying
 callback actually settles, so redelivery cannot overlap a non-cooperative
 attempt. Late values and errors are discarded; settlement releases the key and
 capacity. Permanently pending callbacks remain retained without a TTL. The cache
 is bounded and exposes retained-in-flight and capacity-exhaustion counters;
-pre-invocation aborts, failures, invalid results, registration mismatches, and
-unexpected evaluator rejections are evicted rather than poisoning a later
-same-key attempt.
+callback and frame mismatches are never admitted. Pre-invocation aborts,
+failures, invalid results, and unexpected evaluator rejections are evicted
+rather than poisoning a later same-key attempt.
 
-Durable loop conditions must be pure predicates. Direct mutation of isolated
-state, request context, or step results is rejected and never leaks into retained
-evidence. The evaluator supplies denied Mastra, writer, PubSub, engine, and bail
-capabilities so those framework side effects cannot run through the callback
-context. Network, database, global, and closure effects still cannot be detected
-or rolled back for arbitrary JavaScript and are unsupported. A separate durable
-decision primitive is required for them. The known framework auth token is
-rejected from callback request context, and the complete frame shares one bounded
-canonical byte budget.
+Durable loop conditions must be pure predicates. Changes to isolated canonical
+data values, keys, or reference topology in state, request context, or step
+results are rejected and never leak into retained evidence. Descriptor-only
+reflection and deliberate private-field or global monkey-patching are outside
+this arbitrary-JavaScript contract. The evaluator supplies denied Mastra,
+writer, PubSub, engine, bail, and observability capabilities so those framework
+side effects cannot run through the callback context. Native observability keys
+remain present and `tracingContext` aliases `tracing`, preserving presence and
+identity checks without exposing a shared mutable no-op object. Network,
+database, global, and closure effects still cannot be detected or rolled back
+for arbitrary JavaScript and are unsupported. A separate durable decision
+primitive is required for them. The canonical request-context
+classifier withholds framework namespaces and known bare infrastructure slots
+during trusted frame materialization while preserving application-owned keys;
+the exported frame validator rejects forged infrastructure entries. The complete
+frame shares one bounded canonical byte budget.
 
 A fresh parent revision produces a fresh decision key and permits at most three
 live attempts (`MAX_WORKFLOW_TERMINAL_LOOP_DECISION_ATTEMPTS`: one initial plus

@@ -160,6 +160,82 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(input).toEqual(frame(condition));
   });
 
+  it('rejects state mutations hidden by canonical undefined and negative-zero normalization', async () => {
+    const addingUndefined = async ({ state }: any) => {
+      state.newKey = undefined;
+      return Object.hasOwn(state, 'newKey');
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(addingUndefined))).resolves.toMatchObject({
+      status: 'unsupported_mutation',
+    });
+
+    const changingZero = async ({ state }: any) => {
+      state.zero = -0;
+      return Object.is(state.zero, -0);
+    };
+    const zeroFrame = frame(changingZero);
+    zeroFrame.state.zero = 0;
+    await expect(
+      evaluateEventedWorkflowTerminalLoopDecision({
+        frame: zeroFrame,
+        conditionId: 'nested-condition',
+        condition: changingZero,
+      }),
+    ).resolves.toMatchObject({ status: 'unsupported_mutation' });
+  });
+
+  it('rejects a RequestContext undefined-key mutation hidden by canonical omission', async () => {
+    const condition = async ({ requestContext }: any) => {
+      requestContext.set('newKey', undefined);
+      return requestContext.has('newKey');
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_mutation',
+    });
+  });
+
+  it('rejects mutation that aliases previously independent callback data', async () => {
+    const condition = async ({ requestContext, state }: any) => {
+      requestContext.set('nested', state.nested);
+      return requestContext.get('nested') === state.nested;
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_mutation',
+    });
+  });
+
+  it('detects request-context mutation through the captured native entries method', async () => {
+    const entries = vi.fn(function* () {
+      yield ['tenant', 'one'];
+    });
+    const condition = async ({ requestContext }: any) => {
+      requestContext.set('tenant', 'two');
+      Object.defineProperty(requestContext, 'entries', { configurable: true, value: entries });
+      return true;
+    };
+
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_mutation',
+    });
+    expect(entries).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-string RequestContext key without coercing it', async () => {
+    const get = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const key = new Proxy({}, { get });
+    const condition = async ({ requestContext }: any) => {
+      requestContext.set(key, 1);
+      return true;
+    };
+
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_mutation',
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it('keeps throw and invalid return values as explicit non-decisions', async () => {
     const thrown = { secret: 'must not escape' };
     const throwing = (async () => {
@@ -207,7 +283,11 @@ describe('evented workflow terminal loop decision evaluator', () => {
 
   it('fails closed when the registered callback identity differs from the locked graph', async () => {
     const locked = async () => true;
-    const changed = vi.fn(async () => false);
+    let changedCalls = 0;
+    const changed = async function changedCondition() {
+      changedCalls += 1;
+      return false;
+    };
     await expect(
       evaluateEventedWorkflowTerminalLoopDecision({
         ...evaluation(changed),
@@ -227,7 +307,7 @@ describe('evented workflow terminal loop decision evaluator', () => {
         condition: new Proxy(proxiedTarget, {}),
       }),
     ).resolves.toMatchObject({ status: 'callback_mismatch' });
-    expect(changed).not.toHaveBeenCalled();
+    expect(changedCalls).toBe(0);
     expect(proxiedTarget).not.toHaveBeenCalled();
   });
 
@@ -238,6 +318,27 @@ describe('evented workflow terminal loop decision evaluator', () => {
     ['engine', async ({ engine }: any) => Boolean(engine.execute)],
     ['bail', async ({ bail }: any) => Boolean(bail(true))],
   ] as const)('rejects the %s capability instead of executing a framework side effect', async (_label, condition) => {
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_effect',
+    });
+  });
+
+  it('preserves the native observability key and tracing-alias shape without exposing capabilities', async () => {
+    const condition = async ({ tracing, tracingContext, loggerVNext, metrics }: any) =>
+      tracing !== undefined && tracing === tracingContext && loggerVNext !== undefined && metrics !== undefined;
+
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'evaluated',
+      evaluatedDecision: { conditionResult: true },
+    });
+  });
+
+  it.each([
+    ['tracing', async ({ tracing }: any) => Boolean(tracing.currentSpan)],
+    ['tracing alias', async ({ tracingContext }: any) => Boolean(tracingContext.currentSpan)],
+    ['logger', async ({ loggerVNext }: any) => Boolean(loggerVNext.info)],
+    ['metrics', async ({ metrics }: any) => Boolean(metrics.emit)],
+  ] as const)('rejects attempted observability %s use as a typed non-decision', async (_label, condition) => {
     await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
       status: 'unsupported_effect',
     });
@@ -345,6 +446,30 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(hostile).not.toHaveBeenCalled();
   });
 
+  it('does not let a callback shadow the internal AbortSignal state', async () => {
+    const getter = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const throwingShadow = async ({ abortSignal }: any) => {
+      Object.defineProperty(abortSignal, 'aborted', { configurable: true, get: getter });
+      return true;
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(throwingShadow))).resolves.toMatchObject({
+      status: 'evaluated',
+      evaluatedDecision: { conditionResult: true },
+    });
+    expect(getter).not.toHaveBeenCalled();
+
+    const trueShadow = async ({ abortSignal }: any) => {
+      Object.defineProperty(abortSignal, 'aborted', { configurable: true, value: true });
+      return true;
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(trueShadow))).resolves.toMatchObject({
+      status: 'evaluated',
+      evaluatedDecision: { conditionResult: true },
+    });
+  });
+
   it('rejects a proxied AbortSignal without invoking its prototype trap', async () => {
     const getPrototypeOf = vi.fn(() => {
       throw new Error('must not execute');
@@ -388,6 +513,52 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(condition).toHaveBeenCalledTimes(2);
     await restarted.evaluate(evaluation(condition, `sha256:${'b'.repeat(64)}`));
     expect(condition).toHaveBeenCalledTimes(3);
+  });
+
+  it('validates callback registration and canonical frame identity before reusing a decision key', async () => {
+    const condition = vi.fn(async () => true);
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'evaluated' });
+
+    let changedCalls = 0;
+    const changed = async function changedCondition() {
+      changedCalls += 1;
+      return false;
+    };
+    await expect(evaluator.evaluate({ ...evaluation(changed), frame: frame(condition) })).resolves.toMatchObject({
+      status: 'callback_mismatch',
+    });
+    expect(changedCalls).toBe(0);
+
+    const driftedFrame = frame(condition);
+    driftedFrame.state.keepGoing = false;
+    await expect(evaluator.evaluate({ ...evaluation(condition), frame: driftedFrame })).resolves.toMatchObject({
+      status: 'frame_mismatch',
+    });
+    expect(condition).toHaveBeenCalledTimes(1);
+  });
+
+  it('assigns coalesced cancellation ownership to the first admitted attempt', async () => {
+    let started!: () => void;
+    const didStart = new Promise<void>(resolve => (started = resolve));
+    let settle!: (value: boolean) => void;
+    const condition = vi.fn(() => {
+      started();
+      return new Promise<boolean>(resolve => (settle = resolve));
+    });
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    const firstController = new AbortController();
+    const first = evaluator.evaluate({ ...evaluation(condition), abortSignal: firstController.signal });
+    await didStart;
+
+    const followerController = new AbortController();
+    followerController.abort();
+    const follower = evaluator.evaluate({ ...evaluation(condition), abortSignal: followerController.signal });
+    settle(true);
+
+    await expect(first).resolves.toMatchObject({ status: 'evaluated' });
+    await expect(follower).resolves.toMatchObject({ status: 'evaluated' });
+    expect(condition).toHaveBeenCalledTimes(1);
   });
 
   it('returns distinct closed result copies without exposing the cached decision to mutation', async () => {

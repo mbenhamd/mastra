@@ -1,5 +1,9 @@
+import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { isProxy } from 'node:util/types';
+import { serialize } from 'node:v8';
 import { RequestContext } from '../../../di';
+import type { ObservabilityContext } from '../../../observability';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../../constants';
 import { getStepResult } from '../../step';
 import type { LoopConditionFunction } from '../../step';
@@ -17,11 +21,13 @@ import type {
   WorkflowTerminalLoopDecisionRequestV1,
 } from '../../terminal-continuation';
 import { getWorkflowTerminalCanonicalJson, materializeWorkflowTerminalCanonicalJson } from '../../terminal-recovery';
+import type { WorkflowTerminalCanonicalJsonValue } from '../../terminal-recovery';
 
 const MAX_PROCESS_LOCAL_LOOP_DECISIONS = 256;
 const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 const addEventListener = EventTarget.prototype.addEventListener;
 const removeEventListener = EventTarget.prototype.removeEventListener;
+const requestContextEntries = RequestContext.prototype.entries;
 
 function isSignalAborted(signal: AbortSignal): boolean {
   return Boolean(abortSignalAbortedGetter.call(signal));
@@ -64,6 +70,7 @@ export type EventedWorkflowTerminalLoopDecisionEvaluationResult =
         | 'aborted'
         | 'timed_out'
         | 'callback_mismatch'
+        | 'frame_mismatch'
         | 'invalid_result'
         | 'unsupported_effect'
         | 'unsupported_mutation'
@@ -168,25 +175,31 @@ function timeout(value: unknown): number {
   return result as number;
 }
 
+function observeRequestContext(requestContext: RequestContext): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of requestContextEntries.call(requestContext) as IterableIterator<[unknown, unknown]>) {
+    if (typeof key !== 'string') throw new TypeError('loop decision RequestContext key is invalid');
+    Object.defineProperty(result, key, { configurable: true, enumerable: true, value, writable: true });
+  }
+  return result;
+}
+
 function evaluationObservation(input: {
   inputData?: unknown;
   state: unknown;
   requestContext: RequestContext;
   stepResults: unknown;
   resumeData?: unknown;
-}): string {
-  return getWorkflowTerminalCanonicalJson(
-    materializeWorkflowTerminalCanonicalJson(
-      {
-        ...(input.inputData === undefined ? {} : { inputData: input.inputData }),
-        state: input.state,
-        requestContext: Object.fromEntries(input.requestContext.entries()),
-        stepResults: input.stepResults,
-        ...(input.resumeData === undefined ? {} : { resumeData: input.resumeData }),
-      },
-      'loop condition evaluation inputs',
-    ),
-  );
+}): Record<string, unknown> {
+  const exact = {
+    ...(input.inputData === undefined ? {} : { inputData: input.inputData }),
+    state: input.state,
+    requestContext: observeRequestContext(input.requestContext),
+    stepResults: input.stepResults,
+    ...(input.resumeData === undefined ? {} : { resumeData: input.resumeData }),
+  };
+  materializeWorkflowTerminalCanonicalJson(exact, 'loop condition evaluation inputs');
+  return exact;
 }
 
 interface UnsupportedEffectObservation {
@@ -229,6 +242,14 @@ function callbackSourceMatches(
   } catch {
     return false;
   }
+}
+
+function getLoopDecisionFrameIdentity(frame: WorkflowTerminalLoopConditionFrameV1): string {
+  const hash = createHash('sha256');
+  hash.update('mastra.workflow-terminal-loop-decision-frame.v1');
+  // copyEvaluationInput has already produced a closed canonical frame.
+  hash.update(getWorkflowTerminalCanonicalJson(frame as unknown as WorkflowTerminalCanonicalJsonValue));
+  return hash.digest('hex');
 }
 
 /**
@@ -274,13 +295,14 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
 
   const sandbox = copyWorkflowTerminalLoopConditionFrame(frame);
   const requestContext = new RequestContext(Object.entries(sandbox.requestContext) as any);
-  const baseline = evaluationObservation({
-    ...(sandbox.inputData === undefined ? {} : { inputData: sandbox.inputData }),
-    state: sandbox.state,
-    requestContext,
-    stepResults: sandbox.stepResults,
-    ...(sandbox.resumeData === undefined ? {} : { resumeData: sandbox.resumeData }),
-  });
+  const exactBaseline = {
+    ...(frame.inputData === undefined ? {} : { inputData: frame.inputData }),
+    state: frame.state,
+    requestContext: frame.requestContext,
+    stepResults: frame.stepResults,
+    ...(frame.resumeData === undefined ? {} : { resumeData: frame.resumeData }),
+  };
+  const serializedBaseline = serialize(exactBaseline);
   const controller = new AbortController();
   let abortStatus: 'aborted' | 'timed_out' = 'aborted';
   const onExternalAbort = () => controller.abort();
@@ -294,11 +316,18 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
   const writer = deniedCapability('writer', unsupportedEffect);
   const pubsub = deniedCapability('PubSub', unsupportedEffect);
   const engine = deniedCapability('workflow engine', unsupportedEffect);
+  const tracing = deniedCapability('observability tracing', unsupportedEffect) as ObservabilityContext['tracing'];
+  const observability: ObservabilityContext = {
+    tracing,
+    tracingContext: tracing,
+    loggerVNext: deniedCapability('observability logger', unsupportedEffect) as ObservabilityContext['loggerVNext'],
+    metrics: deniedCapability('observability metrics', unsupportedEffect) as ObservabilityContext['metrics'],
+  };
 
   let callbackInvoked = false;
   let callbackHasSettled = false;
   const callback = Promise.resolve().then(() => {
-    if (controller.signal.aborted) return undefined;
+    if (isSignalAborted(controller.signal)) return undefined;
     callbackInvoked = true;
     return safeInput.condition({
       workflowId: sandbox.parentWorkflowName,
@@ -318,6 +347,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       engine: engine as never,
       abortSignal: controller.signal,
       writer: writer as never,
+      ...observability,
       iterationCount: sandbox.iterationCount,
     } as never);
   });
@@ -328,14 +358,17 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
   const callbackSettled = settled.then(() => {
     callbackHasSettled = true;
   });
+  let resolveAborted!: (value: { type: 'aborted' }) => void;
   const aborted = new Promise<{ type: 'aborted' }>(resolve => {
-    addAbortListener(controller.signal, () => resolve({ type: 'aborted' }));
+    resolveAborted = resolve;
   });
+  const onInternalAbort = () => resolveAborted({ type: 'aborted' });
+  addAbortListener(controller.signal, onInternalAbort);
 
   const result = (async (): Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult> => {
     try {
       const outcome = await Promise.race([settled, aborted]);
-      if (outcome.type === 'aborted' || controller.signal.aborted) {
+      if (outcome.type === 'aborted' || isSignalAborted(controller.signal)) {
         return { status: abortStatus, request };
       }
       if (
@@ -344,7 +377,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       ) {
         return { status: 'unsupported_effect', request };
       }
-      let observation: string;
+      let observation: Record<string, unknown>;
       try {
         observation = evaluationObservation({
           ...(sandbox.inputData === undefined ? {} : { inputData: sandbox.inputData }),
@@ -356,7 +389,9 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       } catch {
         return { status: 'unsupported_mutation', request };
       }
-      if (observation !== baseline) return { status: 'unsupported_mutation', request };
+      if (!isDeepStrictEqual(observation, exactBaseline) || !serialize(observation).equals(serializedBaseline)) {
+        return { status: 'unsupported_mutation', request };
+      }
       if (outcome.type === 'failed') {
         return { status: 'failed', request };
       }
@@ -368,6 +403,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       };
     } finally {
       clearTimeout(timer);
+      removeAbortListener(controller.signal, onInternalAbort);
       if (safeInput.abortSignal) removeAbortListener(safeInput.abortSignal, onExternalAbort);
     }
   })();
@@ -387,6 +423,7 @@ export async function evaluateEventedWorkflowTerminalLoopDecision(
 
 interface EvaluationEntry {
   promise: Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult>;
+  frameIdentity: string;
   retained: false | 'evaluated' | 'in_flight';
   isCallbackSettled(): boolean;
 }
@@ -416,8 +453,15 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
     const safeInput = copyEvaluationInput(input);
     const frame = safeInput.frame;
     const key = frame.request.decisionKey;
+    if (!callbackSourceMatches(safeInput, frame)) {
+      return Promise.resolve(copyEvaluationResult({ status: 'callback_mismatch', request: frame.request }));
+    }
+    const frameIdentity = getLoopDecisionFrameIdentity(frame);
     const existing = this.#evaluations.get(key);
     if (existing) {
+      if (existing.frameIdentity !== frameIdentity) {
+        return Promise.resolve(copyEvaluationResult({ status: 'frame_mismatch', request: frame.request }));
+      }
       if (existing.retained === 'in_flight' && existing.isCallbackSettled()) {
         this.#evaluations.delete(key);
       } else {
@@ -432,6 +476,7 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
     const started = startValidatedEventedWorkflowTerminalLoopDecision(safeInput);
     const entry: EvaluationEntry = {
       promise: started.result,
+      frameIdentity,
       retained: false,
       isCallbackSettled: started.isCallbackSettled,
     };

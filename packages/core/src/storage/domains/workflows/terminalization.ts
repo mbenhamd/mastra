@@ -37,6 +37,10 @@ import {
   validateMaterializedWorkflowTerminalRecoveryEnvelope,
   validateMaterializedWorkflowTerminalRecoveryGraphBinding,
 } from '../../../workflows/terminal-recovery/envelope';
+import {
+  validateWorkflowTerminalEffectRecoveryLink,
+  validateWorkflowTerminalSnapshotRecordIntegrity,
+} from '../../../workflows/terminal-recovery/record-integrity';
 export {
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -46,6 +50,11 @@ export {
   WorkflowTerminalContinuationStoredStateError,
   WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
 } from '../../../workflows/terminal-continuation';
+export {
+  getWorkflowTerminalSnapshotRecordHash,
+  validateWorkflowTerminalEffectRecoveryLink,
+  validateWorkflowTerminalSnapshotRecordIntegrity,
+} from '../../../workflows/terminal-recovery/record-integrity';
 import type {
   AdvanceWorkflowTerminalizationInput,
   AdmitWorkflowNestedRunInput,
@@ -901,48 +910,6 @@ function hashFramedParts(domain: string, parts: readonly string[]): string {
   return hash.digest('hex');
 }
 
-/** @internal Authenticates a retained terminal record, including explicit resource presence. */
-export function getWorkflowTerminalSnapshotRecordHash(
-  retained: Pick<
-    WorkflowTerminalSnapshotRecord,
-    'version' | 'workflowName' | 'runId' | 'resourceId' | 'terminalStatus' | 'envelopeHash' | 'createdAt'
-  >,
-): `sha256:${string}` {
-  if (retained.version !== 1) throw new TypeError('Invalid workflow terminal snapshot version');
-  validateWorkflowTerminalizationIdentity(retained.workflowName, 'workflowName', 512);
-  validateWorkflowTerminalizationIdentity(retained.runId, 'runId', 512);
-  if (retained.resourceId !== undefined) {
-    validateWorkflowTerminalizationIdentity(retained.resourceId, 'resourceId', 512);
-  }
-  if (!['success', 'failed', 'canceled'].includes(retained.terminalStatus)) {
-    throw new TypeError('Invalid workflow terminal snapshot status');
-  }
-  if (!/^sha256:[a-f0-9]{64}$/.test(retained.envelopeHash)) {
-    throw new TypeError('Invalid workflow terminal recovery envelope hash');
-  }
-  if (!Number.isSafeInteger(retained.createdAt) || retained.createdAt < 0) {
-    throw new TypeError('Invalid workflow terminal snapshot createdAt');
-  }
-  const resourceParts =
-    retained.resourceId === undefined ? ['resource-id-absent'] : ['resource-id-present', retained.resourceId];
-  return `sha256:${hashFramedParts('mastra.workflow-terminal-snapshot-record.v1', [
-    String(retained.version),
-    retained.workflowName,
-    retained.runId,
-    retained.terminalStatus,
-    retained.envelopeHash,
-    String(retained.createdAt),
-    ...resourceParts,
-  ])}`;
-}
-
-/** @internal Fails closed when any authenticated retained-record field was altered. */
-export function validateWorkflowTerminalSnapshotRecordIntegrity(retained: WorkflowTerminalSnapshotRecord): void {
-  if (retained.recordHash !== getWorkflowTerminalSnapshotRecordHash(retained)) {
-    throw new TypeError('Invalid workflow terminal snapshot record integrity');
-  }
-}
-
 /** @internal Fails closed when a persisted intent is not evidence for its owning journal. */
 export function validateWorkflowTerminalEffectJournalLink(
   effect: WorkflowTerminalEffectRecord,
@@ -988,23 +955,6 @@ export function validateWorkflowTerminalSnapshotJournalLink(
     retained.createdAt > journal.updatedAt
   ) {
     throw new TypeError('Invalid workflow terminal snapshot journal link');
-  }
-}
-
-/** @internal Binds the structural producer intent to the authenticated retained payload. */
-export function validateWorkflowTerminalEffectRecoveryLink(
-  effect: WorkflowTerminalEffectRecord,
-  retained: WorkflowTerminalSnapshotRecord,
-): void {
-  if (
-    effect.workflowName !== retained.workflowName ||
-    effect.runId !== retained.runId ||
-    effect.terminalStatus !== retained.terminalStatus ||
-    effect.recoveryEnvelopeHash !== retained.envelopeHash ||
-    effect.retainedRecordHash !== retained.recordHash ||
-    effect.resourceId !== retained.resourceId
-  ) {
-    throw new TypeError('Invalid workflow terminal effect recovery link');
   }
 }
 
@@ -1210,28 +1160,8 @@ export function prepareWorkflowTerminalEffectRecord(
   if (!retained) return { status: 'missing_terminal_state' };
   validateWorkflowTerminalSnapshotJournalLink(retained, fence.record, input.workflowName, input.runId);
 
-  const descriptor = materializeWorkflowTerminalEffectDescriptor(input.effect);
-  const immediate = retained.envelope.ancestry[0];
-  if (descriptor.kind === 'workflow-finish') {
-    if (immediate) throw new TypeError('Nested workflow recovery envelope requires a parent terminal effect');
-  } else {
-    if (!immediate) throw new TypeError('Root workflow recovery envelope cannot prepare a parent terminal effect');
-    const sourcePath =
-      immediate.source.kind === 'step'
-        ? immediate.source.executionPath
-        : [...immediate.source.containerPath, immediate.source.iterationIndex];
-    if (
-      immediate.parentWorkflowName !== descriptor.parentWorkflowName ||
-      immediate.parentRunId !== descriptor.parentRunId ||
-      immediate.source.stepId !== descriptor.parentStepId ||
-      sourcePath.length !== descriptor.parentExecutionPath.length ||
-      sourcePath.some((entry, index) => entry !== descriptor.parentExecutionPath[index])
-    ) {
-      throw new TypeError('Workflow terminal parent effect does not match retained recovery ancestry');
-    }
-  }
-
   const desired = createWorkflowTerminalEffectRecord(fence.record, retained, input, now);
+  validateWorkflowTerminalEffectRecoveryLink(desired, retained);
   if (fence.record.phase === targetPhase) {
     if (!existingEffect) return { status: 'missing_effect' };
     const leaseExpiresAt =
