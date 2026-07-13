@@ -1,4 +1,4 @@
 import { MockStore } from '@mastra/core/storage';
-import { createResourceDeletionTest } from './domains/memory/resource-deletion';
+import { createResourceDeletionTest } from './resource-deletion';
 
 createResourceDeletionTest({ storage: new MockStore() });

@@ -33,7 +33,7 @@ describe('MemoryPG.deleteResource', () => {
 
   it('rejects storage failures without retaining driver details', async () => {
     const { client, none } = createDeleteDbClient();
-    const driverError = new Error('connectionString=SECRET query=DELETE');
+    const driverError = Object.assign(new Error('connectionString=SECRET query=DELETE'), { code: '57P01' });
     none.mockRejectedValueOnce(driverError);
     const memory = new MemoryPG({ client });
     const logger = createLogger();
@@ -46,6 +46,7 @@ describe('MemoryPG.deleteResource', () => {
 
     expect(caught).toBeInstanceOf(MastraError);
     expect(caught.id).toContain('DELETE_RESOURCE');
+    expect(caught.details?.failureCode).toBe('SQLSTATE_57');
     expect(caught.cause).not.toBe(driverError);
     const serialized = JSON.stringify(caught.toJSON());
     expect(serialized).not.toContain('connectionString');

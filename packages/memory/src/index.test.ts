@@ -2470,6 +2470,221 @@ describe('Memory', () => {
       expect(workingMemoryMutexes.size).toBe(0);
     });
 
+    it('waits for a metadata working memory save before deleting the resource', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
+      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
+      const operationOrder: string[] = [];
+      let markSaveStarted!: () => void;
+      let releaseSave!: () => void;
+      const saveStarted = new Promise<void>(resolve => {
+        markSaveStarted = resolve;
+      });
+      const saveBlocked = new Promise<void>(resolve => {
+        releaseSave = resolve;
+      });
+
+      vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
+        markSaveStarted();
+        await saveBlocked;
+        const result = await originalSaveThread(args);
+        operationOrder.push('save-thread');
+        return result;
+      });
+      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
+        const result = await originalUpdateResource(args);
+        operationOrder.push('update-resource');
+        return result;
+      });
+      const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
+        await originalDeleteResource(args);
+        operationOrder.push('delete');
+      });
+
+      const savePromise = memory.saveThread({
+        thread: {
+          id: 'thread-save-delete-race',
+          resourceId: 'resource-save-delete-race',
+          metadata: { workingMemory: 'private working memory' },
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+      await saveStarted;
+
+      const deletePromise = memory.deleteResource('resource-save-delete-race');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      releaseSave();
+      await Promise.all([savePromise, deletePromise]);
+
+      expect(operationOrder).toEqual(['save-thread', 'update-resource', 'delete']);
+      await expect(memoryStore.getResourceById({ resourceId: 'resource-save-delete-race' })).resolves.toBeNull();
+      const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
+      expect(workingMemoryMutexes.size).toBe(0);
+    });
+
+    it('waits for a metadata working memory update before deleting the resource', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const threadId = 'thread-update-delete-race';
+      const resourceId = 'resource-update-delete-race';
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          metadata: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+
+      const originalUpdateThread = memoryStore.updateThread.bind(memoryStore);
+      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
+      const operationOrder: string[] = [];
+      let markUpdateStarted!: () => void;
+      let releaseUpdate!: () => void;
+      const updateStarted = new Promise<void>(resolve => {
+        markUpdateStarted = resolve;
+      });
+      const updateBlocked = new Promise<void>(resolve => {
+        releaseUpdate = resolve;
+      });
+
+      vi.spyOn(memoryStore, 'updateThread').mockImplementation(async args => {
+        markUpdateStarted();
+        await updateBlocked;
+        const result = await originalUpdateThread(args);
+        operationOrder.push('update-thread');
+        return result;
+      });
+      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
+        const result = await originalUpdateResource(args);
+        operationOrder.push('update-resource');
+        return result;
+      });
+      const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
+        await originalDeleteResource(args);
+        operationOrder.push('delete');
+      });
+
+      const updatePromise = memory.updateThread({
+        id: threadId,
+        title: 'Updated thread',
+        metadata: { workingMemory: 'private working memory' },
+      });
+      await updateStarted;
+
+      const deletePromise = memory.deleteResource(resourceId);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      releaseUpdate();
+      await Promise.all([updatePromise, deletePromise]);
+
+      expect(operationOrder).toEqual(['update-thread', 'update-resource', 'delete']);
+      await expect(memoryStore.getResourceById({ resourceId })).resolves.toBeNull();
+      const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
+      expect(workingMemoryMutexes.size).toBe(0);
+    });
+
+    it('keeps the resource identity stable while updating metadata working memory', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const threadId = 'thread-resource-reassignment-race';
+      const originalResourceId = 'resource-before-reassignment';
+      const reassignedResourceId = 'resource-after-reassignment';
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId: originalResourceId,
+          metadata: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+
+      const originalSaveThread = memoryStore.saveThread.bind(memoryStore);
+      const originalUpdateThread = memoryStore.updateThread.bind(memoryStore);
+      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const operationOrder: string[] = [];
+      let markUpdateStarted!: () => void;
+      let releaseUpdate!: () => void;
+      const updateStarted = new Promise<void>(resolve => {
+        markUpdateStarted = resolve;
+      });
+      const updateBlocked = new Promise<void>(resolve => {
+        releaseUpdate = resolve;
+      });
+
+      vi.spyOn(memoryStore, 'updateThread').mockImplementation(async args => {
+        markUpdateStarted();
+        await updateBlocked;
+        const result = await originalUpdateThread(args);
+        operationOrder.push('update-thread');
+        return result;
+      });
+      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
+        const result = await originalUpdateResource(args);
+        operationOrder.push('update-resource');
+        return result;
+      });
+      const saveSpy = vi.spyOn(memoryStore, 'saveThread').mockImplementation(async args => {
+        const result = await originalSaveThread(args);
+        operationOrder.push('save-thread');
+        return result;
+      });
+
+      const updatePromise = memory.updateThread({
+        id: threadId,
+        title: 'Updated before reassignment',
+        metadata: { workingMemory: 'private working memory' },
+      });
+      await updateStarted;
+
+      const reassignPromise = memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId: reassignedResourceId,
+          metadata: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(saveSpy).not.toHaveBeenCalled();
+
+      releaseUpdate();
+      await Promise.all([updatePromise, reassignPromise]);
+
+      expect(operationOrder).toEqual(['update-thread', 'update-resource', 'save-thread']);
+      await expect(memoryStore.getResourceById({ resourceId: originalResourceId })).resolves.toEqual(
+        expect.objectContaining({ workingMemory: 'private working memory' }),
+      );
+      await expect(memoryStore.getResourceById({ resourceId: reassignedResourceId })).resolves.toBeNull();
+      await expect(memoryStore.getThreadById({ threadId })).resolves.toEqual(
+        expect.objectContaining({ resourceId: reassignedResourceId }),
+      );
+      const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
+      expect(workingMemoryMutexes.size).toBe(0);
+    });
+
     it('passes observation options to the ObservationalMemory engine', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({

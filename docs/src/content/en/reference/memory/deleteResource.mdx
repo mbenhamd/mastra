@@ -18,7 +18,7 @@ const memory = await agent.getMemory()
 await memory?.deleteResource('resource-123')
 ```
 
-Calling the method for a resource that doesn't exist resolves successfully.
+On supported adapters, calling the method for a resource that doesn't exist resolves successfully.
 
 ## Storage support
 
@@ -27,6 +27,8 @@ Calling the method for a resource that doesn't exist resolves successfully.
 ## Deletion scope
 
 This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record.
+
+Calls made through the same `Memory` instance are serialized with its resource-scoped working-memory writes. Separate `Memory` instances and processes require application-level writer coordination.
 
 Only the resource record is affected. If an application also stored working-memory content in preserved thread metadata or resource-scoped observational memory, remove that content through the application's bounded lifecycle. For account-erasure workflows, stop new writers, drain in-flight work, compose the required thread, message, and observational-memory operations, call this method, and then verify that all targeted records remain absent.
 
