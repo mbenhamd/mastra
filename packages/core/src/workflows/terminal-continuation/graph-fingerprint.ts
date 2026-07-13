@@ -118,6 +118,9 @@ function hashSource(domain: string, value: unknown, field: string, state: GraphS
 
 function hashExecutableSource(domain: string, value: unknown, field: string, state: GraphState): string {
   return hashBoundedSource(domain, value, field, state, source => {
+    if (source.length === 0) {
+      throw new TypeError(`${field} must not be empty`);
+    }
     if (isWorkflowTerminalNativeFunctionSource(source)) {
       throw new TypeError(`${field} must not contain native or bound callback source`);
     }
@@ -401,6 +404,9 @@ export function resolveWorkflowTerminalGraphCoordinate(
     const branch = steps[path[1] as number];
     if (!branch) throw new TypeError('executionPath branch does not exist');
     const branchDescriptors = getDataDescriptors(branch, `${entryField}.steps[${path[1]}]`);
+    if (branchDescriptors.type?.value !== 'step') {
+      throw new TypeError(`${entryField} branch must be a step`);
+    }
     return {
       kind: 'branch',
       containerType: type,

@@ -107,6 +107,15 @@ describe('workflow terminal graph fingerprint', () => {
     expect(() => createWorkflowTerminalGraphFingerprint(fixture)).not.toThrow();
   });
 
+  it('rejects empty executable callback source before fingerprinting', () => {
+    const invalid = graph();
+    const loop = invalid[4];
+    if (loop?.type !== 'loop') throw new Error('invalid fixture');
+    loop.serializedCondition.fn = '';
+
+    expect(() => createWorkflowTerminalGraphFingerprint(invalid)).toThrow(/must not be empty/);
+  });
+
   it('is stable across JSON storage and ignores descriptive fields', () => {
     const original = graph();
     const stored = JSON.parse(JSON.stringify(original)) as SerializedStepFlowEntry[];
@@ -176,6 +185,15 @@ describe('workflow terminal graph fingerprint', () => {
       stepId: 'each-body',
       iterationIndex: 7,
     });
+  });
+
+  it('rejects a malformed non-step branch during coordinate resolution', () => {
+    const invalid = graph();
+    const conditional = invalid[3];
+    if (conditional?.type !== 'conditional') throw new Error('invalid fixture');
+    conditional.steps[0] = { type: 'sleep', step: { id: 'left' } } as unknown as (typeof conditional.steps)[number];
+
+    expect(() => resolveWorkflowTerminalGraphCoordinate(invalid, [3, 0])).toThrow(/branch must be a step/);
   });
 
   it('rejects sparse graphs, accessors, malformed Unicode, and duplicate IDs', () => {
