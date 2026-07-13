@@ -20,6 +20,7 @@ export {
   createWorkflowTerminalGraphFingerprint,
   createWorkflowTerminalParentContinuationContract,
   validateWorkflowTerminalEffectIntegrity,
+  WorkflowTerminalContinuationStoredStateError,
 } from '../../../workflows/terminal-continuation';
 import type {
   AdvanceWorkflowTerminalizationInput,

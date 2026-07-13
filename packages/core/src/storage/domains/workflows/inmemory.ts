@@ -10,6 +10,7 @@ import type {
 import {
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
+  WorkflowTerminalContinuationStoredStateError,
 } from '../../../workflows/terminal-continuation';
 import { normalizePerPage } from '../../base';
 import type {
@@ -872,15 +873,26 @@ export class WorkflowsInMemory extends WorkflowsStorage {
 
     const retained = this.db.workflowTerminalSnapshots.get(journalKey);
     if (!retained) return { status: 'missing_child_terminal_state' };
-    validateWorkflowTerminalSnapshotJournalLink(retained, prepared.journal, operation.workflowName, operation.runId);
+    try {
+      validateWorkflowTerminalSnapshotJournalLink(retained, prepared.journal, operation.workflowName, operation.runId);
+    } catch {
+      return { status: 'corrupt_child_terminal_state' };
+    }
     const parentKey = this.getWorkflowKey(effect.parentWorkflowName, effect.parentRunId);
     const parentRun = this.db.workflows.get(parentKey);
     if (!parentRun?.snapshot) return { status: 'missing_parent' };
-    const parentSnapshot = cloneRunData(
-      typeof parentRun.snapshot === 'string' ? JSON.parse(parentRun.snapshot) : parentRun.snapshot,
-    );
+    let parentSnapshot: WorkflowRunState;
+    try {
+      parentSnapshot = cloneRunData(
+        typeof parentRun.snapshot === 'string' ? JSON.parse(parentRun.snapshot) : parentRun.snapshot,
+      );
+    } catch {
+      return { status: 'corrupt_parent_state' };
+    }
 
-    if (this.getParentRevision(parentKey) !== operation.contract.expectedParentRevision) {
+    const storedParentRevision = this.db.workflowTerminalParentRevisions.get(parentKey);
+    if (storedParentRevision === undefined) return { status: 'corrupt_parent_state' };
+    if (`mem:v1:${storedParentRevision}` !== operation.contract.expectedParentRevision) {
       return { status: 'parent_conflict' };
     }
     const storageTimestamp = now;
@@ -896,7 +908,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         storageTimestamp,
         executionMode: 'continuous',
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof WorkflowTerminalContinuationStoredStateError) {
+        return {
+          status: error.state === 'child' ? 'corrupt_child_terminal_state' : 'corrupt_parent_state',
+        };
+      }
       return { status: 'invalid_contract' };
     }
     const finalized = finalizeWorkflowTerminalParentApplicationRecords(

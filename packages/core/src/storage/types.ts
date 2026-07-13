@@ -385,6 +385,8 @@ export type ApplyWorkflowTerminalParentEffectResult =
         | 'missing_effect'
         | 'missing_child_terminal_state'
         | 'missing_parent'
+        | 'corrupt_child_terminal_state'
+        | 'corrupt_parent_state'
         | 'invalid_contract'
         | 'missing_record'
         | 'missing_run'

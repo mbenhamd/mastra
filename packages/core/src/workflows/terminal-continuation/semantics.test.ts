@@ -8,6 +8,7 @@ import {
   MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_DEPTH,
   MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_ENTRIES,
   MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES,
+  WorkflowTerminalContinuationStoredStateError,
   WORKFLOW_TERMINAL_FOREACH_STATE_KEY,
 } from './semantics';
 
@@ -367,6 +368,43 @@ describe('workflow terminal parent patch semantics', () => {
     expect(stored.context.each.metadata.__workflow_meta[WORKFLOW_TERMINAL_FOREACH_STATE_KEY]['1']).toBe('success');
   });
 
+  it('attributes invalid foreach status and malformed sidecars to stored parent corruption', () => {
+    for (const corruptParent of [
+      (() => {
+        const parent = parentSnapshot();
+        (parent.context.each as Record<string, any>).status = 'invalid';
+        return parent;
+      })(),
+      (() => {
+        const parent = parentSnapshot();
+        (parent.context.each as Record<string, any>).metadata.__workflow_meta[WORKFLOW_TERMINAL_FOREACH_STATE_KEY] = {
+          '1': 'invalid',
+        };
+        return parent;
+      })(),
+    ]) {
+      expect(() =>
+        applyWorkflowTerminalParentContinuationPatch({
+          contract: contractFor(corruptParent, {
+            source: { kind: 'foreach-iteration', stepId: 'each', containerPath: [3], iterationIndex: 1 },
+            action: {
+              kind: 'wait',
+              reason: 'foreach-aggregation',
+              coordinate: { kind: 'container', containerType: 'foreach', executionPath: [3] },
+            },
+          }),
+          effect: effect('success', [3, 1], 'each'),
+          parentRevision: 'revision-1',
+          parentWorkflowName: 'parent',
+          parentSnapshot: corruptParent,
+          retainedChild: retained(),
+          storageTimestamp: 30,
+          executionMode: 'continuous',
+        }),
+      ).toThrow(WorkflowTerminalContinuationStoredStateError);
+    }
+  });
+
   it('updates loop iteration metadata from the evaluated structural decision', () => {
     const parent = parentSnapshot();
     parent.activeStepsPath = { loop: [2] };
@@ -504,7 +542,7 @@ describe('workflow terminal parent patch semantics', () => {
     }
   });
 
-  it('enforces one bounded data traversal for depth, cycles, amplification, entries, and bytes', () => {
+  it('enforces provenance-specific bounded traversals for depth, cycles, amplification, entries, and bytes', () => {
     const nestedData = (depth: number): Record<string, unknown> => {
       let value: unknown = true;
       for (let index = 0; index < depth; index++) value = { next: value };
@@ -614,7 +652,7 @@ describe('workflow terminal parent patch semantics', () => {
     aggregateChild.snapshot.requestContext = {
       childError: inheritedErrorWithMessage('c'.repeat(600_000)),
     };
-    expect(() =>
+    expect(
       applyWorkflowTerminalParentContinuationPatch({
         contract: contractFor(aggregateParent),
         effect: effect(),
@@ -625,7 +663,7 @@ describe('workflow terminal parent patch semantics', () => {
         storageTimestamp: 30,
         executionMode: 'continuous',
       }),
-    ).toThrow(/byte limit/);
+    ).toBeDefined();
 
     const singleChargeParent = parentSnapshot();
     (singleChargeParent.context.nested as Record<string, any>).metadata.large = 'm'.repeat(600_000);

@@ -682,6 +682,21 @@ describe('WorkflowsInMemory terminalization journal', () => {
     expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
   });
 
+  it('keeps a well-formed but unbound source contract in the caller-error category', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const { contractHash: _contractHash, source: _source, ...contractSpec } = fixture.contract;
+    const unbound = createWorkflowTerminalParentContinuationContract({
+      ...contractSpec,
+      source: { kind: 'step', stepId: 'missing', executionPath: [0] },
+    });
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: unbound }),
+    ).resolves.toEqual({ status: 'invalid_contract' });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+  });
+
   it('isolates stored parent context and continuation evidence from caller aliases', async () => {
     const fixture = await setupGraphBoundParentApplication();
     const originalContract = structuredClone(fixture.contract);
@@ -749,7 +764,91 @@ describe('WorkflowsInMemory terminalization journal', () => {
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
-    ).resolves.toEqual({ status: 'invalid_contract' });
+    ).resolves.toEqual({ status: 'corrupt_parent_state' });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+  });
+
+  it('classifies corrupt retained child evidence separately from caller contracts', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
+    const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
+    if (!retained) throw new Error('Expected retained child snapshot');
+    delete retained.snapshot.context.__state;
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'corrupt_child_terminal_state' });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+  });
+
+  it('classifies malformed retained child result envelopes as child corruption', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
+    const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
+    if (!retained) throw new Error('Expected retained child snapshot');
+    retained.snapshot.result = { status: 'failed' } as never;
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'corrupt_child_terminal_state' });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+  });
+
+  it('classifies malformed stored parent context separately from caller contracts', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
+    const parent = fixture.db.workflows.get(parentKey);
+    if (!parent?.snapshot || typeof parent.snapshot === 'string') throw new Error('Expected in-memory parent snapshot');
+    parent.snapshot.requestContext = [] as never;
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'corrupt_parent_state' });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+  });
+
+  it('classifies malformed parent graph and parent-derived result timing as parent corruption', async () => {
+    const graphFixture = await setupGraphBoundParentApplication();
+    const graphParentKey = JSON.stringify([graphFixture.parent.workflowName, graphFixture.parent.runId]);
+    const graphParent = graphFixture.db.workflows.get(graphParentKey);
+    if (!graphParent?.snapshot || typeof graphParent.snapshot === 'string') {
+      throw new Error('Expected in-memory parent snapshot');
+    }
+    graphParent.snapshot.serializedStepGraph = [null] as never;
+    await expect(
+      graphFixture.workflows.applyWorkflowTerminalParentEffect({
+        ...graphFixture.fence,
+        contract: graphFixture.contract,
+      }),
+    ).resolves.toEqual({ status: 'corrupt_parent_state' });
+
+    const timingFixture = await setupGraphBoundParentApplication();
+    const timingParentKey = JSON.stringify([timingFixture.parent.workflowName, timingFixture.parent.runId]);
+    const timingParent = timingFixture.db.workflows.get(timingParentKey);
+    if (!timingParent?.snapshot || typeof timingParent.snapshot === 'string') {
+      throw new Error('Expected in-memory parent snapshot');
+    }
+    (timingParent.snapshot.context.nested as { startedAt: number }).startedAt = -1;
+    await expect(
+      timingFixture.workflows.applyWorkflowTerminalParentEffect({
+        ...timingFixture.fence,
+        contract: timingFixture.contract,
+      }),
+    ).resolves.toEqual({ status: 'corrupt_parent_state' });
+  });
+
+  it('fails closed when persisted in-memory parent revision evidence disappears', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
+    fixture.db.workflowTerminalParentRevisions.delete(parentKey);
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'corrupt_parent_state' });
     expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
     expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
   });

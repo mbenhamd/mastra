@@ -193,7 +193,111 @@ describe('WorkflowsPG terminalization journal', () => {
         [Date.now() + 60_000, parent.workflowName, parent.runId],
       );
       await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
-        status: 'invalid_contract',
+        status: 'corrupt_parent_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot
+         SET snapshot = jsonb_set(snapshot, '{serializedStepGraph}', '[null]'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
+      );
+
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        parent.workflowName,
+        parent.runId,
+      ]);
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await pool.query(
+        `INSERT INTO mastra_workflow_parent_revisions (workflow_name, run_id, generation, updated_at)
+         VALUES ($1, $2, 1, $3)`,
+        [parent.workflowName, parent.runId, Date.now()],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = snapshot #- '{context,__state}'
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{context,__state}', '{"final":true}'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{result,status}', '"failed"'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{result,status}', '"success"'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+
+      const retainedSnapshotBackup = await pool.query<{ snapshot: unknown }>(
+        `SELECT snapshot FROM mastra_workflow_terminal_snapshots
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = to_jsonb('{'::text)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(retainedSnapshotBackup.rows[0]!.snapshot), child.workflowName, child.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot
+         SET snapshot = jsonb_set(snapshot, '{requestContext}', '[]'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
       });
       await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
         status: 'missing_receipt',

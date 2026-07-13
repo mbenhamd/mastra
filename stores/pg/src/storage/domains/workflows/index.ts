@@ -8,6 +8,7 @@ import {
   WorkflowsStorage,
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
+  WorkflowTerminalContinuationStoredStateError,
   MAX_WORKFLOW_TERMINALIZATION_LEASE_MS,
   MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH,
   advanceWorkflowTerminalizationRecord,
@@ -88,6 +89,13 @@ import type {
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+
+class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
+  constructor() {
+    super('Invalid workflow terminal snapshot record');
+    this.name = 'CorruptWorkflowTerminalSnapshotRecordError';
+  }
+}
 
 const TABLE_WORKFLOW_TERMINALIZATIONS = 'mastra_workflow_terminalizations';
 const TABLE_WORKFLOW_TERMINAL_EFFECTS = 'mastra_workflow_terminal_effects';
@@ -584,7 +592,12 @@ export class WorkflowsPG extends WorkflowsStorage {
        WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
       [workflowName, runId],
     );
-    return row ? this.decodeTerminalSnapshotRow(row, now) : undefined;
+    if (!row) return undefined;
+    try {
+      return this.decodeTerminalSnapshotRow(row, now);
+    } catch {
+      throw new CorruptWorkflowTerminalSnapshotRecordError();
+    }
   }
 
   private decodeTerminalDestinationReceiptRow(
@@ -1647,14 +1660,26 @@ export class WorkflowsPG extends WorkflowsStorage {
           throw new TypeError('Parent application became ready without a parent effect');
         }
 
-        const retained = await this.getTerminalSnapshotRecord(t, operation.workflowName, operation.runId, context.now);
+        let retained: WorkflowTerminalSnapshotRecord | undefined;
+        try {
+          retained = await this.getTerminalSnapshotRecord(t, operation.workflowName, operation.runId, context.now);
+        } catch (error) {
+          if (error instanceof CorruptWorkflowTerminalSnapshotRecordError) {
+            return { status: 'corrupt_child_terminal_state' };
+          }
+          throw error;
+        }
         if (!retained) return { status: 'missing_child_terminal_state' };
-        validateWorkflowTerminalSnapshotJournalLink(
-          retained,
-          prepared.journal,
-          operation.workflowName,
-          operation.runId,
-        );
+        try {
+          validateWorkflowTerminalSnapshotJournalLink(
+            retained,
+            prepared.journal,
+            operation.workflowName,
+            operation.runId,
+          );
+        } catch {
+          return { status: 'corrupt_child_terminal_state' };
+        }
         const revisionRow = await t.oneOrNone<{ generation: number | string }>(
           `SELECT generation FROM ${this.workflowParentRevisionTableName()}
            WHERE workflow_name = $1 AND run_id = $2
@@ -1667,15 +1692,20 @@ export class WorkflowsPG extends WorkflowsStorage {
           [effect.parentWorkflowName, effect.parentRunId],
         );
         if (!parentRow) return { status: 'missing_parent' };
-        if (!revisionRow) throw new TypeError('Workflow parent snapshot is missing revision evidence');
+        if (!revisionRow) return { status: 'corrupt_parent_state' };
         const parentGeneration =
           typeof revisionRow.generation === 'string' ? Number(revisionRow.generation) : revisionRow.generation;
         if (!Number.isSafeInteger(parentGeneration) || parentGeneration < 1) {
-          throw new TypeError('Invalid workflow parent revision generation');
+          return { status: 'corrupt_parent_state' };
         }
-        const parentSnapshot = structuredClone(
-          typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot,
-        );
+        let parentSnapshot: WorkflowRunState;
+        try {
+          parentSnapshot = structuredClone(
+            typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot,
+          );
+        } catch {
+          return { status: 'corrupt_parent_state' };
+        }
 
         const finalClock = await t.one<{ now_ms: string }>(
           `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms`,
@@ -1724,7 +1754,12 @@ export class WorkflowsPG extends WorkflowsStorage {
             storageTimestamp,
             executionMode: 'continuous',
           });
-        } catch {
+        } catch (error) {
+          if (error instanceof WorkflowTerminalContinuationStoredStateError) {
+            return {
+              status: error.state === 'child' ? 'corrupt_child_terminal_state' : 'corrupt_parent_state',
+            };
+          }
           return { status: 'invalid_contract' };
         }
         const finalized = finalizeWorkflowTerminalParentApplicationRecords(
