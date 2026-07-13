@@ -364,25 +364,30 @@ export function materializeWorkflowTerminalRecoveryEnvelope(
   if (bytes > MAX_WORKFLOW_TERMINAL_RECOVERY_ENVELOPE_BYTES) fail('envelope', 'byte limit exceeded');
   // Enforce the aggregate node/entry/depth limits across all envelope fields,
   // not only inside each independently materialized payload.
-  materializeWorkflowTerminalCanonicalJson(envelope, 'envelope');
-  return envelope;
+  return materializeWorkflowTerminalCanonicalJson(
+    envelope,
+    'envelope',
+  ) as unknown as WorkflowTerminalRecoveryEnvelopeV1;
 }
 
 export function getWorkflowTerminalRecoveryEnvelopeHash(
   input: WorkflowTerminalRecoveryEnvelopeV1,
 ): WorkflowTerminalSha256 {
   const envelope = materializeWorkflowTerminalRecoveryEnvelope(input);
-  return hashFramed(
-    'mastra.workflow-terminal-recovery-envelope.v1',
-    getWorkflowTerminalCanonicalJson(materializeWorkflowTerminalCanonicalJson(envelope, 'envelope')),
-  );
+  return getMaterializedWorkflowTerminalRecoveryEnvelopeHash(envelope);
 }
 
-export function validateWorkflowTerminalRecoveryEnvelope(
-  input: WorkflowTerminalRecoveryEnvelopeV1,
-  expected: WorkflowTerminalRecoveryEnvelopeExpectedBinding = {},
+function getMaterializedWorkflowTerminalRecoveryEnvelopeHash(
+  envelope: WorkflowTerminalRecoveryEnvelopeV1,
+): WorkflowTerminalSha256 {
+  return hashFramed('mastra.workflow-terminal-recovery-envelope.v1', JSON.stringify(envelope));
+}
+
+function validateMaterializedWorkflowTerminalRecoveryEnvelope(
+  envelope: WorkflowTerminalRecoveryEnvelopeV1,
+  expected: WorkflowTerminalRecoveryEnvelopeExpectedBinding,
+  computedEnvelopeHash?: WorkflowTerminalSha256,
 ): void {
-  const envelope = materializeWorkflowTerminalRecoveryEnvelope(input);
   const expectedInput = descriptors(expected, 'expected');
   exactKeys(
     expectedInput,
@@ -406,10 +411,17 @@ export function validateWorkflowTerminalRecoveryEnvelope(
   }
   if (
     expectedEnvelopeHash !== undefined &&
-    getWorkflowTerminalRecoveryEnvelopeHash(envelope) !== expectedEnvelopeHash
+    (computedEnvelopeHash ?? getMaterializedWorkflowTerminalRecoveryEnvelopeHash(envelope)) !== expectedEnvelopeHash
   ) {
     fail('envelopeHash', 'binding mismatch');
   }
+}
+
+export function validateWorkflowTerminalRecoveryEnvelope(
+  input: WorkflowTerminalRecoveryEnvelopeV1,
+  expected: WorkflowTerminalRecoveryEnvelopeExpectedBinding = {},
+): void {
+  validateMaterializedWorkflowTerminalRecoveryEnvelope(materializeWorkflowTerminalRecoveryEnvelope(input), expected);
 }
 
 export function validateWorkflowTerminalRecoveryEnvelopeIntegrity(
@@ -421,10 +433,9 @@ export function validateWorkflowTerminalRecoveryEnvelopeIntegrity(
   if (read(input, 'version') !== 1) fail('record.version', 'must be 1');
   const envelopeHash = sha256(read(input, 'envelopeHash'), 'record.envelopeHash');
   const envelope = materializeWorkflowTerminalRecoveryEnvelope(read(input, 'envelope'));
-  if (getWorkflowTerminalRecoveryEnvelopeHash(envelope) !== envelopeHash)
-    fail('record.envelopeHash', 'integrity mismatch');
-  validateWorkflowTerminalRecoveryEnvelope(envelope, { envelopeHash });
-  validateWorkflowTerminalRecoveryEnvelope(envelope, expected);
+  const computedEnvelopeHash = getMaterializedWorkflowTerminalRecoveryEnvelopeHash(envelope);
+  if (computedEnvelopeHash !== envelopeHash) fail('record.envelopeHash', 'integrity mismatch');
+  validateMaterializedWorkflowTerminalRecoveryEnvelope(envelope, expected, computedEnvelopeHash);
 }
 
 export function copyWorkflowTerminalRecoveryEnvelope(

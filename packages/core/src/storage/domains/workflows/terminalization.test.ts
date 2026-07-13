@@ -422,15 +422,13 @@ describe('WorkflowsInMemory terminalization journal', () => {
       claimToken: claimed.record.claimToken,
       claimGeneration: claimed.record.claimGeneration,
       snapshot: childSnapshot,
-      recoveryEnvelope: {
-        ...createTerminalRecoveryEnvelope({
-          ...child,
-          snapshot: childSnapshot,
-          terminalStatus,
-          ancestry,
-        }),
+      recoveryEnvelope: createTerminalRecoveryEnvelope({
+        ...child,
+        snapshot: childSnapshot,
+        terminalStatus,
+        ancestry,
         terminalResult,
-      },
+      }),
     });
     const prepared = await workflows.prepareWorkflowTerminalEffect({
       ...child,
@@ -1171,15 +1169,13 @@ describe('WorkflowsInMemory terminalization journal', () => {
       await workflows.persistWorkflowTerminalState({
         ...childFence,
         snapshot,
-        recoveryEnvelope: {
-          ...createTerminalRecoveryEnvelope({
-            ...child,
-            snapshot,
-            terminalStatus: 'success',
-            ancestry,
-          }),
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...child,
+          snapshot,
+          terminalStatus: 'success',
+          ancestry,
           terminalResult: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
-        },
+        }),
       });
       const effect = await workflows.prepareWorkflowTerminalEffect({
         ...childFence,

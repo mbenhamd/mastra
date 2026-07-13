@@ -67,12 +67,30 @@ describe('workflow terminal recovery envelope', () => {
     expect(() =>
       validateWorkflowTerminalRecoveryEnvelopeIntegrity({ version: 1, envelopeHash: hash, envelope }),
     ).not.toThrow();
+    expect(() =>
+      validateWorkflowTerminalRecoveryEnvelopeIntegrity(
+        { version: 1, envelopeHash: hash, envelope },
+        { envelopeHash: `sha256:${'0'.repeat(64)}` },
+      ),
+    ).toThrow(/binding mismatch/);
   });
 
   it('produces stable hashes independent of input key order', () => {
     const left = materializeWorkflowTerminalRecoveryEnvelope(input({ finalState: { z: 1, a: 2 } }));
     const right = materializeWorkflowTerminalRecoveryEnvelope(input({ finalState: { a: 2, z: 1 } }));
     expect(getWorkflowTerminalRecoveryEnvelopeHash(left)).toBe(getWorkflowTerminalRecoveryEnvelopeHash(right));
+  });
+
+  it('keeps the durable envelope and ancestry digest vectors stable', () => {
+    const envelope = materializeWorkflowTerminalRecoveryEnvelope(input({ ancestry: [] }));
+    expect(getWorkflowTerminalRecoveryEnvelopeHash(envelope)).toBe(
+      'sha256:741f468a681ee5c497bb1a9ddd117b24c7c18ae0c2c9e10e25a15ce5fdd3bbe3',
+    );
+
+    const ancestry = materializeWorkflowTerminalRecoveryAncestry([frame()]);
+    expect(getWorkflowTerminalRecoveryAncestryHash(ancestry)).toBe(
+      'sha256:5351dc4169f4084014348159061b4ffbe076ef6e47d9b891a4f052d7c9cc3a9e',
+    );
   });
 
   it('normalizes native failed errors before hashing', () => {
