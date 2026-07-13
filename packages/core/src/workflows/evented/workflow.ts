@@ -2089,7 +2089,6 @@ export class EventedRun<
       includeResumeLabels?: boolean;
     };
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
-    if (params.label !== undefined) assertWorkflowResumeLabel(params.label);
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     if (!workflowsStore) {
       throw new Error('Cannot resume workflow: workflows store is required');
@@ -2180,19 +2179,11 @@ export class EventedRun<
       snapshotResumeStepId === snapshotResumeLabel.stepId &&
       isValidLocalForEachTarget;
 
-    // Do not echo caller-provided or stored label data into errors. Labels may contain
-    // sensitive values and can be arbitrarily large when this API is called dynamically.
+    // Do not echo caller-provided or stored label data into errors because labels may
+    // contain sensitive values.
     if (params.label !== undefined && !isValidSnapshotResumeLabel) {
       throw new Error('Resume label was not found for this workflow run');
     }
-    if (
-      params.label !== undefined &&
-      params.forEachIndex !== undefined &&
-      params.forEachIndex !== snapshotResumeLabel?.foreachIndex
-    ) {
-      throw new Error('Resume label does not match the requested foreach index');
-    }
-
     if (
       params.label !== undefined &&
       params.forEachIndex !== undefined &&

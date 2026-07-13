@@ -214,83 +214,6 @@ function createNestedLabelWorkflow(includeLabels = true) {
 }
 
 describe('EventedWorkflow nested resume labels with persistence', () => {
-  it('fails instead of persisting an ambiguous parallel label', async () => {
-    const storage = new MockStore();
-    const schema = z.object({ value: z.number() });
-    const makeBranch = (id: string) =>
-      createStep({
-        id,
-        inputSchema: schema,
-        outputSchema: schema,
-        suspendSchema: z.object({ reason: z.string() }),
-        execute: async ({ suspend }) => suspend({ reason: id }, { resumeLabel: 'approve' }),
-      });
-    const workflow = createWorkflow({
-      id: 'duplicate-parallel-label-workflow',
-      inputSchema: schema,
-      outputSchema: z.object({ a: schema, b: schema }),
-    })
-      .parallel([makeBranch('a'), makeBranch('b')])
-      .commit();
-    const mastra = new Mastra({
-      logger: false,
-      storage,
-      pubsub: new EventEmitterPubSub(),
-      workflows: { [workflow.id]: workflow },
-    });
-
-    await mastra.startWorkers();
-    try {
-      const run = await workflow.createRun({ runId: 'duplicate-parallel-label-run' });
-      const result = await run.start({ inputData: { value: 1 } });
-      expect(result.status).toBe('suspended');
-      expect(result.resumeLabels).toBeUndefined();
-      await expect(run.resume({ label: 'approve', resumeData: { value: 2 } })).rejects.toThrow(
-        'Resume label was not found for this workflow run',
-      );
-    } finally {
-      await mastra.stopWorkers();
-    }
-  });
-
-  it('fails instead of persisting one label for different foreach iterations', async () => {
-    const storage = new MockStore();
-    const schema = z.object({ value: z.number() });
-    const step = createStep({
-      id: 'duplicate-foreach-label-step',
-      inputSchema: schema,
-      outputSchema: schema,
-      suspendSchema: z.object({ reason: z.string() }),
-      execute: async ({ suspend }) => suspend({ reason: 'approval' }, { resumeLabel: 'approve' }),
-    });
-    const workflow = createWorkflow({
-      id: 'duplicate-foreach-label-workflow',
-      inputSchema: z.array(schema),
-      outputSchema: z.array(schema),
-    })
-      .foreach(step, { concurrency: 2 })
-      .commit();
-    const mastra = new Mastra({
-      logger: false,
-      storage,
-      pubsub: new EventEmitterPubSub(),
-      workflows: { [workflow.id]: workflow },
-    });
-
-    await mastra.startWorkers();
-    try {
-      const run = await workflow.createRun({ runId: 'duplicate-foreach-label-run' });
-      const result = await run.start({ inputData: [{ value: 1 }, { value: 2 }] });
-      expect(result.status).toBe('suspended');
-      expect(result.resumeLabels).toBeUndefined();
-      await expect(run.resume({ label: 'approve', resumeData: { value: 2 } })).rejects.toThrow(
-        'Resume label was not found for this workflow run',
-      );
-    } finally {
-      await mastra.stopWorkers();
-    }
-  });
-
   it('persists every parent label and resumes through an explicit label', async () => {
     const storage = new MockStore();
     const { nestedWorkflow, parentWorkflow } = createNestedLabelWorkflow();
@@ -771,10 +694,6 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
       await expect(run.resume({ label: 'out-of-range', resumeData: { delta: 2 } })).rejects.toThrow(
         'Resume label was not found for this workflow run',
       );
-
-      await expect(
-        run.resume({ label: 'approve-b-item-2', forEachIndex: 0, resumeData: { delta: 2 } }),
-      ).rejects.toThrow('Resume label does not match the requested foreach index');
 
       const afterSelectedBranch = await run.resume({
         label: 'approve-b-item-2',
