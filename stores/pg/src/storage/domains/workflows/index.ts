@@ -51,6 +51,7 @@ import {
   validateWorkflowNestedRunOwnershipInput,
   validateWorkflowNestedRunInitialSnapshot,
   inspectWorkflowNestedRunRetainedSnapshot,
+  validateWorkflowRunSnapshotShape,
   validateWorkflowSnapshotTimestampForFinalState,
   prepareWorkflowTerminalParentApplicationRecords,
   finalizeWorkflowTerminalParentApplicationRecords,
@@ -1150,33 +1151,27 @@ export class WorkflowsPG extends WorkflowsStorage {
             : { status: 'ancestry_conflict' };
         }
         for (const frame of desired.ancestry) {
-          const parentEvidence = await t.one<{
-            snapshot: unknown | null;
-            terminal_status: string | null;
-          }>(
-            `SELECT
-               (
-                 SELECT snapshot FROM ${this.workflowSnapshotTableName()}
-                 WHERE workflow_name = $1 AND run_id = $2
-               ) AS snapshot,
-               (
-                 SELECT terminal_status FROM ${this.workflowParentRevisionTableName()}
-                 WHERE workflow_name = $1 AND run_id = $2
-                 FOR UPDATE
-               ) AS terminal_status`,
+          const parentRevision = await t.oneOrNone<{ terminal_status: string | null }>(
+            `SELECT terminal_status FROM ${this.workflowParentRevisionTableName()}
+             WHERE workflow_name = $1 AND run_id = $2
+             FOR UPDATE`,
             [frame.parentWorkflowName, frame.parentRunId],
           );
-          let parentSnapshot = parentEvidence.snapshot;
+          if (!parentRevision || parentRevision.terminal_status !== null) {
+            throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
+          }
+          const parentEvidence = await t.oneOrNone<{ snapshot: unknown }>(
+            `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [frame.parentWorkflowName, frame.parentRunId],
+          );
+          let parentSnapshot = parentEvidence?.snapshot;
           if (typeof parentSnapshot === 'string') parentSnapshot = JSON.parse(parentSnapshot);
           const parentStatus =
             parentSnapshot && typeof parentSnapshot === 'object' && !Array.isArray(parentSnapshot)
               ? (parentSnapshot as Record<string, unknown>).status
               : undefined;
-          if (
-            parentEvidence.terminal_status !== null ||
-            parentStatus === undefined ||
-            isTerminalWorkflowRunStatus(parentStatus)
-          ) {
+          if (parentStatus === undefined || isTerminalWorkflowRunStatus(parentStatus)) {
             throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
           }
           if (!parentSnapshot || typeof parentSnapshot !== 'object' || Array.isArray(parentSnapshot)) {
@@ -2999,6 +2994,18 @@ export class WorkflowsPG extends WorkflowsStorage {
         }
         if (revisionLock.terminalStatus !== null) return { status: 'parent_terminal' };
         const snapshot = typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot;
+        try {
+          validateWorkflowRunSnapshotShape(snapshot, operation.runId, 'Nested workflow parent snapshot');
+        } catch {
+          if (revisionLock.created) {
+            await t.none(
+              `DELETE FROM ${this.workflowParentRevisionTableName()}
+               WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
+              [operation.workflowName, operation.runId],
+            );
+          }
+          return { status: 'parent_snapshot_conflict' };
+        }
         if (isTerminalWorkflowRunStatus(snapshot.status)) {
           await this.latchWorkflowParentTerminalStatus(t, operation.workflowName, operation.runId, snapshot.status);
           return { status: 'parent_terminal' };

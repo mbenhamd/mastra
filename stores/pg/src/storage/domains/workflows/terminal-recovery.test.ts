@@ -380,16 +380,23 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
     ['wrong-run', { runId: 'forged-run' }],
     ['unknown-status', { status: 'unknown' }],
     ['graph-drift', { serializedStepGraph: [{ type: 'step', step: { id: 'drifted', component: 'WORKFLOW' } }] }],
+    ['missing-value', { value: undefined }],
+    ['non-record-context', { context: [] }],
+    ['malformed-active-paths', { activePaths: 'bad' }],
+    ['malformed-active-step-paths', { activeStepsPath: { nested: ['bad'] } }],
+    ['empty-active-step-path', { activeStepsPath: { nested: [] } }],
+    ['malformed-suspended-paths', { suspendedPaths: null }],
+    ['malformed-resume-labels', { resumeLabels: { resume: { foreachIndex: 0 } } }],
+    ['malformed-waiting-paths', { waitingPaths: { sleep: [-1] } }],
   ] as const)('rejects retained child %s without partial admission writes', async (label, patch) => {
     const suffix = randomUUID();
     const parent = { workflowName: `conflict-parent-${label}-${suffix}`, runId: 'parent-run' };
     const child = { workflowName: `conflict-child-${label}-${suffix}`, runId: 'child-run' };
     try {
       await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
-      await workflowsA.persistWorkflowSnapshot({
-        ...child,
-        snapshot: { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as WorkflowRunState,
-      });
+      const retainedSnapshot = { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as Partial<WorkflowRunState>;
+      if (label === 'missing-value') delete retainedSnapshot.value;
+      await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: retainedSnapshot as WorkflowRunState });
       await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
         child.workflowName,
         child.runId,
@@ -409,6 +416,49 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         status: 'missing_ancestry',
       });
       await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+    } finally {
+      await cleanup([parent.workflowName, child.workflowName]);
+    }
+  });
+
+  it('rejects a malformed locked parent snapshot without admission writes', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `malformed-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `malformed-parent-child-${suffix}`, runId: 'child-run' };
+    const malformedParent = {
+      runId: parent.runId,
+      status: 'running',
+      timestamp: Date.now(),
+      context: {},
+      serializedStepGraph: NESTED_PARENT_GRAPH,
+    } as unknown as WorkflowRunState;
+    try {
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: malformedParent });
+      const parentBefore = await workflowsA.loadWorkflowSnapshot(parent);
+      await pool.query(
+        `DELETE FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+
+      await expect(
+        workflowsB.admitWorkflowNestedRun({
+          ...nestedAdmission(parent, child),
+          initialChildSnapshot: { snapshot: { ...createEmptyWorkflowSnapshot(child.runId), status: 'running' } },
+        }),
+      ).resolves.toEqual({ status: 'parent_snapshot_conflict' });
+
+      const revisionAfter = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(revisionAfter.rowCount).toBe(0);
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+      await expect(workflowsA.loadWorkflowSnapshot(child)).resolves.toBeNull();
+      await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
     } finally {
       await cleanup([parent.workflowName, child.workflowName]);
     }
@@ -826,6 +876,84 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         }),
       ).rejects.toThrow('Invalid workflow terminal snapshot record');
     } finally {
+      await cleanup([child.workflowName, parent.workflowName]);
+    }
+  });
+
+  it('validates ancestry against a graph rewrite committed ahead of the revision lock', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `ancestry-graph-race-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `ancestry-graph-race-child-${suffix}`, runId: 'child-run' };
+    const applicationName = `pf1782-ancestry-${suffix}`;
+    const ancestryPool = new Pool({
+      host: process.env.POSTGRES_HOST || '127.0.0.1',
+      port: Number(process.env.POSTGRES_PORT) || 5434,
+      database: process.env.POSTGRES_DB || 'postgres',
+      user: process.env.POSTGRES_USER || 'postgres',
+      password: process.env.POSTGRES_PASSWORD || 'postgres',
+      application_name: applicationName,
+      max: 1,
+    });
+    const blockedWorkflows = new WorkflowsPG({ pool: ancestryPool });
+    const writer = await pool.connect();
+    let writerTransactionOpen = false;
+    let ancestryAttempt: Promise<unknown> | undefined;
+    try {
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+      const rewrittenSnapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(parent.runId),
+        serializedStepGraph: [{ type: 'step', step: { id: 'rewritten', component: 'WORKFLOW' } }],
+      };
+
+      await writer.query('BEGIN');
+      writerTransactionOpen = true;
+      await writer.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+        [parent.workflowName, parent.runId],
+      );
+      await writer.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $3
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId, JSON.stringify(rewrittenSnapshot)],
+      );
+      await writer.query(
+        `UPDATE mastra_workflow_parent_revisions
+         SET generation = generation + 1,
+             updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+
+      ancestryAttempt = blockedWorkflows.persistWorkflowTerminalRecoveryAncestry({
+        ...child,
+        ancestry: ancestry(child, parent),
+      });
+      const waitDeadline = Date.now() + 5_000;
+      for (;;) {
+        const blocked = await pool.query<{ wait_event_type: string | null }>(
+          `SELECT wait_event_type FROM pg_stat_activity
+           WHERE application_name = $1
+             AND state = 'active'
+             AND query LIKE '%mastra_workflow_parent_revisions%'`,
+          [applicationName],
+        );
+        if (blocked.rows.some(row => row.wait_event_type === 'Lock')) break;
+        if (Date.now() >= waitDeadline) throw new Error('Ancestry validation did not block on the parent revision');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+
+      await writer.query('COMMIT');
+      writerTransactionOpen = false;
+      await expect(ancestryAttempt).rejects.toThrow('does not match serialized parent graph');
+      await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+    } finally {
+      if (writerTransactionOpen) await writer.query('ROLLBACK');
+      writer.release();
+      await ancestryAttempt?.catch(() => undefined);
+      await ancestryPool.end();
       await cleanup([child.workflowName, parent.workflowName]);
     }
   });

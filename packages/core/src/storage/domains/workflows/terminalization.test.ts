@@ -1540,7 +1540,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
   });
 
   it('atomically persists an isolated terminal snapshot before certifying the journal phase', async () => {
-    const workflows = await setup();
+    const { db, workflows } = await setupWithDb();
     const claim = await acquire(workflows);
     const fenced = fence(claim);
     const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
@@ -1569,10 +1569,19 @@ describe('WorkflowsInMemory terminalization journal', () => {
         }),
       ).resolves.toEqual({ status: 'invalid_snapshot' });
     }
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...fenced,
+        snapshot: { runId, status: 'failed', serializedStepGraph: [] } as unknown as WorkflowRunState,
+        recoveryEnvelope: validRecoveryEnvelope,
+      }),
+    ).resolves.toEqual({ status: 'invalid_snapshot' });
     await expect(workflows.getWorkflowTerminalization(run)).resolves.toMatchObject({
       status: 'found',
       record: { phase: 'terminalization_pending' },
     });
+    expect(db.workflowTerminalSnapshots.size).toBe(0);
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
 
     const terminalSnapshot = {
       ...createEmptyWorkflowSnapshot(runId),

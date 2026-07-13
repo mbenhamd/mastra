@@ -36,4 +36,4 @@ await workflowsStorage.persistWorkflowTerminalState({
 const { recovery } = await workflowsStorage.getWorkflowTerminalEffectForDispatch(input)
 ```
 
-The recovery envelope and the atomic initial child snapshot are canonical, bounded data. They reject accessors, proxies, executable values, custom or inherited serialization hooks, malformed Unicode, and the framework authentication token instead of retaining provider or runtime objects.
+The recovery envelope and the atomic initial child snapshot are canonical, bounded data. They reject accessors, proxies, executable values, custom or inherited serialization hooks, malformed Unicode, and the framework authentication token instead of retaining provider or runtime objects. Atomic admission returns `parent_snapshot_conflict` for malformed or incomplete locked parent state without writing ownership, ancestry, or child state. Terminal persistence returns `invalid_snapshot` for incomplete required run state before advancing the journal or retaining evidence.

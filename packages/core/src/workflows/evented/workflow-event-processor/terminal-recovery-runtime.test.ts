@@ -976,6 +976,58 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     await mastra.shutdown();
   });
 
+  it('reports malformed durable parent state before nested start publication', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'malformed-parent-run';
+    const childRunId = 'malformed-parent-child-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        runId: parentRunId,
+        status: 'running',
+        timestamp: Date.now(),
+        context: {},
+        serializedStepGraph: parentGraph,
+      } as unknown as WorkflowRunState,
+    });
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    await expect(
+      processor.start({
+        workflow: workflow('child'),
+        workflowId: 'child',
+        runId: childRunId,
+        executionPath: [0],
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        prevResult: { status: 'success' as const, output: {} },
+        requestContext: {},
+        parentWorkflow: {
+          workflowId: 'parent',
+          runId: parentRunId,
+          stepId: 'child',
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepGraph: parentGraph,
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: { status: 'success' as const, output: {} },
+        },
+      } satisfies ProcessorArgs),
+    ).rejects.toMatchObject({ id: 'MASTRA_WORKFLOW_NESTED_RUN_PARENT_SNAPSHOT_CONFLICT' });
+    expect(publish).not.toHaveBeenCalled();
+    await expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves.toBeNull();
+    await expect(
+      workflows.getWorkflowTerminalRecoveryAncestry({ workflowName: 'child', runId: childRunId }),
+    ).resolves.toEqual({ status: 'missing_ancestry' });
+    await mastra.shutdown();
+  });
+
   it('does not overwrite progress injected after atomic admission and before start publication completes', async () => {
     const { mastra, workflows, processor } = await setup();
     const parentRunId = 'barrier-parent-run';

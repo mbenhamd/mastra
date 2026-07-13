@@ -601,7 +601,9 @@ export class WorkflowEventProcessor extends EventProcessor {
                   ? 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_ANCESTRY_CONFLICT'
                   : admission.status === 'child_snapshot_conflict'
                     ? 'MASTRA_WORKFLOW_NESTED_RUN_CHILD_SNAPSHOT_CONFLICT'
-                    : 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_ADMISSION_UNAVAILABLE',
+                    : admission.status === 'parent_snapshot_conflict'
+                      ? 'MASTRA_WORKFLOW_NESTED_RUN_PARENT_SNAPSHOT_CONFLICT'
+                      : 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_ADMISSION_UNAVAILABLE',
             text: 'Nested workflow recovery admission could not be retained',
             domain: ErrorDomain.MASTRA_WORKFLOW,
             category: ErrorCategory.SYSTEM,

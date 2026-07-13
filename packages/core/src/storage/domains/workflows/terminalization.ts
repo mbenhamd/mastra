@@ -19,6 +19,7 @@ import {
   validateWorkflowTerminalParentContinuationIntegrity,
   WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
 } from '../../../workflows/terminal-continuation';
+import { getDenseDataArray, getPlainDataDescriptors } from '../../../workflows/terminal-continuation/data-shape';
 import {
   copyWorkflowTerminalRecoveryAncestry,
   getWorkflowTerminalRecoveryAncestryHash,
@@ -307,7 +308,7 @@ export function captureWorkflowNestedRunAdmissionInput(
   };
 }
 
-const WORKFLOW_NESTED_RUN_STATUSES = [
+const WORKFLOW_RUN_STATUSES = [
   'running',
   'success',
   'failed',
@@ -319,8 +320,141 @@ const WORKFLOW_NESTED_RUN_STATUSES = [
   'bailed',
   'paused',
 ] as const;
-const WORKFLOW_NESTED_RUN_TERMINAL_STATUSES = ['success', 'failed', 'tripwire', 'canceled', 'bailed'] as const;
-type WorkflowNestedRunTerminalStatus = (typeof WORKFLOW_NESTED_RUN_TERMINAL_STATUSES)[number];
+const WORKFLOW_RUN_TERMINAL_STATUSES = ['success', 'failed', 'tripwire', 'canceled', 'bailed'] as const;
+type WorkflowNestedRunTerminalStatus = (typeof WORKFLOW_RUN_TERMINAL_STATUSES)[number];
+
+const WORKFLOW_RUN_REQUIRED_SNAPSHOT_FIELDS = new Set([
+  'runId',
+  'status',
+  'value',
+  'context',
+  'serializedStepGraph',
+  'activePaths',
+  'activeStepsPath',
+  'suspendedPaths',
+  'resumeLabels',
+  'waitingPaths',
+  'timestamp',
+]);
+const MAX_WORKFLOW_RUN_SNAPSHOT_MAP_KEYS = 100_000;
+
+function workflowRunDataDescriptors(value: unknown, field: string): Record<string, PropertyDescriptor> {
+  return getPlainDataDescriptors(value, {
+    allowNullPrototype: true,
+    typeError: `${field} must be a plain data object`,
+    fieldsError: `${field} must contain only own enumerable data fields`,
+    maxKeys: MAX_WORKFLOW_RUN_SNAPSHOT_MAP_KEYS,
+    maxKeysError: `${field} exceeds the workflow snapshot map-key limit`,
+  });
+}
+
+function requiredWorkflowRunSnapshotField(
+  descriptors: Record<string, PropertyDescriptor>,
+  key: string,
+  field: string,
+): unknown {
+  const descriptor = descriptors[key];
+  if (!descriptor) throw new TypeError(`${field} is missing ${key}`);
+  return descriptor.value;
+}
+
+function validateWorkflowRunSnapshotPath(value: unknown, field: string, minLength = 0): void {
+  const entries = getDenseDataArray(value, {
+    typeError: `${field} must be a dense path`,
+    lengthError: `${field} exceeds the workflow path limit`,
+    dataError: `${field} must be dense and data-only`,
+    minLength,
+    maxLength: MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH,
+  });
+  for (const entry of entries) {
+    if (!Number.isSafeInteger(entry) || (entry as number) < 0) {
+      throw new TypeError(`${field} must contain non-negative safe integers`);
+    }
+  }
+}
+
+function validateWorkflowRunSnapshotPathMap(value: unknown, field: string): void {
+  const descriptors = workflowRunDataDescriptors(value, field);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    validateWorkflowRunSnapshotPath(descriptor.value, `${field}.${key}`, 1);
+  }
+}
+
+function validateWorkflowRunResumeLabels(value: unknown, field: string): void {
+  const labels = workflowRunDataDescriptors(value, field);
+  for (const [label, descriptor] of Object.entries(labels)) {
+    const fields = workflowRunDataDescriptors(descriptor.value, `${field}.${label}`);
+    const keys = Object.keys(fields);
+    if (keys.some(key => key !== 'stepId' && key !== 'foreachIndex') || !fields.stepId) {
+      throw new TypeError(`${field}.${label} is invalid`);
+    }
+    validateWorkflowTerminalizationIdentity(fields.stepId.value, `${field}.${label}.stepId`, 512);
+    if (
+      fields.foreachIndex &&
+      (!Number.isSafeInteger(fields.foreachIndex.value) || (fields.foreachIndex.value as number) < 0)
+    ) {
+      throw new TypeError(`${field}.${label}.foreachIndex must be a non-negative safe integer`);
+    }
+  }
+}
+
+/** @internal Validates the complete required, own-data WorkflowRunState shape. */
+export function validateWorkflowRunSnapshotShape(
+  snapshot: unknown,
+  runId: string,
+  field = 'Workflow run snapshot',
+): {
+  status: (typeof WORKFLOW_RUN_STATUSES)[number];
+  graphFingerprint: string;
+} {
+  const descriptors = workflowRunDataDescriptors(snapshot, field);
+  for (const key of WORKFLOW_RUN_REQUIRED_SNAPSHOT_FIELDS) requiredWorkflowRunSnapshotField(descriptors, key, field);
+  const snapshotRunId = requiredWorkflowRunSnapshotField(descriptors, 'runId', field);
+  const status = requiredWorkflowRunSnapshotField(descriptors, 'status', field);
+  if (snapshotRunId !== runId) throw new TypeError(`${field} run identity is invalid`);
+  if (typeof status !== 'string' || !WORKFLOW_RUN_STATUSES.includes(status as (typeof WORKFLOW_RUN_STATUSES)[number])) {
+    throw new TypeError(`${field} status is invalid`);
+  }
+  const timestamp = requiredWorkflowRunSnapshotField(descriptors, 'timestamp', field);
+  if (!Number.isSafeInteger(timestamp) || (timestamp as number) < 0) {
+    throw new TypeError(`${field} timestamp is invalid`);
+  }
+  workflowRunDataDescriptors(requiredWorkflowRunSnapshotField(descriptors, 'value', field), `${field}.value`);
+  workflowRunDataDescriptors(requiredWorkflowRunSnapshotField(descriptors, 'context', field), `${field}.context`);
+  const requestContext = descriptors.requestContext?.value;
+  if (requestContext !== undefined) workflowRunDataDescriptors(requestContext, `${field}.requestContext`);
+  validateWorkflowRunSnapshotPath(
+    requiredWorkflowRunSnapshotField(descriptors, 'activePaths', field),
+    `${field}.activePaths`,
+  );
+  validateWorkflowRunSnapshotPathMap(
+    requiredWorkflowRunSnapshotField(descriptors, 'activeStepsPath', field),
+    `${field}.activeStepsPath`,
+  );
+  validateWorkflowRunSnapshotPathMap(
+    requiredWorkflowRunSnapshotField(descriptors, 'suspendedPaths', field),
+    `${field}.suspendedPaths`,
+  );
+  validateWorkflowRunResumeLabels(
+    requiredWorkflowRunSnapshotField(descriptors, 'resumeLabels', field),
+    `${field}.resumeLabels`,
+  );
+  validateWorkflowRunSnapshotPathMap(
+    requiredWorkflowRunSnapshotField(descriptors, 'waitingPaths', field),
+    `${field}.waitingPaths`,
+  );
+  const graphFingerprint = createWorkflowTerminalGraphFingerprint(
+    requiredWorkflowRunSnapshotField(
+      descriptors,
+      'serializedStepGraph',
+      field,
+    ) as WorkflowRunState['serializedStepGraph'],
+  );
+  return {
+    status: status as (typeof WORKFLOW_RUN_STATUSES)[number],
+    graphFingerprint,
+  };
+}
 
 export type WorkflowNestedRunRetainedSnapshotInspection =
   | { status: 'retained'; graphFingerprint: string }
@@ -334,25 +468,12 @@ export function inspectWorkflowNestedRunRetainedSnapshot(
   expectedGraphFingerprint?: string,
 ): WorkflowNestedRunRetainedSnapshotInspection {
   try {
-    if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return { status: 'conflict' };
-    if (ownDataValue(snapshot, 'runId') !== nestedRunId) return { status: 'conflict' };
-    const status = ownDataValue(snapshot, 'status');
-    if (
-      typeof status !== 'string' ||
-      !WORKFLOW_NESTED_RUN_STATUSES.includes(status as (typeof WORKFLOW_NESTED_RUN_STATUSES)[number])
-    ) {
-      return { status: 'conflict' };
-    }
-    const timestamp = ownDataValue(snapshot, 'timestamp');
-    if (!Number.isSafeInteger(timestamp) || (timestamp as number) < 0) return { status: 'conflict' };
-    const context = ownDataValue(snapshot, 'context');
-    if (context === null || typeof context !== 'object' || Array.isArray(context)) return { status: 'conflict' };
-    const graphFingerprint = createWorkflowTerminalGraphFingerprint(
-      ownDataValue(snapshot, 'serializedStepGraph') as WorkflowRunState['serializedStepGraph'],
+    const { status, graphFingerprint } = validateWorkflowRunSnapshotShape(
+      snapshot,
+      nestedRunId,
+      'Retained nested workflow snapshot',
     );
-    if (
-      WORKFLOW_NESTED_RUN_TERMINAL_STATUSES.includes(status as (typeof WORKFLOW_NESTED_RUN_TERMINAL_STATUSES)[number])
-    ) {
+    if (WORKFLOW_RUN_TERMINAL_STATUSES.includes(status as (typeof WORKFLOW_RUN_TERMINAL_STATUSES)[number])) {
       return { status: 'terminal', terminalStatus: status as WorkflowNestedRunTerminalStatus, graphFingerprint };
     }
     if (expectedGraphFingerprint !== undefined && graphFingerprint !== expectedGraphFingerprint) {
@@ -404,23 +525,11 @@ export function validateWorkflowNestedRunInitialSnapshot(
     snapshotDescriptor.value,
     'initialChildSnapshot.snapshot',
   ) as unknown as WorkflowRunState;
-  const runId = ownDataValue(snapshot, 'runId');
-  const status = ownDataValue(snapshot, 'status');
-  const timestamp = ownDataValue(snapshot, 'timestamp');
-  const context = ownDataValue(snapshot, 'context');
-  const serializedStepGraph = ownDataValue(snapshot, 'serializedStepGraph') as WorkflowRunState['serializedStepGraph'];
-  if (
-    runId !== nestedRunId ||
-    status !== 'running' ||
-    !Number.isSafeInteger(timestamp) ||
-    (timestamp as number) < 0 ||
-    context === null ||
-    typeof context !== 'object' ||
-    Array.isArray(context)
-  ) {
+  const inspection = validateWorkflowRunSnapshotShape(snapshot, nestedRunId, 'Initial nested workflow snapshot');
+  if (inspection.status !== 'running') {
     throw new TypeError('Initial nested workflow snapshot must be a valid running child snapshot');
   }
-  if (createWorkflowTerminalGraphFingerprint(serializedStepGraph) !== expectedChildGraphFingerprint) {
+  if (inspection.graphFingerprint !== expectedChildGraphFingerprint) {
     throw new TypeError('Initial nested workflow snapshot graph does not match the expected child graph');
   }
   return {
@@ -1803,16 +1912,10 @@ export function persistWorkflowTerminalStateRecord(
     return { status: 'invalid_snapshot' };
   }
   try {
-    if (
-      !inputSnapshot ||
-      typeof inputSnapshot !== 'object' ||
-      Array.isArray(inputSnapshot) ||
-      inputSnapshot.runId !== input.runId ||
-      inputSnapshot.status !== authorization.record.terminalStatus
-    ) {
+    const inspection = validateWorkflowRunSnapshotShape(inputSnapshot, input.runId, 'Workflow terminal snapshot');
+    if (inspection.status !== authorization.record.terminalStatus) {
       return { status: 'invalid_snapshot' };
     }
-    createWorkflowTerminalGraphFingerprint(inputSnapshot.serializedStepGraph);
   } catch {
     return { status: 'invalid_snapshot' };
   }
@@ -1865,17 +1968,21 @@ export function persistWorkflowTerminalStateRecord(
     projectedSnapshot.error = recovery.envelope.terminalResult
       .error as PersistWorkflowTerminalStateInput['snapshot']['error'];
   }
-  const snapshot = materializeSnapshot({
-    ...projectedSnapshot,
-    result: recovery.envelope.terminalResult,
-    context: {
-      ...inputSnapshot.context,
-      __state: recovery.envelope.finalState as never,
-    } as unknown as PersistWorkflowTerminalStateInput['snapshot']['context'],
-    value: recovery.envelope.finalState as PersistWorkflowTerminalStateInput['snapshot']['value'],
-    requestContext: recovery.envelope.requestContextPatch,
-  });
-  if (!snapshot || snapshot.runId !== input.runId || snapshot.status !== authorization.record.terminalStatus) {
+  let snapshot: PersistWorkflowTerminalStateInput['snapshot'];
+  try {
+    snapshot = materializeSnapshot({
+      ...projectedSnapshot,
+      result: recovery.envelope.terminalResult,
+      context: {
+        ...inputSnapshot.context,
+        __state: recovery.envelope.finalState as never,
+      } as unknown as PersistWorkflowTerminalStateInput['snapshot']['context'],
+      value: recovery.envelope.finalState as PersistWorkflowTerminalStateInput['snapshot']['value'],
+      requestContext: recovery.envelope.requestContextPatch,
+    });
+    const inspection = validateWorkflowRunSnapshotShape(snapshot, input.runId, 'Projected workflow terminal snapshot');
+    if (inspection.status !== authorization.record.terminalStatus) return { status: 'invalid_snapshot' };
+  } catch {
     return { status: 'invalid_snapshot' };
   }
   const leaseExpiresAt =

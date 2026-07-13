@@ -263,6 +263,7 @@ export type AdmitWorkflowNestedRunResult =
       status:
         | 'ownership_conflict'
         | 'ancestry_conflict'
+        | 'parent_snapshot_conflict'
         | 'parent_terminal'
         | 'child_terminal'
         | 'child_snapshot_conflict'

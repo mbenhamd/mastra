@@ -350,16 +350,23 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
     ['wrong run identity', { runId: 'forged-run' }],
     ['unknown status', { status: 'unknown' }],
     ['graph drift', { serializedStepGraph: [{ type: 'step', step: { id: 'drifted', component: 'WORKFLOW' } }] }],
+    ['missing value', { value: undefined }],
+    ['non-record context', { context: [] }],
+    ['malformed active paths', { activePaths: 'bad' }],
+    ['malformed active step paths', { activeStepsPath: { nested: ['bad'] } }],
+    ['empty active step path', { activeStepsPath: { nested: [] } }],
+    ['malformed suspended paths', { suspendedPaths: null }],
+    ['malformed resume labels', { resumeLabels: { resume: { foreachIndex: 0 } } }],
+    ['malformed waiting paths', { waitingPaths: { sleep: [-1] } }],
   ] as const)('rejects retained child %s without partial admission writes', async (_label, patch) => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
     const parent = { workflowName: `conflict-parent-${_label}`, runId: 'parent-run' };
     const child = { workflowName: `conflict-child-${_label}`, runId: 'child-run' };
     await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
-    await workflows.persistWorkflowSnapshot({
-      ...child,
-      snapshot: { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as WorkflowRunState,
-    });
+    const retainedSnapshot = { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as Partial<WorkflowRunState>;
+    if (_label === 'missing value') delete retainedSnapshot.value;
+    await workflows.persistWorkflowSnapshot({ ...child, snapshot: retainedSnapshot as WorkflowRunState });
     const childKey = JSON.stringify([child.workflowName, child.runId]);
     db.workflowTerminalParentRevisions.delete(childKey);
     const parentBefore = await workflows.loadWorkflowSnapshot(parent);
@@ -373,6 +380,38 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
       status: 'missing_ancestry',
     });
     await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+  });
+
+  it('rejects a malformed locked parent snapshot without admission writes', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'malformed-parent', runId: 'parent-run' };
+    const child = { workflowName: 'malformed-parent-child', runId: 'child-run' };
+    const malformedParent = {
+      runId: parent.runId,
+      status: 'running',
+      timestamp: Date.now(),
+      context: {},
+      serializedStepGraph: NESTED_PARENT_GRAPH,
+    } as unknown as WorkflowRunState;
+    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: malformedParent });
+    const parentKey = JSON.stringify([parent.workflowName, parent.runId]);
+    const parentBefore = await workflows.loadWorkflowSnapshot(parent);
+    db.workflowTerminalParentRevisions.delete(parentKey);
+
+    await expect(
+      workflows.admitWorkflowNestedRun({
+        ...nestedAdmission(parent, child),
+        initialChildSnapshot: { snapshot: { ...createEmptyWorkflowSnapshot(child.runId), status: 'running' } },
+      }),
+    ).resolves.toEqual({ status: 'parent_snapshot_conflict' });
+
+    expect(db.workflowTerminalParentRevisions.has(parentKey)).toBe(false);
+    await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+    await expect(workflows.loadWorkflowSnapshot(child)).resolves.toBeNull();
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+      status: 'missing_ancestry',
+    });
   });
 
   it.each(['own', 'inherited'] as const)(

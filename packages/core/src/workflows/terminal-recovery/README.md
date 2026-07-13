@@ -74,8 +74,12 @@ nonpersisting durable replay cannot dispatch retained state from a different
 graph. A terminal child marker or snapshot returns `child_terminal` without
 resurrecting a deleted canonical row. Malformed, wrong-run, unknown-status, or
 graph-drifted retained state returns `child_snapshot_conflict`; these failure
-paths write neither parent ownership nor recovery ancestry. Terminal persistence produces the same envelope and hash in every
-adapter and validates them on every read. Nested scalar ownership is stored as
+paths write neither parent ownership nor recovery ancestry. Malformed or
+incomplete locked parent state returns `parent_snapshot_conflict` before parent
+ownership, recovery ancestry, or child initialization changes. Terminal
+persistence rejects incomplete required run state as `invalid_snapshot` before
+advancing the journal or retaining evidence, then produces the same envelope
+and hash in every adapter and validates them on every read. Nested scalar ownership is stored as
 `nestedRunId`; concurrent foreach ownership is stored as
 `iterationRunIds[index]` under the established workflow metadata key. Matching
 ownership-and-ancestry replay does not reapply the transient running result or

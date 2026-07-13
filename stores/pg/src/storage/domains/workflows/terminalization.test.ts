@@ -1405,11 +1405,27 @@ describe('WorkflowsPG terminalization journal', () => {
           recoveryEnvelope: validRecovery,
         }),
       ).resolves.toEqual({ status: 'invalid_snapshot' });
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot: { runId, status: 'failed', serializedStepGraph: [] } as unknown as WorkflowRunState,
+          recoveryEnvelope: validRecovery,
+        }),
+      ).resolves.toEqual({ status: 'invalid_snapshot' });
       await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
         status: 'found',
         record: { phase: 'terminalization_pending' },
       });
       await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
+      const retained = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM mastra_workflow_terminal_snapshots_v2
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(retained.rows[0]?.count).toBe('0');
     } finally {
       await cleanup(workflowName);
     }

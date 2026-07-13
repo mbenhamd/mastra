@@ -105,6 +105,7 @@ import {
   validateWorkflowNestedRunOwnershipInput,
   validateWorkflowNestedRunInitialSnapshot,
   inspectWorkflowNestedRunRetainedSnapshot,
+  validateWorkflowRunSnapshotShape,
   validateWorkflowTerminalSnapshotJournalLink,
   validateWorkflowTerminalEffectRecoveryLink,
   validateWorkflowTerminalRecoveryAncestryRecord,
@@ -1331,6 +1332,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const parentRevision = this.db.workflowTerminalParentRevisions.get(parentKey);
     if (parentRevision?.terminalStatus) return { status: 'parent_terminal' };
     const snapshot = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
+    try {
+      validateWorkflowRunSnapshotShape(snapshot, operation.runId, 'Nested workflow parent snapshot');
+    } catch {
+      return { status: 'parent_snapshot_conflict' };
+    }
     if (isTerminalParentStatus(snapshot.status)) {
       this.latchParentTerminalStatus(parentKey, snapshot.status);
       return { status: 'parent_terminal' };
