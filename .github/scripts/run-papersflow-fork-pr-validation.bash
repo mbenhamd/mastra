@@ -57,6 +57,10 @@ while IFS= read -r file; do
   search_dir="$(dirname "$file")"
   while [[ "$search_dir" != "." && "$search_dir" != "/" ]]; do
     manifest_path="${search_dir}/package.json"
+    if [[ "$manifest_path" == */__fixtures__/* ]]; then
+      search_dir="$(dirname "$search_dir")"
+      continue
+    fi
     if [[ -f "$manifest_path" ]] ||
       git cat-file -e "${HEAD_SHA}:${manifest_path}" 2>/dev/null ||
       git cat-file -e "${BASE_SHA}:${manifest_path}" 2>/dev/null; then
@@ -78,7 +82,7 @@ cat "$changed_workspaces"
 
 while IFS= read -r workspace; do
   case "$workspace" in
-    packages/_internal-core | packages/core | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -135,8 +139,23 @@ fi
 run_with_validation_budget 900 pnpm build:core
 run_with_validation_budget 600 pnpm --filter @mastra/core check
 
+if workspace_changed auth/okta; then
+  run_with_validation_budget 900 pnpm --filter @mastra/auth-okta build
+  run_with_validation_budget 600 pnpm --filter @mastra/auth-okta lint
+fi
+
 if workspace_changed packages/_internal-core; then
   run_with_validation_budget 600 pnpm --dir packages/_internal-core typecheck
+fi
+
+if workspace_changed packages/deployer; then
+  run_with_validation_budget 900 pnpm --filter @mastra/memory build:lib
+  run_with_validation_budget 900 pnpm --filter @mastra/agent-builder build
+  run_with_validation_budget 900 pnpm --filter @mastra/server build:lib
+  run_with_validation_budget 900 pnpm --filter @mastra/hono build
+  run_with_validation_budget 600 pnpm --filter @mastra/deployer exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter @mastra/deployer build:lib
+  run_with_validation_budget 600 pnpm --filter @mastra/deployer lint
 fi
 
 if workspace_changed packages/memory; then
