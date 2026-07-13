@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { Schema } from '@internal/ai-v6';
 import type { ProviderDefinedTool, ToolExecutionOptions } from '@internal/external-types';
 import {
@@ -31,6 +30,10 @@ import { safeStringify } from '../../utils';
 import { isZodObject, safeExtendZodObject } from '../../utils/zod-utils';
 
 import type { SuspendOptions } from '../../workflows';
+import {
+  createToolRecoveryFingerprint as hashToolRecoveryFingerprint,
+  normalizeToolRecoverySchema,
+} from '../recovery-fingerprint';
 import { ToolStream } from '../stream';
 import type {
   CoreTool,
@@ -66,29 +69,44 @@ interface LogMessageOptions {
 function createToolRecoveryFingerprint(
   tool: ToolToConvert,
   schemas: { input?: unknown; output?: unknown; suspend?: unknown; resume?: unknown },
+  options: { backgroundConfig?: unknown; requireApproval?: unknown },
 ): string {
-  const functionSource = (value: unknown) =>
-    typeof value === 'function' ? Function.prototype.toString.call(value) : undefined;
   const candidate = tool as unknown as Record<string, unknown>;
   const originalFingerprint =
     typeof candidate.recoveryFingerprint === 'string' ? candidate.recoveryFingerprint : undefined;
-  return createHash('sha256')
-    .update(
-      safeStringify({
-        id: candidate.id,
-        originalFingerprint,
-        description: candidate.description,
-        schemas,
-        execute: functionSource(candidate.execute),
-        requireApproval: functionSource(candidate.requireApproval) ?? candidate.requireApproval,
-        needsApproval: functionSource(candidate.needsApproval) ?? candidate.needsApproval,
-        needsApprovalFn: functionSource(candidate.needsApprovalFn),
-        toModelOutput: functionSource(candidate.toModelOutput),
-        transform: candidate.transform,
-        mcp: candidate.mcp,
-      }),
-    )
-    .digest('hex');
+  return hashToolRecoveryFingerprint({
+    id: candidate.id,
+    name: candidate.name,
+    type: candidate.type,
+    args: candidate.args,
+    originalFingerprint,
+    description: candidate.description,
+    schemas: {
+      input: normalizeToolRecoverySchema(schemas.input),
+      output: normalizeToolRecoverySchema(schemas.output),
+      suspend: normalizeToolRecoverySchema(schemas.suspend),
+      resume: normalizeToolRecoverySchema(schemas.resume),
+    },
+    requestContextSchema: normalizeToolRecoverySchema(candidate.requestContextSchema),
+    execute: candidate.execute,
+    requireApproval: candidate.requireApproval,
+    builderRequireApproval: options.requireApproval,
+    needsApproval: candidate.needsApproval,
+    needsApprovalFn: candidate.needsApprovalFn,
+    strict: candidate.strict,
+    providerOptions: candidate.providerOptions,
+    toModelOutput: candidate.toModelOutput,
+    transform: candidate.transform,
+    inputExamples: candidate.inputExamples,
+    mcp: candidate.mcp,
+    mcpMetadata: candidate.mcpMetadata,
+    background: candidate.background,
+    backgroundConfig: options.backgroundConfig,
+    onInputStart: candidate.onInputStart,
+    onInputDelta: candidate.onInputDelta,
+    onInputAvailable: candidate.onInputAvailable,
+    onOutput: candidate.onOutput,
+  });
 }
 
 /**
@@ -1024,12 +1042,19 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
-      recoveryFingerprint: createToolRecoveryFingerprint(this.originalTool, {
-        input: processedInputSchema,
-        output: processedOutputSchema,
-        suspend: this.getSuspendSchema(),
-        resume: this.getResumeSchema(),
-      }),
+      recoveryFingerprint: createToolRecoveryFingerprint(
+        this.originalTool,
+        {
+          input: processedInputSchema,
+          output: processedOutputSchema,
+          suspend: this.getSuspendSchema(),
+          resume: this.getResumeSchema(),
+        },
+        {
+          backgroundConfig: this.options.backgroundConfig,
+          requireApproval: this.options.requireApproval,
+        },
+      ),
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,

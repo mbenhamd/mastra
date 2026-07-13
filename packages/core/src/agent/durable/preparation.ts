@@ -50,6 +50,8 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext;
     memoryConfig?: MemoryConfig;
     autoResumeSuspendedTools?: boolean;
+    agentId?: string;
+    agentName?: string;
   }): Promise<Record<string, CoreTool>>;
   listInputProcessors(requestContext?: RequestContext): Promise<InputProcessorOrWorkflow[]>;
   listOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
@@ -59,6 +61,8 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext;
     memory?: AgentExecutionOptions<any>['memory'];
     runId: string;
+    agentId?: string;
+    agentName?: string;
   }): Promise<void>;
 }
 
@@ -88,6 +92,10 @@ export interface PreparationResult<_OUTPUT = undefined> {
 export interface PreparationOptions<OUTPUT = undefined> {
   /** The agent instance */
   agent: Agent<string, any, OUTPUT>;
+  /** Public durable-agent ID to persist when it differs from the wrapped agent ID. */
+  durableAgentId?: string;
+  /** Public durable-agent name to persist when it differs from the wrapped agent name. */
+  durableAgentName?: string;
   /** User messages to process */
   messages: MessageListInput;
   /** Execution options */
@@ -118,6 +126,8 @@ async function preflightDurableExecution<OUTPUT = undefined>(
     options: execOptions,
     runId: providedRunId,
     requestContext: providedRequestContext,
+    durableAgentId,
+    durableAgentName,
     logger,
     mastra,
   } = options;
@@ -143,6 +153,8 @@ async function preflightDurableExecution<OUTPUT = undefined>(
     requestContext,
     memory: execOptions?.memory,
     runId,
+    agentId: durableAgentId ?? agent.id,
+    agentName: durableAgentName ?? agent.name,
   });
 
   return { runId, requestContext, mergedVersions };
@@ -166,7 +178,15 @@ async function preflightDurableExecution<OUTPUT = undefined>(
 export async function prepareForDurableExecution<OUTPUT = undefined>(
   options: PreparationOptions<OUTPUT>,
 ): Promise<PreparationResult<OUTPUT>> {
-  const { agent, messages, options: execOptions, logger, mastra } = options;
+  const {
+    agent,
+    durableAgentId = agent.id,
+    durableAgentName = agent.name,
+    messages,
+    options: execOptions,
+    logger,
+    mastra,
+  } = options;
 
   const typedAgent = agent as unknown as DurablePreparationAgent;
   const preflight = await preflightDurableExecution(options);
@@ -301,6 +321,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext,
       memoryConfig: execOptions?.memory?.options,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      agentId: durableAgentId,
+      agentName: durableAgentName,
     });
   } catch (error) {
     logger?.warn?.(`[DurableAgent] Error converting tools: ${error}`);
@@ -371,8 +393,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 13. Create serialized workflow input
   const workflowInput = createWorkflowInput({
     runId,
-    agentId: agent.id,
-    agentName: agent.name,
+    agentId: durableAgentId,
+    agentName: durableAgentName,
     versions: mergedVersions,
     hasProcessors: inputProcessors.length > 0 || outputProcessors.length > 0 || errorProcessors.length > 0,
     runtimeBindings: {
@@ -416,7 +438,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
 
   // 14. Create registry entry for non-serializable state
   const registryEntry: RunRegistryEntry = {
-    agentId: agent.id,
+    agentId: durableAgentId,
     threadId,
     resourceId,
     tools,

@@ -9,4 +9,21 @@
 **Breaking change:** `DurableAgent.prepare()` no longer returns `registryEntry`.
 
 - Before: read `registryEntry` from the prepared result.
-- After: reuse the returned IDs and `workflowInput` with `stream()`, and call `cleanup()` when abandoning the preparation.
+- After: pass the returned `runId` to `stream()` with the same messages and options. The result still exposes the serializable `workflowInput`; call `cleanup()` if the prepared handoff is abandoned.
+
+```ts
+const messages = 'Recover this task'
+const prepared = await durableAgent.prepare(messages)
+
+try {
+  const stream = await durableAgent.stream(messages, { runId: prepared.runId })
+  try {
+    await stream.output.consumeStream()
+  } finally {
+    stream.cleanup()
+  }
+} catch (error) {
+  prepared.cleanup()
+  throw error
+}
+```

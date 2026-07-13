@@ -998,6 +998,29 @@ describe.each([
   });
 
   describe('agent resume fail-closed boundaries', () => {
+    it('waits for an in-flight pending snapshot to become suspended', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-pending', 'resource-pending');
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const workflows = (await storage.getStore('workflows'))!;
+      const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockResolvedValueOnce({
+        ...persisted!,
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'pending' },
+      });
+
+      const output = await restarted.agent.resumeStream(
+        { approved: true },
+        {
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          memory: { thread: 'thread-pending', resource: 'resource-pending' },
+        },
+      );
+      await output.consumeStream();
+      await vi.waitFor(() => expect(mockFindUser).toHaveBeenCalledOnce());
+    });
+
     it('rejects terminal snapshots even when suspended-looking context remains', async () => {
       const { agent, storage } = createSuspendedSetup();
       const { runId } = await suspendRun(agent, 'thread-terminal', 'resource-terminal');

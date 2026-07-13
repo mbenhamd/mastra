@@ -26,7 +26,7 @@ import type { MessageListInput } from '../message-list';
 import { MessageList } from '../message-list';
 import { stableStringify } from '../message-list/cache/stable-stringify';
 import { SaveQueueManager } from '../save-queue';
-import type { ToolsInput } from '../types';
+import type { AgentMemoryOption, ToolsInput } from '../types';
 
 import { AGENT_STREAM_TOPIC, DurableStepIds } from './constants';
 import { runDurableStreamUntilIdle } from './durable-stream-until-idle';
@@ -972,6 +972,19 @@ export class DurableAgent<
     return input?.__workflowKind === 'durable-agent' ? input : undefined;
   }
 
+  async #assertPublicAgentResumePreflight(options: {
+    requestContext?: RequestContext;
+    memory?: AgentMemoryOption;
+    runId: string;
+    snapshotMemoryInfo?: { threadId?: string; resourceId?: string };
+  }): Promise<void> {
+    await this.#wrappedAgent.__assertAgentResumePreflight({
+      ...options,
+      agentId: this.id,
+      agentName: this.name,
+    });
+  }
+
   #durableSnapshotPairIsConsistent(
     runId: string,
     outerRun: any,
@@ -1392,7 +1405,7 @@ export class DurableAgent<
       });
     }
 
-    await this.#wrappedAgent.__assertAgentResumePreflight({
+    await this.#assertPublicAgentResumePreflight({
       requestContext,
       memory: options.memory,
       runId,
@@ -1434,6 +1447,8 @@ export class DurableAgent<
           requestContext,
           memoryConfig,
           autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
+          agentId: this.id,
+          agentName: this.name,
         }),
         this.#wrappedAgent.getModel({ requestContext }),
         this.#wrappedAgent.getModelList(requestContext),
@@ -1631,7 +1646,7 @@ export class DurableAgent<
       typeof contextResourceId === 'string' && contextResourceId.trim().length > 0 ? contextResourceId : resourceId;
     const scopedThreadId =
       typeof contextThreadId === 'string' && contextThreadId.trim().length > 0 ? contextThreadId : threadId;
-    await this.#wrappedAgent.__assertAgentResumePreflight({
+    await this.#assertPublicAgentResumePreflight({
       requestContext,
       memory: scopedResourceId && scopedThreadId ? { resource: scopedResourceId, thread: scopedThreadId } : undefined,
       runId: 'list-suspended-runs',
@@ -1648,14 +1663,23 @@ export class DurableAgent<
       });
     }
 
-    const { runs } = await workflowsStore.listWorkflowRuns({
-      workflowName: 'durable-agentic-loop',
-      status: 'suspended',
-      resourceId: scopedResourceId,
-      fromDate,
-      toDate,
-      perPage: false,
-    });
+    const [{ runs }, { runs: nestedRuns }] = await Promise.all([
+      workflowsStore.listWorkflowRuns({
+        workflowName: 'durable-agentic-loop',
+        status: 'suspended',
+        resourceId: scopedResourceId,
+        fromDate,
+        toDate,
+        perPage: false,
+      }),
+      workflowsStore.listWorkflowRuns({
+        workflowName: DurableStepIds.AGENTIC_EXECUTION,
+        status: 'suspended',
+        resourceId: scopedResourceId,
+        perPage: false,
+      }),
+    ]);
+    const nestedRunsById = new Map(nestedRuns.map(run => [run.runId, run]));
     const matchedRuns: AgentListSuspendedRunsResult['runs'] = [];
     for (const run of runs) {
       let snapshot: any = run.snapshot;
@@ -1683,10 +1707,7 @@ export class DurableAgent<
       if (scopedThreadId && scopedThreadId !== runThreadId) continue;
       if (scopedResourceId && scopedResourceId !== runResourceId) continue;
 
-      const nestedRun = await workflowsStore.getWorkflowRunById({
-        workflowName: DurableStepIds.AGENTIC_EXECUTION,
-        runId: run.runId,
-      });
+      const nestedRun = nestedRunsById.get(run.runId);
       let nestedSnapshot: any = nestedRun?.snapshot;
       if (typeof nestedSnapshot === 'string') {
         try {
@@ -1741,7 +1762,7 @@ export class DurableAgent<
         const prepared = this.#preparedExecutions.get(options.runId)?.preparation;
         if (prepared) {
           const snapshotMemoryInfo = { threadId: prepared.threadId, resourceId: prepared.resourceId };
-          await this.#wrappedAgent.__assertAgentResumePreflight({
+          await this.#assertPublicAgentResumePreflight({
             requestContext: options.requestContext,
             memory: options.memory,
             runId: options.runId,
@@ -1756,7 +1777,7 @@ export class DurableAgent<
             threadId: preparation.threadId,
             resourceId: preparation.resourceId,
           });
-          await this.#wrappedAgent.__assertAgentResumePreflight({
+          await this.#assertPublicAgentResumePreflight({
             requestContext: options.requestContext,
             memory: options.memory,
             runId: options.runId,
@@ -1767,7 +1788,7 @@ export class DurableAgent<
           }
           reusedPreparedExecution = true;
         } else {
-          await this.#wrappedAgent.__assertAgentResumePreflight({
+          await this.#assertPublicAgentResumePreflight({
             requestContext: options.requestContext,
             memory: options.memory,
             runId: options.runId,
@@ -1778,6 +1799,8 @@ export class DurableAgent<
 
       preparation ??= await prepareForDurableExecution<TOutput>({
         agent: this.#wrappedAgent as Agent<string, any, TOutput>,
+        durableAgentId: this.id,
+        durableAgentName: this.name,
         messages,
         options: options as AgentExecutionOptions<TOutput>,
         runId: options?.runId,
@@ -1944,7 +1967,7 @@ export class DurableAgent<
       typeof contextResourceId === 'string' && typeof contextThreadId === 'string'
         ? { resource: contextResourceId, thread: contextThreadId }
         : options?.memory;
-    await this.#wrappedAgent.__assertAgentResumePreflight({
+    await this.#assertPublicAgentResumePreflight({
       requestContext: explicitRequestContext,
       memory: callerMemory,
       runId,
@@ -1966,7 +1989,7 @@ export class DurableAgent<
         details: { agentName: this.name, runId },
       });
     }
-    await this.#wrappedAgent.__assertAgentResumePreflight({
+    await this.#assertPublicAgentResumePreflight({
       requestContext: explicitRequestContext,
       memory:
         callerMemory ??
@@ -2345,7 +2368,7 @@ export class DurableAgent<
         if (options.runId.trim().length === 0) {
           throw new Error('DurableAgent runId must be a non-empty string.');
         }
-        await this.#wrappedAgent.__assertAgentResumePreflight({
+        await this.#assertPublicAgentResumePreflight({
           requestContext: options.requestContext,
           memory: options.memory,
           runId: options.runId,
@@ -2354,6 +2377,8 @@ export class DurableAgent<
       }
       preparation = await prepareForDurableExecution<TOutput>({
         agent: this.#wrappedAgent as Agent<string, any, TOutput>,
+        durableAgentId: this.id,
+        durableAgentName: this.name,
         messages,
         options,
         runId: options?.runId,

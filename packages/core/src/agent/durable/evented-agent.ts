@@ -88,10 +88,12 @@ export class EventedAgent<
         resourceId: workflowInput.state?.resourceId,
         pubsub: this.pubsubInternal,
       });
-      // Fire and forget - the workflow-level onFinish hook handles terminal cleanup.
+      // The caller already runs executeWorkflow() in the background. Keep this
+      // promise pending until the current workflow segment settles so resume()
+      // can wait for its suspended snapshot to finish persisting.
       const { execution } = await run.startAsync({ inputData: workflowInput, requestContext });
       if (execution) {
-        void execution
+        await execution
           .catch(async error => {
             unpinGlobalRunRegistryEntry(runId);
             await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));

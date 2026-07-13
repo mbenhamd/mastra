@@ -23,6 +23,7 @@ import {
   unpinGlobalRunRegistryEntry,
 } from '../run-registry';
 import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
+import { serializeToolsMetadata } from '../utils/serialize-state';
 
 const openPubsubs: EventEmitterPubSub[] = [];
 let durableRunSequence = 0;
@@ -116,26 +117,33 @@ function createSetup({
   storage,
   model,
   agentId = 'durable-discovery-agent',
+  durableAgentId,
+  durableAgentName,
   execute = vi.fn().mockResolvedValue({ ok: true }),
   includeTool = true,
   fgaProvider,
   requestContextSchema,
   inputProcessors,
+  toolOptions,
 }: {
   storage: InMemoryStore;
   model: MockLanguageModelV2;
   agentId?: string;
+  durableAgentId?: string;
+  durableAgentName?: string;
   execute?: any;
   includeTool?: boolean;
   fgaProvider?: IFGAProvider;
   requestContextSchema?: any;
   inputProcessors?: any[];
+  toolOptions?: Record<string, any>;
 }) {
   const tool = createTool({
     id: 'protectedTool',
     description: 'Requires an explicit approval',
     inputSchema: z.object({ value: z.string() }),
     requireApproval: true,
+    ...toolOptions,
     execute,
   });
   const baseAgent = new Agent({
@@ -149,11 +157,17 @@ function createSetup({
   });
   const pubsub = new EventEmitterPubSub();
   openPubsubs.push(pubsub);
-  const agent = createDurableAgent({ agent: baseAgent, pubsub, cleanupTimeoutMs: 0 });
+  const agent = createDurableAgent({
+    agent: baseAgent,
+    id: durableAgentId,
+    name: durableAgentName,
+    pubsub,
+    cleanupTimeoutMs: 0,
+  });
   new Mastra({
     logger: false,
     storage,
-    agents: { [agentId]: agent as any },
+    agents: { [agent.id]: agent as any },
     server: fgaProvider ? ({ fga: fgaProvider } as any) : undefined,
   });
   return { agent, baseAgent, execute };
@@ -188,6 +202,68 @@ describe('DurableAgent suspended-run discovery', () => {
     await expect(setup.agent.prepare('prepare', { runId: 'fixed-durable-run' })).resolves.toMatchObject({
       runId: 'fixed-durable-run',
     });
+  });
+
+  it('uses the public durable-agent identity for prepared and recovered runs', async () => {
+    const storage = new InMemoryStore();
+    const initial = createSetup({
+      storage,
+      model: textModel(),
+      agentId: 'wrapped-agent-id',
+      durableAgentId: 'public-durable-id',
+      durableAgentName: 'Public durable name',
+    });
+    const prepared = await initial.agent.prepare('prepared', { runId: 'overridden-id-prepared-run' });
+    expect(prepared.workflowInput).toMatchObject({
+      agentId: 'public-durable-id',
+      agentName: 'Public durable name',
+    });
+    expect(getGlobalRunRegistryEntry(prepared.runId)?.agentId).toBe('public-durable-id');
+    const preparedStream = await initial.agent.stream('prepared', { runId: prepared.runId });
+    await preparedStream.output.consumeStream();
+    preparedStream.cleanup();
+
+    const suspending = createSetup({
+      storage,
+      model: toolCallModel('overridden-id-call'),
+      agentId: 'wrapped-agent-id',
+      durableAgentId: 'public-durable-id',
+      durableAgentName: 'Public durable name',
+    });
+    const suspended = await suspending.agent.stream('suspend', {
+      runId: 'overridden-id-suspended-run',
+      requireToolApproval: true,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect((await suspending.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(1);
+    });
+    suspended.cleanup();
+
+    const execute = vi.fn().mockResolvedValue({ ok: true });
+    const restarted = createSetup({
+      storage,
+      model: textModel(),
+      agentId: 'wrapped-agent-id',
+      durableAgentId: 'public-durable-id',
+      durableAgentName: 'Public durable name',
+      execute,
+    });
+    await expect(restarted.agent.listSuspendedRuns({ resourceId: 'resource-1' })).resolves.toMatchObject({
+      total: 1,
+      runs: [{ runId: suspended.runId }],
+    });
+    const resumed = await restarted.agent.resume(
+      suspended.runId,
+      { approved: true },
+      {
+        toolCallId: 'overridden-id-call',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    await resumed.output.consumeStream();
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    resumed.cleanup();
   });
 
   it('binds a prepared runId to the exact request and consumes preparation only once', async () => {
@@ -1174,6 +1250,88 @@ describe('DurableAgent suspended-run discovery', () => {
     );
   });
 
+  it('authorizes the public durable-agent identity when it overrides the wrapped agent id', async () => {
+    const storage = new InMemoryStore();
+    const fgaProvider = createFGAProvider();
+    const requestContext = new RequestContext([
+      ['user', { id: 'user-1' }],
+      [MASTRA_RESOURCE_ID_KEY, 'resource-1'],
+      [MASTRA_THREAD_ID_KEY, 'thread-1'],
+    ]);
+    const setup = createSetup({
+      storage,
+      model: toolCallModel('public-fga-call'),
+      agentId: 'wrapped-agent-id',
+      durableAgentId: 'public-durable-id',
+      durableAgentName: 'Public durable name',
+      fgaProvider,
+    });
+    const expectPublicAgentAuthorization = () => {
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        { id: 'user-1' },
+        expect.objectContaining({
+          resource: { type: 'agent', id: 'public-durable-id' },
+          permission: 'agents:execute',
+          context: expect.objectContaining({
+            metadata: expect.objectContaining({
+              agentId: 'public-durable-id',
+              agentName: 'Public durable name',
+            }),
+          }),
+        }),
+      );
+    };
+
+    const started = await setup.agent.stream('run it', {
+      runId: 'public-fga-run',
+      requireToolApproval: true,
+      requestContext,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    expectPublicAgentAuthorization();
+    await vi.waitFor(async () => {
+      expect((await setup.agent.listSuspendedRuns({ requestContext })).total).toBe(1);
+    });
+    expectPublicAgentAuthorization();
+    started.cleanup();
+
+    vi.mocked(fgaProvider.require).mockClear();
+    const execute = vi.fn().mockResolvedValue({ ok: true });
+    const restarted = createSetup({
+      storage,
+      model: textModel(),
+      agentId: 'wrapped-agent-id',
+      durableAgentId: 'public-durable-id',
+      durableAgentName: 'Public durable name',
+      fgaProvider,
+      execute,
+    });
+    const resumed = await restarted.agent.resume(
+      'public-fga-run',
+      { approved: true },
+      {
+        requestContext,
+        toolCallId: 'public-fga-call',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    await resumed.output.consumeStream();
+    expectPublicAgentAuthorization();
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      { id: 'user-1' },
+      expect.objectContaining({
+        resource: { type: 'tool', id: 'public-durable-id:protectedTool' },
+        permission: 'tools:execute',
+      }),
+    );
+    expect(fgaProvider.require).not.toHaveBeenCalledWith(
+      { id: 'user-1' },
+      expect.objectContaining({ resource: { type: 'tool', id: 'wrapped-agent-id:protectedTool' } }),
+    );
+    expect(execute).toHaveBeenCalledOnce();
+    resumed.cleanup();
+  });
+
   it('validates a required request context before durable storage discovery', async () => {
     const storage = new InMemoryStore();
     const setup = createSetup({
@@ -1481,6 +1639,97 @@ describe('DurableAgent suspended-run discovery', () => {
     expect(restartedExecute).not.toHaveBeenCalled();
   });
 
+  it('rejects changed execution-affecting tool configuration before cold execution', async () => {
+    const storage = new InMemoryStore();
+    const execute = vi.fn(async () => ({ ok: true }));
+    const initial = createSetup({
+      storage,
+      model: toolCallModel('tool-config-binding-call'),
+      execute,
+      toolOptions: {
+        background: { enabled: false, timeoutMs: 1_000 },
+        providerOptions: { openai: { strict: false } },
+      },
+    });
+    const started = await initial.agent.stream('run it', {
+      runId: 'tool-config-binding-run',
+      requireToolApproval: true,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect((await initial.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(1);
+    });
+    started.cleanup();
+
+    const restarted = createSetup({
+      storage,
+      model: textModel(),
+      execute,
+      toolOptions: {
+        background: { enabled: true, timeoutMs: 1_000 },
+        providerOptions: { openai: { strict: false } },
+      },
+    });
+    await expect(
+      restarted.agent.resume(
+        'tool-config-binding-run',
+        { approved: true },
+        {
+          toolCallId: 'tool-config-binding-call',
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+        },
+      ),
+    ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_TOOL_BINDING_MISMATCH' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('accepts semantically equivalent tool schemas with different property order', async () => {
+    const storage = new InMemoryStore();
+    const execute = vi.fn(async () => ({ ok: true }));
+    const initial = createSetup({
+      storage,
+      model: toolCallModel('canonical-schema-call'),
+      execute,
+      toolOptions: {
+        inputSchema: z.object({ value: z.string(), count: z.number() }),
+      },
+    });
+    const started = await initial.agent.stream('run it', {
+      runId: 'canonical-schema-run',
+      requireToolApproval: true,
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await vi.waitFor(async () => {
+      expect((await initial.agent.listSuspendedRuns({ resourceId: 'resource-1' })).total).toBe(1);
+    });
+    started.cleanup();
+
+    const restarted = createSetup({
+      storage,
+      model: textModel(),
+      execute,
+      toolOptions: {
+        inputSchema: z.object({ count: z.number(), value: z.string() }),
+      },
+    });
+    const [initialTools, restartedTools] = await Promise.all([
+      initial.baseAgent.getToolsForExecution({}),
+      restarted.baseAgent.getToolsForExecution({}),
+    ]);
+    expect(serializeToolsMetadata(restartedTools)).toEqual(serializeToolsMetadata(initialTools));
+    const resumed = await restarted.agent.resume(
+      'canonical-schema-run',
+      { approved: false },
+      {
+        toolCallId: 'canonical-schema-call',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      },
+    );
+    await resumed.output.consumeStream();
+    resumed.cleanup();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('rejects cold recovery when request-local processor state cannot be restored', async () => {
     const storage = new InMemoryStore();
     const initial = createSetup({
@@ -1672,13 +1921,22 @@ describe('DurableAgent suspended-run discovery', () => {
     resumed.cleanup();
   });
 
-  it('requests every driver row and surfaces storage failures', async () => {
+  it('batch-loads outer and nested driver rows and surfaces storage failures', async () => {
     const storage = new InMemoryStore();
     const restarted = createSetup({ storage, model: textModel() });
     const workflows = (await storage.getStore('workflows'))!;
     const list = vi.spyOn(workflows, 'listWorkflowRuns');
+    const getById = vi.spyOn(workflows, 'getWorkflowRunById');
     await restarted.agent.listSuspendedRuns({ perPage: 2, page: 0 });
-    expect(list).toHaveBeenCalledWith(expect.objectContaining({ perPage: false }));
+    expect(list).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ workflowName: 'durable-agentic-loop', perPage: false }),
+    );
+    expect(list).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ workflowName: 'durable-agentic-execution', perPage: false }),
+    );
+    expect(getById).not.toHaveBeenCalled();
 
     list.mockRejectedValueOnce(new Error('storage unavailable'));
     await expect(restarted.agent.listSuspendedRuns()).rejects.toThrow('storage unavailable');

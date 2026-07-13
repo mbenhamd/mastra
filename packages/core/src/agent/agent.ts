@@ -1080,6 +1080,8 @@ export class Agent<
       memory?: AgentExecutionOptionsBase<any>['memory'];
       runId?: string;
       snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
+      agentId?: string;
+      agentName?: string;
     },
   ) {
     const fgaProvider = this.#mastra?.getServer()?.fga;
@@ -1089,7 +1091,7 @@ export class Agent<
       if (!user) {
         throw new FGADeniedError(
           { id: 'unknown' },
-          { type: 'agent', id: this.id },
+          { type: 'agent', id: options?.agentId ?? this.id },
           MastraFGAPermissions.AGENTS_EXECUTE,
         );
       }
@@ -1105,6 +1107,8 @@ export class Agent<
         memory: options?.memory,
         runId: options?.runId,
         snapshotMemoryInfo: options?.snapshotMemoryInfo,
+        agentId: options?.agentId,
+        agentName: options?.agentName,
       });
       return;
     }
@@ -1118,11 +1122,15 @@ export class Agent<
     memory?: AgentExecutionOptionsBase<any>['memory'];
     runId: string;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
+    agentId?: string;
+    agentName?: string;
   }): Promise<void> {
     await this.#assertAgentExecutionPreflight(options.requestContext, {
       memory: options.memory,
       runId: options.runId,
       snapshotMemoryInfo: options.snapshotMemoryInfo,
+      agentId: options.agentId,
+      agentName: options.agentName,
     });
   }
 
@@ -3091,6 +3099,8 @@ export class Agent<
     memoryConfig,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3101,6 +3111,8 @@ export class Agent<
     memoryConfig?: MemoryConfigInternal;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let convertedMemoryTools: Record<string, CoreTool> = {};
@@ -3132,8 +3144,8 @@ export class Agent<
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
           memory,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -3167,6 +3179,8 @@ export class Agent<
     mastraProxy,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3176,6 +3190,8 @@ export class Agent<
     mastraProxy?: MastraUnion;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let convertedWorkspaceTools: Record<string, CoreTool> = {};
@@ -3209,8 +3225,8 @@ export class Agent<
           resourceId,
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -3245,6 +3261,8 @@ export class Agent<
     mastraProxy,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3254,6 +3272,8 @@ export class Agent<
     mastraProxy?: MastraUnion;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     const convertedChannelTools: Record<string, CoreTool> = {};
@@ -3276,7 +3296,8 @@ export class Agent<
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
           memory,
-          agentName: this.name,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           tracingPolicy: this.#options?.tracingPolicy,
@@ -3310,6 +3331,8 @@ export class Agent<
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
     suppressEagerSkillTools,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3320,6 +3343,8 @@ export class Agent<
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
     suppressEagerSkillTools: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let convertedSkillTools: Record<string, CoreTool> = {};
@@ -3350,8 +3375,8 @@ export class Agent<
           resourceId,
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -3385,6 +3410,8 @@ export class Agent<
     requestContext,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3393,6 +3420,8 @@ export class Agent<
     requestContext: RequestContext;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let convertedBrowserTools: Record<string, CoreTool> = {};
@@ -3423,8 +3452,8 @@ export class Agent<
           resourceId,
           logger: this.logger,
           mastra: undefined,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -3462,6 +3491,8 @@ export class Agent<
     outputWriter,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     processors: InputProcessorOrWorkflow[];
@@ -3473,6 +3504,8 @@ export class Agent<
     outputWriter?: OutputWriter;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     const convertedProcessorTools: Record<string, CoreTool> = {};
@@ -3511,8 +3544,8 @@ export class Agent<
               logger: this.logger,
               mastra: mastraProxy as MastraUnion | undefined,
               memory,
-              agentName: this.name,
-              agentId: this.id,
+              agentName,
+              agentId,
               requestContext,
               ...observabilityContext,
               model,
@@ -3895,6 +3928,8 @@ export class Agent<
     outputWriter,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3905,6 +3940,8 @@ export class Agent<
     outputWriter?: OutputWriter;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
@@ -3930,8 +3967,8 @@ export class Agent<
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
           memory,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -3968,6 +4005,8 @@ export class Agent<
     mastraProxy,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -3978,6 +4017,8 @@ export class Agent<
     mastraProxy?: MastraUnion;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
@@ -4002,8 +4043,8 @@ export class Agent<
             logger: this.logger,
             mastra: mastraProxy as MastraUnion | undefined,
             memory,
-            agentName: this.name,
-            agentId: this.id,
+            agentName,
+            agentId,
             requestContext,
             ...observabilityContext,
             model: await this.getModel({ requestContext }),
@@ -4039,6 +4080,8 @@ export class Agent<
     clientTools,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -4049,6 +4092,8 @@ export class Agent<
     clientTools?: ToolsInput;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     let toolsForRequest: Record<string, CoreTool> = {};
@@ -4068,8 +4113,8 @@ export class Agent<
           logger: this.logger,
           mastra: mastraProxy as MastraUnion | undefined,
           memory,
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           ...observabilityContext,
           model: await this.getModel({ requestContext }),
@@ -4142,6 +4187,8 @@ export class Agent<
     delegation,
     pubsub,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -4153,6 +4200,8 @@ export class Agent<
     delegation?: DelegationConfig;
     pubsub?: PubSub;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     const convertedAgentTools: Record<string, CoreTool> = {};
@@ -5014,8 +5063,8 @@ export class Agent<
           logger: this.logger,
           mastra: this.#mastra,
           memory: await this.getMemory({ requestContext }),
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           model: await this.getModel({ requestContext }),
           ...observabilityContext,
@@ -5048,6 +5097,8 @@ export class Agent<
     methodType,
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -5057,6 +5108,8 @@ export class Agent<
     methodType: AgentMethodType;
     autoResumeSuspendedTools?: boolean;
     backgroundTaskEnabled?: boolean;
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     const convertedWorkflowTools: Record<string, CoreTool> = {};
@@ -5282,8 +5335,8 @@ export class Agent<
           logger: this.logger,
           mastra: this.#mastra,
           memory: await this.getMemory({ requestContext }),
-          agentName: this.name,
-          agentId: this.id,
+          agentName,
+          agentId,
           requestContext,
           model: await this.getModel({ requestContext }),
           ...observabilityContext,
@@ -5324,6 +5377,8 @@ export class Agent<
     requestContext?: RequestContext;
     memoryConfig?: MemoryConfig;
     autoResumeSuspendedTools?: boolean;
+    agentId?: string;
+    agentName?: string;
   }): Promise<Record<string, CoreTool>> {
     const requestContext = options.requestContext ?? new RequestContext();
     const defaultOptions = await this.getDefaultOptions({ requestContext });
@@ -5356,6 +5411,8 @@ export class Agent<
       autoResumeSuspendedTools: mergedOptions.autoResumeSuspendedTools,
       methodType: 'stream',
       pubsub: this.getPubSub() ?? defaultAgentThreadPubSub,
+      agentId: options.agentId,
+      agentName: options.agentName,
     });
   }
 
@@ -5378,6 +5435,8 @@ export class Agent<
     pubsub,
     backgroundTaskEnabled,
     inputProcessors,
+    agentId = this.id,
+    agentName = this.name,
     ...rest
   }: {
     toolsets?: ToolsetsInput;
@@ -5394,6 +5453,8 @@ export class Agent<
     pubsub?: PubSub;
     backgroundTaskEnabled?: boolean;
     inputProcessors?: InputProcessorOrWorkflow[];
+    agentId?: string;
+    agentName?: string;
   } & Partial<ObservabilityContext>): Promise<Record<string, CoreTool>> {
     const observabilityContext = resolveObservabilityContext(rest);
     let mastraProxy = undefined;
@@ -5413,6 +5474,8 @@ export class Agent<
       outputWriter,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const memoryTools = await this.listMemoryTools({
@@ -5425,6 +5488,8 @@ export class Agent<
       memoryConfig,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const toolsetTools = await this.listToolsets({
@@ -5437,6 +5502,8 @@ export class Agent<
       toolsets: toolsets!,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const clientSideTools = await this.listClientTools({
@@ -5449,6 +5516,8 @@ export class Agent<
       clientTools: clientTools!,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const agentTools = await this.listAgentTools({
@@ -5461,6 +5530,8 @@ export class Agent<
       autoResumeSuspendedTools,
       delegation,
       pubsub,
+      agentId,
+      agentName,
     });
 
     const workflowTools = await this.listWorkflowTools({
@@ -5471,6 +5542,8 @@ export class Agent<
       methodType,
       ...observabilityContext,
       autoResumeSuspendedTools,
+      agentId,
+      agentName,
     });
 
     const workspaceTools = await this.listWorkspaceTools({
@@ -5482,6 +5555,8 @@ export class Agent<
       mastraProxy,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const configuredInputProcessors = inputProcessors ?? (await this.listConfiguredInputProcessors(requestContext));
@@ -5498,6 +5573,8 @@ export class Agent<
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
       suppressEagerSkillTools: hasOnDemandProcessor && !hasSkillsProcessor,
+      agentId,
+      agentName,
     });
 
     const channelTools = await this.listChannelTools({
@@ -5509,6 +5586,8 @@ export class Agent<
       mastraProxy,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const browserTools = await this.listBrowserTools({
@@ -5519,6 +5598,8 @@ export class Agent<
       ...observabilityContext,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     const inputProcessorLoadedTools = await this.listInputProcessorLoadedTools({
@@ -5532,6 +5613,8 @@ export class Agent<
       outputWriter,
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
+      agentId,
+      agentName,
     });
 
     // §14.7: a turn admitted under an active harness ChannelBinding carries both the
@@ -5846,8 +5929,11 @@ export class Agent<
     }
     const workflowRunSnapshot =
       workflowRun?.snapshot && typeof workflowRun.snapshot === 'object' ? workflowRun.snapshot : undefined;
+    const workflowRunStatus = (workflowRunSnapshot as { status?: unknown } | undefined)?.status;
     const existingSnapshot =
-      workflowRunSnapshot ?? (await waitForSuspendedSnapshot(workflowsStore, workflowName, runId));
+      !workflowRunSnapshot || workflowRunStatus === 'pending' || workflowRunStatus === 'paused'
+        ? await waitForSuspendedSnapshot(workflowsStore, workflowName, runId)
+        : workflowRunSnapshot;
 
     if (!existingSnapshot) {
       const hasStorage = !!workflowsStore;
@@ -6187,11 +6273,15 @@ export class Agent<
     memory,
     runId,
     snapshotMemoryInfo,
+    agentId = this.id,
+    agentName = this.name,
   }: {
     requestContext?: RequestContext;
     memory?: AgentExecutionOptionsBase<any>['memory'];
     runId?: string;
     snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
+    agentId?: string;
+    agentName?: string;
   }): Promise<void> {
     const fgaProvider = this.#mastra?.getServer()?.fga;
     if (!fgaProvider) {
@@ -6204,15 +6294,15 @@ export class Agent<
     await requireFGA({
       fgaProvider,
       user,
-      resource: { type: 'agent', id: getAgentFGAResourceId(this.id) },
+      resource: { type: 'agent', id: getAgentFGAResourceId(agentId) },
       permission: MastraFGAPermissions.AGENTS_EXECUTE,
       requestContext,
       context: {
         resourceId: executionResourceId,
       },
       metadata: {
-        agentId: this.id,
-        agentName: this.name,
+        agentId,
+        agentName,
         runId,
         executionResourceId,
       },

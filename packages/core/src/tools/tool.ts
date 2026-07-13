@@ -1,11 +1,10 @@
-import { createHash } from 'node:crypto';
 import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
-import { safeStringify } from '../utils';
 import type { SuspendOptions } from '../workflows';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchema } from './recovery-fingerprint';
 import type {
   McpMetadata,
   MCPToolProperties,
@@ -281,25 +280,31 @@ export class Tool<
   constructor(opts: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
-    const functionSource = (value: unknown) =>
-      typeof value === 'function' ? Function.prototype.toString.call(value) : undefined;
-    this.recoveryFingerprint = createHash('sha256')
-      .update(
-        safeStringify({
-          id: opts.id,
-          description: opts.description,
-          inputSchema: opts.inputSchema,
-          outputSchema: opts.outputSchema,
-          suspendSchema: opts.suspendSchema,
-          resumeSchema: opts.resumeSchema,
-          execute: functionSource(opts.execute),
-          requireApproval: functionSource(opts.requireApproval) ?? opts.requireApproval,
-          toModelOutput: functionSource(opts.toModelOutput),
-          transform: opts.transform,
-          mcp: opts.mcp,
-        }),
-      )
-      .digest('hex');
+    this.recoveryFingerprint = createToolRecoveryFingerprint({
+      id: opts.id,
+      description: opts.description,
+      schemas: {
+        input: normalizeToolRecoverySchema(opts.inputSchema),
+        output: normalizeToolRecoverySchema(opts.outputSchema),
+        suspend: normalizeToolRecoverySchema(opts.suspendSchema),
+        resume: normalizeToolRecoverySchema(opts.resumeSchema),
+        requestContext: normalizeToolRecoverySchema(opts.requestContextSchema),
+      },
+      execute: opts.execute,
+      requireApproval: opts.requireApproval,
+      strict: opts.strict,
+      providerOptions: opts.providerOptions,
+      toModelOutput: opts.toModelOutput,
+      transform: opts.transform,
+      inputExamples: opts.inputExamples,
+      mcp: opts.mcp,
+      mcpMetadata: opts.mcpMetadata,
+      background: opts.background,
+      onInputStart: opts.onInputStart,
+      onInputDelta: opts.onInputDelta,
+      onInputAvailable: opts.onInputAvailable,
+      onOutput: opts.onOutput,
+    });
     this.description = opts.description;
     this.inputSchema = opts.inputSchema ? toStandardSchema(opts.inputSchema) : undefined;
     this.outputSchema = opts.outputSchema ? toStandardSchema(opts.outputSchema) : undefined;

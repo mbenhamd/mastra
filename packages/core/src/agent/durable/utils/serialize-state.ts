@@ -3,6 +3,7 @@ import type { JSONSchema7 } from 'json-schema';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import type { MemoryConfig } from '../../../memory/types';
 import type { VersionOverrides } from '../../../request-context';
+import { normalizeToolRecoverySchema } from '../../../tools/recovery-fingerprint';
 import type { CoreTool } from '../../../tools/types';
 import type { MessageList } from '../../message-list';
 import { stableStringify } from '../../message-list/cache/stable-stringify';
@@ -71,6 +72,7 @@ export function serializeToolMetadata(name: string, tool: CoreTool): Serializabl
       inputSchema = { type: 'object' };
     }
   }
+  inputSchema = normalizeToolRecoverySchema(inputSchema) as JSONSchema7;
 
   return {
     id: 'id' in tool && typeof tool.id === 'string' ? tool.id : name,
