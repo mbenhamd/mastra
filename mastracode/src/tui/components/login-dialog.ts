@@ -3,6 +3,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { win32 } from 'node:path';
 import { Box, Container, getKeybindings, hyperlink, Spacer, Text } from '@earendil-works/pi-tui';
 import type { Focusable, TUI } from '@earendil-works/pi-tui';
 import { getOAuthProviders } from '../../auth/index.js';
@@ -32,12 +33,16 @@ function sanitizeTerminalText(value: string): string {
 
 function openUrlInBrowser(parsed: URL): void {
   const url = parsed.href;
+  const configuredWindowsRoot = process.env.SystemRoot || process.env.WINDIR;
+  const windowsRoot =
+    configuredWindowsRoot && win32.isAbsolute(configuredWindowsRoot) ? configuredWindowsRoot : String.raw`C:\Windows`;
+  const windowsLauncher = win32.join(windowsRoot, 'System32', 'rundll32.exe');
 
   const [cmd, args]: [string, string[]] =
     process.platform === 'darwin'
       ? ['open', [url]]
       : process.platform === 'win32'
-        ? ['rundll32', ['url.dll,FileProtocolHandler', url]]
+        ? [windowsLauncher, ['url.dll,FileProtocolHandler', url]]
         : ['xdg-open', [url]];
 
   try {

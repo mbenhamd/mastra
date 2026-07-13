@@ -86,14 +86,20 @@ describe('LoginDialogComponent browser opening', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it.each([
     { platform: 'darwin', command: 'open', leadingArgs: [] },
-    { platform: 'win32', command: 'rundll32', leadingArgs: ['url.dll,FileProtocolHandler'] },
+    {
+      platform: 'win32',
+      command: String.raw`D:\Windows\System32\rundll32.exe`,
+      leadingArgs: ['url.dll,FileProtocolHandler'],
+    },
     { platform: 'linux', command: 'xdg-open', leadingArgs: [] },
   ])('opens an HTTPS URL with argument arrays on $platform', ({ platform, command, leadingArgs }) => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    vi.stubEnv('SystemRoot', String.raw`D:\Windows`);
     const url = 'https://auth.example/callback?state="; touch /tmp/pwned';
     const canonicalUrl = new URL(url).href;
     const dialog = new LoginDialogComponent(tui as any, 'test-provider', vi.fn());
@@ -108,6 +114,35 @@ describe('LoginDialogComponent browser opening', () => {
     expect(mocks.child.on).toHaveBeenCalledWith('error', expect.any(Function));
     expect(mocks.child.unref).toHaveBeenCalledTimes(1);
     expect(tui.requestRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not resolve the Windows launcher from the current workspace', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('SystemRoot', String.raw`C:\Windows`);
+    const dialog = new LoginDialogComponent(tui as any, 'test-provider', vi.fn());
+
+    dialog.showAuth('https://auth.example/login');
+
+    expect(mocks.spawn).toHaveBeenCalledWith(
+      String.raw`C:\Windows\System32\rundll32.exe`,
+      ['url.dll,FileProtocolHandler', 'https://auth.example/login'],
+      { stdio: 'ignore', detached: true },
+    );
+    expect(mocks.spawn).not.toHaveBeenCalledWith('rundll32', expect.anything(), expect.anything());
+  });
+
+  it('ignores a relative Windows system root', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('SystemRoot', 'workspace-bin');
+    const dialog = new LoginDialogComponent(tui as any, 'test-provider', vi.fn());
+
+    dialog.showAuth('https://auth.example/login');
+
+    expect(mocks.spawn).toHaveBeenCalledWith(
+      String.raw`C:\Windows\System32\rundll32.exe`,
+      ['url.dll,FileProtocolHandler', 'https://auth.example/login'],
+      { stdio: 'ignore', detached: true },
+    );
   });
 
   it('opens a well-formed HTTP URL', () => {
