@@ -1744,8 +1744,9 @@ function displayStateFromRecord(record: SessionRecord): SessionDisplayState {
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): PublicPendingResume | null {
   if (!pending) return null;
-  // Strip storage-internal recovery fields (runtimeDependencies) and the caller
-  // app bag (requestContext) — restored on resume, never surfaced publicly.
+  // Strip storage-internal recovery fields (runtimeDependencies and
+  // toolSurfaceFence) and the caller app bag (requestContext) — restored on
+  // resume, never surfaced publicly.
   const {
     runtimeDependencies: _runtimeDependencies,
     requestContext: _requestContext,

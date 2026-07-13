@@ -3737,7 +3737,11 @@ export class Agent<
     }
     const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
     if (toolSurfaceFence) {
-      enforceToolSurfaceFence(nextTools as Record<string, unknown>, toolSurfaceFence, this.logger);
+      nextTools = enforceToolSurfaceFence(
+        nextTools as Record<string, unknown>,
+        toolSurfaceFence,
+        this.logger,
+      ) as typeof nextTools;
     }
 
     return {
@@ -5391,7 +5395,7 @@ export class Agent<
         autoResumeSuspendedTools,
         backgroundTaskEnabled,
       });
-      const formattedTools = this.formatTools(toolsetTools);
+      let formattedTools = this.formatTools(toolsetTools);
       if (isHarnessChannelBoundTurn(requestContext)) {
         // Replacement suppresses AgentChannels tools, but their normalized
         // names remain reserved on a Harness-bound channel turn. Resolve only
@@ -5421,11 +5425,11 @@ export class Agent<
             `Cannot reconstruct replacement tool implementations for resumed run ${runId ?? '<unknown>'}: ${missingRestoredTools.join(', ')}. Refusing to continue with a widened or incomplete tool surface.`,
           );
         }
-        enforceToolSurfaceFence(
+        formattedTools = enforceToolSurfaceFence(
           formattedTools,
           createToolSurfaceFence(formattedTools, restoredToolSurfaceFence),
           logger,
-        );
+        ) as typeof formattedTools;
       }
       stampToolSurfaceFence(requestContext, runId, formattedTools);
       return formattedTools;

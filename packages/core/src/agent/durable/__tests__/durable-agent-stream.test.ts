@@ -247,6 +247,23 @@ describe('DurableAgent streaming execution', () => {
         inputSchema: z.object({}),
         execute: async () => 'mode',
       });
+      let ownKeysCalls = 0;
+      const processorTools = new Proxy<Record<string, unknown>>(
+        {},
+        {
+          ownKeys: () => {
+            ownKeysCalls++;
+            return ownKeysCalls % 2 === 1 ? ['modeTool'] : ['modeTool', 'hiddenTool'];
+          },
+          getOwnPropertyDescriptor: (_target, key) => ({
+            value: key === 'modeTool' ? modeTool : hiddenTool,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          }),
+          get: (_target, key) => (key === 'modeTool' ? modeTool : hiddenTool),
+        },
+      );
       const baseAgent = new Agent({
         id: 'durable-replacement-agent',
         name: 'Durable Replacement Agent',
@@ -256,8 +273,8 @@ describe('DurableAgent streaming execution', () => {
         inputProcessors: [
           {
             id: 'expand-tools',
-            processInputStep: ({ tools }) => ({
-              tools: { ...tools, hiddenTool },
+            processInputStep: () => ({
+              tools: processorTools,
               activeTools: ['modeTool', 'hiddenTool'],
             }),
           },
@@ -278,6 +295,7 @@ describe('DurableAgent streaming execution', () => {
         ['modeTool'],
       ]);
       expect(hiddenExecute).not.toHaveBeenCalled();
+      expect(ownKeysCalls).toBe(2);
       cleanup();
     });
 

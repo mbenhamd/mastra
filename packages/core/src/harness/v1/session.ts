@@ -12969,7 +12969,7 @@ export class Session {
     }
 
     return {
-      ...(Object.keys(toolsets).length > 0 ? { toolsets } : {}),
+      ...(Object.keys(toolsets).length > 0 || mode.tools !== undefined ? { toolsets } : {}),
       ...(mode.tools !== undefined ? { toolsetsMode: 'replace' as const } : {}),
     };
   }

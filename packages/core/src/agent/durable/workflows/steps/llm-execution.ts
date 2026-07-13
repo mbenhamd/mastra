@@ -208,7 +208,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               ? createToolSurfaceFence(currentTools as unknown as Record<string, unknown>, execOptions.toolSurfaceFence)
               : undefined;
             if (toolSurfaceFence) {
-              enforceToolSurfaceFence(currentTools as unknown as Record<string, unknown>, toolSurfaceFence);
+              currentTools = enforceToolSurfaceFence(
+                currentTools as unknown as Record<string, unknown>,
+                toolSurfaceFence,
+              ) as ToolSet;
               currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
               enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
             }
@@ -306,7 +309,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               currentProviderOptions = processInputStepResult.providerOptions ?? currentProviderOptions;
               currentActiveTools = processInputStepResult.activeTools;
               if (toolSurfaceFence) {
-                enforceToolSurfaceFence(currentTools as unknown as Record<string, unknown>, toolSurfaceFence);
+                currentTools = enforceToolSurfaceFence(
+                  currentTools as unknown as Record<string, unknown>,
+                  toolSurfaceFence,
+                ) as ToolSet;
                 currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
                 enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
               }

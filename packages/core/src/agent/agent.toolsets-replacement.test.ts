@@ -95,9 +95,7 @@ describe('Agent replacement toolsets', () => {
               rawCall: { rawPrompt: null, rawSettings: {} },
               finishReason: 'tool-calls' as const,
               usage,
-              content: [
-                { type: 'tool-call' as const, toolCallId: 'mode-call', toolName: 'modeTool', input: '{}' },
-              ],
+              content: [{ type: 'tool-call' as const, toolCallId: 'mode-call', toolName: 'modeTool', input: '{}' }],
               warnings: [],
             }
           : {
@@ -133,6 +131,61 @@ describe('Agent replacement toolsets', () => {
 
     expect(approvedExecute).toHaveBeenCalledOnce();
     expect(injectedExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not retain a stateful processor tool container after enforcing the replacement surface', async () => {
+    const modeTool = testTool('modeTool');
+    const injectedTool = testTool('injectedTool');
+    const visibleToolNames: string[][] = [];
+    const model = new MockLanguageModelV2({
+      doGenerate: async options => {
+        visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage,
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    let ownKeysCalls = 0;
+    const processorTools = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        ownKeys: () => {
+          ownKeysCalls++;
+          return ownKeysCalls === 1 ? ['modeTool'] : ['modeTool', 'injectedTool'];
+        },
+        getOwnPropertyDescriptor: (_target, key) => ({
+          value: key === 'modeTool' ? modeTool : injectedTool,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        }),
+        get: (_target, key) => (key === 'modeTool' ? modeTool : injectedTool),
+      },
+    );
+    const agent = new Agent({
+      id: 'stateful-container-agent',
+      name: 'stateful-container-agent',
+      instructions: 'test',
+      model,
+      inputProcessors: [
+        {
+          id: 'stateful-container',
+          processInputStep: () => ({ tools: processorTools }),
+        },
+      ],
+    });
+
+    await agent.generate('test', {
+      toolsetsMode: 'replace',
+      toolsets: { mode: { modeTool } },
+    });
+
+    expect(visibleToolNames).toEqual([['modeTool']]);
+    expect(ownKeysCalls).toBe(1);
   });
 
   it('preserves merge as the default and supports an explicitly empty replacement', async () => {
@@ -236,7 +289,7 @@ describe('Agent replacement toolsets', () => {
     expect(visibleToolNames).toEqual([['originalTool']]);
   });
 
-  it('fails closed when a persisted resume tool implementation cannot be reconstructed', async () => {
+  it('fails closed when any implementation in a persisted resume tool surface cannot be reconstructed', async () => {
     const doGenerate = vi.fn();
     const agent = new Agent({
       id: 'missing-resume-tool-agent',
@@ -245,14 +298,14 @@ describe('Agent replacement toolsets', () => {
       model: new MockLanguageModelV2({ doGenerate }),
     });
     const requestContext = new RequestContext();
-    stageToolSurfaceFenceRestore(requestContext, 'missing-tool-run', ['ephemeralTool']);
+    stageToolSurfaceFenceRestore(requestContext, 'missing-tool-run', ['originalTool', 'ephemeralTool']);
 
     await expect(
       agent.generate('resume', {
         runId: 'missing-tool-run',
         requestContext,
         toolsetsMode: 'replace',
-        toolsets: {},
+        toolsets: { mode: { originalTool: testTool('originalTool') } },
       }),
     ).rejects.toThrow(/Cannot reconstruct replacement tool implementations/);
     expect(doGenerate).not.toHaveBeenCalled();

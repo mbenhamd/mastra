@@ -5,6 +5,7 @@ import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import { MODEL_TOKENS } from '../../../../../../docs/src/plugins/remark-model-tokens/models';
 import { MessageList } from '../../../agent/message-list';
+import { stampToolSurfaceFence } from '../../../agent/tool-surface-fence';
 import { SpanType } from '../../../observability';
 import { ProviderHistoryCompat } from '../../../processors/provider-history-compat';
 import { RequestContext } from '../../../request-context';
@@ -1026,6 +1027,89 @@ describe('createLLMExecutionStep gateway provider tools', () => {
       type: 'step-start',
       model: 'override-provider/override-model-id',
     });
+  });
+
+  it('materializes processor tools before the agentic-loop provider reads a stateful container', async () => {
+    const modeTool = createTool({
+      id: 'modeTool',
+      description: 'approved replacement tool',
+      inputSchema: z.object({}),
+      execute: vi.fn(),
+    });
+    const injectedTool = createTool({
+      id: 'injectedTool',
+      description: 'processor-injected tool',
+      inputSchema: z.object({}),
+      execute: vi.fn(),
+    });
+    let ownKeysCalls = 0;
+    const processorTools = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        ownKeys: () => {
+          ownKeysCalls++;
+          return ownKeysCalls === 1 ? ['modeTool'] : ['modeTool', 'injectedTool'];
+        },
+        getOwnPropertyDescriptor: (_target, key) => ({
+          value: key === 'modeTool' ? modeTool : injectedTool,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        }),
+        get: (_target, key) => (key === 'modeTool' ? modeTool : injectedTool),
+      },
+    );
+    const doStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([{ type: 'finish', finishReason: 'stop', usage: testUsage }]),
+      request: {},
+      response: { headers: undefined },
+      warnings: [],
+    }));
+    const tools = { modeTool };
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'test-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'mock-model-id',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream,
+          } as any,
+        },
+      ],
+      inputProcessors: [
+        {
+          id: 'stateful-container',
+          processInputStep: vi.fn(async () => ({ tools: processorTools })),
+        },
+      ],
+      tools,
+      streamState: { serialize: vi.fn(), deserialize: vi.fn() },
+      _internal: { generateId: () => 'generated-id', threadId: 'thread-123', resourceId: 'resource-456' },
+      logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any,
+    } as unknown as OuterLLMRun<typeof tools>);
+    const input = createIterationInput();
+    input.stepResult.isContinued = false;
+    const executeParams = createExecuteParams(input);
+    stampToolSurfaceFence(executeParams.requestContext, 'test-run', tools);
+
+    await llmExecutionStep.execute(executeParams);
+
+    expect(doStream).toHaveBeenCalledOnce();
+    expect(doStream.mock.calls[0]?.[0].tools.map((tool: { name: string }) => tool.name)).toEqual(['modeTool']);
+    expect(ownKeysCalls).toBe(1);
   });
 
   it('runs processLLMRequest before invoking the model without persisting prompt changes', async () => {

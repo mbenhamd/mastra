@@ -1123,7 +1123,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
           if (toolSurfaceFence) {
             if (currentStep.tools) {
-              enforceToolSurfaceFence(currentStep.tools as Record<string, unknown>, toolSurfaceFence, logger);
+              currentStep.tools = enforceToolSurfaceFence(
+                currentStep.tools as Record<string, unknown>,
+                toolSurfaceFence,
+                logger,
+              ) as typeof currentStep.tools;
             }
             currentStep.activeTools = enforceActiveToolsFence(
               currentStep.activeTools as string[] | undefined,

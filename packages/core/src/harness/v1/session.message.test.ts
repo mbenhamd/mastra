@@ -1457,7 +1457,7 @@ describe('Session.message() — per-turn overrides', () => {
     await session.message({ content: 'empty' });
 
     expect(agent.calls[0]!.options.toolsetsMode).toBe('replace');
-    expect(agent.calls[0]!.options.toolsets).toBeUndefined();
+    expect(agent.calls[0]!.options.toolsets).toEqual({});
   });
 
   it('passes modelSettings to sync structured generation only when provided', async () => {
