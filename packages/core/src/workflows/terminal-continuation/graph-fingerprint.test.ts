@@ -99,6 +99,14 @@ describe('workflow terminal graph fingerprint', () => {
     ).toThrow(/native|bound/);
   });
 
+  it('accepts executable callbacks containing a native marker literal', () => {
+    const fixture = graph();
+    const loop = fixture[4];
+    if (loop?.type !== 'loop') throw new Error('invalid fixture');
+    loop.serializedCondition.fn = "({ state }) => state.label === '[native code]'";
+    expect(() => createWorkflowTerminalGraphFingerprint(fixture)).not.toThrow();
+  });
+
   it('is stable across JSON storage and ignores descriptive fields', () => {
     const original = graph();
     const stored = JSON.parse(JSON.stringify(original)) as SerializedStepFlowEntry[];

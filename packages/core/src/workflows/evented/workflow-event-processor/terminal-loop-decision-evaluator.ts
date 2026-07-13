@@ -156,34 +156,38 @@ function evaluationObservation(input: {
   );
 }
 
-function deniedCapability(name: string): object {
+function deniedCapability(name: string, onAccess: () => void): object {
+  const reject = () => {
+    onAccess();
+    throw new UnsupportedDurableLoopConditionEffect(name);
+  };
   return new Proxy(Object.create(null) as object, {
     defineProperty() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     deleteProperty() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     get() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     getOwnPropertyDescriptor() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     getPrototypeOf() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     has() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     ownKeys() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     set() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
     setPrototypeOf() {
-      throw new UnsupportedDurableLoopConditionEffect(name);
+      return reject();
     },
   });
 }
@@ -262,10 +266,14 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
     abortStatus = 'timed_out';
     controller.abort();
   }, timeoutMs);
-  const mastra = deniedCapability('Mastra');
-  const writer = deniedCapability('writer');
-  const pubsub = deniedCapability('PubSub');
-  const engine = deniedCapability('workflow engine');
+  let unsupportedEffectObserved = false;
+  const recordUnsupportedEffect = () => {
+    unsupportedEffectObserved = true;
+  };
+  const mastra = deniedCapability('Mastra', recordUnsupportedEffect);
+  const writer = deniedCapability('writer', recordUnsupportedEffect);
+  const pubsub = deniedCapability('PubSub', recordUnsupportedEffect);
+  const engine = deniedCapability('workflow engine', recordUnsupportedEffect);
 
   let callbackInvoked = false;
   let callbackHasSettled = false;
@@ -284,6 +292,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       getInitData: () => sandbox.stepResults.input,
       getStepResult: getStepResult.bind(null, sandbox.stepResults as any),
       bail: () => {
+        recordUnsupportedEffect();
         throw new UnsupportedDurableLoopConditionEffect('bail');
       },
       abort: () => controller.abort(),
@@ -312,6 +321,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       if (outcome.type === 'aborted' || controller.signal.aborted) {
         return { status: abortStatus, request };
       }
+      if (unsupportedEffectObserved) return { status: 'unsupported_effect', request };
       let observation: string;
       try {
         observation = evaluationObservation({

@@ -12,6 +12,10 @@ export const MAX_TERMINAL_ID_LENGTH = 512;
 export const MAX_TERMINAL_REVISION_LENGTH = 256;
 export const MAX_TERMINAL_LOOP_ITERATIONS = Number.MAX_SAFE_INTEGER - 1;
 
+export function isWorkflowTerminalNativeFunctionSource(source: string): boolean {
+  return /^function(?:\s+[^()]*)?\s*\([^)]*\)\s*\{\s*\[native code\]\s*\}$/.test(source);
+}
+
 function isWellFormed(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
@@ -114,7 +118,7 @@ function hashSource(domain: string, value: unknown, field: string, state: GraphS
 
 function hashExecutableSource(domain: string, value: unknown, field: string, state: GraphState): string {
   return hashBoundedSource(domain, value, field, state, source => {
-    if (source.includes('[native code]')) {
+    if (isWorkflowTerminalNativeFunctionSource(source)) {
       throw new TypeError(`${field} must not contain native or bound callback source`);
     }
   });

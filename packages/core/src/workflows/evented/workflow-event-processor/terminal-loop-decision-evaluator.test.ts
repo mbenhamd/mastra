@@ -228,6 +228,20 @@ describe('evented workflow terminal loop decision evaluator', () => {
     });
   });
 
+  it('rejects a denied capability even when the callback catches the access error', async () => {
+    const condition = async ({ mastra }: any) => {
+      try {
+        mastra.getAgent('one');
+      } catch {
+        return false;
+      }
+      return true;
+    };
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'unsupported_effect',
+    });
+  });
+
   it('does not invoke an already-aborted attempt and lets callback abort win over a boolean', async () => {
     const before = new AbortController();
     before.abort();

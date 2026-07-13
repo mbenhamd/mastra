@@ -190,6 +190,9 @@ describe('workflow terminal loop decision frame', () => {
   it('rejects malformed callback source, aggregate oversize, credentials, and materialization accessors', () => {
     expect(() => getWorkflowTerminalLoopConditionSourceHash('function bad() { /* \ud800 */ }')).toThrow(/well-formed/);
     expect(() => getWorkflowTerminalLoopConditionSourceHash('function () { [native code] }')).toThrow(/unsupported/);
+    expect(() =>
+      getWorkflowTerminalLoopConditionSourceHash("({ state }) => state.label === '[native code]'"),
+    ).not.toThrow();
 
     const valid = materializeWorkflowTerminalLoopConditionFrame(fixture());
     expect(() =>

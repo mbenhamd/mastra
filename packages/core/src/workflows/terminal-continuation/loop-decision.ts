@@ -8,7 +8,11 @@ import {
 } from '../terminal-recovery';
 import type { WorkflowTerminalCanonicalJsonObject, WorkflowTerminalCanonicalJsonValue } from '../terminal-recovery';
 import type { WorkflowRunState, WorkflowTerminalSnapshotRecord } from '../types';
-import { resolveWorkflowTerminalGraphCoordinate, validateWorkflowTerminalStructuralString } from './graph-fingerprint';
+import {
+  isWorkflowTerminalNativeFunctionSource,
+  resolveWorkflowTerminalGraphCoordinate,
+  validateWorkflowTerminalStructuralString,
+} from './graph-fingerprint';
 import {
   completeWorkflowTerminalLoopDecision,
   createWorkflowTerminalLoopDecisionRequest,
@@ -109,7 +113,7 @@ function boundedInteger(value: unknown, field: string, maximum: number): number 
 /** Hashes registered callback source without treating stored source as executable authorization. */
 export function getWorkflowTerminalLoopConditionSourceHash(source: unknown): WorkflowTerminalSha256 {
   const validated = validateWorkflowTerminalStructuralString(source, 'loop condition source', 256 * 1024);
-  if (validated.includes('[native code]')) {
+  if (isWorkflowTerminalNativeFunctionSource(validated)) {
     throw new TypeError('native or bound loop conditions are unsupported in durable mode');
   }
   const bytes = Buffer.from(validated, 'utf8');
