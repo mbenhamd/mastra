@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState, WorkflowTerminalEffectRecord, WorkflowTerminalSnapshotRecord } from '../types';
 import { createWorkflowTerminalParentContinuationContract } from './contract';
 import { createWorkflowTerminalGraphFingerprint } from './graph-fingerprint';
-import { applyWorkflowTerminalParentContinuationPatch, WORKFLOW_TERMINAL_FOREACH_STATE_KEY } from './semantics';
+import {
+  applyWorkflowTerminalParentContinuationPatch,
+  MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_BYTES,
+  MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_DEPTH,
+  MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_ENTRIES,
+  MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES,
+  WORKFLOW_TERMINAL_FOREACH_STATE_KEY,
+} from './semantics';
 
 const mergePatch = {
   kind: 'merge-child-terminal',
@@ -384,6 +391,206 @@ describe('workflow terminal parent patch semantics', () => {
       observedAt: '2026-01-01T00:00:00.000Z',
     });
     expect(next.value).toEqual({ nested: { observedAt: '2026-01-01T00:00:00.000Z' } });
+  });
+
+  it('canonicalizes existing parent request context before applying the child overlay', () => {
+    const parent = parentSnapshot();
+    const parentRequestContext = Object.create(null) as Record<string, unknown>;
+    parentRequestContext.observedAt = new Date('2025-12-31T23:59:59.000Z');
+    parentRequestContext.missing = undefined;
+    parentRequestContext.nested = [{ offset: -0, missing: undefined }, ['value']];
+    Object.defineProperty(parentRequestContext, '__proto__', {
+      enumerable: true,
+      value: { safe: true },
+      writable: true,
+    });
+    parent.requestContext = parentRequestContext;
+    const child = retained();
+    child.snapshot.requestContext = { child: true };
+
+    const next = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(parent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: parent,
+      retainedChild: child,
+      storageTimestamp: 30,
+      executionMode: 'continuous',
+    });
+
+    expect(next.requestContext).toMatchObject({
+      observedAt: '2025-12-31T23:59:59.000Z',
+      nested: [{ offset: 0 }, ['value']],
+      child: true,
+    });
+    expect(Object.hasOwn(next.requestContext!, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(next.requestContext!, '__proto__')?.value).toEqual({ safe: true });
+    expect(Object.is((next.requestContext!.nested as any)[0].offset, -0)).toBe(false);
+    expect(JSON.parse(JSON.stringify(next.requestContext))).toEqual(next.requestContext);
+    expect(Object.prototype).not.toHaveProperty('safe');
+
+    for (const invalid of [new Map([['key', 'value']]), { malformed: '\ud800' }]) {
+      const invalidParent = parentSnapshot();
+      invalidParent.requestContext = { invalid };
+      expect(() =>
+        applyWorkflowTerminalParentContinuationPatch({
+          contract: contractFor(invalidParent),
+          effect: effect(),
+          parentRevision: 'revision-1',
+          parentWorkflowName: 'parent',
+          parentSnapshot: invalidParent,
+          retainedChild: retained(),
+          storageTimestamp: 30,
+          executionMode: 'continuous',
+        }),
+      ).toThrow(/non-JSON object|malformed Unicode/);
+    }
+  });
+
+  it('enforces one bounded data traversal for depth, cycles, amplification, entries, and bytes', () => {
+    const nestedData = (depth: number): Record<string, unknown> => {
+      let value: unknown = true;
+      for (let index = 0; index < depth; index++) value = { next: value };
+      return value as Record<string, unknown>;
+    };
+    const apply = (parent: WorkflowRunState) =>
+      applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(parent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: parent,
+        retainedChild: retained(),
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      });
+    const inheritedErrorWithMessage = (message: string): Error => {
+      const error = new Error();
+      delete error.message;
+      delete error.stack;
+      const errorPrototype = Object.create(Error.prototype);
+      Object.defineProperty(errorPrototype, 'message', { value: message });
+      Object.setPrototypeOf(error, errorPrototype);
+      return error;
+    };
+
+    const exactDepth = parentSnapshot();
+    exactDepth.requestContext = { payload: nestedData(MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_DEPTH - 2) };
+    expect(() => apply(exactDepth)).not.toThrow();
+
+    const overDepth = parentSnapshot();
+    overDepth.requestContext = { payload: nestedData(MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_DEPTH - 1) };
+    expect(() => apply(overDepth)).toThrow(/depth limit/);
+
+    const cyclic = parentSnapshot();
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    cyclic.requestContext = { cycle };
+    expect(() => apply(cyclic)).toThrow(/contains a cycle/);
+
+    const amplified = parentSnapshot();
+    const shared = { value: 'shared' };
+    amplified.requestContext = {
+      aliases: Array.from({ length: MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES }, () => shared),
+    };
+    expect(() => apply(amplified)).toThrow(/node limit/);
+
+    const tooManyEntries = parentSnapshot();
+    tooManyEntries.requestContext = {
+      entries: new Map(
+        Array.from({ length: Math.floor(MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_ENTRIES / 2) + 1 }, (_, index) => [
+          index,
+          index,
+        ]),
+      ),
+    };
+    expect(() => apply(tooManyEntries)).toThrow(/entry limit/);
+
+    const sparse = parentSnapshot();
+    const sparseArray: unknown[] = [];
+    sparseArray.length = MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_ENTRIES + 1;
+    sparse.requestContext = { sparseArray };
+    expect(() => apply(sparse)).toThrow(/entry limit/);
+
+    const tooManyBytes = parentSnapshot();
+    tooManyBytes.requestContext = { value: 'x'.repeat(MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_BYTES + 1) };
+    expect(() => apply(tooManyBytes)).toThrow(/byte limit/);
+
+    const inheritedError = inheritedErrorWithMessage('x'.repeat(MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_BYTES + 1));
+    const failedParent = parentSnapshot();
+    const failedPatch = {
+      ...mergePatch,
+      parentRunWrite: {
+        kind: 'set',
+        status: 'failed',
+        resultSource: 'source-coordinate',
+        activePathSource: 'source-coordinate',
+      },
+    } as const;
+    expect(() =>
+      applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(failedParent, {
+          childTerminalStatus: 'failed',
+          action: { kind: 'fail-parent', reason: 'parent-fail' },
+          patch: failedPatch,
+        }),
+        effect: effect('failed'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: failedParent,
+        retainedChild: retained('failed', {
+          status: 'failed',
+          error: inheritedError,
+          startedAt: 11,
+          endedAt: 20,
+        }),
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/byte limit/);
+
+    const aggregateParent = parentSnapshot();
+    aggregateParent.requestContext = {
+      parentError: inheritedErrorWithMessage('p'.repeat(600_000)),
+    };
+    const aggregateChild = retained();
+    aggregateChild.snapshot.requestContext = {
+      childError: inheritedErrorWithMessage('c'.repeat(600_000)),
+    };
+    expect(() =>
+      applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(aggregateParent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: aggregateParent,
+        retainedChild: aggregateChild,
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/byte limit/);
+
+    const singleChargeParent = parentSnapshot();
+    (singleChargeParent.context.nested as Record<string, any>).metadata.large = 'm'.repeat(600_000);
+    const singleCharge = apply(singleChargeParent);
+    expect((singleCharge.context.nested as Record<string, any>).metadata.large).toHaveLength(600_000);
+
+    const opaque = parentSnapshot();
+    opaque.tracingContext = { opaque: new ArrayBuffer(8) } as never;
+    expect(() => apply(opaque)).toThrow(/non-data object/);
+
+    for (const nonJsonValue of [Symbol('not cloneable'), 1n]) {
+      const nonJson = parentSnapshot();
+      nonJson.requestContext = { nonJsonValue };
+      expect(() => apply(nonJson)).toThrow(/non-data values/);
+    }
+
+    for (const traceId of ['\ud800', 'bad\0trace']) {
+      const malformed = parentSnapshot();
+      malformed.tracingContext = { traceId };
+      expect(() => apply(malformed)).toThrow(/malformed Unicode|null character/);
+    }
   });
 
   it('serializes native failed errors and rejects non-monotonic clocks', () => {

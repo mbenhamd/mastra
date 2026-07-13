@@ -26,10 +26,16 @@ locked parent state; PF-1780 will execute only the committed action.
 - `finish-parent`, `cancel-parent`, and `suspend-parent` are framework actions.
   They are not aliases for publishing a raw `workflow.end` event.
 - The pure patch reference canonicalizes touched values to JSON-observable data,
-  uses retained terminal evidence, preserves the
-  parent's step payload, overlays child metadata, fixes `nestedRunId`, replaces
-  both persisted state views, merges request context, and uses a monotonic
-  storage-provided clock.
+  uses retained terminal evidence, preserves the parent's step payload, overlays
+  child metadata, fixes `nestedRunId`, replaces both persisted state views,
+  canonicalizes the existing parent request context before overlaying the child
+  context, and uses a monotonic storage-provided clock.
+- Contract, effect, parent snapshot, and retained child evidence share one
+  descriptor-safe input budget: depth 64, 4,096 visited nodes, 16,384
+  collection/object entries, and 1 MiB of UTF-8 strings and keys. Cycles,
+  shared-reference amplification, accessors, symbols, non-JSON `bigint` values,
+  unsupported opaque structured-clone objects, and over-budget evidence fail
+  with controlled contract errors before cloning or normalization.
 - Foreach stores raw output and a framework-owned per-index terminal status
   sidecar together. The sidecar distinguishes pending `null`, successful
   `null`/`undefined`, failure, and cancellation after JSON persistence.
