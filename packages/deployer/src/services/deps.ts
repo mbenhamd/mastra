@@ -10,6 +10,19 @@ import { createChildProcessLogger } from '../deploy/log.js';
 
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
+const PROCESS_BOOTSTRAP_ENV_KEYS = ['PATH', 'SystemRoot', 'ComSpec', 'PATHEXT', 'WINDIR'] as const;
+
+function getProcessBootstrapEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of PROCESS_BOOTSTRAP_ENV_KEYS) {
+    const value = process.env[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
 interface ArchitectureOptions {
   os?: string[];
   cpu?: string[];
@@ -96,9 +109,7 @@ export class Deps extends MastraBase {
     return cpLogger({
       cmd: this.packageManager,
       args,
-      env: {
-        PATH: process.env.PATH!,
-      },
+      env: getProcessBootstrapEnv(),
     });
   }
 
@@ -240,9 +251,7 @@ export class Deps extends MastraBase {
       throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
     }
 
-    const env: Record<string, string> = {
-      PATH: process.env.PATH!,
-    };
+    const env = getProcessBootstrapEnv();
 
     if (process.env.npm_config_registry) {
       env.npm_config_registry = process.env.npm_config_registry;

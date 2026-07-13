@@ -4,11 +4,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  execa: vi.fn(),
+  createChildProcessLogger: vi.fn(),
+  runProcess: vi.fn(),
 }));
 
-vi.mock('execa', () => ({
-  execa: mocks.execa,
+vi.mock('../deploy/log.js', () => ({
+  createChildProcessLogger: mocks.createChildProcessLogger,
 }));
 
 import { Bundler } from './index.js';
@@ -29,21 +30,24 @@ describe('Bundler package-lock generation', () => {
     const nodeModules = join(directory, 'node_modules');
     await mkdir(nodeModules);
     await writeFile(join(nodeModules, 'marker'), 'preserved');
-    mocks.execa.mockResolvedValue({ exitCode: 0 });
+    mocks.runProcess.mockResolvedValue({ success: true });
+    mocks.createChildProcessLogger.mockReturnValue(mocks.runProcess);
     const bundler = new (Bundler as unknown as new (name: string) => Bundler)('test');
 
     await (bundler as unknown as { generateNpmLockfile(outputDir: string): Promise<void> }).generateNpmLockfile(
       directory,
     );
 
-    expect(mocks.execa).toHaveBeenCalledWith('npm', ['install', '--package-lock-only', '--force'], {
-      cwd: directory,
-      extendEnv: true,
-      shell: false,
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
+    expect(mocks.createChildProcessLogger).toHaveBeenCalledWith({
+      logger: expect.anything(),
+      root: directory,
       timeout: 60_000,
+      output: 'ignore',
+    });
+    expect(mocks.runProcess).toHaveBeenCalledWith({
+      cmd: 'npm',
+      args: ['install', '--package-lock-only', '--force'],
+      env: process.env,
     });
     await expect(readFile(join(nodeModules, 'marker'), 'utf8')).resolves.toBe('preserved');
   });

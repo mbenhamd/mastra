@@ -6,7 +6,6 @@ import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import type { Config } from '@mastra/core/mastra';
 import virtual from '@rollup/plugin-virtual';
 import * as pkg from 'empathic/package';
-import { execa } from 'execa';
 import fsExtra, { copy, ensureDir, readJSON, emptyDir } from 'fs-extra/esm';
 import type { InputOptions, OutputOptions } from 'rollup';
 import { glob } from 'tinyglobby';
@@ -17,6 +16,7 @@ import { getPackageRootPath } from '../build/package-info';
 import type { BundlerOptions } from '../build/types';
 import type { BundlerPlatform } from '../build/utils';
 import { isBareModuleSpecifier, slash } from '../build/utils';
+import { createChildProcessLogger } from '../deploy/log.js';
 import { DepsService } from '../services/deps';
 import { FileService } from '../services/fs';
 import { getWorkspaceInformation } from './workspaceDependencies';
@@ -158,14 +158,16 @@ export abstract class Bundler extends MastraBundler {
         await fsExtra.move(nodeModules, nodeModulesTmp, { overwrite: true });
         movedNodeModules = true;
       }
-      await execa('npm', ['install', '--package-lock-only', '--force'], {
-        cwd: outputDir,
-        extendEnv: true,
-        shell: false,
-        stdin: 'ignore',
-        stdout: 'pipe',
-        stderr: 'pipe',
+      const runProcess = createChildProcessLogger({
+        logger: this.logger,
+        root: outputDir,
         timeout: 60_000,
+        output: 'ignore',
+      });
+      await runProcess({
+        cmd: 'npm',
+        args: ['install', '--package-lock-only', '--force'],
+        env: process.env as Record<string, string>,
       });
     } catch {
       this.logger.warn('Failed to generate package-lock.json — deploy will fall back to npm install');

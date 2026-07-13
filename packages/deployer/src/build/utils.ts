@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { basename, join, relative } from 'node:path';
 import type { RollupNodeResolveOptions } from '@rollup/plugin-node-resolve';
+import ignore from 'ignore';
 
 /** The detected JavaScript runtime environment */
 export type RuntimePlatform = 'node' | 'bun';
@@ -60,8 +61,7 @@ export function upsertMastraDir({ dir = process.cwd() }: { dir?: string }) {
 
   const gitignorePath = join(dir, '.gitignore');
   const gitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
-  const entries = gitignore.split(/\r?\n/);
-  if (entries.includes('.mastra')) {
+  if (ignore().add(gitignore).ignores('.mastra/')) {
     return;
   }
 

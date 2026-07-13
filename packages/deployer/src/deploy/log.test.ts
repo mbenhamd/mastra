@@ -50,10 +50,11 @@ describe('createChildProcessLogger', () => {
       stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',
+      detached: process.platform !== 'win32',
     });
   });
 
-  it('logs and rethrows process failures', async () => {
+  it('logs allowlisted process status and throws a credential-safe failure', async () => {
     const failure = Object.assign(new Error('process failed with https://user:SECRET@example.invalid/pkg'), {
       command: 'npm install https://user:SECRET@example.invalid/pkg',
       escapedCommand: 'npm install https://user:SECRET@example.invalid/pkg',
@@ -69,7 +70,17 @@ describe('createChildProcessLogger', () => {
     mocks.execa.mockReturnValue(subprocess);
     const run = createChildProcessLogger({ logger: logger as never, root: '/project' });
 
-    await expect(run({ cmd: 'npm', args: ['install'], env: { PATH: '/bin' } })).rejects.toBe(failure);
+    const result = run({ cmd: 'npm', args: ['install'], env: { PATH: '/bin' } });
+
+    await expect(result).rejects.toMatchObject({
+      name: 'ChildProcessError',
+      message: 'Package manager process failed',
+      exitCode: 7,
+      signal: 'SIGTERM',
+      timedOut: true,
+      isCanceled: false,
+    });
+    await expect(result).rejects.not.toBe(failure);
 
     expect(logger.error).toHaveBeenCalledWith('Process failed', {
       error: {
@@ -81,5 +92,8 @@ describe('createChildProcessLogger', () => {
       },
     });
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('SECRET');
+    await expect(
+      result.catch(error => JSON.stringify(error, Object.getOwnPropertyNames(error))),
+    ).resolves.not.toContain('SECRET');
   });
 });

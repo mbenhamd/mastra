@@ -27,6 +27,7 @@ async function createDeps(packageManager: PackageManager) {
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(fixtures.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
@@ -56,10 +57,32 @@ describe('Deps process arguments', () => {
       expect(mocks.runProcess).toHaveBeenCalledWith({
         cmd: pm,
         args: expectedArgs,
-        env: { PATH: process.env.PATH! },
+        env: expect.objectContaining({ PATH: process.env.PATH! }),
       });
     },
   );
+
+  it('preserves Windows process bootstrap variables in the narrow pack environment', async () => {
+    vi.stubEnv('SystemRoot', String.raw`C:\Windows`);
+    vi.stubEnv('ComSpec', String.raw`C:\Windows\System32\cmd.exe`);
+    vi.stubEnv('PATHEXT', '.COM;.EXE;.BAT;.CMD');
+    vi.stubEnv('WINDIR', String.raw`C:\Windows`);
+    const { deps, root } = await createDeps('npm');
+
+    await deps.pack({ dir: root, destination: 'output', sanitizedName: '' });
+
+    expect(mocks.runProcess).toHaveBeenCalledWith({
+      cmd: 'npm',
+      args: ['pack', '--pack-destination', resolve(root, 'output')],
+      env: expect.objectContaining({
+        PATH: process.env.PATH,
+        SystemRoot: String.raw`C:\Windows`,
+        ComSpec: String.raw`C:\Windows\System32\cmd.exe`,
+        PATHEXT: '.COM;.EXE;.BAT;.CMD',
+        WINDIR: String.raw`C:\Windows`,
+      }),
+    });
+  });
 
   it.each(['', '.', '..', '../outside', String.raw`..\outside`])(
     'rejects an unsafe sanitized package name: %j',

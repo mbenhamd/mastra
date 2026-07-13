@@ -36,13 +36,21 @@ describe('upsertMastraDir', () => {
     expect(statSync(`${directory}/.mastra`).isDirectory()).toBe(true);
   });
 
-  it('keeps the ignore entry idempotent', () => {
-    writeFileSync(`${directory}/.gitignore`, '.mastra\n');
+  it.each(['.mastra', '.mastra/', '/.mastra', '/.mastra/'])('recognizes an existing %s ignore entry', entry => {
+    writeFileSync(`${directory}/.gitignore`, `${entry}\n`);
 
     upsertMastraDir({ dir: directory });
     upsertMastraDir({ dir: directory });
 
-    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('.mastra\n');
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe(`${entry}\n`);
+  });
+
+  it('appends a final ignore rule after a later negation', () => {
+    writeFileSync(`${directory}/.gitignore`, '.mastra\n!.mastra/\n');
+
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('.mastra\n!.mastra/\n.mastra\n');
   });
 });
 
