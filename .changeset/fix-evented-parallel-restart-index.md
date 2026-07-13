@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fix evented parallel workflow restarts that could resume the wrong branch, preserve magic-key branch IDs for pending nested workflows, and reject corrupt persisted branch paths before dispatch.
+Fixed evented parallel workflow restarts that could resume the wrong branch. Pending nested workflows now preserve all branch names, and invalid saved restart paths are rejected before any branch runs.
