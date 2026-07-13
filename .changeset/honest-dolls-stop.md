@@ -2,4 +2,4 @@
 '@mastra/deployer': patch
 ---
 
-Deployer commands now work reliably when paths or package specifications contain spaces or special characters, and failures report safe, useful status information.
+Fixed deployer commands for paths and package specifications containing spaces or special characters. Stuck commands now stop after a timeout, required package-manager settings continue to work, failures report credential-safe status information, and the `.mastra` directory is created and ignored reliably.
