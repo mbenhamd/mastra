@@ -1,5 +1,5 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../agent';
 import { Mastra } from '../mastra';
@@ -373,6 +373,63 @@ describe('Processor-returned tools receive requestContext', () => {
     expect(serializedProviderTools).not.toContain('thread-context');
     expect(serializedProviderTools).not.toContain('resource-context');
     expect(serializedProviderTools).not.toContain('processor-workspace');
+  });
+
+  it('authorizes processor-added tools with the owning agent identity', async () => {
+    const fgaProvider = {
+      require: vi.fn().mockResolvedValue(undefined),
+      check: vi.fn(),
+      filterAccessible: vi.fn(),
+    };
+    const mastra = new Mastra({ logger: false, server: { fga: fgaProvider } });
+    const dynamicTool = createTool({
+      id: 'authorized-context-tool',
+      description: 'Exercise agent-scoped authorization for a processor-added tool',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async () => 'authorized',
+    });
+    const processor = {
+      id: 'authorized-context-tool-injector',
+      processInputStep: async () => ({ tools: { 'authorized-context-tool': dynamicTool } }),
+    } as InputProcessor;
+    const requestContext = new RequestContext();
+    const user = { id: 'processor-tool-user' };
+    requestContext.set('user', user);
+    const agent = new Agent({
+      id: 'processor-fga-agent',
+      name: 'Processor FGA Agent',
+      instructions: 'Use the authorized context tool.',
+      model: createToolCallingModel('authorized-context-tool'),
+      mastra,
+      inputProcessors: [processor],
+    });
+
+    const stream = await agent.stream('Authorize the processor-added tool', {
+      maxSteps: 2,
+      requestContext,
+      memory: { thread: 'fga-thread', resource: 'fga-resource' },
+    });
+    for await (const _chunk of stream.fullStream) {
+      // Drain the stream so the processor-added tool executes.
+    }
+
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({
+        resource: { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
+        permission: 'tools:execute',
+        context: expect.objectContaining({
+          resourceId: 'fga-resource',
+          requestContext,
+          metadata: expect.objectContaining({
+            agentId: 'processor-fga-agent',
+            agentName: 'Processor FGA Agent',
+            threadId: 'fga-thread',
+            executionResourceId: 'fga-resource',
+          }),
+        }),
+      }),
+    );
   });
 
   it('keeps optional context absent for processor-added tools', async () => {

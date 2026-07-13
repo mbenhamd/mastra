@@ -543,6 +543,8 @@ The object form can return any combination of these properties:
 ]}
 />
 
+When `tools` contains Mastra tools, Mastra binds them to the current agent execution before the model call. Their execution context includes the active Mastra instance, memory, request context, workspace, and agent, thread, and resource identifiers when configured.
+
 #### Processor chaining
 
 When multiple processors implement `processInputStep`, they run in order and changes chain through:

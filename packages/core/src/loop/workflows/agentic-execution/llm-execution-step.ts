@@ -821,6 +821,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   errorProcessors,
   logger,
   agentId,
+  agentName,
   downloadRetries,
   downloadConcurrency,
   processorStates,
@@ -1072,7 +1073,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                           ? createMastraProxy({ mastra, logger: logger || new ConsoleLogger({ level: 'error' }) })
                           : undefined,
                         memory: _internal?.memory,
-                        agentName: agentId,
+                        agentId,
+                        agentName: agentName || agentId,
                         requestContext: requestContext || new RequestContext(),
                         outputWriter,
                         workspace: currentStep.workspace,

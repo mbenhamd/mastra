@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed processor-added tools to receive the active Mastra and memory context.
+Fixed processor-added Mastra tools to receive the active Mastra, memory, and agent identity context.
