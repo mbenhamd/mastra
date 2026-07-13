@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod/v4';
+import { Mastra } from '../../mastra';
 import type { SerializedStepFlowEntry, WorkflowRunState, WorkflowTerminalEffectRecord } from '../types';
+import { createStep, createWorkflow } from '../workflow';
 import { getWorkflowTerminalEffectIntegrity } from './effect-integrity';
 import { MAX_TERMINAL_LOOP_ITERATIONS } from './graph-fingerprint';
 import {
@@ -66,6 +69,63 @@ function input(parentSnapshot = snapshot(), terminalEffect = effect(), parentRev
 }
 
 describe('workflow terminal parent continuation planner', () => {
+  it('plans persisted conditional and loop graphs emitted by the native Workflow builder', () => {
+    const schema = z.object({ value: z.number() });
+    const nestedWorkflow = (id: string) =>
+      createWorkflow({ id, inputSchema: schema, outputSchema: schema })
+        .then(
+          createStep({
+            id: `${id}-leaf`,
+            inputSchema: schema,
+            outputSchema: schema,
+            execute: async ({ inputData }) => inputData,
+          }),
+        )
+        .commit();
+    const persistedGraph = (graph: readonly SerializedStepFlowEntry[]) =>
+      JSON.parse(JSON.stringify(graph)) as SerializedStepFlowEntry[];
+
+    const branchChild = nestedWorkflow('branch-child');
+    const branchParent = createWorkflow({ id: 'native-branch-parent', inputSchema: schema, outputSchema: schema })
+      .branch([[async () => true, branchChild]])
+      .commit();
+    const loopChild = nestedWorkflow('loop-child');
+    const loopParent = createWorkflow({ id: 'native-loop-parent', inputSchema: schema, outputSchema: schema })
+      .dowhile(loopChild, async () => false)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      workflows: {
+        'native-branch-parent': branchParent,
+        'native-loop-parent': loopParent,
+      },
+    });
+    expect(
+      planWorkflowTerminalParentContinuation(
+        input(
+          snapshot(
+            persistedGraph(mastra.getWorkflow('native-branch-parent').serializedStepGraph),
+            branchChild.id,
+            [0, 0],
+          ),
+          effect([0, 0], branchChild.id),
+        ),
+      ),
+    ).toMatchObject({ action: { kind: 'complete-entry', reason: 'conditional-continue' } });
+
+    const loopInput = input(
+      snapshot(persistedGraph(mastra.getWorkflow('native-loop-parent').serializedStepGraph), loopChild.id),
+      effect([0], loopChild.id),
+    );
+    const loopDecision = completeWorkflowTerminalLoopDecision(
+      createWorkflowTerminalLoopDecisionRequest(loopInput),
+      false,
+    );
+    expect(planWorkflowTerminalParentContinuation({ ...loopInput, evaluatedDecision: loopDecision })).toMatchObject({
+      action: { kind: 'complete-entry', reason: 'loop-exit' },
+    });
+  });
+
   it.each([
     [
       'step',
@@ -655,9 +715,19 @@ describe('workflow terminal parent continuation planner', () => {
     });
 
     delete parent.context.middle;
-    expect(() => planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')))).toThrow(
-      /sibling middle must be a data object/,
+    const missingSibling = planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')));
+    expect(missingSibling).toMatchObject({
+      action: {
+        kind: 'quarantine',
+        reason: 'plan-conflict',
+        conflictDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      },
+      patch: { kind: 'none' },
+    });
+    expect(planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left'))).action).toEqual(
+      missingSibling.action,
     );
+    expect(missingSibling.action).not.toHaveProperty('target');
 
     parent.context.middle = { status: 'unknown' } as any;
     expect(planWorkflowTerminalParentContinuation(input(parent, effect([0, 0], 'left')))).toMatchObject({

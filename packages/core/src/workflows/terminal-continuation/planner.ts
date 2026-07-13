@@ -536,6 +536,13 @@ function planAction(
     ) {
       return 'plan-conflict';
     }
+    if (
+      entry.steps.some(
+        branch => branch.step.id !== source.stepId && contextEntry(view.parentSnapshot, branch.step.id) === undefined,
+      )
+    ) {
+      return 'plan-conflict';
+    }
     const statuses = entry.steps.map(branch =>
       branch.step.id === source.stepId ? 'success' : contextEntry(view.parentSnapshot, branch.step.id)?.status,
     );

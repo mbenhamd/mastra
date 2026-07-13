@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { isProxy } from 'node:util/types';
+import { isDate, isProxy } from 'node:util/types';
 import type { SerializedStep, SerializedStepFlowEntry } from '../types';
 import { getDenseDataArray, getPlainDataDescriptors } from './data-shape';
 import type { WorkflowTerminalSha256 } from './types';
@@ -231,10 +231,10 @@ function normalizeGraph(
         }
         if (date !== undefined) {
           if (isProxy(date)) throw new TypeError(`${entryField}.date must not be a proxy`);
-          if (!(date instanceof Date) && typeof date !== 'string') {
+          if (!isDate(date) && typeof date !== 'string') {
             throw new TypeError(`${entryField}.date must be a Date or string`);
           }
-          const epoch = date instanceof Date ? Date.prototype.getTime.call(date) : Date.parse(date);
+          const epoch = isDate(date) ? Date.prototype.getTime.call(date) : Date.parse(date);
           if (!Number.isFinite(epoch)) throw new TypeError(`${entryField}.date must be valid`);
           if (typeof date === 'string' && new Date(epoch).toISOString() !== date) {
             throw new TypeError(`${entryField}.date must be a canonical ISO timestamp`);

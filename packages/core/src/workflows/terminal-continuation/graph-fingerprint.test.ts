@@ -169,6 +169,15 @@ describe('workflow terminal graph fingerprint', () => {
         { type: 'sleepUntil', id: 'sleep', date: '2026-01-01' } as unknown as SerializedStepFlowEntry,
       ]),
     ).toThrow(/canonical ISO/);
+
+    let prototypeTrapCalls = 0;
+    const proxiedPrototype = countingProxy(Object.create(null) as object, () => prototypeTrapCalls++);
+    const dateWithProxiedPrototype = Object.create(proxiedPrototype) as Date;
+    expect(() =>
+      createWorkflowTerminalGraphFingerprint([{ type: 'sleepUntil', id: 'sleep', date: dateWithProxiedPrototype }]),
+    ).toThrow(/Date or string/);
+    expect(prototypeTrapCalls).toBe(0);
+
     expect(() =>
       createWorkflowTerminalGraphFingerprint([
         {
