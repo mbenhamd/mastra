@@ -175,6 +175,21 @@ describe('evented workflow terminal loop decision evaluator', () => {
     });
   });
 
+  it('classifies a hostile thrown value without invoking its proxy traps', async () => {
+    const getPrototypeOf = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const thrown = new Proxy({}, { getPrototypeOf });
+    const condition = async () => {
+      throw thrown;
+    };
+
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'failed',
+    });
+    expect(getPrototypeOf).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the registered callback identity differs from the locked graph', async () => {
     const locked = async () => true;
     const changed = vi.fn(async () => false);
@@ -288,6 +303,20 @@ describe('evented workflow terminal loop decision evaluator', () => {
     await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'evaluated' });
     expect(condition).toHaveBeenCalledTimes(1);
     expect(hostile).not.toHaveBeenCalled();
+  });
+
+  it('rejects a proxied AbortSignal without invoking its prototype trap', async () => {
+    const getPrototypeOf = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const signal = new Proxy(new AbortController().signal, { getPrototypeOf });
+    const condition = vi.fn(async () => true);
+
+    await expect(
+      evaluateEventedWorkflowTerminalLoopDecision({ ...evaluation(condition), abortSignal: signal }),
+    ).rejects.toThrow(/native AbortSignal/);
+    expect(condition).not.toHaveBeenCalled();
+    expect(getPrototypeOf).not.toHaveBeenCalled();
   });
 
   it('coalesces one decision key in-process but reevaluates after a crash or new revision key', async () => {

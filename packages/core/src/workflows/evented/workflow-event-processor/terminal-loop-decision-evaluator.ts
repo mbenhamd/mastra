@@ -101,7 +101,7 @@ function copyEvaluationInput(input: unknown): EvaluateEventedWorkflowTerminalLoo
     throw new TypeError('loop decision condition must be a function');
   }
   const abortSignal = descriptors.abortSignal?.value;
-  if (abortSignal !== undefined && (!(abortSignal instanceof AbortSignal) || isProxy(abortSignal))) {
+  if (abortSignal !== undefined && (isProxy(abortSignal) || !(abortSignal instanceof AbortSignal))) {
     throw new TypeError('loop decision abortSignal must be a native AbortSignal');
   }
   if (abortSignal !== undefined) {
@@ -326,8 +326,10 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       }
       if (observation !== baseline) return { status: 'unsupported_mutation', request };
       if (outcome.type === 'failed') {
+        const unsupportedEffect =
+          !isProxy(outcome.error) && outcome.error instanceof UnsupportedDurableLoopConditionEffect;
         return {
-          status: outcome.error instanceof UnsupportedDurableLoopConditionEffect ? 'unsupported_effect' : 'failed',
+          status: unsupportedEffect ? 'unsupported_effect' : 'failed',
           request,
         };
       }
