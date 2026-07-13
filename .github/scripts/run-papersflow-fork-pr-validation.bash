@@ -82,7 +82,7 @@ cat "$changed_workspaces"
 
 while IFS= read -r workspace; do
   case "$workspace" in
-    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/mcp | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/mcp | packages/memory | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -210,7 +210,8 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif [[ "$file" =~ integration\.(test|spec)\. && \
       "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
-    elif [[ "$file" == stores/* && "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
+    elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
+      "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/pg/* && \
       ( "$file" =~ \.pooler\.test\. || "$file" =~ \.performance\.test\. || \
@@ -231,6 +232,13 @@ if [[ -s "$unsupported_tests" ]]; then
   echo "These changed tests require a dedicated fork-safe workflow or suite-specific infrastructure:" >&2
   cat "$unsupported_tests" >&2
   echo "Failing closed instead of reporting incomplete validation as successful." >&2
+  exit 1
+fi
+
+if workspace_changed stores/_test-utils &&
+  ! grep -Eq '^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$' "$changed_tests"; then
+  echo "Storage test utility changes must include a changed Vitest file in stores/_test-utils." >&2
+  echo "Failing closed instead of accepting unexecuted shared conformance helpers." >&2
   exit 1
 fi
 
