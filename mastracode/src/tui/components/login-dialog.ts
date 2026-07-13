@@ -3,7 +3,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { Box, Container, getKeybindings, Spacer, Text } from '@earendil-works/pi-tui';
+import { Box, Container, getKeybindings, hyperlink, Spacer, Text } from '@earendil-works/pi-tui';
 import type { Focusable, TUI } from '@earendil-works/pi-tui';
 import { getOAuthProviders } from '../../auth/index.js';
 import { theme } from '../theme.js';
@@ -24,6 +24,10 @@ function parseBrowserUrl(url: string): URL | undefined {
     // Ignore malformed URLs.
   }
   return undefined;
+}
+
+function sanitizeTerminalText(value: string): string {
+  return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, '\uFFFD');
 }
 
 function openUrlInBrowser(parsed: URL): void {
@@ -121,18 +125,18 @@ export class LoginDialogComponent extends Box implements Focusable {
     this.contentContainer.clear();
 
     const parsedUrl = parseBrowserUrl(url);
-    const displayUrl = parsedUrl?.href ?? url.replace(/[\u0000-\u001F\u007F-\u009F]/g, '\uFFFD');
+    const displayUrl = parsedUrl?.href ?? sanitizeTerminalText(url);
     this.contentContainer.addChild(new Text(theme.fg('accent', displayUrl)));
 
     if (parsedUrl) {
       const clickHint = process.platform === 'darwin' ? 'Cmd+click to open' : 'Ctrl+click to open';
-      const hyperlink = `\x1b]8;;${parsedUrl.href}\x07${clickHint}\x1b]8;;\x07`;
-      this.contentContainer.addChild(new Text(theme.fg('muted', hyperlink)));
+      const link = hyperlink(clickHint, parsedUrl.href);
+      this.contentContainer.addChild(new Text(theme.fg('muted', link)));
     }
 
     if (instructions) {
       this.contentContainer.addChild(new Spacer(1));
-      this.contentContainer.addChild(new Text(theme.fg('warning', instructions)));
+      this.contentContainer.addChild(new Text(theme.fg('warning', sanitizeTerminalText(instructions))));
     }
 
     // Try to open browser. The URL comes from the auth provider, so treat it
@@ -151,9 +155,9 @@ export class LoginDialogComponent extends Box implements Focusable {
    */
   showPrompt(message: string, placeholder?: string): Promise<string> {
     this.contentContainer.addChild(new Spacer(1));
-    this.contentContainer.addChild(new Text(theme.fg('text', message)));
+    this.contentContainer.addChild(new Text(theme.fg('text', sanitizeTerminalText(message))));
     if (placeholder) {
-      this.contentContainer.addChild(new Text(theme.fg('muted', `e.g., ${placeholder}`)));
+      this.contentContainer.addChild(new Text(theme.fg('muted', `e.g., ${sanitizeTerminalText(placeholder)}`)));
     }
     this.contentContainer.addChild(this.input);
     this.contentContainer.addChild(new Text(theme.fg('muted', '(Escape to cancel, Enter to submit)')));
@@ -171,7 +175,7 @@ export class LoginDialogComponent extends Box implements Focusable {
    * Show progress message
    */
   showProgress(message: string): void {
-    this.contentContainer.addChild(new Text(theme.fg('muted', message)));
+    this.contentContainer.addChild(new Text(theme.fg('muted', sanitizeTerminalText(message))));
     this.tui.requestRender();
   }
 

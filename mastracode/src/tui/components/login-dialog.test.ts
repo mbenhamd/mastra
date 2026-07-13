@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => {
   return {
     child,
     exec: vi.fn(),
+    hyperlink: vi.fn((text: string, url: string) => `<link:${url}>${text}</link>`),
     spawn: vi.fn(() => child),
   };
 });
@@ -41,6 +42,7 @@ vi.mock('@earendil-works/pi-tui', () => {
       constructor(public text: string) {}
     },
     getKeybindings: () => ({ matches: () => false }),
+    hyperlink: mocks.hyperlink,
   };
 });
 
@@ -75,6 +77,7 @@ describe('LoginDialogComponent browser opening', () => {
 
   beforeEach(() => {
     mocks.exec.mockClear();
+    mocks.hyperlink.mockClear();
     mocks.spawn.mockClear();
     mocks.child.on.mockClear();
     mocks.child.unref.mockClear();
@@ -139,6 +142,7 @@ describe('LoginDialogComponent browser opening', () => {
     const content = (dialog as any).contentContainer.children as Array<{ text?: string }>;
     expect(content[0]?.text).toBe(canonicalUrl);
     expect(content[1]?.text).toContain(canonicalUrl);
+    expect(mocks.hyperlink).toHaveBeenCalledWith('Ctrl+click to open', canonicalUrl);
     expect(mocks.exec).not.toHaveBeenCalled();
   });
 
@@ -177,6 +181,32 @@ describe('LoginDialogComponent browser opening', () => {
     expect(content).toHaveLength(1);
     expect(content[0]?.text).toBe('javascript:alert(1)�]8;;https://evil.example����');
     expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(mocks.hyperlink).not.toHaveBeenCalled();
     expect(mocks.exec).not.toHaveBeenCalled();
+  });
+
+  it('renders provider instructions without C0, DEL, C1, OSC-8, or OSC-52 controls', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const instructions = 'Code\0\x1b]8;;https://evil.example\x07click\x1b]8;;\x07\x1b]52;c;secret\x07\x7f\x9b\x9d\x9c';
+    const dialog = new LoginDialogComponent(tui as any, 'test-provider', vi.fn());
+
+    dialog.showAuth('https://auth.example/login', instructions);
+
+    const content = (dialog as any).contentContainer.children as Array<{ text?: string }>;
+    expect(content[3]?.text).toBe('Code��]8;;https://evil.example�click�]8;;��]52;c;secret�����');
+    expect(content[3]?.text).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/);
+  });
+
+  it('sanitizes provider prompt, placeholder, and progress text at the shared rendering boundary', () => {
+    const dialog = new LoginDialogComponent(tui as any, 'test-provider', vi.fn());
+    void dialog.showPrompt('Prompt\x1b[31m', 'value\x9b');
+    dialog.showProgress('Progress\x1b]52;c;secret\x07');
+
+    const content = (dialog as any).contentContainer.children as Array<{ text?: string }>;
+    const rendered = content.flatMap(child => (child.text === undefined ? [] : [child.text]));
+    expect(rendered).toContain('Prompt�[31m');
+    expect(rendered).toContain('e.g., value�');
+    expect(rendered).toContain('Progress�]52;c;secret�');
+    expect(rendered.join('')).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/);
   });
 });
