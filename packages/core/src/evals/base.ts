@@ -54,19 +54,15 @@ const SCORER_SPAN_MAX_OBJECT_KEYS = 100;
 const SCORER_SPAN_MAX_STRING_LENGTH = 8_192;
 const SCORER_SPAN_TRUNCATED = '[TRUNCATED]';
 const SCORER_SPAN_REDACTED = '[REDACTED]';
-const SCORER_SENSITIVE_KEYS = new Set([
-  'apikey',
-  'authorization',
-  'authtoken',
-  'mastraauthtoken',
-  'password',
-  'refreshtoken',
-  'secret',
-  'token',
-]);
+const SCORER_SENSITIVE_FIELD_PATTERN =
+  /(^|_)(api_?key|key|token|secret|password|passwd|pwd|credential|credentials|auth|authorization|cookie|session)(_|$)/i;
 
 function isScorerSensitiveKey(key: string): boolean {
-  return SCORER_SENSITIVE_KEYS.has(key.replace(/[^a-z0-9]/gi, '').toLowerCase());
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-z0-9]+/gi, '_')
+    .toLowerCase();
+  return SCORER_SENSITIVE_FIELD_PATTERN.test(normalized);
 }
 
 function serializeScorerSpanValue(value: unknown): unknown {
