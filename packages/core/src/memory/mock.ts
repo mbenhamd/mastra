@@ -207,6 +207,11 @@ export class MockMemory extends MastraMemory {
     return memoryStorage.deleteMessages(ids);
   }
 
+  async deleteResource(resourceId: string): Promise<void> {
+    const memoryStorage = await this.getMemoryStore();
+    return memoryStorage.deleteResource({ resourceId });
+  }
+
   async getWorkingMemory({
     threadId,
     resourceId,
