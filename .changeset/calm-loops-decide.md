@@ -1,5 +1,5 @@
 ---
-'@mastra/core': minor
+'@mastra/core': patch
 ---
 
 No user-visible `@mastra/core` behavior changes in this release. This is internal groundwork for a future runtime integration that can recover nested `dowhile` and `dountil` condition decisions after a restart.
