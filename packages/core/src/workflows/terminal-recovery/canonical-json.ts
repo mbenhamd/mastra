@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { isProxy } from 'node:util/types';
+import { isDate, isNativeError, isProxy } from 'node:util/types';
 import type { WorkflowTerminalCanonicalJsonObject, WorkflowTerminalCanonicalJsonValue } from './types';
 
 export const MAX_WORKFLOW_TERMINAL_RECOVERY_VALUE_DEPTH = 64;
@@ -263,7 +263,7 @@ function normalizeValue(
   if (typeof value !== 'object') fail(field, 'non-JSON values are not allowed');
   if (isProxy(value)) fail(field, 'proxies are not allowed');
   if (state.ancestors.has(value)) fail(field, 'contains a cycle');
-  if (value instanceof Date) {
+  if (isDate(value)) {
     if (Reflect.ownKeys(dataDescriptors(value, field)).length !== 0) fail(field, 'Date must not have custom fields');
     const epoch = Date.prototype.getTime.call(value);
     if (!Number.isFinite(epoch)) fail(field, 'invalid Date');
@@ -271,7 +271,7 @@ function normalizeValue(
     consumeBytes(state, iso, field);
     return iso;
   }
-  if (value instanceof Error) return normalizeError(value, field, depth, state);
+  if (isNativeError(value)) return normalizeError(value, field, depth, state);
   state.ancestors.add(value);
   try {
     if (Array.isArray(value)) return normalizeArray(value, field, depth, state);

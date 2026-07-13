@@ -295,6 +295,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       const snapshot: WorkflowRunState = {
         ...createEmptyWorkflowSnapshot(child.runId),
         status: 'failed',
+        error: { name: 'Error', message: 'stale caller failure' },
         serializedStepGraph: childGraph,
         context: { __state: { exact: ['state', 1] } } as unknown as WorkflowRunState['context'],
         value: { stale: 'must-be-replaced' },
@@ -354,6 +355,56 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       await cleanup([child.workflowName, parent.workflowName]);
     }
   });
+
+  it.each([
+    {
+      terminalStatus: 'failed' as const,
+      terminalResult: { status: 'failed', error: { name: 'Error', message: 'authenticated PG failure' } },
+      expectedError: { name: 'Error', message: 'authenticated PG failure' },
+    },
+    {
+      terminalStatus: 'success' as const,
+      terminalResult: { status: 'success', output: { done: true } },
+      expectedError: undefined,
+    },
+    {
+      terminalStatus: 'canceled' as const,
+      terminalResult: { status: 'canceled' },
+      expectedError: undefined,
+    },
+  ])(
+    'projects authenticated $terminalStatus error truth into the PostgreSQL workflow row',
+    async ({ terminalStatus, terminalResult, expectedError }) => {
+      const run = { workflowName: `error-projection-${terminalStatus}-${randomUUID()}`, runId: 'run' };
+      await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+      try {
+        const fence = await claim(workflowsA, run, terminalStatus);
+        const snapshot: WorkflowRunState = {
+          ...createEmptyWorkflowSnapshot(run.runId),
+          status: terminalStatus,
+          error: { name: 'Error', message: 'stale caller failure' },
+        };
+        await expect(
+          workflowsA.persistWorkflowTerminalState({
+            ...fence,
+            snapshot,
+            recoveryEnvelope: createTerminalRecoveryEnvelope({
+              ...run,
+              snapshot,
+              terminalStatus,
+              terminalResult,
+            }),
+          }),
+        ).resolves.toMatchObject({ status: 'persisted' });
+
+        const persisted = await workflowsA.loadWorkflowSnapshot(run);
+        expect(persisted?.result).toEqual(terminalResult);
+        expect(persisted?.error).toEqual(expectedError);
+      } finally {
+        await cleanup([run.workflowName]);
+      }
+    },
+  );
 
   it('persists immutable pre-terminal ancestry and an authenticated native-Error envelope without invoking toJSON', async () => {
     const suffix = randomUUID();
@@ -780,11 +831,20 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
     }
   });
 
-  it('rejects admission for a missing parent without retaining a revision row', async () => {
+  it('rejects ownership and recovery admission for a missing parent without retaining a revision row', async () => {
     const suffix = randomUUID();
     const parent = { workflowName: `missing-parent-${suffix}`, runId: 'parent-run' };
     const child = { workflowName: `missing-child-${suffix}`, runId: 'child-run' };
     try {
+      await expect(
+        workflowsA.bindWorkflowNestedRunOwnership({
+          ...parent,
+          stepId: 'nested',
+          nestedRunId: child.runId,
+          result: { status: 'running', payload: {} },
+          requestContext: {},
+        }),
+      ).resolves.toEqual({ status: 'missing_run' });
       await expect(workflowsA.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toEqual({
         status: 'missing_run',
       });

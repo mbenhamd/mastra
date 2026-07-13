@@ -25,7 +25,7 @@ export function createTerminalRecoveryEnvelope({
     terminalResult:
       terminalResult ??
       (terminalStatus === 'failed'
-        ? { status: terminalStatus, error: 'terminal test failure' }
+        ? { status: terminalStatus, error: { name: 'Error', message: 'terminal test failure' } }
         : { status: terminalStatus }),
     finalState: (snapshot.context?.__state as Record<string, unknown> | undefined) ?? snapshot.value ?? {},
     requestContextPatch: snapshot.requestContext ?? {},

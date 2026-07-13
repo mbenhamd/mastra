@@ -296,6 +296,18 @@ function validateTerminalResult(
   if (expected === 'failed' && !hasError) fail('terminalResult.error', 'failed result requires an error');
   if (expected !== 'failed' && Object.hasOwn(result, 'error'))
     fail('terminalResult.error', 'non-failed result cannot contain error');
+  if (expected === 'failed') {
+    const error = result.error;
+    if (error === null || typeof error !== 'object' || Array.isArray(error)) {
+      fail('terminalResult.error', 'must be a serialized error');
+    }
+    if (typeof error.name !== 'string' || typeof error.message !== 'string') {
+      fail('terminalResult.error', 'must contain string name and message fields');
+    }
+    if (Object.hasOwn(error, 'stack') && typeof error.stack !== 'string') {
+      fail('terminalResult.error.stack', 'must be a string');
+    }
+  }
   const startedAt = result.startedAt;
   const endedAt = result.endedAt;
   if (startedAt !== undefined) safeInteger(startedAt, 'terminalResult.startedAt');

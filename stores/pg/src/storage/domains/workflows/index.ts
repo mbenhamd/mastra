@@ -2601,12 +2601,26 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       return await this.#db.client.tx(async t => {
         const tableName = this.workflowSnapshotTableName();
-        const revision = await this.lockWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
+          t,
+          operation.workflowName,
+          operation.runId,
+        );
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState }>(
           `SELECT snapshot FROM ${tableName} WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
-        if (!row) return { status: 'missing_run' };
+        if (!row) {
+          if (revisionLock.created) {
+            await t.none(
+              `DELETE FROM ${this.workflowParentRevisionTableName()}
+               WHERE workflow_name = $1 AND run_id = $2`,
+              [operation.workflowName, operation.runId],
+            );
+          }
+          return { status: 'missing_run' };
+        }
+        const revision = revisionLock.generation;
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         const current = snapshot.context[operation.stepId] as Record<string, any> | undefined;
         const currentMetadata = current?.metadata ?? {};

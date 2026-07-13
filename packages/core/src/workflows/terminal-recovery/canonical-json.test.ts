@@ -87,6 +87,12 @@ describe('workflow terminal recovery canonical JSON', () => {
     const proxy = new Proxy({}, { getOwnPropertyDescriptor: trap });
     expect(() => materializeWorkflowTerminalCanonicalJson(proxy)).toThrow(/proxies/);
     expect(trap).not.toHaveBeenCalled();
+
+    const prototypeTrap = vi.fn(() => null);
+    const proxyPrototype = new Proxy({}, { getPrototypeOf: prototypeTrap });
+    const inheritedProxy = Object.create(proxyPrototype);
+    expect(() => materializeWorkflowTerminalCanonicalJson({ nested: inheritedProxy })).toThrow(/custom prototypes/);
+    expect(prototypeTrap).not.toHaveBeenCalled();
   });
 
   it('serializes native Error diagnostics from data descriptors only', () => {

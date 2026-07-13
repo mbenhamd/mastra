@@ -296,10 +296,28 @@ export class WorkflowEventProcessor extends EventProcessor {
     const existingRun = await workflowsStore?.getWorkflowRunById({ runId, workflowName: workflow.id });
     const resourceId = existingRun?.resourceId;
 
+    // Check shouldPersistSnapshot option - default to true if not specified.
+    // On resume, a false result must not overwrite a retained suspended snapshot.
+    const shouldPersist =
+      workflow?.options?.shouldPersistSnapshot?.({
+        stepResults: stepResults ?? {},
+        workflowStatus: 'running',
+      }) ?? true;
+    const persistedChildSnapshot =
+      parentWorkflow && terminalRecoveryEnabled && !shouldPersist && workflowsStore
+        ? await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId })
+        : undefined;
+    // Storage capability alone must not opt transient workflows into persistence.
+    // A nested run participates in recovery only when this transition is durable
+    // or an earlier durable snapshot proves that this is a replay/resume.
+    const terminalRecoveryActive =
+      terminalRecoveryEnabled &&
+      (shouldPersist || (persistedChildSnapshot !== null && persistedChildSnapshot !== undefined));
+
     let parentSnapshot: WorkflowRunState | null | undefined;
     let parentForEachIndex: number | undefined;
     let recoveryAncestry: WorkflowTerminalRecoveryAncestryV1 | undefined;
-    if (parentWorkflow && workflowsStore) {
+    if (parentWorkflow && workflowsStore && (shouldPersist || terminalRecoveryActive)) {
       parentSnapshot = await workflowsStore.loadWorkflowSnapshot({
         workflowName: parentWorkflow.workflowId,
         runId: parentWorkflow.runId,
@@ -321,7 +339,7 @@ export class WorkflowEventProcessor extends EventProcessor {
                 containerPath: [parentWorkflow.executionPath[0]!],
                 iterationIndex: parentForEachIndex,
               };
-        if (terminalRecoveryEnabled) {
+        if (terminalRecoveryActive) {
           const retained = await workflowsStore.getWorkflowTerminalRecoveryAncestry({
             workflowName: workflow.id,
             runId,
@@ -349,7 +367,7 @@ export class WorkflowEventProcessor extends EventProcessor {
                 ]);
           parentWorkflow.recoveryAncestry = recoveryAncestry;
         }
-      } else if (terminalRecoveryEnabled) {
+      } else if (terminalRecoveryActive) {
         throw new MastraError({
           id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_PARENT_MISSING',
           text: 'Nested workflow recovery parent evidence is missing',
@@ -359,16 +377,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     }
 
-    // Check shouldPersistSnapshot option - default to true if not specified
-    // This is particularly important for resume: if shouldPersist returns false for 'running',
-    // we shouldn't overwrite the existing 'suspended' status with 'running'
-    const shouldPersist =
-      workflow?.options?.shouldPersistSnapshot?.({
-        stepResults: stepResults ?? {},
-        workflowStatus: 'running',
-      }) ?? true;
-
-    if (parentWorkflow && parentSnapshot && workflowsStore && (shouldPersist || terminalRecoveryEnabled)) {
+    if (parentWorkflow && parentSnapshot && workflowsStore && (shouldPersist || terminalRecoveryActive)) {
       const existing = parentSnapshot.context?.[workflowId] as any;
       const existingMetadata = existing?.metadata ?? {};
       const existingWorkflowMetadata = existingMetadata.__workflow_meta ?? {};
@@ -391,7 +400,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         payload: existing?.payload ?? parentWorkflow.input?.output ?? {},
         ...(existing ?? {}), // preserve anything else (suspendPayload, etc.)
       };
-      if (terminalRecoveryEnabled) {
+      if (terminalRecoveryActive) {
         if (!recoveryAncestry) {
           throw new MastraError({
             id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_ANCESTRY_UNAVAILABLE',

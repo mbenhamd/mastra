@@ -27,7 +27,10 @@ not classified heuristically; producers must supply an allowlisted projection
 and must not place provider tokens, authorization headers, or other secrets in
 that patch.
 
-Ancestry is captured before a nested child begins execution. Terminal
+Ancestry is captured before a durable nested child begins execution. A new
+child for which `shouldPersistSnapshot` returns `false` remains outside this
+protocol; a later transition for an already-retained child still replays its
+admission so a resume cannot silently discard recovery evidence. Terminal
 persistence later requires the exact same ancestry and hashes the complete
 canonical envelope. A parent effect includes that envelope hash in its payload
 integrity, so the continuation contract and destination receipt transitively

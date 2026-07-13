@@ -188,8 +188,6 @@ export interface WorkflowTerminalRecoveryAncestryRecord {
   workflowName: string;
   runId: string;
   ancestryHash: `sha256:${string}`;
-  /** Present only when ancestry and parent ownership were admitted atomically. */
-  admissionHash?: `sha256:${string}`;
   ancestry: WorkflowTerminalRecoveryAncestryV1;
   createdAt: number;
 }

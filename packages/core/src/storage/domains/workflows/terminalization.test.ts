@@ -1415,6 +1415,52 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
   });
 
+  it.each([
+    {
+      terminalStatus: 'failed' as const,
+      terminalResult: { status: 'failed', error: { name: 'Error', message: 'authenticated failure' } },
+      expectedError: { name: 'Error', message: 'authenticated failure' },
+    },
+    {
+      terminalStatus: 'success' as const,
+      terminalResult: { status: 'success', output: { done: true } },
+      expectedError: undefined,
+    },
+    {
+      terminalStatus: 'canceled' as const,
+      terminalResult: { status: 'canceled' },
+      expectedError: undefined,
+    },
+  ])(
+    'projects authenticated $terminalStatus error truth into the replaceable workflow row',
+    async ({ terminalStatus, terminalResult, expectedError }) => {
+      const workflows = await setup();
+      const claim = await acquire(workflows, { terminalStatus });
+      const snapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: terminalStatus,
+        error: { name: 'Error', message: 'stale caller error' },
+      };
+
+      await expect(
+        workflows.persistWorkflowTerminalState({
+          ...fence(claim),
+          snapshot,
+          recoveryEnvelope: createTerminalRecoveryEnvelope({
+            ...run,
+            snapshot,
+            terminalStatus,
+            terminalResult,
+          }),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted' });
+
+      const persisted = await workflows.loadWorkflowSnapshot(run);
+      expect(persisted?.result).toEqual(terminalResult);
+      expect(persisted?.error).toEqual(expectedError);
+    },
+  );
+
   it('normalizes inherited stateful identity fields before validating and storing a snapshot', async () => {
     const workflows = await setup();
     const claim = await acquire(workflows);

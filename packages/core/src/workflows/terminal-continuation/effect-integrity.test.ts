@@ -118,5 +118,6 @@ describe('workflow terminal effect integrity', () => {
     );
     const symbol = { ...effect(), [Symbol('hidden')]: true };
     expect(() => getWorkflowTerminalEffectIntegrity(symbol)).toThrow(/symbol/);
+    expect(() => getWorkflowTerminalEffectIntegrity({ ...effect(), unknown: true })).toThrow(/unknown/);
   });
 });

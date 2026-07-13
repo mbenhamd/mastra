@@ -343,7 +343,10 @@ describe('WorkflowsPG terminal destination receipts', () => {
         ...ready.run,
         snapshot: currentSnapshot,
         terminalStatus: 'failed',
-        terminalResult: { status: 'failed', error: 'replacement terminal result' },
+        terminalResult: {
+          status: 'failed',
+          error: { name: 'Error', message: 'replacement terminal result' },
+        },
       });
       await pool.query(
         `UPDATE mastra_workflow_terminal_snapshots_v2

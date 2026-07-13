@@ -406,6 +406,67 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     await mastra.shutdown();
   });
 
+  it('keeps a brand-new nonpersistent nested run outside durable recovery admission', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'transient-parent-run';
+    const childRunId = 'transient-child-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const admit = vi.spyOn(workflows, 'admitWorkflowNestedRun');
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    await processor.start({
+      workflow: {
+        ...workflow('child'),
+        options: { shouldPersistSnapshot: () => false },
+      } as ProcessorArgs['workflow'],
+      workflowId: 'child',
+      runId: childRunId,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success', output: {} },
+      requestContext: {},
+      parentWorkflow: {
+        workflowId: 'parent',
+        runId: parentRunId,
+        stepId: 'child',
+        executionPath: [0],
+        resume: false,
+        stepResults: {},
+        stepGraph: parentGraph,
+        activeStepsPath: {},
+        resumeSteps: [],
+        resumeData: undefined,
+        input: { status: 'success', output: {} },
+      },
+    });
+
+    expect(admit).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    await expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves.toBeNull();
+    await expect(
+      workflows.getWorkflowTerminalRecoveryAncestry({ workflowName: 'child', runId: childRunId }),
+    ).resolves.toEqual({ status: 'missing_ancestry' });
+    const retainedParent = await workflows.loadWorkflowSnapshot({ workflowName: 'parent', runId: parentRunId });
+    expect(retainedParent?.context.child).toBeUndefined();
+    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+      ['workflow.events.v2.transient-child-run', 'watch'],
+      ['workflows', 'workflow.step.run'],
+    ]);
+    await mastra.shutdown();
+  });
+
   it('reuses immutable retained ancestry when a nested child resumes', async () => {
     const { mastra, workflows, processor } = await setup();
     const parentRunId = 'resume-parent-run';

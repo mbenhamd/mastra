@@ -1469,6 +1469,10 @@ export function persistWorkflowTerminalStateRecord(
   const snapshot = materializeSnapshot({
     ...inputSnapshot,
     result: recovery.envelope.terminalResult,
+    error:
+      existing.terminalStatus === 'failed'
+        ? (recovery.envelope.terminalResult.error as PersistWorkflowTerminalStateInput['snapshot']['error'])
+        : undefined,
     context: {
       ...inputSnapshot.context,
       __state: recovery.envelope.finalState as never,

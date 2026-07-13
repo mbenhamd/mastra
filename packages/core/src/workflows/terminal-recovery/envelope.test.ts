@@ -108,6 +108,13 @@ describe('workflow terminal recovery envelope', () => {
         input({ terminalStatus: 'failed', terminalResult: { status: 'failed' } }),
       ),
     ).toThrow(/requires an error/);
+    for (const error of ['failure', { message: 'missing name' }, { name: 'Error', message: 'failure', stack: 42 }]) {
+      expect(() =>
+        materializeWorkflowTerminalRecoveryEnvelope(
+          input({ terminalStatus: 'failed', terminalResult: { status: 'failed', error } }),
+        ),
+      ).toThrow(/serialized error|string name and message|must be a string/);
+    }
     expect(() =>
       materializeWorkflowTerminalRecoveryEnvelope(
         input({ terminalResult: { status: 'success', error: { message: 'contradiction' } } }),
