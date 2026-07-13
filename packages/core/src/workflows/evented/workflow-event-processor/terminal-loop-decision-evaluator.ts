@@ -219,6 +219,12 @@ function startEventedWorkflowTerminalLoopDecision(
   input: EvaluateEventedWorkflowTerminalLoopDecisionInput,
 ): StartedLoopDecisionEvaluation {
   const safeInput = copyEvaluationInput(input);
+  return startValidatedEventedWorkflowTerminalLoopDecision(safeInput);
+}
+
+function startValidatedEventedWorkflowTerminalLoopDecision(
+  safeInput: EvaluateEventedWorkflowTerminalLoopDecisionInput,
+): StartedLoopDecisionEvaluation {
   const frame = safeInput.frame;
   const request = frame.request;
   const timeoutMs = timeout(safeInput.timeoutMs);
@@ -394,7 +400,7 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
       this.#capacityExceeded++;
       return Promise.resolve({ status: 'capacity_exceeded', request: frame.request });
     }
-    const started = startEventedWorkflowTerminalLoopDecision(safeInput);
+    const started = startValidatedEventedWorkflowTerminalLoopDecision(safeInput);
     const entry: EvaluationEntry = {
       promise: started.result,
       retained: false,

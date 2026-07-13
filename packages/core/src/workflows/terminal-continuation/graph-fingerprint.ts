@@ -94,21 +94,30 @@ function hashFramedParts(domain: string, parts: readonly string[]): string {
   return hash.digest('hex');
 }
 
-function hashSource(domain: string, value: unknown, field: string, state: GraphState): string {
+function hashBoundedSource(
+  domain: string,
+  value: unknown,
+  field: string,
+  state: GraphState,
+  validateSource?: (source: string) => void,
+): string {
   const source = validateWorkflowTerminalStructuralString(value, field, MAX_TERMINAL_GRAPH_BYTES, true);
+  validateSource?.(source);
   state.bytes += Buffer.byteLength(source, 'utf8');
   if (state.bytes > MAX_TERMINAL_GRAPH_BYTES) throw new TypeError('serialized workflow graph exceeds byte limit');
   return hashFramedParts(domain, [source]);
 }
 
+function hashSource(domain: string, value: unknown, field: string, state: GraphState): string {
+  return hashBoundedSource(domain, value, field, state);
+}
+
 function hashExecutableSource(domain: string, value: unknown, field: string, state: GraphState): string {
-  const source = validateWorkflowTerminalStructuralString(value, field, MAX_TERMINAL_GRAPH_BYTES, true);
-  if (source.includes('[native code]')) {
-    throw new TypeError(`${field} must not contain native or bound callback source`);
-  }
-  state.bytes += Buffer.byteLength(source, 'utf8');
-  if (state.bytes > MAX_TERMINAL_GRAPH_BYTES) throw new TypeError('serialized workflow graph exceeds byte limit');
-  return hashFramedParts(domain, [source]);
+  return hashBoundedSource(domain, value, field, state, source => {
+    if (source.includes('[native code]')) {
+      throw new TypeError(`${field} must not contain native or bound callback source`);
+    }
+  });
 }
 
 interface GraphState {
