@@ -101,9 +101,9 @@ describe('processWorkflowParallel restart branch routing', () => {
     ]);
   });
 
-  it('appends real branch indices to a pending nested parallel container path', async () => {
+  it('preserves magic-key IDs from the pending nested producer through parallel restart routing', async () => {
     const { published, pubsub } = recorder();
-    const step = makeParallelStep(['A', 'B', 'C']);
+    const step = makeParallelStep(['__proto__', 'constructor', 'ordinary']);
     const restart = createRestartExecutionParams({
       snapshot: {
         runId: 'pending-nested',
@@ -122,7 +122,12 @@ describe('processWorkflowParallel restart branch routing', () => {
     });
 
     expect(restart.activePaths).toEqual([0]);
-    expect(restart.activeStepsPath).toEqual({ A: [0], B: [0], C: [0] });
+    expect(Object.keys(restart.activeStepsPath)).toEqual(['__proto__', 'constructor', 'ordinary']);
+    expect(Object.prototype.hasOwnProperty.call(restart.activeStepsPath, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(restart.activeStepsPath, 'constructor')).toBe(true);
+    expect(restart.activeStepsPath['__proto__']).toEqual([0]);
+    expect(restart.activeStepsPath.constructor).toEqual([0]);
+    expect(restart.activeStepsPath.ordinary).toEqual([0]);
     await processWorkflowParallel(makeArgs({ executionPath: restart.activePaths, restart }), { pubsub, step });
 
     expect(runPaths(published)).toEqual([
@@ -146,34 +151,54 @@ describe('processWorkflowParallel restart branch routing', () => {
     expect(runPaths(published)).toEqual([[4, 7, 2]]);
   });
 
-  it('ignores unknown and inherited activity keys without invoking accessors', async () => {
+  it('ignores inherited activity keys', async () => {
     const { published, pubsub } = recorder();
-    const getter = vi.fn(() => [0, 2]);
-    const activeStepsPath = { unknown: [9] };
-    Object.defineProperty(activeStepsPath, 'C', { enumerable: true, get: getter });
+    const activeStepsPath = Object.create({ C: [0, 2] });
 
     await processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
       pubsub,
-      step: makeParallelStep(['__proto__', 'constructor', 'C']),
+      step: makeParallelStep(['A', 'B', 'C']),
     });
 
     expect(published).toEqual([]);
+  });
+
+  it('rejects accessor and unknown own keys before publishing', async () => {
+    const getter = vi.fn(() => [0, 2]);
+    const accessorPath = {};
+    Object.defineProperty(accessorPath, 'C', { enumerable: true, get: getter });
+
+    for (const activeStepsPath of [accessorPath, { unknown: [0] }]) {
+      const { published, pubsub } = recorder();
+      await expect(
+        processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
+          pubsub,
+          step: makeParallelStep(['A', 'B', 'C']),
+        }),
+      ).rejects.toThrow('Invalid parallel restart state');
+      expect(published).toEqual([]);
+    }
+
     expect(getter).not.toHaveBeenCalled();
   });
 
-  it('recognizes own magic-key branch IDs after JSON transport', async () => {
+  it.each([
+    ['non-array', true],
+    ['wrong prefix', [9, 2]],
+    ["another branch's stored path", [1]],
+    ['wrong full branch index', [0, 1]],
+    ['sparse path', Object.assign(new Array(2), { 0: 0 })],
+    ['overlong path', [0, 2, 0]],
+  ])('rejects a %s before publishing', async (_label, path) => {
     const { published, pubsub } = recorder();
-    const activeStepsPath = JSON.parse('{"__proto__":[0],"constructor":[1]}');
 
-    await processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
-      pubsub,
-      step: makeParallelStep(['__proto__', 'constructor', 'ordinary']),
-    });
-
-    expect(runPaths(published)).toEqual([
-      [0, 0],
-      [0, 1],
-    ]);
+    await expect(
+      processWorkflowParallel(
+        makeArgs({ restart: { activeStepsPath: { C: path }, isParallelOrConditionalRestarted: false } }),
+        { pubsub, step: makeParallelStep(['A', 'B', 'C']) },
+      ),
+    ).rejects.toThrow('Invalid parallel restart state');
+    expect(published).toEqual([]);
   });
 
   it('preserves ordinary fan-out and per-step behavior', async () => {

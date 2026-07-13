@@ -5,6 +5,56 @@ import { resolveCurrentState } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import type { ProcessorArgs } from '.';
 
+function pathsEqual(left: readonly number[], right: readonly number[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function validateParallelRestartPaths({
+  activeStepsPath,
+  allowContainerPath,
+  restartContainerPath,
+  step,
+}: {
+  activeStepsPath: Record<string, number[]>;
+  allowContainerPath: boolean;
+  restartContainerPath: number[];
+  step: Extract<StepFlowEntry, { type: 'parallel' }>;
+}) {
+  const branchIndices = new Map(
+    step.steps.flatMap((nestedStep, index) =>
+      nestedStep.type === 'step' ? ([[nestedStep.step.id, index]] as const) : [],
+    ),
+  );
+
+  for (const stepId of Object.getOwnPropertyNames(activeStepsPath)) {
+    const branchIndex = branchIndices.get(stepId);
+    if (branchIndex === undefined) {
+      throw new Error(`Invalid parallel restart state: active step "${stepId}" is not a branch of this parallel step.`);
+    }
+
+    const descriptor = Object.getOwnPropertyDescriptor(activeStepsPath, stepId)!;
+    const path = 'value' in descriptor ? descriptor.value : undefined;
+    const isDenseIntegerPath =
+      Array.isArray(path) &&
+      Object.keys(path).length === path.length &&
+      path.every(
+        (value, index) => Object.prototype.hasOwnProperty.call(path, index) && Number.isInteger(value) && value >= 0,
+      );
+    const fullBranchPath = restartContainerPath.concat(branchIndex);
+    const storedBranchPath = [branchIndex];
+    if (
+      !isDenseIntegerPath ||
+      (!pathsEqual(path, fullBranchPath) &&
+        !pathsEqual(path, storedBranchPath) &&
+        !(allowContainerPath && pathsEqual(path, restartContainerPath)))
+    ) {
+      throw new Error(
+        `Invalid parallel restart state: active step "${stepId}" must store its branch path or the pending parallel container path.`,
+      );
+    }
+  }
+}
+
 export async function processWorkflowParallel(
   {
     workflowId,
@@ -39,13 +89,21 @@ export async function processWorkflowParallel(
       ? executionPath
       : executionPath.slice(0, -1)
     : undefined;
+  if (restart) {
+    validateParallelRestartPaths({
+      activeStepsPath: restart.activeStepsPath,
+      allowContainerPath: executionPath.length === 1,
+      restartContainerPath: restartContainerPath!,
+      step,
+    });
+  }
   for (let i = 0; i < step.steps.length; i++) {
     const nestedStep = step.steps[i];
     if (nestedStep?.type === 'step') {
       //if restart, only run the step if it's in the active steps path
       if (restart) {
         const descriptor = Object.getOwnPropertyDescriptor(restart.activeStepsPath, nestedStep.step.id);
-        if (descriptor && 'value' in descriptor && descriptor.value) {
+        if (descriptor) {
           pathsToRun.add(nestedStep.step.id);
         }
       } else {
