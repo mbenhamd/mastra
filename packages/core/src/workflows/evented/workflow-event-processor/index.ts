@@ -2441,8 +2441,8 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     let workflow;
-    if (this.mastra.__hasInternalWorkflow(workflowData.workflowId)) {
-      workflow = this.mastra.__getInternalWorkflow(workflowData.workflowId);
+    if (this.mastra.__hasInternalWorkflow(workflowData.workflowId, workflowData.runId)) {
+      workflow = this.mastra.__getInternalWorkflow(workflowData.workflowId, workflowData.runId);
     } else if (workflowData.parentWorkflow) {
       workflow = getNestedWorkflow(this.mastra, workflowData.parentWorkflow);
     } else {

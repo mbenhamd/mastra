@@ -6294,15 +6294,18 @@ export class Agent<
     // configured storage instead of logging "Mastra storage is not initialized" on every run.
     // The workflow opts out of snapshot persistence (shouldPersistSnapshot returns false), so
     // this does not write any execution-workflow rows to storage.
+    const executionRunId = randomUUID();
     if (this.#mastra) {
-      executionWorkflow.__registerMastra(this.#mastra);
+      this.#mastra.__registerInternalWorkflow(executionWorkflow, executionRunId);
     }
 
-    const run = await executionWorkflow.createRun();
     const observabilityContext = createObservabilityContext({ currentSpan: agentSpan });
-    const result = await run.start({ ...observabilityContext });
-
-    return result;
+    try {
+      const run = await executionWorkflow.createRun({ runId: executionRunId });
+      return await run.start({ ...observabilityContext });
+    } finally {
+      this.#mastra?.__unregisterInternalWorkflow(executionWorkflow.id, executionRunId);
+    }
   }
 
   /**

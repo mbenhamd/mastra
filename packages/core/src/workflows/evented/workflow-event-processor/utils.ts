@@ -24,7 +24,7 @@ function isWorkflowStep(step: unknown): step is Workflow {
 
 export function getNestedWorkflow(
   mastra: Mastra,
-  { workflowId, executionPath, parentWorkflow }: ParentWorkflow,
+  { workflowId, executionPath, parentWorkflow, runId }: ParentWorkflow,
 ): Workflow | null {
   let workflow: Workflow | null = null;
 
@@ -43,8 +43,8 @@ export function getNestedWorkflow(
   // for callers like the bg-tasks `__background-task` workflow.
   workflow =
     workflow ??
-    (mastra.__hasInternalWorkflow(workflowId)
-      ? mastra.__getInternalWorkflow(workflowId)
+    (mastra.__hasInternalWorkflow(workflowId, runId)
+      ? mastra.__getInternalWorkflow(workflowId, runId)
       : mastra.getWorkflow(workflowId));
   const stepGraph = workflow.stepGraph;
   let parentStep = stepGraph[executionPath[0]!];

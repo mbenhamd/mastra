@@ -109,6 +109,15 @@ export class OrchestrationWorker extends MastraWorker {
       throw new Error('OrchestrationWorker not initialized');
     }
 
+    if (this.deps?.mastra && !this.deps.mastra.__shouldProcessWorkflowEvent(event)) {
+      try {
+        await ack?.();
+      } catch (e) {
+        this.deps.logger?.error('OrchestrationWorker: error acking foreign event', { error: e });
+      }
+      return;
+    }
+
     // The local processor is used (rather than mastra.handleWorkflowEvent)
     // because it carries the standalone-worker step-execution strategy
     // (HttpRemoteStrategy when MASTRA_STEP_EXECUTION_URL is set), which the

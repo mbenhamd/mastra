@@ -66,9 +66,9 @@ The default is `['pull']` so that custom implementations keep today's behavior u
 
 ### Core methods
 
-#### `publish(topic, event)`
+#### `publish(topic, event, options?)`
 
-Publishes an event to a topic. The `id` and `createdAt` fields are assigned by the implementation.
+Publishes an event to a topic. The `id` and `createdAt` fields are assigned by the implementation. Set `options.localOnly` to keep an event in the publishing process when the backend supports process-local delivery.
 
 ```typescript
 await pubsub.publish('my-topic', {
@@ -77,6 +77,8 @@ await pubsub.publish('my-topic', {
   runId: 'run-123',
 })
 ```
+
+Mastra applies `localOnly` automatically to run-scoped internal workflow events. Custom backends must not send a `localOnly` event to another process or host.
 
 #### `subscribe(topic, cb, options?)`
 

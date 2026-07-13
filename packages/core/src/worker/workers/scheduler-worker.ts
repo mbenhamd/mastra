@@ -41,7 +41,7 @@ export class SchedulerWorker extends MastraWorker {
 
     this.#scheduler = new WorkflowScheduler({
       schedulesStore,
-      pubsub: deps.pubsub,
+      pubsub: deps.mastra?.pubsub ?? deps.pubsub,
       config: {
         tickIntervalMs: this.#config.tickIntervalMs,
         batchSize: this.#config.batchSize,

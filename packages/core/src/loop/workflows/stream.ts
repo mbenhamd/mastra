@@ -201,7 +201,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       });
 
       if (rest.mastra) {
-        agenticLoopWorkflow.__registerMastra(rest.mastra);
+        rest.mastra.__registerInternalWorkflow(agenticLoopWorkflow, runId);
       }
 
       const initialData = {
@@ -236,36 +236,45 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         });
       }
 
-      const run = await agenticLoopWorkflow.createRun({
-        runId,
-        resourceId: _internal?.resourceId,
-      });
+      let keepRegisteredForResume = false;
+      let executionResult;
+      try {
+        const run = await agenticLoopWorkflow.createRun({
+          runId,
+          resourceId: _internal?.resourceId,
+        });
 
-      if (typeof requireToolApproval === 'function') {
-        // Store the function so the tool-call-step can evaluate it per call. RequestContext.toJSON()
-        // strips non-serializable values, so this never reaches the persisted suspend snapshot — that
-        // is fine because approval is only decided at call time, before any suspend/resume.
-        requestContext.set('__mastra_requireToolApproval', requireToolApproval);
-      } else if (requireToolApproval) {
-        requestContext.set('__mastra_requireToolApproval', true);
-      } else {
-        // Clear any value left over from a prior call so a reused RequestContext can't leak a
-        // stale function/`true` into a call where approval is no longer required.
-        requestContext.delete('__mastra_requireToolApproval');
+        if (typeof requireToolApproval === 'function') {
+          // Store the function so the tool-call-step can evaluate it per call. RequestContext.toJSON()
+          // strips non-serializable values, so this never reaches the persisted suspend snapshot — that
+          // is fine because approval is only decided at call time, before any suspend/resume.
+          requestContext.set('__mastra_requireToolApproval', requireToolApproval);
+        } else if (requireToolApproval) {
+          requestContext.set('__mastra_requireToolApproval', true);
+        } else {
+          // Clear any value left over from a prior call so a reused RequestContext can't leak a
+          // stale function/`true` into a call where approval is no longer required.
+          requestContext.delete('__mastra_requireToolApproval');
+        }
+
+        executionResult = resumeContext
+          ? await run.resume({
+              resumeData: resumeContext.resumeData,
+              ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
+              requestContext,
+              label: toolCallId,
+            })
+          : await run.start({
+              inputData: initialData,
+              ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
+              requestContext,
+            });
+        keepRegisteredForResume = executionResult.status === 'suspended';
+      } finally {
+        if (!keepRegisteredForResume) {
+          rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId);
+        }
       }
-
-      const executionResult = resumeContext
-        ? await run.resume({
-            resumeData: resumeContext.resumeData,
-            ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
-            requestContext,
-            label: toolCallId,
-          })
-        : await run.start({
-            inputData: initialData,
-            ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
-            requestContext,
-          });
 
       if (executionResult.status !== 'success') {
         if (executionResult.status === 'failed') {

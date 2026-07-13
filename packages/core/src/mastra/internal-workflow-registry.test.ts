@@ -1,18 +1,17 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { createWorkflow } from '../workflows/create';
 import { createStep } from '../workflows/workflow';
 import { Mastra } from './index';
 
 /**
- * Tests for the run-scoped internal workflow registry and lazy TTL sweep.
+ * Tests for the run-scoped internal workflow registry.
  *
  * The registry supports two kinds of entries:
  * 1. Unscoped (singleton): keyed by `${id}` — used for background tasks,
  *    score-traces, etc.  These live forever.
- * 2. Run-scoped: keyed by `${id}:${runId}` — used for per-run agentic-loop
- *    and prepare-stream workflows.  These carry a timestamp and are evicted
- *    by a lazy sweep when they exceed `Mastra.INTERNAL_WORKFLOW_TTL_MS`.
+ * 2. Run-scoped: stored as structured workflow-id/run-id maps and removed by
+ *    the execution lifecycle. Suspended runs remain registered until resume.
  */
 
 const dummyStep = createStep({
@@ -75,6 +74,17 @@ describe('internal workflow registry', () => {
       expect(m.__getInternalWorkflow('agentic-loop', 'run-2')).toBe(wf2);
     });
 
+    it('does not alias delimiter-bearing workflow and run ids', () => {
+      const m = makeMastra();
+      const first = makeWorkflow('a:b');
+      const second = makeWorkflow('a');
+      m.__registerInternalWorkflow(first, 'c');
+      m.__registerInternalWorkflow(second, 'b:c');
+
+      expect(m.__getInternalWorkflow('a:b', 'c')).toBe(first);
+      expect(m.__getInternalWorkflow('a', 'b:c')).toBe(second);
+    });
+
     it('falls back to unscoped entry when run-scoped is missing', () => {
       const m = makeMastra();
       const singleton = makeWorkflow('shared-wf');
@@ -117,94 +127,35 @@ describe('internal workflow registry', () => {
     });
   });
 
-  describe('lazy TTL sweep', () => {
-    beforeEach(() => {
+  describe('lifecycle cleanup', () => {
+    it('keeps a live run registered until explicit terminal cleanup', () => {
+      const m = makeMastra();
+      const live = makeWorkflow('loop');
+      m.__registerInternalWorkflow(live, 'suspended-run');
+      m.__registerInternalWorkflow(makeWorkflow('unrelated'), 'other-run');
+
+      expect(m.__getInternalWorkflow('loop', 'suspended-run')).toBe(live);
+
+      m.__unregisterInternalWorkflow('loop', 'suspended-run');
+      expect(m.__hasInternalWorkflow('loop', 'suspended-run')).toBe(false);
+    });
+
+    it('lazily evicts abandoned run-scoped workflows after the TTL', () => {
       vi.useFakeTimers();
-    });
-    afterEach(() => {
-      vi.useRealTimers();
-    });
+      try {
+        const m = makeMastra();
+        const stale = makeWorkflow('stale-loop');
+        const fresh = makeWorkflow('fresh-loop');
+        m.__registerInternalWorkflow(stale, 'stale-run');
 
-    it('evicts run-scoped entries older than TTL on next registration', () => {
-      const m = makeMastra();
-      const old = makeWorkflow('loop');
-      m.__registerInternalWorkflow(old, 'run-old');
+        vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
+        m.__registerInternalWorkflow(fresh, 'fresh-run');
 
-      // Advance past TTL
-      vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
-
-      // Trigger sweep by registering a new run-scoped entry
-      const fresh = makeWorkflow('loop');
-      m.__registerInternalWorkflow(fresh, 'run-fresh');
-
-      // Old entry should be evicted
-      expect(m.__hasInternalWorkflow('loop', 'run-old')).toBe(false);
-      // Fresh entry should still be present
-      expect(m.__hasInternalWorkflow('loop', 'run-fresh')).toBe(true);
-      expect(m.__getInternalWorkflow('loop', 'run-fresh')).toBe(fresh);
-    });
-
-    it('does NOT evict run-scoped entries within TTL', () => {
-      const m = makeMastra();
-      const recent = makeWorkflow('loop');
-      m.__registerInternalWorkflow(recent, 'run-recent');
-
-      // Advance to just under the TTL
-      vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS - 1000);
-
-      // Trigger sweep
-      const fresh = makeWorkflow('loop');
-      m.__registerInternalWorkflow(fresh, 'run-trigger');
-
-      // Recent entry should still be present
-      expect(m.__hasInternalWorkflow('loop', 'run-recent')).toBe(true);
-    });
-
-    it('does NOT evict unscoped (singleton) entries regardless of age', () => {
-      const m = makeMastra();
-      const singleton = makeWorkflow('bg-task');
-      m.__registerInternalWorkflow(singleton); // no runId
-
-      vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS * 10);
-
-      // Trigger sweep
-      const trigger = makeWorkflow('trigger');
-      m.__registerInternalWorkflow(trigger, 'run-x');
-
-      // Singleton should survive
-      expect(m.__hasInternalWorkflow('bg-task')).toBe(true);
-      expect(m.__getInternalWorkflow('bg-task')).toBe(singleton);
-    });
-
-    it('evicts multiple stale entries in a single sweep', () => {
-      const m = makeMastra();
-      m.__registerInternalWorkflow(makeWorkflow('loop'), 'run-a');
-      m.__registerInternalWorkflow(makeWorkflow('loop'), 'run-b');
-      m.__registerInternalWorkflow(makeWorkflow('loop'), 'run-c');
-
-      // Advance past TTL for all three (registered at the same time)
-      vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
-
-      // Trigger sweep
-      m.__registerInternalWorkflow(makeWorkflow('loop'), 'run-fresh');
-
-      expect(m.__hasInternalWorkflow('loop', 'run-a')).toBe(false);
-      expect(m.__hasInternalWorkflow('loop', 'run-b')).toBe(false);
-      expect(m.__hasInternalWorkflow('loop', 'run-c')).toBe(false);
-      expect(m.__hasInternalWorkflow('loop', 'run-fresh')).toBe(true);
-    });
-
-    it('sweep is not triggered by unscoped registration', () => {
-      const m = makeMastra();
-      m.__registerInternalWorkflow(makeWorkflow('loop'), 'run-old');
-
-      vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
-
-      // Register unscoped — sweep should NOT fire
-      m.__registerInternalWorkflow(makeWorkflow('singleton'));
-
-      // Old run-scoped entry should still exist (no sweep happened)
-      expect(m.__hasInternalWorkflow('loop', 'run-old')).toBe(true);
+        expect(m.__hasInternalWorkflow('stale-loop', 'stale-run')).toBe(false);
+        expect(m.__getInternalWorkflow('fresh-loop', 'fresh-run')).toBe(fresh);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

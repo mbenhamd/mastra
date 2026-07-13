@@ -9,9 +9,11 @@
  * → processWorkflowFail → workflows-finish, erroneously terminating the
  * correct instance's run.
  */
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
+import { Agent } from '../agent';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import type { PubSubDeliveryMode } from '../events/pubsub';
 import type { Event } from '../events/types';
@@ -26,7 +28,7 @@ class PushOnlyPubSub extends EventEmitterPubSub {
   }
 }
 
-function makeStartEvent(workflowId: string, runId: string): Event {
+function makeStartEvent(workflowId: string, runId: string, internal = true): Event {
   return {
     type: 'workflow.start',
     runId,
@@ -38,6 +40,7 @@ function makeStartEvent(workflowId: string, runId: string): Event {
       prevResult: { status: 'success', output: {} },
       activeSteps: {},
       requestContext: {},
+      ...(internal ? { __mastraInternalWorkflow: true } : {}),
     },
   } as Event;
 }
@@ -60,6 +63,39 @@ function makeNoopWorkflow(id: string) {
 }
 
 describe('cross-process workflow event guard', () => {
+  it('registers real agent execution and loop workflows without test-only ownership setup', async () => {
+    const agent = new Agent({
+      id: 'owned-agent',
+      name: 'Owned agent',
+      instructions: 'Reply briefly.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text', text: 'owned' }],
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          warnings: [],
+        }),
+      }),
+    });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      pubsub: new PushOnlyPubSub(),
+      agents: { ownedAgent: agent },
+    });
+    const register = vi.spyOn(mastra, '__registerInternalWorkflow');
+    const unregister = vi.spyOn(mastra, '__unregisterInternalWorkflow');
+
+    await mastra.startWorkers();
+    await mastra.getAgent('ownedAgent').generate('hello');
+
+    expect(register.mock.calls.some(([workflow, runId]) => workflow.id === 'execution-workflow' && !!runId)).toBe(true);
+    expect(register.mock.calls.some(([workflow, runId]) => workflow.id === 'agentic-loop' && !!runId)).toBe(true);
+    expect(unregister.mock.calls.some(([workflowId]) => workflowId === 'execution-workflow')).toBe(true);
+    expect(unregister.mock.calls.some(([workflowId]) => workflowId === 'agentic-loop')).toBe(true);
+    await mastra.shutdown();
+  });
+
   it('skips events for internal workflows not owned by this instance', async () => {
     const sharedPubSub = new PushOnlyPubSub();
 
@@ -121,7 +157,7 @@ describe('cross-process workflow event guard', () => {
     const spyA = vi.spyOn(mastraA, 'handleWorkflowEvent');
     const spyB = vi.spyOn(mastraB, 'handleWorkflowEvent');
 
-    await sharedPubSub.publish('workflows', makeStartEvent('my-public-workflow', 'run-pub'));
+    await sharedPubSub.publish('workflows', makeStartEvent('my-public-workflow', 'run-pub', false));
     await vi.waitFor(
       () => {
         expect(spyA).toHaveBeenCalled();
@@ -130,6 +166,47 @@ describe('cross-process workflow event guard', () => {
       { timeout: 1000, interval: 10 },
     );
 
+    await mastraA.shutdown();
+    await mastraB.shutdown();
+  });
+
+  it('still processes nested events whose public root is registered on each instance', async () => {
+    const sharedPubSub = new PushOnlyPubSub();
+    const mastraA = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { publicRoot: makeNoopWorkflow('public-root') } as any,
+      pubsub: sharedPubSub,
+    });
+    const mastraB = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { publicRoot: makeNoopWorkflow('public-root') } as any,
+      pubsub: sharedPubSub,
+    });
+    await mastraA.startWorkers();
+    await mastraB.startWorkers();
+    const spyA = vi.spyOn(mastraA, 'handleWorkflowEvent');
+    const spyB = vi.spyOn(mastraB, 'handleWorkflowEvent');
+
+    await sharedPubSub.publish('workflows', {
+      ...makeStartEvent('nested-child', 'nested-run', false),
+      data: {
+        ...makeStartEvent('nested-child', 'nested-run', false).data,
+        parentWorkflow: {
+          workflowId: 'public-root',
+          runId: 'public-run',
+          executionPath: [0],
+          stepResults: {},
+          stepGraph: [],
+        },
+      },
+    } as Event);
+
+    await vi.waitFor(() => {
+      expect(spyA).toHaveBeenCalled();
+      expect(spyB).toHaveBeenCalled();
+    });
     await mastraA.shutdown();
     await mastraB.shutdown();
   });
@@ -208,6 +285,7 @@ describe('cross-process workflow event guard', () => {
         prevResult: { status: 'success', output: {} },
         activeSteps: {},
         requestContext: {},
+        __mastraInternalWorkflow: true,
         parentWorkflow: {
           workflowId: 'execution-workflow',
           runId: 'run-owner',
@@ -265,6 +343,38 @@ describe('cross-process workflow event guard', () => {
     await new Promise(r => setTimeout(r, 100));
     expect(spy).not.toHaveBeenCalled();
 
+    await mastra.shutdown();
+  });
+
+  it('logs only structural ownership fields when a foreign event is skipped', async () => {
+    const sharedPubSub = new PushOnlyPubSub();
+    const debug = vi.fn();
+    const mastra = new Mastra({
+      logger: {
+        debug,
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        trackException: vi.fn(),
+      } as any,
+      storage: new MockStore(),
+      workflows: {} as any,
+      pubsub: sharedPubSub,
+    });
+    await mastra.startWorkers();
+    const event = makeStartEvent('foreign-workflow', 'foreign-run');
+    (event.data as Record<string, unknown>).payload = { secret: 'must-not-enter-logs' };
+
+    await sharedPubSub.publish('workflows', event);
+
+    await vi.waitFor(() => {
+      expect(debug).toHaveBeenCalledWith('Skipping workflow event not owned by this Mastra instance', {
+        workflowId: 'foreign-workflow',
+        eventType: 'workflow.start',
+        ownership: 'foreign',
+      });
+    });
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('must-not-enter-logs');
     await mastra.shutdown();
   });
 });
@@ -376,14 +486,32 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     await mastra.shutdown();
   });
 
-  it('tags scheduler-spawned background workflow events as localOnly', async () => {
+  it('routes a real scheduler publication through the ownership-aware proxy', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
-    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    const storage = new MockStore();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      workflows: { scheduled: makeNoopWorkflow('scheduled') } as any,
+      scheduler: { enabled: true, tickIntervalMs: 600_000 },
+      pubsub,
+    });
+    await mastra.startWorkers();
+    await vi.waitFor(() => expect(mastra.scheduler).toBeDefined());
+    const schedules = (await storage.getStore('schedules'))!;
+    const now = Date.now();
+    await schedules.createSchedule({
+      id: 'real-scheduler-route',
+      target: { type: 'workflow', workflowId: 'scheduled' },
+      cron: '0 0 1 1 *',
+      status: 'active',
+      nextFireAt: now - 1,
+      createdAt: now,
+      updatedAt: now,
+    });
 
-    const schedRunId = 'sched_wf___mastra_notification_dispatcher__dispatch_1781099940000';
-    await mastra.pubsub.publish('workflows', makeStartEvent('__mastra_notification_dispatcher', schedRunId));
-
-    expect(pubsub.calls[0]!.localOnly).toBe(true);
+    await mastra.scheduler!.tick();
+    expect(pubsub.calls).toContainEqual(expect.objectContaining({ topic: 'workflows', localOnly: true }));
     await mastra.shutdown();
   });
 
@@ -422,6 +550,39 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
 
     await mastra.pubsub.publish('some-other-topic', { type: 'whatever', runId: 'x', data: {} } as Event);
 
+    expect(pubsub.calls[0]!.localOnly).toBe(false);
+    await mastra.shutdown();
+  });
+
+  it('preserves caller-supplied localOnly options for unrelated topics', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+
+    await mastra.pubsub.publish('some-other-topic', { type: 'whatever', runId: 'x', data: {} } as Event, {
+      localOnly: true,
+    });
+
+    expect(pubsub.calls[0]!.localOnly).toBe(true);
+    await mastra.shutdown();
+  });
+
+  it('bounds cyclic parentWorkflow traversal', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    const first: { workflowId: string; runId: string; parentWorkflow?: unknown } = {
+      workflowId: 'foreign-parent-a',
+      runId: 'foreign-run-a',
+    };
+    const second: { workflowId: string; runId: string; parentWorkflow?: unknown } = {
+      workflowId: 'foreign-parent-b',
+      runId: 'foreign-run-b',
+      parentWorkflow: first,
+    };
+    first.parentWorkflow = second;
+
+    await mastra.pubsub.publish('workflows', makeStepRunEvent('foreign-child', 'foreign-child-run', first));
+
+    expect(pubsub.calls).toHaveLength(1);
     expect(pubsub.calls[0]!.localOnly).toBe(false);
     await mastra.shutdown();
   });
