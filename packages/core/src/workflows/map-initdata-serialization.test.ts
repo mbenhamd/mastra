@@ -56,11 +56,44 @@ describe('map(): initData mapping does not serialize the live workflow (#19018)'
     return workflow;
   };
 
-  const mapStepConfig = (workflow: any): string => {
+  const buildStepSourceWorkflow = () => {
+    const sourceStep = createStep({
+      id: 'source',
+      inputSchema: z.object({ seed: z.number() }),
+      outputSchema: z.object({ seed: z.number() }),
+      execute: async ({ inputData }) => inputData,
+    });
+    const sourceWorkflow = createWorkflow({
+      id: 'step-source-workflow',
+      inputSchema: z.object({ seed: z.number() }),
+      outputSchema: z.object({ seed: z.number() }),
+    })
+      .then(sourceStep)
+      .commit();
+    const consumerStep = createStep({
+      id: 'step-consumer',
+      inputSchema: z.object({ seed: z.number() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: async () => ({ ok: true }),
+    });
+
+    return createWorkflow({
+      id: 'map-step-workflow',
+      inputSchema: z.object({ seed: z.number() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+    })
+      .map({
+        seed: mapVariable({ step: sourceWorkflow as any, path: 'seed' }) as any,
+      })
+      .then(consumerStep)
+      .commit();
+  };
+
+  const mapStepConfig = (workflow: any, sourceKey = 'initData'): string => {
     const mapEntry = workflow.serializedStepFlow.find(
-      (e: any) => typeof e?.step?.mapConfig === 'string' && e.step.mapConfig.includes('initData'),
+      (e: any) => typeof e?.step?.mapConfig === 'string' && e.step.mapConfig.includes(`"${sourceKey}"`),
     );
-    expect(mapEntry, 'expected a serialized map step with an initData mapConfig').toBeDefined();
+    expect(mapEntry, `expected a serialized map step with a ${sourceKey} mapConfig`).toBeDefined();
     return mapEntry.step.mapConfig as string;
   };
 
@@ -83,6 +116,19 @@ describe('map(): initData mapping does not serialize the live workflow (#19018)'
     // Before the fix this map step's config was a giant (truncated-at-1000)
     // dump of the inlined workflow; after, it is a compact reference.
     const mapConfig = mapStepConfig(buildInitDataWorkflow());
+    expect(mapConfig.length).toBeLessThan(300);
+  });
+
+  it('serializes a workflow used as a step source by id', () => {
+    const mapConfig = mapStepConfig(buildStepSourceWorkflow(), 'step');
+
+    expect(mapConfig).not.toContain('"logger"');
+    expect(mapConfig).not.toContain('"component"');
+    expect(mapConfig).not.toContain('"stepFlow"');
+    expect(mapConfig).not.toContain('"serializedStepFlow"');
+    expect(JSON.parse(mapConfig)).toEqual({
+      seed: { step: 'step-source-workflow', path: 'seed' },
+    });
     expect(mapConfig.length).toBeLessThan(300);
   });
 });

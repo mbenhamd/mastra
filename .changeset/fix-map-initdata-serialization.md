@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed workflow commits that could run out of memory when `.map()` uses `mapVariable({ initData: workflow })`. Map configurations now store a compact workflow reference, keeping workflow setup reliable.
+Fixed workflow commits that could run out of memory when `.map()` uses a live workflow as an `initData` or step source. Serialized map configurations now store compact workflow and step references, keeping workflow setup reliable.

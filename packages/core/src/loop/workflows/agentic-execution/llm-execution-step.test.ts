@@ -1561,6 +1561,7 @@ describe('createLLMExecutionStep gateway provider tools', () => {
         isRetryable: false,
       });
     });
+    const processAPIError = vi.fn(async () => ({ retry: false }));
 
     const llmExecutionStep = createLLMExecutionStep({
       agentId: 'test-agent',
@@ -1575,7 +1576,7 @@ describe('createLLMExecutionStep gateway provider tools', () => {
       errorProcessors: [
         {
           id: 'observe-api-error',
-          processAPIError: vi.fn(async () => ({ retry: false })),
+          processAPIError,
         },
       ],
       models: [
@@ -1616,6 +1617,11 @@ describe('createLLMExecutionStep gateway provider tools', () => {
       expect.objectContaining({
         type: SpanType.PROCESSOR_RUN,
         name: 'request error processor: observe-api-error',
+      }),
+    );
+    expect(processAPIError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tracingContext: expect.objectContaining({ currentSpan: processorSpan }),
       }),
     );
   });

@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fix a custom `stopWhen` being ignored when `maxSteps` is also set. Previously, setting `maxSteps` replaced the user's `stopWhen` with `stepCountIs(maxSteps)`, so the agent could not stop early and ran to the `maxSteps` cap. The two are now composed, so `stopWhen` still fires while `maxSteps` acts as an upper safety cap. Closes #19007.
+Fixed custom `stopWhen` being ignored when `maxSteps` is set. Custom stop conditions now run alongside the max-step limit, so agents can stop early while still respecting the configured cap. Invalid `maxSteps` values are rejected. Closes #19007.
