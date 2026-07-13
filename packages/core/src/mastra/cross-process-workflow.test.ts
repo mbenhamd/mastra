@@ -486,14 +486,32 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     await mastra.shutdown();
   });
 
-  it('tags scheduler-spawned background workflow events as localOnly', async () => {
+  it('routes a real scheduler publication through the ownership-aware proxy', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
-    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    const storage = new MockStore();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      workflows: { scheduled: makeNoopWorkflow('scheduled') } as any,
+      scheduler: { enabled: true, tickIntervalMs: 600_000 },
+      pubsub,
+    });
+    await mastra.startWorkers();
+    await vi.waitFor(() => expect(mastra.scheduler).toBeDefined());
+    const schedules = (await storage.getStore('schedules'))!;
+    const now = Date.now();
+    await schedules.createSchedule({
+      id: 'real-scheduler-route',
+      target: { type: 'workflow', workflowId: 'scheduled' },
+      cron: '0 0 1 1 *',
+      status: 'active',
+      nextFireAt: now - 1,
+      createdAt: now,
+      updatedAt: now,
+    });
 
-    const schedRunId = 'sched_wf___mastra_notification_dispatcher__dispatch_1781099940000';
-    await mastra.pubsub.publish('workflows', makeStartEvent('__mastra_notification_dispatcher', schedRunId));
-
-    expect(pubsub.calls[0]!.localOnly).toBe(true);
+    await mastra.scheduler!.tick();
+    expect(pubsub.calls).toContainEqual(expect.objectContaining({ topic: 'workflows', localOnly: true }));
     await mastra.shutdown();
   });
 

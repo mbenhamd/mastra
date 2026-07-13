@@ -740,7 +740,7 @@ export class Mastra<
                   (workflowId !== undefined &&
                     runId !== undefined &&
                     self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow)) ||
-                  runId?.startsWith('sched_wf_') === true;
+                  runId?.startsWith('sched_') === true;
 
                 if (isOwnedHere) {
                   return target.publish(
@@ -4713,6 +4713,7 @@ export class Mastra<
     if (data?.__mastraInternalWorkflow !== true) return true;
     const workflowId = data.workflowId;
     const runId = data.runId;
+    if (typeof runId === 'string' && runId.startsWith('sched_')) return true;
     return (
       typeof workflowId === 'string' &&
       typeof runId === 'string' &&
