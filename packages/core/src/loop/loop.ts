@@ -74,6 +74,9 @@ export function loop<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
     skipBgTaskWait: _internal?.skipBgTaskWait,
     drainPendingSignals: _internal?.drainPendingSignals,
     initialSignalEchoes: _internal?.initialSignalEchoes ? [..._internal.initialSignalEchoes] : undefined,
+    // This rebuilt bag hydrates the run scope. Dropping the transform here makes
+    // every non-durable tool payload transformation silently no-op.
+    toolPayloadTransform: _internal?.toolPayloadTransform,
   };
 
   let startTimestamp = internalToUse.now?.();
