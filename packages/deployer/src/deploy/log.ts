@@ -41,7 +41,22 @@ export function createChildProcessLogger({ logger, root }: { logger: IMastraLogg
       pinoStream.end();
       return { success: true };
     } catch (error) {
-      logger.error('Process failed', { error });
+      const processError = error as {
+        name?: unknown;
+        exitCode?: unknown;
+        signal?: unknown;
+        timedOut?: unknown;
+        isCanceled?: unknown;
+      };
+      logger.error('Process failed', {
+        error: {
+          name: typeof processError?.name === 'string' ? processError.name : 'Error',
+          exitCode: typeof processError?.exitCode === 'number' ? processError.exitCode : undefined,
+          signal: typeof processError?.signal === 'string' ? processError.signal : undefined,
+          timedOut: processError?.timedOut === true,
+          isCanceled: processError?.isCanceled === true,
+        },
+      });
       pinoStream.end();
       throw error;
     }

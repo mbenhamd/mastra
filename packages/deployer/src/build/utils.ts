@@ -1,5 +1,4 @@
-import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { basename, join, relative } from 'node:path';
 import type { RollupNodeResolveOptions } from '@rollup/plugin-node-resolve';
@@ -57,8 +56,17 @@ export function upsertMastraDir({ dir = process.cwd() }: { dir?: string }) {
 
   if (!existsSync(dirPath)) {
     mkdirSync(dirPath, { recursive: true });
-    execSync(`echo ".mastra" >> .gitignore`);
   }
+
+  const gitignorePath = join(dir, '.gitignore');
+  const gitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
+  const entries = gitignore.split(/\r?\n/);
+  if (entries.includes('.mastra')) {
+    return;
+  }
+
+  const separator = gitignore.length > 0 && !gitignore.endsWith('\n') ? '\n' : '';
+  writeFileSync(gitignorePath, `${gitignore}${separator}.mastra\n`);
 }
 
 export function isDependencyPartOfPackage(dep: string, packageName: string) {

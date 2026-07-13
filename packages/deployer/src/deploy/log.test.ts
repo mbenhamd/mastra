@@ -54,7 +54,14 @@ describe('createChildProcessLogger', () => {
   });
 
   it('logs and rethrows process failures', async () => {
-    const failure = new Error('process failed');
+    const failure = Object.assign(new Error('process failed with https://user:SECRET@example.invalid/pkg'), {
+      command: 'npm install https://user:SECRET@example.invalid/pkg',
+      escapedCommand: 'npm install https://user:SECRET@example.invalid/pkg',
+      exitCode: 7,
+      signal: 'SIGTERM',
+      timedOut: true,
+      isCanceled: false,
+    });
     const subprocess = Object.assign(Promise.reject(failure), {
       stdout: new PassThrough(),
       stderr: new PassThrough(),
@@ -64,6 +71,15 @@ describe('createChildProcessLogger', () => {
 
     await expect(run({ cmd: 'npm', args: ['install'], env: { PATH: '/bin' } })).rejects.toBe(failure);
 
-    expect(logger.error).toHaveBeenCalledWith('Process failed', { error: failure });
+    expect(logger.error).toHaveBeenCalledWith('Process failed', {
+      error: {
+        name: 'Error',
+        exitCode: 7,
+        signal: 'SIGTERM',
+        timedOut: true,
+        isCanceled: false,
+      },
+    });
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('SECRET');
   });
 });

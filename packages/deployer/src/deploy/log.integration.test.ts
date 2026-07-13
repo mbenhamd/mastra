@@ -33,4 +33,35 @@ describe('createChildProcessLogger integration', () => {
     expect(logger.info).toHaveBeenCalledWith(stderrValue);
     expect(logger.error).not.toHaveBeenCalled();
   });
+
+  it('does not log credential-bearing argv when a real child fails', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const logger = {
+      info: vi.fn(),
+      error: vi.fn(),
+    };
+    const credential = 'https://user:DUMMY_SECRET_TOKEN_123@example.invalid/pkg';
+    const run = createChildProcessLogger({ logger: logger as never, root: process.cwd() });
+
+    await expect(
+      run({
+        cmd: process.execPath,
+        args: ['-e', 'process.exit(7)', credential],
+        env: { PATH: process.env.PATH! },
+      }),
+    ).rejects.toMatchObject({ exitCode: 7 });
+
+    const serializedLog = JSON.stringify(logger.error.mock.calls);
+    expect(serializedLog).not.toContain(credential);
+    expect(serializedLog).not.toContain('DUMMY_SECRET_TOKEN_123');
+    expect(logger.error).toHaveBeenCalledWith('Process failed', {
+      error: {
+        name: 'ExecaError',
+        exitCode: 7,
+        signal: undefined,
+        timedOut: false,
+        isCanceled: false,
+      },
+    });
+  });
 });

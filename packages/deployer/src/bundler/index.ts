@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
@@ -7,6 +6,7 @@ import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import type { Config } from '@mastra/core/mastra';
 import virtual from '@rollup/plugin-virtual';
 import * as pkg from 'empathic/package';
+import { execa } from 'execa';
 import fsExtra, { copy, ensureDir, readJSON, emptyDir } from 'fs-extra/esm';
 import type { InputOptions, OutputOptions } from 'rollup';
 import { glob } from 'tinyglobby';
@@ -158,9 +158,13 @@ export abstract class Bundler extends MastraBundler {
         await fsExtra.move(nodeModules, nodeModulesTmp, { overwrite: true });
         movedNodeModules = true;
       }
-      execSync('npm install --package-lock-only --force', {
+      await execa('npm', ['install', '--package-lock-only', '--force'], {
         cwd: outputDir,
-        stdio: 'pipe',
+        extendEnv: true,
+        shell: false,
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
         timeout: 60_000,
       });
     } catch {
