@@ -100,7 +100,7 @@ describe('MemoryPG list read failures', () => {
   const sensitiveId = 'SECRET_SQL_PARAMETER';
   const sensitiveCauseText = 'database rejected connectionString=SECRET_CONNECTION_STRING query=$1';
 
-  const failureCases = [
+  const failureOperations = [
     {
       operation: 'LIST_THREADS',
       invoke: (memory: MemoryPG) => memory.listThreads({ filter: { resourceId: sensitiveId } }),
@@ -118,12 +118,17 @@ describe('MemoryPG list read failures', () => {
       invoke: (memory: MemoryPG) => memory.listMessagesByResourceId({ resourceId: sensitiveId }),
     },
   ];
+  const failureCases = failureOperations.flatMap(failureOperation =>
+    (['direct', 'routed'] as const).map(clientMode => ({ ...failureOperation, clientMode })),
+  );
 
   it.each(failureCases)(
-    '$operation propagates a safe typed error without retaining the driver error',
-    async ({ operation, invoke }) => {
+    '$operation propagates a safe typed error through the $clientMode client without retaining the driver error',
+    async ({ operation, invoke, clientMode }) => {
       const cause = new Error(sensitiveCauseText);
-      const memory = new MemoryPG({ client: new ReadDbClient({ failure: cause }) });
+      const directClient = new ReadDbClient({ failure: cause });
+      const client = clientMode === 'direct' ? directClient : new RoutingDbClient(directClient);
+      const memory = new MemoryPG({ client });
       const logger = createLogger();
       memory.__setLogger(logger as any);
 
