@@ -190,6 +190,21 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(getPrototypeOf).not.toHaveBeenCalled();
   });
 
+  it('classifies a thrown value without traversing a proxied prototype chain', async () => {
+    const getPrototypeOf = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const thrown = Object.create(new Proxy({}, { getPrototypeOf }));
+    const condition = async () => {
+      throw thrown;
+    };
+
+    await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
+      status: 'failed',
+    });
+    expect(getPrototypeOf).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the registered callback identity differs from the locked graph', async () => {
     const locked = async () => true;
     const changed = vi.fn(async () => false);
@@ -228,15 +243,26 @@ describe('evented workflow terminal loop decision evaluator', () => {
     });
   });
 
-  it('rejects a denied capability even when the callback catches the access error', async () => {
-    const condition = async ({ mastra }: any) => {
-      try {
-        mastra.getAgent('one');
-      } catch {
-        return false;
-      }
-      return true;
-    };
+  it.each([
+    [
+      'Mastra',
+      async ({ mastra }: any) => {
+        try {
+          mastra.getAgent('one');
+        } catch {}
+        return true;
+      },
+    ],
+    [
+      'bail',
+      async ({ bail }: any) => {
+        try {
+          bail(true);
+        } catch {}
+        return true;
+      },
+    ],
+  ] as const)('retains a caught forbidden %s attempt as a typed non-decision', async (_label, condition) => {
     await expect(evaluateEventedWorkflowTerminalLoopDecision(evaluation(condition))).resolves.toMatchObject({
       status: 'unsupported_effect',
     });
@@ -333,6 +359,20 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(getPrototypeOf).not.toHaveBeenCalled();
   });
 
+  it('rejects an AbortSignal impostor without traversing a proxied prototype chain', async () => {
+    const getPrototypeOf = vi.fn(() => {
+      throw new Error('must not execute');
+    });
+    const signal = Object.create(new Proxy({}, { getPrototypeOf }));
+    const condition = vi.fn(async () => true);
+
+    await expect(
+      evaluateEventedWorkflowTerminalLoopDecision({ ...evaluation(condition), abortSignal: signal }),
+    ).rejects.toThrow(/native AbortSignal/);
+    expect(condition).not.toHaveBeenCalled();
+    expect(getPrototypeOf).not.toHaveBeenCalled();
+  });
+
   it('coalesces one decision key in-process but reevaluates after a crash or new revision key', async () => {
     const condition = vi.fn(async () => true);
     const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
@@ -348,6 +388,32 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(condition).toHaveBeenCalledTimes(2);
     await restarted.evaluate(evaluation(condition, `sha256:${'b'.repeat(64)}`));
     expect(condition).toHaveBeenCalledTimes(3);
+  });
+
+  it('returns distinct closed result copies without exposing the cached decision to mutation', async () => {
+    const condition = vi.fn(async () => true);
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    const [first, concurrent] = await Promise.all([
+      evaluator.evaluate(evaluation(condition)),
+      evaluator.evaluate(evaluation(condition)),
+    ]);
+    expect(first).not.toBe(concurrent);
+    expect(first.request).not.toBe(concurrent.request);
+    expect(first.status).toBe('evaluated');
+    expect(concurrent.status).toBe('evaluated');
+    if (first.status !== 'evaluated' || concurrent.status !== 'evaluated') throw new Error('expected decisions');
+    expect(first.evaluatedDecision).not.toBe(concurrent.evaluatedDecision);
+
+    first.request.decisionKey = `sha256:${'b'.repeat(64)}`;
+    first.evaluatedDecision.decisionKey = `sha256:${'b'.repeat(64)}`;
+    first.evaluatedDecision.conditionResult = false;
+
+    await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({
+      status: 'evaluated',
+      request: { decisionKey: `sha256:${'a'.repeat(64)}` },
+      evaluatedDecision: { decisionKey: `sha256:${'a'.repeat(64)}`, conditionResult: true },
+    });
+    expect(condition).toHaveBeenCalledTimes(1);
   });
 
   it('limits repeated fresh-key CAS replans to three callback attempts', async () => {

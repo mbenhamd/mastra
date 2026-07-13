@@ -35,11 +35,21 @@ function removeAbortListener(signal: AbortSignal, listener: () => void): void {
   removeEventListener.call(signal, 'abort', listener);
 }
 
+const unsupportedDurableLoopConditionEffects = new WeakSet<object>();
+
 class UnsupportedDurableLoopConditionEffect extends Error {
   constructor(capability: string) {
     super(`Durable loop conditions cannot use ${capability}`);
     this.name = 'UnsupportedDurableLoopConditionEffect';
+    unsupportedDurableLoopConditionEffects.add(this);
   }
+}
+
+function isUnsupportedDurableLoopConditionEffect(value: unknown): boolean {
+  return (
+    ((typeof value === 'object' && value !== null) || typeof value === 'function') &&
+    unsupportedDurableLoopConditionEffects.has(value)
+  );
 }
 
 export type EventedWorkflowTerminalLoopDecisionEvaluationResult =
@@ -60,6 +70,29 @@ export type EventedWorkflowTerminalLoopDecisionEvaluationResult =
         | 'capacity_exceeded';
       request: WorkflowTerminalLoopDecisionRequestV1;
     };
+
+function copyEvaluationResult(
+  result: EventedWorkflowTerminalLoopDecisionEvaluationResult,
+): EventedWorkflowTerminalLoopDecisionEvaluationResult {
+  const request: WorkflowTerminalLoopDecisionRequestV1 = {
+    version: 1,
+    kind: 'loop-condition',
+    decisionKey: result.request.decisionKey,
+    loopType: result.request.loopType,
+    previousIterationCount: result.request.previousIterationCount,
+  };
+  if (result.status !== 'evaluated') return { status: result.status, request };
+  return {
+    status: 'evaluated',
+    request,
+    evaluatedDecision: {
+      version: 1,
+      kind: 'loop-condition',
+      decisionKey: result.evaluatedDecision.decisionKey,
+      conditionResult: result.evaluatedDecision.conditionResult,
+    },
+  };
+}
 
 export interface EvaluateEventedWorkflowTerminalLoopDecisionInput {
   frame: WorkflowTerminalLoopConditionFrameV1;
@@ -101,12 +134,12 @@ function copyEvaluationInput(input: unknown): EvaluateEventedWorkflowTerminalLoo
     throw new TypeError('loop decision condition must be a function');
   }
   const abortSignal = descriptors.abortSignal?.value;
-  if (abortSignal !== undefined && (isProxy(abortSignal) || !(abortSignal instanceof AbortSignal))) {
-    throw new TypeError('loop decision abortSignal must be a native AbortSignal');
-  }
   if (abortSignal !== undefined) {
+    if (abortSignal === null || typeof abortSignal !== 'object' || isProxy(abortSignal)) {
+      throw new TypeError('loop decision abortSignal must be a native AbortSignal');
+    }
     try {
-      isSignalAborted(abortSignal);
+      isSignalAborted(abortSignal as AbortSignal);
     } catch {
       throw new TypeError('loop decision abortSignal must be a native AbortSignal');
     }
@@ -156,39 +189,29 @@ function evaluationObservation(input: {
   );
 }
 
-function deniedCapability(name: string, onAccess: () => void): object {
-  const reject = () => {
-    onAccess();
-    throw new UnsupportedDurableLoopConditionEffect(name);
-  };
+interface UnsupportedEffectObservation {
+  attempted: boolean;
+}
+
+function rejectUnsupportedEffect(observation: UnsupportedEffectObservation, name: string): never {
+  observation.attempted = true;
+  throw new UnsupportedDurableLoopConditionEffect(name);
+}
+
+function deniedCapability(name: string, observation: UnsupportedEffectObservation): object {
+  const reject = () => rejectUnsupportedEffect(observation, name);
   return new Proxy(Object.create(null) as object, {
-    defineProperty() {
-      return reject();
-    },
-    deleteProperty() {
-      return reject();
-    },
-    get() {
-      return reject();
-    },
-    getOwnPropertyDescriptor() {
-      return reject();
-    },
-    getPrototypeOf() {
-      return reject();
-    },
-    has() {
-      return reject();
-    },
-    ownKeys() {
-      return reject();
-    },
-    set() {
-      return reject();
-    },
-    setPrototypeOf() {
-      return reject();
-    },
+    defineProperty: reject,
+    deleteProperty: reject,
+    get: reject,
+    getOwnPropertyDescriptor: reject,
+    getPrototypeOf: reject,
+    has: reject,
+    isExtensible: reject,
+    ownKeys: reject,
+    preventExtensions: reject,
+    set: reject,
+    setPrototypeOf: reject,
   });
 }
 
@@ -266,14 +289,11 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
     abortStatus = 'timed_out';
     controller.abort();
   }, timeoutMs);
-  let unsupportedEffectObserved = false;
-  const recordUnsupportedEffect = () => {
-    unsupportedEffectObserved = true;
-  };
-  const mastra = deniedCapability('Mastra', recordUnsupportedEffect);
-  const writer = deniedCapability('writer', recordUnsupportedEffect);
-  const pubsub = deniedCapability('PubSub', recordUnsupportedEffect);
-  const engine = deniedCapability('workflow engine', recordUnsupportedEffect);
+  const unsupportedEffect: UnsupportedEffectObservation = { attempted: false };
+  const mastra = deniedCapability('Mastra', unsupportedEffect);
+  const writer = deniedCapability('writer', unsupportedEffect);
+  const pubsub = deniedCapability('PubSub', unsupportedEffect);
+  const engine = deniedCapability('workflow engine', unsupportedEffect);
 
   let callbackInvoked = false;
   let callbackHasSettled = false;
@@ -291,10 +311,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       resumeData: sandbox.resumeData,
       getInitData: () => sandbox.stepResults.input,
       getStepResult: getStepResult.bind(null, sandbox.stepResults as any),
-      bail: () => {
-        recordUnsupportedEffect();
-        throw new UnsupportedDurableLoopConditionEffect('bail');
-      },
+      bail: () => rejectUnsupportedEffect(unsupportedEffect, 'bail'),
       abort: () => controller.abort(),
       [PUBSUB_SYMBOL]: pubsub as never,
       [STREAM_FORMAT_SYMBOL]: undefined,
@@ -321,7 +338,12 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       if (outcome.type === 'aborted' || controller.signal.aborted) {
         return { status: abortStatus, request };
       }
-      if (unsupportedEffectObserved) return { status: 'unsupported_effect', request };
+      if (
+        unsupportedEffect.attempted ||
+        (outcome.type === 'failed' && isUnsupportedDurableLoopConditionEffect(outcome.error))
+      ) {
+        return { status: 'unsupported_effect', request };
+      }
       let observation: string;
       try {
         observation = evaluationObservation({
@@ -336,12 +358,7 @@ function startValidatedEventedWorkflowTerminalLoopDecision(
       }
       if (observation !== baseline) return { status: 'unsupported_mutation', request };
       if (outcome.type === 'failed') {
-        const unsupportedEffect =
-          !isProxy(outcome.error) && outcome.error instanceof UnsupportedDurableLoopConditionEffect;
-        return {
-          status: unsupportedEffect ? 'unsupported_effect' : 'failed',
-          request,
-        };
+        return { status: 'failed', request };
       }
       if (typeof outcome.value !== 'boolean') return { status: 'invalid_result', request };
       return {
@@ -404,7 +421,7 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
       if (existing.retained === 'in_flight' && existing.isCallbackSettled()) {
         this.#evaluations.delete(key);
       } else {
-        return existing.promise;
+        return existing.promise.then(copyEvaluationResult);
       }
     }
     this.#evictCompleted();
@@ -445,7 +462,7 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
         }
       },
     );
-    return entry.promise;
+    return entry.promise.then(copyEvaluationResult);
   }
 
   #evictCompleted(): void {
