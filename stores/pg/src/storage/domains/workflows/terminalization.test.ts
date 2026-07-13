@@ -150,6 +150,40 @@ describe('WorkflowsPG terminalization journal', () => {
     }
   });
 
+  it('observes terminalization without waiting for the writer advisory lock', async () => {
+    const workflowName = `terminalization-read-only-${randomUUID()}`;
+    const runId = 'run';
+    const run = { workflowName, runId };
+    await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
+    await workflowsA.claimWorkflowTerminalization({
+      ...run,
+      eventKey: 'event',
+      terminalStatus: 'failed',
+      ownerId: 'worker-a',
+      leaseMs: 1_000,
+    });
+
+    const lockClient = await pool.connect();
+    try {
+      await lockClient.query('BEGIN');
+      await lockClient.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+        JSON.stringify([workflowName, runId]),
+      ]);
+
+      const observation = await Promise.race([
+        workflowsB.getWorkflowTerminalization(run),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('observation waited for the writer lock')), 500),
+        ),
+      ]);
+      expect(observation).toMatchObject({ status: 'found', record: { eventKey: 'event' } });
+    } finally {
+      await lockClient.query('ROLLBACK');
+      lockClient.release();
+      await cleanup(workflowName);
+    }
+  });
+
   it('rolls back the journal phase when canonical snapshot serialization fails', async () => {
     const workflowName = `terminalization-rollback-${randomUUID()}`;
     const runId = 'run';

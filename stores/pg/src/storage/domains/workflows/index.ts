@@ -212,6 +212,33 @@ export class WorkflowsPG extends WorkflowsStorage {
     };
   }
 
+  private async getTerminalizationObservation(
+    workflowName: string,
+    runId: string,
+  ): Promise<GetWorkflowTerminalizationResult> {
+    const row = await this.#db.client.one<Record<string, unknown>>(
+      `SELECT terminalization.*,
+              terminalization.run_id IS NOT NULL AS terminalization_exists,
+              snapshot.run_id IS NOT NULL AS snapshot_exists,
+              floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS observation_now_ms
+       FROM (SELECT $1::text AS workflow_name, $2::text AS run_id) AS identity
+       LEFT JOIN ${this.terminalizationTableName()} AS terminalization
+         ON terminalization.workflow_name = identity.workflow_name AND terminalization.run_id = identity.run_id
+       LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+         ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id`,
+      [workflowName, runId],
+    );
+    if (row.terminalization_exists) {
+      const now = Number(row.observation_now_ms);
+      if (!Number.isSafeInteger(now)) throw new TypeError('Invalid PostgreSQL terminalization clock');
+      return {
+        status: 'found',
+        record: observeWorkflowTerminalizationRecord(this.decodeTerminalizationRow(row, now)),
+      };
+    }
+    return row.snapshot_exists ? { status: 'missing_record' } : { status: 'missing_run' };
+  }
+
   private async saveTerminalizationRecord(
     t: TxClient,
     workflowName: string,
@@ -338,11 +365,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       runId: input.runId,
     };
     try {
-      return await this.#db.client.tx(async t => {
-        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
-        if (context.record) return { status: 'found', record: observeWorkflowTerminalizationRecord(context.record) };
-        return context.snapshotExists ? { status: 'missing_record' } : { status: 'missing_run' };
-      });
+      return await this.getTerminalizationObservation(operation.workflowName, operation.runId);
     } catch (error) {
       return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error);
     }
