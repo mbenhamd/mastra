@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   exec: vi.fn(),
   child: {
     on: vi.fn(),
+    unref: vi.fn(),
     stdin: {
       on: vi.fn(),
       end: vi.fn(),
@@ -23,6 +24,7 @@ describe('sendNotification', () => {
   beforeEach(() => {
     mocks.exec.mockReset();
     mocks.child.on.mockReset();
+    mocks.child.unref.mockReset();
     mocks.child.stdin.on.mockReset();
     mocks.child.stdin.end.mockReset();
     mocks.spawn.mockReset();
@@ -49,6 +51,7 @@ describe('sendNotification', () => {
     );
     expect(mocks.child.on).toHaveBeenCalledWith('error', expect.any(Function));
     expect(mocks.child.stdin.on).toHaveBeenCalledWith('error', expect.any(Function));
+    expect(mocks.child.unref).toHaveBeenCalledTimes(1);
   });
 
   it('replaces NUL bytes and ignores synchronous notifier failures', () => {

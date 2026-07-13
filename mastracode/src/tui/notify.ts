@@ -64,6 +64,7 @@ function sendSystemNotification(reason: NotificationReason, message?: string): v
         // The child can exit before stdin is written when osascript is unavailable.
       });
       child.stdin.end(script);
+      child.unref();
     } catch {
       // Best-effort: ignore synchronous argument/spawn failures
     }
