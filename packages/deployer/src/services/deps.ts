@@ -10,13 +10,79 @@ import { createChildProcessLogger } from '../deploy/log.js';
 
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
-const PROCESS_BOOTSTRAP_ENV_KEYS = ['PATH', 'SystemRoot', 'ComSpec', 'PATHEXT', 'WINDIR'] as const;
+const PROCESS_BOOTSTRAP_ENV_KEYS = [
+  'PATH',
+  'SystemRoot',
+  'ComSpec',
+  'PATHEXT',
+  'WINDIR',
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'all_proxy',
+  'NPM_TOKEN',
+  'NODE_AUTH_TOKEN',
+  'YARN_NPM_AUTH_TOKEN',
+  'YARN_NPM_AUTH_IDENT',
+] as const;
+
+const PACKAGE_MANAGER_NETWORK_CONFIG_KEYS = new Set([
+  'registry',
+  'proxy',
+  'https_proxy',
+  'https-proxy',
+  'noproxy',
+  'no_proxy',
+  'no-proxy',
+  'strict_ssl',
+  'strict-ssl',
+  'cafile',
+  'cert',
+  'key',
+]);
+
+function isPackageManagerNetworkOrAuthConfig(key: string): boolean {
+  const normalizedKey = key.toLowerCase();
+  const prefix = normalizedKey.startsWith('npm_config_')
+    ? 'npm_config_'
+    : normalizedKey.startsWith('pnpm_config_')
+      ? 'pnpm_config_'
+      : undefined;
+  if (!prefix) {
+    return false;
+  }
+
+  const configKey = normalizedKey.slice(prefix.length);
+  return (
+    PACKAGE_MANAGER_NETWORK_CONFIG_KEYS.has(configKey) ||
+    /^@[^:]+:registry$/.test(configKey) ||
+    /^\/\/.+\/:(_auth|_authtoken|username|_password|email|always-auth)$/.test(configKey)
+  );
+}
 
 function getProcessBootstrapEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of PROCESS_BOOTSTRAP_ENV_KEYS) {
     const value = process.env[key];
     if (value) {
+      env[key] = value;
+    }
+  }
+  for (const [key, value] of Object.entries(process.env)) {
+    // Package-manager config also includes execution-changing settings such as
+    // script-shell. Forward only the network and authentication subset needed
+    // for private registries; the child still inherits no ambient shell config.
+    if (value && isPackageManagerNetworkOrAuthConfig(key)) {
       env[key] = value;
     }
   }
@@ -251,12 +317,6 @@ export class Deps extends MastraBase {
       throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
     }
 
-    const env = getProcessBootstrapEnv();
-
-    if (process.env.npm_config_registry) {
-      env.npm_config_registry = process.env.npm_config_registry;
-    }
-
     const cpLogger = createChildProcessLogger({
       logger: this.logger,
       root: '',
@@ -265,7 +325,7 @@ export class Deps extends MastraBase {
     return cpLogger({
       cmd: pm,
       args: [...installArgs, ...packages],
-      env,
+      env: getProcessBootstrapEnv(),
     });
   }
 

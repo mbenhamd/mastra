@@ -84,6 +84,35 @@ describe('Deps process arguments', () => {
     });
   });
 
+  it('preserves home, proxy, and private-registry package-manager configuration', async () => {
+    vi.stubEnv('HOME', '/home/mastra');
+    vi.stubEnv('HTTPS_PROXY', 'https://proxy.example.com');
+    vi.stubEnv('NPM_TOKEN', 'test-npm-token');
+    vi.stubEnv('NODE_AUTH_TOKEN', 'test-node-auth-token');
+    vi.stubEnv('npm_config_registry', 'https://registry.example.com');
+    vi.stubEnv('npm_config_//registry.example.com/:_authToken', 'test-private-registry-token');
+    vi.stubEnv('PNPM_CONFIG_@private:registry', 'https://registry.example.com');
+    vi.stubEnv('npm_config_script_shell', '/tmp/attacker');
+    const { deps } = await createDeps('pnpm');
+
+    await deps.installPackages(['@private/package@1.0.0']);
+
+    expect(mocks.runProcess).toHaveBeenCalledWith({
+      cmd: 'pnpm',
+      args: ['add', '--loglevel=error', '@private/package@1.0.0'],
+      env: expect.objectContaining({
+        HOME: '/home/mastra',
+        HTTPS_PROXY: 'https://proxy.example.com',
+        NPM_TOKEN: 'test-npm-token',
+        NODE_AUTH_TOKEN: 'test-node-auth-token',
+        npm_config_registry: 'https://registry.example.com',
+        'npm_config_//registry.example.com/:_authToken': 'test-private-registry-token',
+        'PNPM_CONFIG_@private:registry': 'https://registry.example.com',
+      }),
+    });
+    expect(mocks.runProcess.mock.calls[0]?.[0].env).not.toHaveProperty('npm_config_script_shell');
+  });
+
   it.each(['', '.', '..', '../outside', String.raw`..\outside`])(
     'rejects an unsafe sanitized package name: %j',
     async sanitizedName => {
