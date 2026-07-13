@@ -61,7 +61,7 @@ function parentSnapshot(): WorkflowRunState {
       {
         type: 'loop',
         step: { id: 'loop' },
-        serializedCondition: { id: 'loop', fn: '() => true' },
+        serializedCondition: { id: 'loop-condition', fn: '() => true' },
         loopType: 'dowhile',
       },
       { type: 'foreach', step: { id: 'each' }, opts: { concurrency: 2 } },
@@ -189,7 +189,7 @@ describe('workflow terminal parent patch semantics', () => {
     expect(next.timestamp).toBe(30);
   });
 
-  it('rejects snapshot accessors before binding or structured cloning can execute them', () => {
+  it('rejects snapshot accessors and proxies before binding or structured cloning can execute them', () => {
     const parent = parentSnapshot();
     let getterCalls = 0;
     Object.defineProperty(parent.context, 'unrelated', {
@@ -237,6 +237,62 @@ describe('workflow terminal parent patch semantics', () => {
       }),
     ).toThrow(/accessor/);
     expect(stackGetterCalls).toBe(0);
+
+    const countingHandler = <T extends object>(increment: () => void): ProxyHandler<T> => ({
+      get(target, property, receiver) {
+        increment();
+        return Reflect.get(target, property, receiver);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        increment();
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+      getPrototypeOf(target) {
+        increment();
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys(target) {
+        increment();
+        return Reflect.ownKeys(target);
+      },
+    });
+    const proxyParent = parentSnapshot();
+    const patchInput = {
+      contract: contractFor(proxyParent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: proxyParent,
+      retainedChild: retained(),
+      storageTimestamp: 30,
+      executionMode: 'continuous' as const,
+    };
+    let inputTrapCalls = 0;
+    const inputProxy = new Proxy(
+      patchInput,
+      countingHandler(() => {
+        inputTrapCalls++;
+      }),
+    );
+    expect(() => applyWorkflowTerminalParentContinuationPatch(inputProxy)).toThrow(/must not be a proxy/);
+    expect(inputTrapCalls).toBe(0);
+
+    const nestedProxyParent = parentSnapshot();
+    let nestedTrapCalls = 0;
+    nestedProxyParent.context.unrelated = new Proxy(
+      { status: 'success' },
+      countingHandler(() => {
+        nestedTrapCalls++;
+      }),
+    ) as any;
+    expect(() =>
+      applyWorkflowTerminalParentContinuationPatch({
+        ...patchInput,
+        contract: contractFor(nestedProxyParent),
+        parentSnapshot: nestedProxyParent,
+      }),
+    ).toThrow(/contains a proxy/);
+    expect(nestedTrapCalls).toBe(0);
   });
 
   it('sets parent failure state, result, error, and exact active path', () => {

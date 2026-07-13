@@ -48,7 +48,7 @@ function parentSnapshot(status: WorkflowRunState['status'] = 'running'): Workflo
       {
         type: 'loop',
         step: { id: 'loop' },
-        serializedCondition: { id: 'loop', fn: '() => true' },
+        serializedCondition: { id: 'loop-condition', fn: '() => true' },
         loopType: 'dowhile',
       },
       { type: 'foreach', step: { id: 'each' }, opts: { concurrency: 2 } },
@@ -146,6 +146,142 @@ describe('workflow terminal parent continuation contract', () => {
     expect(replay).toEqual(negative);
   });
 
+  it('rejects record and array proxies without invoking their reflection traps', () => {
+    const countingHandler = <T extends object>(increment: () => void): ProxyHandler<T> => ({
+      get(target, property, receiver) {
+        increment();
+        return Reflect.get(target, property, receiver);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        increment();
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+      getPrototypeOf(target) {
+        increment();
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys(target) {
+        increment();
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    let recordTrapCalls = 0;
+    const recordProxy = new Proxy(
+      nextSleepSpec(),
+      countingHandler(() => {
+        recordTrapCalls++;
+      }),
+    );
+    expect(() => createWorkflowTerminalParentContinuationContract(recordProxy)).toThrow(/must not be a proxy/);
+    expect(recordTrapCalls).toBe(0);
+
+    let arrayTrapCalls = 0;
+    const pathProxy = new Proxy(
+      [0],
+      countingHandler(() => {
+        arrayTrapCalls++;
+      }),
+    );
+    expect(() =>
+      createWorkflowTerminalParentContinuationContract({
+        ...nextSleepSpec(),
+        source: { kind: 'step', stepId: 'nested', executionPath: pathProxy },
+      }),
+    ).toThrow(/must not be a proxy/);
+    expect(arrayTrapCalls).toBe(0);
+
+    const snapshot = parentSnapshot();
+    const contract = createWorkflowTerminalParentContinuationContract(nextSleepSpec(snapshot));
+    let contextTrapCalls = 0;
+    snapshot.context = new Proxy(
+      snapshot.context,
+      countingHandler(() => {
+        contextTrapCalls++;
+      }),
+    );
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: snapshot,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/must not be a proxy/);
+    expect(contextTrapCalls).toBe(0);
+  });
+
+  it('rejects non-enumerable source and active-path evidence that JSON persistence would drop', () => {
+    const snapshot = parentSnapshot();
+    const contract = createWorkflowTerminalParentContinuationContract(nextSleepSpec(snapshot));
+
+    const hiddenSource = structuredClone(snapshot);
+    const sourceState = hiddenSource.context.nested;
+    Object.defineProperty(hiddenSource.context, 'nested', {
+      configurable: true,
+      enumerable: false,
+      value: sourceState,
+      writable: true,
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: hiddenSource,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/non-enumerable/);
+
+    const hiddenActivePath = structuredClone(snapshot);
+    Object.defineProperty(hiddenActivePath.activeStepsPath, 'nested', {
+      configurable: true,
+      enumerable: false,
+      value: [0],
+      writable: true,
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: hiddenActivePath,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/non-enumerable/);
+  });
+
+  it('does not read inherited parent-context accessors as source state', () => {
+    const snapshot = parentSnapshot();
+    const contract = createWorkflowTerminalParentContinuationContract(nextSleepSpec(snapshot));
+    delete snapshot.context.nested;
+    let getterCalls = 0;
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'nested');
+    Object.defineProperty(Object.prototype, 'nested', {
+      configurable: true,
+      get() {
+        getterCalls++;
+        return { status: 'running', metadata: { nestedRunId: 'child-run' } };
+      },
+    });
+    try {
+      expect(() =>
+        validateWorkflowTerminalParentContinuationBinding(contract, {
+          effect: effect(),
+          parentRevision: 'revision-1',
+          parentWorkflowName: 'parent',
+          parentSnapshot: snapshot,
+          executionMode: 'continuous',
+        }),
+      ).toThrow(/must be a data object/);
+      expect(getterCalls).toBe(0);
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, 'nested', previous);
+      else delete (Object.prototype as Record<string, unknown>).nested;
+    }
+  });
+
   it('rejects forged hashes and revision, status, graph, or effect binding drift', () => {
     const snapshot = parentSnapshot();
     const contract = createWorkflowTerminalParentContinuationContract(nextSleepSpec(snapshot));
@@ -241,6 +377,25 @@ describe('workflow terminal parent continuation contract', () => {
       patch: { kind: 'none' },
     });
     expect(contract.action.kind).toBe('noop');
+
+    const foreachSnapshot = parentSnapshot('success');
+    delete foreachSnapshot.context.each;
+    const foreachNoop = createWorkflowTerminalParentContinuationContract({
+      ...nextSleepSpec(foreachSnapshot),
+      observedParentStatus: 'success',
+      source: { kind: 'foreach-iteration', stepId: 'each', containerPath: [3], iterationIndex: 1 },
+      action: { kind: 'noop', reason: 'already-terminal' },
+      patch: { kind: 'none' },
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(foreachNoop, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: foreachSnapshot,
+        executionMode: 'continuous',
+      }),
+    ).not.toThrow();
   });
 
   it('binds an exact foreach iteration and rejects out-of-bounds coordinates', () => {
@@ -263,6 +418,104 @@ describe('workflow terminal parent continuation contract', () => {
         executionMode: 'continuous',
       }),
     ).not.toThrow();
+    const notStarted = structuredClone(snapshot);
+    (notStarted.context.each as any).output = [null];
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: notStarted,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/iteration was not started/);
+    const sparse = structuredClone(snapshot);
+    (sparse.context.each as any).output = new Array(2);
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: sparse,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/dense and data-only/);
+    const oversized = structuredClone(snapshot);
+    const oversizedPayload: unknown[] = [];
+    oversizedPayload.length = 16_385;
+    (oversized.context.each as any).payload = oversizedPayload;
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: oversized,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/payload has an invalid length/);
+    const nonEnumerable = structuredClone(snapshot);
+    Object.defineProperty((nonEnumerable.context.each as any).output, '1', {
+      configurable: true,
+      enumerable: false,
+      value: null,
+      writable: true,
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: nonEnumerable,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/dense and data-only/);
+    const hiddenOwnership = structuredClone(snapshot);
+    Object.defineProperty((hiddenOwnership.context.each as any).metadata.__workflow_meta.iterationRunIds, '1', {
+      configurable: true,
+      enumerable: false,
+      value: 'child-run',
+      writable: true,
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: hiddenOwnership,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/ownership sidecar is invalid/);
+    const accessor = structuredClone(snapshot);
+    let getterCalls = 0;
+    Object.defineProperty((accessor.context.each as any).output, '1', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls++;
+        return null;
+      },
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: accessor,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/dense and data-only/);
+    expect(getterCalls).toBe(0);
+    const missingOutput = structuredClone(snapshot);
+    delete (missingOutput.context.each as any).output;
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(contract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: missingOutput,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/dense data-only array/);
     const outOfBounds = createWorkflowTerminalParentContinuationContract({
       ...nextSleepSpec(snapshot),
       source: { kind: 'foreach-iteration', stepId: 'each', containerPath: [3], iterationIndex: 2 },
@@ -403,6 +656,17 @@ describe('workflow terminal parent continuation contract', () => {
         executionMode: 'continuous',
       }),
     ).not.toThrow();
+    const futureTerminalState = structuredClone(continuing);
+    (futureTerminalState.context.each as any).metadata.__workflow_meta.terminalIterationStates = { '1': 'success' };
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(continueContract, {
+        effect: effect([3, 0], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: futureTerminalState,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/state sidecar is invalid/);
 
     const complete = parentSnapshot();
     complete.context.each = {
@@ -510,6 +774,23 @@ describe('workflow terminal parent continuation contract', () => {
       }),
     ).not.toThrow();
 
+    const overrun = structuredClone(suspended);
+    (overrun.context.each as any).output.push({
+      status: 'suspended',
+      suspendPayload: {
+        __workflow_meta: { resumeLabels: { phantom: { stepId: 'each', foreachIndex: 2 } } },
+      },
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(suspendContract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: overrun,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/output exceeds its input payload/);
+
     const corrupt = structuredClone(suspended);
     (corrupt.context.each as any).metadata.__workflow_meta.terminalIterationStates = { '0': 'bogus' };
     expect(() =>
@@ -518,6 +799,24 @@ describe('workflow terminal parent continuation contract', () => {
         parentRevision: 'revision-1',
         parentWorkflowName: 'parent',
         parentSnapshot: corrupt,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(/state sidecar is invalid/);
+
+    const hiddenState = structuredClone(suspended);
+    (hiddenState.context.each as any).metadata.__workflow_meta.terminalIterationStates = {};
+    Object.defineProperty((hiddenState.context.each as any).metadata.__workflow_meta.terminalIterationStates, '0', {
+      configurable: true,
+      enumerable: false,
+      value: 'success',
+      writable: true,
+    });
+    expect(() =>
+      validateWorkflowTerminalParentContinuationBinding(suspendContract, {
+        effect: effect([3, 1], 'each'),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: hiddenState,
         executionMode: 'continuous',
       }),
     ).toThrow(/state sidecar is invalid/);
@@ -701,8 +1000,8 @@ describe('workflow terminal parent continuation contract', () => {
           { type: 'step', step: { id: 'skipped' } },
         ],
         serializedConditions: [
-          { id: 'selected', fn: '() => true' },
-          { id: 'skipped', fn: '() => false' },
+          { id: 'selected-condition', fn: '() => true' },
+          { id: 'skipped-condition', fn: '() => false' },
         ],
       },
     ];

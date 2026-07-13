@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { WorkflowTerminalEffectRecord, WorkflowRunState, WorkflowRunStatus } from '../types';
 import {
   MAX_TERMINAL_LOOP_ITERATIONS,
@@ -36,15 +37,18 @@ const ALL_PARENT_STATUSES = new Set<WorkflowRunStatus>([
 const CHILD_STATUSES = new Set(['success', 'failed', 'canceled']);
 const QUARANTINE_REASONS = new Set(['graph-conflict', 'parent-conflict-exhausted', 'plan-conflict']);
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
+const MAX_TERMINAL_FOREACH_ENTRIES = 16_384;
 
 function getRecord(value: unknown, field: string): Record<string, PropertyDescriptor> {
+  if (isProxy(value)) throw new TypeError(`${field} must not be a proxy`);
   if (value === null || typeof value !== 'object') throw new TypeError(`${field} must be a data object`);
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${field} must be a plain object`);
   const descriptors = Object.getOwnPropertyDescriptors(value);
+  Object.setPrototypeOf(descriptors, null);
   for (const key of Reflect.ownKeys(descriptors)) {
-    if (typeof key !== 'string' || !('value' in descriptors[key]!)) {
-      throw new TypeError(`${field} contains symbol or accessor fields`);
+    if (typeof key !== 'string' || !('value' in descriptors[key]!) || descriptors[key]!.enumerable !== true) {
+      throw new TypeError(`${field} contains symbol, accessor, or non-enumerable fields`);
     }
   }
   return descriptors as Record<string, PropertyDescriptor>;
@@ -66,31 +70,44 @@ function assertKeys(
 }
 
 function value(descriptors: Record<string, PropertyDescriptor>, key: string): unknown {
-  return descriptors[key]?.value;
+  return Object.prototype.hasOwnProperty.call(descriptors, key) ? descriptors[key]!.value : undefined;
 }
 
-function canonicalPath(input: unknown, field: string, allowEmpty = false): number[] {
-  if (!Array.isArray(input)) throw new TypeError(`${field} must be a dense path`);
-  const descriptors = Object.getOwnPropertyDescriptors(input) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
-  if (!Number.isSafeInteger(length) || length > MAX_TERMINAL_PATH_LENGTH || (!allowEmpty && length === 0)) {
+function materializeDenseDataArray(input: unknown, field: string, maxLength: number): unknown[] {
+  if (isProxy(input)) throw new TypeError(`${field} must not be a proxy`);
+  if (!Array.isArray(input)) throw new TypeError(`${field} must be a dense data-only array`);
+  const length = Object.getOwnPropertyDescriptor(input, 'length')?.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length > maxLength) {
     throw new TypeError(`${field} has an invalid length`);
   }
-  const path = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) throw new TypeError(`${field} must be dense and data-only`);
-    const entry = descriptor.value;
-    if (!Number.isSafeInteger(entry) || entry < 0) throw new TypeError(`${field} contains an invalid index`);
-    return entry === 0 ? 0 : (entry as number);
-  });
+  const descriptors = Object.getOwnPropertyDescriptors(input) as unknown as Record<PropertyKey, PropertyDescriptor>;
+  const descriptorKeys = Reflect.ownKeys(descriptors);
   if (
-    Reflect.ownKeys(descriptors).some(
-      key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
-    )
+    descriptorKeys.length !== length + 1 ||
+    descriptorKeys.some(
+      key =>
+        key !== 'length' &&
+        (typeof key !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(key) ||
+          Number(key) >= length ||
+          descriptors[key]!.enumerable !== true),
+    ) ||
+    descriptorKeys.some(key => !('value' in descriptors[key]!))
   ) {
     throw new TypeError(`${field} must be dense and data-only`);
   }
-  return path;
+  return Array.from({ length }, (_, index) => descriptors[String(index)]!.value);
+}
+
+function canonicalPath(input: unknown, field: string, allowEmpty = false): number[] {
+  const entries = materializeDenseDataArray(input, field, MAX_TERMINAL_PATH_LENGTH);
+  if (!allowEmpty && entries.length === 0) throw new TypeError(`${field} has an invalid length`);
+  return entries.map(entry => {
+    if (!Number.isSafeInteger(entry) || (entry as number) < 0) {
+      throw new TypeError(`${field} contains an invalid index`);
+    }
+    return entry === 0 ? 0 : (entry as number);
+  });
 }
 
 function canonicalSafeInteger(value: unknown, field: string, max = Number.MAX_SAFE_INTEGER): number {
@@ -658,18 +675,25 @@ function samePath(left: readonly number[], right: readonly number[]): boolean {
   return left.length === right.length && left.every((entry, index) => entry === right[index]);
 }
 
-/** @internal Shared closed parser for persisted foreach terminal-state sidecars. */
-export function materializeWorkflowTerminalForeachStates(value: unknown, upperBound: number): Record<string, string> {
+function materializeWorkflowTerminalForeachSidecar<T extends string>(
+  value: unknown,
+  upperBound: number,
+  field: string,
+  parseValue: (value: unknown, key: string) => T,
+): Record<string, T> {
   if (value === undefined) return {};
+  if (isProxy(value)) {
+    throw new TypeError(`${field} is invalid`);
+  }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('Workflow terminal foreach iteration state sidecar is invalid');
+    throw new TypeError(`${field} is invalid`);
   }
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError('Workflow terminal foreach iteration state sidecar is invalid');
+    throw new TypeError(`${field} is invalid`);
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  const states: Record<string, string> = {};
+  const output: Record<string, T> = {};
   for (const key of Reflect.ownKeys(descriptors)) {
     const descriptor = descriptors[key as string];
     if (
@@ -678,18 +702,47 @@ export function materializeWorkflowTerminalForeachStates(value: unknown, upperBo
       Number(key) >= upperBound ||
       !descriptor ||
       !('value' in descriptor) ||
-      (descriptor.value !== 'success' && descriptor.value !== 'failed' && descriptor.value !== 'canceled')
+      descriptor.enumerable !== true
     ) {
-      throw new TypeError('Workflow terminal foreach iteration state sidecar is invalid');
+      throw new TypeError(`${field} is invalid`);
     }
-    Object.defineProperty(states, key, {
+    Object.defineProperty(output, key, {
       configurable: true,
       enumerable: true,
-      value: descriptor.value,
+      value: parseValue(descriptor.value, key),
       writable: true,
     });
   }
-  return states;
+  return output;
+}
+
+/** @internal Shared closed parser for persisted foreach terminal-state sidecars. */
+export function materializeWorkflowTerminalForeachStates(value: unknown, upperBound: number): Record<string, string> {
+  return materializeWorkflowTerminalForeachSidecar(
+    value,
+    upperBound,
+    'Workflow terminal foreach iteration state sidecar',
+    state => {
+      if (state !== 'success' && state !== 'failed' && state !== 'canceled') {
+        throw new TypeError('Workflow terminal foreach iteration state sidecar is invalid');
+      }
+      return state;
+    },
+  );
+}
+
+function materializeWorkflowTerminalForeachOwnership(value: unknown, upperBound: number): Record<string, string> {
+  return materializeWorkflowTerminalForeachSidecar(
+    value,
+    upperBound,
+    'Workflow terminal foreach iteration ownership sidecar',
+    (runId, key) => {
+      if (typeof runId !== 'string') {
+        throw new TypeError('Workflow terminal foreach iteration ownership sidecar is invalid');
+      }
+      return validateWorkflowTerminalStructuralString(runId, `Workflow terminal foreach iteration ownership ${key}`);
+    },
+  );
 }
 
 function sourceExecutionPath(source: WorkflowTerminalResultCoordinate): readonly number[] {
@@ -731,35 +784,68 @@ export function validateWorkflowTerminalParentContinuationBinding(
 ): void {
   validateWorkflowTerminalParentContinuationIntegrity(input);
   const contract = input;
-  const { effect, parentRevision, parentWorkflowName, parentSnapshot, executionMode } = context;
+  const bindingContext = getRecord(context, 'parent continuation binding context');
+  assertKeys(
+    bindingContext,
+    ['effect', 'parentRevision', 'parentWorkflowName', 'parentSnapshot', 'executionMode'],
+    ['effect', 'parentRevision', 'parentWorkflowName', 'parentSnapshot', 'executionMode'],
+    'parent continuation binding context',
+  );
+  const effect = value(bindingContext, 'effect') as Extract<
+    WorkflowTerminalEffectRecord,
+    { kind: 'parent-workflow-step-end' }
+  >;
+  const parentRevision = value(bindingContext, 'parentRevision');
+  const parentWorkflowName = value(bindingContext, 'parentWorkflowName');
+  const parentSnapshot = value(bindingContext, 'parentSnapshot') as WorkflowRunState;
+  const executionMode = value(bindingContext, 'executionMode');
+  const effectRecord = getRecord(effect, 'parent continuation effect');
+  const parentSnapshotRecord = getRecord(parentSnapshot, 'parent continuation snapshot');
+  const parentContext = getRecord(value(parentSnapshotRecord, 'context'), 'parent continuation snapshot context');
+  const activeStepsPath = getRecord(
+    value(parentSnapshotRecord, 'activeStepsPath'),
+    'parent continuation active step paths',
+  );
+  const serializedStepGraph = value(
+    parentSnapshotRecord,
+    'serializedStepGraph',
+  ) as WorkflowRunState['serializedStepGraph'];
+  const effectRunId = value(effectRecord, 'runId');
+  const effectParentExecutionPath = canonicalPath(
+    value(effectRecord, 'parentExecutionPath'),
+    'parent continuation effect parentExecutionPath',
+  );
   if (
     contract.expectedParentRevision !== parentRevision ||
-    contract.terminalEffectKey !== effect.effectKey ||
-    contract.terminalEffectPayloadHash !== effect.payloadHash ||
+    contract.terminalEffectKey !== value(effectRecord, 'effectKey') ||
+    contract.terminalEffectPayloadHash !== value(effectRecord, 'payloadHash') ||
     contract.executionMode !== executionMode ||
-    parentWorkflowName !== effect.parentWorkflowName ||
-    contract.graphFingerprint !== createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph) ||
-    contract.observedParentStatus !== parentSnapshot.status ||
-    contract.childTerminalStatus !== effect.terminalStatus ||
-    parentSnapshot.runId !== effect.parentRunId
+    parentWorkflowName !== value(effectRecord, 'parentWorkflowName') ||
+    contract.graphFingerprint !== createWorkflowTerminalGraphFingerprint(serializedStepGraph) ||
+    contract.observedParentStatus !== value(parentSnapshotRecord, 'status') ||
+    contract.childTerminalStatus !== value(effectRecord, 'terminalStatus') ||
+    value(parentSnapshotRecord, 'runId') !== value(effectRecord, 'parentRunId')
   ) {
     throw new TypeError('Workflow terminal parent continuation binding conflict');
   }
-  if (contract.source.stepId !== effect.parentStepId) {
+  if (contract.source.stepId !== value(effectRecord, 'parentStepId')) {
     throw new TypeError('Workflow terminal parent continuation source step conflict');
   }
+  let boundForeachPayload: unknown[] | undefined;
+  let boundForeachOutput: unknown[] | undefined;
+  let boundForeachStates: Record<string, string> | undefined;
   const contractSourcePath =
     contract.source.kind === 'step'
       ? contract.source.executionPath
       : [...contract.source.containerPath, contract.source.iterationIndex];
-  if (!samePath(contractSourcePath, effect.parentExecutionPath)) {
+  if (!samePath(contractSourcePath, effectParentExecutionPath)) {
     throw new TypeError('Workflow terminal parent continuation source path conflict');
   }
   if (contract.action.kind === 'quarantine') {
     if (contract.action.reason === 'graph-conflict') {
       let graphConflict = false;
       try {
-        const resolved = resolveWorkflowTerminalGraphCoordinate(parentSnapshot.serializedStepGraph, contractSourcePath);
+        const resolved = resolveWorkflowTerminalGraphCoordinate(serializedStepGraph, contractSourcePath);
         graphConflict =
           contract.source.kind === 'step'
             ? !(
@@ -776,10 +862,7 @@ export function validateWorkflowTerminalParentContinuationBinding(
     return;
   }
   if (contract.source.kind === 'step') {
-    const resolved = resolveWorkflowTerminalGraphCoordinate(
-      parentSnapshot.serializedStepGraph,
-      contract.source.executionPath,
-    );
+    const resolved = resolveWorkflowTerminalGraphCoordinate(serializedStepGraph, contract.source.executionPath);
     if (
       !['step', 'branch', 'loop'].includes(resolved.kind) ||
       !('stepId' in resolved) ||
@@ -789,31 +872,53 @@ export function validateWorkflowTerminalParentContinuationBinding(
     }
   } else {
     const fullPath = [...contract.source.containerPath, contract.source.iterationIndex];
-    const resolved = resolveWorkflowTerminalGraphCoordinate(parentSnapshot.serializedStepGraph, fullPath);
+    const resolved = resolveWorkflowTerminalGraphCoordinate(serializedStepGraph, fullPath);
     if (resolved.kind !== 'foreach' || resolved.stepId !== contract.source.stepId) {
       throw new TypeError('Workflow terminal parent continuation foreach source is invalid');
     }
-    const current = parentSnapshot.context?.[contract.source.stepId] as
-      | { payload?: unknown; metadata?: Record<string, unknown> }
-      | undefined;
-    if (!Array.isArray(current?.payload) || contract.source.iterationIndex >= current.payload.length) {
-      throw new TypeError('Workflow terminal parent continuation foreach index is out of bounds');
-    }
     if (contract.patch.kind === 'merge-child-terminal') {
-      const workflowMetadata = current.metadata?.__workflow_meta as Record<string, unknown> | undefined;
-      const iterationRuns = workflowMetadata?.[WORKFLOW_TERMINAL_FOREACH_RUN_KEY];
-      if (
-        iterationRuns === null ||
-        typeof iterationRuns !== 'object' ||
-        Array.isArray(iterationRuns) ||
-        (iterationRuns as Record<string, unknown>)[String(contract.source.iterationIndex)] !== effect.runId
-      ) {
+      const current = getRecord(
+        value(parentContext, contract.source.stepId),
+        'Workflow terminal parent continuation foreach source state',
+      );
+      const payload = materializeDenseDataArray(
+        value(current, 'payload'),
+        'parent foreach payload',
+        MAX_TERMINAL_FOREACH_ENTRIES,
+      );
+      if (contract.source.iterationIndex >= payload.length) {
+        throw new TypeError('Workflow terminal parent continuation foreach index is out of bounds');
+      }
+      const output = materializeDenseDataArray(
+        value(current, 'output'),
+        'parent foreach output',
+        MAX_TERMINAL_FOREACH_ENTRIES,
+      );
+      if (contract.source.iterationIndex >= output.length) {
+        throw new TypeError('Workflow terminal parent continuation foreach source iteration was not started');
+      }
+      if (output.length > payload.length) {
+        throw new TypeError('Workflow terminal parent continuation foreach output exceeds its input payload');
+      }
+      boundForeachPayload = payload;
+      boundForeachOutput = output;
+      const metadataValue = value(current, 'metadata');
+      const metadata = metadataValue === undefined ? undefined : getRecord(metadataValue, 'parent foreach metadata');
+      const workflowMetadataValue = metadata && value(metadata, '__workflow_meta');
+      const workflowMetadata =
+        workflowMetadataValue === undefined
+          ? undefined
+          : getRecord(workflowMetadataValue, 'parent foreach workflow metadata');
+      const iterationRunsValue = workflowMetadata && value(workflowMetadata, WORKFLOW_TERMINAL_FOREACH_RUN_KEY);
+      const iterationRuns = materializeWorkflowTerminalForeachOwnership(iterationRunsValue, output.length);
+      if (iterationRuns[String(contract.source.iterationIndex)] !== effectRunId) {
         throw new TypeError('Workflow terminal foreach source is not owned by the terminal child run');
       }
       const states = materializeWorkflowTerminalForeachStates(
-        workflowMetadata?.[WORKFLOW_TERMINAL_FOREACH_STATE_KEY],
-        current.payload.length,
+        workflowMetadata && value(workflowMetadata, WORKFLOW_TERMINAL_FOREACH_STATE_KEY),
+        output.length,
       );
+      boundForeachStates = states;
       const state = states[String(contract.source.iterationIndex)];
       if (state === 'success' || state === 'failed' || state === 'canceled') {
         throw new TypeError('Workflow terminal foreach source iteration is already terminal');
@@ -822,13 +927,19 @@ export function validateWorkflowTerminalParentContinuationBinding(
   }
   const { action } = contract;
   if (contract.patch.kind === 'merge-child-terminal' && contract.source.kind === 'step') {
-    const existing = parentSnapshot.context?.[contract.source.stepId] as
-      | { status?: unknown; metadata?: { nestedRunId?: unknown } }
-      | undefined;
+    const existing = getRecord(
+      value(parentContext, contract.source.stepId),
+      'Workflow terminal parent continuation scalar source state',
+    );
+    const metadata = getRecord(value(existing, 'metadata'), 'Workflow terminal parent continuation scalar metadata');
+    const activePath = canonicalPath(
+      value(activeStepsPath, contract.source.stepId),
+      'Workflow terminal parent continuation active source path',
+    );
     if (
-      existing?.status !== 'running' ||
-      existing.metadata?.nestedRunId !== effect.runId ||
-      !samePath(parentSnapshot.activeStepsPath[contract.source.stepId] ?? [], contract.source.executionPath)
+      value(existing, 'status') !== 'running' ||
+      value(metadata, 'nestedRunId') !== effectRunId ||
+      !samePath(activePath, contract.source.executionPath)
     ) {
       throw new TypeError('Workflow terminal parent continuation source is not the active child run');
     }
@@ -836,18 +947,18 @@ export function validateWorkflowTerminalParentContinuationBinding(
   if ('target' in action) {
     if (action.target.kind === 'foreach-iteration') {
       const path = [...action.target.containerPath, action.target.iterationIndex];
-      const resolved = resolveWorkflowTerminalGraphCoordinate(parentSnapshot.serializedStepGraph, path);
+      const resolved = resolveWorkflowTerminalGraphCoordinate(serializedStepGraph, path);
       if (resolved.kind !== 'foreach' || resolved.stepId !== action.target.stepId) {
         throw new TypeError('Workflow terminal parent continuation foreach target is invalid');
       }
     } else {
-      validateTargetBinding(action.target, parentSnapshot.serializedStepGraph);
+      validateTargetBinding(action.target, serializedStepGraph);
     }
   }
-  if ('coordinate' in action) validateTargetBinding(action.coordinate, parentSnapshot.serializedStepGraph);
+  if ('coordinate' in action) validateTargetBinding(action.coordinate, serializedStepGraph);
   const sourcePath = sourceExecutionPath(contract.source);
   const sourceEntry = resolveWorkflowTerminalGraphCoordinate(
-    parentSnapshot.serializedStepGraph,
+    serializedStepGraph,
     contract.source.kind === 'step'
       ? contract.source.executionPath
       : [...contract.source.containerPath, contract.source.iterationIndex],
@@ -866,11 +977,11 @@ export function validateWorkflowTerminalParentContinuationBinding(
       contract.source.kind !== 'step' ||
       sourceEntry.kind !== 'step' ||
       contract.source.executionPath.length !== 1 ||
-      contract.source.executionPath[0] !== parentSnapshot.serializedStepGraph.length - 1
+      contract.source.executionPath[0] !== serializedStepGraph.length - 1
     ) {
       throw new TypeError('Workflow terminal parent-end source is not the final sequential entry');
     }
-    if (Object.keys(parentSnapshot.activeStepsPath).some(stepId => stepId !== contract.source.stepId)) {
+    if (Object.keys(activeStepsPath).some(stepId => stepId !== contract.source.stepId)) {
       throw new TypeError('Workflow terminal parent-end has unrelated active steps');
     }
   }
@@ -897,15 +1008,18 @@ export function validateWorkflowTerminalParentContinuationBinding(
     ) {
       throw new TypeError('Workflow terminal branch action is not bound to its source container');
     }
-    const branch = parentSnapshot.serializedStepGraph[sourcePath[0]!];
+    const branch = serializedStepGraph[sourcePath[0]!];
     if (!branch || (branch.type !== 'parallel' && branch.type !== 'conditional')) {
       throw new TypeError('Workflow terminal branch container is missing');
     }
-    const siblingStatuses = branch.steps.map(entry =>
-      entry.step.id === contract.source.stepId
-        ? contract.childTerminalStatus
-        : (parentSnapshot.context?.[entry.step.id] as { status?: unknown } | undefined)?.status,
-    );
+    const siblingStatuses = branch.steps.map(entry => {
+      if (entry.step.id === contract.source.stepId) return contract.childTerminalStatus;
+      const sibling = getRecord(
+        value(parentContext, entry.step.id),
+        `Workflow terminal parent continuation sibling ${entry.step.id}`,
+      );
+      return value(sibling, 'status');
+    });
     const hasInvalidTerminal = siblingStatuses.some(
       status => status === 'failed' || status === 'canceled' || (containerType === 'parallel' && status === 'skipped'),
     );
@@ -947,22 +1061,12 @@ export function validateWorkflowTerminalParentContinuationBinding(
     if (!samePath(targetPath, foreachSource.containerPath)) {
       throw new TypeError('Workflow terminal foreach action is not bound to its source container');
     }
-    const current = parentSnapshot.context?.[foreachSource.stepId] as
-      | { payload?: unknown; output?: unknown; metadata?: Record<string, unknown> }
-      | undefined;
-    if (!Array.isArray(current?.payload) || !Array.isArray(current.output)) {
+    if (!boundForeachPayload || !boundForeachOutput || !boundForeachStates) {
       throw new TypeError('Workflow terminal foreach source state is invalid');
     }
-    const foreachPayload = current.payload;
-    const foreachOutput = current.output;
-    if (foreachSource.iterationIndex >= foreachOutput.length) {
-      throw new TypeError('Workflow terminal foreach source iteration was not started');
-    }
-    const workflowMetadata = current.metadata?.__workflow_meta as Record<string, unknown> | undefined;
-    const states = materializeWorkflowTerminalForeachStates(
-      workflowMetadata?.[WORKFLOW_TERMINAL_FOREACH_STATE_KEY],
-      foreachOutput.length,
-    );
+    const foreachPayload = boundForeachPayload;
+    const foreachOutput = boundForeachOutput;
+    const states = boundForeachStates;
     const isTerminal = (index: number) =>
       index === foreachSource.iterationIndex ||
       ['success', 'failed', 'canceled'].includes(String(states[String(index)]));
@@ -1013,10 +1117,16 @@ export function validateWorkflowTerminalParentContinuationBinding(
     if (sourceEntry.kind !== 'loop' || sourceEntry.loopType !== loopAction.loopDecision.loopType) {
       throw new TypeError('Workflow terminal parent continuation loop decision does not match the source loop');
     }
-    const currentLoop = parentSnapshot.context?.[contract.source.stepId] as
-      | { metadata?: { iterationCount?: unknown } }
-      | undefined;
-    const previousIterationCount = currentLoop?.metadata?.iterationCount ?? 0;
+    const currentLoop = getRecord(
+      value(parentContext, contract.source.stepId),
+      'Workflow terminal parent continuation loop source state',
+    );
+    const loopMetadataValue = value(currentLoop, 'metadata');
+    const loopMetadata =
+      loopMetadataValue === undefined
+        ? undefined
+        : getRecord(loopMetadataValue, 'Workflow terminal parent continuation loop metadata');
+    const previousIterationCount = (loopMetadata && value(loopMetadata, 'iterationCount')) ?? 0;
     if (previousIterationCount !== loopAction.loopDecision.previousIterationCount) {
       throw new TypeError('Workflow terminal parent continuation loop count conflicts with the parent snapshot');
     }

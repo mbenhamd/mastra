@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { SerializedStep, SerializedStepFlowEntry } from '../types';
 import type { WorkflowTerminalSha256 } from './types';
 
@@ -43,13 +44,15 @@ export function validateWorkflowTerminalStructuralString(
 }
 
 function getDataDescriptors(value: unknown, field: string): Record<PropertyKey, PropertyDescriptor> {
+  if (isProxy(value)) throw new TypeError(`${field} must not be a proxy`);
   if (value === null || typeof value !== 'object') throw new TypeError(`${field} must be a data object`);
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${field} must be a plain object`);
   const descriptors = Object.getOwnPropertyDescriptors(value) as Record<PropertyKey, PropertyDescriptor>;
+  Object.setPrototypeOf(descriptors, null);
   for (const key of Reflect.ownKeys(descriptors)) {
-    if (typeof key !== 'string' || !('value' in descriptors[key]!)) {
-      throw new TypeError(`${field} contains symbol or accessor fields`);
+    if (typeof key !== 'string' || !('value' in descriptors[key]!) || descriptors[key]!.enumerable !== true) {
+      throw new TypeError(`${field} contains symbol, accessor, or non-enumerable fields`);
     }
   }
   return descriptors;
@@ -71,6 +74,7 @@ function validateKeys(
 }
 
 function getDenseArray(value: unknown, field: string, maxLength = MAX_TERMINAL_GRAPH_NODES): unknown[] {
+  if (isProxy(value)) throw new TypeError(`${field} must not be a proxy`);
   if (!Array.isArray(value)) throw new TypeError(`${field} must be a dense array`);
   const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
   const length = descriptors.length?.value;
@@ -149,19 +153,16 @@ function normalizeStep(
   const id = validateWorkflowTerminalStructuralString(descriptors.id!.value, `${field}.id`);
   if (scopeStepIds.has(id)) throw new TypeError(`serialized workflow graph contains duplicate step id ${id}`);
   scopeStepIds.add(id);
+  const componentValue = descriptors.component?.value;
   const component =
-    descriptors.component === undefined
+    componentValue === undefined
       ? ''
-      : validateWorkflowTerminalStructuralString(descriptors.component.value, `${field}.component`, 512, true);
+      : validateWorkflowTerminalStructuralString(componentValue, `${field}.component`, 512, true);
+  const mapConfigValue = descriptors.mapConfig?.value;
   const mapConfig =
-    descriptors.mapConfig === undefined
+    mapConfigValue === undefined
       ? ''
-      : hashSource(
-          'mastra.workflow-terminal-parent-graph.map-config.v1',
-          descriptors.mapConfig.value,
-          `${field}.mapConfig`,
-          state,
-        );
+      : hashSource('mastra.workflow-terminal-parent-graph.map-config.v1', mapConfigValue, `${field}.mapConfig`, state);
   const canSuspend = descriptors.canSuspend?.value;
   if (canSuspend !== undefined && typeof canSuspend !== 'boolean') {
     throw new TypeError(`${field}.canSuspend must be boolean`);
@@ -241,6 +242,7 @@ function normalizeGraph(
           throw new TypeError(`${entryField} must contain exactly one of date or fn`);
         }
         if (date !== undefined) {
+          if (isProxy(date)) throw new TypeError(`${entryField}.date must not be a proxy`);
           if (!(date instanceof Date) && typeof date !== 'string') {
             throw new TypeError(`${entryField}.date must be a Date or string`);
           }
@@ -297,7 +299,7 @@ function normalizeGraph(
             state,
             `${entryField}.serializedConditions[${conditionIndex}]`,
           );
-          if (conditionId !== branchIds[conditionIndex]) {
+          if (conditionId !== `${branchIds[conditionIndex]}-condition`) {
             throw new TypeError(`${entryField} conditional branch and condition IDs differ`);
           }
         });
@@ -320,7 +322,9 @@ function normalizeGraph(
         state,
         `${entryField}.serializedCondition`,
       );
-      if (conditionId !== stepId) throw new TypeError(`${entryField} loop step and condition IDs differ`);
+      if (conditionId !== `${stepId}-condition`) {
+        throw new TypeError(`${entryField} loop step and condition IDs differ`);
+      }
     } else if (type === 'foreach') {
       validateKeys(descriptors, ['type', 'step', 'opts'], ['type', 'step', 'opts'], entryField);
       normalizeStep(descriptors.step!.value, parts, state, scopeStepIds, depth, `${entryField}.step`);
@@ -377,34 +381,47 @@ export function resolveWorkflowTerminalGraphCoordinate(
   const rootIndex = path[0] as number;
   const entry = entries[rootIndex];
   if (!entry) throw new TypeError('executionPath does not exist in serialized workflow graph');
-  if (entry.type === 'parallel' || entry.type === 'conditional') {
-    if (path.length === 1) return { kind: 'container', containerType: entry.type };
-    const branch = entry.steps[path[1] as number];
+  const entryField = `serialized workflow graph[${rootIndex}]`;
+  const entryDescriptors = getDataDescriptors(entry, entryField);
+  const type = entryDescriptors.type?.value;
+  if (type === 'parallel' || type === 'conditional') {
+    if (path.length === 1) return { kind: 'container', containerType: type };
+    const steps = getDenseArray(entryDescriptors.steps?.value, `${entryField}.steps`);
+    const branch = steps[path[1] as number];
     if (!branch) throw new TypeError('executionPath branch does not exist');
+    const branchDescriptors = getDataDescriptors(branch, `${entryField}.steps[${path[1]}]`);
     return {
       kind: 'branch',
-      containerType: entry.type,
-      stepId: readStepId(branch.step, `serialized workflow graph[${rootIndex}].steps[${path[1]}].step`),
+      containerType: type,
+      stepId: readStepId(branchDescriptors.step?.value as SerializedStep, `${entryField}.steps[${path[1]}].step`),
     };
   }
-  if (entry.type === 'foreach') {
+  if (type === 'foreach') {
     if (path.length > 2) throw new TypeError('foreach executionPath is invalid');
     return {
       kind: 'foreach',
-      stepId: readStepId(entry.step, `serialized workflow graph[${rootIndex}].step`),
+      stepId: readStepId(entryDescriptors.step?.value as SerializedStep, `${entryField}.step`),
       ...(path.length === 2 ? { iterationIndex: path[1] as number } : {}),
     };
   }
   if (path.length !== 1) throw new TypeError('executionPath contains a surplus segment');
-  if (entry.type === 'step') {
-    return { kind: 'step', stepId: readStepId(entry.step, `serialized workflow graph[${rootIndex}].step`) };
+  if (type === 'step') {
+    return { kind: 'step', stepId: readStepId(entryDescriptors.step?.value as SerializedStep, `${entryField}.step`) };
   }
-  if (entry.type === 'loop') {
+  if (type === 'loop') {
+    const loopType = entryDescriptors.loopType?.value;
+    if (loopType !== 'dowhile' && loopType !== 'dountil') {
+      throw new TypeError(`${entryField}.loopType is invalid`);
+    }
     return {
       kind: 'loop',
-      stepId: readStepId(entry.step, `serialized workflow graph[${rootIndex}].step`),
-      loopType: entry.loopType,
+      stepId: readStepId(entryDescriptors.step?.value as SerializedStep, `${entryField}.step`),
+      loopType,
     };
   }
-  return { kind: entry.type, entryId: entry.id };
+  if (type !== 'sleep' && type !== 'sleepUntil') throw new TypeError(`${entryField}.type is invalid`);
+  return {
+    kind: type,
+    entryId: validateWorkflowTerminalStructuralString(entryDescriptors.id?.value, `${entryField}.id`),
+  };
 }

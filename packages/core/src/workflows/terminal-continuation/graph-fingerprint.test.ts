@@ -18,18 +18,39 @@ function graph(): SerializedStepFlowEntry[] {
         { type: 'step', step: { id: 'right' } },
       ],
       serializedConditions: [
-        { id: 'left', fn: '({ inputData }) => Boolean(inputData)' },
-        { id: 'right', fn: '() => true' },
+        { id: 'left-condition', fn: '({ inputData }) => Boolean(inputData)' },
+        { id: 'right-condition', fn: '() => true' },
       ],
     },
     {
       type: 'loop',
       step: { id: 'loop-body' },
-      serializedCondition: { id: 'loop-body', fn: '({ iterationCount }) => iterationCount < 3' },
+      serializedCondition: { id: 'loop-body-condition', fn: '({ iterationCount }) => iterationCount < 3' },
       loopType: 'dowhile',
     },
     { type: 'foreach', step: { id: 'each-body' }, opts: { concurrency: 2 } },
   ];
+}
+
+function countingProxy<T extends object>(target: T, increment: () => void): T {
+  return new Proxy(target, {
+    get(target, property, receiver) {
+      increment();
+      return Reflect.get(target, property, receiver);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      increment();
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    getPrototypeOf(target) {
+      increment();
+      return Reflect.getPrototypeOf(target);
+    },
+    ownKeys(target) {
+      increment();
+      return Reflect.ownKeys(target);
+    },
+  });
 }
 
 describe('workflow terminal graph fingerprint', () => {
@@ -96,6 +117,26 @@ describe('workflow terminal graph fingerprint', () => {
     Object.defineProperty(accessor[0]!.step, 'id', { get: () => 'nested' });
     expect(() => createWorkflowTerminalGraphFingerprint(accessor)).toThrow(/accessor/);
 
+    const hidden = graph();
+    Object.defineProperty(hidden[0], 'type', {
+      configurable: true,
+      enumerable: false,
+      value: 'step',
+      writable: true,
+    });
+    expect(() => createWorkflowTerminalGraphFingerprint(hidden)).toThrow(/non-enumerable/);
+
+    let proxyTrapCalls = 0;
+    const proxied = countingProxy(graph(), () => proxyTrapCalls++);
+    expect(() => createWorkflowTerminalGraphFingerprint(proxied)).toThrow(/must not be a proxy/);
+    expect(proxyTrapCalls).toBe(0);
+
+    const proxiedEntryGraph = graph();
+    let entryTrapCalls = 0;
+    proxiedEntryGraph[0] = countingProxy(proxiedEntryGraph[0]!, () => entryTrapCalls++);
+    expect(() => resolveWorkflowTerminalGraphCoordinate(proxiedEntryGraph, [0])).toThrow(/must not be a proxy/);
+    expect(entryTrapCalls).toBe(0);
+
     expect(() => validateWorkflowTerminalStructuralString('\ud800', 'id')).toThrow(/well-formed/);
     expect(validateWorkflowTerminalStructuralString('emoji-😀', 'id')).toBe('emoji-😀');
 
@@ -133,7 +174,7 @@ describe('workflow terminal graph fingerprint', () => {
         {
           type: 'conditional',
           steps: [{ type: 'step', step: { id: 'branch' } }],
-          serializedConditions: [{ id: 'other', fn: '() => true' }],
+          serializedConditions: [{ id: 'other-condition', fn: '() => true' }],
         },
       ]),
     ).toThrow(/IDs differ/);

@@ -33,12 +33,15 @@ locked parent state; PF-1780 will execute only the committed action.
 - Contract, effect, parent snapshot, and retained child evidence share one
   descriptor-safe input budget: depth 64, 4,096 visited nodes, 16,384
   collection/object entries, and 1 MiB of UTF-8 strings and keys. Cycles,
-  shared-reference amplification, accessors, symbols, non-JSON `bigint` values,
+  shared-reference amplification, proxies, accessors, symbols, non-JSON `bigint` values,
   unsupported opaque structured-clone objects, and over-budget evidence fail
   with controlled contract errors before cloning or normalization.
 - Foreach stores raw output and a framework-owned per-index terminal status
   sidecar together. The sidecar distinguishes pending `null`, successful
   `null`/`undefined`, failure, and cancellation after JSON persistence.
+- Foreach source evidence must contain a dense started-output array bounded by
+  the original input payload; phantom iterations never become suspension or
+  resume-label evidence.
 - No-op and quarantine contracts apply no parent patch.
 - Scalar sources must still be the exact active `nestedRunId`; concurrent
   foreach sources use a separate `iterationRunIds[index]` ownership sidecar.

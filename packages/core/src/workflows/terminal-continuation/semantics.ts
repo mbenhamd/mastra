@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { WorkflowRunState, WorkflowTerminalEffectRecord, WorkflowTerminalSnapshotRecord } from '../types';
 import {
   materializeWorkflowTerminalForeachStates,
@@ -96,6 +97,7 @@ function assertBoundedDataOnly(
       }
       continue;
     }
+    if (isProxy(visit.value)) throw new TypeError(`${visit.field} contains a proxy`);
     if (ancestors.has(visit.value)) throw new TypeError(`${visit.field} contains a cycle`);
     const prototype = Object.getPrototypeOf(visit.value);
     if (
@@ -653,6 +655,7 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
   storageTimestamp: number;
   executionMode: 'continuous';
 }): WorkflowRunState {
+  if (isProxy(input)) throw new TypeError('parent continuation patch input must not be a proxy');
   const expectedInputKeys = new Set([
     'contract',
     'effect',
