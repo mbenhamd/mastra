@@ -398,11 +398,7 @@ function terminalResultFromRetained(
   storageTimestamp: number,
   childBudget: ContinuationDataBudget,
 ): ParentStepResult {
-  const terminalResult = dataRecord(
-    retained.envelope.terminalResult,
-    'retained child terminal result',
-    childBudget,
-  );
+  const terminalResult = dataRecord(retained.envelope.terminalResult, 'retained child terminal result', childBudget);
   const status = retained.terminalStatus;
   if (terminalResult.status !== undefined && terminalResult.status !== status) {
     throw new TypeError('retained child result status conflicts with its terminal snapshot');
@@ -410,9 +406,7 @@ function terminalResultFromRetained(
   if (status === 'success' && terminalResult.status !== 'success') {
     throw new TypeError('successful retained child snapshot is missing a successful result');
   }
-  const rawError = terminalResult.error;
-  const error =
-    rawError === undefined ? undefined : canonicalJsonValue(rawError, 'retained child error', childBudget);
+  const error = terminalResult.error;
   if (status === 'failed' && error === undefined) {
     throw new TypeError('failed retained child snapshot is missing an error');
   }

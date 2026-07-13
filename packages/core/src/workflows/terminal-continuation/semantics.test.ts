@@ -644,6 +644,28 @@ describe('workflow terminal parent patch semantics', () => {
       }),
     ).toThrow(/byte limit/);
 
+    const boundedError = { message: 'x'.repeat(600_000) };
+    const boundedFailure = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(failedParent, {
+        childTerminalStatus: 'failed',
+        action: { kind: 'fail-parent', reason: 'parent-fail' },
+        patch: failedPatch,
+      }),
+      effect: effect('failed'),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: failedParent,
+      retainedChild: retained('failed', {
+        status: 'failed',
+        error: boundedError,
+        startedAt: 11,
+        endedAt: 20,
+      }),
+      storageTimestamp: 30,
+      executionMode: 'continuous',
+    });
+    expect(boundedFailure.error).toEqual(boundedError);
+
     const aggregateParent = parentSnapshot();
     aggregateParent.requestContext = {
       parentError: inheritedErrorWithMessage('p'.repeat(600_000)),
