@@ -45,19 +45,26 @@ export function getPlainDataDescriptors(
     }
     return selected;
   }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  if (options.nullPrototypeResult) Object.setPrototypeOf(descriptors, null);
-  if (options.maxKeys !== undefined && Reflect.ownKeys(descriptors).length > options.maxKeys) {
+  const keys = Reflect.ownKeys(value);
+  if (options.maxKeys !== undefined && keys.length > options.maxKeys) {
     throw new TypeError(options.maxKeysError ?? fieldsError(''));
   }
-  for (const key of Reflect.ownKeys(descriptors)) {
+  const descriptors: Record<string, PropertyDescriptor> = options.nullPrototypeResult ? Object.create(null) : {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
     if (
       typeof key !== 'string' ||
-      !('value' in descriptors[key]!) ||
-      (options.requireEnumerable && descriptors[key]!.enumerable !== true)
+      !('value' in descriptor) ||
+      (options.requireEnumerable && descriptor.enumerable !== true)
     ) {
       throw new TypeError(fieldsError(key));
     }
+    Object.defineProperty(descriptors, key, {
+      configurable: true,
+      enumerable: true,
+      value: descriptor,
+      writable: true,
+    });
   }
   return descriptors;
 }
@@ -75,22 +82,23 @@ interface DenseDataArrayOptions {
 export function getDenseDataArray(value: unknown, options: DenseDataArrayOptions): unknown[] {
   if (isProxy(value)) throw new TypeError(options.proxyError ?? options.typeError);
   if (!Array.isArray(value)) throw new TypeError(options.typeError);
-  const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  const length = lengthDescriptor && 'value' in lengthDescriptor ? lengthDescriptor.value : undefined;
   if (!Number.isSafeInteger(length) || length < (options.minLength ?? 0) || length > options.maxLength) {
     throw new TypeError(options.lengthError);
   }
-  const result = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) throw new TypeError(options.dataError);
-    return descriptor.value;
-  });
+  const keys = Reflect.ownKeys(value);
   if (
-    Reflect.ownKeys(descriptors).some(
+    keys.some(
       key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
     )
   ) {
     throw new TypeError(options.dataError);
   }
+  const result = Array.from({ length }, (_, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !('value' in descriptor)) throw new TypeError(options.dataError);
+    return descriptor.value;
+  });
   return result;
 }
