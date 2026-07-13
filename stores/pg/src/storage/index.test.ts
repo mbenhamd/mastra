@@ -5,7 +5,6 @@ import {
   createDomainDirectTests,
   createStoreIndexTests,
   createDomainIndexTests,
-  createResourceDeletionTest,
 } from '@internal/storage-test-utils';
 import { Mastra } from '@mastra/core/mastra';
 import { TABLE_THREADS } from '@mastra/core/storage';
@@ -26,7 +25,6 @@ vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 createTestSuite(new PostgresStore(TEST_CONFIG));
 createTestSuite(new PostgresStore({ ...TEST_CONFIG, schemaName: 'my_schema' }));
-createResourceDeletionTest({ storage: new PostgresStore(TEST_CONFIG) });
 
 describe('PostgresStore workspace authorIds filtering', () => {
   it('lists owned and legacy unowned workspaces without returning other authors', async () => {

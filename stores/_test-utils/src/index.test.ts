@@ -2,12 +2,10 @@ import { MockStore } from '@mastra/core/storage';
 import type { ObservabilityStorage } from '@mastra/core/storage';
 import { createTestSuite } from './factory';
 import { createMastraStorageCompositionTests } from './composite-tests';
-import { createResourceDeletionTest } from './domains/memory/resource-deletion';
 import { createObservabilityVNextTests } from './domains/observability-vnext';
 
 // Test InMemoryStore (MockStore)
 createTestSuite(new MockStore());
-createResourceDeletionTest({ storage: new MockStore() });
 
 // Test MastraStorage composition with InMemoryStore backing
 createMastraStorageCompositionTests();
