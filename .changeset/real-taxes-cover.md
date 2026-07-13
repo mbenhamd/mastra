@@ -2,4 +2,4 @@
 '@mastra/convex': patch
 ---
 
-Fixed workflow step-result storage so magic step IDs remain own data properties without mutating context prototypes.
+Fixed Convex workflow storage so steps with reserved JavaScript property names, such as `__proto__`, keep their results correctly.
