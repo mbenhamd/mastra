@@ -16,4 +16,4 @@ const reservation = await workflowsStorage.reserveWorkflowTerminalDestinationRec
 });
 ```
 
-Repeating the call for the same effect and consumer returns the same receipt. A different consumer receives its own receipt. Reserved receipts survive normal workflow-run deletion until completed terminal records are cleaned up. Version 1 does not mark destination work as applied.
+Repeating the call for the same effect and consumer returns the same receipt. PostgreSQL atomically permits at most eight distinct consumers per effect and returns `consumer_limit_reached` for another distinct consumer, including under concurrent reservations. Reserved receipts survive normal workflow-run deletion until completed terminal records are cleaned up. A reserved receipt records retry identity only; it does not confirm that destination work was delivered or applied.

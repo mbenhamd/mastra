@@ -8,6 +8,7 @@ import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
 import { InMemoryDB } from '../inmemory-db';
 import { WorkflowsInMemory } from './inmemory';
 import {
+  MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT,
   createWorkflowTerminalDestinationReceiptRecord,
   validateWorkflowTerminalDestinationReceiptIntegrity,
 } from './terminalization';
@@ -115,6 +116,34 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       throw new Error('Expected one stable receipt');
     }
     expect(second.receipt).toEqual(first.receipt);
+  });
+
+  it('atomically caps distinct consumers per effect while preserving idempotent retries', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const ready = await createReadyRun(workflows, { workflowName: 'bounded-receipts', runId: 'bounded-run' });
+
+    for (let index = 0; index < MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT - 1; index += 1) {
+      await expect(
+        workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, `consumer-${index}`)),
+      ).resolves.toMatchObject({ status: 'reserved' });
+    }
+
+    const boundary = await Promise.all([
+      workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'boundary-a')),
+      workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'boundary-b')),
+    ]);
+    expect(boundary.map(result => result.status).sort()).toEqual(['consumer_limit_reached', 'reserved']);
+    expect(db.workflowTerminalDestinationReceipts.size).toBe(MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT);
+
+    const winner = boundary.find(result => result.status === 'reserved');
+    if (!winner || winner.status !== 'reserved') throw new Error('Expected one boundary reservation');
+    await expect(
+      workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, winner.receipt.consumerId)),
+    ).resolves.toMatchObject({ status: 'already_exists', receipt: { receiptKey: winner.receipt.receiptKey } });
+    await expect(
+      workflows.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'over-limit')),
+    ).resolves.toEqual({ status: 'consumer_limit_reached' });
   });
 
   it('reserves isolated receipts, retains them after run deletion, and removes them with completed evidence', async () => {
@@ -317,6 +346,15 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       'Conflicting workflow terminal destination receipt storage',
     );
     db.workflowTerminalDestinationReceipts.delete(physicalReceiptKey);
+    const aliasedReceipt = { ...storedReceipt, effectKey: `wte:v1:${'0'.repeat(64)}` };
+    db.workflowTerminalDestinationReceipts.set('corrupt-logical-alias', aliasedReceipt);
+    await expect(workflows.getWorkflowTerminalDestinationReceipt(input)).rejects.toThrow(
+      'Invalid workflow terminal destination receipt integrity',
+    );
+    await expect(workflows.reserveWorkflowTerminalDestinationReceipt(input)).rejects.toThrow(
+      'Invalid workflow terminal destination receipt integrity',
+    );
+    db.workflowTerminalDestinationReceipts.delete('corrupt-logical-alias');
     await expect(workflows.getWorkflowTerminalDestinationReceipt(stale)).resolves.toMatchObject({
       status: 'fence_conflict',
     });

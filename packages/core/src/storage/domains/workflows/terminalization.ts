@@ -89,7 +89,7 @@ type InternalReserveWorkflowTerminalDestinationReceiptResult =
       status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
       record: WorkflowTerminalizationRecord;
     }
-  | { status: 'missing_effect' | 'missing_record' };
+  | { status: 'consumer_limit_reached' | 'missing_effect' | 'missing_record' };
 
 type InternalGetWorkflowTerminalDestinationReceiptResult =
   | { status: 'found'; receipt: WorkflowTerminalDestinationReceiptRecord }
@@ -111,6 +111,7 @@ const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTermina
 
 export const MAX_WORKFLOW_TERMINALIZATION_LEASE_MS = 86_400_000;
 export const MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH = 256;
+export const MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT = 8;
 
 function isWellFormedUnicode(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -839,6 +840,7 @@ export function reserveWorkflowTerminalDestinationReceiptRecord(
   journal: WorkflowTerminalizationRecord | undefined,
   effect: WorkflowTerminalEffectRecord | undefined,
   existingReceipt: WorkflowTerminalDestinationReceiptRecord | undefined,
+  existingReceiptCount: number,
   input: ReserveWorkflowTerminalDestinationReceiptInput,
   now: number,
 ): InternalReserveWorkflowTerminalDestinationReceiptResult {
@@ -848,7 +850,16 @@ export function reserveWorkflowTerminalDestinationReceiptRecord(
   if (fence.status !== 'ok') return fence;
   if (!effect || effect.kind !== input.effectKind) return { status: 'missing_effect' };
   const desired = createWorkflowTerminalDestinationReceiptRecord(effect, input.consumerId, now);
-  if (!existingReceipt) return { status: 'reserved', receipt: desired };
+  if (!existingReceipt) {
+    if (
+      !Number.isSafeInteger(existingReceiptCount) ||
+      existingReceiptCount < 0 ||
+      existingReceiptCount >= MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT
+    ) {
+      return { status: 'consumer_limit_reached' };
+    }
+    return { status: 'reserved', receipt: desired };
+  }
   validateWorkflowTerminalDestinationReceiptIntegrity(existingReceipt, effect, now);
   if (!sameWorkflowTerminalDestinationReceipt(existingReceipt, desired)) {
     throw new TypeError('Conflicting workflow terminal destination receipt identity');

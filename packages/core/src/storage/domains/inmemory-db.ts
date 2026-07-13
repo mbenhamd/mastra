@@ -59,6 +59,101 @@ import type { ScorerDefinitionVersion } from './scorer-definitions';
 import type { SkillVersion } from './skills';
 import type { WorkspaceVersion } from './workspaces';
 
+class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminalDestinationReceiptRecord> {
+  readonly #physicalKeysByEffect = new Map<string, Set<string>>();
+  readonly #physicalKeysByLogicalEffect = new Map<string, Set<string>>();
+  readonly #physicalKeysByEffectConsumer = new Map<string, Set<string>>();
+  readonly #physicalKeysByLogicalConsumer = new Map<string, Set<string>>();
+
+  #effectKey(receipt: WorkflowTerminalDestinationReceiptRecord): string {
+    return JSON.stringify([receipt.effectKey]);
+  }
+
+  #logicalEffectKey(receipt: WorkflowTerminalDestinationReceiptRecord): string {
+    return JSON.stringify([receipt.workflowName, receipt.runId, receipt.effectKind]);
+  }
+
+  #effectConsumerKey(receipt: WorkflowTerminalDestinationReceiptRecord): string {
+    return JSON.stringify([receipt.effectKey, receipt.consumerId]);
+  }
+
+  #logicalConsumerKey(receipt: WorkflowTerminalDestinationReceiptRecord): string {
+    return JSON.stringify([receipt.workflowName, receipt.runId, receipt.effectKind, receipt.consumerId]);
+  }
+
+  #add(index: Map<string, Set<string>>, indexKey: string, physicalKey: string): void {
+    const keys = index.get(indexKey) ?? new Set<string>();
+    keys.add(physicalKey);
+    index.set(indexKey, keys);
+  }
+
+  #remove(index: Map<string, Set<string>>, indexKey: string, physicalKey: string): void {
+    const keys = index.get(indexKey);
+    if (!keys) return;
+    keys.delete(physicalKey);
+    if (keys.size === 0) index.delete(indexKey);
+  }
+
+  #index(physicalKey: string, receipt: WorkflowTerminalDestinationReceiptRecord): void {
+    this.#add(this.#physicalKeysByEffect, this.#effectKey(receipt), physicalKey);
+    this.#add(this.#physicalKeysByLogicalEffect, this.#logicalEffectKey(receipt), physicalKey);
+    this.#add(this.#physicalKeysByEffectConsumer, this.#effectConsumerKey(receipt), physicalKey);
+    this.#add(this.#physicalKeysByLogicalConsumer, this.#logicalConsumerKey(receipt), physicalKey);
+  }
+
+  #deindex(physicalKey: string, receipt: WorkflowTerminalDestinationReceiptRecord): void {
+    this.#remove(this.#physicalKeysByEffect, this.#effectKey(receipt), physicalKey);
+    this.#remove(this.#physicalKeysByLogicalEffect, this.#logicalEffectKey(receipt), physicalKey);
+    this.#remove(this.#physicalKeysByEffectConsumer, this.#effectConsumerKey(receipt), physicalKey);
+    this.#remove(this.#physicalKeysByLogicalConsumer, this.#logicalConsumerKey(receipt), physicalKey);
+  }
+
+  override set(physicalKey: string, receipt: WorkflowTerminalDestinationReceiptRecord): this {
+    const existing = this.get(physicalKey);
+    if (existing) this.#deindex(physicalKey, existing);
+    super.set(physicalKey, receipt);
+    this.#index(physicalKey, receipt);
+    return this;
+  }
+
+  override delete(physicalKey: string): boolean {
+    const existing = this.get(physicalKey);
+    const deleted = super.delete(physicalKey);
+    if (deleted && existing) this.#deindex(physicalKey, existing);
+    return deleted;
+  }
+
+  override clear(): void {
+    super.clear();
+    this.#physicalKeysByEffect.clear();
+    this.#physicalKeysByLogicalEffect.clear();
+    this.#physicalKeysByEffectConsumer.clear();
+    this.#physicalKeysByLogicalConsumer.clear();
+  }
+
+  findMatches(effect: WorkflowTerminalEffectRecord, consumerId: string): WorkflowTerminalDestinationReceiptRecord[] {
+    const physicalKeys = new Set<string>([
+      JSON.stringify([effect.effectKey, consumerId]),
+      ...(this.#physicalKeysByEffectConsumer.get(JSON.stringify([effect.effectKey, consumerId])) ?? []),
+      ...(this.#physicalKeysByLogicalConsumer.get(
+        JSON.stringify([effect.workflowName, effect.runId, effect.kind, consumerId]),
+      ) ?? []),
+    ]);
+    return [...physicalKeys].flatMap(physicalKey => {
+      const receipt = this.get(physicalKey);
+      return receipt ? [receipt] : [];
+    });
+  }
+
+  countForEffect(effect: WorkflowTerminalEffectRecord): number {
+    return new Set([
+      ...(this.#physicalKeysByEffect.get(JSON.stringify([effect.effectKey])) ?? []),
+      ...(this.#physicalKeysByLogicalEffect.get(JSON.stringify([effect.workflowName, effect.runId, effect.kind])) ??
+        []),
+    ]).size;
+  }
+}
+
 /**
  * InMemoryDB is a thin database layer for in-memory storage.
  * It holds all the Maps that store data, similar to how a real database
@@ -78,7 +173,7 @@ export class InMemoryDB {
   /** Immutable terminal state retained while terminal protocol evidence remains incomplete. */
   readonly workflowTerminalSnapshots = new Map<string, WorkflowTerminalSnapshotRecord>();
   /** Consumer-scoped destination receipt evidence, isolated from replaceable workflow runs. */
-  readonly workflowTerminalDestinationReceipts = new Map<string, WorkflowTerminalDestinationReceiptRecord>();
+  readonly workflowTerminalDestinationReceipts = new WorkflowTerminalDestinationReceiptMap();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];

@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import {
+  MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT,
+  createEmptyWorkflowSnapshot,
+} from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WorkflowsPG } from '.';
@@ -136,6 +139,42 @@ describe('WorkflowsPG terminal destination receipts', () => {
         status: 'found',
         receipt: receipts[0],
       });
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('atomically caps concurrent distinct consumers per effect', async () => {
+    const workflowName = `receipt-boundary-${randomUUID()}`;
+    const ready = await createReadyRun(workflowsA, { workflowName, runId: 'run' });
+
+    try {
+      for (let index = 0; index < MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT - 1; index += 1) {
+        await expect(
+          workflowsA.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, `consumer-${index}`)),
+        ).resolves.toMatchObject({ status: 'reserved' });
+      }
+
+      const boundary = await Promise.all([
+        workflowsA.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'boundary-a')),
+        workflowsB.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'boundary-b')),
+      ]);
+      expect(boundary.map(result => result.status).sort()).toEqual(['consumer_limit_reached', 'reserved']);
+      const count = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM mastra_workflow_terminal_destination_receipts
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [ready.run.workflowName, ready.run.runId],
+      );
+      expect(Number(count.rows[0]?.count)).toBe(MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT);
+
+      const winner = boundary.find(result => result.status === 'reserved');
+      if (!winner || winner.status !== 'reserved') throw new Error('Expected one boundary reservation');
+      await expect(
+        workflowsB.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, winner.receipt.consumerId)),
+      ).resolves.toMatchObject({ status: 'already_exists', receipt: { receiptKey: winner.receipt.receiptKey } });
+      await expect(
+        workflowsA.reserveWorkflowTerminalDestinationReceipt(receiptInput(ready, 'over-limit')),
+      ).resolves.toEqual({ status: 'consumer_limit_reached' });
     } finally {
       await cleanup(workflowName);
     }

@@ -239,7 +239,13 @@ export type ReserveWorkflowTerminalDestinationReceiptResult =
       record: WorkflowTerminalizationObservation;
     }
   | {
-      status: 'missing_effect' | 'missing_terminal_state' | 'missing_record' | 'missing_run' | 'unsupported';
+      status:
+        | 'consumer_limit_reached'
+        | 'missing_effect'
+        | 'missing_terminal_state'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
     };
 
 export interface GetWorkflowTerminalDestinationReceiptInput extends GetWorkflowTerminalizationInput {

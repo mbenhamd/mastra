@@ -22,4 +22,4 @@ const reservation = await workflowsStorage.reserveWorkflowTerminalDestinationRec
 });
 ```
 
-Repeating the call for the same effect and consumer returns the same receipt. A different consumer receives its own receipt. Version 1 reserves receipt identity only; it does not apply destination work, schedule follow-up work, or acknowledge transport.
+Repeating the call for the same effect and consumer returns the same receipt. Version 1 permits at most eight distinct consumers per effect and returns `consumer_limit_reached` for another distinct consumer, while idempotent retries remain available at the limit. A reserved receipt records retry identity only; it does not confirm destination delivery or application, schedule follow-up work, or acknowledge transport.

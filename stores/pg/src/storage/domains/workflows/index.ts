@@ -611,6 +611,24 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
   }
 
+  private async countTerminalDestinationReceiptRecords(
+    t: TxClient,
+    effect: WorkflowTerminalEffectRecord,
+  ): Promise<number> {
+    const row = await t.one<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM ${this.terminalDestinationReceiptTableName()}
+       WHERE effect_key = $1
+          OR (workflow_name = $2 AND run_id = $3 AND effect_kind = $4)`,
+      [effect.effectKey, effect.workflowName, effect.runId, effect.kind],
+    );
+    const count = Number(row.count);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new TypeError('Invalid workflow terminal destination receipt count');
+    }
+    return count;
+  }
+
   private async saveTerminalWorkflowSnapshot(
     t: TxClient,
     input: PersistWorkflowTerminalStateInput,
@@ -1062,10 +1080,12 @@ export class WorkflowsPG extends WorkflowsStorage {
         const receipt = effect
           ? await this.getTerminalDestinationReceiptRecord(t, effect, operation.consumerId, context.now)
           : undefined;
+        const receiptCount = effect ? await this.countTerminalDestinationReceiptRecords(t, effect) : 0;
         const result = reserveWorkflowTerminalDestinationReceiptRecord(
           context.record,
           effect,
           receipt,
+          receiptCount,
           operation,
           context.now,
         );
