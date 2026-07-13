@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Mastra } from '../../../mastra';
 import { processWorkflowLoop } from './loop';
 import { WorkflowEventProcessor } from '.';
@@ -153,5 +153,66 @@ describe('evented loop iterationCount', () => {
       checkpoint: 'kept',
       iterationCount: 2,
     });
+  });
+
+  it('preserves completed-iteration metadata when a nested loop body suspends', async () => {
+    const published: any[] = [];
+    const updateWorkflowResults = vi.fn(async ({ stepId, result }: { stepId: string; result: any }) => ({
+      body: stepId === 'body' ? result : undefined,
+    }));
+    const workflowsStore = {
+      updateWorkflowResults,
+      updateWorkflowState: vi.fn(),
+    };
+    const mastra = {
+      pubsub: {
+        publish: async (_topic: string, event: any) => {
+          published.push(event);
+        },
+      },
+      getStorage: () => ({ getStore: () => workflowsStore }),
+      getLogger: () => undefined,
+    } as unknown as Mastra;
+
+    class ExposedProcessor extends WorkflowEventProcessor {
+      endStep(args: any) {
+        return this.processWorkflowStepEnd(args);
+      }
+    }
+
+    const processor = new ExposedProcessor({ mastra });
+    await processor.endStep({
+      workflow: {
+        id: 'wf',
+        stepGraph: [{ type: 'loop', step: { id: 'body' }, condition: () => false, loopType: 'dountil' }],
+        options: { shouldPersistSnapshot: () => false },
+      },
+      workflowId: 'wf',
+      runId: 'run-nested-suspended',
+      executionPath: [0],
+      stepResults: { body: { status: 'success', metadata: { iterationCount: 2, prior: 'kept' } } },
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: {
+        status: 'suspended',
+        suspendPayload: { reason: 'nested approval' },
+        metadata: { checkpoint: 'kept' },
+      },
+      parentContext: { input: { output: { original: true } } },
+      nestedRunId: 'nested-run',
+      requestContext: {},
+      state: {},
+    });
+
+    const storedBodyResult = updateWorkflowResults.mock.calls[0]?.[0].result;
+    expect(storedBodyResult.metadata).toEqual({
+      iterationCount: 2,
+      prior: 'kept',
+      checkpoint: 'kept',
+      nestedRunId: 'nested-run',
+    });
+    const suspendEvent = published.find(event => event.type === 'workflow.suspend');
+    expect(suspendEvent.data.stepResults.body.metadata).toEqual(storedBodyResult.metadata);
+    expect(suspendEvent.data.prevResult.metadata).toEqual(storedBodyResult.metadata);
   });
 });

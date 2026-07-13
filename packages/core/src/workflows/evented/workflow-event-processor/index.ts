@@ -2039,12 +2039,14 @@ export class WorkflowEventProcessor extends EventProcessor {
 
       // handle nested workflow
       if (parentContext) {
+        const priorMetadata = stepResults[step.step.id]?.metadata ?? {};
         prevResult = stepResults[step.step.id] = {
           ...prevResult,
           payload: parentContext.input?.output ?? {},
           // Store nestedRunId in metadata for getWorkflowRunById retrieval
           ...(nestedRunId && {
             metadata: {
+              ...priorMetadata,
               ...(prevResult as any).metadata,
               nestedRunId,
             },

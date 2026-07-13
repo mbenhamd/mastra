@@ -149,7 +149,7 @@ export class MastraLLMVNext extends MastraBase {
     const observabilityContext = resolveObservabilityContext(rest);
     if (maxSteps !== undefined && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
       throw new MastraError({
-        id: 'MASTR_LLM_INVALID_MAX_STEPS',
+        id: 'LLM_INVALID_MAX_STEPS',
         domain: ErrorDomain.LLM,
         category: ErrorCategory.USER,
         text: 'maxSteps must be a positive safe integer',
