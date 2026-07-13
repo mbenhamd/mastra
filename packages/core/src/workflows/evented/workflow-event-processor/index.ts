@@ -17,7 +17,7 @@ import type {
 import type { Workflow } from '../../../workflows/workflow';
 import { createRestartExecutionParams, createTimeTravelExecutionParams, validateStepResumeData } from '../../utils';
 import { resolveCurrentState } from '../helpers';
-import { createWorkflowResumeLabels, mergeWorkflowResumeLabels, readWorkflowResumeLabels } from '../resume-labels';
+import { createEventedResumeLabels, mergeEventedResumeLabels, normalizeEventedResumeLabels } from '../resume-label';
 import { StepExecutor } from '../step-executor';
 import { EventedWorkflow } from '../workflow';
 import { processWorkflowForEach, processWorkflowLoop } from './loop';
@@ -537,11 +537,16 @@ export class WorkflowEventProcessor extends EventProcessor {
       const propagatedPath =
         suspendedStepId && existingPath[0] !== suspendedStepId ? [suspendedStepId, ...existingPath] : existingPath;
 
-      const resumeLabels = createWorkflowResumeLabels();
-      mergeWorkflowResumeLabels(resumeLabels, prevResult.suspendPayload?.__workflow_meta?.resumeLabels, target => ({
-        stepId: parentWorkflow.stepId,
-        foreachIndex: target.foreachIndex,
-      }));
+      const nestedResumeLabels = prevResult.suspendPayload?.__workflow_meta?.resumeLabels ?? {};
+      let resumeLabels;
+      try {
+        resumeLabels = mergeEventedResumeLabels(undefined, nestedResumeLabels, target => ({
+          stepId: parentWorkflow.stepId,
+          ...(target.foreachIndex !== undefined ? { foreachIndex: target.foreachIndex } : {}),
+        }));
+      } catch (error) {
+        return this.errorWorkflow(args, getErrorFromUnknown(error));
+      }
 
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.step.end',
@@ -969,17 +974,29 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId: nestedRunId,
         });
 
-        const nestedResumeLabels = (() => {
-          if (resumeLabel === undefined) return undefined;
-          try {
-            return readWorkflowResumeLabels(snapshot?.resumeLabels);
-          } catch {
-            return undefined;
-          }
-        })();
+        let nestedResumeLabels;
+        try {
+          nestedResumeLabels = normalizeEventedResumeLabels(snapshot?.resumeLabels ?? {});
+        } catch (error) {
+          return this.errorWorkflow(
+            {
+              workflowId,
+              runId,
+              executionPath,
+              stepResults,
+              activeStepsPath,
+              resumeSteps,
+              prevResult,
+              resumeData,
+              parentWorkflow,
+              requestContext,
+            },
+            getErrorFromUnknown(error),
+          );
+        }
         const hasNestedResumeLabel =
-          resumeLabel !== undefined && Object.prototype.hasOwnProperty.call(nestedResumeLabels ?? {}, resumeLabel);
-        const nestedResumeLabel = hasNestedResumeLabel ? nestedResumeLabels?.[resumeLabel!] : undefined;
+          resumeLabel !== undefined && Object.prototype.hasOwnProperty.call(nestedResumeLabels, resumeLabel);
+        const nestedResumeLabel = hasNestedResumeLabel ? nestedResumeLabels[resumeLabel!] : undefined;
         const isValidNestedResumeLabel =
           nestedResumeLabel !== null &&
           typeof nestedResumeLabel === 'object' &&
@@ -1682,33 +1699,50 @@ export class WorkflowEventProcessor extends EventProcessor {
     let skippedCount = 0;
     const allResults: Record<string, any> = {};
     const suspendedPaths: Record<string, number[]> = {};
-    const resumeLabels = createWorkflowResumeLabels();
+    let resumeLabels = createEventedResumeLabels();
 
-    branchEntry.steps.forEach((branch, idx) => {
-      if (!isExecutableStep(branch)) {
-        return;
+    try {
+      for (const [idx, branch] of branchEntry.steps.entries()) {
+        if (!isExecutableStep(branch)) continue;
+        const res = stepResults?.[branch.step.id] as any;
+        if (!res || !res.status) continue; // branch not finished yet
+        if (res.status === 'success') {
+          // For the branch that just completed, prefer its in-flight result so structured
+          // values (Date, Map, ...) aren't flattened by the storage round-trip.
+          const output =
+            idx === finishedBranchIdx && latestBranchResult?.status === 'success'
+              ? (latestBranchResult as any).output
+              : res.output;
+          allResults[branch.step.id] = output;
+        } else if (res.status === 'skipped') {
+          skippedCount++;
+        } else if (res.status === 'suspended') {
+          suspendedCount++;
+          suspendedPaths[branch.step.id] = [parentIdx, idx];
+          resumeLabels = mergeEventedResumeLabels(resumeLabels, res.suspendPayload?.__workflow_meta?.resumeLabels);
+        }
+        // failed / canceled branches short-circuit the workflow before reaching here
       }
-      const res = stepResults?.[branch.step.id] as any;
-      if (!res || !res.status) {
-        return; // branch not finished yet
-      }
-      if (res.status === 'success') {
-        // For the branch that just completed, prefer its in-flight result so structured
-        // values (Date, Map, ...) aren't flattened by the storage round-trip.
-        const output =
-          idx === finishedBranchIdx && latestBranchResult?.status === 'success'
-            ? (latestBranchResult as any).output
-            : res.output;
-        allResults[branch.step.id] = output;
-      } else if (res.status === 'skipped') {
-        skippedCount++;
-      } else if (res.status === 'suspended') {
-        suspendedCount++;
-        suspendedPaths[branch.step.id] = [parentIdx, idx];
-        mergeWorkflowResumeLabels(resumeLabels, res.suspendPayload?.__workflow_meta?.resumeLabels);
-      }
-      // failed / canceled branches short-circuit the workflow before reaching here
-    });
+    } catch (error) {
+      return this.errorWorkflow(
+        {
+          workflowId,
+          runId,
+          executionPath: branchExecutionPath,
+          resumeSteps,
+          stepResults,
+          prevResult: latestBranchResult ?? ({ status: 'failed' } as any),
+          activeStepsPath,
+          requestContext,
+          timeTravel,
+          restart,
+          parentWorkflow,
+          state: currentState,
+          outputOptions,
+        },
+        getErrorFromUnknown(error),
+      );
+    }
 
     const finishedCount = Object.keys(allResults).length + skippedCount + suspendedCount;
     if (finishedCount < branchEntry.steps.length) {
@@ -2047,27 +2081,45 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (suspendedCount > 0) {
           // Some iterations are suspended - emit workflow suspend
           // Build aggregated suspend metadata from all suspended iterations
-          const collectedResumeLabels = createWorkflowResumeLabels();
+          let collectedResumeLabels = createEventedResumeLabels();
           // suspendedPaths maps stepId -> executionPath, using the step ID (not stepId[index])
           const suspendedPaths: Record<string, number[]> = {
             [step.step.id]: [executionPath[0]!],
           };
 
-          for (let i = 0; i < iterationResults.length; i++) {
-            const iterResult = iterationResults[i];
-            if (iterResult && typeof iterResult === 'object' && iterResult.status === 'suspended') {
-              // Collect resume labels
-              if (iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-                mergeWorkflowResumeLabels(
+          try {
+            for (let i = 0; i < iterationResults.length; i++) {
+              const iterResult = iterationResults[i];
+              if (iterResult && typeof iterResult === 'object' && iterResult.status === 'suspended') {
+                collectedResumeLabels = mergeEventedResumeLabels(
                   collectedResumeLabels,
-                  iterResult.suspendPayload.__workflow_meta.resumeLabels,
-                  target => ({
-                    ...target,
-                    foreachIndex: i,
-                  }),
+                  iterResult.suspendPayload?.__workflow_meta?.resumeLabels,
+                  target => ({ ...target, foreachIndex: i }),
                 );
               }
             }
+          } catch (error) {
+            return this.errorWorkflow(
+              {
+                workflowId,
+                runId,
+                executionPath,
+                resumeSteps,
+                stepResults,
+                prevResult,
+                activeStepsPath,
+                requestContext,
+                timeTravel,
+                restart,
+                parentWorkflow,
+                perStep,
+                state: currentState,
+                outputOptions,
+                forEachIndex,
+                nestedRunId,
+              },
+              getErrorFromUnknown(error),
+            );
           }
 
           // Create the aggregated foreach step suspend result
@@ -2286,7 +2338,32 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
 
       // Extract resume labels from suspend payload metadata
-      const resumeLabels = readWorkflowResumeLabels(prevResult.suspendPayload?.__workflow_meta?.resumeLabels);
+      let resumeLabels;
+      try {
+        resumeLabels = normalizeEventedResumeLabels(prevResult.suspendPayload?.__workflow_meta?.resumeLabels ?? {});
+      } catch (error) {
+        return this.errorWorkflow(
+          {
+            workflowId,
+            runId,
+            executionPath,
+            resumeSteps,
+            stepResults,
+            prevResult,
+            activeStepsPath,
+            requestContext,
+            timeTravel,
+            restart,
+            parentWorkflow,
+            perStep,
+            state: currentState,
+            outputOptions,
+            forEachIndex,
+            nestedRunId,
+          },
+          getErrorFromUnknown(error),
+        );
+      }
 
       // Check shouldPersistSnapshot option - default to true if not specified
       const shouldPersist =

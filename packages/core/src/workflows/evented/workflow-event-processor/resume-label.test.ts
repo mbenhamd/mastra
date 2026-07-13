@@ -11,6 +11,10 @@ class TestWorkflowEventProcessor extends WorkflowEventProcessor {
   propagateSuspend(args: ProcessorArgs) {
     return this.processWorkflowSuspend(args);
   }
+
+  aggregateBranches(args: any) {
+    return this.aggregateBranchResults(args);
+  }
 }
 
 function createProcessor() {
@@ -121,12 +125,62 @@ describe('WorkflowEventProcessor nested resume-label propagation', () => {
       }),
     );
   });
+
+  it.each(['parallel', 'conditional'] as const)('fails a %s suspension with colliding labels', async type => {
+    const { processor, publish } = createProcessor();
+    const suspendedResult = (stepId: string) => ({
+      status: 'suspended',
+      suspendPayload: {
+        __workflow_meta: {
+          resumeLabels: {
+            approve: { stepId },
+          },
+        },
+      },
+    });
+
+    await processor.aggregateBranches({
+      workflow: { id: 'workflow' } as any,
+      workflowId: 'workflow',
+      runId: 'run',
+      branchEntry: {
+        type,
+        steps: [
+          { type: 'step', step: { id: 'branch-a' } },
+          { type: 'step', step: { id: 'branch-b' } },
+        ],
+      } as any,
+      branchExecutionPath: [0, 1],
+      latestBranchResult: suspendedResult('branch-b') as any,
+      resumeSteps: [],
+      stepResults: {
+        'branch-a': suspendedResult('branch-a'),
+        'branch-b': suspendedResult('branch-b'),
+      },
+      activeStepsPath: {},
+      requestContext: {},
+      state: {},
+    });
+
+    expect(publish).toHaveBeenCalledWith(
+      'workflows',
+      expect.objectContaining({
+        type: 'workflow.fail',
+        data: expect.objectContaining({
+          prevResult: expect.objectContaining({ status: 'failed' }),
+        }),
+      }),
+    );
+    expect(publish).not.toHaveBeenCalledWith('workflows', expect.objectContaining({ type: 'workflow.suspend' }));
+  });
 });
 
-function createNestedLabelWorkflow() {
+function createNestedLabelWorkflow(includeLabels = true) {
   const approvalAction = vi.fn(async ({ inputData, resumeData, suspend }) => {
     if (!resumeData) {
-      return await suspend({ reason: 'approval-required' }, { resumeLabel: ['approve-nested', 'revise-nested'] });
+      return includeLabels
+        ? await suspend({ reason: 'approval-required' }, { resumeLabel: ['approve-nested', 'revise-nested'] })
+        : await suspend({ reason: 'approval-required' });
     }
 
     return { value: inputData.value + resumeData.value };
@@ -393,6 +447,89 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
     }
   });
 
+  it('fails a foreach suspension instead of persisting an ambiguous label', async () => {
+    const storage = new MockStore();
+    const itemSchema = z.object({ id: z.string() });
+    const approvalStep = createStep({
+      id: 'foreach-collision-step',
+      inputSchema: itemSchema,
+      outputSchema: itemSchema,
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ inputData, suspend }) =>
+        suspend({ reason: inputData.id }, { resumeLabel: 'approve' }) as Promise<{ id: string }>,
+    });
+    const workflow = createWorkflow({
+      id: 'foreach-collision-workflow',
+      inputSchema: z.array(itemSchema),
+      outputSchema: z.array(itemSchema),
+    })
+      .foreach(approvalStep, { concurrency: 2 })
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub: new EventEmitterPubSub(),
+      workflows: { [workflow.id]: workflow },
+    });
+
+    await mastra.startWorkers();
+    try {
+      const run = await workflow.createRun({ runId: 'foreach-label-collision-run' });
+      const result = await run.start({ inputData: [{ id: 'a' }, { id: 'b' }] });
+      expect(result.status).toBe('failed');
+      expect((result as any).error?.message).toBe('Invalid workflow resume label metadata');
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
+  it('propagates a nested label collision as a workflow failure', async () => {
+    const storage = new MockStore();
+    const schema = z.object({ value: z.number() });
+    const makeApprovalStep = (id: string) =>
+      createStep({
+        id,
+        inputSchema: schema,
+        outputSchema: schema,
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ suspend }) =>
+          suspend({ reason: id }, { resumeLabel: 'approve' }) as Promise<{ value: number }>,
+      });
+    const nestedWorkflow = createWorkflow({
+      id: 'nested-label-collision-workflow',
+      inputSchema: schema,
+      outputSchema: z.object({
+        'nested-branch-a': schema,
+        'nested-branch-b': schema,
+      }),
+    })
+      .parallel([makeApprovalStep('nested-branch-a'), makeApprovalStep('nested-branch-b')])
+      .commit();
+    const parentWorkflow = createWorkflow({
+      id: 'parent-label-collision-workflow',
+      inputSchema: schema,
+      outputSchema: nestedWorkflow.outputSchema,
+    })
+      .then(nestedWorkflow)
+      .commit();
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub: new EventEmitterPubSub(),
+      workflows: { [parentWorkflow.id]: parentWorkflow },
+    });
+
+    await mastra.startWorkers();
+    try {
+      const run = await parentWorkflow.createRun({ runId: 'nested-label-collision-run' });
+      const result = await run.start({ inputData: { value: 1 } });
+      expect(result.status).toBe('failed');
+      expect((result as any).error?.message).toBe('Invalid workflow resume label metadata');
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
   it('preserves and routes a nested foreach label index', async () => {
     const storage = new MockStore();
     const mapAction = vi.fn(async ({ inputData, resumeData, suspend }) => {
@@ -453,7 +590,15 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
         foreachIndex: 1,
       });
 
-      const afterB = await run.resume({ label: 'approve-b', resumeData: { delta: 10 } });
+      await expect(run.resume({ label: 'approve-b', forEachIndex: 0, resumeData: { delta: 10 } })).rejects.toThrow(
+        'Resume label does not match the requested forEachIndex',
+      );
+      await expect(run.resume({ label: 'approve-b', forEachIndex: 99, resumeData: { delta: 10 } })).rejects.toThrow(
+        'Resume label does not match the requested forEachIndex',
+      );
+      expect(mapAction).toHaveBeenCalledTimes(3);
+
+      const afterB = await run.resume({ label: 'approve-b', forEachIndex: 1, resumeData: { delta: 10 } });
       expect(afterB.status).toBe('suspended');
       expect(mapAction).toHaveBeenCalledTimes(4);
       expect(mapAction.mock.calls[3]?.[0]).toMatchObject({
@@ -650,7 +795,7 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
 
   it('preserves explicit step and foreach-index resume for a nested workflow body', async () => {
     const storage = new MockStore();
-    const { approvalAction, nestedWorkflow } = createNestedLabelWorkflow();
+    const { approvalAction, nestedWorkflow } = createNestedLabelWorkflow(false);
     const itemSchema = z.object({ value: z.number() });
     const parentWorkflow = createWorkflow({
       id: 'explicit-outer-foreach-parent-workflow',
@@ -796,7 +941,7 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
 
       const sensitiveUnknownLabel = `missing-${'sensitive'.repeat(100)}`;
       await expect(run.resume({ label: sensitiveUnknownLabel, resumeData: { value: 5 } })).rejects.toThrow(
-        'Workflow resume label exceeds the size limit',
+        'Resume label is invalid',
       );
       await expect(run.resume({ label: '__proto__', resumeData: { value: 5 } })).rejects.toThrow(
         'Resume label was not found for this workflow run',
@@ -806,6 +951,19 @@ describe('EventedWorkflow nested resume labels with persistence', () => {
       );
 
       const store = await storage.getStore('workflows');
+      await store?.updateWorkflowState({
+        workflowName: parentWorkflow.id,
+        runId: run.runId,
+        opts: {
+          resumeLabels: Object.fromEntries(
+            Array.from({ length: 65 }, (_, index) => [`label-${index}`, { stepId: nestedWorkflow.id }]),
+          ),
+        },
+      });
+      await expect(run.resume({ label: 'label-0', resumeData: { value: 5 } })).rejects.toThrow(
+        'Resume label was not found for this workflow run',
+      );
+
       await store?.updateWorkflowState({
         workflowName: parentWorkflow.id,
         runId: run.runId,

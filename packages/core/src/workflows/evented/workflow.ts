@@ -67,7 +67,7 @@ import type { AgentStepOptions } from '../workflow';
 import { EventedExecutionEngine } from './execution-engine';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
 import type { TripwireChunk } from './helpers';
-import { assertWorkflowResumeLabel, readWorkflowResumeLabels } from './resume-labels';
+import { assertEventedResumeLabelName, normalizeEventedResumeLabels } from './resume-label';
 import { WorkflowEventProcessor } from './workflow-event-processor';
 
 export type EventedEngineType = {};
@@ -2107,16 +2107,28 @@ export class EventedRun<
       throw new Error('This workflow run was not suspended');
     }
 
+    if (params.label !== undefined && (typeof params.label !== 'string' || params.label.length === 0)) {
+      throw new Error('Resume label must be a non-empty string');
+    }
+
+    if (params.label !== undefined) {
+      try {
+        assertEventedResumeLabelName(params.label);
+      } catch {
+        throw new Error('Resume label is invalid');
+      }
+    }
+
     // Resolve only own data properties. A plain-object label map inherits keys such as
     // "__proto__", which must not be treated as stored resume metadata.
-    const snapshotResumeLabels = (() => {
-      if (params.label === undefined) return undefined;
+    let snapshotResumeLabels: ReturnType<typeof normalizeEventedResumeLabels> | undefined;
+    if (params.label !== undefined) {
       try {
-        return readWorkflowResumeLabels(snapshot?.resumeLabels);
+        snapshotResumeLabels = normalizeEventedResumeLabels(snapshot?.resumeLabels ?? {});
       } catch {
         throw new Error('Resume label was not found for this workflow run');
       }
-    })();
+    }
     const hasSnapshotResumeLabel =
       params.label !== undefined && Object.prototype.hasOwnProperty.call(snapshotResumeLabels ?? {}, params.label);
     const snapshotResumeLabel = hasSnapshotResumeLabel ? snapshotResumeLabels?.[params.label!] : undefined;
@@ -2179,6 +2191,14 @@ export class EventedRun<
       params.forEachIndex !== snapshotResumeLabel?.foreachIndex
     ) {
       throw new Error('Resume label does not match the requested foreach index');
+    }
+
+    if (
+      params.label !== undefined &&
+      params.forEachIndex !== undefined &&
+      params.forEachIndex !== snapshotResumeLabel?.foreachIndex
+    ) {
+      throw new Error('Resume label does not match the requested forEachIndex');
     }
 
     // Label takes precedence over step param
@@ -2288,7 +2308,7 @@ export class EventedRun<
           stepResults: snapshot?.context as any,
           resumePayload: resumeDataToUse,
           resumePath,
-          forEachIndex: snapshotResumeLabel?.foreachIndex ?? params.forEachIndex,
+          forEachIndex: params.label !== undefined ? snapshotResumeLabel?.foreachIndex : params.forEachIndex,
           label: params.label,
         },
         pubsub: this.mastra.pubsub,

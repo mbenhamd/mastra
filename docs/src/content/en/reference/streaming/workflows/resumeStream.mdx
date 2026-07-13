@@ -40,7 +40,7 @@ if (result!.status === 'suspended') {
     name: 'label',
     type: 'string',
     description:
-      'The resume label recorded when the step suspended (maximum 256 UTF-8 bytes). Use a label to select the matching suspended step, including a step inside a nested workflow, parallel branch, or foreach iteration. Labels reused by different suspended coordinates are quarantined and cannot be resumed by label.',
+      'The resume label recorded when the step suspended. Use a label to select the matching suspended step, including a step inside a nested workflow, parallel branch, or foreach iteration. Evented workflows accept labels up to 256 UTF-8 bytes. If you also pass forEachIndex, it must match the iteration stored for the label.',
     isOptional: true,
   },
   {
@@ -65,7 +65,7 @@ if (result!.status === 'suspended') {
     name: 'forEachIndex',
     type: 'number',
     description:
-      'Target a specific iteration of a suspended `.foreach()` step. Pass the zero-based index of the iteration to resume; other iterations remain suspended. Omit to resume all suspended iterations of the step with the same `resumeData`. When `label` is also provided, the index must exactly match the label-selected iteration.',
+      'Target a specific iteration of a suspended `.foreach()` step. Pass the zero-based index of the iteration to resume; other iterations remain suspended. Omit to resume all suspended iterations of the step with the same `resumeData`. When label is present, this index must equal the iteration selected by that label.',
     isOptional: true,
   },
   {

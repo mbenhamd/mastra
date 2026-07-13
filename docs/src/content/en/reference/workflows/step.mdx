@@ -269,8 +269,9 @@ const agentStep = createStep(testAgent, {
           },
           {
             name: 'suspend',
-            type: '(suspendPayload: any, suspendOptions?: { resumeLabel?: string }) => Promise<void>',
-            description: 'Function to pause workflow execution',
+            type: '(suspendPayload: any, suspendOptions?: { resumeLabel?: string | string[] }) => Promise<void>',
+            description:
+              'Function to pause workflow execution. Evented resume labels must be unique across concurrently suspended targets, are limited to 256 UTF-8 bytes each, and are bounded to 64 labels and 16 KiB of label metadata per suspended workflow state.',
           },
           {
             name: 'state',
