@@ -286,7 +286,137 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         return withToolPayloadTransformMetadata(withToolPayloadTransformMetadata(chunk, inputTransform), transform);
       }
 
-      if (inputData?.some(toolCall => toolCall?.result === undefined && !toolCall.providerExecuted)) {
+      // A declined approval has no `result` but is fully resolved — it must not be mistaken for a
+      // pending HITL/deferred tool call (which would otherwise suspend or stall the loop).
+      const isDeniedApproval = (toolCall: { approval?: { approved?: boolean } }) =>
+        toolCall?.approval?.approved === false;
+      const persistDeniedApproval = (toolCall: z.infer<typeof toolCallOutputSchema>) => {
+        const deniedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
+        const deniedPart = {
+          type: 'tool-invocation' as const,
+          toolInvocation: {
+            state: 'output-denied' as const,
+            toolCallId: deniedToolCallId,
+            toolName: sanitizeToolName(toolCall.toolName),
+            args: toolCall.args,
+            approval: {
+              id: toolCall.approval!.id,
+              approved: false,
+              reason: toolCall.approval!.reason,
+            },
+          },
+        };
+
+        if (!rest.messageList.updateToolInvocation(deniedPart)) {
+          // A recalled or provider-shaped history can be missing the original call part. Retain
+          // the resolved denial as a response instead of silently dropping the user decision.
+          rest.messageList.add(
+            {
+              id: _internal?.generateId?.() ?? crypto.randomUUID(),
+              role: 'assistant',
+              content: { format: 2, parts: [deniedPart] },
+              createdAt: new Date(),
+            },
+            'response',
+          );
+        }
+
+        if (deniedToolCallId !== toolCall.toolCallId) {
+          // The model created a new provider call to communicate the decision. Resolve that
+          // technical invocation too; otherwise the next provider request contains an orphan call.
+          const syntheticResultPart = {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result' as const,
+              toolCallId: toolCall.toolCallId,
+              toolName: sanitizeToolName(toolCall.toolName),
+              args: toolCall.args,
+              result: toolCall.approval?.reason ?? 'Tool call was not approved by the user',
+            },
+          } as const;
+          if (!rest.messageList.updateToolInvocation(syntheticResultPart)) {
+            // Normalized/provider-shaped history may omit the current invocation too. Store a
+            // complete resolved part so the next model prompt never contains an unmatched call.
+            rest.messageList.add(
+              {
+                id: _internal?.generateId?.() ?? crypto.randomUUID(),
+                role: 'assistant',
+                content: { format: 2, parts: [syntheticResultPart] },
+                createdAt: new Date(),
+              },
+              'response',
+            );
+          }
+        }
+      };
+      const processDeniedApproval = async (toolCall: z.infer<typeof toolCallOutputSchema>) => {
+        // Keep the recalled message in the approval-specific `output-denied` state, while
+        // retaining the existing public stream contract that exposes a denial in toolResults.
+        // Persist first so a later pending-HITL bail can never strand the approval decision.
+        persistDeniedApproval(toolCall);
+
+        const result = toolCall.approval?.reason ?? 'Tool call was not approved by the user';
+        // This is a compatibility result, not tool output. Do not invoke toModelOutput or
+        // tool-payload output transforms that legitimately expect the tool's output schema.
+        const chunk: ChunkType<OUTPUT> = {
+          type: 'tool-result',
+          runId: rest.runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            args: toolCall.args,
+            toolCallId: toolCall.toolCallId,
+            toolName: toolCall.toolName,
+            result,
+            providerMetadata: toolCall.providerMetadata as ProviderMetadata | undefined,
+            providerExecuted: toolCall.providerExecuted,
+          },
+        };
+        const processed = await processAndEnqueueChunk(chunk);
+        if (processed) await rest.options?.onChunk?.(processed);
+      };
+      const persistResolvedToolCall = (
+        toolCall: z.infer<typeof toolCallOutputSchema>,
+        resolvedPart: Parameters<typeof rest.messageList.updateToolInvocation>[0],
+      ) => {
+        const persistPart = (part: Parameters<typeof rest.messageList.updateToolInvocation>[0]) => {
+          if (!rest.messageList.updateToolInvocation(part)) {
+            rest.messageList.add(
+              {
+                id: _internal?.generateId?.() ?? crypto.randomUUID(),
+                role: 'assistant',
+                content: { format: 2, parts: [part] },
+                createdAt: new Date(),
+              },
+              'response',
+            );
+          }
+        };
+        const resolvedToolCallId = toolCall.resumeTargetToolCallId ?? toolCall.toolCallId;
+        persistPart({
+          ...resolvedPart,
+          toolInvocation: {
+            ...resolvedPart.toolInvocation,
+            toolCallId: resolvedToolCallId,
+          },
+        });
+
+        if (resolvedToolCallId !== toolCall.toolCallId) {
+          const { approval: _approval, ...syntheticInvocation } = resolvedPart.toolInvocation;
+          persistPart({
+            ...resolvedPart,
+            toolInvocation: {
+              ...syntheticInvocation,
+              toolCallId: toolCall.toolCallId,
+            },
+          });
+        }
+      };
+
+      if (
+        inputData?.some(
+          toolCall => toolCall?.result === undefined && !toolCall.providerExecuted && !isDeniedApproval(toolCall),
+        )
+      ) {
         const errorResults = inputData.filter(toolCall => toolCall?.error && !toolCall.providerExecuted);
 
         if (errorResults?.length) {
@@ -310,7 +440,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             const processed = await processAndEnqueueChunk(chunk);
             if (processed) await rest.options?.onChunk?.(processed);
 
-            rest.messageList.updateToolInvocation({
+            persistResolvedToolCall(toolCall, {
               type: 'tool-invocation' as const,
               toolInvocation: {
                 state: 'result' as const,
@@ -318,6 +448,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 toolName: sanitizeToolName(toolCall.toolName),
                 args: toolCall.args,
                 result: toolCall.error?.message ?? toolCall.error,
+                ...(toolCall.approval ? { approval: toolCall.approval } : {}),
               },
               ...(withToolPayloadTransformProviderMetadata(
                 toolCall.providerMetadata as ProviderMetadata,
@@ -340,10 +471,18 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         // will see them on the next turn. This handles both tool-not-found errors
         // (hallucinated tool names) and tool execution errors (tool throws).
         //
+        // A decline is resolved even though it has no result. Persist every denial
+        // before either the error-recovery return or the pending-HITL bail path.
+        for (const toolCall of inputData.filter(isDeniedApproval)) {
+          await processDeniedApproval(toolCall);
+        }
+
         // Check for pending HITL tool calls (tools with no result and no error).
         // In mixed turns with errors and pending HITL tools,
         // the HITL suspension path should take priority over continuing the loop.
-        const hasPendingHITL = inputData.some(tc => tc.result === undefined && !tc.error && !tc.providerExecuted);
+        const hasPendingHITL = inputData.some(
+          tc => tc.result === undefined && !tc.error && !tc.providerExecuted && !isDeniedApproval(tc),
+        );
 
         if (errorResults?.length > 0 && !hasPendingHITL) {
           // Process any successful tool results from this turn before continuing.
@@ -385,7 +524,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
               if (!toolCall.providerExecuted) {
                 // Update tool invocations from state:'call' to state:'result' for successful client tools.
                 // Provider-executed tools are handled by llm-execution-step.
-                rest.messageList.updateToolInvocation({
+                persistResolvedToolCall(toolCall, {
                   type: 'tool-invocation' as const,
                   toolInvocation: {
                     state: 'result' as const,
@@ -393,6 +532,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                     toolName: sanitizeToolName(toolCall.toolName),
                     args: toolCall.args,
                     result: toolCall.result,
+                    // Preserve the approval decision for an approved approval-gated tool in a mixed
+                    // turn (one tool errored, another approved) so it round-trips on recall too.
+                    ...(toolCall.approval ? { approval: toolCall.approval } : {}),
                   },
                   ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
                     ? {
@@ -441,6 +583,13 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
 
       if (inputData?.length) {
         for (const toolCall of inputData) {
+          // A declined approval has no step `result`: persist it as `output-denied` while still
+          // emitting the denial result expected by the public stream/toolResults contract.
+          if (isDeniedApproval(toolCall)) {
+            await processDeniedApproval(toolCall);
+            continue;
+          }
+
           // No result yet — skip emitting a chunk. For deferred provider-executed tools
           // (e.g. Anthropic web_search), the result arrives in a later step and is handled
           // by processOutputStream's 'tool-result' case in llm-execution-step.
@@ -478,7 +627,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           // Exclude provider-executed tools — these are handled by llm-execution-step
           // (same-turn results are stored directly, deferred results are resolved via updateToolInvocation).
           if (!toolCall.providerExecuted) {
-            rest.messageList.updateToolInvocation({
+            persistResolvedToolCall(toolCall, {
               type: 'tool-invocation' as const,
               toolInvocation: {
                 state: 'result' as const,
@@ -486,6 +635,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 toolName: sanitizeToolName(toolCall.toolName),
                 args: toolCall.args,
                 result: toolCall.result,
+                // Preserve the approval decision for an approved approval-gated tool so it
+                // round-trips on recall as `approval: { approved: true }`.
+                ...(toolCall.approval ? { approval: toolCall.approval } : {}),
               },
               ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
                 ? {

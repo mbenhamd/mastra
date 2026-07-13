@@ -226,6 +226,7 @@ describe('CoreToolBuilder background override injection', () => {
       const properties = extractJsonProperties(tool);
       expect(properties).toHaveProperty('message');
       expect(properties).toHaveProperty('suspendedToolRunId');
+      expect(properties).toHaveProperty('suspendedToolCallId');
       expect(properties).toHaveProperty('resumeData');
 
       // The injected JSON Schema must match the pre-PR shape so existing
@@ -254,6 +255,7 @@ describe('CoreToolBuilder background override injection', () => {
 
       const properties = extractJsonProperties(tool);
       expect(properties).toHaveProperty('suspendedToolRunId');
+      expect(properties).toHaveProperty('suspendedToolCallId');
       expect(properties).toHaveProperty('resumeData');
     });
 
@@ -278,6 +280,7 @@ describe('CoreToolBuilder background override injection', () => {
       expect(properties).toHaveProperty('message');
       expect(properties).toHaveProperty('_background');
       expect(properties).toHaveProperty('suspendedToolRunId');
+      expect(properties).toHaveProperty('suspendedToolCallId');
       expect(properties).toHaveProperty('resumeData');
     });
   });

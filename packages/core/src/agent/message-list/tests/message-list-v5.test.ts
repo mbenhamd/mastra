@@ -2203,6 +2203,73 @@ describe('MessageList V5 Support', () => {
       expect(drainedApprovalPart.data.args).toBeNull();
     });
 
+    it('should keep suspension payload transforms separate from tool arguments in UI and transcript', () => {
+      const list = new MessageList({ threadId, resourceId });
+      const transformMetadata = {
+        mastra: {
+          toolPayloadTransform: {
+            display: {
+              suspend: { transformed: { reason: 'redacted display suspension' } },
+            },
+            transcript: {
+              suspend: { transformed: { reason: 'redacted transcript suspension' } },
+            },
+          },
+        },
+      };
+      const suspendedTool = {
+        toolCallId: 'call-suspend-transform',
+        toolName: 'waitForReview',
+        args: { documentId: 'doc-123' },
+        type: 'suspension',
+        runId: 'run-suspend-transform',
+        suspendPayload: { reason: 'contains private review context' },
+        metadata: transformMetadata,
+      };
+
+      list.add(
+        {
+          id: 'msg-suspend-transform',
+          role: 'assistant',
+          createdAt: new Date(),
+          threadId,
+          resourceId,
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'data-tool-call-suspended',
+                data: suspendedTool,
+              } as any,
+            ],
+            metadata: {
+              suspendedTools: {
+                'call-suspend-transform': suspendedTool,
+              },
+            },
+          },
+        },
+        'response',
+      );
+
+      const uiSuspendedPart = list.get.all.aiV5
+        .ui()[0]!
+        .parts.find(part => part.type === 'data-tool-call-suspended') as any;
+      expect(uiSuspendedPart.data.args).toEqual({ documentId: 'doc-123' });
+      expect(uiSuspendedPart.data.suspendPayload).toEqual({ reason: 'redacted display suspension' });
+
+      const drainedMessage = list.drainUnsavedMessages()[0]!;
+      const drainedSuspendedPart = drainedMessage.content.parts!.find(
+        part => part.type === 'data-tool-call-suspended',
+      ) as any;
+      expect(drainedSuspendedPart.data.args).toEqual({ documentId: 'doc-123' });
+      expect(drainedSuspendedPart.data.suspendPayload).toEqual({ reason: 'redacted transcript suspension' });
+      expect((drainedMessage.content.metadata!.suspendedTools as any)['call-suspend-transform']).toMatchObject({
+        args: { documentId: 'doc-123' },
+        suspendPayload: { reason: 'redacted transcript suspension' },
+      });
+    });
+
     it('should preserve modelOutput metadata across db to model to db conversion', () => {
       const list = new MessageList({ threadId, resourceId });
       const toolResultMessage: MastraDBMessage = {

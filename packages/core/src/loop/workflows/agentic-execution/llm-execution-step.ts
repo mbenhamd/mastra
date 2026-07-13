@@ -1229,11 +1229,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
             if (suspendedToolsMessage) {
               const metadata = suspendedToolsMessage.content.metadata;
-              let suspendedToolObj = (metadata?.suspendedTools || metadata?.pendingToolApprovals) as Record<
-                string,
-                any
-              >;
-              if (!suspendedToolObj) {
+              let suspendedToolObj: Record<string, any> | undefined;
+              if (metadata?.suspendedTools || metadata?.pendingToolApprovals) {
+                suspendedToolObj = Object.assign(
+                  Object.create(null),
+                  metadata?.pendingToolApprovals ?? {},
+                  metadata?.suspendedTools ?? {},
+                );
+              } else {
                 suspendedToolObj = suspendedToolsMessage.content.parts
                   ?.filter(part => part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval')
                   ?.reduce(
@@ -1242,14 +1245,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') &&
                         !(part.data as any).resumed
                       ) {
-                        acc[(part.data as any).toolName] = part.data;
+                        acc[(part.data as any).toolCallId] = part.data;
                       }
                       return acc;
                     },
-                    {} as Record<string, any>,
+                    Object.create(null) as Record<string, any>,
                   );
               }
-              const suspendedTools = Object.values(suspendedToolObj);
+              const suspendedTools = Object.values(suspendedToolObj ?? {});
               if (suspendedTools.length > 0) {
                 inputMessages = inputMessages.map((message, index) => {
                   if (message.role === 'system' && index === 0) {
@@ -1259,6 +1262,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                       resumeData can not be an empty object nor null/undefined.
                       When you find that and call that tool, add the resumeData to the tool call arguments/input.
                       Also, add the runId of the suspended tool as suspendedToolRunId to the tool call arguments/input.
+                      Add the suspended tool's original toolCallId as suspendedToolCallId; this exact ID binds the response to the pending call even when the provider creates a new tool-call ID.
                       If the suspendedTool.type is 'approval', resumeData will be an object that contains 'approved' which can either be true or false depending on the user's message. If you can't construct resumeData from the message for approval type, set approved to true and add resumeData: { approved: true } to the tool call arguments/input.
 
                       IMPORTANT: If you're able to construct resumeData and get suspendedToolRunId, get the previous arguments/input of the tool call from args in the suspended tool, and spread it in the new arguments/input created, do not add duplicate data. 

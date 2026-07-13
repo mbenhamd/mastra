@@ -250,6 +250,8 @@ export interface DurableLLMStepOutput {
  * Input for a single tool call step
  */
 export interface DurableToolCallInput {
+  /** Agent-loop iteration that produced this tool call */
+  iterationCount?: number;
   /** Tool call identifier from the LLM */
   toolCallId: string;
   /** Name of the tool to execute */
@@ -277,6 +279,16 @@ export interface DurableToolCallOutput extends DurableToolCallInput {
     name: string;
     message: string;
     stack?: string;
+  };
+  /**
+   * Approval decision for a `requireApproval` tool, present once the user has approved or declined.
+   * A declined call carries `approved: false` and no `result`, so it persists as `output-denied`.
+   * An approved call carries `approved: true` alongside the `result`.
+   */
+  approval?: {
+    id: string;
+    approved: boolean;
+    reason?: string;
   };
 }
 
@@ -384,6 +396,9 @@ export interface AgentSuspendedEventData {
   toolCallId?: string;
   toolName?: string;
   args?: Record<string, unknown>;
+  identityDigest?: string;
+  approval?: { id: string; approved: true; reason?: string };
+  approvalSource?: 'tool-gate' | 'tool-execution';
   suspendPayload?: unknown;
   resumeSchema?: string;
   type: 'approval' | 'suspension';

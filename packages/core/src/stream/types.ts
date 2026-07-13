@@ -763,6 +763,13 @@ interface ToolExecutionAbortPayload {
 }
 
 interface ToolCallApprovalPayload {
+  version?: 1;
+  originRunId?: string;
+  stepId?: string;
+  type?: 'approval';
+  approvalSource?: 'tool-gate' | 'tool-execution';
+  identityDigest?: string;
+  resumeIdentityDigest?: string;
   toolCallId: string;
   toolName: string;
   args: Record<string, any>;
@@ -772,11 +779,18 @@ interface ToolCallApprovalPayload {
 }
 
 interface ToolCallSuspendedPayload {
+  version?: 1;
+  originRunId?: string;
+  stepId?: string;
+  type?: 'suspension';
+  identityDigest?: string;
+  resumeIdentityDigest?: string;
   toolCallId: string;
   toolName: string;
   suspendPayload: any;
   args: Record<string, any>;
   resumeSchema: string;
+  approval?: { id: string; approved: true; reason?: string };
 }
 
 export type DataChunkType = {

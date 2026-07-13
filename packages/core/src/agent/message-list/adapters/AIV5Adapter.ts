@@ -7,6 +7,7 @@ import type {
   MastraDBMessage,
   MastraMessageContentV2,
   MastraMessagePart,
+  MastraToolInvocation,
   MastraToolInvocationPart,
   MessageSource,
 } from '../state/types';
@@ -187,9 +188,7 @@ function transformToolStateDataForDisplay(data: unknown, phase: 'approval' | 'su
           : undefined
       : hasTransformedToolPayload(inputTransform)
         ? inputTransform.transformed
-        : hasTransformedToolPayload(argsTransform)
-          ? argsTransform.transformed
-          : undefined;
+        : undefined;
   const transformedSuspendPayload =
     phase === 'suspend' && hasTransformedToolPayload(argsTransform) ? argsTransform.transformed : undefined;
 
@@ -248,7 +247,10 @@ export class AIV5Adapter {
     // 1. Handle tool invocations (only if not already in parts array)
     const hasToolInvocationParts = dbMsg.content.parts?.some(p => p.type === 'tool-invocation');
     if (dbMsg.content.toolInvocations && !hasToolInvocationParts) {
-      for (const invocation of dbMsg.content.toolInvocations) {
+      for (const legacyInvocation of dbMsg.content.toolInvocations) {
+        // Persisted format-2 data is not runtime-schema constrained to the old AI SDK v4 union.
+        // Treat the legacy array as the canonical Mastra extension when reading it back.
+        const invocation = legacyInvocation as MastraToolInvocation;
         if (invocation.state === 'result') {
           parts.push({
             type: `tool-${invocation.toolName}`,
@@ -256,6 +258,16 @@ export class AIV5Adapter {
             state: 'output-available',
             input: invocation.args,
             output: invocation.result,
+          });
+        } else if (invocation.state === 'output-denied') {
+          // Legacy messages may store toolInvocations without structured parts. V5 has no
+          // denied state, so preserve the same completed-result downgrade used below.
+          parts.push({
+            type: `tool-${invocation.toolName}`,
+            toolCallId: invocation.toolCallId,
+            state: 'output-available',
+            input: invocation.args,
+            output: invocation.approval?.reason ?? 'Tool call was not approved by the user',
           });
         } else {
           parts.push({
@@ -328,6 +340,19 @@ export class AIV5Adapter {
                 transformToolPayloads,
               ) as string,
               state: 'output-error',
+              callProviderMetadata: mergeMastraCreatedAt(part.providerMetadata, part.createdAt),
+              providerExecuted: (part as { providerExecuted?: boolean }).providerExecuted,
+            } satisfies AIV5Type.ToolUIPart);
+          } else if (inv.state === 'output-denied') {
+            // v5 has no denied state. Downgrade to a single output-available part whose output is
+            // the denial reason, so v5 UI consumers — and the next LLM turn's prompt, which is
+            // built through this adapter — see a tool result instead of a dangling tool call.
+            parts.push({
+              type: `tool-${inv.toolName}`,
+              toolCallId: inv.toolCallId,
+              input: getDisplayTransform(part.providerMetadata, 'input-available', inv.args, transformToolPayloads),
+              output: inv.approval?.reason ?? 'Tool call was not approved by the user',
+              state: 'output-available',
               callProviderMetadata: mergeMastraCreatedAt(part.providerMetadata, part.createdAt),
               providerExecuted: (part as { providerExecuted?: boolean }).providerExecuted,
             } satisfies AIV5Type.ToolUIPart);

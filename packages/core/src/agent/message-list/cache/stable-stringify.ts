@@ -13,9 +13,14 @@
 export function stableStringify(value: unknown): string {
   return JSON.stringify(value, (_key, val) => {
     if (val && typeof val === 'object' && !Array.isArray(val)) {
-      const sorted: Record<string, unknown> = {};
+      const sorted: Record<string, unknown> = Object.create(null);
       for (const k of Object.keys(val as Record<string, unknown>).sort()) {
-        sorted[k] = (val as Record<string, unknown>)[k];
+        Object.defineProperty(sorted, k, {
+          configurable: true,
+          enumerable: true,
+          value: (val as Record<string, unknown>)[k],
+          writable: true,
+        });
       }
       return sorted;
     }

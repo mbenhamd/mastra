@@ -101,6 +101,159 @@ describe('convertMessages', () => {
     });
   });
 
+  // Regression for issue #17218: a declined approval is stored as `state: 'output-denied'`.
+  // AI SDK v4 has no denied state and requires every tool invocation to carry a result, so
+  // converting to AIV4.Core (used by the agent's onFinish memory save) used to throw
+  // "ToolInvocation must have a result". It must downgrade to a result whose value is the reason.
+  describe('Mastra V2 output-denied tool invocation', () => {
+    const deniedMessage: MastraDBMessage = {
+      id: 'assistant-denied',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'output-denied',
+              toolCallId: 'call-1',
+              toolName: 'findUserTool',
+              args: { name: 'Dero Israel' },
+              approval: { id: 'call-1', approved: false, reason: 'Tool call was not approved by the user' },
+            },
+          },
+          { type: 'text', text: 'All done.' },
+        ],
+      },
+    };
+    const legacyDeniedMessage: MastraDBMessage = {
+      id: 'assistant-denied-legacy',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        toolInvocations: [
+          {
+            state: 'output-denied',
+            toolCallId: 'call-legacy',
+            toolName: 'findUserTool',
+            args: { name: 'Dero Israel' },
+            approval: { id: 'approval-legacy', approved: false, reason: 'Legacy denial reason' },
+          },
+        ],
+      },
+    };
+
+    it('converts to AIV4.Core without throwing, using the decline reason as the result', () => {
+      const result = convertMessages(deniedMessage).to('AIV4.Core');
+      const toolMessage = result.find(m => m.role === 'tool');
+      expect(toolMessage).toBeDefined();
+      expect(toolMessage?.content).toMatchObject([
+        { type: 'tool-result', toolCallId: 'call-1', result: 'Tool call was not approved by the user' },
+      ]);
+    });
+
+    it('converts to AIV4.UI as an output-available tool part carrying the reason', () => {
+      const [uiMessage] = convertMessages(deniedMessage).to('AIV4.UI');
+      const toolPart = (uiMessage.parts ?? []).find((p: any) => p.type === 'tool-invocation') as any;
+      expect(toolPart?.toolInvocation).toMatchObject({
+        state: 'result',
+        toolCallId: 'call-1',
+        result: 'Tool call was not approved by the user',
+      });
+    });
+
+    it('downgrades a legacy-only denial for AIV4.UI without dropping the invocation', () => {
+      const [uiMessage] = convertMessages(legacyDeniedMessage).to('AIV4.UI');
+
+      expect(uiMessage.toolInvocations).toEqual([
+        expect.objectContaining({
+          state: 'result',
+          toolCallId: 'call-legacy',
+          result: 'Legacy denial reason',
+        }),
+      ]);
+    });
+
+    it('preserves native denial state and provenance for legacy-only AIV6.UI history', () => {
+      const [uiMessage] = convertMessages(legacyDeniedMessage).to('AIV6.UI');
+      const toolPart = uiMessage.parts.find(
+        (part: any) => part.toolCallId === 'call-legacy' && part.state === 'output-denied',
+      );
+
+      expect(toolPart).toMatchObject({
+        toolCallId: 'call-legacy',
+        state: 'output-denied',
+        input: { name: 'Dero Israel' },
+        approval: { id: 'approval-legacy', approved: false, reason: 'Legacy denial reason' },
+      });
+    });
+
+    it('preserves a legacy denial alongside unrelated structured tool parts in AIV6.UI', () => {
+      const mixedMessage: MastraDBMessage = {
+        ...legacyDeniedMessage,
+        id: 'assistant-denied-mixed',
+        content: {
+          ...legacyDeniedMessage.content,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'call-structured',
+                toolName: 'otherTool',
+                args: {},
+                result: 'done',
+              },
+            },
+          ],
+        },
+      };
+
+      const [uiMessage] = convertMessages(mixedMessage).to('AIV6.UI');
+
+      expect(uiMessage.parts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ toolCallId: 'call-structured', state: 'output-available' }),
+          expect.objectContaining({
+            toolCallId: 'call-legacy',
+            state: 'output-denied',
+            approval: { id: 'approval-legacy', approved: false, reason: 'Legacy denial reason' },
+          }),
+        ]),
+      );
+    });
+
+    it('reconstructs a denial after an AIV4 downgrade and reimport', () => {
+      const [v4Message] = convertMessages(legacyDeniedMessage).to('AIV4.UI');
+      const [v6Message] = convertMessages(v4Message).to('AIV6.UI');
+      const toolPart = v6Message.parts.find((part: any) => part.toolCallId === 'call-legacy');
+
+      expect(toolPart).toMatchObject({
+        toolCallId: 'call-legacy',
+        state: 'output-denied',
+        approval: { id: 'approval-legacy', approved: false, reason: 'Legacy denial reason' },
+      });
+    });
+
+    it('reconstructs a structured denial after an AIV4 downgrade and reimport', () => {
+      const [v4Message] = convertMessages(deniedMessage).to('AIV4.UI');
+      const [v6Message] = convertMessages(v4Message).to('AIV6.UI');
+      const toolPart = v6Message.parts.find((part: any) => part.toolCallId === 'call-1');
+
+      expect(toolPart).toMatchObject({
+        toolCallId: 'call-1',
+        state: 'output-denied',
+        approval: {
+          id: 'call-1',
+          approved: false,
+          reason: 'Tool call was not approved by the user',
+        },
+      });
+    });
+  });
+
   describe('Multiple messages', () => {
     const messages: AIV4.UIMessage[] = [
       {

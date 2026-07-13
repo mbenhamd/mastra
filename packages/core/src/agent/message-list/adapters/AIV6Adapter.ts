@@ -57,6 +57,10 @@ function isV6OnlyToolState(
   return state === 'approval-requested' || state === 'approval-responded' || state === 'output-denied';
 }
 
+function isDowngradedV4Denial(invocation: MastraToolInvocation): boolean {
+  return invocation.state === 'result' && invocation.approval?.approved === false;
+}
+
 function toMastraApproval(
   approval: AIV6Type.UIToolInvocation<AIV6Type.UITool>['approval'],
 ): MastraToolApproval | undefined {
@@ -282,15 +286,46 @@ export class AIV6Adapter {
     const hasReasoningParts = dbParts.some(part => part.type === 'reasoning');
     const hasFileParts = dbParts.some(part => part.type === 'file');
     const hasTextParts = dbParts.some(part => part.type === 'text');
+    const structuredToolCallIds = new Set(
+      dbParts
+        .filter((part): part is MastraToolInvocationPart => part.type === 'tool-invocation')
+        .map(part => part.toolInvocation.toolCallId),
+    );
+    const legacyV6OnlyToolInvocations = (dbMsg.content.toolInvocations ?? [])
+      .filter(
+        invocation =>
+          (isV6OnlyToolState(invocation.state) || isDowngradedV4Denial(invocation)) &&
+          !structuredToolCallIds.has(invocation.toolCallId),
+      )
+      .map(invocation =>
+        isDowngradedV4Denial(invocation) ? ({ ...invocation, state: 'output-denied' as const } as const) : invocation,
+      );
+    const legacyV6OnlyToolCallIds = new Set(legacyV6OnlyToolInvocations.map(invocation => invocation.toolCallId));
 
     for (const part of dbParts) {
-      parts.push(AIV6Adapter.toUIPart(part));
+      parts.push(
+        part.type === 'tool-invocation' && isDowngradedV4Denial(part.toolInvocation)
+          ? AIV6Adapter.toUIPart({
+              ...part,
+              toolInvocation: { ...part.toolInvocation, state: 'output-denied' },
+            })
+          : AIV6Adapter.toUIPart(part),
+      );
+    }
+
+    for (const toolInvocation of legacyV6OnlyToolInvocations) {
+      parts.push(
+        AIV6Adapter.toUIPart({
+          type: 'tool-invocation',
+          toolInvocation,
+        }),
+      );
     }
 
     if (!hasToolInvocationParts || !hasReasoningParts || !hasFileParts || !hasTextParts) {
       for (const part of v5Message.parts) {
         if (AIV5.isToolUIPart(part)) {
-          if (!hasToolInvocationParts) {
+          if (!hasToolInvocationParts && !legacyV6OnlyToolCallIds.has(part.toolCallId)) {
             parts.push(AIV6Adapter.toUIPartFromV5(part));
           }
           continue;

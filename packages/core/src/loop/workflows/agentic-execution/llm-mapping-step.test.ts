@@ -4,10 +4,15 @@ import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
 import { RequestContext } from '../../../request-context';
 import { ToolStream } from '../../../tools/stream';
-import { createStep } from '../../../workflows';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../../../workflows/constants';
 import type { ExecuteFunctionParams } from '../../../workflows/step';
+import { createStep } from '../../../workflows/workflow';
 import { createLLMMappingStep } from './llm-mapping-step';
+
+vi.mock('../../../workflows/workflow', () => ({
+  createStep: (config: unknown) => config,
+  Workflow: class {},
+}));
 
 type ToolCallOutput = {
   toolCallId: string;
@@ -17,6 +22,8 @@ type ToolCallOutput = {
   error?: Error;
   providerMetadata?: Record<string, any>;
   providerExecuted?: boolean;
+  resumeTargetToolCallId?: string;
+  approval?: { id: string; approved: boolean; reason?: string };
 };
 
 describe('createLLMMappingStep HITL behavior', () => {
@@ -653,6 +660,328 @@ describe('createLLMMappingStep tool execution error self-recovery (issue #9815)'
     // Loop should continue for self-recovery
     expect(bail).not.toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('should persist a decline when it occurs alongside a tool execution error', async () => {
+    (messageList.updateToolInvocation as Mock).mockImplementation(
+      part => part.toolInvocation.toolCallId !== 'call-denied',
+    );
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-error',
+        toolName: 'failingTool',
+        args: {},
+        error: new Error('Tool failed'),
+      },
+      {
+        toolCallId: 'call-denied',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        approval: { id: 'approval-denied', approved: false, reason: 'Not safe' },
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'output-denied',
+          toolCallId: 'call-denied',
+          approval: { id: 'approval-denied', approved: false, reason: 'Not safe' },
+        }),
+      }),
+    );
+    expect(messageList.add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              toolInvocation: expect.objectContaining({
+                state: 'output-denied',
+                toolCallId: 'call-denied',
+              }),
+            }),
+          ],
+        }),
+      }),
+      'response',
+    );
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({
+          toolCallId: 'call-denied',
+          result: 'Not safe',
+        }),
+      }),
+    );
+    expect(bail).not.toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('should persist a decline before bailing for another pending HITL call', async () => {
+    const callOrder: string[] = [];
+    (messageList.updateToolInvocation as Mock).mockImplementation(part => {
+      if (part.toolInvocation.toolCallId === 'call-denied') {
+        callOrder.push('attempt-denial-update');
+        return false;
+      }
+      return true;
+    });
+    (messageList.add as Mock).mockImplementation((_message, source) => {
+      if (source === 'response') callOrder.push('persist-denial-fallback');
+    });
+    bail.mockImplementation(data => {
+      callOrder.push('bail');
+      return data;
+    });
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-error',
+        toolName: 'failingTool',
+        args: {},
+        error: new Error('Tool failed'),
+      },
+      {
+        toolCallId: 'call-denied',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        approval: { id: 'approval-denied', approved: false, reason: 'Not safe' },
+      },
+      {
+        toolCallId: 'call-pending',
+        toolName: 'awaitingHuman',
+        args: {},
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'output-denied',
+          toolCallId: 'call-denied',
+          approval: { id: 'approval-denied', approved: false, reason: 'Not safe' },
+        }),
+      }),
+    );
+    expect(messageList.add).toHaveBeenCalled();
+    expect(bail).toHaveBeenCalled();
+    expect(callOrder.indexOf('attempt-denial-update')).toBeGreaterThanOrEqual(0);
+    expect(callOrder.indexOf('persist-denial-fallback')).toBeGreaterThan(callOrder.indexOf('attempt-denial-update'));
+    expect(callOrder.indexOf('persist-denial-fallback')).toBeLessThan(callOrder.indexOf('bail'));
+    expect(result.stepResult.isContinued).toBe(false);
+  });
+
+  it('should deny the original approval and resolve its synthetic resume invocation', async () => {
+    const toModelOutput = vi.fn(() => {
+      throw new Error('must not map a denial as tool output');
+    });
+    llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        tools: { sensitiveTool: { toModelOutput } },
+        _internal: { generateId: () => 'test-message-id' },
+      } as any,
+      llmExecutionStep,
+    );
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'provider-resume-call',
+        resumeTargetToolCallId: 'original-pending-call',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'output-denied',
+          toolCallId: 'original-pending-call',
+          approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
+        }),
+      }),
+    );
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'provider-resume-call',
+          result: 'Not safe',
+        }),
+      }),
+    );
+    expect(messageList.add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              toolInvocation: expect.objectContaining({
+                state: 'output-denied',
+                toolCallId: 'original-pending-call',
+                approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
+              }),
+            }),
+          ],
+        }),
+      }),
+      'response',
+    );
+    expect(messageList.add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              toolInvocation: expect.objectContaining({
+                state: 'result',
+                toolCallId: 'provider-resume-call',
+                result: 'Not safe',
+              }),
+            }),
+          ],
+        }),
+      }),
+      'response',
+    );
+    expect(messageList.add).toHaveBeenCalledTimes(2);
+    expect(controller.enqueue).toHaveBeenCalledTimes(1);
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({ toolCallId: 'provider-resume-call', result: 'Not safe' }),
+      }),
+    );
+    expect(toModelOutput).not.toHaveBeenCalled();
+  });
+
+  it('should persist an approved model resume on both the original and synthetic calls', async () => {
+    (messageList.updateToolInvocation as Mock).mockReturnValue(true);
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'provider-resume-call',
+        resumeTargetToolCallId: 'original-pending-call',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        result: { deleted: true },
+        approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'original-pending-call',
+          result: { deleted: true },
+          approval: { id: 'original-pending-call', approved: true, reason: 'Reviewed' },
+        }),
+      }),
+    );
+    expect(messageList.updateToolInvocation).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'provider-resume-call',
+          result: { deleted: true },
+        }),
+      }),
+    );
+    expect((messageList.updateToolInvocation as Mock).mock.calls[1]?.[0].toolInvocation).not.toHaveProperty('approval');
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({
+          toolCallId: 'provider-resume-call',
+          result: { deleted: true },
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    {
+      name: 'original denial update misses',
+      successfulUpdateId: 'provider-resume-call',
+      fallbackId: 'original-pending-call',
+      fallbackState: 'output-denied',
+    },
+    {
+      name: 'synthetic result update misses',
+      successfulUpdateId: 'original-pending-call',
+      fallbackId: 'provider-resume-call',
+      fallbackState: 'result',
+    },
+  ])('should persist exactly one fallback when the $name', async scenario => {
+    (messageList.updateToolInvocation as Mock).mockImplementation(
+      part => part.toolInvocation.toolCallId === scenario.successfulUpdateId,
+    );
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'provider-resume-call',
+        resumeTargetToolCallId: 'original-pending-call',
+        toolName: 'sensitiveTool',
+        args: { operation: 'delete' },
+        approval: { id: 'approval-original', approved: false, reason: 'Not safe' },
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.add).toHaveBeenCalledTimes(1);
+    const fallbackPart = (messageList.add as Mock).mock.calls[0]?.[0].content.parts[0];
+    expect(fallbackPart.toolInvocation).toMatchObject({
+      state: scenario.fallbackState,
+      toolCallId: scenario.fallbackId,
+    });
+    if (scenario.fallbackState === 'output-denied') {
+      expect(fallbackPart.toolInvocation.approval).toEqual({
+        id: 'approval-original',
+        approved: false,
+        reason: 'Not safe',
+      });
+    } else {
+      expect(fallbackPart.toolInvocation).not.toHaveProperty('approval');
+      expect(fallbackPart.toolInvocation.result).toBe('Not safe');
+    }
+  });
+
+  it('should persist approval provenance when an approved tool throws', async () => {
+    const approval = { id: 'call-approved', approved: true };
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-approved',
+        toolName: 'approvedTool',
+        args: {},
+        error: new Error('Tool failed after approval'),
+        approval,
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'result',
+          toolCallId: 'call-approved',
+          approval,
+        }),
+      }),
+    );
   });
 
   it('should continue the loop when multiple tool execution errors occur in the same turn', async () => {

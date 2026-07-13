@@ -21,9 +21,8 @@ import { isDataChunkType } from './utils';
 
 /**
  * Separator used to encode both runId and toolCallId into a single approvalId string.
- * Chosen because neither runId nor toolCallId can contain ":" in normal usage
- * (UUIDs are hex + hyphens; provider tool call IDs are alphanumeric + underscores).
- * The server splits on this separator to recover the runId for resumeStream.
+ * The server recovers the boundary by suffix-matching this separator plus the
+ * visible toolCallId, so opaque provider IDs may contain the separator too.
  */
 export const APPROVAL_ID_SEPARATOR = '::';
 
@@ -244,6 +243,13 @@ export function convertMastraChunkToAISDKBase<OUTPUT = undefined>({
         data: {
           state: 'data-tool-call-approval',
           runId: chunk.runId,
+          ...(chunk.payload.version === 1 ? { version: 1 as const } : {}),
+          ...(chunk.payload.originRunId ? { originRunId: chunk.payload.originRunId } : {}),
+          ...(chunk.payload.stepId ? { stepId: chunk.payload.stepId } : {}),
+          ...(chunk.payload.type ? { type: chunk.payload.type } : {}),
+          ...(chunk.payload.approvalSource ? { approvalSource: chunk.payload.approvalSource } : {}),
+          ...(chunk.payload.identityDigest ? { identityDigest: chunk.payload.identityDigest } : {}),
+          ...(chunk.payload.resumeIdentityDigest ? { resumeIdentityDigest: chunk.payload.resumeIdentityDigest } : {}),
           toolCallId: chunk.payload.toolCallId,
           toolName: chunk.payload.toolName,
           args: hasTransformedToolPayload(displayApprovalTransform)
@@ -259,8 +265,20 @@ export function convertMastraChunkToAISDKBase<OUTPUT = undefined>({
         data: {
           state: 'data-tool-call-suspended',
           runId: chunk.runId,
+          ...(chunk.payload.version === 1 ? { version: 1 as const } : {}),
+          ...(chunk.payload.originRunId ? { originRunId: chunk.payload.originRunId } : {}),
+          ...(chunk.payload.stepId ? { stepId: chunk.payload.stepId } : {}),
+          ...(chunk.payload.type ? { type: chunk.payload.type } : {}),
+          ...(chunk.payload.identityDigest ? { identityDigest: chunk.payload.identityDigest } : {}),
+          ...(chunk.payload.resumeIdentityDigest ? { resumeIdentityDigest: chunk.payload.resumeIdentityDigest } : {}),
+          ...(chunk.payload.approval ? { approval: chunk.payload.approval } : {}),
           toolCallId: chunk.payload.toolCallId,
           toolName: chunk.payload.toolName,
+          args: hasTransformedToolPayload(displayInputTransform)
+            ? displayInputTransform.transformed
+            : hasTransformedToolPayload(displaySuspendTransform)
+              ? displaySuspendTransform.transformed
+              : chunk.payload.args,
           suspendPayload: hasTransformedToolPayload(displaySuspendTransform)
             ? displaySuspendTransform.transformed
             : chunk.payload.suspendPayload,
@@ -483,27 +501,24 @@ export function convertMastraChunkToAISDKv6<OUTPUT = undefined>({
   mode?: 'generate' | 'stream';
 }): OutputChunkType<OUTPUT> | OutputChunkType<OUTPUT>[] {
   if (chunk.type === 'tool-call-approval') {
-    const displayTransform = getTransformedToolPayload(chunk.metadata, 'display', 'approval');
+    const dataChunk = convertMastraChunkToAISDKBase<OUTPUT>({
+      chunk,
+      mode,
+      normalizeWarnings: normalizeV6Warnings,
+      normalizeUsage: normalizeV6Usage,
+      normalizeFinishReason: toAISDKFinishReasonV6,
+      includeRawFinishReason: true,
+    });
     // Emit both the native v6 tool-approval-request AND the legacy data-tool-call-approval
-    // so that consumers using the data stream protocol remain backwards-compatible.
+    // so that consumers using the data stream protocol receive the same resume evidence
+    // as every other AI SDK version.
     return [
       {
         type: 'tool-approval-request',
         approvalId: `${chunk.runId}${APPROVAL_ID_SEPARATOR}${chunk.payload.toolCallId}`,
         toolCallId: chunk.payload.toolCallId,
       } as OutputChunkType<OUTPUT>,
-      {
-        type: 'data-tool-call-approval',
-        id: chunk.payload.toolCallId,
-        data: {
-          state: 'data-tool-call-approval',
-          runId: chunk.runId,
-          toolCallId: chunk.payload.toolCallId,
-          toolName: chunk.payload.toolName,
-          args: hasTransformedToolPayload(displayTransform) ? displayTransform.transformed : chunk.payload.args,
-          resumeSchema: chunk.payload.resumeSchema,
-        },
-      } satisfies DataChunkType,
+      dataChunk,
     ];
   }
 

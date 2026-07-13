@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { createStep } from '../../../../workflows';
 import { MessageList } from '../../../message-list';
-import type { MastraDBMessage } from '../../../message-list';
+import type { MastraDBMessage, MastraMessagePart } from '../../../message-list';
 import { DurableStepIds } from '../../constants';
 import type {
   DurableLLMStepOutput,
@@ -82,10 +82,38 @@ export function createDurableLLMMappingStep() {
       });
       messageList.deserialize(llmOutput.messageListState);
 
+      // A declined approval has no `result` but is fully resolved: persist it as `output-denied`
+      // with the approval decision (rather than as a successful `result`) so it round-trips on
+      // recall. Mirrors the non-durable llm-mapping-step.
+      const isDeniedApproval = (toolResult: { approval?: { approved?: boolean } }) =>
+        toolResult?.approval?.approved === false;
+
       // 2. Add tool results to message list
       if (toolResults.length > 0) {
         // Create tool result parts for each tool call
-        const toolResultParts = toolResults.map(toolResult => {
+        const toolResultParts: MastraMessagePart[] = [];
+        for (const toolResult of toolResults) {
+          if (isDeniedApproval(toolResult)) {
+            const deniedPart: Extract<MastraMessagePart, { type: 'tool-invocation' }> = {
+              type: 'tool-invocation' as const,
+              toolInvocation: {
+                state: 'output-denied' as const,
+                toolCallId: toolResult.toolCallId,
+                toolName: toolResult.toolName,
+                args: toolResult.args,
+                approval: {
+                  id: toolResult.approval!.id,
+                  approved: false,
+                  reason: toolResult.approval!.reason,
+                },
+              },
+            };
+            if (!messageList.updateToolInvocation(deniedPart)) {
+              toolResultParts.push(deniedPart);
+            }
+            continue;
+          }
+
           // Determine the result content
           let resultContent: string;
           if (toolResult.error) {
@@ -97,7 +125,7 @@ export function createDurableLLMMappingStep() {
             resultContent = '';
           }
 
-          return {
+          const resultPart: Extract<MastraMessagePart, { type: 'tool-invocation' }> = {
             type: 'tool-invocation' as const,
             toolInvocation: {
               state: 'result' as const,
@@ -105,22 +133,31 @@ export function createDurableLLMMappingStep() {
               toolName: toolResult.toolName,
               args: toolResult.args,
               result: resultContent,
+              // Preserve the approval decision for an approved approval-gated tool so it
+              // round-trips on recall as `approval: { approved: true }`.
+              ...(toolResult.approval ? { approval: toolResult.approval } : {}),
             },
           };
-        });
+          if (!toolResult.approval || !messageList.updateToolInvocation(resultPart)) {
+            toolResultParts.push(resultPart);
+          }
+        }
 
-        // Add as assistant message with tool results
-        const toolResultMessage: MastraDBMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant' as const,
-          content: {
-            format: 2,
-            parts: toolResultParts,
-          },
-          createdAt: new Date(),
-        };
+        if (toolResultParts.length > 0) {
+          // Preserve the fork's append-based mapping behavior for ordinary results and
+          // as a fallback when an approval-bearing call cannot find its original part.
+          const toolResultMessage: MastraDBMessage = {
+            id: crypto.randomUUID(),
+            role: 'assistant' as const,
+            content: {
+              format: 2,
+              parts: toolResultParts,
+            },
+            createdAt: new Date(),
+          };
 
-        messageList.add(toolResultMessage, 'response');
+          messageList.add(toolResultMessage, 'response');
+        }
       }
 
       // 3. Determine if we should continue

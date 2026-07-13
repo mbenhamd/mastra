@@ -50,6 +50,12 @@ function createApprovalStream() {
         runId: 'run-123',
         from: ChunkFrom.AGENT,
         payload: {
+          version: 1 as const,
+          originRunId: 'run-123',
+          stepId: 'toolCallStep',
+          type: 'approval' as const,
+          identityDigest: 'digest-123',
+          resumeIdentityDigest: 'resume-digest-123',
           toolCallId: 'tooluse_abc123',
           toolName: 'myTool',
           args: { param: 'value' },
@@ -70,6 +76,12 @@ describe('tool-call-approval chunk conversion (issue #12878)', () => {
         runId: 'run-123',
         from: ChunkFrom.AGENT,
         payload: {
+          version: 1 as const,
+          originRunId: 'run-123',
+          stepId: 'toolCallStep',
+          type: 'approval' as const,
+          identityDigest: 'digest-123',
+          resumeIdentityDigest: 'resume-digest-123',
           toolCallId: 'tooluse_abc123',
           toolName: 'myTool',
           args: { param: 'value' },
@@ -82,6 +94,10 @@ describe('tool-call-approval chunk conversion (issue #12878)', () => {
       expect(result).toBeDefined();
       expect(result.type).toBe('data-tool-call-approval');
       expect(result.id).toBe('tooluse_abc123');
+      expect(result.data).toMatchObject({
+        identityDigest: 'digest-123',
+        resumeIdentityDigest: 'resume-digest-123',
+      });
 
       // Issue #12878: The data-tool-call-approval chunk should include a state
       // field so the frontend can identify the part's state consistently
@@ -96,8 +112,16 @@ describe('tool-call-approval chunk conversion (issue #12878)', () => {
         runId: 'run-123',
         from: ChunkFrom.AGENT,
         payload: {
+          version: 1 as const,
+          originRunId: 'run-123',
+          stepId: 'toolCallStep',
+          type: 'suspension' as const,
+          identityDigest: 'digest-123',
+          resumeIdentityDigest: 'resume-digest-123',
+          approval: { id: 'tooluse_abc123', approved: true as const },
           toolCallId: 'tooluse_abc123',
           toolName: 'myTool',
+          args: { param: 'value' },
           suspendPayload: { reason: 'Needs user input' },
           resumeSchema: '{"type":"object"}',
         },
@@ -112,6 +136,16 @@ describe('tool-call-approval chunk conversion (issue #12878)', () => {
       // Issue #12878: Consistent with tool-call-approval, the suspended chunk
       // should also include a state field
       expect(result.data).toHaveProperty('state', 'data-tool-call-suspended');
+      expect(result.data).toMatchObject({
+        version: 1,
+        originRunId: 'run-123',
+        stepId: 'toolCallStep',
+        type: 'suspension',
+        identityDigest: 'digest-123',
+        resumeIdentityDigest: 'resume-digest-123',
+        approval: { id: 'tooluse_abc123', approved: true },
+        args: { param: 'value' },
+      });
     });
   });
 
@@ -165,7 +199,212 @@ describe('extractV6NativeApproval', () => {
 
     const result = extractV6NativeApproval(messages as any);
 
-    expect(result).toEqual({ resumeData: { approved: true }, runId: 'run-123' });
+    expect(result).toEqual({
+      resumeData: { approved: true },
+      runId: 'run-123',
+      toolCallId: 'tooluse_abc123',
+    });
+  });
+
+  it('preserves separator-bearing run and tool-call IDs', () => {
+    const toolCallId = 'provider::opaque-call';
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-delimited',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId,
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run::opaque${APPROVAL_ID_SEPARATOR}${toolCallId}`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toEqual({
+      resumeData: { approved: true },
+      runId: 'run::opaque',
+      toolCallId,
+    });
+  });
+
+  it('rejects a composite approval ID that conflicts with the visible tool-call ID', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-conflict',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'visible-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}different-call`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('does not fall back to an older valid response when the latest response is malformed', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-no-fallback',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'older-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}older-call`, approved: true },
+          },
+          {
+            type: 'tool-myTool',
+            toolCallId: 'latest-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}different-call`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('rejects a malformed latest approval response without throwing', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-malformed-latest',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'latest-call',
+            state: 'approval-responded' as const,
+            input: {},
+          },
+        ],
+      },
+    ];
+
+    expect(() => extractV6NativeApproval(messages as any)).not.toThrow();
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('rejects a latest approval response without a boolean decision', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-malformed-decision',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'latest-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}latest-call` },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('rejects a malformed earlier approval response without throwing', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-malformed-earlier',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'earlier-call',
+            state: 'approval-responded' as const,
+            input: {},
+          },
+          {
+            type: 'tool-myTool',
+            toolCallId: 'latest-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}latest-call`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(() => extractV6NativeApproval(messages as any)).not.toThrow();
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('rejects duplicate responded identities in the trailing assistant message', () => {
+    const approvalId = `run-1${APPROVAL_ID_SEPARATOR}duplicate-call`;
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-duplicate',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'duplicate-call',
+            state: 'approval-responded' as const,
+            input: { attempt: 1 },
+            approval: { id: approvalId, approved: false },
+          },
+          {
+            type: 'tool-myTool',
+            toolCallId: 'duplicate-call',
+            state: 'approval-responded' as const,
+            input: { attempt: 2 },
+            approval: { id: approvalId, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('targets the answered call when another tool call is still awaiting approval', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-parallel-approvals',
+        parts: [
+          {
+            type: 'tool-firstTool',
+            toolCallId: 'tooluse_first',
+            state: 'approval-requested' as const,
+            input: {},
+            approval: { id: `run-shared${APPROVAL_ID_SEPARATOR}tooluse_first` },
+          },
+          {
+            type: 'tool-secondTool',
+            toolCallId: 'tooluse_second',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: {
+              id: `run-shared${APPROVAL_ID_SEPARATOR}tooluse_second`,
+              approved: true,
+            },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toEqual({
+      resumeData: { approved: true },
+      runId: 'run-shared',
+      toolCallId: 'tooluse_second',
+    });
   });
 
   it('includes reason when the user denied with a reason', () => {
@@ -188,7 +427,11 @@ describe('extractV6NativeApproval', () => {
 
     const result = extractV6NativeApproval(messages as any);
 
-    expect(result).toEqual({ resumeData: { approved: false, reason: 'Not safe' }, runId: 'run-456' });
+    expect(result).toEqual({
+      resumeData: { approved: false, reason: 'Not safe' },
+      runId: 'run-456',
+      toolCallId: 'tooluse_xyz',
+    });
   });
 
   it('omits reason when not provided', () => {
@@ -284,6 +527,31 @@ describe('extractV6NativeApproval', () => {
     expect(result?.runId).toBe('new-run');
     expect(result?.resumeData.approved).toBe(false);
     expect(result?.resumeData.reason).toBe('changed mind');
+  });
+
+  it('does not replay an older approval when the newest responded part is structurally malformed', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-1',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'old-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `old-run${APPROVAL_ID_SEPARATOR}old-call`, approved: true },
+          },
+          {
+            type: 'text',
+            state: 'approval-responded' as const,
+            text: 'malformed approval response',
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
   });
 
   it('scans from the end and picks the most recent approval-responded part', () => {
@@ -395,7 +663,7 @@ describe('handleChatStream v6 native approve() resume flow', () => {
     expect(mockAgent.resumeStream).toHaveBeenCalledTimes(1);
     expect(mockAgent.resumeStream).toHaveBeenCalledWith(
       { approved: true },
-      expect.objectContaining({ runId: 'run-123' }),
+      expect.objectContaining({ runId: 'run-123', toolCallId: 'tooluse_abc123' }),
     );
     expect(mockAgent.stream).not.toHaveBeenCalled();
   });
@@ -475,14 +743,31 @@ describe('tool-call-approval conversion', () => {
       runId: 'run-123',
       from: ChunkFrom.AGENT,
       payload: {
+        version: 1 as const,
+        originRunId: 'run-origin',
+        stepId: 'toolCallStep',
+        type: 'approval' as const,
+        approvalSource: 'tool-gate' as const,
+        identityDigest: 'digest-123',
+        resumeIdentityDigest: 'resume-digest-123',
         toolCallId: 'tooluse_abc123',
         toolName: 'myTool',
         args: { param: 'value' },
         resumeSchema: '{"type":"object","properties":{"approved":{"type":"boolean"}}}',
       },
+      metadata: {
+        mastra: {
+          toolPayloadTransform: {
+            display: {
+              approval: { transformed: { param: 'redacted' } },
+            },
+          },
+        },
+      },
     };
 
     const result = convertMastraChunkToAISDKv6({ chunk, mode: 'stream' }) as any[];
+    const expectedDataChunk = convertMastraChunkToAISDKv5({ chunk, mode: 'stream' });
 
     expect(Array.isArray(result)).toBe(true);
     expect(result[0]).toEqual({
@@ -496,9 +781,18 @@ describe('tool-call-approval conversion', () => {
       data: expect.objectContaining({
         state: 'data-tool-call-approval',
         runId: 'run-123',
+        version: 1,
+        originRunId: 'run-origin',
+        stepId: 'toolCallStep',
+        type: 'approval',
+        approvalSource: 'tool-gate',
+        identityDigest: 'digest-123',
+        resumeIdentityDigest: 'resume-digest-123',
         toolCallId: 'tooluse_abc123',
       }),
     });
+    expect(result[1]).toEqual(expectedDataChunk);
+    expect(result[1].data.args).toEqual({ param: 'redacted' });
   });
 
   it('keeps v5 streaming behavior unchanged', async () => {

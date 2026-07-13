@@ -12,6 +12,11 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { SuspendOptions } from '../../../../workflows/step';
 import type { MessageList } from '../../../message-list';
 import type { SaveQueueManager } from '../../../save-queue';
+import {
+  createToolCallIdentityDigest,
+  parseToolApprovalDecision,
+  parseToolApprovalGrant,
+} from '../../../tool-call-identity';
 import { DurableStepIds } from '../../constants';
 import { globalRunRegistry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
@@ -24,6 +29,7 @@ import { serializeError } from '../../utils/serialize-state';
  * Each tool call flows through this schema when using .foreach()
  */
 const durableToolCallInputSchema = z.object({
+  iterationCount: z.number().int().nonnegative().optional(),
   toolCallId: z.string(),
   toolName: z.string(),
   args: z.record(z.string(), z.any()),
@@ -43,6 +49,15 @@ const durableToolCallOutputSchema = durableToolCallInputSchema.extend({
       name: z.string(),
       message: z.string(),
       stack: z.string().optional(),
+    })
+    .optional(),
+  // Approval decision for a `requireApproval` tool. Without this field Zod would strip the
+  // approval off the step output, so a declined call would lose its `output-denied` marker.
+  approval: z
+    .object({
+      id: z.string(),
+      approved: z.boolean(),
+      reason: z.string().optional(),
     })
     .optional(),
 });
@@ -118,13 +133,13 @@ export function createDurableToolCallStep() {
     inputSchema: durableToolCallInputSchema,
     outputSchema: durableToolCallOutputSchema,
     execute: async params => {
-      const { inputData, mastra, suspend, resumeData, requestContext, getInitData } = params;
+      const { inputData, mastra, suspend, resumeData, suspendData, requestContext, getInitData } = params;
 
       // Access pubsub via symbol
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
 
       const typedInput = inputData as DurableToolCallInput;
-      const { toolCallId, toolName, args, providerExecuted, output, activeTools } = typedInput;
+      const { iterationCount = 0, toolCallId, toolName, args, providerExecuted, output, activeTools } = typedInput;
 
       // Get context from init data (the parent workflow input)
       const initData = getInitData<{
@@ -141,6 +156,7 @@ export function createDurableToolCallStep() {
 
       const { runId, options: agentOptions, state } = initData;
       const logger = (mastra as any)?.getLogger?.();
+      const identityDigest = createToolCallIdentityDigest({ toolCallId, toolName, args });
 
       // If the tool was already executed by the provider, return the output
       if (providerExecuted && output !== undefined) {
@@ -218,20 +234,74 @@ export function createDurableToolCallStep() {
           },
         });
 
-      // 2. Check if tool requires approval (and capture any reason the predicate surfaced)
-      const { required: requiresApproval, reasons: approvalReasons } = await toolApprovalRequirement(
-        tool,
-        agentOptions.requireToolApproval,
-        args,
-        {
-          requestContext,
-          workspace,
-          logger,
-          toolName,
-        },
-      );
+      const suspendRecord =
+        suspendData && typeof suspendData === 'object' && !Array.isArray(suspendData)
+          ? (suspendData as Record<string, unknown>)
+          : undefined;
+      const suspensionType = suspendRecord?.type;
+      const hasKnownSuspendType = suspensionType === 'approval' || suspensionType === 'suspension';
+      const hasMatchingSuspendIdentity =
+        suspendRecord !== undefined &&
+        Object.hasOwn(suspendRecord, 'version') &&
+        suspendRecord.version === 1 &&
+        Object.hasOwn(suspendRecord, 'runId') &&
+        suspendRecord.runId === runId &&
+        Object.hasOwn(suspendRecord, 'iterationCount') &&
+        suspendRecord.iterationCount === iterationCount &&
+        Object.hasOwn(suspendRecord, 'stepId') &&
+        suspendRecord.stepId === DurableStepIds.TOOL_CALL &&
+        Object.hasOwn(suspendRecord, 'toolCallId') &&
+        suspendRecord.toolCallId === toolCallId &&
+        Object.hasOwn(suspendRecord, 'toolName') &&
+        suspendRecord.toolName === toolName &&
+        Object.hasOwn(suspendRecord, 'identityDigest') &&
+        suspendRecord.identityDigest === identityDigest;
+      const hasInvalidSuspendEnvelope =
+        resumeData !== undefined && (!hasKnownSuspendType || !hasMatchingSuspendIdentity);
+      const isApprovalResume = suspensionType === 'approval' && hasMatchingSuspendIdentity;
+      const approvalDecision = parseToolApprovalDecision(resumeData);
+      const hasValidApprovalDecision = isApprovalResume && approvalDecision !== undefined;
+      const isToolExecutionApprovalResume =
+        hasValidApprovalDecision && suspendRecord?.approvalSource === 'tool-execution';
+      const persistedApprovalGrant =
+        suspensionType === 'suspension' && hasMatchingSuspendIdentity
+          ? parseToolApprovalGrant(suspendRecord?.approval, toolCallId)
+          : undefined;
 
-      if (requiresApproval && !resumeData) {
+      // Authenticate durable resume evidence before reevaluating dynamic policy or dispatching work.
+      if (hasInvalidSuspendEnvelope || (isApprovalResume && !hasValidApprovalDecision)) {
+        return {
+          ...typedInput,
+          error: {
+            name: 'DurableResumeValidationError',
+            message: 'Durable tool resume evidence did not match the suspended tool call',
+          },
+        };
+      }
+
+      if (hasValidApprovalDecision && approvalDecision.approved === false) {
+        return {
+          ...typedInput,
+          approval: {
+            id: toolCallId,
+            approved: false,
+            reason: approvalDecision.reason ?? 'Tool call was not approved by the user',
+          },
+        };
+      }
+
+      // 2. Check if a fresh tool call requires approval. A resume uses its persisted decision.
+      const { required: requiresApproval, reasons: approvalReasons } =
+        resumeData === undefined
+          ? await toolApprovalRequirement(tool, agentOptions.requireToolApproval, args, {
+              requestContext,
+              workspace,
+              logger,
+              toolName,
+            })
+          : { required: false, reasons: [] };
+
+      if (requiresApproval && resumeData === undefined) {
         const resumeSchema = JSON.stringify({
           type: 'object',
           properties: {
@@ -246,7 +316,19 @@ export function createDurableToolCallStep() {
             type: 'tool-call-approval',
             runId,
             from: ChunkFrom.AGENT,
-            payload: { toolCallId, toolName, args, resumeSchema, ...(approvalReasons.length > 0 ? { approvalReasons } : {}) },
+            payload: {
+              version: 1,
+              originRunId: runId,
+              stepId: DurableStepIds.TOOL_CALL,
+              type: 'approval',
+              approvalSource: 'tool-gate',
+              identityDigest,
+              toolCallId,
+              toolName,
+              args,
+              resumeSchema,
+              ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
+            },
           });
         }
 
@@ -256,7 +338,9 @@ export function createDurableToolCallStep() {
             toolCallId,
             toolName,
             args,
+            identityDigest,
             type: 'approval',
+            approvalSource: 'tool-gate',
             resumeSchema,
           });
         }
@@ -267,10 +351,16 @@ export function createDurableToolCallStep() {
         // Suspend and wait for approval
         return suspend(
           {
+            version: 1,
             type: 'approval',
+            approvalSource: 'tool-gate',
+            runId,
+            iterationCount,
+            stepId: DurableStepIds.TOOL_CALL,
             toolCallId,
             toolName,
             args,
+            identityDigest,
             ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
           },
           {
@@ -279,20 +369,23 @@ export function createDurableToolCallStep() {
         );
       }
 
-      // Check if resuming from approval
-      if (resumeData && typeof resumeData === 'object' && resumeData !== null && 'approved' in resumeData) {
-        if (!(resumeData as { approved: boolean }).approved) {
-          return {
-            ...typedInput,
-            result: 'Tool call was not approved by the user',
-          };
-        }
-      }
+      // Preserve approval provenance even when a dynamic approval predicate changes between
+      // suspension and resume, or when the approval was requested from inside tool execution.
+      const approvalGrant = hasValidApprovalDecision
+        ? ({
+            approval: {
+              id: toolCallId,
+              approved: true as const,
+              ...(approvalDecision.reason !== undefined ? { reason: approvalDecision.reason } : {}),
+            },
+          } as const)
+        : persistedApprovalGrant
+          ? ({ approval: persistedApprovalGrant } as const)
+          : undefined;
 
-      // Check if resuming from in-execution suspension
-      // Pass resumeData through to the tool so it can continue from where it left off
-      const isResumingFromSuspension =
-        resumeData && typeof resumeData === 'object' && resumeData !== null && !('approved' in resumeData);
+      // Pass general suspension data through to the tool. An approved-shaped payload is still
+      // general suspension data when the persisted suspend marker says `suspension`.
+      const isResumingFromSuspension = resumeData !== undefined && !isApprovalResume;
 
       // 3. Check for background task execution
       const bgManager = registryEntry?.backgroundTaskManager;
@@ -312,6 +405,7 @@ export function createDurableToolCallStep() {
         return {
           ...typedInput,
           result: undefined,
+          ...(approvalGrant ?? {}),
         };
       }
 
@@ -320,7 +414,7 @@ export function createDurableToolCallStep() {
         messages: [],
         workspace,
         requestContext,
-        resumeData: isResumingFromSuspension ? resumeData : undefined,
+        resumeData: isResumingFromSuspension || isToolExecutionApprovalResume ? resumeData : undefined,
 
         // In-execution suspend callback — allows tools to suspend mid-execution
         suspend: async (suspendPayload: any, suspendOptions?: SuspendOptions) => {
@@ -339,7 +433,18 @@ export function createDurableToolCallStep() {
                 type: 'tool-call-approval',
                 runId,
                 from: ChunkFrom.AGENT,
-                payload: { toolCallId, toolName, args, resumeSchema: approvalResumeSchema },
+                payload: {
+                  version: 1,
+                  originRunId: runId,
+                  stepId: DurableStepIds.TOOL_CALL,
+                  type: 'approval',
+                  approvalSource: 'tool-execution',
+                  identityDigest,
+                  toolCallId,
+                  toolName,
+                  args,
+                  resumeSchema: approvalResumeSchema,
+                },
               });
             }
 
@@ -348,7 +453,9 @@ export function createDurableToolCallStep() {
                 toolCallId,
                 toolName,
                 args,
+                identityDigest,
                 type: 'approval',
+                approvalSource: 'tool-execution',
                 resumeSchema: approvalResumeSchema,
               });
             }
@@ -357,7 +464,16 @@ export function createDurableToolCallStep() {
 
             return suspend(
               {
+                version: 1,
                 type: 'approval',
+                approvalSource: 'tool-execution',
+                runId,
+                iterationCount,
+                stepId: DurableStepIds.TOOL_CALL,
+                toolCallId,
+                toolName,
+                args,
+                identityDigest,
                 requireToolApproval: { toolCallId, toolName, args },
               },
               { resumeLabel: toolCallId },
@@ -368,6 +484,8 @@ export function createDurableToolCallStep() {
               toolCallId,
               toolName,
               args,
+              identityDigest,
+              ...(approvalGrant ?? {}),
               suspendPayload,
               type: 'suspension',
               resumeSchema: suspendOptions?.resumeSchema,
@@ -379,6 +497,12 @@ export function createDurableToolCallStep() {
                 runId,
                 from: ChunkFrom.AGENT,
                 payload: {
+                  version: 1,
+                  originRunId: runId,
+                  stepId: DurableStepIds.TOOL_CALL,
+                  type: 'suspension',
+                  identityDigest,
+                  ...(approvalGrant ?? {}),
                   toolCallId,
                   toolName,
                   suspendPayload,
@@ -394,9 +518,17 @@ export function createDurableToolCallStep() {
 
             return suspend(
               {
+                version: 1,
                 type: 'suspension',
+                runId,
+                iterationCount,
+                stepId: DurableStepIds.TOOL_CALL,
                 toolCallSuspended: suspendPayload,
+                toolCallId,
                 toolName,
+                args,
+                identityDigest,
+                ...(approvalGrant ?? {}),
                 resumeLabel: suspendOptions?.resumeLabel,
               },
               { resumeLabel: toolCallId },
@@ -505,6 +637,9 @@ export function createDurableToolCallStep() {
                         toolName: params.toolName,
                         args: cleanedArgs,
                         result,
+                        // Preserve the approval decision for an approved approval-gated tool that
+                        // ran in the background so it round-trips on recall, matching the sync path.
+                        ...(approvalGrant ?? {}),
                       },
                     },
                     {
@@ -598,7 +733,7 @@ export function createDurableToolCallStep() {
             // bg task exists for this toolCallId+runId, resume the bg task with
             // the agent-resume payload instead of dispatching a fresh one.
             const isSuspendedBgResume =
-              isResumingFromSuspension && resumeData && typeof resumeData === 'object' && resumeData !== null;
+              (isResumingFromSuspension || isToolExecutionApprovalResume) && resumeData !== undefined;
             if (isSuspendedBgResume) {
               const isSuspended = await bgTask.checkIfSuspended({
                 toolCallId,
@@ -614,6 +749,7 @@ export function createDurableToolCallStep() {
                   ...typedInput,
                   args: cleanedArgs,
                   result: `Background task resumed. Task ID: ${task.id}. The tool "${toolName}" is running in the background. You will be notified when it completes.`,
+                  ...(approvalGrant ?? {}),
                 };
               }
             }
@@ -640,6 +776,7 @@ export function createDurableToolCallStep() {
                 ...typedInput,
                 args: cleanedArgs,
                 result: `Background task started. Task ID: ${task.id}. The tool "${toolName}" is running in the background. You will be notified when it completes.`,
+                ...(approvalGrant ?? {}),
               };
             }
             // fallbackToSync: concurrency limit hit, fall through to synchronous execution
@@ -671,6 +808,7 @@ export function createDurableToolCallStep() {
         return {
           ...typedInput,
           result,
+          ...(approvalGrant ?? {}),
         };
       } catch (error) {
         const toolError = serializeError(error);
@@ -692,6 +830,7 @@ export function createDurableToolCallStep() {
         return {
           ...typedInput,
           error: toolError,
+          ...(approvalGrant ?? {}),
         };
       }
     },

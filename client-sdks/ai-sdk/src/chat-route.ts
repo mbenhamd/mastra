@@ -27,8 +27,8 @@ import type {
 /**
  * Scans a v6 UIMessage array for the most recent 'approval-responded' tool
  * part in the last trailing assistant message only. When found, splits the
- * composite approvalId ("${runId}::${toolCallId}") to recover the runId
- * needed for resumeStream.
+ * composite approvalId ("${runId}::${toolCallId}") to recover the runId and
+ * toolCallId needed for a targeted resumeStream.
  *
  * Only the last trailing assistant message is inspected so that approval
  * responses from earlier turns are never re-processed. Within that message,
@@ -40,7 +40,7 @@ import type {
  */
 export function extractV6NativeApproval(
   messages: V6UIMessage[],
-): { resumeData: Record<string, unknown>; runId: string } | null {
+): { resumeData: Record<string, unknown>; runId: string; toolCallId: string } | null {
   // Only inspect the actual trailing message. If a user has already sent a
   // follow-up turn after an approval response, we must treat that as a normal
   // chat submission rather than replaying the stale approval response.
@@ -48,25 +48,60 @@ export function extractV6NativeApproval(
   if (!lastAssistantMsg || lastAssistantMsg.role !== 'assistant') return null;
 
   const parts = lastAssistantMsg.parts ?? [];
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const part = parts[i]!;
-    if (!isToolUIPart(part) || part.state !== 'approval-responded') continue;
-
-    const lastSep = part.approval.id.lastIndexOf(APPROVAL_ID_SEPARATOR);
-    if (lastSep === -1) continue;
-    const runId = part.approval.id.slice(0, lastSep);
-    if (!runId) continue;
-
-    return {
-      resumeData: {
-        approved: part.approval.approved,
-        ...(part.approval.reason != null ? { reason: part.approval.reason } : {}),
-      },
-      runId,
-    };
+  // Preserve every runtime part that claims to be an approval response until
+  // after validation. Filtering through `isToolUIPart` first would silently
+  // discard a malformed newest response and could replay an older valid one.
+  const respondedParts = parts.filter(
+    part =>
+      typeof part === 'object' &&
+      part !== null &&
+      'state' in part &&
+      (part as { state?: unknown }).state === 'approval-responded',
+  );
+  const part = respondedParts.at(-1);
+  if (!part || !isToolUIPart(part) || part.state !== 'approval-responded') return null;
+  if (
+    !part.approval ||
+    typeof part.approval.id !== 'string' ||
+    typeof part.approval.approved !== 'boolean' ||
+    (part.approval.reason != null && typeof part.approval.reason !== 'string')
+  ) {
+    return null;
   }
 
-  return null;
+  // Never fall back to an older decision when the latest response is malformed,
+  // and reject duplicate identities rather than applying last-writer-wins.
+  const earlierParts = respondedParts.slice(0, -1);
+  if (
+    earlierParts.some(
+      earlier =>
+        !isToolUIPart(earlier) ||
+        earlier.state !== 'approval-responded' ||
+        !earlier.approval ||
+        typeof earlier.approval.id !== 'string' ||
+        typeof earlier.approval.approved !== 'boolean' ||
+        (earlier.approval.reason != null && typeof earlier.approval.reason !== 'string') ||
+        earlier.toolCallId === part.toolCallId ||
+        earlier.approval.id === part.approval.id,
+    )
+  ) {
+    return null;
+  }
+
+  const suffix = `${APPROVAL_ID_SEPARATOR}${part.toolCallId}`;
+  if (!part.approval.id.endsWith(suffix)) return null;
+  const runId = part.approval.id.slice(0, -suffix.length);
+  const toolCallId = part.toolCallId;
+  if (!runId || !toolCallId) return null;
+
+  return {
+    resumeData: {
+      approved: part.approval.approved,
+      ...(part.approval.reason != null ? { reason: part.approval.reason } : {}),
+    },
+    runId,
+    toolCallId,
+  };
 }
 
 export type ChatStreamHandlerParams<
@@ -436,6 +471,7 @@ export async function handleChatStream<OUTPUT = undefined>({
     ...defaultOptionsRest,
     ...restOptions,
     ...(effectiveRunId && { runId: effectiveRunId }),
+    ...(nativeApproval?.toolCallId && { toolCallId: nativeApproval.toolCallId }),
     requestContext: requestContext || defaultOptions?.requestContext,
     ...(Object.keys(mergedProviderOptions).length > 0 && { providerOptions: mergedProviderOptions }),
   };
