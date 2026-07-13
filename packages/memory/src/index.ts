@@ -616,24 +616,29 @@ export class Memory extends MastraMemory {
     thread: StorageThreadType;
     memoryConfig?: MemoryConfigInternal;
   }): Promise<StorageThreadType> {
-    const memoryStore = await this.getMemoryStore();
     const resourceWorkingMemory = this.getResourceScopedWorkingMemoryFromMetadata({
       workingMemory: thread.metadata?.workingMemory,
       memoryConfig,
     });
 
-    return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
-      if (resourceWorkingMemory && thread.resourceId) {
-        return this.withWorkingMemoryMutex(`resource-${thread.resourceId}`, async () => {
-          const savedThread = await memoryStore.saveThread({ thread });
-          await memoryStore.updateResource({
-            resourceId: thread.resourceId,
-            workingMemory: resourceWorkingMemory,
+    if (resourceWorkingMemory && thread.resourceId) {
+      return this.withResourceMetadataOperationMutex(async () => {
+        return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
+          return this.withWorkingMemoryMutex(`resource-${thread.resourceId}`, async () => {
+            const memoryStore = await this.getMemoryStore();
+            const savedThread = await memoryStore.saveThread({ thread });
+            await memoryStore.updateResource({
+              resourceId: thread.resourceId,
+              workingMemory: resourceWorkingMemory,
+            });
+            return savedThread;
           });
-          return savedThread;
         });
-      }
+      });
+    }
 
+    return this.withWorkingMemoryMutex(`thread-${thread.id}`, async () => {
+      const memoryStore = await this.getMemoryStore();
       return memoryStore.saveThread({ thread });
     });
   }
@@ -649,15 +654,15 @@ export class Memory extends MastraMemory {
     metadata: Record<string, unknown>;
     memoryConfig?: MemoryConfigInternal;
   }): Promise<StorageThreadType> {
-    const memoryStore = await this.getMemoryStore();
     const resourceWorkingMemory = this.getResourceScopedWorkingMemoryFromMetadata({
       workingMemory: metadata?.workingMemory,
       memoryConfig,
     });
 
     if (resourceWorkingMemory) {
-      return this.withWorkingMemoryMutex(`thread-${id}`, async () => {
-        return this.withResourceMetadataOperationMutex(async () => {
+      return this.withResourceMetadataOperationMutex(async () => {
+        return this.withWorkingMemoryMutex(`thread-${id}`, async () => {
+          const memoryStore = await this.getMemoryStore();
           const updatedThread = await memoryStore.updateThread({
             id,
             title,
@@ -677,6 +682,7 @@ export class Memory extends MastraMemory {
       });
     }
 
+    const memoryStore = await this.getMemoryStore();
     return memoryStore.updateThread({
       id,
       title,
@@ -830,6 +836,7 @@ export class Memory extends MastraMemory {
 
   /**
    * Serializes metadata-derived resource writes with resource deletion for this Memory instance.
+   * Metadata writers acquire this lock before their thread and resource locks.
    * Separate instances and processes still require lifecycle-level writer coordination.
    */
   private resourceMetadataOperationMutex = new Mutex();
