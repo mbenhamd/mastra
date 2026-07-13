@@ -25,6 +25,16 @@ const POSTGRES_MAX_BIND_PARAMETERS = 65535;
 // Keep in sync with the message INSERT column list in saveMessages.
 const MESSAGE_INSERT_BIND_PARAMETERS = 8;
 const MAX_MESSAGES_PER_INSERT = Math.floor(POSTGRES_MAX_BIND_PARAMETERS / MESSAGE_INSERT_BIND_PARAMETERS);
+const POSTGRES_SQLSTATE_PATTERN = /^[0-9A-Z]{5}$/;
+const SAFE_NETWORK_ERROR_CODES = new Set([
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+]);
 
 /**
  * Columns added to the OM table after its initial release.
@@ -501,7 +511,7 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
-    } catch {
+    } catch (rawError) {
       throw this.createAndTrackSafeReadError({
         operation: 'LIST_THREADS',
         text: 'Failed to list PostgreSQL threads',
@@ -510,6 +520,7 @@ export class MemoryPG extends MemoryStorage {
           hasMetadataFilter: Boolean(filter?.metadata),
           page,
         },
+        rawError,
       });
     }
   }
@@ -826,17 +837,23 @@ export class MemoryPG extends MemoryStorage {
     operation,
     text,
     details,
+    rawError,
   }: {
     operation: 'LIST_THREADS' | 'LIST_MESSAGES_BY_ID' | 'LIST_MESSAGES' | 'LIST_MESSAGES_BY_RESOURCE_ID';
     text: string;
     details: Record<string, string | number | boolean>;
+    rawError: unknown;
   }): MastraError {
+    const failureCode = this.getSafeReadFailureCode(rawError);
     const definition = {
       id: createStorageErrorId('PG', operation, 'FAILED'),
       domain: ErrorDomain.STORAGE,
       category: ErrorCategory.THIRD_PARTY,
       text,
-      details,
+      details: {
+        ...details,
+        ...(failureCode && { failureCode }),
+      },
     } as const;
     // Do not retain the driver error as `cause`: Mastra error normalization can later add `toJSON` to a
     // plain Error, which would make driver messages, query text, or connection details serializable.
@@ -844,6 +861,19 @@ export class MemoryPG extends MemoryStorage {
     this.logger?.error?.(error.toString());
     this.logger?.trackException(error);
     return error;
+  }
+
+  private getSafeReadFailureCode(error: unknown): string | undefined {
+    try {
+      if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
+      const code = (error as { code?: unknown }).code;
+      if (typeof code !== 'string') return undefined;
+      if (SAFE_NETWORK_ERROR_CODES.has(code)) return code;
+      if (POSTGRES_SQLSTATE_PATTERN.test(code)) return `SQLSTATE_${code.slice(0, 2)}`;
+    } catch {
+      // Ignore error-like values with throwing property accessors.
+    }
+    return undefined;
   }
 
   private getSafePaginationDetails(page: unknown, perPage: unknown) {
@@ -878,11 +908,12 @@ export class MemoryPG extends MemoryStorage {
         'memory',
       );
       return { messages: list.get.all.db() };
-    } catch {
+    } catch (rawError) {
       throw this.createAndTrackSafeReadError({
         operation: 'LIST_MESSAGES_BY_ID',
         text: 'Failed to list PostgreSQL messages by ID',
         details: { messageIdCount: messageIds.length },
+        rawError,
       });
     }
   }
@@ -1032,7 +1063,7 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch {
+    } catch (rawError) {
       throw this.createAndTrackSafeReadError({
         operation: 'LIST_MESSAGES',
         text: 'Failed to list PostgreSQL messages',
@@ -1042,6 +1073,7 @@ export class MemoryPG extends MemoryStorage {
           hasIncludeTargets: Boolean(include?.length),
           page,
         },
+        rawError,
       });
     }
   }
@@ -1194,7 +1226,7 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch {
+    } catch (rawError) {
       throw this.createAndTrackSafeReadError({
         operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
         text: 'Failed to list PostgreSQL messages by resource ID',
@@ -1203,6 +1235,7 @@ export class MemoryPG extends MemoryStorage {
           hasIncludeTargets: Boolean(include?.length),
           page,
         },
+        rawError,
       });
     }
   }

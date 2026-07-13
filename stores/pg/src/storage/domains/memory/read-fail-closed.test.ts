@@ -234,6 +234,52 @@ describe('MemoryPG list read failures', () => {
     expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveId);
   });
 
+  it.each([
+    { code: '57P01', expected: 'SQLSTATE_57' },
+    { code: 'ECONNREFUSED', expected: 'ECONNREFUSED' },
+  ])('retains the safe failure classification for $code without the driver message', async ({ code, expected }) => {
+    for (const clientMode of ['direct', 'routed'] as const) {
+      const cause = Object.assign(new Error(sensitiveCauseText), { code });
+      const directClient = new ReadDbClient({ failure: cause });
+      const client = clientMode === 'direct' ? directClient : new RoutingDbClient(directClient);
+      const memory = new MemoryPG({ client });
+
+      const caught = await memory.listThreads({}).catch(error => error as MastraError);
+
+      expect(caught.details?.failureCode).toBe(expected);
+      expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveCauseText);
+      expect(caught.cause).not.toBe(cause);
+    }
+  });
+
+  it.each([
+    {
+      name: 'unrecognized code',
+      createCause: () => Object.assign(new Error(sensitiveCauseText), { code: sensitiveId }),
+    },
+    {
+      name: 'throwing code accessor',
+      createCause: () => {
+        const cause = new Error(sensitiveCauseText);
+        Object.defineProperty(cause, 'code', {
+          get() {
+            throw new Error(sensitiveId);
+          },
+        });
+        return cause;
+      },
+    },
+  ])('drops unsafe failure classification for $name', async ({ createCause }) => {
+    const cause = createCause();
+    const memory = new MemoryPG({ client: new ReadDbClient({ failure: cause }) });
+
+    const caught = await memory.listThreads({}).catch(error => error as MastraError);
+
+    expect(caught.details?.failureCode).toBeUndefined();
+    expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveId);
+    expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveCauseText);
+  });
+
   it('does not serialize a driver error that already exposes toJSON', async () => {
     const cause = Object.assign(new Error(sensitiveCauseText), {
       toJSON: () => ({ message: sensitiveCauseText, connectionString: 'SECRET_CONNECTION_STRING' }),
