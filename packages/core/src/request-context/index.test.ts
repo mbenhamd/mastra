@@ -296,7 +296,18 @@ describe('RequestContext', () => {
       const serialized = ctx.serializeForSpan();
       expect(Object.keys(serialized).length).toBeLessThanOrEqual(101);
       expect(serialized.large).toBe(`${'x'.repeat(2_037)}[TRUNCATED]`);
-      expect(JSON.stringify(serialized).length).toBeLessThan(16_384);
+      expect(new TextEncoder().encode(JSON.stringify(serialized)).byteLength).toBeLessThanOrEqual(16_384);
+      expect(serialized['[TRUNCATED]']).toBe(true);
+    });
+
+    it('counts emitted labels and JSON escaping toward the total byte budget', () => {
+      const ctx = new RequestContext();
+      for (let index = 0; index < 100; index += 1) {
+        ctx.set(`${index}-${'\\'.repeat(180)}`, { nested: true });
+      }
+
+      const serialized = ctx.serializeForSpan();
+      expect(new TextEncoder().encode(JSON.stringify(serialized)).byteLength).toBeLessThanOrEqual(16_384);
       expect(serialized['[TRUNCATED]']).toBe(true);
     });
   });

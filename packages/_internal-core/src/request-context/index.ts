@@ -54,16 +54,40 @@ const SPAN_CONTEXT_MAX_KEYS = 100;
 const SPAN_CONTEXT_MAX_STRING_BYTES = 2_048;
 const SPAN_CONTEXT_MAX_TOTAL_BYTES = 16_384;
 const SPAN_TRUNCATION_MARKER = '[TRUNCATED]';
+const SPAN_TEXT_ENCODER = new TextEncoder();
+const SPAN_TEXT_DECODER = new TextDecoder();
 
 function truncateSpanString(value: string, maxBytes: number): string {
-  const encoder = new TextEncoder();
-  const encoded = encoder.encode(value);
+  const encoded = SPAN_TEXT_ENCODER.encode(value);
   if (encoded.byteLength <= maxBytes) return value;
-  const marker = encoder.encode(SPAN_TRUNCATION_MARKER);
+  const marker = SPAN_TEXT_ENCODER.encode(SPAN_TRUNCATION_MARKER);
   if (marker.byteLength >= maxBytes) return SPAN_TRUNCATION_MARKER.slice(0, maxBytes);
   let end = maxBytes - marker.byteLength;
   while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
-  return `${new TextDecoder().decode(encoded.subarray(0, end))}${SPAN_TRUNCATION_MARKER}`;
+  return `${SPAN_TEXT_DECODER.decode(encoded.subarray(0, end))}${SPAN_TRUNCATION_MARKER}`;
+}
+
+function setSpanSnapshotEntry(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function spanSnapshotByteLength(snapshot: Record<string, unknown>): number {
+  return SPAN_TEXT_ENCODER.encode(JSON.stringify(snapshot)).byteLength;
+}
+
+function addSpanTruncationMarker(snapshot: Record<string, unknown>, emittedKeys: string[]): void {
+  setSpanSnapshotEntry(snapshot, SPAN_TRUNCATION_MARKER, true);
+  while (spanSnapshotByteLength(snapshot) > SPAN_CONTEXT_MAX_TOTAL_BYTES && emittedKeys.length > 0) {
+    const key = emittedKeys.pop()!;
+    if (key !== SPAN_TRUNCATION_MARKER) {
+      delete snapshot[key];
+    }
+  }
 }
 
 export type VersionSelector = { versionId: string } | { status: 'draft' | 'published' };
@@ -314,28 +338,45 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
    */
   public serializeForSpan(): Record<string, unknown> {
     const safe: Record<string, unknown> = {};
-    let remainingBytes = SPAN_CONTEXT_MAX_TOTAL_BYTES;
+    const emittedKeys: string[] = [];
     let keyCount = 0;
+    let truncated = false;
     for (const [key, value] of this.registry.entries()) {
-      if (keyCount >= SPAN_CONTEXT_MAX_KEYS || remainingBytes <= 0) {
-        safe[SPAN_TRUNCATION_MARKER] = true;
+      if (keyCount >= SPAN_CONTEXT_MAX_KEYS) {
+        truncated = true;
         break;
       }
-      const safeKey = truncateSpanString(key, Math.min(SPAN_CONTEXT_MAX_STRING_BYTES, remainingBytes));
-      remainingBytes -= new TextEncoder().encode(safeKey).byteLength;
-      keyCount += 1;
+      const safeKey = truncateSpanString(key, SPAN_CONTEXT_MAX_STRING_BYTES);
 
+      let safeValue: unknown;
       if (key === MASTRA_AUTH_TOKEN_KEY) {
-        safe[safeKey] = '[REDACTED]';
+        safeValue = '[REDACTED]';
       } else if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
-        safe[safeKey] = value;
+        safeValue = value;
       } else if (typeof value === 'string') {
-        const bounded = truncateSpanString(value, Math.min(SPAN_CONTEXT_MAX_STRING_BYTES, remainingBytes));
-        safe[safeKey] = bounded;
-        remainingBytes -= new TextEncoder().encode(bounded).byteLength;
+        safeValue = truncateSpanString(value, SPAN_CONTEXT_MAX_STRING_BYTES);
       } else {
-        safe[safeKey] = `[${typeof value}]`;
+        safeValue = `[${typeof value}]`;
       }
+
+      const previous = Object.getOwnPropertyDescriptor(safe, safeKey);
+      setSpanSnapshotEntry(safe, safeKey, safeValue);
+      if (spanSnapshotByteLength(safe) > SPAN_CONTEXT_MAX_TOTAL_BYTES) {
+        if (previous) {
+          Object.defineProperty(safe, safeKey, previous);
+        } else {
+          delete safe[safeKey];
+        }
+        truncated = true;
+        break;
+      }
+      if (!previous) {
+        emittedKeys.push(safeKey);
+      }
+      keyCount += 1;
+    }
+    if (truncated || keyCount < this.registry.size) {
+      addSpanTruncationMarker(safe, emittedKeys);
     }
     return safe;
   }

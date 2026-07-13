@@ -715,6 +715,10 @@ describe('createScorer', () => {
         userId: 'user-123',
         nested: {
           authToken: 'Bearer SECRET_DERIVED_AUTH',
+          access_token: 'SECRET_ACCESS_TOKEN',
+          clientSecret: 'SECRET_CLIENT_SECRET',
+          sessionToken: 'SECRET_SESSION_TOKEN',
+          passwordHash: 'SECRET_PASSWORD_HASH',
           secret: 'SECRET_NESTED_CONTEXT',
           oversized: 'x'.repeat(20_000),
         },
