@@ -2471,9 +2471,15 @@ export class Workflow<
       stepResults: {},
     });
 
-    const existingRun = await this.getWorkflowRunById(runIdToUse, {
-      withNestedWorkflows: false,
-    });
+    // A run using the built-in UUID generator for a workflow that never
+    // persists snapshots cannot already exist in storage in normal operation.
+    // Custom generators may be deterministic, so retain the collision/status
+    // read whenever one is configured.
+    const usesCustomGeneratedRunId = !options?.runId && Boolean(this.#mastra?.getIdGenerator());
+    const existingRun =
+      shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId
+        ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
+        : undefined;
 
     // Check if run exists in persistent storage (not just in-memory)
     const existsInStorage = existingRun && !existingRun.isFromInMemory;

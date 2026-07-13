@@ -77,11 +77,9 @@ function buildAgentWithProcessor() {
 }
 
 describe('agent processor-workflow storage noise (issue #17137 follow-up to #17344)', () => {
-  it('gives the internal processor workflow access to storage (no "storage is not initialized" branch)', async () => {
-    // The buggy processor workflow used its own un-registered logger, so spying on the Mastra
-    // logger does not see the noise. Instead, assert the root cause directly: when
-    // getWorkflowRunById runs for the processor workflow it now has storage, so the
-    // no-storage debug branch is unreachable.
+  it('skips the guaranteed-miss storage read for the internal processor workflow', async () => {
+    // Processor workflows generate a fresh run ID and intentionally never
+    // persist snapshots. Their createRun lookup can therefore never succeed.
     const seen: Array<{ id: string; hasStorage: boolean }> = [];
     const original = (Workflow.prototype as unknown as { getWorkflowRunById: (...a: unknown[]) => unknown })
       .getWorkflowRunById;
@@ -100,8 +98,7 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
     }
 
     const processorLookups = seen.filter(s => s.id === PROCESSOR_WORKFLOW_ID);
-    expect(processorLookups.length).toBeGreaterThan(0);
-    expect(processorLookups.every(s => s.hasStorage)).toBe(true);
+    expect(processorLookups).toEqual([]);
   });
 
   it('does not persist a snapshot for the internal processor workflow on generate', async () => {

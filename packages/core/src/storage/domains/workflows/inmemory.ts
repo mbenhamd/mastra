@@ -1696,8 +1696,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     runId: string;
     workflowName?: string;
   }): Promise<WorkflowRun | null> {
-    const runs = Array.from(this.db.workflows.values()).filter((r: any) => r.run_id === runId);
-    let run = runs.find((r: any) => r.workflow_name === workflowName);
+    const run = Array.from(this.db.workflows.values())
+      .filter(
+        (candidate: any) => candidate.run_id === runId && (!workflowName || candidate.workflow_name === workflowName),
+      )
+      .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
 
     if (!run) return null;
 

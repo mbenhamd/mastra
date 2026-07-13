@@ -1639,9 +1639,14 @@ export class EventedWorkflow<
       stepResults: {},
     });
 
-    const existingRun = await this.getWorkflowRunById(runIdToUse, {
-      withNestedWorkflows: false,
-    });
+    // A generated run for a workflow that never persists snapshots cannot
+    // already exist in storage. Avoid the guaranteed-miss round trip while
+    // retaining collision/status checks for persistent runs and caller-owned
+    // run IDs.
+    const existingRun =
+      shouldPersistSnapshot || options?.runId
+        ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
+        : undefined;
 
     // Check if run exists in persistent storage (not just in-memory)
     const existsInStorage = existingRun && !existingRun.isFromInMemory;
