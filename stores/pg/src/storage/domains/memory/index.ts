@@ -25,6 +25,16 @@ const POSTGRES_MAX_BIND_PARAMETERS = 65535;
 // Keep in sync with the message INSERT column list in saveMessages.
 const MESSAGE_INSERT_BIND_PARAMETERS = 8;
 const MAX_MESSAGES_PER_INSERT = Math.floor(POSTGRES_MAX_BIND_PARAMETERS / MESSAGE_INSERT_BIND_PARAMETERS);
+const POSTGRES_SQLSTATE_PATTERN = /^[0-9A-Z]{5}$/;
+const SAFE_NETWORK_ERROR_CODES = new Set([
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+]);
 
 /**
  * Columns added to the OM table after its initial release.
@@ -404,14 +414,14 @@ export class MemoryPG extends MemoryStorage {
     try {
       // Validate pagination input before normalization
       // This ensures page === 0 when perPageInput === false
-      this.validatePaginationInput(page, perPageInput ?? 100);
-    } catch (error) {
+      this.validatePaginationInput(page, perPageInput === undefined ? 100 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: error instanceof Error ? error.message : 'Invalid pagination parameters',
-        details: { page, ...(perPageInput !== undefined && { perPage: perPageInput }) },
+        text: 'Invalid pagination parameters',
+        details: this.getSafePaginationDetails(page, perPageInput),
       });
     }
 
@@ -420,13 +430,13 @@ export class MemoryPG extends MemoryStorage {
     // Validate metadata keys to prevent SQL injection
     try {
       this.validateMetadataKeys(filter?.metadata);
-    } catch (error) {
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_METADATA_KEY'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: error instanceof Error ? error.message : 'Invalid metadata key',
-        details: { metadataKeys: filter?.metadata ? Object.keys(filter.metadata).join(', ') : '' },
+        text: 'Invalid metadata filter',
+        details: { hasMetadataFilter: filter?.metadata !== undefined },
       });
     }
 
@@ -501,29 +511,17 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_THREADS', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            ...(filter?.resourceId && { resourceId: filter.resourceId }),
-            hasMetadataFilter: !!filter?.metadata,
-            page,
-          },
+    } catch (rawError) {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_THREADS',
+        text: 'Failed to list PostgreSQL threads',
+        details: {
+          hasResourceIdFilter: Boolean(filter?.resourceId),
+          hasMetadataFilter: Boolean(filter?.metadata),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        threads: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+        rawError,
+      });
     }
   }
 
@@ -835,6 +833,63 @@ export class MemoryPG extends MemoryStorage {
     } satisfies MastraDBMessage;
   }
 
+  private createAndTrackSafeReadError({
+    operation,
+    text,
+    details,
+    rawError,
+  }: {
+    operation: 'LIST_THREADS' | 'LIST_MESSAGES_BY_ID' | 'LIST_MESSAGES' | 'LIST_MESSAGES_BY_RESOURCE_ID';
+    text: string;
+    details: Record<string, string | number | boolean>;
+    rawError: unknown;
+  }): MastraError {
+    const failureCode = this.getSafeReadFailureCode(rawError);
+    const definition = {
+      id: createStorageErrorId('PG', operation, 'FAILED'),
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.THIRD_PARTY,
+      text,
+      details: {
+        ...details,
+        ...(failureCode && { failureCode }),
+      },
+    } as const;
+    // Do not retain the driver error as `cause`: Mastra error normalization can later add `toJSON` to a
+    // plain Error, which would make driver messages, query text, or connection details serializable.
+    const error = new MastraError(definition, new Error(text));
+    this.logger?.error?.(error.toString());
+    this.logger?.trackException(error);
+    return error;
+  }
+
+  private getSafeReadFailureCode(error: unknown): string | undefined {
+    try {
+      if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
+      const code = (error as { code?: unknown }).code;
+      if (typeof code !== 'string') return undefined;
+      if (SAFE_NETWORK_ERROR_CODES.has(code)) return code;
+      if (POSTGRES_SQLSTATE_PATTERN.test(code)) return `SQLSTATE_${code.slice(0, 2)}`;
+    } catch {
+      // Ignore error-like values with throwing property accessors.
+    }
+    return undefined;
+  }
+
+  private getSafePaginationDetails(page: unknown, perPage: unknown) {
+    const hasValidPage = typeof page === 'number' && Number.isFinite(page) && Number.isSafeInteger(page) && page >= 0;
+    const hasValidPerPage =
+      perPage === undefined ||
+      perPage === false ||
+      (typeof perPage === 'number' && Number.isFinite(perPage) && Number.isSafeInteger(perPage) && perPage >= 0);
+
+    return {
+      hasValidPage,
+      hasValidPerPage,
+      hasValidPaginationCombination: perPage !== false || page === 0,
+    };
+  }
+
   public async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messageIds.length === 0) return { messages: [] };
     const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
@@ -853,21 +908,13 @@ export class MemoryPG extends MemoryStorage {
         'memory',
       );
       return { messages: list.get.all.db() };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_ID', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            messageIds: JSON.stringify(messageIds),
-          },
-        },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return { messages: [] };
+    } catch (rawError) {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES_BY_ID',
+        text: 'Failed to list PostgreSQL messages by ID',
+        details: { messageIdCount: messageIds.length },
+        rawError,
+      });
     }
   }
 
@@ -884,21 +931,27 @@ export class MemoryPG extends MemoryStorage {
           id: createStorageErrorId('PG', 'LIST_MESSAGES', 'INVALID_THREAD_ID'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { threadId: Array.isArray(threadId) ? String(threadId) : String(threadId) },
+          details: {
+            hasThreadId: threadId !== undefined && threadId !== null,
+            threadIdCount: Array.isArray(threadId) ? threadId.length : 1,
+          },
         },
         new Error('threadId must be a non-empty string or array of non-empty strings'),
       );
     }
 
-    if (page < 0) {
+    try {
+      this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Page number must be non-negative',
+        text: 'Invalid pagination parameters',
         details: {
-          threadId: Array.isArray(threadId) ? threadId.join(',') : threadId,
-          page,
+          hasThreadId: true,
+          threadIdCount: threadIds.length,
+          ...this.getSafePaginationDetails(page, perPageInput),
         },
       });
     }
@@ -1010,28 +1063,18 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            threadId: Array.isArray(threadId) ? threadId.join(',') : threadId,
-            resourceId: resourceId ?? '',
-          },
+    } catch (rawError) {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES',
+        text: 'Failed to list PostgreSQL messages',
+        details: {
+          threadIdCount: threadIds.length,
+          hasResourceId: resourceId !== undefined,
+          hasIncludeTargets: Boolean(include?.length),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+        rawError,
+      });
     }
   }
 
@@ -1041,7 +1084,7 @@ export class MemoryPG extends MemoryStorage {
     const { resourceId, include, filter, perPage: perPageInput, page = 0, orderBy } = args;
 
     // Validate that resourceId is provided
-    const hasResourceId = resourceId !== undefined && resourceId !== null && resourceId.trim() !== '';
+    const hasResourceId = typeof resourceId === 'string' && resourceId.trim() !== '';
     if (!hasResourceId) {
       throw new MastraError(
         {
@@ -1049,23 +1092,24 @@ export class MemoryPG extends MemoryStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.USER,
           details: {
-            resourceId: resourceId ?? '',
+            hasResourceId,
           },
         },
         new Error('resourceId is required'),
       );
     }
 
-    // Validate page parameter
-    if (page < 0) {
+    try {
+      this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Page number must be non-negative',
+        text: 'Invalid pagination parameters',
         details: {
-          resourceId,
-          page,
+          hasResourceId,
+          ...this.getSafePaginationDetails(page, perPageInput),
         },
       });
     }
@@ -1182,27 +1226,17 @@ export class MemoryPG extends MemoryStorage {
         perPage: perPageForResponse,
         hasMore,
       };
-    } catch (error) {
-      const mastraError = new MastraError(
-        {
-          id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'FAILED'),
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: {
-            resourceId: resourceId ?? '',
-          },
+    } catch (rawError) {
+      throw this.createAndTrackSafeReadError({
+        operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
+        text: 'Failed to list PostgreSQL messages by resource ID',
+        details: {
+          hasResourceId: Boolean(resourceId),
+          hasIncludeTargets: Boolean(include?.length),
+          page,
         },
-        error,
-      );
-      this.logger?.error?.(mastraError.toString());
-      this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+        rawError,
+      });
     }
   }
 

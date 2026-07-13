@@ -453,6 +453,12 @@ for await (const chunk of stream.textStream) {
 }
 ```
 
+### Handling read failures
+
+PostgreSQL thread and message list methods return empty collections only when a database query succeeds with no matching rows. If PostgreSQL rejects the read, the method throws a typed storage error instead of treating the failure as missing history.
+
+Handle or retry these errors at your application boundary. Don't use a caught read failure as evidence that a thread, message, or resource has no stored history.
+
 ## Index management
 
 PostgreSQL storage provides index management to optimize query performance.
