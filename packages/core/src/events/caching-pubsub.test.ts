@@ -56,6 +56,20 @@ describe('CachingPubSub', () => {
       );
     });
 
+    it('does not persist localOnly events in the shared cache', async () => {
+      const callback = vi.fn();
+      await innerPubsub.subscribe('internal-topic', callback);
+
+      await cachingPubsub.publish(
+        'internal-topic',
+        { type: 'internal', runId: 'run-local', data: { liveCallback: () => 'local' } },
+        { localOnly: true },
+      );
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(await cachingPubsub.getHistory('internal-topic')).toEqual([]);
+    });
+
     it('should cache multiple events in order', async () => {
       const topic = 'test-topic';
 

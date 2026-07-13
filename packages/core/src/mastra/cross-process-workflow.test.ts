@@ -464,6 +464,7 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
 
     expect(pubsub.calls).toHaveLength(1);
     expect(pubsub.calls[0]!.localOnly).toBe(true);
+
     await mastra.shutdown();
   });
 
@@ -483,10 +484,11 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     await mastra.pubsub.publish('workflows', deeplyNested);
 
     expect(pubsub.calls[0]!.localOnly).toBe(true);
+
     await mastra.shutdown();
   });
 
-  it('routes a real scheduler publication through the ownership-aware proxy', async () => {
+  it('keeps real scheduled public workflow starts portable', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
     const storage = new MockStore();
     const mastra = new Mastra({
@@ -511,11 +513,11 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     });
 
     await mastra.scheduler!.tick();
-    expect(pubsub.calls).toContainEqual(expect.objectContaining({ topic: 'workflows', localOnly: true }));
+    expect(pubsub.calls).toContainEqual(expect.objectContaining({ topic: 'workflows', localOnly: false }));
     await mastra.shutdown();
   });
 
-  it('tags workflow.events.v2.* per-run stream events as localOnly', async () => {
+  it('keeps public workflow stream events portable', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
     const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
 
@@ -525,7 +527,82 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
       data: { chunk: 'whatever' },
     } as unknown as Event);
 
+    expect(pubsub.calls[0]!.localOnly).toBe(false);
+    await mastra.shutdown();
+  });
+
+  it('tags stream events for owned internal runs as localOnly', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    mastra.__registerInternalWorkflow(makeNoopWorkflow('agentic-loop') as any, 'run-xyz');
+
+    await mastra.pubsub.publish('workflow.events.v2.run-xyz', {
+      type: 'watch',
+      runId: 'run-xyz',
+      data: { chunk: 'whatever' },
+    } as unknown as Event);
+
     expect(pubsub.calls[0]!.localOnly).toBe(true);
+
+    await mastra.pubsub.publish('workflow.events.v2.run-xyz', {
+      type: 'watch',
+      runId: 'run-xyz',
+      data: { type: 'workflow-finish', payload: { runId: 'run-xyz' } },
+    } as unknown as Event);
+    await mastra.pubsub.publish('workflow.events.v2.run-xyz', {
+      type: 'watch',
+      runId: 'run-xyz',
+      data: { type: 'late-event' },
+    } as unknown as Event);
+
+    expect(pubsub.calls.at(-2)!.localOnly).toBe(true);
+    expect(pubsub.calls.at(-1)!.localOnly).toBe(false);
+    await mastra.shutdown();
+  });
+
+  it('keeps streams local for unscoped and parent-owned internal runs', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    mastra.__registerInternalWorkflow(makeNoopWorkflow('__background-task') as any);
+    mastra.__registerInternalWorkflow(makeNoopWorkflow('agentic-loop') as any, 'root-run');
+
+    await mastra.pubsub.publish('workflows', makeStartEvent('__background-task', 'task-run'));
+    await mastra.pubsub.publish(
+      'workflows',
+      makeStepRunEvent('nested-internal', 'nested-run', { workflowId: 'agentic-loop', runId: 'root-run' }),
+    );
+    await mastra.pubsub.publish('workflow.events.v2.task-run', {
+      type: 'watch',
+      runId: 'task-run',
+      data: { chunk: 'task' },
+    } as unknown as Event);
+    await mastra.pubsub.publish('workflow.events.v2.nested-run', {
+      type: 'watch',
+      runId: 'nested-run',
+      data: { chunk: 'nested' },
+    } as unknown as Event);
+
+    const streamCalls = pubsub.calls.filter(call => call.topic.startsWith('workflow.events.v2.'));
+    expect(streamCalls).toHaveLength(2);
+    expect(streamCalls.every(call => call.localOnly)).toBe(true);
+
+    await mastra.pubsub.publish('workflow.events.v2.task-run', {
+      type: 'watch',
+      runId: 'task-run',
+      data: { type: 'workflow-finish', payload: { runId: 'task-run' } },
+    } as unknown as Event);
+    await mastra.pubsub.publish('workflows', {
+      type: 'workflow.end',
+      runId: 'task-run',
+      data: { workflowId: '__background-task', runId: 'task-run' },
+    } as Event);
+    await mastra.pubsub.publish('workflow.events.v2.task-run', {
+      type: 'watch',
+      runId: 'task-run',
+      data: { type: 'late-event' },
+    } as unknown as Event);
+
+    expect(pubsub.calls.at(-1)!.localOnly).toBe(false);
     await mastra.shutdown();
   });
 

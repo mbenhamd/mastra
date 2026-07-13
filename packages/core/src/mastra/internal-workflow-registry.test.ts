@@ -51,6 +51,13 @@ describe('internal workflow registry', () => {
       const m = makeMastra();
       expect(m.__hasInternalWorkflow('missing')).toBe(false);
     });
+
+    it('does not treat Object prototype keys as registered workflows', () => {
+      const m = makeMastra();
+      expect(m.__hasInternalWorkflow('toString')).toBe(false);
+      expect(m.__hasInternalWorkflow('constructor')).toBe(false);
+      expect(() => m.__getInternalWorkflow('toString')).toThrow(/not found/i);
+    });
   });
 
   describe('run-scoped registration', () => {

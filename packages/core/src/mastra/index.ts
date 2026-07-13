@@ -703,8 +703,9 @@ export class Mastra<
   #events: {
     [topic: string]: ((event: Event, cb?: () => Promise<void>) => Promise<void>)[];
   } = {};
-  #internalMastraWorkflows: Record<string, AnyWorkflow> = {};
+  #internalMastraWorkflows = new Map<string, AnyWorkflow>();
   #runScopedInternalWorkflows = new Map<string, Map<string, AnyWorkflow>>();
+  #ownedInternalRunIds = new Set<string>();
   #runScopedWorkflowTimestamps = new Map<string, Map<string, number>>();
   static readonly INTERNAL_WORKFLOW_TTL_MS = 30 * 60 * 1000;
   // Server cache for temporary persistence and durable agent resumable streams
@@ -739,20 +740,37 @@ export class Mastra<
                 const workflowId = data?.workflowId as string | undefined;
                 const runId = data?.runId as string | undefined;
                 const isOwnedHere =
-                  (workflowId !== undefined &&
-                    runId !== undefined &&
-                    self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow)) ||
-                  runId?.startsWith('sched_') === true;
+                  workflowId !== undefined &&
+                  runId !== undefined &&
+                  self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow);
 
                 if (isOwnedHere) {
-                  return target.publish(
+                  const isTerminalWorkflowEvent =
+                    topic === 'workflows' &&
+                    (event.type === 'workflow.end' ||
+                      event.type === 'workflow.fail' ||
+                      event.type === 'workflow.cancel');
+                  if (!isTerminalWorkflowEvent) self.#ownedInternalRunIds.add(runId);
+                  const published = target.publish(
                     topic,
                     { ...event, data: { ...data, __mastraInternalWorkflow: true } },
                     { ...options, localOnly: true },
                   );
+                  if (isTerminalWorkflowEvent) {
+                    return published.finally(() => self.#ownedInternalRunIds.delete(runId));
+                  }
+                  return published;
                 }
               } else if (topic.startsWith('workflow.events.v2.')) {
-                return target.publish(topic, event, { ...options, localOnly: true });
+                const runId = event.runId;
+                if (typeof runId === 'string' && self.#ownedInternalRunIds.has(runId)) {
+                  const published = target.publish(topic, event, { ...options, localOnly: true });
+                  const data = event.data as { type?: unknown } | undefined;
+                  if (data?.type === 'workflow-finish') {
+                    return published.finally(() => self.#ownedInternalRunIds.delete(runId));
+                  }
+                  return published;
+                }
               }
 
               // Preserve caller-supplied transport options for portable and unrelated events.
@@ -3006,6 +3024,7 @@ export class Mastra<
         this.#runScopedInternalWorkflows.set(workflow.id, runs);
       }
       runs.set(runId, workflow);
+      this.#ownedInternalRunIds.add(runId);
 
       let timestamps = this.#runScopedWorkflowTimestamps.get(workflow.id);
       if (!timestamps) {
@@ -3015,7 +3034,7 @@ export class Mastra<
       timestamps.set(runId, Date.now());
       this.#sweepStaleRunScopedWorkflows();
     } else {
-      this.#internalMastraWorkflows[workflow.id] = workflow;
+      this.#internalMastraWorkflows.set(workflow.id, workflow);
     }
   }
 
@@ -3023,6 +3042,7 @@ export class Mastra<
     const runs = this.#runScopedInternalWorkflows.get(id);
     runs?.delete(runId);
     if (runs?.size === 0) this.#runScopedInternalWorkflows.delete(id);
+    this.#ownedInternalRunIds.delete(runId);
 
     const timestamps = this.#runScopedWorkflowTimestamps.get(id);
     timestamps?.delete(runId);
@@ -3031,14 +3051,14 @@ export class Mastra<
 
   __hasInternalWorkflow(id: string, runId?: string): boolean {
     return runId
-      ? !!this.#runScopedInternalWorkflows.get(id)?.has(runId) || !!this.#internalMastraWorkflows[id]
-      : !!this.#internalMastraWorkflows[id];
+      ? !!this.#runScopedInternalWorkflows.get(id)?.has(runId) || this.#internalMastraWorkflows.has(id)
+      : this.#internalMastraWorkflows.has(id);
   }
 
   __getInternalWorkflow(id: string, runId?: string): AnyWorkflow {
     const workflow = runId
-      ? (this.#runScopedInternalWorkflows.get(id)?.get(runId) ?? this.#internalMastraWorkflows[id])
-      : this.#internalMastraWorkflows[id];
+      ? (this.#runScopedInternalWorkflows.get(id)?.get(runId) ?? this.#internalMastraWorkflows.get(id))
+      : this.#internalMastraWorkflows.get(id);
     if (!workflow) {
       throw new MastraError({
         id: 'MASTRA_GET_INTERNAL_WORKFLOW_BY_ID_NOT_FOUND',
@@ -4738,7 +4758,6 @@ export class Mastra<
     if (data?.__mastraInternalWorkflow !== true) return true;
     const workflowId = data.workflowId;
     const runId = data.runId;
-    if (typeof runId === 'string' && runId.startsWith('sched_')) return true;
     return (
       typeof workflowId === 'string' &&
       typeof runId === 'string' &&
