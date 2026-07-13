@@ -18,6 +18,10 @@ import { MessageHistory } from '@mastra/core/processors'
 const processor = new MessageHistory({
   storage: memoryStorage,
   lastMessages: 50,
+  toolCallFilter: {
+    preserveModelOutput: true,
+    maxModelOutputBytes: 4096,
+  },
 })
 ```
 
@@ -45,6 +49,42 @@ const processor = new MessageHistory({
             type: 'number',
             description: 'Maximum number of historical messages to retrieve. If not specified, retrieves all messages',
             isOptional: true,
+          },
+          {
+            name: 'toolCallFilter',
+            type: 'MessageHistoryToolCallFilterOptions',
+            description:
+              'Optional policy that removes selected tool calls and results before MessageHistory persists them. If omitted, existing persistence behavior is unchanged',
+            isOptional: true,
+            properties: [
+              {
+                type: 'MessageHistoryToolCallFilterOptions',
+                parameters: [
+                  {
+                    name: 'exclude',
+                    type: 'string[]',
+                    description: 'Tool names to remove. If omitted, removes all tool calls and results',
+                    isOptional: true,
+                  },
+                  {
+                    name: 'preserveModelOutput',
+                    type: 'boolean',
+                    description:
+                      'Preserves compact model-facing output from completed filtered tool results while removing raw arguments and results',
+                    isOptional: true,
+                    defaultValue: 'false',
+                  },
+                  {
+                    name: 'maxModelOutputBytes',
+                    type: 'number',
+                    description:
+                      'Maximum UTF-8 bytes retained from each preserved model output. Defaults to 16384 bytes',
+                    isOptional: true,
+                    defaultValue: '16384',
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -108,6 +148,10 @@ export const agent = new Agent({
   outputProcessors: [
     new MessageHistory({
       storage,
+      toolCallFilter: {
+        preserveModelOutput: true,
+        maxModelOutputBytes: 4096,
+      },
     }),
   ],
 })
@@ -128,8 +172,28 @@ export const agent = new Agent({
 1. Retrieves `threadId` from the request context
 1. Skips persistence if `readOnly` is set in memory config
 1. Filters out incomplete tool calls from messages
+1. Applies `toolCallFilter` when configured, removing matching raw tool arguments and results
 1. Persists new user input and assistant response messages to storage
 1. Updates the thread's `updatedAt` timestamp
+
+## Filter persisted tool calls
+
+Set `toolCallFilter` to remove tool calls and results at the persistence boundary. Omitting `exclude` removes all tool calls. Set `exclude` to filter selected tools only.
+
+`preserveModelOutput` keeps compact model-facing output from completed results. It doesn't preserve media, incomplete states, denied results, failed results, raw arguments, or raw results. When `maxModelOutputBytes` is omitted, MessageHistory retains at most 16 KiB per preserved model output.
+
+When this persistence policy removes or compacts a tool payload, it also removes message-level provider metadata from that changed message. Messages without a matching tool payload remain unchanged by the tool-call policy.
+
+```typescript
+const messageHistory = new MessageHistory({
+  storage,
+  toolCallFilter: {
+    exclude: ['searchDatabase'],
+    preserveModelOutput: true,
+    maxModelOutputBytes: 4096,
+  },
+})
+```
 
 ## Related
 

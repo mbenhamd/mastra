@@ -925,4 +925,283 @@ describe('MessageHistory', () => {
       expect(savedParts.map((p: any) => p.text)).toEqual(['Saved.', ' untouched ']);
     });
   });
+
+  describe('toolCallFilter persistence policy', () => {
+    const createPersistenceStorage = () =>
+      ({
+        saveMessages: vi.fn().mockResolvedValue(undefined),
+        getThreadById: vi.fn().mockResolvedValue({
+          id: 'thread-1',
+          title: 'Test Thread',
+          metadata: {},
+        }),
+        updateThread: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as MemoryStorage;
+
+    const createToolResultMessage = (): MastraDBMessage => ({
+      role: 'assistant',
+      content: {
+        format: 2,
+        content: 'Final answer',
+        providerMetadata: {
+          mastra: { rawToolResult: 'CONTENT_PROVIDER_SECRET' },
+        },
+        parts: [
+          { type: 'text', text: 'Final answer' },
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'call-search',
+              toolName: 'search',
+              args: { query: 'RAW_ARGS_SENTINEL' },
+              result: { hits: ['RAW_RESULT_SENTINEL'] },
+              rawInput: { query: 'RAW_INPUT_SENTINEL' },
+              errorText: 'ERROR_TEXT_SENTINEL',
+              approval: { id: 'APPROVAL_ID_SENTINEL', reason: 'APPROVAL_REASON_SENTINEL' },
+            },
+            title: 'PART_TITLE_SENTINEL',
+            providerExecuted: true,
+            providerMetadata: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [
+                    { type: 'text', text: 'Compact result' },
+                    { type: 'media', data: 'BASE64_SENTINEL', mediaType: 'image/png' },
+                  ],
+                },
+                rawProviderPayload: 'PROVIDER_METADATA_SENTINEL',
+              },
+            },
+          },
+        ],
+        toolInvocations: [
+          {
+            state: 'result',
+            toolCallId: 'call-search',
+            toolName: 'search',
+            args: { query: 'TOP_LEVEL_ARGS_SENTINEL' },
+            result: 'TOP_LEVEL_RESULT_SENTINEL',
+          },
+        ],
+      },
+      id: 'msg-tool-result',
+      createdAt: new Date('2024-01-01T00:00:01Z'),
+    });
+
+    const createPrefilteredToolMessage = (toolName: string, state: 'call' | 'partial-call'): MastraDBMessage =>
+      ({
+        role: 'assistant',
+        content: {
+          format: 2,
+          content: 'Keep this answer',
+          providerMetadata: {
+            mastra: { rawToolPayload: 'PREFILTERED_PROVIDER_SECRET' },
+          },
+          parts: [
+            { type: 'text', text: 'Keep this answer' },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state,
+                toolCallId: `call-${toolName}`,
+                toolName,
+                args: { secret: 'PREFILTERED_ARGS_SECRET' },
+              },
+            },
+          ],
+        },
+        id: `msg-${toolName}`,
+        createdAt: new Date('2024-01-01T00:00:01Z'),
+      }) as MastraDBMessage;
+
+    it('filters direct persistMessages writes without mutating the source message', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: {
+          preserveModelOutput: true,
+          maxModelOutputBytes: 128,
+        },
+      });
+      const message = createToolResultMessage();
+      const sourceBefore = JSON.stringify(message);
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      expect(JSON.stringify(message)).toBe(sourceBefore);
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(savedMessages).toHaveLength(1);
+      expect(serialized).toContain('Final answer');
+      expect(serialized).toContain('search result:\\nCompact result');
+      expect(serialized).not.toContain('RAW_ARGS_SENTINEL');
+      expect(serialized).not.toContain('RAW_RESULT_SENTINEL');
+      expect(serialized).not.toContain('RAW_INPUT_SENTINEL');
+      expect(serialized).not.toContain('ERROR_TEXT_SENTINEL');
+      expect(serialized).not.toContain('APPROVAL_ID_SENTINEL');
+      expect(serialized).not.toContain('APPROVAL_REASON_SENTINEL');
+      expect(serialized).not.toContain('PART_TITLE_SENTINEL');
+      expect(serialized).not.toContain('PROVIDER_METADATA_SENTINEL');
+      expect(serialized).not.toContain('CONTENT_PROVIDER_SECRET');
+      expect(serialized).not.toContain('TOP_LEVEL_ARGS_SENTINEL');
+      expect(serialized).not.toContain('TOP_LEVEL_RESULT_SENTINEL');
+      expect(serialized).not.toContain('BASE64_SENTINEL');
+      expect(savedMessages[0]!.content.toolInvocations).toBeUndefined();
+    });
+
+    it('applies the same policy through processOutputResult', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: { preserveModelOutput: true },
+      });
+      const message = createToolResultMessage();
+      const messageList = new MessageList().add(message, 'response');
+
+      await processor.processOutputResult({
+        messageList,
+        messages: [message],
+        abort: mockAbort,
+        requestContext: createRuntimeContextWithMemory('thread-1'),
+      });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('search result:\\nCompact result');
+      expect(serialized).not.toContain('RAW_RESULT_SENTINEL');
+      expect(messageList.get.response.db()).toEqual([message]);
+    });
+
+    it.each([
+      ['streaming tool call', 'search', 'partial-call'],
+      ['working-memory tool call', 'updateWorkingMemory', 'call'],
+    ] as const)('strips provider metadata when the policy covers a prefiltered %s', async (_label, toolName, state) => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: {} });
+      const message = createPrefilteredToolMessage(toolName, state);
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('Keep this answer');
+      expect(serialized).not.toContain('PREFILTERED_PROVIDER_SECRET');
+      expect(serialized).not.toContain('PREFILTERED_ARGS_SECRET');
+    });
+
+    it('preserves existing metadata behavior when exclude is an empty no-op policy', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: { exclude: [] } });
+      const message = createPrefilteredToolMessage('search', 'partial-call');
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('PREFILTERED_PROVIDER_SECRET');
+      expect(serialized).not.toContain('PREFILTERED_ARGS_SECRET');
+    });
+
+    it('applies a finite model-output bound when persistence filtering omits one', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: { preserveModelOutput: true },
+      });
+      const message = createToolResultMessage();
+      const toolPart = message.content.parts.find(part => part.type === 'tool-invocation');
+      if (!toolPart || toolPart.type !== 'tool-invocation') throw new Error('expected tool invocation');
+      toolPart.providerMetadata = { mastra: { modelOutput: 'x'.repeat(1024 * 1024) } };
+
+      const encodeSpy = vi.spyOn(TextEncoder.prototype, 'encode');
+      let encodedInputLengths: number[];
+      try {
+        await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+        encodedInputLengths = encodeSpy.mock.calls.map(([input]) => input.length);
+      } finally {
+        encodeSpy.mockRestore();
+      }
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(Math.max(...encodedInputLengths!)).toBeLessThanOrEqual(16 * 1024 + 1);
+      expect(serialized).toContain('[truncated]');
+      expect(new TextEncoder().encode(serialized).byteLength).toBeLessThan(17 * 1024);
+    });
+
+    it.each(['array', 'legacy wrapper'] as const)('omits circular %s model output', async shape => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: { preserveModelOutput: true },
+      });
+      const message = createToolResultMessage();
+      const toolPart = message.content.parts.find(part => part.type === 'tool-invocation');
+      if (!toolPart || toolPart.type !== 'tool-invocation') throw new Error('expected tool invocation');
+      const circular: unknown[] | { value?: unknown } = shape === 'array' ? [] : {};
+      if (Array.isArray(circular)) circular.push(circular);
+      else circular.value = circular;
+      toolPart.providerMetadata = { mastra: { modelOutput: circular } };
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(JSON.stringify(savedMessages)).not.toContain('search result');
+    });
+
+    it('filters legacy messages that store tool payloads only in content.toolInvocations', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: {} });
+      const message = createToolResultMessage();
+      message.content.parts = [{ type: 'text', text: 'Final answer' }];
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('Final answer');
+      expect(serialized).not.toContain('TOP_LEVEL_ARGS_SENTINEL');
+      expect(serialized).not.toContain('TOP_LEVEL_RESULT_SENTINEL');
+      expect(savedMessages[0]!.content.toolInvocations).toBeUndefined();
+    });
+
+    it.each([
+      ['string content', 'Legacy text'],
+      ['missing parts', { format: 2, content: 'Legacy object text' }],
+    ])('does not crash on %s when persistence filtering is enabled', async (_label, content) => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage, toolCallFilter: {} });
+      const message = {
+        id: 'legacy-malformed-message',
+        role: 'assistant',
+        content,
+        createdAt: new Date('2024-01-01T00:00:01Z'),
+      } as unknown as MastraDBMessage;
+      const sourceBefore = JSON.stringify(message);
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      expect(JSON.stringify(message)).toBe(sourceBefore);
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages).toHaveLength(1);
+      expect(JSON.stringify(savedMessages[0]!.content)).toContain('Legacy');
+    });
+
+    it('keeps existing persistence behavior when the policy is omitted', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({ storage });
+      const message = createToolResultMessage();
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('RAW_ARGS_SENTINEL');
+      expect(serialized).toContain('RAW_RESULT_SENTINEL');
+      expect(serialized).toContain('TOP_LEVEL_ARGS_SENTINEL');
+      expect(serialized).toContain('TOP_LEVEL_RESULT_SENTINEL');
+    });
+  });
 });

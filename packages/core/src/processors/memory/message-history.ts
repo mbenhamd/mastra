@@ -6,6 +6,15 @@ import { SpanType, EntityType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
+import { filterToolCallMessages, normalizeToolCallFilterExclude } from '../tool-call-filter-utils';
+import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
+
+const DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES = 16 * 1024;
+
+export type MessageHistoryToolCallFilterOptions = Pick<
+  ToolCallFilteringOptions,
+  'exclude' | 'preserveModelOutput' | 'maxModelOutputBytes'
+>;
 
 /**
  * Options for the MessageHistory processor
@@ -13,6 +22,13 @@ import type { MemoryStorage } from '../../storage';
 export interface MessageHistoryOptions {
   storage: MemoryStorage;
   lastMessages?: number;
+  /**
+   * Opt-in filtering applied only to messages written by MessageHistory.
+   * Omit this option to preserve the existing persistence behavior.
+   * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
+   * Messages changed by this policy also drop message-level provider metadata.
+   */
+  toolCallFilter?: MessageHistoryToolCallFilterOptions;
 }
 
 /**
@@ -28,10 +44,12 @@ export class MessageHistory implements Processor {
   readonly name = 'MessageHistory';
   private storage: MemoryStorage;
   private lastMessages?: number;
+  private toolCallFilter?: MessageHistoryToolCallFilterOptions;
 
   constructor(options: MessageHistoryOptions) {
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
+    this.toolCallFilter = options.toolCallFilter;
   }
 
   /**
@@ -173,10 +191,18 @@ export class MessageHistory implements Processor {
    * - For client-side tools (no execute function), 'call' is the final state from the server's perspective
    */
   private filterMessagesForPersistence(messages: MastraDBMessage[]): MastraDBMessage[] {
-    return messages
+    const normalizedToolCallFilterExclude =
+      this.toolCallFilter === undefined
+        ? undefined
+        : normalizeToolCallFilterExclude((this.toolCallFilter as { exclude?: unknown }).exclude);
+    const policyFiltersTool = (toolName: string): boolean =>
+      normalizedToolCallFilterExclude === 'all' || normalizedToolCallFilterExclude?.includes(toolName) === true;
+
+    const filteredMessages = messages
       .filter(m => m.role !== 'system')
       .map(m => {
         const newMessage = { ...m };
+        let removedToolInvocationCoveredByPolicy = false;
         // Only spread content if it's a proper V2 object
         if (m.content && typeof m.content === 'object' && !Array.isArray(m.content)) {
           newMessage.content = { ...m.content };
@@ -192,13 +218,13 @@ export class MessageHistory implements Processor {
         if (Array.isArray(newMessage.content?.parts)) {
           newMessage.content.parts = newMessage.content.parts
             .map(p => {
-              // Filter out streaming tool calls (partial-call is an intermediate state during streaming)
-              if (p.type === `tool-invocation` && p.toolInvocation.state === `partial-call`) {
-                return null;
-              }
-              // Filter out updateWorkingMemory tool invocations (hide args from message history)
-              if (p.type === `tool-invocation` && p.toolInvocation.toolName === `updateWorkingMemory`) {
-                return null;
+              if (p.type === `tool-invocation`) {
+                const shouldRemove =
+                  p.toolInvocation.state === `partial-call` || p.toolInvocation.toolName === `updateWorkingMemory`;
+                if (shouldRemove) {
+                  removedToolInvocationCoveredByPolicy ||= policyFiltersTool(p.toolInvocation.toolName);
+                  return null;
+                }
               }
               // Strip working memory tags from text parts
               if (p.type === `text`) {
@@ -213,6 +239,10 @@ export class MessageHistory implements Processor {
             })
             .filter((p): p is NonNullable<typeof p> => Boolean(p));
 
+          if (removedToolInvocationCoveredByPolicy) {
+            delete newMessage.content.providerMetadata;
+          }
+
           // If all parts were filtered out, skip the whole message
           if (newMessage.content.parts.length === 0) {
             return null;
@@ -222,6 +252,18 @@ export class MessageHistory implements Processor {
         return newMessage;
       })
       .filter((m): m is NonNullable<typeof m> => Boolean(m));
+
+    return this.toolCallFilter === undefined
+      ? filteredMessages
+      : filterToolCallMessages(
+          filteredMessages,
+          {
+            ...this.toolCallFilter,
+            maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
+          },
+          new Set(),
+          { stripMessageProviderMetadata: true },
+        );
   }
 
   async processOutputResult(

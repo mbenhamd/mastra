@@ -77,6 +77,7 @@ export const toolCallFilterProvider: ProcessorProvider = {
     exclude: z.array(z.string()).optional(),
     filterAfterToolSteps: z.number().optional(),
     preserveModelOutput: z.boolean().optional(),
+    maxModelOutputBytes: z.number().finite().nonnegative().optional(),
   }),
   availablePhases: ['processInput'] as ProcessorPhase[],
   createProcessor(config) {
