@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Added opt-in tool-call filtering for MessageHistory persistence and bounded compact model-output preservation for both MessageHistory and ToolCallFilter.
+Added opt-in tool-call filtering for messages saved by MessageHistory, plus configurable model-output byte limits for MessageHistory and ToolCallFilter.
 
 ```ts
 new MessageHistory({
