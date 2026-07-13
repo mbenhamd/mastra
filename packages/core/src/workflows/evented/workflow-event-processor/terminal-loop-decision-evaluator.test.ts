@@ -333,6 +333,65 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(condition).toHaveBeenCalledTimes(1);
   });
 
+  it('retains the key after a post-start external abort until the callback settles', async () => {
+    let started!: () => void;
+    const didStart = new Promise<void>(resolve => (started = resolve));
+    const condition = vi.fn(() => {
+      started();
+      return new Promise<boolean>(() => {});
+    });
+    const controller = new AbortController();
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    const first = evaluator.evaluate({ ...evaluation(condition), abortSignal: controller.signal });
+    await didStart;
+    controller.abort();
+    await expect(first).resolves.toMatchObject({ status: 'aborted' });
+    await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'aborted' });
+    expect(condition).toHaveBeenCalledTimes(1);
+    expect(evaluator.getStats()).toMatchObject({ retainedInFlight: 1, capacityExceeded: 0 });
+  });
+
+  it('retains the key when callback abort is followed by a non-settling promise', async () => {
+    const condition = vi.fn(({ abort }: any) => {
+      abort();
+      return new Promise<boolean>(() => {});
+    });
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'aborted' });
+    await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'aborted' });
+    expect(condition).toHaveBeenCalledTimes(1);
+    expect(evaluator.getStats().retainedInFlight).toBe(1);
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'evicts a post-abort key after the underlying callback settles late by %s',
+    async settlement => {
+      let started!: () => void;
+      const didStart = new Promise<void>(resolve => (started = resolve));
+      let resolveLate!: (value: boolean) => void;
+      let rejectLate!: (error: Error) => void;
+      const condition = vi.fn(() => {
+        if (condition.mock.calls.length > 1) return true;
+        started();
+        return new Promise<boolean>((resolve, reject) => {
+          resolveLate = resolve;
+          rejectLate = reject;
+        });
+      });
+      const controller = new AbortController();
+      const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+      const first = evaluator.evaluate({ ...evaluation(condition), abortSignal: controller.signal });
+      await didStart;
+      controller.abort();
+      await expect(first).resolves.toMatchObject({ status: 'aborted' });
+      if (settlement === 'resolve') resolveLate(false);
+      else rejectLate(new Error('late failure'));
+      await vi.waitFor(() => expect(evaluator.getStats().retainedInFlight).toBe(0));
+      await expect(evaluator.evaluate(evaluation(condition))).resolves.toMatchObject({ status: 'evaluated' });
+      expect(condition).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it('does not let failure, invalid output, or callback mismatch poison a later same-key attempt', async () => {
     const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
     const failed = vi.fn(async () => {
@@ -394,6 +453,38 @@ describe('evented workflow terminal loop decision evaluator', () => {
       status: 'capacity_exceeded',
     });
     expect(condition).toHaveBeenCalledTimes(256);
+    expect(evaluator.getStats()).toEqual({ size: 256, retainedInFlight: 256, capacityExceeded: 1 });
+  });
+
+  it('recovers capacity after all timed-out callbacks eventually settle', async () => {
+    vi.useFakeTimers();
+    const resolvers: Array<(value: boolean) => void> = [];
+    const condition = vi.fn(
+      () =>
+        new Promise<boolean>(resolve => {
+          resolvers.push(resolve);
+        }),
+    );
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+    const attempts = Array.from({ length: 256 }, (_, index) =>
+      evaluator.evaluate({
+        ...evaluation(condition, `sha256:${index.toString(16).padStart(64, '0')}`),
+        timeoutMs: 1,
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(Promise.all(attempts)).resolves.toHaveLength(256);
+    expect(evaluator.getStats().retainedInFlight).toBe(256);
+    for (const resolve of resolvers) resolve(false);
+    await vi.waitFor(() => expect(evaluator.getStats().size).toBe(0));
+
+    const fresh = evaluator.evaluate({
+      ...evaluation(condition, `sha256:${'d'.repeat(64)}`),
+      timeoutMs: 1,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(fresh).resolves.toMatchObject({ status: 'timed_out' });
+    expect(condition).toHaveBeenCalledTimes(257);
   });
 
   it('evicts completed successful decisions instead of rejecting fresh work at capacity', async () => {

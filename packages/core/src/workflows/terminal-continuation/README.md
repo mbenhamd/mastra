@@ -125,9 +125,13 @@ invalid return, denied capability use, input mutation, or capacity exhaustion as
 a typed non-decision. None of those outcomes can be passed to the planner or
 storage as `false`. Native abort intrinsics prevent hostile own `AbortSignal`
 properties from executing. A decision-key-local evaluator coalesces concurrent
-work in one process, retains successful decisions, and retains non-cooperative
-timeouts so redelivery cannot overlap the same callback there. The cache is
-bounded; aborts, failures, invalid results, registration mismatches, and
+work in one process and retains successful decisions. When abort or timeout wins
+after callback invocation, the key remains occupied until the underlying
+callback actually settles, so redelivery cannot overlap a non-cooperative
+attempt. Late values and errors are discarded; settlement releases the key and
+capacity. Permanently pending callbacks remain retained without a TTL. The cache
+is bounded and exposes retained-in-flight and capacity-exhaustion counters;
+pre-invocation aborts, failures, invalid results, registration mismatches, and
 unexpected evaluator rejections are evicted rather than poisoning a later
 same-key attempt.
 

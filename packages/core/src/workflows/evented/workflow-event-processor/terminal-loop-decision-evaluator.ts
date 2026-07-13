@@ -208,15 +208,36 @@ function callbackSourceMatches(
  * Executes one capability-reduced callback attempt. It never reads storage,
  * publishes an event, or converts a non-decision outcome into a boolean.
  */
-export async function evaluateEventedWorkflowTerminalLoopDecision(
+interface StartedLoopDecisionEvaluation {
+  result: Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult>;
+  callbackSettled: Promise<void>;
+  wasCallbackInvoked(): boolean;
+  isCallbackSettled(): boolean;
+}
+
+function startEventedWorkflowTerminalLoopDecision(
   input: EvaluateEventedWorkflowTerminalLoopDecisionInput,
-): Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult> {
+): StartedLoopDecisionEvaluation {
   const safeInput = copyEvaluationInput(input);
   const frame = safeInput.frame;
   const request = frame.request;
   const timeoutMs = timeout(safeInput.timeoutMs);
-  if (!callbackSourceMatches(safeInput, frame)) return { status: 'callback_mismatch', request };
-  if (safeInput.abortSignal && isSignalAborted(safeInput.abortSignal)) return { status: 'aborted', request };
+  if (!callbackSourceMatches(safeInput, frame)) {
+    return {
+      result: Promise.resolve({ status: 'callback_mismatch', request }),
+      callbackSettled: Promise.resolve(),
+      wasCallbackInvoked: () => false,
+      isCallbackSettled: () => true,
+    };
+  }
+  if (safeInput.abortSignal && isSignalAborted(safeInput.abortSignal)) {
+    return {
+      result: Promise.resolve({ status: 'aborted', request }),
+      callbackSettled: Promise.resolve(),
+      wasCallbackInvoked: () => false,
+      isCallbackSettled: () => true,
+    };
+  }
 
   const sandbox = copyWorkflowTerminalLoopConditionFrame(frame);
   const requestContext = new RequestContext(Object.entries(sandbox.requestContext) as any);
@@ -240,8 +261,11 @@ export async function evaluateEventedWorkflowTerminalLoopDecision(
   const pubsub = deniedCapability('PubSub');
   const engine = deniedCapability('workflow engine');
 
+  let callbackInvoked = false;
+  let callbackHasSettled = false;
   const callback = Promise.resolve().then(() => {
     if (controller.signal.aborted) return undefined;
+    callbackInvoked = true;
     return safeInput.condition({
       workflowId: sandbox.parentWorkflowName,
       runId: sandbox.parentRunId,
@@ -269,60 +293,87 @@ export async function evaluateEventedWorkflowTerminalLoopDecision(
     value => ({ type: 'resolved' as const, value }),
     error => ({ type: 'failed' as const, error }),
   );
+  const callbackSettled = settled.then(() => {
+    callbackHasSettled = true;
+  });
   const aborted = new Promise<{ type: 'aborted' }>(resolve => {
     addAbortListener(controller.signal, () => resolve({ type: 'aborted' }));
   });
 
-  try {
-    const outcome = await Promise.race([settled, aborted]);
-    if (outcome.type === 'aborted' || controller.signal.aborted) {
-      return { status: abortStatus, request };
-    }
-    let observation: string;
+  const result = (async (): Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult> => {
     try {
-      observation = evaluationObservation({
-        ...(sandbox.inputData === undefined ? {} : { inputData: sandbox.inputData }),
-        state: sandbox.state,
-        requestContext,
-        stepResults: sandbox.stepResults,
-        ...(sandbox.resumeData === undefined ? {} : { resumeData: sandbox.resumeData }),
-      });
-    } catch {
-      return { status: 'unsupported_mutation', request };
-    }
-    if (observation !== baseline) return { status: 'unsupported_mutation', request };
-    if (outcome.type === 'failed') {
+      const outcome = await Promise.race([settled, aborted]);
+      if (outcome.type === 'aborted' || controller.signal.aborted) {
+        return { status: abortStatus, request };
+      }
+      let observation: string;
+      try {
+        observation = evaluationObservation({
+          ...(sandbox.inputData === undefined ? {} : { inputData: sandbox.inputData }),
+          state: sandbox.state,
+          requestContext,
+          stepResults: sandbox.stepResults,
+          ...(sandbox.resumeData === undefined ? {} : { resumeData: sandbox.resumeData }),
+        });
+      } catch {
+        return { status: 'unsupported_mutation', request };
+      }
+      if (observation !== baseline) return { status: 'unsupported_mutation', request };
+      if (outcome.type === 'failed') {
+        return {
+          status: outcome.error instanceof UnsupportedDurableLoopConditionEffect ? 'unsupported_effect' : 'failed',
+          request,
+        };
+      }
+      if (typeof outcome.value !== 'boolean') return { status: 'invalid_result', request };
       return {
-        status: outcome.error instanceof UnsupportedDurableLoopConditionEffect ? 'unsupported_effect' : 'failed',
+        status: 'evaluated',
         request,
+        evaluatedDecision: completeWorkflowTerminalLoopDecision(request, outcome.value),
       };
+    } finally {
+      clearTimeout(timer);
+      if (safeInput.abortSignal) removeAbortListener(safeInput.abortSignal, onExternalAbort);
     }
-    if (typeof outcome.value !== 'boolean') return { status: 'invalid_result', request };
-    return {
-      status: 'evaluated',
-      request,
-      evaluatedDecision: completeWorkflowTerminalLoopDecision(request, outcome.value),
-    };
-  } finally {
-    clearTimeout(timer);
-    if (safeInput.abortSignal) removeAbortListener(safeInput.abortSignal, onExternalAbort);
-  }
+  })();
+  return {
+    result,
+    callbackSettled,
+    wasCallbackInvoked: () => callbackInvoked,
+    isCallbackSettled: () => callbackHasSettled,
+  };
+}
+
+export async function evaluateEventedWorkflowTerminalLoopDecision(
+  input: EvaluateEventedWorkflowTerminalLoopDecisionInput,
+): Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult> {
+  return startEventedWorkflowTerminalLoopDecision(input).result;
 }
 
 interface EvaluationEntry {
   promise: Promise<EventedWorkflowTerminalLoopDecisionEvaluationResult>;
-  retained: false | 'evaluated' | 'timed_out';
+  retained: false | 'evaluated' | 'in_flight';
+  isCallbackSettled(): boolean;
 }
 
 /**
- * Bounded process-local coalescing. Only successful decisions and timed-out
- * non-decisions are retained; caller aborts, failures, and invalid inputs cannot
- * poison a later same-key attempt. Timed-out entries deliberately have no TTL:
- * JavaScript cannot terminate a non-cooperative callback, so expiring one could
- * overlap the still-running same-key attempt. Capacity exhaustion fails closed.
+ * Bounded process-local coalescing. Successful decisions remain reusable, while
+ * aborts/timeouts retain their decision key only until the invoked callback
+ * actually settles. JavaScript cannot terminate a non-cooperative callback, so
+ * a permanently pending callback remains retained without a TTL. Capacity
+ * exhaustion fails closed and is exposed through getStats().
  */
 export class EventedWorkflowTerminalLoopDecisionEvaluator {
   readonly #evaluations = new Map<string, EvaluationEntry>();
+  #capacityExceeded = 0;
+
+  getStats(): { size: number; retainedInFlight: number; capacityExceeded: number } {
+    let retainedInFlight = 0;
+    for (const entry of this.#evaluations.values()) {
+      if (entry.retained === 'in_flight') retainedInFlight++;
+    }
+    return { size: this.#evaluations.size, retainedInFlight, capacityExceeded: this.#capacityExceeded };
+  }
 
   evaluate(
     input: EvaluateEventedWorkflowTerminalLoopDecisionInput,
@@ -331,23 +382,41 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
     const frame = safeInput.frame;
     const key = frame.request.decisionKey;
     const existing = this.#evaluations.get(key);
-    if (existing) return existing.promise;
+    if (existing) {
+      if (existing.retained === 'in_flight' && existing.isCallbackSettled()) {
+        this.#evaluations.delete(key);
+      } else {
+        return existing.promise;
+      }
+    }
     this.#evictCompleted();
     if (this.#evaluations.size >= MAX_PROCESS_LOCAL_LOOP_DECISIONS) {
+      this.#capacityExceeded++;
       return Promise.resolve({ status: 'capacity_exceeded', request: frame.request });
     }
+    const started = startEventedWorkflowTerminalLoopDecision(safeInput);
     const entry: EvaluationEntry = {
-      promise: evaluateEventedWorkflowTerminalLoopDecision(safeInput),
+      promise: started.result,
       retained: false,
+      isCallbackSettled: started.isCallbackSettled,
     };
     this.#evaluations.set(key, entry);
     void entry.promise.then(
       result => {
         const current = this.#evaluations.get(key);
         if (current !== entry) return;
-        if (result.status === 'evaluated' || result.status === 'timed_out') {
-          entry.retained = result.status;
+        if (result.status === 'evaluated') {
+          entry.retained = 'evaluated';
           this.#evictCompleted();
+        } else if (
+          (result.status === 'aborted' || result.status === 'timed_out') &&
+          started.wasCallbackInvoked() &&
+          !started.isCallbackSettled()
+        ) {
+          entry.retained = 'in_flight';
+          void started.callbackSettled.then(() => {
+            if (this.#evaluations.get(key) === entry) this.#evaluations.delete(key);
+          });
         } else {
           this.#evaluations.delete(key);
         }
