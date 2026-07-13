@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { MastraScorer, MastraScorerEntry } from '../../../evals/base';
 import { runScorer } from '../../../evals/hooks';
 import type { PubSub } from '../../../events/pubsub';
+import { validateMaxSteps } from '../../../llm/model/max-steps';
+import type { IMastraLogger } from '../../../logger';
 import type { Mastra } from '../../../mastra';
 import { createObservabilityContext, InternalSpans } from '../../../observability';
 import { RequestContext } from '../../../request-context';
@@ -87,7 +89,9 @@ type IterationState = z.infer<typeof iterationStateSchema>;
  * All state flows through workflow input/output, making it durable across
  * process restarts and execution engine replays.
  */
-export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOptions) {
+export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOptions, logger?: IMastraLogger) {
+  validateMaxSteps(options?.maxSteps, logger);
+
   const maxSteps = options?.maxSteps ?? DurableAgentDefaults.MAX_STEPS;
 
   // Create the LLM execution step - tools and model are resolved from Mastra at runtime
@@ -217,6 +221,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
       .map(
         async ({ inputData }) => {
           const input = inputData as DurableAgenticWorkflowInput;
+          validateMaxSteps(input.options?.maxSteps, logger);
           const iterationState: IterationState = {
             ...input,
             iterationCount: 0,

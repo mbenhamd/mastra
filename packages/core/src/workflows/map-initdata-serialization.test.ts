@@ -106,10 +106,10 @@ describe('map(): initData mapping does not serialize the live workflow (#19018)'
     expect(mapConfig).not.toContain('"stepFlow"');
     expect(mapConfig).not.toContain('"serializedStepFlow"');
 
-    // It should hold the slim reference: the source workflow's id + the path.
-    expect(mapConfig).toContain('"initData"');
-    expect(mapConfig).toContain('init-source-workflow');
-    expect(mapConfig).toContain('"path"');
+    // It should hold exactly the slim reference: the source workflow's id + the path.
+    expect(JSON.parse(mapConfig)).toEqual({
+      seed: { initData: 'init-source-workflow', path: 'seed' },
+    });
   });
 
   it('is small — not the multi-KB blob a serialized workflow produces', () => {

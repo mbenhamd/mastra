@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Agent } from './index';
 
 describe('Agent maxSteps validation', () => {
-  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
     'rejects invalid maxSteps %s before calling the provider',
     async maxSteps => {
       const doStream = vi.fn();

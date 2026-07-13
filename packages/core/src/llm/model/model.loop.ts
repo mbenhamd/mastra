@@ -11,6 +11,7 @@ import type { MastraModelOutput } from '../../stream/base/output';
 import type { ModelManagerModelConfig } from '../../stream/types';
 import { delay } from '../../utils';
 
+import { validateMaxSteps } from './max-steps';
 import type { ModelLoopStreamArgs } from './model.loop.types';
 import { resolveResponseModelId } from './server-side-fallback';
 import type { MastraModelOptions } from './shared.types';
@@ -147,15 +148,7 @@ export class MastraLLMVNext extends MastraBase {
     ...rest
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     const observabilityContext = resolveObservabilityContext(rest);
-    if (maxSteps !== undefined && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
-      throw new MastraError({
-        id: 'LLM_INVALID_MAX_STEPS',
-        domain: ErrorDomain.LLM,
-        category: ErrorCategory.USER,
-        text: 'maxSteps must be a positive safe integer',
-        details: { maxSteps },
-      });
-    }
+    validateMaxSteps(maxSteps, this.logger);
     // `maxSteps` is sugar for the stop condition `stepCountIs(maxSteps)`. When a
     // custom `stopWhen` is also provided, compose the two (the loop ORs stop
     // conditions) instead of letting the maxSteps cap replace the user's

@@ -77,18 +77,21 @@ describe('MastraLLMVNext stop conditions', () => {
     expect(stopWhen.slice(1)).toEqual([firstStop, secondStop]);
   });
 
-  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid maxSteps %s', maxSteps => {
-    expect(() =>
-      createModel().stream({
-        messageList,
-        requestContext: {} as never,
-        tracingContext: {},
-        methodType: 'stream',
-        maxSteps,
-      } as never),
-    ).toThrow('maxSteps must be a positive safe integer');
-    expect(loopMock).not.toHaveBeenCalled();
-  });
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid maxSteps %s',
+    maxSteps => {
+      expect(() =>
+        createModel().stream({
+          messageList,
+          requestContext: {} as never,
+          tracingContext: {},
+          methodType: 'stream',
+          maxSteps,
+        } as never),
+      ).toThrow('maxSteps must be a positive safe integer');
+      expect(loopMock).not.toHaveBeenCalled();
+    },
+  );
 
   it('uses a monotonic cap for restored step counts already above maxSteps', async () => {
     createModel().stream({

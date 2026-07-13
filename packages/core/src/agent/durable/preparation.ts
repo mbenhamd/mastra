@@ -1,4 +1,5 @@
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
+import { validateMaxSteps } from '../../llm/model/max-steps';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
@@ -117,6 +118,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     logger,
     mastra,
   } = options;
+
+  validateMaxSteps(execOptions?.maxSteps, logger);
 
   const typedAgent = agent as unknown as DurablePreparationAgent;
 
