@@ -2408,6 +2408,17 @@ describe('Memory', () => {
       await expect(memoryStore.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
     });
 
+    it('fails explicitly when the storage adapter predates resource deletion support', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({ storage });
+      const memoryStore = (await storage.getStore('memory'))!;
+      Object.defineProperty(memoryStore, 'deleteResource', { configurable: true, value: undefined });
+
+      await expect(memory.deleteResource('resource-delete')).rejects.toThrow(
+        'Resource deletion is not implemented by this storage adapter',
+      );
+    });
+
     it('waits for an in-flight resource working memory write before deleting the resource', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({

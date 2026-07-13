@@ -689,7 +689,14 @@ export class Memory extends MastraMemory {
   async deleteResource(resourceId: string): Promise<void> {
     await this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
       const memoryStore = await this.getMemoryStore();
-      await memoryStore.deleteResource({ resourceId });
+      const deleteResource = memoryStore.deleteResource;
+      if (typeof deleteResource !== 'function') {
+        throw new Error(
+          `Resource deletion is not implemented by this storage adapter (${memoryStore.constructor.name}). ` +
+            `The deleteResource method needs to be implemented in the storage adapter.`,
+        );
+      }
+      await deleteResource.call(memoryStore, { resourceId });
     });
   }
 
