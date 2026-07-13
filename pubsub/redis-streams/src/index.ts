@@ -260,11 +260,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async #advanceReclaimedMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
     let event: Event;
     try {
-      const parsed: unknown = JSON.parse(fields.event ?? '{}');
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new TypeError('reclaimed event payload must be an object');
-      }
-      event = parsed as Event;
+      event = this.#parseEvent(fields);
     } catch {
       // Reuse the normal malformed-payload path, which logs and acknowledges
       // the poison entry without invoking user code.
@@ -302,6 +298,19 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
       } satisfies Event),
     };
     await this.#deliverMessage(sub, streamId, reclaimedFields);
+  }
+
+  #parseEvent(fields: Record<string, string>): Event {
+    const parsed: unknown = JSON.parse(fields.event ?? '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('event payload must be an object');
+    }
+
+    const event = parsed as Event;
+    if (typeof event.createdAt === 'string') {
+      event.createdAt = new Date(event.createdAt);
+    }
+    return event;
   }
 
   async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
@@ -529,11 +538,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async #deliverMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
     let event: Event;
     try {
-      event = JSON.parse(fields.event ?? '{}') as Event;
-      // createdAt is serialized as a string; rehydrate.
-      if (typeof event.createdAt === 'string') {
-        event.createdAt = new Date(event.createdAt);
-      }
+      event = this.#parseEvent(fields);
     } catch (err) {
       this.#logger?.debug?.('redis-streams: malformed payload, dropping', {
         topic: sub.topic,

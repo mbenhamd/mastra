@@ -21,17 +21,17 @@ function makeEvent(overrides: Partial<Omit<Event, 'id' | 'createdAt'>> = {}): Om
  * Throws if the timeout is hit.
  */
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   opts: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 5000;
   const intervalMs = opts.intervalMs ?? 25;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise(r => setTimeout(r, intervalMs));
   }
-  if (!predicate()) {
+  if (!(await predicate())) {
     throw new Error(`waitFor timed out after ${timeoutMs}ms`);
   }
 }
@@ -402,15 +402,80 @@ describe('RedisStreamsPubSub', () => {
       expect(settledGroupEvents).toHaveLength(1);
     });
 
-    it('acknowledges a reclaimed non-object JSON payload without invoking the subscriber', async () => {
-      const topic = `t-null-${randomUUID()}`;
+    it('counts repeated crash reclaims and drops the entry after the delivery cap', async () => {
+      const warnings: Array<{ message: string; metadata: unknown }> = [];
+      const makeConsumer = (captureWarnings = false) =>
+        new RedisStreamsPubSub({
+          url: REDIS_URL,
+          blockMs: 100,
+          reclaimIntervalMs: 50,
+          reclaimIdleMs: 100,
+          maxDeliveryAttempts: 3,
+          logger: captureWarnings
+            ? {
+                warn: (message, metadata) => warnings.push({ message: String(message), metadata }),
+              }
+            : undefined,
+        });
+      const consumers = [makeConsumer(), makeConsumer(), makeConsumer(), makeConsumer(true)];
+      pubsubs.push(...consumers);
+
+      const topic = `t-reclaim-cap-${randomUUID()}`;
       const streamKey = `mastra:topic:${topic}`;
-      const groupName = `claim-null-${randomUUID()}`;
+      const groupName = `claim-cap-${randomUUID()}`;
+      const seenAttempts: number[][] = [[], [], [], []];
+
+      for (let index = 0; index < 3; index++) {
+        const cb: EventCallback = event => {
+          seenAttempts[index]!.push(event.deliveryAttempt ?? 0);
+          // Simulate a worker crash: leave the entry pending.
+        };
+        await consumers[index]!.subscribe(topic, cb, { group: groupName });
+        if (index === 0) {
+          await consumers[index]!.publish(topic, makeEvent({ type: 'reclaim-cap' }));
+        }
+        await waitFor(() => seenAttempts[index]!.length === 1, { timeoutMs: 5000 });
+        await consumers[index]!.unsubscribe(topic, cb);
+      }
+
+      const finalCb: EventCallback = event => {
+        seenAttempts[3]!.push(event.deliveryAttempt ?? 0);
+      };
+      await consumers[3]!.subscribe(topic, finalCb, { group: groupName });
+      await waitFor(() => warnings.some(entry => entry.message.includes('dropping crash-reclaimed event')), {
+        timeoutMs: 5000,
+      });
+
+      expect(seenAttempts).toEqual([[1], [2], [3], []]);
+      expect(warnings).toContainEqual({
+        message: 'redis-streams: dropping crash-reclaimed event after max delivery attempts',
+        metadata: expect.objectContaining({ attempt: 4, max: 3 }),
+      });
+
+      const inspector = createClient({ url: REDIS_URL }) as RedisClientType;
+      await inspector.connect();
+      try {
+        await waitFor(async () => (await inspector.xPending(streamKey, groupName)).pending === 0, { timeoutMs: 5000 });
+      } finally {
+        await inspector.quit();
+      }
+    });
+
+    it.each([
+      ['null', 'null'],
+      ['array', '[]'],
+      ['string', '"invalid"'],
+      ['number', '42'],
+      ['boolean', 'true'],
+    ])('acknowledges a reclaimed %s JSON payload without invoking the subscriber', async (_label, payload) => {
+      const topic = `t-invalid-${randomUUID()}`;
+      const streamKey = `mastra:topic:${topic}`;
+      const groupName = `claim-invalid-${randomUUID()}`;
       const direct = createClient({ url: REDIS_URL }) as RedisClientType;
       await direct.connect();
       try {
         await direct.xGroupCreate(streamKey, groupName, '0', { MKSTREAM: true });
-        await direct.xAdd(streamKey, '*', { event: 'null' });
+        await direct.xAdd(streamKey, '*', { event: payload });
         await direct.xReadGroup(groupName, 'abandoned-consumer', [{ key: streamKey, id: '>' }], { COUNT: 1 });
       } finally {
         await direct.quit();
