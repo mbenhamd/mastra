@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Workflow storage now exposes version 1 graph-bound atomic parent terminal application. A fenced runtime reads the effect-derived parent context, creates a PF-1781 continuation contract, atomically applies its pure parent patch with the canonical receipt and committed contract, and recovers the exact stored action after restart:
+Workflow storage can now recover a nested workflow's terminal outcome and apply it to the parent exactly once, including after a process restart:
 
 ```ts
 const parent = await workflowsStorage.getWorkflowTerminalParentContext({
@@ -25,4 +25,4 @@ const applied = await workflowsStorage.applyWorkflowTerminalParentEffect({
 });
 ```
 
-The API uses the fixed `mastra.parent-application.v1` consumer, rejects raw PubSub targets and redundant parent identifiers, returns explicit CAS and redacted contract conflicts without orphan evidence, and never executes workflow conditions or user callbacks inside storage. In-memory storage uses monotonic tombstone revisions so delete/recreate cannot revive an old planning context.
+Retries return the same stored result without applying the outcome twice. Conflicting or stale requests return clear results without leaving partial state. Storage does not run workflow conditions or user callbacks while applying the outcome.
