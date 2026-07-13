@@ -126,6 +126,12 @@ const TABLE_WORKFLOW_TERMINAL_RECOVERY_ANCESTRIES = 'mastra_workflow_terminal_re
 const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_destination_receipts';
 const TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS = 'mastra_workflow_terminal_continuation_plans_v2';
 const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
+const TERMINAL_WORKFLOW_RUN_STATUSES = ['success', 'failed', 'canceled', 'tripwire', 'bailed'] as const;
+type TerminalWorkflowRunStatus = (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number];
+
+function isTerminalWorkflowRunStatus(value: unknown): value is TerminalWorkflowRunStatus {
+  return typeof value === 'string' && TERMINAL_WORKFLOW_RUN_STATUSES.includes(value as TerminalWorkflowRunStatus);
+}
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -263,7 +269,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     t: TxClient,
     workflowName: string,
     runId: string,
-  ): Promise<{ generation: number; created: boolean }> {
+  ): Promise<{ generation: number; created: boolean; terminalStatus: TerminalWorkflowRunStatus | null }> {
     const inserted = await t.oneOrNone<{ generation: number | string }>(
       `INSERT INTO ${this.workflowParentRevisionTableName()}
        (workflow_name, run_id, generation, updated_at)
@@ -272,8 +278,8 @@ export class WorkflowsPG extends WorkflowsStorage {
        RETURNING generation`,
       [workflowName, runId],
     );
-    const row = await t.one<{ generation: number | string }>(
-      `SELECT generation FROM ${this.workflowParentRevisionTableName()}
+    const row = await t.one<{ generation: number | string; terminal_status: string | null }>(
+      `SELECT generation, terminal_status FROM ${this.workflowParentRevisionTableName()}
        WHERE workflow_name = $1 AND run_id = $2
        FOR UPDATE`,
       [workflowName, runId],
@@ -282,7 +288,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (!Number.isSafeInteger(generation) || generation < 0) {
       throw new TypeError('Invalid workflow parent revision generation');
     }
-    return { generation, created: inserted !== null };
+    if (row.terminal_status !== null && !isTerminalWorkflowRunStatus(row.terminal_status)) {
+      throw new TypeError('Invalid workflow parent terminal status');
+    }
+    return { generation, created: inserted !== null, terminalStatus: row.terminal_status };
   }
 
   private async lockWorkflowParentRevision(t: TxClient, workflowName: string, runId: string): Promise<number> {
@@ -298,14 +307,42 @@ export class WorkflowsPG extends WorkflowsStorage {
     const next = generation + 1;
     if (!Number.isSafeInteger(next)) throw new TypeError('Workflow parent revision exhausted');
     const result = await t.query(
-      `UPDATE ${this.workflowParentRevisionTableName()}
+      `UPDATE ${this.workflowParentRevisionTableName()} AS revision
        SET generation = $1,
+           terminal_status = COALESCE(
+             revision.terminal_status,
+             (
+               SELECT CASE
+                 WHEN snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+                   THEN snapshot.snapshot->>'status'
+                 ELSE NULL
+               END
+               FROM ${this.workflowSnapshotTableName()} AS snapshot
+               WHERE snapshot.workflow_name = $2 AND snapshot.run_id = $3
+             )
+           ),
            updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
        WHERE workflow_name = $2 AND run_id = $3 AND generation = $4`,
       [next, workflowName, runId, generation],
     );
     if ((result.rowCount ?? 0) !== 1) throw new TypeError('Workflow parent revision conflict');
     return next;
+  }
+
+  private async latchWorkflowParentTerminalStatus(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    terminalStatus: TerminalWorkflowRunStatus,
+  ): Promise<void> {
+    const result = await t.query(
+      `UPDATE ${this.workflowParentRevisionTableName()}
+       SET terminal_status = COALESCE(terminal_status, $1),
+           updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+       WHERE workflow_name = $2 AND run_id = $3`,
+      [terminalStatus, workflowName, runId],
+    );
+    if ((result.rowCount ?? 0) !== 1) throw new TypeError('Workflow parent terminal marker is unavailable');
   }
 
   private decodeTerminalizationRow(row: Record<string, unknown>, now: number): WorkflowTerminalizationRecord {
@@ -1084,6 +1121,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           const parentEvidence = await t.one<{
             journal_exists: boolean;
             snapshot: unknown | null;
+            terminal_status: string | null;
           }>(
             `SELECT
                EXISTS (
@@ -1093,7 +1131,12 @@ export class WorkflowsPG extends WorkflowsStorage {
                (
                  SELECT snapshot FROM ${this.workflowSnapshotTableName()}
                  WHERE workflow_name = $1 AND run_id = $2
-               ) AS snapshot`,
+               ) AS snapshot,
+               (
+                 SELECT terminal_status FROM ${this.workflowParentRevisionTableName()}
+                 WHERE workflow_name = $1 AND run_id = $2
+                 FOR UPDATE
+               ) AS terminal_status`,
             [frame.parentWorkflowName, frame.parentRunId],
           );
           let parentSnapshot = parentEvidence.snapshot;
@@ -1103,8 +1146,9 @@ export class WorkflowsPG extends WorkflowsStorage {
               ? (parentSnapshot as Record<string, unknown>).status
               : undefined;
           if (
-            !parentEvidence.journal_exists &&
-            (parentStatus === undefined || ['success', 'failed', 'canceled'].includes(String(parentStatus)))
+            parentEvidence.terminal_status !== null ||
+            (!parentEvidence.journal_exists &&
+              (parentStatus === undefined || isTerminalWorkflowRunStatus(parentStatus)))
           ) {
             throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
           }
@@ -1771,6 +1815,7 @@ export class WorkflowsPG extends WorkflowsStorage {
             operation.workflowName,
             operation.runId,
           );
+          validateWorkflowTerminalEffectRecoveryLink(effect!, retained);
           return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(result.receipt) };
         }
         return 'record' in result
@@ -2378,9 +2423,11 @@ export class WorkflowsPG extends WorkflowsStorage {
       "workflow_name" TEXT NOT NULL,
       "run_id" TEXT NOT NULL,
       "generation" BIGINT NOT NULL,
+      "terminal_status" TEXT,
       "updated_at" BIGINT NOT NULL,
       PRIMARY KEY ("workflow_name", "run_id"),
       CHECK ("generation" >= 0),
+      CHECK ("terminal_status" IS NULL OR "terminal_status" IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')),
       CHECK ("updated_at" >= 0)
     );`;
   }
@@ -2469,12 +2516,31 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getTerminalDestinationReceiptTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionTableDDL(this.#schema));
     await this.#db.client.none(
+      `ALTER TABLE ${this.workflowParentRevisionTableName()}
+       ADD COLUMN IF NOT EXISTS terminal_status TEXT
+       CHECK (terminal_status IS NULL OR terminal_status IN ('success', 'failed', 'canceled', 'tripwire', 'bailed'))`,
+    );
+    await this.#db.client.none(
       `INSERT INTO ${this.workflowParentRevisionTableName()}
-       (workflow_name, run_id, generation, updated_at)
+       (workflow_name, run_id, generation, terminal_status, updated_at)
        SELECT workflow_name, run_id, 1,
+         CASE
+           WHEN snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')
+             THEN snapshot->>'status'
+           ELSE NULL
+         END,
          floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
        FROM ${this.workflowSnapshotTableName()}
        ON CONFLICT (workflow_name, run_id) DO NOTHING`,
+    );
+    await this.#db.client.none(
+      `UPDATE ${this.workflowParentRevisionTableName()} AS revision
+       SET terminal_status = snapshot.snapshot->>'status'
+       FROM ${this.workflowSnapshotTableName()} AS snapshot
+       WHERE revision.workflow_name = snapshot.workflow_name
+         AND revision.run_id = snapshot.run_id
+         AND revision.terminal_status IS NULL
+         AND snapshot.snapshot->>'status' IN ('success', 'failed', 'canceled', 'tripwire', 'bailed')`,
     );
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
@@ -2689,15 +2755,10 @@ export class WorkflowsPG extends WorkflowsStorage {
           }
           return { status: 'missing_run' };
         }
+        if (revisionLock.terminalStatus !== null) return { status: 'parent_terminal' };
         const snapshot = typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot;
-        if (snapshot.status === 'success' || snapshot.status === 'failed' || snapshot.status === 'canceled') {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2`,
-              [operation.workflowName, operation.runId],
-            );
-          }
+        if (isTerminalWorkflowRunStatus(snapshot.status)) {
+          await this.latchWorkflowParentTerminalStatus(t, operation.workflowName, operation.runId, snapshot.status);
           return { status: 'parent_terminal' };
         }
         const revision = revisionLock.generation;

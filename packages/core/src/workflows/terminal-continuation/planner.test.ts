@@ -910,7 +910,7 @@ describe('workflow terminal parent continuation planner', () => {
     const parent = snapshot(graph);
     (parent.context.nested as any).metadata.iterationCount = 3;
     expect(createWorkflowTerminalLoopDecisionRequest(input(parent)).decisionKey).toBe(
-      'sha256:4d54157d5b67f421b87ed4a54af5679ab015e451cf7d4ce20d5c2e306891ffe3',
+      'sha256:c178caa655135b19cf705eb9780df56ac386d24d3817bc3a38ff00b3dba44c05',
     );
 
     const wrongOwner = structuredClone(parent);
@@ -919,7 +919,7 @@ describe('workflow terminal parent continuation planner', () => {
       action: {
         kind: 'quarantine',
         reason: 'plan-conflict',
-        conflictDigest: 'sha256:e979778c41752e4b80aa24f719d8dab4fdc532830c0aeded669885d5c52ca88a',
+        conflictDigest: 'sha256:629084ad195fd98810262b2bf6bba1032d360dde2eebbd843ac29d576669cfed',
       },
     });
   });

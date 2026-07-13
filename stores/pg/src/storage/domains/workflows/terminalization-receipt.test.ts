@@ -4,6 +4,7 @@ import {
   createEmptyWorkflowSnapshot,
   createWorkflowTerminalGraphFingerprint,
 } from '@mastra/core/storage';
+import { getWorkflowTerminalRecoveryEnvelopeHash } from '@mastra/core/workflows';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -331,6 +332,40 @@ describe('WorkflowsPG terminal destination receipts', () => {
     const stale = { ...input, claimToken: 'stale-token' };
 
     try {
+      const retained = await pool.query<{ envelope_hash: string; envelope: unknown }>(
+        `SELECT envelope_hash, envelope FROM mastra_workflow_terminal_snapshots_v2
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, ready.run.runId],
+      );
+      const currentSnapshot = await workflowsA.loadWorkflowSnapshot(ready.run);
+      if (!currentSnapshot) throw new Error('Expected retained workflow snapshot');
+      const replacementEnvelope = createTerminalRecoveryEnvelope({
+        ...ready.run,
+        snapshot: currentSnapshot,
+        terminalStatus: 'failed',
+        terminalResult: { status: 'failed', error: 'replacement terminal result' },
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope_hash = $1, envelope = $2
+         WHERE workflow_name = $3 AND run_id = $4`,
+        [
+          getWorkflowTerminalRecoveryEnvelopeHash(replacementEnvelope),
+          JSON.stringify(replacementEnvelope),
+          workflowName,
+          ready.run.runId,
+        ],
+      );
+      await expect(workflowsA.getWorkflowTerminalDestinationReceipt(input)).rejects.toThrow(
+        'Invalid workflow terminal effect recovery link',
+      );
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope_hash = $1, envelope = $2
+         WHERE workflow_name = $3 AND run_id = $4`,
+        [retained.rows[0]!.envelope_hash, JSON.stringify(retained.rows[0]!.envelope), workflowName, ready.run.runId],
+      );
+
       await pool.query(
         `UPDATE mastra_workflow_terminal_effects_v2 SET payload_hash = $1
          WHERE workflow_name = $2 AND run_id = $3 AND effect_kind = $4`,

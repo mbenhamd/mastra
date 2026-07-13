@@ -1884,6 +1884,8 @@ describe('WorkflowsPG terminalization journal', () => {
       const revisionDDL = exportDDL.find(statement => statement.includes('mastra_workflow_parent_revisions'))!;
       expect(revisionDDL).toContain('PRIMARY KEY ("workflow_name", "run_id")');
       expect(revisionDDL).toContain('"generation" BIGINT NOT NULL');
+      expect(revisionDDL).toContain('"terminal_status" TEXT');
+      expect(revisionDDL).toContain("'tripwire', 'bailed'");
     } finally {
       await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     }

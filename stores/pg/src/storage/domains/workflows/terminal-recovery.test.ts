@@ -721,6 +721,65 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
     },
   );
 
+  it('retains terminal ancestry evidence after journal cleanup and a running snapshot rewrite', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `terminal-marker-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `terminal-marker-child-${suffix}`, runId: 'child-run' };
+    try {
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+      const fence = await claim(workflowsA, parent, 'failed');
+      const terminalSnapshot: WorkflowRunState = {
+        ...createParentSnapshot(parent.runId),
+        status: 'failed',
+        context: { __state: { terminal: true } } as WorkflowRunState['context'],
+        value: { terminal: true },
+      };
+      await workflowsA.persistWorkflowTerminalState({
+        ...fence,
+        snapshot: terminalSnapshot,
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...parent,
+          snapshot: terminalSnapshot,
+          terminalStatus: 'failed',
+        }),
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminalizations
+         SET phase = 'complete', owner_id = NULL, claim_token = NULL, lease_expires_at = NULL,
+             completed_at = updated_at
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      await expect(
+        workflowsA.deleteCompletedWorkflowTerminalizations({
+          ...parent,
+          olderThan: new Date(Date.now() + 60_000),
+        }),
+      ).resolves.toEqual({ status: 'deleted', count: 1 });
+
+      await workflowsB.persistWorkflowSnapshot({
+        ...parent,
+        snapshot: { ...createParentSnapshot(parent.runId), status: 'running' },
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toMatchObject({ status: 'running' });
+      await expect(
+        workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry: ancestry(child, parent) }),
+      ).rejects.toThrow('Workflow terminal recovery ancestry parent evidence is unavailable');
+      await expect(workflowsB.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toEqual({
+        status: 'parent_terminal',
+      });
+
+      const marker = await pool.query<{ terminal_status: string | null }>(
+        `SELECT terminal_status FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(marker.rows).toEqual([{ terminal_status: 'failed' }]);
+    } finally {
+      await cleanup([child.workflowName, parent.workflowName]);
+    }
+  });
+
   it('rejects admission for a missing parent without retaining a revision row', async () => {
     const suffix = randomUUID();
     const parent = { workflowName: `missing-parent-${suffix}`, runId: 'parent-run' };
