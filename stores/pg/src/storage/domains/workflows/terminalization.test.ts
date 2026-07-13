@@ -1381,6 +1381,10 @@ describe('WorkflowsPG terminalization journal', () => {
       if (claim.status !== 'acquired') throw new Error('claim failed');
       const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
       const validRecovery = recoveryEnvelope(validSnapshot, run, 'failed');
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        run.workflowName,
+        run.runId,
+      ]);
       await expect(
         workflowsA.persistWorkflowTerminalState({
           ...run,
@@ -1415,6 +1419,16 @@ describe('WorkflowsPG terminalization journal', () => {
           recoveryEnvelope: validRecovery,
         }),
       ).resolves.toEqual({ status: 'invalid_snapshot' });
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot: validSnapshot,
+          recoveryEnvelope: undefined as never,
+        }),
+      ).resolves.toEqual({ status: 'invalid_recovery_envelope' });
       await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
         status: 'found',
         record: { phase: 'terminalization_pending' },
@@ -1426,6 +1440,54 @@ describe('WorkflowsPG terminalization journal', () => {
         [run.workflowName, run.runId],
       );
       expect(retained.rows[0]?.count).toBe('0');
+      const revision = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(revision.rowCount).toBe(0);
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('seeds a missing parent revision when terminal persistence succeeds', async () => {
+    const workflowName = `terminalization-revision-seed-${randomUUID()}`;
+    const runId = 'run';
+    const run = { workflowName, runId };
+    await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
+
+    try {
+      const claim = await workflowsA.claimWorkflowTerminalization({
+        ...run,
+        eventKey: 'terminal-event',
+        terminalStatus: 'failed',
+        ownerId: 'worker',
+        leaseMs: 10_000,
+      });
+      if (claim.status !== 'acquired') throw new Error('claim failed');
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        run.workflowName,
+        run.runId,
+      ]);
+      const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot,
+          recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
+      const revision = await pool.query<{ generation: string; terminal_status: string | null }>(
+        `SELECT generation::text, terminal_status FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(revision.rows).toEqual([{ generation: '1', terminal_status: 'failed' }]);
     } finally {
       await cleanup(workflowName);
     }

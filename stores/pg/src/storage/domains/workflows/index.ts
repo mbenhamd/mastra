@@ -1607,19 +1607,21 @@ export class WorkflowsPG extends WorkflowsStorage {
           operation.workflowName,
           operation.runId,
         );
+        const deleteCreatedRevision = async (): Promise<void> => {
+          if (!revisionLock.created) return;
+          await t.none(
+            `DELETE FROM ${this.workflowParentRevisionTableName()}
+             WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
+            [operation.workflowName, operation.runId],
+          );
+        };
         const snapshotRow = await t.oneOrNone<{ resource_id: unknown }>(
           `SELECT "resourceId" AS resource_id FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
         if (!snapshotRow) {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2`,
-              [operation.workflowName, operation.runId],
-            );
-          }
+          await deleteCreatedRevision();
           return { status: 'missing_run' };
         }
         const ancestryRow = await t.oneOrNone<Record<string, unknown>>(
@@ -1639,7 +1641,10 @@ export class WorkflowsPG extends WorkflowsStorage {
             return { status: 'invalid_snapshot' };
           }
         })();
-        if (snapshotCapture.status === 'invalid_snapshot') return snapshotCapture;
+        if (snapshotCapture.status === 'invalid_snapshot') {
+          await deleteCreatedRevision();
+          return snapshotCapture;
+        }
         const recoveryCapture:
           | { status: 'captured'; value: WorkflowTerminalRecoveryEnvelopeV1 }
           | { status: 'invalid_recovery_envelope' } = (() => {
@@ -1649,7 +1654,10 @@ export class WorkflowsPG extends WorkflowsStorage {
             return { status: 'invalid_recovery_envelope' };
           }
         })();
-        if (recoveryCapture.status === 'invalid_recovery_envelope') return recoveryCapture;
+        if (recoveryCapture.status === 'invalid_recovery_envelope') {
+          await deleteCreatedRevision();
+          return recoveryCapture;
+        }
         const authorizedOperation: PersistWorkflowTerminalStateInput = {
           ...operation,
           snapshot: snapshotCapture.value,
@@ -1683,6 +1691,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
           return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
         }
+        await deleteCreatedRevision();
         return 'record' in result
           ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
           : result;
