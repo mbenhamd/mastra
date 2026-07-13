@@ -48,9 +48,26 @@ export function extractV6NativeApproval(
   if (!lastAssistantMsg || lastAssistantMsg.role !== 'assistant') return null;
 
   const parts = lastAssistantMsg.parts ?? [];
-  const respondedParts = parts.filter(part => isToolUIPart(part) && part.state === 'approval-responded');
+  // Preserve every runtime part that claims to be an approval response until
+  // after validation. Filtering through `isToolUIPart` first would silently
+  // discard a malformed newest response and could replay an older valid one.
+  const respondedParts = parts.filter(
+    part =>
+      typeof part === 'object' &&
+      part !== null &&
+      'state' in part &&
+      (part as { state?: unknown }).state === 'approval-responded',
+  );
   const part = respondedParts.at(-1);
   if (!part || !isToolUIPart(part) || part.state !== 'approval-responded') return null;
+  if (
+    !part.approval ||
+    typeof part.approval.id !== 'string' ||
+    typeof part.approval.approved !== 'boolean' ||
+    (part.approval.reason != null && typeof part.approval.reason !== 'string')
+  ) {
+    return null;
+  }
 
   // Never fall back to an older decision when the latest response is malformed,
   // and reject duplicate identities rather than applying last-writer-wins.
@@ -58,9 +75,14 @@ export function extractV6NativeApproval(
   if (
     earlierParts.some(
       earlier =>
-        isToolUIPart(earlier) &&
-        earlier.state === 'approval-responded' &&
-        (earlier.toolCallId === part.toolCallId || earlier.approval.id === part.approval.id),
+        !isToolUIPart(earlier) ||
+        earlier.state !== 'approval-responded' ||
+        !earlier.approval ||
+        typeof earlier.approval.id !== 'string' ||
+        typeof earlier.approval.approved !== 'boolean' ||
+        (earlier.approval.reason != null && typeof earlier.approval.reason !== 'string') ||
+        earlier.toolCallId === part.toolCallId ||
+        earlier.approval.id === part.approval.id,
     )
   ) {
     return null;

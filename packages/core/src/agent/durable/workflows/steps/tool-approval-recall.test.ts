@@ -72,6 +72,7 @@ function makeSuspendEnvelope(overrides: Record<string, unknown> = {}) {
   return {
     version: 1,
     type: 'approval',
+    approvalSource: 'tool-gate',
     runId: RUN_ID,
     iterationCount: 0,
     stepId: 'durable-tool-call',
@@ -206,9 +207,14 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
   });
 
   it.each([
-    { kind: 'general suspension', options: undefined, type: 'suspension' },
-    { kind: 'in-tool approval', options: { requireToolApproval: true }, type: 'approval' },
-  ])('persists a versioned exact identity envelope for $kind', async ({ options, type }) => {
+    { kind: 'general suspension', options: undefined, type: 'suspension', approvalSource: undefined },
+    {
+      kind: 'in-tool approval',
+      options: { requireToolApproval: true },
+      type: 'approval',
+      approvalSource: 'tool-execution',
+    },
+  ])('persists a versioned exact identity envelope for $kind', async ({ options, type, approvalSource }) => {
     const suspend = vi.fn();
     vi.mocked(toolApprovalRequirement).mockResolvedValueOnce({ required: false, reasons: [] });
     setupRegistry(
@@ -224,6 +230,7 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
       expect.objectContaining({
         version: 1,
         type,
+        ...(approvalSource ? { approvalSource } : {}),
         runId: RUN_ID,
         iterationCount: 0,
         stepId: 'durable-tool-call',
@@ -238,6 +245,23 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
       }),
       { resumeLabel: TOOL_CALL_ID },
     );
+  });
+
+  it('delivers an approved in-tool decision back to the suspended durable tool', async () => {
+    const execute = vi.fn(async (_args: unknown, context: any) => ({ resumed: context.resumeData?.approved }));
+    vi.mocked(toolApprovalRequirement).mockResolvedValueOnce({ required: false, reasons: [] });
+    setupRegistry(execute);
+
+    const result = await runToolCallStep({ approved: true }, makeSuspendEnvelope({ approvalSource: 'tool-execution' }));
+
+    expect(execute).toHaveBeenCalledWith(TOOL_ARGS, expect.objectContaining({ resumeData: { approved: true } }));
+    expect(result).toEqual({
+      toolCallId: TOOL_CALL_ID,
+      toolName: TOOL_NAME,
+      args: TOOL_ARGS,
+      result: { resumed: true },
+      approval: { id: TOOL_CALL_ID, approved: true },
+    });
   });
 
   it('decline returns approval { approved: false } with the reason and NO result', async () => {
@@ -286,11 +310,36 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
     const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
     setupRegistry(execute);
 
-    const result = await runToolCallStep({ approved: true });
+    const result = await runToolCallStep({ approved: true, reason: 'Reviewed by admin' });
 
     expect(execute).toHaveBeenCalledTimes(1);
     expect(result.result).toEqual(TOOL_RESULT);
-    expect(result.approval).toEqual({ id: TOOL_CALL_ID, approved: true });
+    expect(result.approval).toEqual({ id: TOOL_CALL_ID, approved: true, reason: 'Reviewed by admin' });
+  });
+
+  it('carries and restores approval provenance across an ordinary suspension', async () => {
+    const suspend = vi.fn();
+    setupRegistry(
+      vi.fn(async (_args, context) => {
+        await context.suspend({ reason: 'need-more-input' });
+        return TOOL_RESULT;
+      }),
+    );
+
+    await runToolCallStep({ approved: true }, makeSuspendEnvelope(), suspend);
+
+    const suspensionEnvelope = suspend.mock.calls.find(call => call[0]?.type === 'suspension')?.[0];
+    expect(suspensionEnvelope).toMatchObject({
+      type: 'suspension',
+      toolCallId: TOOL_CALL_ID,
+      approval: { id: TOOL_CALL_ID, approved: true },
+    });
+
+    setupRegistry(vi.fn().mockResolvedValue(TOOL_RESULT));
+    const resumed = await runToolCallStep({ answer: 'continue' }, suspensionEnvelope);
+
+    expect(resumed.result).toEqual(TOOL_RESULT);
+    expect(resumed.approval).toEqual({ id: TOOL_CALL_ID, approved: true });
   });
 
   it('preserves approval provenance when the dynamic requirement changes before resume', async () => {

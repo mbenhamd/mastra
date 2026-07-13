@@ -160,19 +160,36 @@ async function runApprovalFlow(decision: 'approve' | 'decline') {
       ? await registered.approveToolCall({ runId: stream.runId, toolCallId })
       : await registered.declineToolCall({ runId: stream.runId, toolCallId });
 
-  for await (const _chunk of resumeStream.fullStream) {
-    // drain so the resumed turn persists
+  const fullStreamChunks = [];
+  for await (const chunk of resumeStream.fullStream) {
+    fullStreamChunks.push(chunk);
   }
+  const toolResults = await resumeStream.toolResults;
 
   const memory = (await registered.getMemory())!;
   const { messages } = await memory.recall({ threadId, perPage: false });
-  return { messages, stored: findStoredToolInvocation(messages, toolCallId), v6: findV6ToolPart(messages, toolCallId) };
+  return {
+    messages,
+    fullStreamChunks,
+    stored: findStoredToolInvocation(messages, toolCallId),
+    toolResults,
+    v6: findV6ToolPart(messages, toolCallId),
+  };
 }
 
 describe('issue #17218: tool approval decisions round-trip on recall', () => {
   it('decline persists as output-denied + approval and recalls as a v6 output-denied part', async () => {
-    const { stored, v6 } = await runApprovalFlow('decline');
+    const { fullStreamChunks, stored, toolResults, v6 } = await runApprovalFlow('decline');
     expect(mockFindUser).toHaveBeenCalledTimes(0);
+
+    // Public result access remains compatible even though persisted history uses output-denied.
+    const isDenialResult = (chunk: (typeof toolResults)[number]) =>
+      chunk.type === 'tool-result' &&
+      chunk.payload.toolCallId === TOOL_CALL_ID &&
+      chunk.payload.toolName === 'findUserTool' &&
+      chunk.payload.result === DECLINE_REASON;
+    expect(toolResults.filter(isDenialResult)).toHaveLength(1);
+    expect(fullStreamChunks.filter(isDenialResult)).toHaveLength(1);
 
     // Stored MastraToolInvocation should be a denial, not a plain successful result.
     expect(stored).toBeDefined();

@@ -89,7 +89,7 @@ function mergeBackgroundTasks(
     return undefined;
   }
 
-  const merged: Record<string, unknown> = { ...(existingBgTasks ?? {}) };
+  const merged = Object.assign(Object.create(null) as Record<string, unknown>, existingBgTasks ?? {});
   for (const [toolCallId, incomingTask] of Object.entries(incomingBgTasks ?? {})) {
     const existingTask = merged[toolCallId];
     merged[toolCallId] =
@@ -944,9 +944,7 @@ export class MessageList {
             : undefined
         : hasTransformedToolPayload(inputTransform)
           ? inputTransform.transformed
-          : hasTransformedToolPayload(phaseTransform)
-            ? phaseTransform.transformed
-            : undefined;
+          : undefined;
     const transformedSuspendPayload =
       phase === 'suspend' && hasTransformedToolPayload(phaseTransform) ? phaseTransform.transformed : undefined;
 
@@ -1137,18 +1135,29 @@ export class MessageList {
                 } as AIV5Type.ProviderMetadata)
               : undefined;
 
+          const updatedToolInvocation = {
+            ...inputPart.toolInvocation,
+            args: part.toolInvocation.args,
+          };
           msg.content.parts[i] = {
             ...inputPart,
-            toolInvocation: {
-              ...inputPart.toolInvocation,
-              args: part.toolInvocation.args,
-            },
+            toolInvocation: updatedToolInvocation,
             // Preserve providerExecuted from original call if not in result
             ...(originalPart.providerExecuted !== undefined && inputPartWithMeta.providerExecuted === undefined
               ? { providerExecuted: originalPart.providerExecuted }
               : {}),
             ...(mergedProviderMetadata !== undefined ? { providerMetadata: mergedProviderMetadata } : {}),
           };
+          if (msg.content.toolInvocations) {
+            msg.content.toolInvocations = msg.content.toolInvocations.map(invocation =>
+              invocation.toolCallId === toolCallId
+                ? {
+                    ...updatedToolInvocation,
+                    args: invocation.args,
+                  }
+                : invocation,
+            );
+          }
           this.lastCreatedAt = Math.max(this.lastCreatedAt || 0, Date.now());
           this.updateLastCreatedAt(msg);
 

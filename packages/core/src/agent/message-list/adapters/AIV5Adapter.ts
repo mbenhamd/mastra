@@ -188,9 +188,7 @@ function transformToolStateDataForDisplay(data: unknown, phase: 'approval' | 'su
           : undefined
       : hasTransformedToolPayload(inputTransform)
         ? inputTransform.transformed
-        : hasTransformedToolPayload(argsTransform)
-          ? argsTransform.transformed
-          : undefined;
+        : undefined;
   const transformedSuspendPayload =
     phase === 'suspend' && hasTransformedToolPayload(argsTransform) ? argsTransform.transformed : undefined;
 

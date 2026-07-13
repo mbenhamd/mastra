@@ -767,7 +767,9 @@ interface ToolCallApprovalPayload {
   originRunId?: string;
   stepId?: string;
   type?: 'approval';
+  approvalSource?: 'tool-gate' | 'tool-execution';
   identityDigest?: string;
+  resumeIdentityDigest?: string;
   toolCallId: string;
   toolName: string;
   args: Record<string, any>;
@@ -782,11 +784,13 @@ interface ToolCallSuspendedPayload {
   stepId?: string;
   type?: 'suspension';
   identityDigest?: string;
+  resumeIdentityDigest?: string;
   toolCallId: string;
   toolName: string;
   suspendPayload: any;
   args: Record<string, any>;
   resumeSchema: string;
+  approval?: { id: string; approved: true; reason?: string };
 }
 
 export type DataChunkType = {

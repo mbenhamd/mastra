@@ -397,6 +397,8 @@ export interface AgentSuspendedEventData {
   toolName?: string;
   args?: Record<string, unknown>;
   identityDigest?: string;
+  approval?: { id: string; approved: true; reason?: string };
+  approvalSource?: 'tool-gate' | 'tool-execution';
   suspendPayload?: unknown;
   resumeSchema?: string;
   type: 'approval' | 'suspension';

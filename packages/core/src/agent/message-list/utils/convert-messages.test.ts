@@ -236,6 +236,22 @@ describe('convertMessages', () => {
         approval: { id: 'approval-legacy', approved: false, reason: 'Legacy denial reason' },
       });
     });
+
+    it('reconstructs a structured denial after an AIV4 downgrade and reimport', () => {
+      const [v4Message] = convertMessages(deniedMessage).to('AIV4.UI');
+      const [v6Message] = convertMessages(v4Message).to('AIV6.UI');
+      const toolPart = v6Message.parts.find((part: any) => part.toolCallId === 'call-1');
+
+      expect(toolPart).toMatchObject({
+        toolCallId: 'call-1',
+        state: 'output-denied',
+        approval: {
+          id: 'call-1',
+          approved: false,
+          reason: 'Tool call was not approved by the user',
+        },
+      });
+    });
   });
 
   describe('Multiple messages', () => {

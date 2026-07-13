@@ -156,6 +156,45 @@ describe('durable tool-call background task dispatch', () => {
     expect(result.result).toContain('Background task resumed');
   });
 
+  it('resumes an approved in-tool background suspension and preserves the grant', async () => {
+    const pubsub = mockPubsub();
+    setupRegistry();
+    const initData = makeInitData();
+    const input = baseInput();
+    const resume = vi.fn().mockResolvedValue({ id: 'task-resumed' });
+    const dispatch = vi.fn();
+    const resumeData = { approved: true, reason: 'Reviewed by admin' };
+
+    vi.mocked(resolveBackgroundConfig).mockReturnValue({ runInBackground: true } as any);
+    vi.mocked(createBackgroundTask).mockReturnValue({
+      checkIfSuspended: vi.fn().mockResolvedValue(true),
+      resume,
+      dispatch,
+    } as any);
+
+    const result = await executeStep(pubsub, initData, input, resumeData, {
+      version: 1,
+      type: 'approval',
+      approvalSource: 'tool-execution',
+      runId: RUN_ID,
+      iterationCount: 0,
+      stepId: 'durable-tool-call',
+      toolCallId: TOOL_CALL_ID,
+      toolName: TOOL_NAME,
+      identityDigest: createToolCallIdentityDigest({
+        toolCallId: TOOL_CALL_ID,
+        toolName: TOOL_NAME,
+        args: input.args,
+      }),
+    });
+
+    expect(resume).toHaveBeenCalledWith(resumeData);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      approval: { id: TOOL_CALL_ID, approved: true, reason: 'Reviewed by admin' },
+    });
+  });
+
   it('dispatches a background task and returns a placeholder result', async () => {
     const pubsub = mockPubsub();
     setupRegistry();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createToolCallIdentityDigest, parseToolApprovalDecision } from './tool-call-identity';
+import { createToolCallIdentityDigest, parseToolApprovalDecision, parseToolApprovalGrant } from './tool-call-identity';
 
 describe('createToolCallIdentityDigest', () => {
   it('is stable across object key order', () => {
@@ -29,12 +29,40 @@ describe('createToolCallIdentityDigest', () => {
 });
 
 describe('parseToolApprovalDecision', () => {
-  it('accepts only own approved and optional reason fields', () => {
+  it('requires an own approved field while ignoring unrelated resume context', () => {
     expect(parseToolApprovalDecision({ approved: true, reason: 'reviewed' })).toEqual({
       approved: true,
       reason: 'reviewed',
     });
+    expect(parseToolApprovalDecision({ approved: true, toolName: 'lookup', toolCallId: 'call-1' })).toEqual({
+      approved: true,
+    });
     expect(parseToolApprovalDecision({ approved: true, injected: 'payload' })).toBeUndefined();
+    expect(
+      parseToolApprovalDecision(Object.assign(Object.create({ reason: 'inherited' }), { approved: true })),
+    ).toEqual({
+      approved: true,
+    });
+    expect(parseToolApprovalDecision({ approved: true, reason: 42 })).toBeUndefined();
     expect(parseToolApprovalDecision(Object.create({ approved: true }))).toBeUndefined();
+  });
+});
+
+describe('parseToolApprovalGrant', () => {
+  it('accepts only an exact approved grant for the expected call', () => {
+    expect(parseToolApprovalGrant(Object.create({ id: 'call-1', approved: true }), 'call-1')).toBeUndefined();
+    expect(parseToolApprovalGrant({ id: 'call-1', approved: true }, 'call-1')).toEqual({
+      id: 'call-1',
+      approved: true,
+    });
+    expect(parseToolApprovalGrant({ id: 'call-other', approved: true }, 'call-1')).toBeUndefined();
+    expect(parseToolApprovalGrant({ id: 'call-1', approved: false }, 'call-1')).toBeUndefined();
+    expect(parseToolApprovalGrant({ id: 'call-1', approved: true, injected: true }, 'call-1')).toBeUndefined();
+    expect(
+      parseToolApprovalGrant(
+        Object.assign(Object.create({ reason: 'inherited' }), { id: 'call-1', approved: true }),
+        'call-1',
+      ),
+    ).toEqual({ id: 'call-1', approved: true });
   });
 });

@@ -303,7 +303,14 @@ export class AIV6Adapter {
     const legacyV6OnlyToolCallIds = new Set(legacyV6OnlyToolInvocations.map(invocation => invocation.toolCallId));
 
     for (const part of dbParts) {
-      parts.push(AIV6Adapter.toUIPart(part));
+      parts.push(
+        part.type === 'tool-invocation' && isDowngradedV4Denial(part.toolInvocation)
+          ? AIV6Adapter.toUIPart({
+              ...part,
+              toolInvocation: { ...part.toolInvocation, state: 'output-denied' },
+            })
+          : AIV6Adapter.toUIPart(part),
+      );
     }
 
     for (const toolInvocation of legacyV6OnlyToolInvocations) {

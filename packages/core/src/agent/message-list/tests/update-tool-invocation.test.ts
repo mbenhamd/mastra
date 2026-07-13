@@ -80,6 +80,53 @@ describe('MessageList.updateToolInvocation', () => {
     expect(part.toolInvocation.args).toEqual({ topic: 'TypeScript history', detail: true });
   });
 
+  it('should keep a legacy toolInvocations entry in sync with its structured part', () => {
+    const messageList = new MessageList();
+    const originalArgs = { operation: 'delete' };
+    const msg = makeAssistantMessage([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'call',
+          toolCallId: 'tc-denied',
+          toolName: 'delete-record',
+          args: originalArgs,
+        },
+      },
+    ]);
+    msg.content.toolInvocations = [
+      {
+        state: 'call',
+        toolCallId: 'tc-denied',
+        toolName: 'delete-record',
+        args: originalArgs,
+      },
+    ];
+    messageList.add(msg, 'response');
+
+    const updated = messageList.updateToolInvocation({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-denied',
+        toolCallId: 'tc-denied',
+        toolName: 'delete-record',
+        args: {},
+        approval: { id: 'tc-denied', approved: false, reason: 'Not safe' },
+      },
+    });
+
+    expect(updated).toBe(true);
+    expect(msg.content.toolInvocations).toEqual([
+      {
+        state: 'output-denied',
+        toolCallId: 'tc-denied',
+        toolName: 'delete-record',
+        args: originalArgs,
+        approval: { id: 'tc-denied', approved: false, reason: 'Not safe' },
+      },
+    ]);
+  });
+
   it('should update message metadata by toolCallId without changing the tool invocation', () => {
     const messageList = new MessageList();
 
@@ -203,6 +250,42 @@ describe('MessageList.updateToolInvocation', () => {
         },
       },
     });
+  });
+
+  it('should preserve reserved tool-call IDs as own background task keys', () => {
+    const messageList = new MessageList();
+    const msg = makeAssistantMessage([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'result',
+          toolCallId: '__proto__',
+          toolName: 'research',
+          args: {},
+          result: 'Background task started.',
+        },
+      },
+    ]);
+    msg.content.metadata = {
+      backgroundTasks: JSON.parse('{"constructor":{"taskId":"existing"}}'),
+    };
+    messageList.add(msg, 'response');
+
+    const updated = messageList.updateMessageMetadataByToolCallId('__proto__', {
+      backgroundTasks: JSON.parse('{"__proto__":{"taskId":"task-1"},"prototype":{"taskId":"task-2"}}'),
+    });
+
+    expect(updated).toBe(true);
+    const backgroundTasks = (msg.content.metadata as any).backgroundTasks;
+    expect(Object.getPrototypeOf(backgroundTasks)).toBeNull();
+    expect(Object.hasOwn(backgroundTasks, '__proto__')).toBe(true);
+    expect(Object.hasOwn(backgroundTasks, 'constructor')).toBe(true);
+    expect(Object.hasOwn(backgroundTasks, 'prototype')).toBe(true);
+    expect(JSON.parse(JSON.stringify(backgroundTasks))).toEqual(
+      JSON.parse(
+        '{"__proto__":{"taskId":"task-1"},"constructor":{"taskId":"existing"},"prototype":{"taskId":"task-2"}}',
+      ),
+    );
   });
 
   it('should move a memory message to response source for re-saving', () => {

@@ -5,6 +5,58 @@ import { MessageList } from '../../message-list';
 import { convertToV1Messages } from './convert-to-mastra-v1';
 
 describe('convertToV1Messages', () => {
+  it('converts a denied approval into a completed tool result', () => {
+    const messages: MastraDBMessage[] = [
+      {
+        id: 'msg-denied',
+        role: 'assistant',
+        createdAt: new Date('2024-01-01'),
+        content: {
+          format: 2,
+          parts: [],
+          toolInvocations: [
+            {
+              state: 'output-denied',
+              toolCallId: 'call-denied',
+              toolName: 'deleteDocument',
+              args: { id: 'doc-1' },
+              approval: { id: 'call-denied', approved: false, reason: 'Document is protected' },
+            },
+          ],
+        },
+      },
+    ];
+
+    const result = convertToV1Messages(messages);
+
+    expect(result.find(message => message.type === 'tool-call')).toEqual(
+      expect.objectContaining({
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-denied',
+            toolName: 'deleteDocument',
+            args: { id: 'doc-1' },
+          },
+        ],
+      }),
+    );
+    expect(result.find(message => message.type === 'tool-result')).toEqual(
+      expect.objectContaining({
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'call-denied',
+            toolName: 'deleteDocument',
+            result: 'Document is protected',
+          },
+        ],
+      }),
+    );
+  });
+
   it('should preserve toolInvocations when text follows tool invocations (reproduces issue #6087)', () => {
     // This reproduces the exact issue from GitHub issue #6087
     // When an assistant message has tool invocations followed by text,
