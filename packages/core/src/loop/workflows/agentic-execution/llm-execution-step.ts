@@ -46,7 +46,7 @@ import {
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
 import { getProviderToolName, isMastraTool, isProviderTool } from '../../../tools/toolchecks';
-import { makeCoreTool } from '../../../utils';
+import { createMastraProxy, makeCoreTool } from '../../../utils';
 import { createStep } from '../../../workflows/workflow';
 import type { Workspace } from '../../../workspace/workspace';
 import type { LoopConfig, OuterLLMRun } from '../../types';
@@ -1068,6 +1068,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         threadId: _internal?.threadId,
                         resourceId: _internal?.resourceId,
                         logger,
+                        mastra: mastra
+                          ? createMastraProxy({ mastra, logger: logger || new ConsoleLogger({ level: 'error' }) })
+                          : undefined,
+                        memory: _internal?.memory,
                         agentName: agentId,
                         requestContext: requestContext || new RequestContext(),
                         outputWriter,
