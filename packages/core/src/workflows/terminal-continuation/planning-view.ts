@@ -5,6 +5,7 @@ import type {
   WorkflowRunStatus,
   WorkflowTerminalEffectRecord,
 } from '../types';
+import { getDenseDataArray, getPlainDataDescriptors } from './data-shape';
 import { validateWorkflowTerminalEffectIntegrity } from './effect-integrity';
 import {
   MAX_TERMINAL_LOOP_ITERATIONS,
@@ -35,38 +36,16 @@ function dataRecord(
   field: string,
   selectedKeys?: ReadonlySet<string>,
 ): Record<string, PropertyDescriptor> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) {
-    throw new TypeError(`${field} must be a plain data object`);
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError(`${field} must be a plain data object`);
-  }
-  if (selectedKeys) {
-    const selected: Record<string, PropertyDescriptor> = {};
-    for (const key of selectedKeys) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor) continue;
-      if (!('value' in descriptor)) throw new TypeError(`${field} contains an accessor field ${key}`);
-      Object.defineProperty(selected, key, {
-        configurable: true,
-        enumerable: true,
-        value: descriptor,
-        writable: true,
-      });
-    }
-    return selected;
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  if (Reflect.ownKeys(descriptors).length > MAX_PLANNER_MAP_KEYS) {
-    throw new TypeError(`${field} exceeds the planner map-key limit`);
-  }
-  for (const key of Reflect.ownKeys(descriptors)) {
-    if (typeof key !== 'string' || !('value' in descriptors[key]!)) {
-      throw new TypeError(`${field} contains symbol or accessor fields`);
-    }
-  }
-  return descriptors;
+  return getPlainDataDescriptors(value, {
+    allowNullPrototype: true,
+    typeError: `${field} must be a plain data object`,
+    fieldsError: selectedKeys
+      ? key => `${field} contains an accessor field ${String(key)}`
+      : `${field} contains symbol or accessor fields`,
+    selectedKeys,
+    maxKeys: selectedKeys ? undefined : MAX_PLANNER_MAP_KEYS,
+    maxKeysError: `${field} exceeds the planner map-key limit`,
+  });
 }
 
 function defineDataProperty(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -200,25 +179,12 @@ function materializeEffect(
 }
 
 function denseArray(value: unknown, field: string): unknown[] {
-  if (!Array.isArray(value) || isProxy(value)) throw new TypeError(`${field} must be an array`);
-  const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
-  if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PLANNER_COLLECTION_ITEMS) {
-    throw new TypeError(`${field} exceeds the planner collection-item limit`);
-  }
-  const result = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) throw new TypeError(`${field} must be dense and data-only`);
-    return descriptor.value;
+  return getDenseDataArray(value, {
+    typeError: `${field} must be an array`,
+    lengthError: `${field} exceeds the planner collection-item limit`,
+    dataError: `${field} must be dense and data-only`,
+    maxLength: MAX_PLANNER_COLLECTION_ITEMS,
   });
-  if (
-    Reflect.ownKeys(descriptors).some(
-      key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
-    )
-  ) {
-    throw new TypeError(`${field} must be dense and data-only`);
-  }
-  return result;
 }
 
 function copySidecarMap(value: unknown, field: string): Record<string, unknown> | undefined {

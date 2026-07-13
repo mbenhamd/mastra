@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { isProxy } from 'node:util/types';
 import type { SerializedStepFlowEntry, WorkflowRunState } from '../types';
 import {
   createWorkflowTerminalParentContinuationContract,
   validateWorkflowTerminalParentContinuationBinding,
 } from './contract';
+import { getPlainDataDescriptors } from './data-shape';
 import {
   MAX_TERMINAL_LOOP_ITERATIONS,
   resolveWorkflowTerminalGraphCoordinate,
@@ -335,15 +335,12 @@ function nextTarget(graph: readonly SerializedStepFlowEntry[], index: number): W
 }
 
 function materializeDecision(value: unknown): WorkflowTerminalEvaluatedLoopDecisionV1 {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) {
-    throw new TypeError('evaluatedDecision must be a plain data object');
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError('evaluatedDecision must be a plain data object');
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = ['version', 'kind', 'decisionKey', 'conditionResult'];
+  const descriptors = getPlainDataDescriptors(value, {
+    allowNullPrototype: true,
+    typeError: 'evaluatedDecision must be a plain data object',
+    fieldsError: 'evaluatedDecision contains unknown, missing, symbol, or accessor fields',
+  });
   if (
     Reflect.ownKeys(descriptors).some(
       key => typeof key !== 'string' || !keys.includes(key) || !('value' in descriptors[key]!),
@@ -433,11 +430,13 @@ export function completeWorkflowTerminalLoopDecision(
   request: WorkflowTerminalLoopDecisionRequestV1,
   conditionResult: boolean,
 ): WorkflowTerminalEvaluatedLoopDecisionV1 {
-  if (isProxy(request)) throw new TypeError('Loop decision request or result is invalid');
-  const descriptors = Object.getOwnPropertyDescriptors(request);
   const keys = ['version', 'kind', 'decisionKey', 'loopType', 'previousIterationCount'];
+  const descriptors = getPlainDataDescriptors(request, {
+    allowNullPrototype: false,
+    typeError: 'Loop decision request or result is invalid',
+    fieldsError: 'Loop decision request or result is invalid',
+  });
   if (
-    Object.getPrototypeOf(request) !== Object.prototype ||
     Reflect.ownKeys(descriptors).some(
       key => typeof key !== 'string' || !keys.includes(key) || !('value' in descriptors[key]!),
     ) ||

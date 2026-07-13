@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import type { WorkflowTerminalEffectRecord } from '../types';
+import { getPlainDataDescriptors } from './data-shape';
 import { MAX_TERMINAL_PATH_LENGTH, validateWorkflowTerminalStructuralString } from './graph-fingerprint';
 
 type IntegrityInput =
@@ -12,20 +13,11 @@ type IntegrityInput =
   | Omit<Extract<WorkflowTerminalEffectRecord, { kind: 'workflow-finish' }>, 'effectKey' | 'payloadHash' | 'createdAt'>;
 
 function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) {
-    throw new TypeError('workflow terminal effect must be a plain data object');
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError('workflow terminal effect must be a plain data object');
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  for (const key of Reflect.ownKeys(descriptors)) {
-    if (typeof key !== 'string' || !('value' in descriptors[key]!)) {
-      throw new TypeError('workflow terminal effect contains symbol or accessor fields');
-    }
-  }
-  return descriptors;
+  return getPlainDataDescriptors(value, {
+    allowNullPrototype: true,
+    typeError: 'workflow terminal effect must be a plain data object',
+    fieldsError: 'workflow terminal effect contains symbol or accessor fields',
+  });
 }
 
 function canonicalPath(value: unknown): number[] {

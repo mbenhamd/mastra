@@ -1,5 +1,5 @@
 ---
-'@mastra/core': minor
+'@mastra/core': patch
 ---
 
-Add deterministic recovery planning for nested workflows so retries can safely select the same next action after a restart.
+Add internal groundwork for deterministic nested-workflow recovery planning. This prepares retry-safe recovery for a future release and does not change current runtime or retry behavior.
