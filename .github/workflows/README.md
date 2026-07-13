@@ -26,8 +26,11 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   GitHub-hosted `ubuntu-24.04` runners.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Internal Core, Deployer,
-  MCP, Memory, AI SDK, PostgreSQL, and Redis, and executes each supported changed
-  Vitest file in full. Okta Auth runs its package build and lint; Deployer runs
+  MCP, Memory, AI SDK, shared Storage Test Utils, PostgreSQL, and Redis, and
+  executes each supported changed Vitest file in full. Storage Test Utils
+  changes must include a changed Vitest file in that workspace so shared
+  conformance helpers cannot pass without execution. Okta Auth runs its package
+  build and lint; Deployer runs
   explicit Memory, Agent Builder, Server, and Hono prerequisite builds before
   its package typecheck, build, lint, and changed-test coverage. This avoids the
   unrelated package failures in Deployer's broad Turbo dependency closure. MCP
