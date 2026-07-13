@@ -340,6 +340,8 @@ function materializeDecision(value: unknown): WorkflowTerminalEvaluatedLoopDecis
     allowNullPrototype: true,
     typeError: 'evaluatedDecision must be a plain data object',
     fieldsError: 'evaluatedDecision contains unknown, missing, symbol, or accessor fields',
+    maxKeys: keys.length,
+    maxKeysError: 'evaluatedDecision contains unknown, missing, symbol, or accessor fields',
   });
   if (
     Reflect.ownKeys(descriptors).some(
@@ -435,6 +437,8 @@ export function completeWorkflowTerminalLoopDecision(
     allowNullPrototype: false,
     typeError: 'Loop decision request or result is invalid',
     fieldsError: 'Loop decision request or result is invalid',
+    maxKeys: keys.length,
+    maxKeysError: 'Loop decision request or result is invalid',
   });
   if (
     Reflect.ownKeys(descriptors).some(

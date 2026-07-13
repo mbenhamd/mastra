@@ -6,8 +6,6 @@ interface PlainDataDescriptorOptions {
   proxyError?: string;
   prototypeError?: string;
   fieldsError: string | ((key: PropertyKey) => string);
-  requireEnumerable?: boolean;
-  nullPrototypeResult?: boolean;
   selectedKeys?: ReadonlySet<string>;
   maxKeys?: number;
   maxKeysError?: string;
@@ -29,13 +27,11 @@ export function getPlainDataDescriptors(
     throw new TypeError(options.prototypeError ?? options.typeError);
   }
   if (options.selectedKeys) {
-    const selected: Record<string, PropertyDescriptor> = options.nullPrototypeResult ? Object.create(null) : {};
+    const selected = Object.create(null) as Record<string, PropertyDescriptor>;
     for (const key of options.selectedKeys) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor) continue;
-      if (!('value' in descriptor) || (options.requireEnumerable && descriptor.enumerable !== true)) {
-        throw new TypeError(fieldsError(key));
-      }
+      if (!('value' in descriptor) || descriptor.enumerable !== true) throw new TypeError(fieldsError(key));
       Object.defineProperty(selected, key, {
         configurable: true,
         enumerable: true,
@@ -49,14 +45,11 @@ export function getPlainDataDescriptors(
   if (options.maxKeys !== undefined && keys.length > options.maxKeys) {
     throw new TypeError(options.maxKeysError ?? fieldsError(''));
   }
-  const descriptors: Record<string, PropertyDescriptor> = options.nullPrototypeResult ? Object.create(null) : {};
+  const descriptors = Object.create(null) as Record<string, PropertyDescriptor>;
   for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
-    if (
-      typeof key !== 'string' ||
-      !('value' in descriptor) ||
-      (options.requireEnumerable && descriptor.enumerable !== true)
-    ) {
+    if (typeof key !== 'string') throw new TypeError(fieldsError(key));
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !('value' in descriptor) || descriptor.enumerable !== true) {
       throw new TypeError(fieldsError(key));
     }
     Object.defineProperty(descriptors, key, {
@@ -82,13 +75,13 @@ interface DenseDataArrayOptions {
 export function getDenseDataArray(value: unknown, options: DenseDataArrayOptions): unknown[] {
   if (isProxy(value)) throw new TypeError(options.proxyError ?? options.typeError);
   if (!Array.isArray(value)) throw new TypeError(options.typeError);
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  const length = lengthDescriptor && 'value' in lengthDescriptor ? lengthDescriptor.value : undefined;
+  const length = Object.getOwnPropertyDescriptor(value, 'length')?.value;
   if (!Number.isSafeInteger(length) || length < (options.minLength ?? 0) || length > options.maxLength) {
     throw new TypeError(options.lengthError);
   }
   const keys = Reflect.ownKeys(value);
   if (
+    keys.length !== length + 1 ||
     keys.some(
       key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
     )

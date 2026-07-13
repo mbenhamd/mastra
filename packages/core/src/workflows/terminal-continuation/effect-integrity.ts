@@ -1,8 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { isProxy } from 'node:util/types';
 import type { WorkflowTerminalEffectRecord } from '../types';
-import { getPlainDataDescriptors } from './data-shape';
+import { getDenseDataArray, getPlainDataDescriptors } from './data-shape';
 import { MAX_TERMINAL_PATH_LENGTH, validateWorkflowTerminalStructuralString } from './graph-fingerprint';
 
 type IntegrityInput =
@@ -17,37 +16,25 @@ function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
     allowNullPrototype: true,
     typeError: 'workflow terminal effect must be a plain data object',
     fieldsError: 'workflow terminal effect contains symbol or accessor fields',
+    maxKeys: 13,
+    maxKeysError: 'workflow terminal effect contains unknown, missing, symbol, or accessor fields',
   });
 }
 
 function canonicalPath(value: unknown): number[] {
-  if (!Array.isArray(value) || isProxy(value)) {
-    throw new TypeError('parentExecutionPath must be a dense data-only path');
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
-  if (!Number.isSafeInteger(length) || length < 1 || length > MAX_TERMINAL_PATH_LENGTH) {
-    throw new TypeError('parentExecutionPath has an invalid length');
-  }
-  const path = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) {
-      throw new TypeError('parentExecutionPath must be dense and data-only');
-    }
-    const entry = descriptor.value;
-    if (!Number.isSafeInteger(entry) || entry < 0 || Object.is(entry, -0)) {
+  const entries = getDenseDataArray(value, {
+    typeError: 'parentExecutionPath must be a dense data-only path',
+    lengthError: 'parentExecutionPath has an invalid length',
+    dataError: 'parentExecutionPath must be dense and data-only',
+    minLength: 1,
+    maxLength: MAX_TERMINAL_PATH_LENGTH,
+  });
+  return entries.map(entry => {
+    if (!Number.isSafeInteger(entry) || (entry as number) < 0 || Object.is(entry, -0)) {
       throw new TypeError('parentExecutionPath contains an invalid index');
     }
     return entry as number;
   });
-  if (
-    Reflect.ownKeys(descriptors).some(
-      key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
-    )
-  ) {
-    throw new TypeError('parentExecutionPath must be dense and data-only');
-  }
-  return path;
 }
 
 function materializeIntegrityInput(value: unknown): IntegrityInput {

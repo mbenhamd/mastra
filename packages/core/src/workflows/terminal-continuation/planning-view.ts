@@ -84,25 +84,14 @@ export function canonicalPlannerInteger(value: unknown, field: string, max = Num
 }
 
 export function canonicalPlannerPath(value: unknown, field: string): number[] {
-  if (!Array.isArray(value) || isProxy(value)) throw new TypeError(`${field} must be a dense path`);
-  const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
-  if (!Number.isSafeInteger(length) || length < 1 || length > MAX_TERMINAL_PATH_LENGTH) {
-    throw new TypeError(`${field} has an invalid length`);
-  }
-  const result = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) throw new TypeError(`${field} must be dense and data-only`);
-    return canonicalPlannerInteger(descriptor.value, `${field}[${index}]`);
+  const entries = getDenseDataArray(value, {
+    typeError: `${field} must be a dense path`,
+    lengthError: `${field} has an invalid length`,
+    dataError: `${field} must be dense and data-only`,
+    minLength: 1,
+    maxLength: MAX_TERMINAL_PATH_LENGTH,
   });
-  if (
-    Reflect.ownKeys(descriptors).some(
-      key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
-    )
-  ) {
-    throw new TypeError(`${field} must be dense and data-only`);
-  }
-  return result;
+  return entries.map((entry, index) => canonicalPlannerInteger(entry, `${field}[${index}]`));
 }
 
 function structuralString(value: unknown, field: string, maxLength: number): string {

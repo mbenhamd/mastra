@@ -51,8 +51,8 @@ function getDataDescriptors(value: unknown, field: string): Record<PropertyKey, 
     proxyError: `${field} must not be a proxy`,
     prototypeError: `${field} must be a plain object`,
     fieldsError: `${field} contains symbol, accessor, or non-enumerable fields`,
-    requireEnumerable: true,
-    nullPrototypeResult: true,
+    maxKeys: 7,
+    maxKeysError: `${field} contains too many fields`,
   });
 }
 
