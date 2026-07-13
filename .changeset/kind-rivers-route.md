@@ -2,4 +2,6 @@
 '@mastra/core': patch
 ---
 
-Keep scheduled public workflows and public workflow streams portable while retaining process-local routing for owned internal runs, and prevent local-only events from entering shared replay caches.
+Fixed scheduled workflows and their public event streams so they keep working across processes.
+
+Improved internal workflow isolation and prevented internal-only events from entering shared replay history.
