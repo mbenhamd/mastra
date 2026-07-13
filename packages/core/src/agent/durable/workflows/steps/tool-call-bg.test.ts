@@ -320,7 +320,7 @@ describe('durable tool-call background task dispatch', () => {
     expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
   });
 
-  it('onExecution hook updates message metadata with startedAt/taskId', async () => {
+  it('onExecution hook updates the tool invocation with startedAt/taskId metadata', async () => {
     const pubsub = mockPubsub();
     const { messageList } = setupRegistry();
     const initData = makeInitData();
@@ -354,8 +354,14 @@ describe('durable tool-call background task dispatch', () => {
       startedAt,
     });
 
-    expect(messageList.updateMessageMetadataByToolCallId).toHaveBeenCalledWith(
-      TOOL_CALL_ID,
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          state: 'call',
+          toolCallId: TOOL_CALL_ID,
+          toolName: TOOL_NAME,
+        }),
+      }),
       expect.objectContaining({
         backgroundTasks: expect.objectContaining({
           [TOOL_CALL_ID]: expect.objectContaining({
@@ -365,7 +371,7 @@ describe('durable tool-call background task dispatch', () => {
         }),
       }),
     );
-    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
+    expect(messageList.updateMessageMetadataByToolCallId).not.toHaveBeenCalled();
   });
 
   it('onChunk emits tool-call + tool-result chunks via PubSub on completion', async () => {
