@@ -399,7 +399,9 @@ describe('Processor-returned tools receive requestContext', () => {
     });
 
     const stream = await agent.stream('Capture absent context', { maxSteps: 2 });
-    await stream.consumeStream();
+    for await (const _chunk of stream.fullStream) {
+      // Drain the stream so the processor-added tool executes.
+    }
 
     expect(capturedContext).toBeDefined();
     expect(capturedContext?.mastra).toBeUndefined();
