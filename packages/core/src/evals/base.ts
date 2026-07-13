@@ -47,6 +47,93 @@ interface ScorerStepDefinition {
   isPromptObject: boolean;
 }
 
+const SCORER_SPAN_MAX_DEPTH = 8;
+const SCORER_SPAN_MAX_NODES = 1_000;
+const SCORER_SPAN_MAX_ARRAY_ITEMS = 100;
+const SCORER_SPAN_MAX_OBJECT_KEYS = 100;
+const SCORER_SPAN_MAX_STRING_LENGTH = 8_192;
+const SCORER_SPAN_TRUNCATED = '[TRUNCATED]';
+const SCORER_SPAN_REDACTED = '[REDACTED]';
+const SCORER_SENSITIVE_KEYS = new Set([
+  'apikey',
+  'authorization',
+  'authtoken',
+  'mastraauthtoken',
+  'password',
+  'refreshtoken',
+  'secret',
+  'token',
+]);
+
+function isScorerSensitiveKey(key: string): boolean {
+  return SCORER_SENSITIVE_KEYS.has(key.replace(/[^a-z0-9]/gi, '').toLowerCase());
+}
+
+function serializeScorerSpanValue(value: unknown): unknown {
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+
+  const visit = (current: unknown, depth: number): unknown => {
+    nodes += 1;
+    if (nodes > SCORER_SPAN_MAX_NODES || depth > SCORER_SPAN_MAX_DEPTH) return SCORER_SPAN_TRUNCATED;
+    if (typeof current === 'string') {
+      return current.length > SCORER_SPAN_MAX_STRING_LENGTH
+        ? `${current.slice(0, SCORER_SPAN_MAX_STRING_LENGTH)}${SCORER_SPAN_TRUNCATED}`
+        : current;
+    }
+    if (current === null || typeof current === 'number' || typeof current === 'boolean') return current;
+    if (current === undefined) return undefined;
+    if (typeof current !== 'object') return `[${typeof current}]`;
+    if (seen.has(current)) return '[CIRCULAR]';
+    seen.add(current);
+
+    try {
+      if (Array.isArray(current)) {
+        const result = current.slice(0, SCORER_SPAN_MAX_ARRAY_ITEMS).map(item => visit(item, depth + 1));
+        if (current.length > SCORER_SPAN_MAX_ARRAY_ITEMS) result.push(SCORER_SPAN_TRUNCATED);
+        return result;
+      }
+
+      const result: Record<string, unknown> = {};
+      let keys: string[];
+      let totalKeyCount: number;
+      try {
+        const allKeys = Object.keys(current);
+        totalKeyCount = allKeys.length;
+        keys = allKeys.slice(0, SCORER_SPAN_MAX_OBJECT_KEYS);
+      } catch {
+        return '[UNREADABLE]';
+      }
+      for (const key of keys) {
+        if (isScorerSensitiveKey(key)) {
+          result[key] = SCORER_SPAN_REDACTED;
+          continue;
+        }
+        try {
+          result[key] = visit((current as Record<string, unknown>)[key], depth + 1);
+        } catch {
+          result[key] = '[UNREADABLE]';
+        }
+      }
+      if (totalKeyCount > SCORER_SPAN_MAX_OBJECT_KEYS) result[SCORER_SPAN_TRUNCATED] = true;
+      return result;
+    } finally {
+      seen.delete(current);
+    }
+  };
+
+  return visit(value, 0);
+}
+
+function attachScorerSpanSerialization<T extends Record<string, unknown>>(value: T): T {
+  Object.defineProperty(value, 'serializeForSpan', {
+    configurable: true,
+    enumerable: false,
+    value: () => serializeScorerSpanValue(value),
+  });
+  return value;
+}
+
 // Predefined type shortcuts for common scorer patterns
 type ScorerTypeShortcuts = {
   agent: {
@@ -549,10 +636,10 @@ class MastraScorer<
       entityType: EntityType.SCORER,
       entityId: this.id,
       input: {
-        input: prepared.input,
-        output: prepared.output,
-        groundTruth: prepared.groundTruth,
-        expectedTrajectory: prepared.expectedTrajectory,
+        input: serializeScorerSpanValue(prepared.input),
+        output: serializeScorerSpanValue(prepared.output),
+        groundTruth: serializeScorerSpanValue(prepared.groundTruth),
+        expectedTrajectory: serializeScorerSpanValue(prepared.expectedTrajectory),
         requestContext: normalizedRequestContext?.serializeForSpan(),
       },
       attributes: {
@@ -779,7 +866,7 @@ class MastraScorer<
             });
           }
 
-          stepSpan?.end({ output: stepResult });
+          stepSpan?.end({ output: serializeScorerSpanValue(stepResult) });
 
           const newGeneratedPrompts =
             prompt !== undefined
@@ -794,11 +881,11 @@ class MastraScorer<
             [`${scorerStep.name}StepResult`]: stepResult,
           };
 
-          return {
+          return attachScorerSpanSerialization({
             stepResult,
             accumulatedResults: newAccumulatedResults,
             generatedPrompts: newGeneratedPrompts,
-          };
+          });
         },
       });
     });
@@ -862,7 +949,9 @@ class MastraScorer<
     run: ScorerRun<TInput, TRunOutput>,
     accumulatedResults: Record<string, any>,
   ) {
-    return this.createScorerContext(stepName, this.createScorerSpanRun(run), accumulatedResults);
+    return serializeScorerSpanValue(
+      this.createScorerContext(stepName, this.createScorerSpanRun(run), accumulatedResults),
+    );
   }
 
   private createScorerSpanRun(run: ScorerRun<TInput, TRunOutput>) {

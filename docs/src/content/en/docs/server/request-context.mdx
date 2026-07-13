@@ -311,7 +311,7 @@ const spanInput = requestContext.serializeForSpan()
 // }
 ```
 
-The reserved raw auth token is always represented as `[REDACTED]`. String, number, boolean, `null`, and `undefined` values are preserved. Objects, arrays, functions, and other non-primitive values are replaced with type labels such as `[object]` or `[function]`; their properties and serialization hooks aren't evaluated.
+The reserved raw auth token is always represented as `[REDACTED]`. Number, boolean, `null`, and `undefined` values are preserved. Strings are limited to 2,048 UTF-8 bytes, the snapshot is limited to 100 keys and a 16 KiB budget, and deterministic `[TRUNCATED]` markers identify omitted content. Objects, arrays, functions, and other non-primitive values are replaced with type labels such as `[object]` or `[function]`; their properties and serialization hooks aren't evaluated.
 
 Mastra applies this bounded representation to scorer run and scorer step span input. `serializeForSpan()` doesn't change the original `RequestContext` passed to scorer execution.
 

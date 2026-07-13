@@ -287,5 +287,17 @@ describe('RequestContext', () => {
     it('returns an empty object for an empty context', () => {
       expect(new RequestContext().serializeForSpan()).toEqual({});
     });
+
+    it('bounds wide contexts and multi-megabyte strings', () => {
+      const ctx = new RequestContext();
+      ctx.set('large', 'x'.repeat(1_000_000));
+      for (let index = 0; index < 1_000; index += 1) ctx.set(`key-${index}`, index);
+
+      const serialized = ctx.serializeForSpan();
+      expect(Object.keys(serialized).length).toBeLessThanOrEqual(101);
+      expect(serialized.large).toBe(`${'x'.repeat(2_037)}[TRUNCATED]`);
+      expect(JSON.stringify(serialized).length).toBeLessThan(16_384);
+      expect(serialized['[TRUNCATED]']).toBe(true);
+    });
   });
 });
