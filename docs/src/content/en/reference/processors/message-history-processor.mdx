@@ -77,8 +77,10 @@ const processor = new MessageHistory({
                   {
                     name: 'maxModelOutputBytes',
                     type: 'number',
-                    description: 'Maximum UTF-8 bytes retained from each preserved model output',
+                    description:
+                      'Maximum UTF-8 bytes retained from each preserved model output. Defaults to 16384 bytes',
                     isOptional: true,
+                    defaultValue: '16384',
                   },
                 ],
               },
@@ -178,7 +180,9 @@ export const agent = new Agent({
 
 Set `toolCallFilter` to remove tool calls and results at the persistence boundary. Omitting `exclude` removes all tool calls. Set `exclude` to filter selected tools only.
 
-`preserveModelOutput` keeps compact model-facing output from completed results. It doesn't preserve media, incomplete states, denied results, failed results, raw arguments, or raw results.
+`preserveModelOutput` keeps compact model-facing output from completed results. It doesn't preserve media, incomplete states, denied results, failed results, raw arguments, or raw results. When `maxModelOutputBytes` is omitted, MessageHistory retains at most 16 KiB per preserved model output.
+
+When this persistence policy removes or compacts a tool payload, it also removes message-level provider metadata from that changed message. Messages without a matching tool payload remain unchanged by the tool-call policy.
 
 ```typescript
 const messageHistory = new MessageHistory({

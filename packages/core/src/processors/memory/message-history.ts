@@ -25,6 +25,8 @@ export interface MessageHistoryOptions {
   /**
    * Opt-in filtering applied only to messages written by MessageHistory.
    * Omit this option to preserve the existing persistence behavior.
+   * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
+   * Messages changed by this policy also drop message-level provider metadata.
    */
   toolCallFilter?: MessageHistoryToolCallFilterOptions;
 }
@@ -241,10 +243,15 @@ export class MessageHistory implements Processor {
 
     return this.toolCallFilter === undefined
       ? filteredMessages
-      : filterToolCallMessages(filteredMessages, {
-          ...this.toolCallFilter,
-          maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
-        });
+      : filterToolCallMessages(
+          filteredMessages,
+          {
+            ...this.toolCallFilter,
+            maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
+          },
+          new Set(),
+          { stripMessageProviderMetadata: true },
+        );
   }
 
   async processOutputResult(

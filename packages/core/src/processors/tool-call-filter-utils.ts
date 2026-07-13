@@ -16,6 +16,17 @@ type NormalizedToolCallFilteringOptions = {
   maxModelOutputBytes?: number;
 };
 
+type ModelOutputTraversal = {
+  seen: WeakSet<object>;
+  depth: number;
+  nodes: number;
+  exhausted: boolean;
+};
+
+type ToolCallMessageFilterBehavior = {
+  stripMessageProviderMetadata?: boolean;
+};
+
 function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedToolCallFilteringOptions {
   const resolvedOptions = options ?? {};
   const exclude = (resolvedOptions as { exclude?: unknown }).exclude;
@@ -81,6 +92,220 @@ function safeJsonStringify(value: unknown): string | null {
   }
 }
 
+class BoundedTextBuilder {
+  private chunks: string[] = [];
+  private length = 0;
+
+  constructor(private readonly maxCodeUnits: number) {}
+
+  get isFull(): boolean {
+    return this.length >= this.maxCodeUnits;
+  }
+
+  get remaining(): number {
+    return Math.max(0, this.maxCodeUnits - this.length);
+  }
+
+  append(text: string): void {
+    const remaining = this.remaining;
+    if (remaining === 0 || text.length === 0) return;
+    const bounded = text.length <= remaining ? text : text.slice(0, remaining);
+    this.chunks.push(bounded);
+    this.length += bounded.length;
+  }
+
+  toString(): string {
+    return this.chunks.join('');
+  }
+}
+
+function appendBoundedJsonString(builder: BoundedTextBuilder, value: string): void {
+  builder.append('"');
+  let runStart = 0;
+
+  for (let index = 0; index < value.length && !builder.isFull; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    let escaped: string | undefined;
+
+    switch (codeUnit) {
+      case 0x08:
+        escaped = '\\b';
+        break;
+      case 0x09:
+        escaped = '\\t';
+        break;
+      case 0x0a:
+        escaped = '\\n';
+        break;
+      case 0x0c:
+        escaped = '\\f';
+        break;
+      case 0x0d:
+        escaped = '\\r';
+        break;
+      case 0x22:
+        escaped = '\\"';
+        break;
+      case 0x5c:
+        escaped = '\\\\';
+        break;
+      default:
+        if (codeUnit < 0x20 || (codeUnit >= 0xd800 && codeUnit <= 0xdfff)) {
+          const isSurrogatePair =
+            codeUnit >= 0xd800 &&
+            codeUnit <= 0xdbff &&
+            index + 1 < value.length &&
+            value.charCodeAt(index + 1) >= 0xdc00 &&
+            value.charCodeAt(index + 1) <= 0xdfff;
+          if (isSurrogatePair) {
+            index += 1;
+          } else {
+            escaped = `\\u${codeUnit.toString(16).padStart(4, '0')}`;
+          }
+        }
+    }
+
+    if (escaped !== undefined) {
+      if (runStart < index) builder.append(value.slice(runStart, index));
+      builder.append(escaped);
+      runStart = index + 1;
+      continue;
+    }
+
+    // Flush safe text in small chunks so a huge JSON string never becomes a huge
+    // temporary slice before the configured output limit is reached.
+    if (index - runStart + 1 >= Math.min(1024, builder.remaining)) {
+      builder.append(value.slice(runStart, index + 1));
+      runStart = index + 1;
+    }
+  }
+
+  if (!builder.isFull && runStart < value.length) builder.append(value.slice(runStart));
+  if (!builder.isFull) builder.append('"');
+}
+
+function appendBoundedJsonValue(builder: BoundedTextBuilder, value: unknown, seen: WeakSet<object>): boolean {
+  if (builder.isFull) return true;
+  if (value === null) {
+    builder.append('null');
+    return true;
+  }
+  if (typeof value === 'string') {
+    appendBoundedJsonString(builder, value);
+    return true;
+  }
+  if (typeof value === 'number') {
+    builder.append(Number.isFinite(value) ? String(value) : 'null');
+    return true;
+  }
+  if (typeof value === 'boolean') {
+    builder.append(String(value));
+    return true;
+  }
+  if (typeof value !== 'object' || seen.has(value)) return false;
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      builder.append('[');
+      for (let index = 0; index < value.length && !builder.isFull; index += 1) {
+        if (index > 0) builder.append(',');
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor) {
+          builder.append('null');
+          continue;
+        }
+        if (!('value' in descriptor) || !appendBoundedJsonValue(builder, descriptor.value, seen)) return false;
+      }
+      if (!builder.isFull) builder.append(']');
+      return true;
+    }
+
+    builder.append('{');
+    let hasEntry = false;
+    for (const key in value) {
+      if (builder.isFull) break;
+      if (!Object.hasOwn(value, key)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable) continue;
+      if (!('value' in descriptor)) return false;
+      if (hasEntry) builder.append(',');
+      appendBoundedJsonString(builder, key);
+      builder.append(':');
+      if (!appendBoundedJsonValue(builder, descriptor.value, seen)) return false;
+      hasEntry = true;
+    }
+    if (!builder.isFull) builder.append('}');
+    return true;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function boundedJsonStringify(value: unknown, maxCodeUnits: number | undefined): string | null {
+  if (maxCodeUnits === undefined) return safeJsonStringify(value);
+  const builder = new BoundedTextBuilder(maxCodeUnits);
+  return appendBoundedJsonValue(builder, value, new WeakSet<object>()) ? builder.toString() : null;
+}
+
+function visitModelOutputNode(traversal: ModelOutputTraversal): boolean {
+  if (traversal.nodes >= MAX_MODEL_OUTPUT_TRAVERSAL_NODES) {
+    traversal.exhausted = true;
+    return false;
+  }
+  traversal.nodes += 1;
+  return true;
+}
+
+function isBoundedJsonValue(value: unknown, traversal: ModelOutputTraversal): boolean {
+  if (!visitModelOutputNode(traversal)) return false;
+  const valueType = typeof value;
+  if (value === null || valueType === 'string' || valueType === 'number' || valueType === 'boolean') return true;
+  if (typeof value !== 'object' || traversal.seen.has(value) || traversal.depth >= MAX_MODEL_OUTPUT_TRAVERSAL_DEPTH) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+
+  const ownToJSON = Object.getOwnPropertyDescriptor(value, 'toJSON');
+  const inheritedToJSON = prototype && Object.getOwnPropertyDescriptor(prototype, 'toJSON');
+  if (
+    (ownToJSON && (!('value' in ownToJSON) || typeof ownToJSON.value === 'function')) ||
+    (inheritedToJSON && (!('value' in inheritedToJSON) || typeof inheritedToJSON.value === 'function'))
+  )
+    return false;
+
+  traversal.seen.add(value);
+  traversal.depth += 1;
+  try {
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor) {
+          if (!visitModelOutputNode(traversal)) return false;
+          continue;
+        }
+        if (!('value' in descriptor) || !isBoundedJsonValue(descriptor.value, traversal)) return false;
+      }
+      return true;
+    }
+
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable) continue;
+      if (!('value' in descriptor) || !isBoundedJsonValue(descriptor.value, traversal)) return false;
+    }
+    return true;
+  } finally {
+    traversal.depth -= 1;
+    traversal.seen.delete(value);
+  }
+}
+
 /**
  * Convert supported model-facing tool output into text without serializing media or unknown objects.
  *
@@ -89,17 +314,25 @@ function safeJsonStringify(value: unknown): string | null {
  */
 function modelOutputToText(
   modelOutput: unknown,
-  traversal: { seen: WeakSet<object>; depth: number; nodes: number } = {
+  maxTextCodeUnits?: number,
+  traversal: ModelOutputTraversal = {
     seen: new WeakSet<object>(),
     depth: 0,
     nodes: 0,
+    exhausted: false,
   },
 ): string | null {
+  if (!visitModelOutputNode(traversal)) return null;
+
   if (typeof modelOutput === 'string') {
-    return modelOutput;
+    return maxTextCodeUnits === undefined ? modelOutput : modelOutput.slice(0, maxTextCodeUnits);
   }
 
-  if (typeof modelOutput === 'number' || typeof modelOutput === 'boolean' || typeof modelOutput === 'bigint') {
+  if (typeof modelOutput === 'bigint') {
+    return maxTextCodeUnits === undefined ? String(modelOutput) : null;
+  }
+
+  if (typeof modelOutput === 'number' || typeof modelOutput === 'boolean') {
     return String(modelOutput);
   }
 
@@ -107,59 +340,90 @@ function modelOutputToText(
     return null;
   }
 
-  if (
-    traversal.seen.has(modelOutput) ||
-    traversal.depth >= MAX_MODEL_OUTPUT_TRAVERSAL_DEPTH ||
-    traversal.nodes >= MAX_MODEL_OUTPUT_TRAVERSAL_NODES
-  ) {
+  if (traversal.seen.has(modelOutput) || traversal.depth >= MAX_MODEL_OUTPUT_TRAVERSAL_DEPTH) {
     return null;
   }
 
   traversal.seen.add(modelOutput);
   traversal.depth += 1;
-  traversal.nodes += 1;
 
   try {
     if (Array.isArray(modelOutput)) {
-      const text = modelOutput
-        .map(part => modelOutputToText(part, traversal))
-        .filter((part): part is string => Boolean(part))
-        .join('\n');
-      return text || null;
+      const text: string[] = [];
+      let textLength = 0;
+      for (const part of modelOutput) {
+        const converted = modelOutputToText(
+          part,
+          maxTextCodeUnits === undefined ? undefined : Math.max(0, maxTextCodeUnits - textLength),
+          traversal,
+        );
+        if (traversal.exhausted) return null;
+        if (converted) {
+          if (text.length > 0) {
+            text.push('\n');
+            textLength += 1;
+          }
+          const remaining = maxTextCodeUnits === undefined ? undefined : Math.max(0, maxTextCodeUnits - textLength);
+          const bounded = remaining === undefined ? converted : converted.slice(0, Math.max(0, remaining));
+          text.push(bounded);
+          textLength += bounded.length;
+        }
+        if (maxTextCodeUnits !== undefined && textLength >= maxTextCodeUnits) break;
+      }
+      return text.length > 0 ? text.join('') : null;
     }
 
     const output = modelOutput as Record<string, unknown>;
     switch (output.type) {
       case 'text':
       case 'error-text':
-        return typeof output.value === 'string' ? output.value : typeof output.text === 'string' ? output.text : null;
+        if (typeof output.value === 'string')
+          return maxTextCodeUnits === undefined ? output.value : output.value.slice(0, maxTextCodeUnits);
+        if (typeof output.text === 'string')
+          return maxTextCodeUnits === undefined ? output.text : output.text.slice(0, maxTextCodeUnits);
+        return null;
       case 'json':
       case 'error-json':
-        return Object.hasOwn(output, 'value') ? safeJsonStringify(output.value) : null;
+        return Object.hasOwn(output, 'value') && isBoundedJsonValue(output.value, traversal)
+          ? boundedJsonStringify(output.value, maxTextCodeUnits)
+          : null;
       case 'content': {
         if (!Array.isArray(output.value)) return null;
-        const text = output.value
-          .flatMap(part => {
-            if (!part || typeof part !== 'object') return [];
-            const contentPart = part as Record<string, unknown>;
-            if (contentPart.type !== 'text') return [];
-            const value = typeof contentPart.text === 'string' ? contentPart.text : contentPart.value;
-            return typeof value === 'string' ? [value] : [];
-          })
-          .join('\n');
-        return text || null;
+        if (!visitModelOutputNode(traversal)) return null;
+        const text: string[] = [];
+        let textLength = 0;
+        for (const part of output.value) {
+          if (!visitModelOutputNode(traversal)) return null;
+          if (!part || typeof part !== 'object') continue;
+          const contentPart = part as Record<string, unknown>;
+          if (contentPart.type !== 'text') continue;
+          const value = typeof contentPart.text === 'string' ? contentPart.text : contentPart.value;
+          if (typeof value !== 'string') continue;
+          if (text.length > 0) {
+            text.push('\n');
+            textLength += 1;
+          }
+          const remaining = maxTextCodeUnits === undefined ? undefined : Math.max(0, maxTextCodeUnits - textLength);
+          const bounded = remaining === undefined ? value : value.slice(0, remaining);
+          text.push(bounded);
+          textLength += bounded.length;
+          if (maxTextCodeUnits !== undefined && textLength >= maxTextCodeUnits) break;
+        }
+        return text.length > 0 ? text.join('') : null;
       }
       default:
         // Preserve the two legacy wrapper shapes ToolCallFilter already accepted, but never stringify
         // arbitrary objects. This fails closed for media and unknown provider-specific output.
-        if (typeof output.text === 'string') return output.text;
+        if (typeof output.text === 'string')
+          return maxTextCodeUnits === undefined ? output.text : output.text.slice(0, maxTextCodeUnits);
         if (!Object.hasOwn(output, 'type') && Object.hasOwn(output, 'value')) {
-          return modelOutputToText(output.value, traversal);
+          return modelOutputToText(output.value, maxTextCodeUnits, traversal);
         }
         return null;
     }
   } finally {
     traversal.depth -= 1;
+    traversal.seen.delete(modelOutput);
   }
 }
 
@@ -190,37 +454,46 @@ function getPreservedModelOutputPart(
     return null;
   }
 
-  const mastraMetadata = part.providerMetadata?.mastra;
-  if (!mastraMetadata || !Object.hasOwn(mastraMetadata, 'modelOutput')) {
+  try {
+    const mastraMetadata = part.providerMetadata?.mastra;
+    if (!mastraMetadata || !Object.hasOwn(mastraMetadata, 'modelOutput')) {
+      return null;
+    }
+
+    const maxTextCodeUnits =
+      options.maxModelOutputBytes === undefined
+        ? undefined
+        : Math.min(Number.MAX_SAFE_INTEGER, options.maxModelOutputBytes + 1);
+    const text = modelOutputToText(mastraMetadata.modelOutput, maxTextCodeUnits);
+    if (!text) return null;
+
+    const boundedText = truncateUtf8(text, options.maxModelOutputBytes);
+    if (!boundedText) return null;
+
+    return {
+      type: 'text',
+      text: `${part.toolInvocation.toolName} result:\n${boundedText}`,
+    };
+  } catch {
     return null;
   }
-
-  const text = modelOutputToText(mastraMetadata.modelOutput);
-  if (!text) return null;
-
-  const boundedText = truncateUtf8(text, options.maxModelOutputBytes);
-  if (!boundedText) return null;
-
-  return {
-    type: 'text',
-    text: `${part.toolInvocation.toolName} result:\n${boundedText}`,
-  };
 }
 
 function buildContent(
   message: MastraDBMessage,
   parts: MastraDBMessage['content']['parts'],
   toolInvocations: MastraDBMessage['content']['toolInvocations'],
+  behavior: ToolCallMessageFilterBehavior,
 ): MastraDBMessage['content'] {
-  const {
-    toolInvocations: _originalToolInvocations,
-    providerMetadata: _providerMetadata,
-    ...contentWithoutToolInvocations
-  } = message.content;
+  const { toolInvocations: _originalToolInvocations, ...contentWithoutToolInvocations } = message.content;
   const updatedContent: MastraDBMessage['content'] = {
     ...contentWithoutToolInvocations,
     parts,
   };
+
+  if (behavior.stripMessageProviderMetadata) {
+    delete updatedContent.providerMetadata;
+  }
 
   if (toolInvocations && toolInvocations.length > 0) {
     updatedContent.toolInvocations = toolInvocations;
@@ -233,11 +506,13 @@ function filterAllToolCalls(
   messages: MastraDBMessage[],
   options: NormalizedToolCallFilteringOptions,
   preserveToolCallIds: Set<string>,
+  behavior: ToolCallMessageFilterBehavior,
 ): MastraDBMessage[] {
   return messages
     .map(message => {
       if (!hasToolInvocations(message)) return message;
 
+      let changed = false;
       const nonToolParts: MastraMessagePart[] = [];
       for (const part of getMessageParts(message)) {
         if (part.type !== 'tool-invocation') {
@@ -251,14 +526,19 @@ function filterAllToolCalls(
           continue;
         }
 
+        changed = true;
         const modelOutputPart = getPreservedModelOutputPart(part, options);
         if (modelOutputPart) nonToolParts.push(modelOutputPart);
       }
 
-      const filteredToolInvocations = getTopLevelToolInvocations(message).filter(invocation => {
+      const originalToolInvocations = getTopLevelToolInvocations(message);
+      const filteredToolInvocations = originalToolInvocations.filter(invocation => {
         const toolCallId = getToolCallId(invocation);
         return toolCallId !== undefined && preserveToolCallIds.has(toolCallId);
       });
+      changed ||= filteredToolInvocations.length !== originalToolInvocations.length;
+
+      if (!changed) return message;
 
       if (
         nonToolParts.length === 0 &&
@@ -270,7 +550,7 @@ function filterAllToolCalls(
 
       return {
         ...message,
-        content: buildContent(message, nonToolParts, filteredToolInvocations),
+        content: buildContent(message, nonToolParts, filteredToolInvocations, behavior),
       };
     })
     .filter((message): message is MastraDBMessage => message !== null);
@@ -280,6 +560,7 @@ function filterSpecificToolCalls(
   messages: MastraDBMessage[],
   options: NormalizedToolCallFilteringOptions & { exclude: string[] },
   preserveToolCallIds: Set<string>,
+  behavior: ToolCallMessageFilterBehavior,
 ): MastraDBMessage[] {
   const excludedToolCallIds = new Set<string>();
 
@@ -300,6 +581,7 @@ function filterSpecificToolCalls(
     .map(message => {
       if (!hasToolInvocations(message)) return message;
 
+      let changed = false;
       const filteredParts: MastraMessagePart[] = [];
       for (const part of getMessageParts(message)) {
         if (part.type !== 'tool-invocation') {
@@ -322,11 +604,13 @@ function filterSpecificToolCalls(
           continue;
         }
 
+        changed = true;
         const modelOutputPart = getPreservedModelOutputPart(part, options);
         if (modelOutputPart) filteredParts.push(modelOutputPart);
       }
 
-      const filteredToolInvocations = getTopLevelToolInvocations(message).filter(invocation => {
+      const originalToolInvocations = getTopLevelToolInvocations(message);
+      const filteredToolInvocations = originalToolInvocations.filter(invocation => {
         const toolCallId = getToolCallId(invocation);
         return (
           (toolCallId !== undefined && preserveToolCallIds.has(toolCallId)) ||
@@ -334,6 +618,9 @@ function filterSpecificToolCalls(
             (toolCallId === undefined || !excludedToolCallIds.has(toolCallId)))
         );
       });
+      changed ||= filteredToolInvocations.length !== originalToolInvocations.length;
+
+      if (!changed) return message;
 
       if (
         filteredParts.length === 0 &&
@@ -345,7 +632,7 @@ function filterSpecificToolCalls(
 
       return {
         ...message,
-        content: buildContent(message, filteredParts, filteredToolInvocations),
+        content: buildContent(message, filteredParts, filteredToolInvocations, behavior),
       };
     })
     .filter((message): message is MastraDBMessage => message !== null);
@@ -355,15 +642,17 @@ export function filterToolCallMessages(
   messages: MastraDBMessage[],
   options: ToolCallFilteringOptions | null = {},
   preserveToolCallIds = new Set<string>(),
+  behavior: ToolCallMessageFilterBehavior = {},
 ): MastraDBMessage[] {
   const normalizedOptions = normalizeOptions(options);
   if (normalizedOptions.exclude === 'all') {
-    return filterAllToolCalls(messages, normalizedOptions, preserveToolCallIds);
+    return filterAllToolCalls(messages, normalizedOptions, preserveToolCallIds, behavior);
   }
   if (normalizedOptions.exclude.length === 0) return messages;
   return filterSpecificToolCalls(
     messages,
     { ...normalizedOptions, exclude: normalizedOptions.exclude },
     preserveToolCallIds,
+    behavior,
   );
 }

@@ -1059,10 +1059,18 @@ describe('MessageHistory', () => {
       if (!toolPart || toolPart.type !== 'tool-invocation') throw new Error('expected tool invocation');
       toolPart.providerMetadata = { mastra: { modelOutput: 'x'.repeat(1024 * 1024) } };
 
-      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+      const encodeSpy = vi.spyOn(TextEncoder.prototype, 'encode');
+      let encodedInputLengths: number[];
+      try {
+        await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+        encodedInputLengths = encodeSpy.mock.calls.map(([input]) => input.length);
+      } finally {
+        encodeSpy.mockRestore();
+      }
 
       const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
       const serialized = JSON.stringify(savedMessages);
+      expect(Math.max(...encodedInputLengths!)).toBeLessThanOrEqual(16 * 1024 + 1);
       expect(serialized).toContain('[truncated]');
       expect(new TextEncoder().encode(serialized).byteLength).toBeLessThan(17 * 1024);
     });
