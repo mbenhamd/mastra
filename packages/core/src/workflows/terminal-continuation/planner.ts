@@ -284,6 +284,44 @@ function sourceIsOwned(view: WorkflowTerminalParentPlanningView, source: Workflo
   );
 }
 
+function activeTopologyMatchesSource(
+  view: WorkflowTerminalParentPlanningView,
+  source: WorkflowTerminalResultCoordinate,
+): boolean {
+  const activeEntries = Object.entries(view.parentSnapshot.activeStepsPath);
+  if (source.kind === 'step') {
+    return (
+      activeEntries.length === 1 &&
+      activeEntries[0]![0] === source.stepId &&
+      samePath(activeEntries[0]![1], source.executionPath)
+    );
+  }
+
+  const current = contextEntry(view.parentSnapshot, source.stepId);
+  if (!Array.isArray(current?.payload) || !Array.isArray(current.output)) return false;
+  const workflowMeta = current.metadata?.__workflow_meta as Record<string, unknown> | undefined;
+  const iterationRuns = workflowMeta?.[WORKFLOW_TERMINAL_FOREACH_RUN_KEY] as Record<string, unknown> | undefined;
+  const iterationStates = workflowMeta?.[WORKFLOW_TERMINAL_FOREACH_STATE_KEY] as Record<string, unknown> | undefined;
+  return activeEntries.every(([stepId, path]) => {
+    if (stepId !== source.stepId) return false;
+    if (samePath(path, source.containerPath)) return true;
+    if (
+      path.length !== source.containerPath.length + 1 ||
+      !source.containerPath.every((entry, index) => path[index] === entry)
+    ) {
+      return false;
+    }
+    const iterationIndex = path[path.length - 1]!;
+    return (
+      Number.isSafeInteger(iterationIndex) &&
+      iterationIndex >= 0 &&
+      iterationIndex < current.output.length &&
+      typeof iterationRuns?.[String(iterationIndex)] === 'string' &&
+      !FOREACH_TERMINAL_STATES.has(iterationStates?.[String(iterationIndex)])
+    );
+  });
+}
+
 function nextTarget(graph: readonly SerializedStepFlowEntry[], index: number): WorkflowTerminalRunTarget {
   const entry = graph[index];
   if (!entry) throw new TypeError('Workflow terminal planner successor is missing');
@@ -382,7 +420,8 @@ export function createWorkflowTerminalLoopDecisionRequest(
     graphConflict ||
     view.effect.terminalStatus !== 'success' ||
     view.parentSnapshot.status !== 'running' ||
-    !sourceIsOwned(view, source)
+    !sourceIsOwned(view, source) ||
+    !activeTopologyMatchesSource(view, source)
   ) {
     throw new TypeError('Loop decision requested for an inactive or unowned source');
   }
@@ -445,6 +484,12 @@ function planAction(
       return 'plan-conflict';
     }
     return { action: { kind: 'cancel-parent', reason: 'child-canceled' }, patch: terminalPatch('canceled') };
+  }
+  if (
+    (resolved.kind === 'loop' || (resolved.kind === 'foreach' && resolved.iterationIndex !== undefined)) &&
+    !activeTopologyMatchesSource(view, source)
+  ) {
+    return 'plan-conflict';
   }
   const foreachState =
     resolved.kind === 'foreach' && resolved.iterationIndex !== undefined && source.kind === 'foreach-iteration'

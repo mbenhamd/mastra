@@ -288,6 +288,43 @@ describe('workflow terminal parent continuation planner', () => {
     );
   });
 
+  it.each(['unrelated-active-step', 'source-at-wrong-coordinate'] as const)(
+    'rejects loop callback and continuation planning with %s',
+    contradiction => {
+      const graph: SerializedStepFlowEntry[] = [
+        {
+          type: 'loop',
+          step: { id: 'nested', component: 'WORKFLOW' },
+          loopType: 'dowhile',
+          serializedCondition: { id: 'nested', fn: '() => true' },
+        },
+      ];
+      const validParent = snapshot(graph);
+      const request = createWorkflowTerminalLoopDecisionRequest(input(validParent));
+
+      for (const conditionResult of [true, false]) {
+        const parent = structuredClone(validParent);
+        if (contradiction === 'unrelated-active-step') parent.activeStepsPath.unrelated = [1];
+        else parent.activeStepsPath.nested = [1];
+
+        expect(() => createWorkflowTerminalLoopDecisionRequest(input(parent))).toThrow(/inactive or unowned/);
+        const evaluatedDecision = completeWorkflowTerminalLoopDecision(request, conditionResult);
+        if (contradiction === 'unrelated-active-step') {
+          expect(planWorkflowTerminalParentContinuation({ ...input(parent), evaluatedDecision })).toMatchObject({
+            action: { kind: 'quarantine', reason: 'plan-conflict' },
+          });
+        } else {
+          expect(() => planWorkflowTerminalParentContinuation({ ...input(parent), evaluatedDecision })).toThrow(
+            /Plan-conflict planning rejects evaluated decisions/,
+          );
+          expect(planWorkflowTerminalParentContinuation(input(parent))).toMatchObject({
+            action: { kind: 'quarantine', reason: 'plan-conflict' },
+          });
+        }
+      }
+    },
+  );
+
   it('allows a boundary loop exit but rejects another iteration past the configured count', () => {
     const graph: SerializedStepFlowEntry[] = [
       {
@@ -380,6 +417,41 @@ describe('workflow terminal parent continuation planner', () => {
     });
     const failedSibling = foreachParent(['a', 'b'], [false, null], 1, { '1': 'child-run' }, { '0': 'failed' });
     expect(planWorkflowTerminalParentContinuation(input(failedSibling, effect([0, 1], 'each')))).toMatchObject({
+      action: { kind: 'quarantine', reason: 'plan-conflict' },
+    });
+  });
+
+  it('quarantines every successful foreach action with unrelated or wrong-coordinate active work', () => {
+    const cases = [
+      foreachParent(['a', 'b'], [null, null], 0, { '0': 'child-run', '1': 'other' }),
+      foreachParent(['a', 'b'], [null], 0, { '0': 'child-run' }),
+      foreachParent(['a', 'b'], [null, null], 1, { '1': 'child-run' }, { '0': 'success' }),
+      foreachParent(['a', 'b'], [{ status: 'suspended' }, null], 1, { '0': 'suspended-run', '1': 'child-run' }),
+    ];
+
+    for (const validParent of cases) {
+      const sourceIndex = validParent.activeStepsPath.each![1]!;
+      for (const contradiction of ['unrelated-active-step', 'source-at-wrong-coordinate'] as const) {
+        const parent = structuredClone(validParent);
+        if (contradiction === 'unrelated-active-step') parent.activeStepsPath.unrelated = [1];
+        else parent.activeStepsPath.each = [1];
+        expect(planWorkflowTerminalParentContinuation(input(parent, effect([0, sourceIndex], 'each')))).toMatchObject({
+          action: { kind: 'quarantine', reason: 'plan-conflict' },
+        });
+      }
+    }
+  });
+
+  it('quarantines foreach active coordinates for unstarted and terminal iterations', () => {
+    const unstarted = foreachParent(['a', 'b'], [null], 0, { '0': 'child-run' });
+    unstarted.activeStepsPath.each = [0, 1];
+    expect(planWorkflowTerminalParentContinuation(input(unstarted, effect([0, 0], 'each')))).toMatchObject({
+      action: { kind: 'quarantine', reason: 'plan-conflict' },
+    });
+
+    const terminal = foreachParent(['a', 'b'], [null, null], 1, { '1': 'child-run' }, { '0': 'success' });
+    terminal.activeStepsPath.each = [0, 0];
+    expect(planWorkflowTerminalParentContinuation(input(terminal, effect([0, 1], 'each')))).toMatchObject({
       action: { kind: 'quarantine', reason: 'plan-conflict' },
     });
   });
@@ -547,6 +619,7 @@ describe('workflow terminal parent continuation planner', () => {
       parent = foreachParent(['a'], [null], 0, { '0': 'child-run' });
       terminalEffect = effect([0, 0], 'each', terminalStatus);
     }
+    if (topology === 'loop' || topology === 'foreach') parent.activeStepsPath.unrelated = [1];
     parent.status = status;
     expect(planWorkflowTerminalParentContinuation(input(parent, terminalEffect))).toMatchObject({
       action: { kind: actionKind },
