@@ -147,18 +147,18 @@ describe('internal workflow registry', () => {
       expect(m.__hasInternalWorkflow('loop', 'suspended-run')).toBe(false);
     });
 
-    it('lazily evicts abandoned run-scoped workflows after the TTL', () => {
+    it('does not infer abandonment from registration age', () => {
       vi.useFakeTimers();
       try {
         const m = makeMastra();
-        const stale = makeWorkflow('stale-loop');
+        const longRunning = makeWorkflow('long-running-loop');
         const fresh = makeWorkflow('fresh-loop');
-        m.__registerInternalWorkflow(stale, 'stale-run');
+        m.__registerInternalWorkflow(longRunning, 'long-running-run');
 
-        vi.advanceTimersByTime(Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
+        vi.advanceTimersByTime(30 * 60 * 1000 + 1);
         m.__registerInternalWorkflow(fresh, 'fresh-run');
 
-        expect(m.__hasInternalWorkflow('stale-loop', 'stale-run')).toBe(false);
+        expect(m.__getInternalWorkflow('long-running-loop', 'long-running-run')).toBe(longRunning);
         expect(m.__getInternalWorkflow('fresh-loop', 'fresh-run')).toBe(fresh);
       } finally {
         vi.useRealTimers();

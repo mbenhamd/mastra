@@ -6295,16 +6295,14 @@ export class Agent<
     // The workflow opts out of snapshot persistence (shouldPersistSnapshot returns false), so
     // this does not write any execution-workflow rows to storage.
     const executionRunId = randomUUID();
-    if (this.#mastra) {
-      this.#mastra.__registerInternalWorkflow(executionWorkflow, executionRunId);
-    }
+    const executionWorkflowRegistration = this.#mastra?.__registerInternalWorkflow(executionWorkflow, executionRunId);
 
     const observabilityContext = createObservabilityContext({ currentSpan: agentSpan });
     try {
       const run = await executionWorkflow.createRun({ runId: executionRunId });
       return await run.start({ ...observabilityContext });
     } finally {
-      this.#mastra?.__unregisterInternalWorkflow(executionWorkflow.id, executionRunId);
+      this.#mastra?.__unregisterInternalWorkflow(executionWorkflow.id, executionRunId, executionWorkflowRegistration);
     }
   }
 
