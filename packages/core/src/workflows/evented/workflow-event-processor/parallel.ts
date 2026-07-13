@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { StepFlowEntry } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
@@ -7,6 +8,37 @@ import type { ProcessorArgs } from '.';
 
 function pathsEqual(left: readonly number[], right: readonly number[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function readParallelRestartPath(value: unknown, maxLength: number): number[] | undefined {
+  if (value === null || typeof value !== 'object' || isProxy(value) || !Array.isArray(value)) return undefined;
+
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    !lengthDescriptor ||
+    !('value' in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value > maxLength ||
+    Object.getOwnPropertySymbols(value).length > 0 ||
+    Object.getOwnPropertyNames(value).length !== lengthDescriptor.value + 1
+  ) {
+    return undefined;
+  }
+
+  const path: number[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      !descriptor?.enumerable ||
+      !('value' in descriptor) ||
+      !Number.isSafeInteger(descriptor.value) ||
+      descriptor.value < 0
+    ) {
+      return undefined;
+    }
+    path.push(descriptor.value);
+  }
+  return path;
 }
 
 function validateParallelRestartPaths({
@@ -20,6 +52,22 @@ function validateParallelRestartPaths({
   restartContainerPath: number[];
   step: Extract<StepFlowEntry, { type: 'parallel' }>;
 }) {
+  if (
+    activeStepsPath === null ||
+    typeof activeStepsPath !== 'object' ||
+    isProxy(activeStepsPath) ||
+    Array.isArray(activeStepsPath)
+  ) {
+    throw new Error('Invalid parallel restart state: active step paths must be an own-property data record.');
+  }
+  const activeStepsPathPrototype = Object.getPrototypeOf(activeStepsPath);
+  if (
+    (activeStepsPathPrototype !== Object.prototype && activeStepsPathPrototype !== null) ||
+    Object.getOwnPropertySymbols(activeStepsPath).length > 0
+  ) {
+    throw new Error('Invalid parallel restart state: active step paths must be an own-property data record.');
+  }
+
   const branchIndices = new Map(
     step.steps.flatMap((nestedStep, index) =>
       nestedStep.type === 'step' ? ([[nestedStep.step.id, index]] as const) : [],
@@ -32,18 +80,15 @@ function validateParallelRestartPaths({
       throw new Error(`Invalid parallel restart state: active step "${stepId}" is not a branch of this parallel step.`);
     }
 
-    const descriptor = Object.getOwnPropertyDescriptor(activeStepsPath, stepId)!;
-    const path = 'value' in descriptor ? descriptor.value : undefined;
-    const isDenseIntegerPath =
-      Array.isArray(path) &&
-      Object.keys(path).length === path.length &&
-      path.every(
-        (value, index) => Object.prototype.hasOwnProperty.call(path, index) && Number.isInteger(value) && value >= 0,
-      );
+    const descriptor = Object.getOwnPropertyDescriptor(activeStepsPath, stepId);
+    const path =
+      descriptor?.enumerable && 'value' in descriptor
+        ? readParallelRestartPath(descriptor.value, restartContainerPath.length + 1)
+        : undefined;
     const fullBranchPath = restartContainerPath.concat(branchIndex);
     const storedBranchPath = [branchIndex];
     if (
-      !isDenseIntegerPath ||
+      !path ||
       (!pathsEqual(path, fullBranchPath) &&
         !pathsEqual(path, storedBranchPath) &&
         !(allowContainerPath && pathsEqual(path, restartContainerPath)))

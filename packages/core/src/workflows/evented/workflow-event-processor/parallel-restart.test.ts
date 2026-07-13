@@ -151,17 +151,21 @@ describe('processWorkflowParallel restart branch routing', () => {
     expect(runPaths(published)).toEqual([[4, 7, 2]]);
   });
 
-  it('ignores inherited activity keys', async () => {
-    const { published, pubsub } = recorder();
-    const activeStepsPath = Object.create({ C: [0, 2] });
+  it.each([Object.create({ C: [0, 2] }), new Date()])(
+    'rejects a custom-prototype activity record',
+    async activeStepsPath => {
+      const { published, pubsub } = recorder();
 
-    await processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
-      pubsub,
-      step: makeParallelStep(['A', 'B', 'C']),
-    });
+      await expect(
+        processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
+          pubsub,
+          step: makeParallelStep(['A', 'B', 'C']),
+        }),
+      ).rejects.toThrow('Invalid parallel restart state');
 
-    expect(published).toEqual([]);
-  });
+      expect(published).toEqual([]);
+    },
+  );
 
   it('rejects accessor and unknown own keys before publishing', async () => {
     const getter = vi.fn(() => [0, 2]);
@@ -182,6 +186,54 @@ describe('processWorkflowParallel restart branch routing', () => {
     expect(getter).not.toHaveBeenCalled();
   });
 
+  it('rejects proxy maps and paths before invoking reflection traps', async () => {
+    const trap = vi.fn(() => {
+      throw new Error('proxy trap must not run');
+    });
+    const handler = {
+      get: trap,
+      getOwnPropertyDescriptor: trap,
+      getPrototypeOf: trap,
+      ownKeys: trap,
+    } as ProxyHandler<Record<string, unknown>>;
+
+    const proxyMap = new Proxy({ C: [0, 2] }, handler);
+    const proxyPath = new Proxy([0, 2], handler as ProxyHandler<number[]>);
+    const revoked = Proxy.revocable({ C: [0, 2] }, {});
+    revoked.revoke();
+
+    for (const activeStepsPath of [proxyMap, { C: proxyPath }, revoked.proxy]) {
+      const { published, pubsub } = recorder();
+      await expect(
+        processWorkflowParallel(makeArgs({ restart: { activeStepsPath, isParallelOrConditionalRestarted: false } }), {
+          pubsub,
+          step: makeParallelStep(['A', 'B', 'C']),
+        }),
+      ).rejects.toThrow('Invalid parallel restart state');
+      expect(published).toEqual([]);
+    }
+
+    expect(trap).not.toHaveBeenCalled();
+  });
+
+  it('rejects accessor path indices without invoking them', async () => {
+    const getter = vi.fn(() => 2);
+    const path: number[] = [];
+    Object.defineProperty(path, '0', { enumerable: true, get: getter });
+    path.length = 1;
+    const { published, pubsub } = recorder();
+
+    await expect(
+      processWorkflowParallel(
+        makeArgs({ restart: { activeStepsPath: { C: path }, isParallelOrConditionalRestarted: false } }),
+        { pubsub, step: makeParallelStep(['A', 'B', 'C']) },
+      ),
+    ).rejects.toThrow('Invalid parallel restart state');
+
+    expect(getter).not.toHaveBeenCalled();
+    expect(published).toEqual([]);
+  });
+
   it.each([
     ['non-array', true],
     ['wrong prefix', [9, 2]],
@@ -189,6 +241,7 @@ describe('processWorkflowParallel restart branch routing', () => {
     ['wrong full branch index', [0, 1]],
     ['sparse path', Object.assign(new Array(2), { 0: 0 })],
     ['overlong path', [0, 2, 0]],
+    ['unsafe integer path', [0, Number.MAX_SAFE_INTEGER + 1]],
   ])('rejects a %s before publishing', async (_label, path) => {
     const { published, pubsub } = recorder();
 
