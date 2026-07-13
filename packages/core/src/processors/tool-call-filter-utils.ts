@@ -29,6 +29,14 @@ type ToolCallMessageFilterBehavior = {
   stripMessageProviderMetadata?: boolean;
 };
 
+export function normalizeToolCallFilterExclude(exclude: unknown): string[] | 'all' {
+  if (exclude == null) return 'all';
+  if (!Array.isArray(exclude) || exclude.some(toolName => typeof toolName !== 'string')) {
+    throw new TypeError('Tool call filter options.exclude must be an array of strings when provided');
+  }
+  return exclude;
+}
+
 function getOwnDataProperty(value: object, key: PropertyKey): OwnDataProperty {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
   if (!descriptor) return { kind: 'missing' };
@@ -41,7 +49,7 @@ function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedT
   const exclude = (resolvedOptions as { exclude?: unknown }).exclude;
   const maxModelOutputBytes = resolvedOptions.maxModelOutputBytes;
   return {
-    exclude: exclude == null ? 'all' : Array.isArray(exclude) ? exclude : [],
+    exclude: normalizeToolCallFilterExclude(exclude),
     preserveModelOutput: resolvedOptions.preserveModelOutput ?? false,
     ...(maxModelOutputBytes === undefined
       ? {}

@@ -43,6 +43,18 @@ describe('ToolCallFilter', () => {
       expect(() => new ToolCallFilter(null as any)).not.toThrow();
     });
 
+    it.each(['weather', false, {}, ['weather', 42]])('rejects malformed runtime exclude input: %j', exclude => {
+      expect(() => new ToolCallFilter({ exclude } as any)).toThrow(
+        'Tool call filter options.exclude must be an array of strings when provided',
+      );
+    });
+
+    it('rejects malformed runtime exclude input in the shared filter utility', () => {
+      expect(() => filterToolCallMessages([], { exclude: ['weather', 42] } as any)).toThrow(
+        'Tool call filter options.exclude must be an array of strings when provided',
+      );
+    });
+
     it('should exclude all tool calls and tool results', async () => {
       const filter = new ToolCallFilter();
 
