@@ -4188,7 +4188,7 @@ export class Agent<
     pubsub,
     backgroundTaskEnabled,
     agentId = this.id,
-    agentName = this.name,
+    agentName: toolAgentName = this.name,
     ...rest
   }: {
     runId?: string;
@@ -5063,7 +5063,7 @@ export class Agent<
           logger: this.logger,
           mastra: this.#mastra,
           memory: await this.getMemory({ requestContext }),
-          agentName,
+          agentName: toolAgentName,
           agentId,
           requestContext,
           model: await this.getModel({ requestContext }),
