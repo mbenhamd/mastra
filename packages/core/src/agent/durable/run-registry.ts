@@ -5,6 +5,8 @@ import type { MessageList } from '../message-list';
 import type { SaveQueueManager } from '../save-queue';
 import type { RunRegistryEntry } from './types';
 
+const pinnedRunRegistry = new Map<string, { entry: RunRegistryEntry; count: number }>();
+
 /**
  * Global registry for accessing run entries from workflow steps.
  * This is necessary because workflow steps don't have direct access to
@@ -20,11 +22,46 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
   max: 1000,
   ttl: 10 * 60 * 1000,
   updateAgeOnGet: true,
-  dispose: entry => {
-    entry.cleanup?.();
+  dispose: (entry, runId) => {
+    // TTLCache can call dispose with an undefined value after a missing get()
+    // refreshes expiration metadata. Terminal workflow cleanup and the public
+    // cleanup handle may legitimately race, so disposal must remain idempotent.
+    if (!pinnedRunRegistry.has(runId)) entry?.cleanup?.();
   },
   noDisposeOnSet: true,
 });
+
+/** Resolve a runtime entry, including one pinned for an active workflow segment. */
+export function getGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
+  return pinnedRunRegistry.get(runId)?.entry ?? globalRunRegistry.get(runId);
+}
+
+/** Keep an active workflow segment immune to TTL/capacity eviction. */
+export function pinGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
+  const pinned = pinnedRunRegistry.get(runId);
+  if (pinned) {
+    pinned.count += 1;
+    return pinned.entry;
+  }
+  const entry = globalRunRegistry.get(runId);
+  if (entry) pinnedRunRegistry.set(runId, { entry, count: 1 });
+  return entry;
+}
+
+/** Release an active segment and restore its TTL entry when it remains resumable. */
+export function unpinGlobalRunRegistryEntry(runId: string): void {
+  const pinned = pinnedRunRegistry.get(runId);
+  if (!pinned) return;
+  pinned.count -= 1;
+  if (pinned.count > 0) return;
+  pinnedRunRegistry.delete(runId);
+  if (!globalRunRegistry.has(runId)) globalRunRegistry.set(runId, pinned.entry);
+}
+
+/** Remove a pin during explicit terminal/consumer cleanup. */
+export function clearPinnedRunRegistryEntry(runId: string): void {
+  pinnedRunRegistry.delete(runId);
+}
 
 /**
  * Registry for per-run non-serializable state.

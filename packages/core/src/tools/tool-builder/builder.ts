@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Schema } from '@internal/ai-v6';
 import type { ProviderDefinedTool, ToolExecutionOptions } from '@internal/external-types';
 import {
@@ -60,6 +61,34 @@ interface LogMessageOptions {
   start: string;
   error: string;
   logData: Record<string, unknown>;
+}
+
+function createToolRecoveryFingerprint(
+  tool: ToolToConvert,
+  schemas: { input?: unknown; output?: unknown; suspend?: unknown; resume?: unknown },
+): string {
+  const functionSource = (value: unknown) =>
+    typeof value === 'function' ? Function.prototype.toString.call(value) : undefined;
+  const candidate = tool as unknown as Record<string, unknown>;
+  const originalFingerprint =
+    typeof candidate.recoveryFingerprint === 'string' ? candidate.recoveryFingerprint : undefined;
+  return createHash('sha256')
+    .update(
+      safeStringify({
+        id: candidate.id,
+        originalFingerprint,
+        description: candidate.description,
+        schemas,
+        execute: functionSource(candidate.execute),
+        requireApproval: functionSource(candidate.requireApproval) ?? candidate.requireApproval,
+        needsApproval: functionSource(candidate.needsApproval) ?? candidate.needsApproval,
+        needsApprovalFn: functionSource(candidate.needsApprovalFn),
+        toModelOutput: functionSource(candidate.toModelOutput),
+        transform: candidate.transform,
+        mcp: candidate.mcp,
+      }),
+    )
+    .digest('hex');
 }
 
 /**
@@ -995,6 +1024,12 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
+      recoveryFingerprint: createToolRecoveryFingerprint(this.originalTool, {
+        input: processedInputSchema,
+        output: processedOutputSchema,
+        suspend: this.getSuspendSchema(),
+        resume: this.getResumeSchema(),
+      }),
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,

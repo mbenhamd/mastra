@@ -121,6 +121,24 @@ afterEach(() => {
 });
 
 describe('durable tool-call background task dispatch', () => {
+  it('fails closed when a built-in durable run loses its runtime registry entry', async () => {
+    const pubsub = mockPubsub();
+
+    await expect(executeStep(pubsub, makeInitData({ runtimeResolution: 'registry-required' }))).rejects.toMatchObject({
+      id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+    });
+    expect(_resolveTool).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back to a current Mastra tool for a registry-required run', async () => {
+    const pubsub = mockPubsub();
+    setupRegistry({ tools: {} });
+
+    const result = await executeStep(pubsub, makeInitData({ runtimeResolution: 'registry-required' }));
+    expect(result.error).toMatchObject({ name: 'ToolNotFoundError' });
+    expect(_resolveTool).not.toHaveBeenCalled();
+  });
+
   it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {
     const pubsub = mockPubsub();
     setupRegistry();

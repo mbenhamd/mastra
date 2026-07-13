@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { createBackgroundTask } from '../../../../background-tasks/create';
 import { resolveBackgroundConfig } from '../../../../background-tasks/resolve-config';
 import type { ToolBackgroundConfig } from '../../../../background-tasks/types';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
 import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
@@ -18,7 +19,7 @@ import {
   parseToolApprovalGrant,
 } from '../../../tool-call-identity';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getGlobalRunRegistryEntry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type { DurableToolCallInput, SerializableDurableOptions, AgentSuspendedEventData } from '../../types';
 import { resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
@@ -145,6 +146,7 @@ export function createDurableToolCallStep() {
       const initData = getInitData<{
         runId: string;
         agentId: string;
+        runtimeResolution?: 'registry-required';
         options: SerializableDurableOptions;
         state: {
           threadId?: string;
@@ -167,10 +169,19 @@ export function createDurableToolCallStep() {
       }
 
       // 1. Resolve the tool from global registry first, then Mastra
-      const registryEntry = globalRunRegistry.get(runId);
+      const registryEntry = getGlobalRunRegistryEntry(runId);
+      if (!registryEntry && initData.runtimeResolution === 'registry-required') {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+          details: { agentId: initData.agentId, runId },
+        });
+      }
       let tool = registryEntry?.tools?.[toolName];
 
-      if (!tool) {
+      if (!tool && initData.runtimeResolution !== 'registry-required') {
         tool = resolveTool(toolName, mastra as Mastra);
       }
 
@@ -215,7 +226,7 @@ export function createDurableToolCallStep() {
       let messageList: MessageList | undefined;
       // For local execution, the globalRunRegistry might have an ExtendedRunRegistry entry
       // that stores the messageList. We cast and check safely.
-      const extendedEntry = globalRunRegistry.get(runId) as any;
+      const extendedEntry = getGlobalRunRegistryEntry(runId) as any;
       if (extendedEntry?.messageList) {
         messageList = extendedEntry.messageList;
       }

@@ -1,10 +1,11 @@
 import { z } from 'zod';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
 import { ChunkFrom } from '../../../../stream/types';
 import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getGlobalRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 
 const BG_CHECK_STEP_ID = `${DurableStepIds.AGENTIC_EXECUTION}-bg-task-check`;
@@ -40,12 +41,22 @@ export function createDurableBackgroundTaskCheckStep() {
       const initData = getInitData<{
         runId: string;
         agentId: string;
+        runtimeResolution?: 'registry-required';
         options?: { skipBgTaskWait?: boolean };
         state?: { threadId?: string; resourceId?: string };
       }>();
       const { runId, agentId } = initData;
 
-      const registryEntry = globalRunRegistry.get(runId);
+      const registryEntry = getGlobalRunRegistryEntry(runId);
+      if (!registryEntry && initData.runtimeResolution === 'registry-required') {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+          details: { agentId, runId },
+        });
+      }
       const bgManager = registryEntry?.backgroundTaskManager;
 
       if (!bgManager) {

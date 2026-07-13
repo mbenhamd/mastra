@@ -16,7 +16,7 @@ import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig } from '../../memory/types';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
-import type { RequestContext } from '../../request-context';
+import type { RequestContext, VersionOverrides } from '../../request-context';
 import type { ChunkType } from '../../stream/types';
 import type { CoreTool } from '../../tools/types';
 import type { Workspace } from '../../workspace';
@@ -40,6 +40,8 @@ export interface SerializableToolMetadata {
   requireApproval?: boolean;
   /** Whether the tool has a suspend schema for custom suspension */
   hasSuspendSchema?: boolean;
+  /** Opaque binding to the resolved implementation and recovery-relevant schemas. */
+  recoveryFingerprint?: string;
 }
 
 /**
@@ -180,6 +182,14 @@ export interface DurableAgenticWorkflowInput {
   agentId: string;
   /** Agent name for logging/tracing */
   agentName?: string;
+  /** Exact effective version selectors used to resolve runtime dependencies. */
+  versions?: VersionOverrides;
+  /** Cold recovery cannot safely reconstruct request-local processor state. */
+  hasProcessors?: boolean;
+  /** Opaque identities for request-resolved runtime services. */
+  runtimeBindings?: { memory?: string; workspace?: string };
+  /** Built-in DurableAgent runs require guarded in-process runtime registration. */
+  runtimeResolution?: 'registry-required';
   /** Serialized MessageList state */
   messageListState: SerializedMessageListState;
   /** Tool metadata (without execute functions) */
@@ -418,6 +428,10 @@ export interface RegistryModelListEntry {
  * Registry entry for a single run's non-serializable state
  */
 export interface RunRegistryEntry {
+  /** Durable owner tuple used to reject cross-agent/run-id registry collisions. */
+  agentId?: string;
+  threadId?: string;
+  resourceId?: string;
   /** Resolved tools with execute functions */
   tools: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
@@ -432,6 +446,8 @@ export interface RunRegistryEntry {
   workspace?: Workspace;
   /** Request context for forwarding auth data, feature flags, etc. to tools */
   requestContext?: RequestContext;
+  /** Immutable snapshot of the version selectors accepted when the run started. */
+  versions?: VersionOverrides;
   /** Cleanup function to call when run completes */
   cleanup?: () => void;
   /** MessageList for tracking conversation messages (non-serializable) */
@@ -448,6 +464,8 @@ export interface RunRegistryEntry {
   backgroundTaskManager?: BackgroundTaskManager;
   /** Agent background tasks configuration */
   backgroundTasksConfig?: AgentBackgroundConfig;
+  /** Current workflow segment, used to serialize suspend/resume persistence. */
+  workflowExecution?: Promise<void>;
 }
 
 /**

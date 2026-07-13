@@ -159,16 +159,27 @@ describe('DurableAgent RequestContext reserved keys', () => {
         },
       });
 
-      // Memory options from body are used for preparation
-      // RequestContext reserved keys take precedence at runtime
-      expect(result.threadId).toBe('body-thread');
-      expect(result.resourceId).toBe('body-resource');
+      // Reserved middleware identity is canonical during preparation as well as runtime.
+      expect(result.threadId).toBe('middleware-thread');
+      expect(result.resourceId).toBe('middleware-user');
+      expect(result.workflowInput.state).toMatchObject({
+        threadId: 'middleware-thread',
+        resourceId: 'middleware-user',
+      });
+      expect(result.workflowInput.messageListState.memoryInfo).toEqual({
+        threadId: 'middleware-thread',
+        resourceId: 'middleware-user',
+      });
     });
   });
 
   describe('RequestContext with tools', () => {
     it('should pass requestContext to tool execute', async () => {
       let receivedRequestContext: unknown = undefined;
+      let releaseFirstCall!: () => void;
+      const firstCallGate = new Promise<void>(resolve => {
+        releaseFirstCall = resolve;
+      });
 
       // Model that calls a tool on first invocation, then returns text
       let callCount = 0;
@@ -176,6 +187,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
         doStream: async () => {
           callCount++;
           if (callCount === 1) {
+            await firstCallGate;
             return {
               stream: convertArrayToReadableStream([
                 { type: 'stream-start', warnings: [] },
@@ -238,12 +250,17 @@ describe('DurableAgent RequestContext reserved keys', () => {
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
       const requestContext = new RequestContext();
+      const policy = { role: 'admin' };
       requestContext.set('userId', 'user-123');
+      requestContext.set('policy', policy);
 
       // Stream to actually execute the tool
       const { cleanup } = await durableAgent.stream('Use the tool', {
         requestContext,
       });
+      policy.role = 'user';
+      requestContext.set('userId', 'substituted-user');
+      releaseFirstCall();
 
       // Wait for execution to complete
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -252,6 +269,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       // Verify requestContext was passed through to tool.execute()
       expect(receivedRequestContext).toBeDefined();
       expect((receivedRequestContext as RequestContext).get('userId')).toBe('user-123');
+      expect((receivedRequestContext as RequestContext).get('policy')).toEqual({ role: 'admin' });
     });
   });
 

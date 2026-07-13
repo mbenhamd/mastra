@@ -7,7 +7,7 @@ packages:
 
 # Run.startAsync()
 
-The `.startAsync()` method starts a workflow run without waiting for completion. It returns immediately with the `runId`, allowing the workflow to execute in the background. This is useful for long-running workflows, scheduled tasks, or when you want to avoid blocking on workflow completion.
+The `.startAsync()` method starts a workflow run without waiting for completion. It returns immediately with the `runId`, allowing the workflow to execute in the background. Built-in workflow runs also return an optional `execution` promise so infrastructure code can observe background completion or rejection without changing the fire-and-forget behavior. Evented or integration-backed engines may omit that promise; use persisted run status as the portable completion contract.
 
 ## Usage example
 
@@ -15,10 +15,15 @@ The `.startAsync()` method starts a workflow run without waiting for completion.
 const run = await workflow.createRun()
 
 // Fire-and-forget - returns immediately
-const { runId } = await run.startAsync({
+const { runId, execution } = await run.startAsync({
   inputData: {
     value: 'initial data',
   },
+})
+
+// Optional: observe an in-process built-in execution without blocking this call.
+void execution?.catch(error => {
+  console.error('Background workflow failed', error)
 })
 
 // Optionally poll for completion later
@@ -106,6 +111,13 @@ const result = await workflow.getWorkflowRunExecutionResult(runId)
     name: 'runId',
     type: 'string',
     description: 'The unique identifier for this workflow run. Use this to check status or retrieve results later.',
+  },
+  {
+    name: 'execution',
+    type: 'Promise<WorkflowResult> | undefined',
+    isOptional: true,
+    description:
+      'Observable execution promise for built-in workflow runs. Integration-backed engines may omit it; attach a rejection handler when consuming it.',
   },
 ]}
 />

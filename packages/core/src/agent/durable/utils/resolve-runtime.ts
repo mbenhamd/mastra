@@ -1,4 +1,5 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import { resolveModelConfig } from '../../../llm/model/resolve-model';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import type { StreamInternal } from '../../../loop/types';
@@ -11,7 +12,7 @@ import type { CoreTool } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
-import { globalRunRegistry } from '../run-registry';
+import { getGlobalRunRegistryEntry } from '../run-registry';
 import type {
   SerializableDurableState,
   SerializableModelConfig,
@@ -63,14 +64,9 @@ export interface ResolveRuntimeOptions {
 /**
  * Resolve all runtime dependencies needed for durable step execution.
  *
- * This function reconstructs the non-serializable state needed to execute
- * agent steps from:
- * 1. The Mastra instance (for agent lookup, tools, model)
- * 2. The serialized workflow input (for MessageList, state)
- *
- * Unlike the registry-based approach, this reconstructs tools and model
- * from the agent registered with Mastra, making it truly durable across
- * process restarts.
+ * Built-in DurableAgent runs require runtime dependencies registered by
+ * stream() or guarded cold recovery. Other durable engines, such as Inngest,
+ * retain their established Mastra reconstruction contract.
  */
 export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions): Promise<ResolvedRuntimeDependencies> {
   const { mastra, runId, agentId, input, logger } = options;
@@ -84,23 +80,29 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
 
   // 2. Check global registry first (for local/test execution)
   // This is necessary because workflow steps don't have direct access to DurableAgent's registry
-  const globalEntry = globalRunRegistry.get(runId);
+  const globalEntry = getGlobalRunRegistryEntry(runId);
+  if (!globalEntry && input.runtimeResolution === 'registry-required') {
+    throw new MastraError({
+      id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.SYSTEM,
+      text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+      details: { agentId, runId },
+    });
+  }
   let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
-  let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
+  let model = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
   let workspace: Workspace | undefined = globalEntry?.workspace;
-  let memory: MastraMemory | undefined;
+  let memory: MastraMemory | undefined = globalEntry?.memory;
+  let saveQueueManager = globalEntry?.saveQueueManager;
 
-  // If we found the entry in global registry, we already have model and tools
   if (globalEntry) {
     logger?.debug?.(`[DurableAgent:${agentId}] Using model and tools from global registry for run ${runId}`);
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
-
-      // Build a request context with version overrides if available
       const resolveRequestContext = new RequestContext();
-      // Future: restore serialized version overrides from workflow input here
 
       tools = await agent.getToolsForExecution({
         runId,
@@ -110,11 +112,9 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         memoryConfig: input.state.memoryConfig,
         autoResumeSuspendedTools: input.options?.autoResumeSuspendedTools,
       });
-
       model =
         (await (agent as any).getModel?.({ requestContext: resolveRequestContext })) ??
         resolveModel(input.modelConfig, mastra);
-
       const rawModelList = await (agent as any).getModelList?.(resolveRequestContext);
       if (rawModelList && Array.isArray(rawModelList)) {
         modelList = rawModelList.map((entry: any) => ({
@@ -124,7 +124,6 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
           enabled: entry.enabled ?? true,
         }));
       }
-
       memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
       workspace = await (agent as any).getWorkspace?.({ requestContext: resolveRequestContext });
     } catch (error) {
@@ -141,8 +140,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   }
 
   // 3. Get or create SaveQueueManager
-  let saveQueueManager: SaveQueueManager | undefined;
-  if (memory) {
+  if (memory && !saveQueueManager) {
     saveQueueManager = new SaveQueueManager({
       logger: mastra?.getLogger?.(),
       memory,

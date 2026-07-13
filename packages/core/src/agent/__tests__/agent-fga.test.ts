@@ -39,6 +39,8 @@ function createMockMastra(
     getVersionOverrides: () => undefined,
     generateId: () => 'test-run-id',
     listGateways: () => [],
+    __registerInternalWorkflow: vi.fn(),
+    __unregisterInternalWorkflow: vi.fn(),
   } as any;
 }
 
@@ -89,7 +91,15 @@ function createMockLegacyModel() {
 
 function createWorkflowRunStorage({
   resourceId,
-  snapshot = { context: {} },
+  snapshot = {
+    status: 'suspended',
+    context: {
+      suspendedStep: {
+        status: 'suspended',
+        suspendPayload: { __agentId: 'test-agent' },
+      },
+    },
+  },
   loadedSnapshot = snapshot,
 }: {
   resourceId?: string;
@@ -104,6 +114,7 @@ function createWorkflowRunStorage({
       snapshot,
     }),
     loadWorkflowSnapshot: vi.fn().mockResolvedValue(loadedSnapshot),
+    listWorkflowRuns: vi.fn().mockResolvedValue({ runs: [], total: 0 }),
   };
   const storage = {
     getStore: vi.fn().mockReturnValue(workflowsStore),
@@ -1135,6 +1146,45 @@ describe('Agent FGA checks', () => {
     });
   });
 
+  describe('listSuspendedRuns()', () => {
+    it('requires and authorizes the reserved resource before storage discovery', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const { getStorage, workflowsStore } = createWorkflowRunStorage({ resourceId: 'resource-a' });
+      const mastra = createMockMastra(fgaProvider, getStorage);
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model: {} as any });
+      (agent as any).__registerMastra(mastra);
+
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+      requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-a');
+      await expect(agent.listSuspendedRuns({ requestContext })).resolves.toEqual({ runs: [], total: 0 });
+      expect(workflowsStore.listWorkflowRuns).toHaveBeenCalledOnce();
+      expectAgentExecutionRequire(fgaProvider, { id: 'user-1' }, { resourceId: 'resource-a' });
+    });
+
+    it('rejects missing or conflicting reserved resource ids before storage discovery', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const { getStorage, workflowsStore } = createWorkflowRunStorage({ resourceId: 'resource-a' });
+      const mastra = createMockMastra(fgaProvider, getStorage);
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model: {} as any });
+      (agent as any).__registerMastra(mastra);
+
+      const missingResource = new RequestContext();
+      missingResource.set('user', { id: 'user-1' });
+      await expect(agent.listSuspendedRuns({ requestContext: missingResource })).rejects.toMatchObject({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_UNVERIFIED',
+      });
+
+      const conflictingResource = new RequestContext();
+      conflictingResource.set('user', { id: 'user-1' });
+      conflictingResource.set(MASTRA_RESOURCE_ID_KEY, 'resource-a');
+      await expect(
+        agent.listSuspendedRuns({ requestContext: conflictingResource, resourceId: 'resource-b' }),
+      ).rejects.toMatchObject({ id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_MISMATCH' });
+      expect(workflowsStore.listWorkflowRuns).not.toHaveBeenCalled();
+    });
+  });
+
   describe('resumeStream()', () => {
     it('should call FGA provider before loading a persisted snapshot', async () => {
       const fgaProvider = createMockFGAProvider(true);
@@ -1433,9 +1483,13 @@ describe('Agent FGA checks', () => {
       });
 
       expect(fgaProvider.require).toHaveBeenCalledTimes(1);
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should authorize merged resumeStreamUntilIdle options when caller memory overrides defaults', async () => {
@@ -1575,9 +1629,13 @@ describe('Agent FGA checks', () => {
         id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
       });
 
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should reject callers whose resource does not own the suspended generate run', async () => {
@@ -1632,7 +1690,15 @@ describe('Agent FGA checks', () => {
       const { getStorage, workflowsStore } = createWorkflowRunStorage({
         resourceId: 'resource-a',
         snapshot: '{"context":{}}',
-        loadedSnapshot: { context: {} },
+        loadedSnapshot: {
+          status: 'suspended',
+          context: {
+            suspendedStep: {
+              status: 'suspended',
+              suspendPayload: { __agentId: 'test-agent' },
+            },
+          },
+        },
       });
       const mastra = createMockMastra(fgaProvider, getStorage);
 

@@ -4,7 +4,9 @@ import { z } from 'zod/v4';
 import type { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
 import { Agent } from './agent';
+import type { AgentRunToolCall } from './agent';
 import type { AgentExecutionOptions, PublicAgentExecutionOptions } from './agent.types';
+import type { DurableAgent, DurableAgentResumeOptions } from './durable';
 import type { AgentConfig } from './types';
 
 /**
@@ -13,6 +15,23 @@ import type { AgentConfig } from './types';
  * Issue #9657: defaultOptions.structuredOutput should accept Zod schemas
  */
 describe('Agent Type Tests', () => {
+  describe('suspended run discovery', () => {
+    it('exports exact discovery and durable resume types', () => {
+      expectTypeOf<AgentRunToolCall['toolCallId']>().toEqualTypeOf<string>();
+
+      const options: DurableAgentResumeOptions = {
+        toolCallId: 'call-123',
+        memory: { thread: 'thread-123', resource: 'resource-123' },
+      };
+      expectTypeOf(options.toolCallId).toEqualTypeOf<string | undefined>();
+
+      const durableAgent = undefined as unknown as DurableAgent;
+      void durableAgent.resumeStream({}, { runId: 'run-123', toolCallId: 'call-123' });
+      // @ts-expect-error Unknown resume options must not be accepted by the durable override.
+      void durableAgent.resumeStream({}, { runId: 'run-123', banana: true });
+    });
+  });
+
   describe('Issue #9657: defaultOptions.structuredOutput should accept Zod schemas', () => {
     it('should allow Zod schema in AgentExecutionOptions.structuredOutput when OUTPUT is specified', () => {
       const mySchema = z.object({

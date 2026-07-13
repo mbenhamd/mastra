@@ -115,6 +115,7 @@ import {
   readChannelToolFence,
   stampChannelToolFence,
 } from './channel-tool-fence';
+import { snapshotAgentExecutionOptions, snapshotAgentExecutionValue } from './execution-snapshot';
 import { buildMcpServerGuidance } from './mcp-guidance';
 import { MessageList } from './message-list';
 import type { MessageInput, MessageListInput, UIMessageWithMetadata, MastraDBMessage } from './message-list';
@@ -201,6 +202,47 @@ type AgentSnapshotMemoryInfo = {
   threadId?: string;
   resourceId?: string;
 };
+
+/** A tool call waiting inside a persisted suspended agent run. */
+export interface AgentRunToolCall {
+  /** Exact workflow resume label required to continue this call. */
+  toolCallId: string;
+  toolName?: string;
+  /** Arguments supplied by the model for approval-gated calls. */
+  args?: unknown;
+  requiresApproval: boolean;
+  /** Tool-defined payload for calls parked through `suspend()`. */
+  suspendPayload?: unknown;
+}
+
+export type AgentRunStatus = 'suspended';
+
+/** Storage-backed filters for {@link Agent.listSuspendedRuns}. */
+export interface AgentListSuspendedRunsOptions {
+  threadId?: string;
+  resourceId?: string;
+  requestContext?: RequestContext;
+  fromDate?: Date;
+  toDate?: Date;
+  perPage?: number;
+  page?: number;
+}
+
+/** A suspended run owned by this agent and recovered from workflow storage. */
+export interface AgentRun {
+  runId: string;
+  status: AgentRunStatus;
+  workflowName: 'agentic-loop' | 'durable-agentic-loop';
+  threadId?: string;
+  resourceId?: string;
+  suspendedAt: Date;
+  toolCalls: AgentRunToolCall[];
+}
+
+export interface AgentListSuspendedRunsResult {
+  runs: AgentRun[];
+  total: number;
+}
 
 type ProcessorWorkflowChildrenContainer = {
   steps?: Record<string, unknown> | unknown[];
@@ -1068,6 +1110,20 @@ export class Agent<
     }
 
     await this.#validateRequestContext(requestContext);
+  }
+
+  /** @internal Shared by DurableAgent when restoring a persisted run. */
+  async __assertAgentResumePreflight(options: {
+    requestContext?: RequestContext;
+    memory?: AgentExecutionOptionsBase<any>['memory'];
+    runId: string;
+    snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
+  }): Promise<void> {
+    await this.#assertAgentExecutionPreflight(options.requestContext, {
+      memory: options.memory,
+      runId: options.runId,
+      snapshotMemoryInfo: options.snapshotMemoryInfo,
+    });
   }
 
   /**
@@ -5812,6 +5868,20 @@ export class Agent<
         },
       });
     }
+    const snapshotStatus = (existingSnapshot as { status?: unknown }).status;
+    if (snapshotStatus !== 'suspended') {
+      throw new MastraError({
+        id: 'AGENT_RESUME_RUN_NOT_SUSPENDED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" ${method}() cannot resume runId "${runId}" because it is not suspended.`,
+        details: {
+          runId,
+          agentName: this.name,
+          status: typeof snapshotStatus === 'string' ? snapshotStatus : 'unknown',
+        },
+      });
+    }
 
     return {
       resourceId: typeof workflowRun?.resourceId === 'string' ? workflowRun.resourceId : undefined,
@@ -5839,12 +5909,16 @@ export class Agent<
     method,
     runId,
     runResourceId,
+    runThreadId,
+    snapshot,
     requestContext,
     options,
   }: {
     method: string;
     runId: string;
     runResourceId?: string;
+    runThreadId?: string;
+    snapshot?: any;
     requestContext?: RequestContext;
     options?: AgentExecutionOptionsBase<any>;
   }): void {
@@ -5852,6 +5926,24 @@ export class Agent<
     const callerResourceId = this.#getResumeCallerResourceId(requestContext, options, {
       trustMemoryResource: !hasFga,
     });
+    const requestedThread = options?.memory?.thread;
+    const memoryThreadId = typeof requestedThread === 'string' ? requestedThread : requestedThread?.id;
+    const contextThreadId = requestContext?.get(MASTRA_THREAD_ID_KEY);
+    const callerThreadId = typeof contextThreadId === 'string' ? contextThreadId : hasFga ? undefined : memoryThreadId;
+
+    const runAgentId = snapshot ? this.#getAgenticLoopSnapshotAgentId(snapshot) : undefined;
+    if (snapshot && runAgentId !== this.id) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_AGENT_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" ${method}() cannot resume runId "${runId}" because it is not owned by this agent.`,
+        details: {
+          runId,
+          agentName: this.name,
+        },
+      });
+    }
 
     if (runResourceId && callerResourceId && runResourceId !== callerResourceId) {
       throw new MastraError({
@@ -5871,7 +5963,33 @@ export class Agent<
         id: 'AGENT_RESUME_OWNER_UNVERIFIED',
         domain: ErrorDomain.AGENT,
         category: ErrorCategory.USER,
-        text: `Agent "${this.name}" ${method}() requires a matching resource id to resume runId "${runId}".`,
+        text: `Agent "${this.name}" ${method}() requires the matching resource id to resume runId "${runId}".`,
+        details: {
+          runId,
+          agentName: this.name,
+        },
+      });
+    }
+
+    if (runThreadId && callerThreadId && callerThreadId !== runThreadId) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_THREAD_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" ${method}() requires the matching thread id to resume runId "${runId}".`,
+        details: {
+          runId,
+          agentName: this.name,
+        },
+      });
+    }
+
+    if (hasFga && runThreadId && !callerThreadId) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_THREAD_UNVERIFIED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" ${method}() requires the matching thread id to resume runId "${runId}".`,
         details: {
           runId,
           agentName: this.name,
@@ -5893,14 +6011,137 @@ export class Agent<
     }
   }
 
-  #getAgenticLoopSnapshotMemoryInfo(existingSnapshot: any): { threadId?: string; resourceId?: string } | undefined {
+  #getAgenticLoopSnapshotMemoryInfo(
+    existingSnapshot: any,
+  ): { threadId?: string; resourceId?: string } | null | undefined {
+    const threadIds = new Set<string>();
+    const resourceIds = new Set<string>();
+    let foundMemoryInfo = false;
     for (const key in existingSnapshot?.context) {
       const step = existingSnapshot?.context[key];
-      if (step && step.status === 'suspended' && step.suspendPayload?.__streamState) {
-        return step.suspendPayload?.__streamState?.messageList?.memoryInfo;
+      const payload = step?.status === 'suspended' ? step.suspendPayload : undefined;
+      const isToolSuspension = Boolean(
+        payload?.requireToolApproval || payload?.toolCallSuspended || payload?.toolName || payload?.toolCallId,
+      );
+      if (isToolSuspension) {
+        const memoryInfo = payload?.__streamState?.messageList?.memoryInfo;
+        if (!memoryInfo || typeof memoryInfo !== 'object') return null;
+        foundMemoryInfo = true;
+        if (typeof memoryInfo.threadId === 'string' && memoryInfo.threadId.length > 0) {
+          threadIds.add(memoryInfo.threadId);
+        }
+        if (typeof memoryInfo.resourceId === 'string' && memoryInfo.resourceId.length > 0) {
+          resourceIds.add(memoryInfo.resourceId);
+        }
       }
     }
-    return undefined;
+    if (threadIds.size > 1 || resourceIds.size > 1) return null;
+    if (!foundMemoryInfo) return undefined;
+    return {
+      threadId: [...threadIds][0],
+      resourceId: [...resourceIds][0],
+    };
+  }
+
+  #getAgenticLoopSnapshotAgentId(existingSnapshot: any): string | undefined {
+    const agentIds = new Set<string>();
+    for (const key in existingSnapshot?.context) {
+      const step = existingSnapshot?.context[key];
+      const payload = step?.status === 'suspended' ? step.suspendPayload : undefined;
+      const isToolSuspension = Boolean(
+        payload?.requireToolApproval || payload?.toolCallSuspended || payload?.toolName || payload?.toolCallId,
+      );
+      if (typeof payload?.__agentId === 'string') {
+        agentIds.add(payload.__agentId);
+      } else if (isToolSuspension) {
+        return undefined;
+      }
+    }
+    return agentIds.size === 1 ? [...agentIds][0] : undefined;
+  }
+
+  #findResumeLabelForStep(existingSnapshot: any, stepId: string): string | undefined {
+    const matchingLabels = Object.entries(existingSnapshot?.resumeLabels ?? {}).filter(
+      ([, target]) => (target as { stepId?: string } | undefined)?.stepId === stepId,
+    );
+    return matchingLabels.length === 1 ? matchingLabels[0]![0] : undefined;
+  }
+
+  #getAgenticLoopSuspendedToolCalls(existingSnapshot: any): {
+    toolCalls: AgentRunToolCall[];
+    hasLabelConflict: boolean;
+  } {
+    const toolCalls: AgentRunToolCall[] = [];
+    let hasLabelConflict = false;
+    for (const stepId in existingSnapshot?.context) {
+      const step = existingSnapshot.context[stepId];
+      if (step?.status !== 'suspended') continue;
+      const payload = step.suspendPayload;
+      if (!payload || typeof payload !== 'object') continue;
+
+      if (payload.requireToolApproval) {
+        const resumeLabel = this.#findResumeLabelForStep(existingSnapshot, stepId);
+        if (
+          !resumeLabel ||
+          (payload.requireToolApproval.toolCallId && payload.requireToolApproval.toolCallId !== resumeLabel)
+        ) {
+          hasLabelConflict = true;
+          continue;
+        }
+        toolCalls.push({
+          toolCallId: resumeLabel,
+          toolName: payload.requireToolApproval.toolName,
+          args: payload.requireToolApproval.args,
+          requiresApproval: true,
+        });
+      } else if (payload.toolCallSuspended || payload.toolName || payload.toolCallId) {
+        const resumeLabel = this.#findResumeLabelForStep(existingSnapshot, stepId);
+        if (!resumeLabel || (payload.toolCallId && payload.toolCallId !== resumeLabel)) {
+          hasLabelConflict = true;
+          continue;
+        }
+        toolCalls.push({
+          toolCallId: resumeLabel,
+          toolName: payload.toolName,
+          requiresApproval: false,
+          suspendPayload: payload.toolCallSuspended,
+        });
+      }
+    }
+    return { toolCalls, hasLabelConflict };
+  }
+
+  #assertAgenticLoopSuspendedToolCall(snapshot: any, runId: string, requestedToolCallId?: string): void {
+    const { toolCalls, hasLabelConflict } = this.#getAgenticLoopSuspendedToolCalls(snapshot);
+    if (hasLabelConflict) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_LABEL_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `Agent "${this.name}" found conflicting persisted resume labels for runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
+    if (requestedToolCallId) {
+      const matchingCalls = toolCalls.filter(toolCall => toolCall.toolCallId === requestedToolCallId);
+      if (matchingCalls.length !== 1) {
+        throw new MastraError({
+          id: 'AGENT_RESUME_TOOL_CALL_MISMATCH',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: `Agent "${this.name}" cannot find suspended tool call "${requestedToolCallId}" in runId "${runId}".`,
+          details: { runId, agentName: this.name, toolCallId: requestedToolCallId },
+        });
+      }
+    } else if (toolCalls.length > 1) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_AMBIGUOUS_TOOL_CALL',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" requires an exact toolCallId to resume runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
   }
 
   #withSnapshotThreadTarget<T extends { memory?: AgentExecutionOptionsBase<any>['memory'] }>(
@@ -5924,15 +6165,8 @@ export class Agent<
     } as T;
   }
 
-  #getSnapshotMemoryInfo(existingSnapshot: any): AgentSnapshotMemoryInfo | undefined {
-    for (const key in existingSnapshot?.context) {
-      const step = existingSnapshot?.context[key];
-      if (step && step.status === 'suspended' && step.suspendPayload?.__streamState) {
-        return step.suspendPayload?.__streamState?.messageList?.memoryInfo;
-      }
-    }
-
-    return undefined;
+  #getSnapshotMemoryInfo(existingSnapshot: any): AgentSnapshotMemoryInfo | null | undefined {
+    return this.#getAgenticLoopSnapshotMemoryInfo(existingSnapshot);
   }
 
   #getAgentExecutionResourceId({
@@ -5991,7 +6225,9 @@ export class Agent<
    */
   async #execute<OUTPUT>({ methodType, resumeContext, _pubsub, ...options }: InnerAgentExecutionOptions<OUTPUT>) {
     const existingSnapshot = resumeContext?.snapshot;
-    const snapshotMemoryInfo = existingSnapshot ? this.#getAgenticLoopSnapshotMemoryInfo(existingSnapshot) : undefined;
+    const snapshotMemoryInfo = existingSnapshot
+      ? (this.#getAgenticLoopSnapshotMemoryInfo(existingSnapshot) ?? undefined)
+      : undefined;
     const requestContext = options.requestContext || new RequestContext();
 
     // Build version overrides by merging: Mastra defaults < requestContext < call-site
@@ -6986,6 +7222,146 @@ export class Agent<
     return agentThreadStreamRuntime.getActiveThreadRunId(options, this.getPubSub());
   }
 
+  /**
+   * List this agent's suspended standard runs from workflow storage.
+   *
+   * This remains a core API only. Server/client route exposure is intentionally
+   * owned by the separate native checkpoint API lane.
+   */
+  async listSuspendedRuns(options: AgentListSuspendedRunsOptions = {}): Promise<AgentListSuspendedRunsResult> {
+    options = snapshotAgentExecutionOptions(options, [
+      'threadId',
+      'resourceId',
+      'requestContext',
+      'fromDate',
+      'toDate',
+      'perPage',
+      'page',
+    ]);
+    const { threadId, resourceId, requestContext, fromDate, toDate, perPage, page } = options;
+    if (perPage !== undefined && (!Number.isInteger(perPage) || perPage <= 0)) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_INVALID_PER_PAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" listSuspendedRuns() requires perPage to be a positive integer.`,
+        details: { agentName: this.name, perPage },
+      });
+    }
+    if (page !== undefined && (!Number.isInteger(page) || page < 0)) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_INVALID_PAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" listSuspendedRuns() requires page to be a non-negative integer.`,
+        details: { agentName: this.name, page },
+      });
+    }
+
+    const hasFga = Boolean(this.#mastra?.getServer()?.fga);
+    const contextResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY);
+    const contextThreadId = requestContext?.get(MASTRA_THREAD_ID_KEY);
+    if (hasFga && (typeof contextResourceId !== 'string' || contextResourceId.trim().length === 0)) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_UNVERIFIED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" listSuspendedRuns() requires a verified resource id.`,
+        details: { agentName: this.name },
+      });
+    }
+    if (typeof contextResourceId === 'string' && resourceId && contextResourceId !== resourceId) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" listSuspendedRuns() cannot list a different resource.`,
+        details: { agentName: this.name },
+      });
+    }
+    if (typeof contextThreadId === 'string' && threadId && contextThreadId !== threadId) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_THREAD_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" listSuspendedRuns() cannot list a different thread.`,
+        details: { agentName: this.name },
+      });
+    }
+    const scopedResourceId =
+      typeof contextResourceId === 'string' && contextResourceId.trim().length > 0 ? contextResourceId : resourceId;
+    const scopedThreadId =
+      typeof contextThreadId === 'string' && contextThreadId.trim().length > 0 ? contextThreadId : threadId;
+    await this.#assertAgentExecutionPreflight(requestContext, {
+      memory: scopedResourceId && scopedThreadId ? { resource: scopedResourceId, thread: scopedThreadId } : undefined,
+    });
+
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text:
+          `Agent "${this.name}" listSuspendedRuns() requires storage to discover suspended runs. ` +
+          `Register the agent on a Mastra instance with persistent storage.`,
+        details: { agentName: this.name },
+      });
+    }
+
+    // Always bypass driver defaults (notably DynamoDB's ten-row default), then
+    // paginate after snapshot-owned thread/resource filtering so total is exact.
+    const { runs } = await workflowsStore.listWorkflowRuns({
+      workflowName: 'agentic-loop',
+      status: 'suspended',
+      resourceId: scopedResourceId,
+      fromDate,
+      toDate,
+      perPage: false,
+    });
+
+    const matchedRuns: AgentRun[] = [];
+    for (const run of runs) {
+      let snapshot: any = run.snapshot;
+      if (typeof snapshot === 'string') {
+        try {
+          snapshot = JSON.parse(snapshot);
+        } catch {
+          continue;
+        }
+      }
+      if (snapshot?.status !== 'suspended') continue;
+      if (this.#getAgenticLoopSnapshotAgentId(snapshot) !== this.id) continue;
+
+      const memoryInfo = this.#getAgenticLoopSnapshotMemoryInfo(snapshot);
+      if (memoryInfo === null) continue;
+      const runThreadId = memoryInfo?.threadId;
+      if (run.resourceId && memoryInfo?.resourceId && run.resourceId !== memoryInfo.resourceId) continue;
+      const runResourceId = run.resourceId ?? memoryInfo?.resourceId;
+      if (scopedThreadId && runThreadId !== scopedThreadId) continue;
+      if (scopedResourceId && runResourceId !== scopedResourceId) continue;
+      const suspendedToolCalls = this.#getAgenticLoopSuspendedToolCalls(snapshot);
+      if (suspendedToolCalls.hasLabelConflict) continue;
+
+      matchedRuns.push({
+        runId: run.runId,
+        status: 'suspended',
+        workflowName: 'agentic-loop',
+        threadId: runThreadId,
+        resourceId: runResourceId,
+        suspendedAt: run.updatedAt,
+        toolCalls: suspendedToolCalls.toolCalls,
+      });
+    }
+
+    const total = matchedRuns.length;
+    const paginatedRuns =
+      perPage !== undefined && page !== undefined
+        ? matchedRuns.slice(page * perPage, (page + 1) * perPage)
+        : matchedRuns;
+    return { runs: paginatedRuns, total };
+  }
+
   abortThreadStream(options: AgentSubscribeToThreadOptions): boolean {
     return agentThreadStreamRuntime.abortThread(options, this.#resolveThreadStreamPubSub(options) ?? this.getPubSub());
   }
@@ -7859,6 +8235,10 @@ export class Agent<
       toolCallId?: string;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<MastraModelOutput<OUTPUT>> {
+    resumeData = snapshotAgentExecutionValue(resumeData);
+    streamOptions = streamOptions
+      ? snapshotAgentExecutionOptions(streamOptions, ['runId', 'toolCallId', 'requestContext', 'memory'])
+      : undefined;
     const pubsub =
       ((streamOptions as any)?._pubsub as PubSub | undefined) ?? this.getPubSub() ?? defaultAgentThreadPubSub;
     const streamOptionsWithPubSub: ResumeStreamInternalOptions | undefined = streamOptions
@@ -7904,6 +8284,25 @@ export class Agent<
     if (requestContextToUse) {
       ownershipOptions.requestContext = requestContextToUse;
     }
+    const snapshotMemoryInfo = this.#getAgenticLoopSnapshotMemoryInfo(existingSnapshot);
+    if (snapshotMemoryInfo === null) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `Agent "${this.name}" found conflicting persisted ownership for runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
+    if (runResourceId && snapshotMemoryInfo?.resourceId && runResourceId !== snapshotMemoryInfo.resourceId) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `Agent "${this.name}" found conflicting resource ownership for runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
     if (
       streamOptionsWithPubSub?.[SKIP_AGENT_EXECUTION_PREFLIGHT] &&
       !requestContextToUse &&
@@ -7918,14 +8317,14 @@ export class Agent<
     this.#assertAgenticLoopResumeOwnership({
       method: 'resumeStream',
       runId,
-      runResourceId,
+      runResourceId: runResourceId ?? snapshotMemoryInfo?.resourceId,
+      runThreadId: snapshotMemoryInfo?.threadId,
+      snapshot: existingSnapshot,
       requestContext: ownershipOptions.requestContext,
       options: ownershipOptions,
     });
-    const streamOptionsWithSnapshotTarget = this.#withSnapshotThreadTarget(
-      streamOptionsWithPubSub,
-      this.#getAgenticLoopSnapshotMemoryInfo(existingSnapshot),
-    );
+    this.#assertAgenticLoopSuspendedToolCall(existingSnapshot, runId, streamOptionsWithPubSub?.toolCallId);
+    const streamOptionsWithSnapshotTarget = this.#withSnapshotThreadTarget(streamOptionsWithPubSub, snapshotMemoryInfo);
     const initialThreadTarget = this.#getThreadTarget(streamOptionsWithSnapshotTarget);
     const canReserveBeforeDefaults = this.#hasExplicitThreadMemory(streamOptionsWithSnapshotTarget);
     let releaseReservedRun =
@@ -8127,6 +8526,12 @@ export class Agent<
         ...this.#getThreadTarget(preparedOptionsWithPubSub),
       };
 
+      await this.#assertAgentExecutionPreflight(preparedOptionsWithPubSub.requestContext, {
+        memory: preparedOptionsWithPubSub.memory,
+        runId: preparedOptionsWithPubSub.runId,
+        snapshotMemoryInfo: snapshotMemoryInfo ?? undefined,
+      });
+
       const result = await this.#execute({
         ...preparedOptionsWithPubSub,
         structuredOutput: mergedStreamOptions.structuredOutput
@@ -8238,6 +8643,10 @@ export class Agent<
       toolCallId?: string;
     } & { model?: DynamicArgument<MastraModelConfig> },
   ): Promise<FullOutput<OUTPUT>> {
+    resumeData = snapshotAgentExecutionValue(resumeData);
+    options = options
+      ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory'])
+      : undefined;
     const requestContextToUse = options?.requestContext;
     let defaultOptions: AgentExecutionOptions<TOutput> | undefined;
     if (requestContextToUse) {
@@ -8273,20 +8682,35 @@ export class Agent<
     if (requestContextToUse) {
       mergedOptions.requestContext = requestContextToUse;
     }
+    const snapshotMemoryInfo = this.#getSnapshotMemoryInfo(existingSnapshot);
+    if (snapshotMemoryInfo === null) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `Agent "${this.name}" found conflicting persisted ownership for runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
+    if (runResourceId && snapshotMemoryInfo?.resourceId && runResourceId !== snapshotMemoryInfo.resourceId) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `Agent "${this.name}" found conflicting resource ownership for runId "${runId}".`,
+        details: { runId, agentName: this.name },
+      });
+    }
     this.#assertAgenticLoopResumeOwnership({
       method: 'resumeGenerate',
       runId,
-      runResourceId,
+      runResourceId: runResourceId ?? snapshotMemoryInfo?.resourceId,
+      runThreadId: snapshotMemoryInfo?.threadId,
+      snapshot: existingSnapshot,
       requestContext: mergedOptions.requestContext,
       options: mergedOptions,
     });
-
-    await this.#requireAgentExecutionFGA({
-      requestContext: mergedOptions.requestContext,
-      memory: mergedOptions.memory,
-      runId: mergedOptions.runId,
-      snapshotMemoryInfo: this.#getSnapshotMemoryInfo(existingSnapshot),
-    });
+    this.#assertAgenticLoopSuspendedToolCall(existingSnapshot, runId, options?.toolCallId);
 
     const llm = await this.getLLM({
       requestContext: mergedOptions.requestContext,
@@ -8315,6 +8739,12 @@ export class Agent<
         },
       });
     }
+
+    await this.#assertAgentExecutionPreflight(mergedOptions.requestContext, {
+      memory: mergedOptions.memory,
+      runId: mergedOptions.runId,
+      snapshotMemoryInfo: snapshotMemoryInfo ?? undefined,
+    });
 
     const result = await this.#execute({
       ...mergedOptions,
@@ -8396,11 +8826,33 @@ export class Agent<
       resourceId: string;
       toolCallId?: string;
       approved: boolean;
+      /** Resume data for a `suspend()`-parked call identified by `toolCallId`. */
+      resumeData?: unknown;
       messages?: MessageListInput;
       streamOptions?: AgentExecutionOptions<OUTPUT>;
     },
   ): Promise<{ accepted: true; runId: string; toolCallId?: string }> {
-    const { threadId, resourceId, approved, messages, streamOptions, ...executionOptions } = options;
+    const { threadId, resourceId, approved, resumeData, messages, streamOptions, ...executionOptions } = options;
+
+    if (messages && resumeData !== undefined) {
+      throw new MastraError({
+        id: 'AGENT_SEND_TOOL_APPROVAL_CONFLICTING_CONTINUATION_INPUT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" sendToolApproval() accepts messages or resumeData, not both.`,
+        details: { threadId, resourceId, agentName: this.name },
+      });
+    }
+
+    if (resumeData !== undefined && !options.toolCallId) {
+      throw new MastraError({
+        id: 'AGENT_SEND_TOOL_APPROVAL_RESUME_DATA_REQUIRES_TOOL_CALL_ID',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" sendToolApproval() requires toolCallId when resumeData is provided.`,
+        details: { threadId, resourceId, agentName: this.name },
+      });
+    }
 
     if (messages && approved) {
       const continuation = agentThreadStreamRuntime.continueWithMessages(
@@ -8420,13 +8872,82 @@ export class Agent<
       return { accepted: continuation.accepted, runId: continuation.runId, toolCallId: options.toolCallId };
     }
 
-    const runId = this.getActiveThreadRunId({ threadId, resourceId });
+    const activeRunId = this.getActiveThreadRunId({ threadId, resourceId });
+    let runId: string | undefined;
+    let recoveredToolCallId = options.toolCallId;
+    let suspendedRuns: AgentRun[] = [];
+    try {
+      ({ runs: suspendedRuns } = await this.listSuspendedRuns({
+        threadId,
+        resourceId,
+        requestContext: executionOptions.requestContext,
+      }));
+    } catch (error) {
+      // Preserve the pre-existing in-memory-only behavior when storage is not
+      // configured. Driver failures and authorization failures remain visible.
+      if (!(error instanceof MastraError) || error.id !== 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE') {
+        throw error;
+      }
+    }
+
+    const candidates: Array<{
+      run: Pick<AgentRun, 'runId'>;
+      toolCall: { toolCallId?: string; requiresApproval: boolean };
+    }> = suspendedRuns.flatMap(run =>
+      run.toolCalls
+        .filter(toolCall => toolCall.requiresApproval || resumeData !== undefined)
+        .filter(toolCall => !options.toolCallId || toolCall.toolCallId === options.toolCallId)
+        .map(toolCall => ({ run, toolCall })),
+    );
+    // During the narrow interval before an active run's suspension snapshot is
+    // persisted, retain the in-memory fallback. Once a row exists, its exact
+    // calls participate in the same ambiguity check as every cold run.
+    if (activeRunId && !suspendedRuns.some(run => run.runId === activeRunId)) {
+      candidates.push({
+        run: { runId: activeRunId } as AgentRun,
+        toolCall: {
+          toolCallId: options.toolCallId,
+          requiresApproval: true,
+        },
+      });
+    }
+
+    if (candidates.length > 1) {
+      throw new MastraError({
+        id: 'AGENT_SEND_TOOL_APPROVAL_AMBIGUOUS_SUSPENDED_CALLS',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text:
+          `Agent "${this.name}" sendToolApproval() found ${candidates.length} matching suspended tool calls for thread "${threadId}". ` +
+          `Pass a toolCallId that identifies exactly one call.`,
+        details: {
+          threadId,
+          resourceId,
+          agentName: this.name,
+          runIds: [...new Set(candidates.map(candidate => candidate.run.runId))].join(', '),
+        },
+      });
+    }
+
+    runId = candidates[0]?.run.runId;
+    recoveredToolCallId = candidates[0]?.toolCall.toolCallId;
+    if (activeRunId && runId && activeRunId !== runId) {
+      throw new MastraError({
+        id: 'AGENT_SEND_TOOL_APPROVAL_ACTIVE_RUN_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text:
+          `Agent "${this.name}" sendToolApproval() found the requested call in suspended run "${runId}", ` +
+          `but run "${activeRunId}" currently owns thread "${threadId}". Resolve the active run first.`,
+        details: { threadId, resourceId, agentName: this.name, runId, activeRunId },
+      });
+    }
     if (!runId) {
       throw new MastraError({
         id: 'AGENT_SEND_TOOL_APPROVAL_NO_ACTIVE_THREAD_RUN',
         domain: ErrorDomain.AGENT,
         category: ErrorCategory.USER,
-        text: `Agent "${this.name}" sendToolApproval() could not find an active run for thread "${threadId}".`,
+        text: `Agent "${this.name}" sendToolApproval() could not find an active or suspended approval for thread "${threadId}".`,
         details: {
           threadId,
           resourceId,
@@ -8438,6 +8959,7 @@ export class Agent<
     const approvalOptions = {
       ...executionOptions,
       runId,
+      ...(recoveredToolCallId ? { toolCallId: recoveredToolCallId } : {}),
       memory: {
         ...(executionOptions.memory ?? {}),
         thread: executionOptions.memory?.thread ?? threadId,
@@ -8445,12 +8967,16 @@ export class Agent<
       },
     } as unknown as AgentExecutionOptions<OUTPUT> & { runId: string; toolCallId?: string };
 
-    if (approved) {
+    if (resumeData !== undefined) {
+      // @ts-expect-error - resumeStream overloads don't narrow cleanly for the
+      // merged execution options used by this cross-process convenience API.
+      await this.resumeStream(resumeData, approvalOptions);
+    } else if (approved) {
       await this.approveToolCall(approvalOptions);
     } else {
       await this.declineToolCall(approvalOptions);
     }
-    return { accepted: true, runId, toolCallId: options.toolCallId };
+    return { accepted: true, runId, toolCallId: recoveredToolCallId };
   }
 
   /**

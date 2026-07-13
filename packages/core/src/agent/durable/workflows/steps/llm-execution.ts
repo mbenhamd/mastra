@@ -18,7 +18,7 @@ import { MessageList } from '../../../message-list';
 import type { MastraDBMessage } from '../../../message-list';
 import { isSupportedLanguageModel } from '../../../utils';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getGlobalRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent, emitStepStartEvent } from '../../stream-adapter';
 import type { DurableAgenticWorkflowInput, DurableLLMStepOutput, DurableToolCallInput } from '../../types';
 import { resolveRuntimeDependencies, resolveModelFromListEntry } from '../../utils/resolve-runtime';
@@ -235,7 +235,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   }
                 : undefined;
 
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getGlobalRunRegistryEntry(runId);
             const executionAbortSignal = (registryEntry as any)?.abortSignal ?? abortSignal;
             if (registryEntry?.inputProcessors?.length) {
               const inputStepWriter = pubsub
@@ -618,7 +618,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             });
 
             // Try processAPIError if error processors are available
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getGlobalRunRegistryEntry(runId);
             if (registryEntry?.errorProcessors?.length) {
               try {
                 const runner = new ProcessorRunner({

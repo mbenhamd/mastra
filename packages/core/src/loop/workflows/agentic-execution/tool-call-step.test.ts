@@ -25,7 +25,7 @@ const createMessageList = () =>
     get: {
       input: { aiV5: { model: () => [] } },
       response: { db: () => [] },
-      all: { db: () => [] },
+      all: { db: () => [], aiV5: { model: () => [] } },
     },
   }) as unknown as MessageList;
 
@@ -1333,6 +1333,129 @@ describe('createToolCallStep tool approval workflow', () => {
         }),
       }),
       { resumeLabel: inputData.toolCallId },
+    );
+  });
+
+  it('persists the delegated resume label when a resumed tool suspends again', async () => {
+    const inputData = {
+      ...makeInputData(),
+      toolCallId: 'wrapper-call-id',
+      toolName: 'agent-delegate',
+      args: {
+        param: 'test',
+        resumeData: { approved: true },
+        suspendedToolCallId: 'original-call-id',
+      },
+    };
+    const suspend = vi.fn();
+    tools['agent-delegate'] = tools['test-tool'];
+    toolCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      requireToolApproval: true,
+      runId: 'test-run',
+      streamState,
+    });
+    tools['test-tool'].execute.mockImplementation(async (_args, context) => {
+      await context.suspend({ reason: 'need-more-input' });
+      return { success: true };
+    });
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        suspend,
+        suspendData: {
+          toolCallResume: {
+            version: 1,
+            originRunId: 'test-run',
+            stepId: 'toolCallStep',
+            type: 'suspension',
+            toolCallId: 'original-call-id',
+            toolName: 'agent-delegate',
+            identityDigest: createToolCallIdentityDigest({
+              toolCallId: 'original-call-id',
+              toolName: 'agent-delegate',
+              args: { param: 'test' },
+            }),
+          },
+        },
+      }),
+    );
+
+    expect(result).not.toHaveProperty('error');
+    expect(suspend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCallResume: expect.objectContaining({ toolCallId: 'original-call-id' }),
+        toolCallId: 'original-call-id',
+      }),
+      { resumeLabel: 'original-call-id' },
+    );
+  });
+
+  it('persists the delegated resume label when a resumed tool requests execution approval', async () => {
+    const inputData = {
+      ...makeInputData(),
+      toolCallId: 'wrapper-call-id',
+      toolName: 'agent-delegate',
+      args: {
+        param: 'test',
+        resumeData: { answer: 'continue' },
+        suspendedToolCallId: 'original-call-id',
+      },
+    };
+    const suspend = vi.fn();
+    tools['agent-delegate'] = tools['test-tool'];
+    toolCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      requireToolApproval: false,
+      runId: 'test-run',
+      streamState,
+    });
+    tools['test-tool'].requireApproval = false;
+    tools['test-tool'].execute.mockImplementation(async (_args, context) => {
+      await context.suspend({ reason: 'approve-side-effect' }, { requireToolApproval: true });
+      return { success: true };
+    });
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        suspend,
+        suspendData: {
+          toolCallResume: {
+            version: 1,
+            originRunId: 'test-run',
+            stepId: 'toolCallStep',
+            type: 'suspension',
+            toolCallId: 'original-call-id',
+            toolName: 'agent-delegate',
+            identityDigest: createToolCallIdentityDigest({
+              toolCallId: 'original-call-id',
+              toolName: 'agent-delegate',
+              args: { param: 'test' },
+            }),
+          },
+        },
+      }),
+    );
+
+    expect(result).not.toHaveProperty('error');
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-call-approval',
+        payload: expect.objectContaining({ toolCallId: 'original-call-id' }),
+      }),
+    );
+    expect(suspend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCallResume: expect.objectContaining({ toolCallId: 'original-call-id' }),
+        requireToolApproval: expect.objectContaining({ toolCallId: 'original-call-id' }),
+      }),
+      { resumeLabel: 'original-call-id' },
     );
   });
 

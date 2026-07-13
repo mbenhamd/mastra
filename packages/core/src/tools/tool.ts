@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
 import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
+import { safeStringify } from '../utils';
 import type { SuspendOptions } from '../workflows';
 import type {
   McpMetadata,
@@ -89,6 +91,9 @@ export class Tool<
 > implements ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext> {
   /** Unique identifier for the tool */
   id: TId;
+
+  /** @internal Binding to the original implementation used by durable cold recovery. */
+  recoveryFingerprint: string;
 
   /** Description of what the tool does */
   description: string;
@@ -276,6 +281,25 @@ export class Tool<
   constructor(opts: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
+    const functionSource = (value: unknown) =>
+      typeof value === 'function' ? Function.prototype.toString.call(value) : undefined;
+    this.recoveryFingerprint = createHash('sha256')
+      .update(
+        safeStringify({
+          id: opts.id,
+          description: opts.description,
+          inputSchema: opts.inputSchema,
+          outputSchema: opts.outputSchema,
+          suspendSchema: opts.suspendSchema,
+          resumeSchema: opts.resumeSchema,
+          execute: functionSource(opts.execute),
+          requireApproval: functionSource(opts.requireApproval) ?? opts.requireApproval,
+          toModelOutput: functionSource(opts.toModelOutput),
+          transform: opts.transform,
+          mcp: opts.mcp,
+        }),
+      )
+      .digest('hex');
     this.description = opts.description;
     this.inputSchema = opts.inputSchema ? toStandardSchema(opts.inputSchema) : undefined;
     this.outputSchema = opts.outputSchema ? toStandardSchema(opts.outputSchema) : undefined;

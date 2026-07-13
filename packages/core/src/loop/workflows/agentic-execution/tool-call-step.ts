@@ -862,6 +862,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
                 __streamState: streamState.serialize(),
+                __agentId: agentId,
               },
               {
                 resumeLabel: inputData.toolCallId,
@@ -949,7 +950,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     ...expectedResumeIdentity,
                     type: 'approval',
                     approvalSource: 'tool-execution',
-                    toolCallId: inputData.toolCallId,
+                    toolCallId: metadataToolCallId,
                     toolName: inputData.toolName,
                     args: inputData.args,
                     resumeSchema: JSON.stringify(
@@ -973,7 +974,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
               // Add approval metadata to message before persisting
               addToolMetadata({
-                toolCallId: inputData.toolCallId,
+                toolCallId: metadataToolCallId,
                 toolName: inputData.toolName,
                 args: inputData.args,
                 type: 'approval',
@@ -1006,14 +1007,15 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     approvalSource: 'tool-execution',
                   },
                   requireToolApproval: {
-                    toolCallId: inputData.toolCallId,
+                    toolCallId: metadataToolCallId,
                     toolName: inputData.toolName,
                     args: inputData.args,
                   },
                   __streamState: streamState.serialize(),
+                  __agentId: agentId,
                 },
                 {
-                  resumeLabel: inputData.toolCallId,
+                  resumeLabel: metadataToolCallId,
                 },
               );
             } else {
@@ -1063,6 +1065,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   },
                   toolCallSuspended: suspendPayload,
                   __streamState: streamState.serialize(),
+                  __agentId: agentId,
+                  toolCallId: metadataToolCallId,
                   toolName: inputData.toolName,
                   resumeLabel: options?.resumeLabel,
                 },

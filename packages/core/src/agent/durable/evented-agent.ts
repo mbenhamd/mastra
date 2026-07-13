@@ -10,10 +10,12 @@
  * 3. Events are streamed via pubsub as the workflow executes
  */
 
+import type { WorkflowFinishCallbackResult } from '../../workflows/types';
 import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';
 import type { DurableAgentConfig } from './durable-agent';
+import { pinGlobalRunRegistryEntry, unpinGlobalRunRegistryEntry } from './run-registry';
 import type { DurableAgenticWorkflowInput } from './types';
 
 /**
@@ -80,15 +82,35 @@ export class EventedAgent<
   protected override async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     try {
       const workflow = this.getWorkflow();
-      const requestContext = this.runRegistryInternal.get(runId)?.requestContext;
+      const requestContext = pinGlobalRunRegistryEntry(runId)?.requestContext;
       const run = await workflow.createRun({
         runId,
+        resourceId: workflowInput.state?.resourceId,
         pubsub: this.pubsubInternal,
       });
-      // Fire and forget - use startAsync for non-blocking execution
-      await run.startAsync({ inputData: workflowInput, requestContext });
+      // Fire and forget - the workflow-level onFinish hook handles terminal cleanup.
+      const { execution } = await run.startAsync({ inputData: workflowInput, requestContext });
+      if (execution) {
+        void execution
+          .catch(async error => {
+            unpinGlobalRunRegistryEntry(runId);
+            await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
+          })
+          .catch(error => {
+            this.logger.error(`[EventedAgent] Failed to report background execution error for run ${runId}`, error);
+          });
+      }
     } catch (error) {
+      unpinGlobalRunRegistryEntry(runId);
       await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  protected override async onDurableWorkflowFinish(result: WorkflowFinishCallbackResult): Promise<void> {
+    try {
+      await super.onDurableWorkflowFinish(result);
+    } finally {
+      unpinGlobalRunRegistryEntry(result.runId);
     }
   }
 }
