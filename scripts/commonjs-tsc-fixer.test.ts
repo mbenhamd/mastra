@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,5 +157,23 @@ describe('commonjs-tsc-fixer', () => {
       /Generated declaration target cannot be a symbolic link/,
     );
     await expect(readFile(outside, 'utf8')).resolves.toBe('do not overwrite');
+  });
+
+  it('atomically replaces a hard-linked declaration without mutating the other link', async () => {
+    const root = await createFixture({
+      './nested/*': { require: { types: './dist/*/index.d.ts' } },
+    });
+    const outside = join(dirname(root), 'outside.d.ts');
+    const target = join(root, 'nested', 'example.d.ts');
+    await writeFile(outside, 'do not overwrite');
+    await mkdir(join(root, 'dist', 'example'), { recursive: true });
+    await writeFile(join(root, 'dist', 'example', 'index.d.ts'), 'export type Example = true;');
+    await mkdir(join(root, 'nested'));
+    await link(outside, target);
+
+    await run(process.execPath, [fixerPath], { cwd: root });
+
+    await expect(readFile(outside, 'utf8')).resolves.toBe('do not overwrite');
+    await expect(readFile(target, 'utf8')).resolves.toBe('export * from "./../dist/example";');
   });
 });

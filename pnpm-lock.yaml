@@ -3619,6 +3619,9 @@ importers:
       debug:
         specifier: ^4.4.3
         version: 4.4.3
+      execa:
+        specifier: ^9.6.1
+        version: 9.6.1
       jscodeshift:
         specifier: ^17.3.0
         version: 17.3.0(@babel/preset-env@7.28.5(@babel/core@7.29.7))

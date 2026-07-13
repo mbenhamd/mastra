@@ -1,4 +1,5 @@
-import { readFile, writeFile, rm, mkdir, lstat, realpath } from 'node:fs/promises';
+import { readFile, rm, mkdir, lstat, realpath, open, rename } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { glob as globby } from 'tinyglobby';
 
@@ -39,19 +40,21 @@ async function prepareSafeTarget(rootPath, targetPath) {
 
   for (const component of relativeTargetDirectory.split(sep).filter(Boolean)) {
     canonicalTargetDirectory = join(canonicalTargetDirectory, component);
+    let componentStats;
     try {
-      const componentStats = await lstat(canonicalTargetDirectory);
-      if (componentStats.isSymbolicLink()) {
-        throw new Error(`Generated declaration directory cannot contain symbolic links: ${canonicalTargetDirectory}`);
-      }
-      if (!componentStats.isDirectory()) {
-        throw new Error(`Generated declaration directory component is not a directory: ${canonicalTargetDirectory}`);
-      }
+      componentStats = await lstat(canonicalTargetDirectory);
     } catch (error) {
       if (error?.code !== 'ENOENT') {
         throw error;
       }
       await mkdir(canonicalTargetDirectory);
+      continue;
+    }
+    if (componentStats.isSymbolicLink()) {
+      throw new Error(`Generated declaration directory cannot contain symbolic links: ${canonicalTargetDirectory}`);
+    }
+    if (!componentStats.isDirectory()) {
+      throw new Error(`Generated declaration directory component is not a directory: ${canonicalTargetDirectory}`);
     }
   }
 
@@ -73,6 +76,21 @@ async function prepareSafeTarget(rootPath, targetPath) {
   // These checks reject pre-existing symlink escapes. A concurrent same-user
   // path swap remains an OS-level race without portable openat-style APIs.
   return safeTargetPath;
+}
+
+async function replaceFileAtomically(targetPath, contents) {
+  const temporaryPath = join(dirname(targetPath), `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
+  let temporaryFile;
+  try {
+    temporaryFile = await open(temporaryPath, 'wx');
+    await temporaryFile.writeFile(contents);
+    await temporaryFile.close();
+    temporaryFile = undefined;
+    await rename(temporaryPath, targetPath);
+  } finally {
+    await temporaryFile?.close();
+    await rm(temporaryPath, { force: true });
+  }
 }
 
 function declarationExport(targetPath, sourcePath) {
@@ -125,13 +143,13 @@ async function writeDtsFiles() {
           assertContained(rootPath, targetPath, 'Generated declaration path');
           const safeTargetPath = await prepareSafeTarget(rootPath, targetPath);
 
-          await writeFile(safeTargetPath, declarationExport(safeTargetPath, file));
+          await replaceFileAtomically(safeTargetPath, declarationExport(safeTargetPath, file));
         } else {
           const targetPath = resolve(rootPath, `${key}.d.ts`);
           assertContained(rootPath, targetPath, 'Generated declaration path');
           const safeTargetPath = await prepareSafeTarget(rootPath, targetPath);
 
-          await writeFile(safeTargetPath, declarationExport(safeTargetPath, file));
+          await replaceFileAtomically(safeTargetPath, declarationExport(safeTargetPath, file));
         }
       }
     }

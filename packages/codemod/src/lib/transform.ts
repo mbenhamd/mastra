@@ -1,17 +1,15 @@
-import child_process from 'node:child_process';
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import util from 'node:util';
 import debug from 'debug';
-
-const execFile = util.promisify(child_process.execFile);
+import { execa } from 'execa';
 
 interface TransformOptions {
   dry?: boolean;
   print?: boolean;
   verbose?: boolean;
-  jscodeshift?: string;
+  jscodeshift?: string[];
 }
 
 const log = debug('codemod:transform');
@@ -19,97 +17,22 @@ const error = debug('codemod:transform:error');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function getJscodeshiftBin(): string {
-  // jscodeshift is a direct dependency, so run its JavaScript entrypoint with
-  // the current Node executable instead of relying on a shell or .bin shim.
+export function getJscodeshiftBin(): string {
+  // Resolve the direct dependency's declared executable instead of depending
+  // on a private source layout or a platform-specific .bin shim.
   const require = createRequire(import.meta.url);
-  return require.resolve('jscodeshift/bin/jscodeshift.js');
+  const manifestPath = require.resolve('jscodeshift/package.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+    bin?: string | Record<string, string>;
+  };
+  const declaredBin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.jscodeshift;
+  if (!declaredBin) {
+    throw new Error('The installed jscodeshift package does not declare a jscodeshift executable');
+  }
+  return path.resolve(path.dirname(manifestPath), declaredBin);
 }
 
-/**
- * Split the CLI's single custom-options value without applying shell syntax.
- * Quotes group whitespace; backslashes remain path separators unless they
- * explicitly escape whitespace or a quote. Shell-looking characters are data.
- */
-function parseJscodeshiftArgs(value: string): string[] {
-  const args: string[] = [];
-  let current = '';
-  let quote: "'" | '"' | undefined;
-  let tokenStarted = false;
-
-  for (let index = 0; index < value.length; index++) {
-    const character = value[index]!;
-
-    if (quote) {
-      if (character === quote) {
-        quote = undefined;
-      } else if (character === '\\' && quote === '"') {
-        let backslashCount = 1;
-        while (value[index + backslashCount] === '\\') {
-          backslashCount++;
-        }
-
-        if (value[index + backslashCount] === '"') {
-          current += '\\'.repeat(Math.floor(backslashCount / 2));
-          if (backslashCount % 2 === 0) {
-            quote = undefined;
-          } else {
-            current += '"';
-          }
-          index += backslashCount;
-        } else {
-          current += '\\'.repeat(backslashCount);
-          index += backslashCount - 1;
-        }
-      } else {
-        current += character;
-      }
-      continue;
-    }
-
-    if (/\s/.test(character)) {
-      if (tokenStarted) {
-        args.push(current);
-        current = '';
-        tokenStarted = false;
-      }
-      continue;
-    }
-
-    if (character === "'" || character === '"') {
-      quote = character;
-      tokenStarted = true;
-      continue;
-    }
-
-    if (character === '\\') {
-      const next = value[index + 1];
-      if (next && (/\s/.test(next) || next === "'" || next === '"')) {
-        current += next;
-        index++;
-      } else {
-        // Preserve ordinary and trailing backslashes for Windows paths.
-        current += character;
-      }
-      tokenStarted = true;
-      continue;
-    }
-
-    current += character;
-    tokenStarted = true;
-  }
-
-  if (quote) {
-    throw new Error('Custom jscodeshift options contain an unterminated quote');
-  }
-  if (tokenStarted) {
-    args.push(current);
-  }
-
-  return args;
-}
-
-function buildArgs(codemodPath: string, targetPath: string, options: TransformOptions): string[] {
+export function buildArgs(codemodPath: string, targetPath: string, options: TransformOptions): string[] {
   // Ignoring everything under `.*/` covers `.mastra/` along with any other
   // framework build related or otherwise intended-to-be-hidden directories.
   const args = [
@@ -135,11 +58,11 @@ function buildArgs(codemodPath: string, targetPath: string, options: TransformOp
   }
 
   if (options.verbose) {
-    args.push('--verbose');
+    args.push('--verbose=2');
   }
 
   if (options.jscodeshift) {
-    args.push(...parseJscodeshiftArgs(options.jscodeshift));
+    args.push(...options.jscodeshift);
   }
 
   return args;
@@ -195,7 +118,10 @@ export async function transform(
   const codemodPath = path.resolve(__dirname, `./codemods/${codemod}.js`);
   const targetPath = path.resolve(source);
   const args = buildArgs(codemodPath, targetPath, transformOptions);
-  const { stdout } = await execFile(process.execPath, [getJscodeshiftBin(), ...args], { encoding: 'utf8' });
+  const { stdout } = await execa(process.execPath, [getJscodeshiftBin(), ...args], {
+    encoding: 'utf8',
+    maxBuffer: 100 * 1024 * 1024,
+  });
   const errors = parseErrors(codemod, stdout);
   const notImplementedErrors = parseNotImplementedErrors(codemod, stdout);
   if (options.logStatus) {

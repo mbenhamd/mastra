@@ -2,14 +2,20 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
-import { getPackageManagerAddCommand } from '../utils/package-manager';
+import { getPackageManagerAddArgs } from '../utils/package-manager';
 import type { PackageManager } from '../utils/package-manager';
+
+type InstallPackagesOptions = {
+  dev?: boolean;
+  timeout?: number;
+  cancelSignal?: AbortSignal;
+};
 
 export class DepsService {
   readonly packageManager: PackageManager;
 
-  constructor() {
-    this.packageManager = this.getPackageManager();
+  constructor(packageManager?: PackageManager) {
+    this.packageManager = packageManager ?? this.getPackageManager();
   }
 
   private findLockFile(dir: string): string | null {
@@ -43,9 +49,9 @@ export class DepsService {
     }
   }
 
-  public async installPackages(packages: string[]) {
+  public async installPackages(packages: string[], options: InstallPackagesOptions = {}) {
     const pm = this.packageManager;
-    const installCommand = getPackageManagerAddCommand(pm);
+    const installArgs = getPackageManagerAddArgs(pm);
 
     const optionLikePackage = packages.find(packageSpec => packageSpec.startsWith('-'));
     if (optionLikePackage) {
@@ -54,9 +60,17 @@ export class DepsService {
 
     // Keep package specs as discrete arguments so neither a shell nor the
     // package manager can reinterpret them as command-line options.
-    return execa(pm, [...installCommand.split(' '), ...packages], {
+    if (options.dev) {
+      installArgs.push('-D');
+    }
+
+    return execa(pm, [...installArgs, ...packages], {
       all: true,
       stdio: 'pipe',
+      timeout: options.timeout,
+      cancelSignal: options.cancelSignal,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: 1_000,
     });
   }
 
