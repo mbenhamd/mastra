@@ -77,21 +77,29 @@ describe('MastraLLMVNext stop conditions', () => {
     expect(stopWhen.slice(1)).toEqual([firstStop, secondStop]);
   });
 
-  it('treats maxSteps zero as an explicit cap', async () => {
-    const customStop = vi.fn(() => false);
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid maxSteps %s', maxSteps => {
+    expect(() =>
+      createModel().stream({
+        messageList,
+        requestContext: {} as never,
+        tracingContext: {},
+        methodType: 'stream',
+        maxSteps,
+      } as never),
+    ).toThrow('maxSteps must be a positive safe integer');
+    expect(loopMock).not.toHaveBeenCalled();
+  });
 
+  it('uses a monotonic cap for restored step counts already above maxSteps', async () => {
     createModel().stream({
       messageList,
       requestContext: {} as never,
       tracingContext: {},
       methodType: 'stream',
-      maxSteps: 0,
-      stopWhen: customStop,
+      maxSteps: 2,
     } as never) as MastraModelOutput;
 
     const stopWhen = loopMock.mock.calls[0]?.[0].stopWhen;
-    expect(stopWhen).toHaveLength(2);
-    expect(await stopWhen[0]({ steps: [] } as never)).toBe(true);
-    expect(stopWhen[1]).toBe(customStop);
+    expect(await stopWhen[0]({ steps: [{}, {}, {}] } as never)).toBe(true);
   });
 });

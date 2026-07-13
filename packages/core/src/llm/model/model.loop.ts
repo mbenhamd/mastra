@@ -1,4 +1,3 @@
-import { stepCountIs } from '@internal/ai-sdk-v5';
 import type { ModelMessage, ToolSet } from '@internal/ai-sdk-v5';
 import type { MastraPrimitives } from '../../action';
 import { MastraBase } from '../../base';
@@ -15,6 +14,11 @@ import { delay } from '../../utils';
 import type { ModelLoopStreamArgs } from './model.loop.types';
 import { resolveResponseModelId } from './server-side-fallback';
 import type { MastraModelOptions } from './shared.types';
+
+const stepCountAtLeast =
+  (stepCount: number) =>
+  ({ steps }: { steps: unknown[] }) =>
+    steps.length >= stepCount;
 
 export class MastraLLMVNext extends MastraBase {
   #models: ModelManagerModelConfig[];
@@ -143,6 +147,15 @@ export class MastraLLMVNext extends MastraBase {
     ...rest
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     const observabilityContext = resolveObservabilityContext(rest);
+    if (maxSteps !== undefined && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
+      throw new MastraError({
+        id: 'MASTR_LLM_INVALID_MAX_STEPS',
+        domain: ErrorDomain.LLM,
+        category: ErrorCategory.USER,
+        text: 'maxSteps must be a positive safe integer',
+        details: { maxSteps },
+      });
+    }
     // `maxSteps` is sugar for the stop condition `stepCountIs(maxSteps)`. When a
     // custom `stopWhen` is also provided, compose the two (the loop ORs stop
     // conditions) instead of letting the maxSteps cap replace the user's
@@ -150,9 +163,9 @@ export class MastraLLMVNext extends MastraBase {
     let stopWhenToUse;
     if (typeof maxSteps === 'number') {
       const userConditions = stopWhen ? (Array.isArray(stopWhen) ? stopWhen : [stopWhen]) : [];
-      stopWhenToUse = [stepCountIs(maxSteps), ...userConditions];
+      stopWhenToUse = [stepCountAtLeast(maxSteps), ...userConditions];
     } else {
-      stopWhenToUse = stopWhen ?? stepCountIs(5);
+      stopWhenToUse = stopWhen ?? stepCountAtLeast(5);
     }
 
     const messages = messageList.get.all.aiV5.model();
