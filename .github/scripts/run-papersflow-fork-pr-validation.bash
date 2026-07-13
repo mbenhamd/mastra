@@ -82,7 +82,7 @@ cat "$changed_workspaces"
 
 while IFS= read -r workspace; do
   case "$workspace" in
-    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/mcp | packages/memory | client-sdks/ai-sdk | stores/pg | stores/redis | mastracode | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -161,6 +161,12 @@ fi
 if workspace_changed packages/memory; then
   run_with_validation_budget 600 pnpm --filter @mastra/memory check
   run_with_validation_budget 900 pnpm --filter @mastra/memory build:lib
+fi
+
+if workspace_changed packages/mcp; then
+  run_with_validation_budget 600 pnpm --filter @mastra/mcp exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter @mastra/mcp build:lib
+  run_with_validation_budget 600 pnpm --filter @mastra/mcp lint
 fi
 
 if workspace_changed client-sdks/ai-sdk; then
