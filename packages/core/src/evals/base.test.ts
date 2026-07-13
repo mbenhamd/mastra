@@ -713,21 +713,28 @@ describe('createScorer', () => {
       const requestContext = {
         [MASTRA_AUTH_TOKEN_KEY]: 'Bearer SECRET_SCORER_AUTH',
         userId: 'user-123',
-        nested: { secret: 'SECRET_NESTED_CONTEXT' },
+        nested: {
+          authToken: 'Bearer SECRET_DERIVED_AUTH',
+          secret: 'SECRET_NESTED_CONTEXT',
+          oversized: 'x'.repeat(20_000),
+        },
       };
       let executionRun: Record<string, any> | undefined;
 
       const scorer = createScorer({
         id: 'safe-context-scorer',
         description: 'Safe context scorer',
-      }).generateScore(({ run }) => {
-        executionRun = run;
-        expect(run.requestContext).toBe(requestContext);
-        expect((run.requestContext as Record<string, unknown>)[MASTRA_AUTH_TOKEN_KEY]).toBe(
-          'Bearer SECRET_SCORER_AUTH',
-        );
-        return 1;
-      });
+      })
+        .preprocess(({ run }) => run.requestContext)
+        .generateScore(({ run, results }) => {
+          executionRun = run;
+          expect(run.requestContext).toBe(requestContext);
+          expect((run.requestContext as Record<string, unknown>)[MASTRA_AUTH_TOKEN_KEY]).toBe(
+            'Bearer SECRET_SCORER_AUTH',
+          );
+          expect(results.preprocessStepResult).toBe(requestContext);
+          return 1;
+        });
       scorer.__registerMastra(mockMastra as any);
 
       await scorer.run({ ...testData.scoringInput, requestContext });
@@ -762,6 +769,13 @@ describe('createScorer', () => {
         }),
       );
       expect(JSON.stringify(scorerStepCall)).not.toContain('SECRET_');
+      const scorerStepSpans = scorerRunSpan.createChildSpan.mock.results
+        .map(({ value }: { value: ReturnType<typeof createMockSpan> }) => value)
+        .filter((span: ReturnType<typeof createMockSpan>) => span.type === SpanType.SCORER_STEP);
+      expect(scorerStepSpans).toHaveLength(2);
+      const serializedStepOutputs = JSON.stringify(scorerStepSpans.map((span: any) => span.end.mock.calls));
+      expect(serializedStepOutputs).not.toContain('SECRET_');
+      expect(serializedStepOutputs).toContain('[TRUNCATED]');
 
       expect(executionRun?.requestContext).toBe(requestContext);
       expect(Object.keys(executionRun ?? {})).not.toContain('serializeForSpan');

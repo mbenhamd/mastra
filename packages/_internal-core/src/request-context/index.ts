@@ -50,6 +50,22 @@ export const MASTRA_VERSIONS_KEY = 'mastra__versions';
  */
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
+const SPAN_CONTEXT_MAX_KEYS = 100;
+const SPAN_CONTEXT_MAX_STRING_BYTES = 2_048;
+const SPAN_CONTEXT_MAX_TOTAL_BYTES = 16_384;
+const SPAN_TRUNCATION_MARKER = '[TRUNCATED]';
+
+function truncateSpanString(value: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(value);
+  if (encoded.byteLength <= maxBytes) return value;
+  const marker = encoder.encode(SPAN_TRUNCATION_MARKER);
+  if (marker.byteLength >= maxBytes) return SPAN_TRUNCATION_MARKER.slice(0, maxBytes);
+  let end = maxBytes - marker.byteLength;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
+  return `${new TextDecoder().decode(encoded.subarray(0, end))}${SPAN_TRUNCATION_MARKER}`;
+}
+
 export type VersionSelector = { versionId: string } | { status: 'draft' | 'published' };
 
 export type VersionOverrides = {
@@ -298,19 +314,27 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
    */
   public serializeForSpan(): Record<string, unknown> {
     const safe: Record<string, unknown> = {};
+    let remainingBytes = SPAN_CONTEXT_MAX_TOTAL_BYTES;
+    let keyCount = 0;
     for (const [key, value] of this.registry.entries()) {
+      if (keyCount >= SPAN_CONTEXT_MAX_KEYS || remainingBytes <= 0) {
+        safe[SPAN_TRUNCATION_MARKER] = true;
+        break;
+      }
+      const safeKey = truncateSpanString(key, Math.min(SPAN_CONTEXT_MAX_STRING_BYTES, remainingBytes));
+      remainingBytes -= new TextEncoder().encode(safeKey).byteLength;
+      keyCount += 1;
+
       if (key === MASTRA_AUTH_TOKEN_KEY) {
-        safe[key] = '[REDACTED]';
-      } else if (
-        value === null ||
-        value === undefined ||
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'boolean'
-      ) {
-        safe[key] = value;
+        safe[safeKey] = '[REDACTED]';
+      } else if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
+        safe[safeKey] = value;
+      } else if (typeof value === 'string') {
+        const bounded = truncateSpanString(value, Math.min(SPAN_CONTEXT_MAX_STRING_BYTES, remainingBytes));
+        safe[safeKey] = bounded;
+        remainingBytes -= new TextEncoder().encode(bounded).byteLength;
       } else {
-        safe[key] = `[${typeof value}]`;
+        safe[safeKey] = `[${typeof value}]`;
       }
     }
     return safe;
