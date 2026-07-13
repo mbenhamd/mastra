@@ -1466,6 +1466,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       claimGeneration: input.claimGeneration,
       kind: 'parent-workflow-step-end' as const,
     };
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationFence(operation);
     try {
       return await this.#db.client.tx(async t => {
@@ -1549,6 +1550,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       claimToken: input.claimToken,
       claimGeneration: input.claimGeneration,
     };
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationFence(operation);
     try {
       return await this.#db.client.tx(async t => {
@@ -1613,6 +1615,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       claimGeneration: input.claimGeneration,
       contract,
     };
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationFence(operation);
     try {
       return await this.#db.client.tx(async t => {

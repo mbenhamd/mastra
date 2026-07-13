@@ -744,7 +744,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async getWorkflowTerminalParentContext(
     input: GetWorkflowTerminalParentContextInput,
   ): Promise<GetWorkflowTerminalParentContextResult> {
-    const operation = { ...input, kind: 'parent-workflow-step-end' as const };
+    const operation = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      kind: 'parent-workflow-step-end' as const,
+    };
+    validateWorkflowTerminalizationRunIdentity(operation);
+    validateWorkflowTerminalizationFence(operation);
     const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const childKey = this.getWorkflowKey(operation.workflowName, operation.runId);
     const journal = this.db.workflowTerminalizations.get(journalKey);
@@ -796,6 +805,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       claimToken: input.claimToken,
       claimGeneration: input.claimGeneration,
     };
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationFence(operation);
     const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
@@ -836,6 +846,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       claimGeneration: input.claimGeneration,
       contract,
     };
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationFence(operation);
     const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const childRunKey = this.getWorkflowKey(operation.workflowName, operation.runId);

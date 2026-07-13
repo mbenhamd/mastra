@@ -491,6 +491,65 @@ describe('WorkflowsInMemory terminalization journal', () => {
     return { db, workflows, parent, context, effect: prepared.effect, contract, fence, retained };
   }
 
+  it('validates every parent-application run identity before storage lookup', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const invalidIdentities = [
+      [
+        { workflowName: 'w'.repeat(513) },
+        'workflowName must be a well-formed non-empty string no longer than 512 characters',
+      ],
+      [
+        { runId: `run${String.fromCharCode(0xd800)}` },
+        'runId must be a well-formed non-empty string no longer than 512 characters',
+      ],
+    ] as const;
+
+    for (const [identity, message] of invalidIdentities) {
+      const operation = { ...fixture.fence, ...identity };
+      await expect(fixture.workflows.getWorkflowTerminalParentContext(operation)).rejects.toThrow(message);
+      await expect(fixture.workflows.getWorkflowTerminalContinuationPlan(operation)).rejects.toThrow(message);
+      await expect(
+        fixture.workflows.applyWorkflowTerminalParentEffect({ ...operation, contract: fixture.contract }),
+      ).rejects.toThrow(message);
+    }
+  });
+
+  it('normalizes parent-context identity once without enumerating caller input', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    let workflowNameReads = 0;
+    let runIdReads = 0;
+    const prototype = {};
+    Object.defineProperties(prototype, {
+      workflowName: {
+        get: () => {
+          workflowNameReads += 1;
+          return fixture.fence.workflowName;
+        },
+      },
+      runId: {
+        get: () => {
+          runIdReads += 1;
+          return fixture.fence.runId;
+        },
+      },
+    });
+    const operation = Object.assign(Object.create(prototype), {
+      ownerId: fixture.fence.ownerId,
+      claimToken: fixture.fence.claimToken,
+      claimGeneration: fixture.fence.claimGeneration,
+    }) as typeof fixture.fence;
+    const unrelatedGetter = vi.fn(() => {
+      throw new Error('unrelated input getter must not run');
+    });
+    Object.defineProperty(operation, 'unrelated', { enumerable: true, get: unrelatedGetter });
+
+    await expect(fixture.workflows.getWorkflowTerminalParentContext(operation)).resolves.toMatchObject({
+      status: 'found',
+    });
+    expect({ workflowNameReads, runIdReads }).toEqual({ workflowNameReads: 1, runIdReads: 1 });
+    expect(unrelatedGetter).not.toHaveBeenCalled();
+  });
+
   it('atomically applies the exact PF-1781 patch and stores a pending framework action', async () => {
     const fixture = await setupGraphBoundParentApplication();
     const expected = applyWorkflowTerminalParentContinuationPatch({

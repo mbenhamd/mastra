@@ -72,6 +72,46 @@ describe('WorkflowsPG terminalization journal', () => {
     return { operation, reads: () => ({ workflowName: workflowNameReads, runId: runIdReads }) };
   }
 
+  it('validates every parent-application run identity before storage lookup', async () => {
+    const missing = {
+      workflowName: `parent-identity-${randomUUID()}`,
+      runId: 'missing',
+      ownerId: 'owner',
+      claimToken: 'token',
+      claimGeneration: 1,
+    };
+    const contract = createWorkflowTerminalParentContinuationContract({
+      version: 1,
+      terminalEffectKey: 'effect',
+      terminalEffectPayloadHash: `sha256:${'0'.repeat(64)}`,
+      executionMode: 'continuous',
+      expectedParentRevision: 'pg:v1:1',
+      graphFingerprint: createWorkflowTerminalGraphFingerprint([]),
+      childTerminalStatus: 'success',
+      observedParentStatus: 'success',
+      source: { kind: 'step', stepId: 'step', executionPath: [0] },
+      action: { kind: 'noop', reason: 'already-terminal' },
+      patch: { kind: 'none' },
+    });
+    const invalidIdentities = [
+      [
+        { workflowName: 'w'.repeat(513) },
+        'workflowName must be a well-formed non-empty string no longer than 512 characters',
+      ],
+      [
+        { runId: `run${String.fromCharCode(0xd800)}` },
+        'runId must be a well-formed non-empty string no longer than 512 characters',
+      ],
+    ] as const;
+
+    for (const [identity, message] of invalidIdentities) {
+      const operation = { ...missing, ...identity };
+      await expect(workflowsA.getWorkflowTerminalParentContext(operation)).rejects.toThrow(message);
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(operation)).rejects.toThrow(message);
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...operation, contract })).rejects.toThrow(message);
+    }
+  });
+
   it('atomically applies and recovers the exact graph-bound parent contract', async () => {
     const suffix = randomUUID();
     const child = { workflowName: `parent-apply-child-${suffix}`, runId: 'child-run' };
