@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { createToolCallIdentityDigest } from '../../../tool-call-identity';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableToolCallStep } from './tool-call';
 
@@ -93,13 +94,14 @@ function setupRegistry(overrides: Record<string, any> = {}) {
   return { messageList, saveQueueManager, bgManager, entry };
 }
 
-function executeStep(pubsub: any, initData: any, input?: any) {
+function executeStep(pubsub: any, initData: any, input?: any, resumeData?: unknown, suspendData?: unknown) {
   const step = createDurableToolCallStep();
   return (step as any).execute({
     inputData: input ?? baseInput(),
     mastra: { getLogger: () => undefined },
     suspend: vi.fn(),
-    resumeData: undefined,
+    resumeData,
+    suspendData,
     requestContext: new Map(),
     getInitData: () => initData,
     [PUBSUB_SYMBOL]: pubsub,
@@ -114,6 +116,41 @@ afterEach(() => {
 });
 
 describe('durable tool-call background task dispatch', () => {
+  it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {
+    const pubsub = mockPubsub();
+    setupRegistry();
+    const initData = makeInitData();
+    const input = baseInput();
+    const resume = vi.fn().mockResolvedValue({ id: 'task-resumed' });
+    const dispatch = vi.fn();
+
+    vi.mocked(resolveBackgroundConfig).mockReturnValue({ runInBackground: true } as any);
+    vi.mocked(createBackgroundTask).mockReturnValue({
+      checkIfSuspended: vi.fn().mockResolvedValue(true),
+      resume,
+      dispatch,
+    } as any);
+
+    const result = await executeStep(pubsub, initData, input, resumeData, {
+      version: 1,
+      type: 'suspension',
+      runId: RUN_ID,
+      iterationCount: 0,
+      stepId: 'durable-tool-call',
+      toolCallId: TOOL_CALL_ID,
+      toolName: TOOL_NAME,
+      identityDigest: createToolCallIdentityDigest({
+        toolCallId: TOOL_CALL_ID,
+        toolName: TOOL_NAME,
+        args: input.args,
+      }),
+    });
+
+    expect(resume).toHaveBeenCalledWith(resumeData);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.result).toContain('Background task resumed');
+  });
+
   it('dispatches a background task and returns a placeholder result', async () => {
     const pubsub = mockPubsub();
     setupRegistry();

@@ -165,7 +165,145 @@ describe('extractV6NativeApproval', () => {
 
     const result = extractV6NativeApproval(messages as any);
 
-    expect(result).toEqual({ resumeData: { approved: true }, runId: 'run-123' });
+    expect(result).toEqual({
+      resumeData: { approved: true },
+      runId: 'run-123',
+      toolCallId: 'tooluse_abc123',
+    });
+  });
+
+  it('preserves separator-bearing run and tool-call IDs', () => {
+    const toolCallId = 'provider::opaque-call';
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-delimited',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId,
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run::opaque${APPROVAL_ID_SEPARATOR}${toolCallId}`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toEqual({
+      resumeData: { approved: true },
+      runId: 'run::opaque',
+      toolCallId,
+    });
+  });
+
+  it('rejects a composite approval ID that conflicts with the visible tool-call ID', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-conflict',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'visible-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}different-call`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('does not fall back to an older valid response when the latest response is malformed', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-no-fallback',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'older-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}older-call`, approved: true },
+          },
+          {
+            type: 'tool-myTool',
+            toolCallId: 'latest-call',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: { id: `run-1${APPROVAL_ID_SEPARATOR}different-call`, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('rejects duplicate responded identities in the trailing assistant message', () => {
+    const approvalId = `run-1${APPROVAL_ID_SEPARATOR}duplicate-call`;
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-duplicate',
+        parts: [
+          {
+            type: 'tool-myTool',
+            toolCallId: 'duplicate-call',
+            state: 'approval-responded' as const,
+            input: { attempt: 1 },
+            approval: { id: approvalId, approved: false },
+          },
+          {
+            type: 'tool-myTool',
+            toolCallId: 'duplicate-call',
+            state: 'approval-responded' as const,
+            input: { attempt: 2 },
+            approval: { id: approvalId, approved: true },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toBeNull();
+  });
+
+  it('targets the answered call when another tool call is still awaiting approval', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        id: 'msg-parallel-approvals',
+        parts: [
+          {
+            type: 'tool-firstTool',
+            toolCallId: 'tooluse_first',
+            state: 'approval-requested' as const,
+            input: {},
+            approval: { id: `run-shared${APPROVAL_ID_SEPARATOR}tooluse_first` },
+          },
+          {
+            type: 'tool-secondTool',
+            toolCallId: 'tooluse_second',
+            state: 'approval-responded' as const,
+            input: {},
+            approval: {
+              id: `run-shared${APPROVAL_ID_SEPARATOR}tooluse_second`,
+              approved: true,
+            },
+          },
+        ],
+      },
+    ];
+
+    expect(extractV6NativeApproval(messages as any)).toEqual({
+      resumeData: { approved: true },
+      runId: 'run-shared',
+      toolCallId: 'tooluse_second',
+    });
   });
 
   it('includes reason when the user denied with a reason', () => {
@@ -188,7 +326,11 @@ describe('extractV6NativeApproval', () => {
 
     const result = extractV6NativeApproval(messages as any);
 
-    expect(result).toEqual({ resumeData: { approved: false, reason: 'Not safe' }, runId: 'run-456' });
+    expect(result).toEqual({
+      resumeData: { approved: false, reason: 'Not safe' },
+      runId: 'run-456',
+      toolCallId: 'tooluse_xyz',
+    });
   });
 
   it('omits reason when not provided', () => {
@@ -395,7 +537,7 @@ describe('handleChatStream v6 native approve() resume flow', () => {
     expect(mockAgent.resumeStream).toHaveBeenCalledTimes(1);
     expect(mockAgent.resumeStream).toHaveBeenCalledWith(
       { approved: true },
-      expect.objectContaining({ runId: 'run-123' }),
+      expect.objectContaining({ runId: 'run-123', toolCallId: 'tooluse_abc123' }),
     );
     expect(mockAgent.stream).not.toHaveBeenCalled();
   });

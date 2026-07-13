@@ -36,9 +36,16 @@ function transformV4ToolInvocationForDisplay(
   invocation: NonNullable<MastraMessageContentV2['toolInvocations']>[number],
   providerMetadata: unknown,
   enabled: boolean,
-) {
+): ToolInvocationV4 {
+  const isDeniedApproval = invocation.state === 'output-denied';
   return {
     ...invocation,
+    ...(isDeniedApproval
+      ? {
+          state: 'result' as const,
+          result: invocation.approval?.reason ?? 'Tool call was not approved by the user',
+        }
+      : {}),
     args: getDisplayTransform(providerMetadata, 'input-available', invocation.args, enabled),
     ...(invocation.state === 'result'
       ? {
@@ -50,7 +57,7 @@ function transformV4ToolInvocationForDisplay(
           ),
         }
       : {}),
-  };
+  } as ToolInvocationV4;
 }
 
 /**
@@ -308,7 +315,7 @@ export class AIV4Adapter {
         toolInvocations:
           `toolInvocations` in m.content
             ? m.content.toolInvocations
-                ?.filter(t => t.state === 'result')
+                ?.filter(t => t.state === 'result' || t.state === 'output-denied')
                 .map(toolInvocation => {
                   const partProviderMetadata = m.content.parts?.find(
                     part =>

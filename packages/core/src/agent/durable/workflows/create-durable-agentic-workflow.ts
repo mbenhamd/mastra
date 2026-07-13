@@ -148,9 +148,10 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
     .then(llmExecutionStep)
     // Step 2: Extract tool calls as array for foreach
     .map(
-      async ({ inputData }) => {
+      async ({ inputData, getInitData }) => {
         const llmOutput = inputData as DurableLLMStepOutput;
-        return (llmOutput.toolCalls ?? []) as DurableToolCallInput[];
+        const iterationCount = (getInitData() as IterationState).iterationCount;
+        return (llmOutput.toolCalls ?? []).map(toolCall => ({ ...toolCall, iterationCount })) as DurableToolCallInput[];
       },
       { id: 'extract-tool-calls' },
     )

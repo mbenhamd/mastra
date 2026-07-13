@@ -449,6 +449,7 @@ describe('DurableAgent in-execution tool suspension', () => {
 
   it('should resume tool execution after suspension with resume data', async () => {
     const mockModel = createToolCallThenTextModel('interactiveTool', { input: 'test' }, 'All done');
+    const observedResumeData: unknown[] = [];
 
     const interactiveTool = createTool({
       id: 'interactiveTool',
@@ -457,6 +458,7 @@ describe('DurableAgent in-execution tool suspension', () => {
       execute: async (_inputData: { input: string }, context?: any) => {
         const suspend = context?.agent?.suspend || context?.suspend;
         const resumeData = context?.agent?.resumeData || context?.resumeData;
+        observedResumeData.push(resumeData);
         if (suspend && !resumeData) {
           await suspend({ reason: 'Waiting for user input' });
         }
@@ -507,6 +509,7 @@ describe('DurableAgent in-execution tool suspension', () => {
     await delay(500);
 
     expect(finishData).not.toBeNull();
+    expect(observedResumeData).toEqual([undefined, { userResponse: 'yes' }]);
     resumeResult.cleanup();
     cleanup();
   });

@@ -3,6 +3,7 @@ import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
+import { createToolCallIdentityDigest } from '../../../agent/tool-call-identity';
 import { RequestContext } from '../../../request-context';
 import { ChunkFrom } from '../../../stream/types';
 import { createTool } from '../../../tools';
@@ -11,6 +12,11 @@ import { CoreToolBuilder } from '../../../tools/tool-builder/builder';
 import type { MastraToolInvocationOptions } from '../../../tools/types';
 import type { OuterLLMRun } from '../../types';
 import { createToolCallStep } from './tool-call-step';
+
+vi.mock('../../../workflows/workflow', () => ({
+  createStep: (config: unknown) => config,
+  Workflow: class {},
+}));
 
 // Shared helpers used by multiple describe blocks
 const createMessageList = () =>
@@ -136,6 +142,65 @@ describe('createToolCallStep background task stream replay', () => {
       },
     });
   });
+
+  it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {
+    const controller = { enqueue: vi.fn() };
+    const streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
+    const resume = vi.fn().mockResolvedValue({ id: 'task-1' });
+    const enqueue = vi.fn();
+    const backgroundTaskManager = {
+      enqueue,
+      resume,
+      cancel: vi.fn(),
+      waitForNextTask: vi.fn(),
+      listTasks: vi.fn().mockResolvedValue({ tasks: [{ id: 'task-1' }], total: 1 }),
+    };
+    const args = { query: 'customers' };
+    const toolCallStep = createToolCallStep({
+      tools: {
+        'background-tool': {
+          backgroundConfig: { enabled: true },
+          execute: vi.fn(),
+        },
+      } as any,
+      messageList: createMessageList(),
+      controller,
+      runId: 'current-run',
+      agentId: 'agent-1',
+      streamState,
+      _internal: {
+        backgroundTaskManager,
+        backgroundTaskManagerConfig: { enabled: true },
+        agentBackgroundConfig: { tools: 'all' },
+      },
+    } as any);
+
+    const result = await toolCallStep.execute(
+      makeBaseExecuteParams(vi.fn(), {
+        inputData: { toolCallId: 'call-1', toolName: 'background-tool', args },
+        resumeData,
+        suspendData: {
+          toolCallResume: {
+            version: 1,
+            originRunId: 'current-run',
+            stepId: 'toolCallStep',
+            type: 'suspension',
+            toolCallId: 'call-1',
+            toolName: 'background-tool',
+            identityDigest: createToolCallIdentityDigest({
+              toolCallId: 'call-1',
+              toolName: 'background-tool',
+              args,
+            }),
+          },
+        },
+      }),
+    );
+
+    expect(resume).toHaveBeenCalledWith('task-1', resumeData);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(result.result).toContain('Background task resumed');
+  });
 });
 
 describe('createToolCallStep tool execution error handling', () => {
@@ -257,6 +322,22 @@ describe('createToolCallStep tool approval workflow', () => {
     args: { param: 'test' },
   });
 
+  const makeSuspendData = (type: 'approval' | 'suspension' = 'approval') => ({
+    toolCallResume: {
+      version: 1,
+      originRunId: 'test-run',
+      stepId: 'toolCallStep',
+      type,
+      toolCallId: 'test-call-id',
+      toolName: 'test-tool',
+      identityDigest: createToolCallIdentityDigest({
+        toolCallId: 'test-call-id',
+        toolName: 'test-tool',
+        args: { param: 'test' },
+      }),
+    },
+  });
+
   const makeExecuteParams = (overrides: any = {}) => ({
     ...makeBaseExecuteParams(suspend),
     writer: new ToolStream({
@@ -327,14 +408,15 @@ describe('createToolCallStep tool approval workflow', () => {
     );
 
     expect(suspend).toHaveBeenCalledWith(
-      {
+      expect.objectContaining({
+        toolCallResume: makeSuspendData().toolCallResume,
         requireToolApproval: {
           toolCallId: 'test-call-id',
           toolName: 'test-tool',
           args: { param: 'test' },
         },
         __streamState: 'serialized-state',
-      },
+      }),
       {
         resumeLabel: 'test-call-id',
       },
@@ -349,11 +431,46 @@ describe('createToolCallStep tool approval workflow', () => {
     const inputData = makeInputData();
     const resumeData = { approved: false };
 
-    const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData }));
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData() }),
+    );
+
+    // A declined approval returns the decision (not a `result` string) so it persists as
+    // `output-denied` with the approval object; the reason carries the existing message.
+    expect(result).toEqual({
+      ...inputData,
+      approval: {
+        id: inputData.toolCallId,
+        approved: false,
+        reason: 'Tool call was not approved by the user',
+      },
+    });
+    expectNoToolExecution();
+  });
+
+  it('should preserve a user-provided decline reason', async () => {
+    const inputData = {
+      ...makeInputData(),
+      approval: { id: 'stale-approval', approved: true },
+    };
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: false, reason: 'Not safe' },
+        suspendData: makeSuspendData(),
+      }),
+    );
 
     expect(result).toEqual({
-      result: 'Tool call was not approved by the user',
-      ...inputData,
+      approval: {
+        id: inputData.toolCallId,
+        approved: false,
+        reason: 'Not safe',
+      },
+      toolCallId: inputData.toolCallId,
+      toolName: inputData.toolName,
+      args: inputData.args,
     });
     expectNoToolExecution();
   });
@@ -361,13 +478,67 @@ describe('createToolCallStep tool approval workflow', () => {
   it('should reject malformed approval resumes without executing the tool', async () => {
     const inputData = makeInputData();
 
-    const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData: {} }));
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData, resumeData: {}, suspendData: makeSuspendData() }),
+    );
 
-    expect(result).toEqual({
-      result: 'Tool call was not approved by the user',
-      ...inputData,
-    });
+    expect(result).toEqual({ ...inputData, error: expect.any(Error) });
+    expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
     expectNoToolExecution();
+  });
+
+  it.each([
+    { field: 'type', value: 'future-approval' },
+    { field: 'identityDigest', value: 'tampered' },
+    { field: 'originRunId', value: 'other-run' },
+  ])('should fail closed for a corrupt authoritative $field', async ({ field, value }) => {
+    const needsApprovalFn = vi.fn().mockReturnValue(false);
+    tools['test-tool'].requireApproval = false;
+    (tools['test-tool'] as any).needsApprovalFn = needsApprovalFn;
+    const suspendData = makeSuspendData();
+    (suspendData.toolCallResume as Record<string, unknown>)[field] = value;
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData: makeInputData(), resumeData: { approved: true }, suspendData }),
+    );
+
+    expect(result.approval).toBeUndefined();
+    expect(result.error).toBeInstanceOf(Error);
+    expect(needsApprovalFn).not.toHaveBeenCalled();
+    expectNoToolExecution();
+  });
+
+  it('should reject approval decisions with extra control fields', async () => {
+    const inputData = makeInputData();
+    const result = await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true, injected: 'payload' },
+        suspendData: makeSuspendData(),
+      }),
+    );
+
+    expect(result.approval).toBeUndefined();
+    expect(result.error).toBeInstanceOf(Error);
+    expectNoToolExecution();
+  });
+
+  it('should never forward an approval reason to tool resumeData', async () => {
+    const inputData = makeInputData();
+    tools['test-tool'].execute.mockResolvedValue({ success: true });
+
+    await toolCallStep.execute(
+      makeExecuteParams({
+        inputData,
+        resumeData: { approved: true, reason: 'reviewed' },
+        suspendData: makeSuspendData(),
+      }),
+    );
+
+    expect(tools['test-tool'].execute).toHaveBeenCalledWith(
+      inputData.args,
+      expect.objectContaining({ resumeData: undefined }),
+    );
   });
 
   it('should honor declined approval even if needsApprovalFn later returns false', async () => {
@@ -379,10 +550,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           pendingToolApprovals: {
-            'test-tool': {
+            'test-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'test-call-id',
               toolName: 'test-tool',
               args: { param: 'test' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'test-call-id',
+                toolName: 'test-tool',
+                args: { param: 'test' },
+              }),
               type: 'approval',
               runId: 'test-run',
               resumeSchema: '{}',
@@ -402,8 +581,12 @@ describe('createToolCallStep tool approval workflow', () => {
     const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData }));
 
     expect(result).toEqual({
-      result: 'Tool call was not approved by the user',
       ...inputData,
+      approval: {
+        id: inputData.toolCallId,
+        approved: false,
+        reason: 'Tool call was not approved by the user',
+      },
     });
     expect(needsApprovalFn).not.toHaveBeenCalled();
     expectNoToolExecution();
@@ -418,10 +601,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           pendingToolApprovals: {
-            'test-tool': {
+            'test-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'test-call-id',
               toolName: 'test-tool',
               args: { param: 'test' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'test-call-id',
+                toolName: 'test-tool',
+                args: { param: 'test' },
+              }),
               type: 'approval',
               runId: 'test-run',
               resumeSchema: '{}',
@@ -439,10 +630,8 @@ describe('createToolCallStep tool approval workflow', () => {
 
     const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData: {} }));
 
-    expect(result).toEqual({
-      result: 'Tool call was not approved by the user',
-      ...inputData,
-    });
+    expect(result).toEqual({ ...inputData, error: expect.any(Error) });
+    expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
     expect(needsApprovalFn).not.toHaveBeenCalled();
     expectNoToolExecution();
   });
@@ -458,10 +647,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           pendingToolApprovals: {
-            'test-tool': {
+            'test-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'test-call-id',
               toolName: 'test-tool',
               args: { param: 'test' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'test-call-id',
+                toolName: 'test-tool',
+                args: { param: 'test' },
+              }),
               type: 'approval',
               runId: 'test-run',
               resumeSchema: '{}',
@@ -503,6 +700,29 @@ describe('createToolCallStep tool approval workflow', () => {
     expect(flushMessages).toHaveBeenCalled();
     expect(result).toEqual({
       result: toolResult,
+      approval: {
+        id: inputData.toolCallId,
+        approved: true,
+      },
+      ...inputData,
+    });
+  });
+
+  it('should preserve approval when an approved tool throws', async () => {
+    const inputData = makeInputData();
+    const error = new Error('Tool failed after approval');
+    tools['test-tool'].execute.mockRejectedValue(error);
+
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData, resumeData: { approved: true }, suspendData: makeSuspendData() }),
+    );
+
+    expect(result).toEqual({
+      error,
+      approval: {
+        id: inputData.toolCallId,
+        approved: true,
+      },
       ...inputData,
     });
   });
@@ -514,7 +734,9 @@ describe('createToolCallStep tool approval workflow', () => {
     const inputData = makeInputData();
     const resumeData = { approved: false };
 
-    const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData }));
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData('suspension') }),
+    );
 
     expect(tools['test-tool'].execute).toHaveBeenCalledWith(
       inputData.args,
@@ -534,10 +756,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           pendingToolApprovals: {
-            'agent-subAgent': {
+            'agent-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'agent-call-id',
               toolName: 'agent-subAgent',
               args: { prompt: 'lookup' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'agent-call-id',
+                toolName: 'agent-subAgent',
+                args: { prompt: 'lookup' },
+              }),
               type: 'approval',
               runId: 'suspended-agent-run-id',
               resumeSchema: '{}',
@@ -617,10 +847,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           pendingToolApprovals: {
-            'agent-subAgent': {
+            'agent-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'agent-call-id',
               toolName: 'agent-subAgent',
               args: { prompt: 'lookup' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'agent-call-id',
+                toolName: 'agent-subAgent',
+                args: { prompt: 'lookup' },
+              }),
               type: 'approval',
               runId: 'test-run',
               resumeSchema: '{}',
@@ -685,10 +923,18 @@ describe('createToolCallStep tool approval workflow', () => {
       content: {
         metadata: {
           suspendedTools: {
-            'agent-subAgent': {
+            'agent-call-id': {
+              version: 1,
+              originRunId: 'test-run',
+              stepId: 'toolCallStep',
               toolCallId: 'agent-call-id',
               toolName: 'agent-subAgent',
               args: { prompt: 'lookup' },
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: 'agent-call-id',
+                toolName: 'agent-subAgent',
+                args: { prompt: 'lookup' },
+              }),
               type: 'suspension',
               runId: 'suspended-agent-run-id',
               resumeSchema: '{}',
@@ -722,9 +968,14 @@ describe('createToolCallStep tool approval workflow', () => {
     } as any);
 
     const inputData = {
-      toolCallId: 'agent-call-id',
+      toolCallId: 'agent-resume-call-id',
       toolName: 'agent-subAgent',
-      args: { prompt: 'lookup', resumeData: { approved: false } },
+      args: {
+        prompt: 'lookup',
+        resumeData: { approved: false },
+        suspendedToolCallId: 'agent-call-id',
+        suspendedToolRunId: 'suspended-agent-run-id',
+      },
     };
 
     const result = await step.execute(
@@ -732,7 +983,7 @@ describe('createToolCallStep tool approval workflow', () => {
         inputData,
         writer: new ToolStream({
           prefix: 'tool',
-          callId: 'agent-call-id',
+          callId: 'agent-resume-call-id',
           name: 'agent-subAgent',
           runId: 'test-run-id',
         }),
@@ -780,7 +1031,9 @@ describe('createToolCallStep tool approval workflow', () => {
     tools['test-tool'].execute.mockResolvedValue(toolResult);
     const resumeData = { approved: true };
 
-    const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData }));
+    const result = await toolCallStep.execute(
+      makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData() }),
+    );
 
     expect(tools['test-tool'].execute).toHaveBeenCalledWith(
       inputData.args,
@@ -791,9 +1044,15 @@ describe('createToolCallStep tool approval workflow', () => {
       }),
     );
     expect(suspend).not.toHaveBeenCalled();
+    // An approved approval-gated tool tags its result with the approval grant so it
+    // round-trips on recall as `approval: { approved: true }`.
     expect(result).toEqual({
       result: toolResult,
       ...inputData,
+      approval: {
+        id: inputData.toolCallId,
+        approved: true,
+      },
     });
   });
 });

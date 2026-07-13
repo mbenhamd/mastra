@@ -78,7 +78,7 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
                     type: 'tool-call',
                     toolCallId: 'call-2',
                     toolName: 'findUserTool',
-                    input: '{"name":"Dero Israel", "resumeData": { "approved": true }}',
+                    input: '{"name":"Dero Israel", "resumeData": { "approved": true }, "suspendedToolCallId":"call-1"}',
                     providerExecuted: false,
                   },
                   {
@@ -280,7 +280,7 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
                   type: 'tool-call',
                   toolCallId: 'call-2',
                   toolName: 'findUserTool',
-                  input: '{"name":"Dero Israel", "resumeData": { "approved": true }}',
+                  input: '{"name":"Dero Israel", "resumeData": { "approved": true }, "suspendedToolCallId":"call-1"}',
                   providerExecuted: false,
                 },
                 {

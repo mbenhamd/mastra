@@ -75,14 +75,14 @@ function isZodV4Schema(schema: unknown): boolean {
 
 /**
  * Build a Standard Schema that:
- *  - exposes the spliced JSON Schema (with `_background`/`suspendedToolRunId`/
- *    `resumeData` properties added) so provider compat layers see the override
+ *  - exposes the spliced JSON Schema (with `_background`/`suspendedToolCallId`/
+ *    `suspendedToolRunId`/`resumeData` properties added) so provider compat layers see the override
  *    fields when serializing the tool to an LLM, and
  *  - delegates runtime `validate` to the *original* schema so Zod v3
  *    `.transform()` / `.default()` / `.refine()` and other Standard Schema
  *    parsing behavior still run before `execute()` sees the args.
  *
- * Injected override keys (`_background`, `suspendedToolRunId`, `resumeData`)
+ * Injected override keys (`_background`, `suspendedToolCallId`, `suspendedToolRunId`, `resumeData`)
  * are stripped from the input before delegating, then merged back into the
  * validated value so the inner `execute()` still receives them — matching the
  * Zod v4 `.extend()` path's behavior.
@@ -246,6 +246,7 @@ export class CoreToolBuilder extends MastraBase {
           }
           if (isResumableTool) {
             nextSchema = safeExtendZodObject(nextSchema, {
+              suspendedToolCallId: z.string().describe('The original toolCallId of the suspended tool').optional(),
               suspendedToolRunId: z.string().describe('The runId of the suspended tool').nullable().optional(),
               resumeData: z
                 .any()
@@ -274,10 +275,14 @@ export class CoreToolBuilder extends MastraBase {
                 type: ['string', 'null'],
                 description: 'The runId of the suspended tool',
               };
+              properties.suspendedToolCallId = {
+                type: 'string',
+                description: 'The original toolCallId of the suspended tool',
+              };
               properties.resumeData = {
                 description: 'The resumeData object created from the resumeSchema of suspended tool',
               };
-              injectedKeys.push('suspendedToolRunId', 'resumeData');
+              injectedKeys.push('suspendedToolCallId', 'suspendedToolRunId', 'resumeData');
             }
 
             // Preserve the original schema's runtime validator (Zod v3

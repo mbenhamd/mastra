@@ -763,6 +763,11 @@ interface ToolExecutionAbortPayload {
 }
 
 interface ToolCallApprovalPayload {
+  version?: 1;
+  originRunId?: string;
+  stepId?: string;
+  type?: 'approval';
+  identityDigest?: string;
   toolCallId: string;
   toolName: string;
   args: Record<string, any>;
@@ -772,6 +777,11 @@ interface ToolCallApprovalPayload {
 }
 
 interface ToolCallSuspendedPayload {
+  version?: 1;
+  originRunId?: string;
+  stepId?: string;
+  type?: 'suspension';
+  identityDigest?: string;
   toolCallId: string;
   toolName: string;
   suspendPayload: any;

@@ -96,7 +96,7 @@ export type MastraMessageContentV2 = {
   parts: MastraMessagePart[];
   experimental_attachments?: UIMessageV4['experimental_attachments'];
   content?: UIMessageV4['content'];
-  toolInvocations?: UIMessageV4['toolInvocations'];
+  toolInvocations?: MastraToolInvocation[];
   reasoning?: UIMessageV4['reasoning'];
   annotations?: UIMessageV4['annotations'];
   metadata?: Record<string, unknown>;

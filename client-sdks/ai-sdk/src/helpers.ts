@@ -21,9 +21,8 @@ import { isDataChunkType } from './utils';
 
 /**
  * Separator used to encode both runId and toolCallId into a single approvalId string.
- * Chosen because neither runId nor toolCallId can contain ":" in normal usage
- * (UUIDs are hex + hyphens; provider tool call IDs are alphanumeric + underscores).
- * The server splits on this separator to recover the runId for resumeStream.
+ * The server recovers the boundary by suffix-matching this separator plus the
+ * visible toolCallId, so opaque provider IDs may contain the separator too.
  */
 export const APPROVAL_ID_SEPARATOR = '::';
 

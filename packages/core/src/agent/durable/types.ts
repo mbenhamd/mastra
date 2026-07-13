@@ -250,6 +250,8 @@ export interface DurableLLMStepOutput {
  * Input for a single tool call step
  */
 export interface DurableToolCallInput {
+  /** Agent-loop iteration that produced this tool call */
+  iterationCount?: number;
   /** Tool call identifier from the LLM */
   toolCallId: string;
   /** Name of the tool to execute */
@@ -384,6 +386,7 @@ export interface AgentSuspendedEventData {
   toolCallId?: string;
   toolName?: string;
   args?: Record<string, unknown>;
+  identityDigest?: string;
   suspendPayload?: unknown;
   resumeSchema?: string;
   type: 'approval' | 'suspension';
