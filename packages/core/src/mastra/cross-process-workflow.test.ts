@@ -11,7 +11,9 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 
+import { Agent } from '../agent';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import type { PubSubDeliveryMode } from '../events/pubsub';
 import type { Event } from '../events/types';
@@ -61,6 +63,39 @@ function makeNoopWorkflow(id: string) {
 }
 
 describe('cross-process workflow event guard', () => {
+  it('registers real agent execution and loop workflows without test-only ownership setup', async () => {
+    const agent = new Agent({
+      id: 'owned-agent',
+      name: 'Owned agent',
+      instructions: 'Reply briefly.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text', text: 'owned' }],
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          warnings: [],
+        }),
+      }),
+    });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      pubsub: new PushOnlyPubSub(),
+      agents: { ownedAgent: agent },
+    });
+    const register = vi.spyOn(mastra, '__registerInternalWorkflow');
+    const unregister = vi.spyOn(mastra, '__unregisterInternalWorkflow');
+
+    await mastra.startWorkers();
+    await mastra.getAgent('ownedAgent').generate('hello');
+
+    expect(register.mock.calls.some(([workflow, runId]) => workflow.id === 'execution-workflow' && !!runId)).toBe(true);
+    expect(register.mock.calls.some(([workflow, runId]) => workflow.id === 'agentic-loop' && !!runId)).toBe(true);
+    expect(unregister.mock.calls.some(([workflowId]) => workflowId === 'execution-workflow')).toBe(true);
+    expect(unregister.mock.calls.some(([workflowId]) => workflowId === 'agentic-loop')).toBe(true);
+    await mastra.shutdown();
+  });
+
   it('skips events for internal workflows not owned by this instance', async () => {
     const sharedPubSub = new PushOnlyPubSub();
 
