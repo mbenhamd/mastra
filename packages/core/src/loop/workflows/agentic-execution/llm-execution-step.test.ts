@@ -5,6 +5,7 @@ import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import { MODEL_TOKENS } from '../../../../../../docs/src/plugins/remark-model-tokens/models';
 import { MessageList } from '../../../agent/message-list';
+import { SpanType } from '../../../observability';
 import { ProviderHistoryCompat } from '../../../processors/provider-history-compat';
 import { RequestContext } from '../../../request-context';
 import { ToolStream } from '../../../tools/stream';
@@ -462,16 +463,14 @@ describe('createLLMExecutionStep gateway provider tools', () => {
 
   it('resolves streamed tool payload transforms without rescanning tools per delta', async () => {
     const onInputDelta = vi.fn();
+    const transformToolPayload = vi.fn(({ target, inputTextDelta }) =>
+      target === 'display' ? inputTextDelta?.toUpperCase() : undefined,
+    );
     const rawTools = {
       registeredLookup: {
         id: 'lookup_by_model_name',
         inputSchema: z.object({ query: z.string() }),
         onInputDelta,
-        transform: {
-          display: {
-            inputDelta: ({ inputTextDelta }: { inputTextDelta?: string }) => inputTextDelta?.toUpperCase(),
-          },
-        },
       },
     };
     let toolEnumerationCount = 0;
@@ -542,6 +541,10 @@ describe('createLLMExecutionStep gateway provider tools', () => {
       },
       _internal: {
         generateId: () => 'generated-id',
+        toolPayloadTransform: {
+          targets: ['display'],
+          transformToolPayload,
+        },
       },
       logger: {
         error: vi.fn(),
@@ -557,6 +560,16 @@ describe('createLLMExecutionStep gateway provider tools', () => {
 
     expect(toolEnumerationCount).toBeLessThanOrEqual(5);
     expect(onInputDelta).toHaveBeenCalledTimes(toolInputDeltas.length);
+    const deltaTransformCalls = transformToolPayload.mock.calls.filter(([context]) => context.phase === 'input-delta');
+    expect(deltaTransformCalls).toHaveLength(toolInputDeltas.length);
+    for (const [context] of deltaTransformCalls) {
+      expect(context).toMatchObject({
+        target: 'display',
+        phase: 'input-delta',
+        toolName: 'lookup_by_model_name',
+        toolCallId: 'call-1',
+      });
+    }
     expect(deltaChunks).toHaveLength(toolInputDeltas.length);
     expect(deltaChunks.map(chunk => chunk.metadata?.mastra?.toolPayloadTransform?.display?.['input-delta'])).toEqual(
       toolInputDeltas.map(delta => ({ transformed: delta.toUpperCase() })),
