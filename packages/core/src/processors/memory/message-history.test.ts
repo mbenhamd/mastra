@@ -943,6 +943,9 @@ describe('MessageHistory', () => {
       content: {
         format: 2,
         content: 'Final answer',
+        providerMetadata: {
+          mastra: { rawToolResult: 'CONTENT_PROVIDER_SECRET' },
+        },
         parts: [
           { type: 'text', text: 'Final answer' },
           {
@@ -1015,6 +1018,7 @@ describe('MessageHistory', () => {
       expect(serialized).not.toContain('APPROVAL_REASON_SENTINEL');
       expect(serialized).not.toContain('PART_TITLE_SENTINEL');
       expect(serialized).not.toContain('PROVIDER_METADATA_SENTINEL');
+      expect(serialized).not.toContain('CONTENT_PROVIDER_SECRET');
       expect(serialized).not.toContain('TOP_LEVEL_ARGS_SENTINEL');
       expect(serialized).not.toContain('TOP_LEVEL_RESULT_SENTINEL');
       expect(serialized).not.toContain('BASE64_SENTINEL');
@@ -1042,6 +1046,45 @@ describe('MessageHistory', () => {
       expect(serialized).toContain('search result:\\nCompact result');
       expect(serialized).not.toContain('RAW_RESULT_SENTINEL');
       expect(messageList.get.response.db()).toEqual([message]);
+    });
+
+    it('applies a finite model-output bound when persistence filtering omits one', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: { preserveModelOutput: true },
+      });
+      const message = createToolResultMessage();
+      const toolPart = message.content.parts.find(part => part.type === 'tool-invocation');
+      if (!toolPart || toolPart.type !== 'tool-invocation') throw new Error('expected tool invocation');
+      toolPart.providerMetadata = { mastra: { modelOutput: 'x'.repeat(1024 * 1024) } };
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('[truncated]');
+      expect(new TextEncoder().encode(serialized).byteLength).toBeLessThan(17 * 1024);
+    });
+
+    it.each(['array', 'legacy wrapper'] as const)('omits circular %s model output', async shape => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        toolCallFilter: { preserveModelOutput: true },
+      });
+      const message = createToolResultMessage();
+      const toolPart = message.content.parts.find(part => part.type === 'tool-invocation');
+      if (!toolPart || toolPart.type !== 'tool-invocation') throw new Error('expected tool invocation');
+      const circular: unknown[] | { value?: unknown } = shape === 'array' ? [] : {};
+      if (Array.isArray(circular)) circular.push(circular);
+      else circular.value = circular;
+      toolPart.providerMetadata = { mastra: { modelOutput: circular } };
+
+      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(JSON.stringify(savedMessages)).not.toContain('search result');
     });
 
     it('filters legacy messages that store tool payloads only in content.toolInvocations', async () => {

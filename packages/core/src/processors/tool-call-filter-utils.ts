@@ -1,6 +1,8 @@
 import type { MastraDBMessage, MastraMessagePart, MastraToolInvocationPart } from '../agent/message-list';
 
 const MODEL_OUTPUT_TRUNCATION_SUFFIX = '\n[truncated]';
+const MAX_MODEL_OUTPUT_TRAVERSAL_DEPTH = 64;
+const MAX_MODEL_OUTPUT_TRAVERSAL_NODES = 10_000;
 
 export type ToolCallFilteringOptions = {
   exclude?: string[];
@@ -24,9 +26,7 @@ function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedT
     ...(maxModelOutputBytes === undefined
       ? {}
       : {
-          maxModelOutputBytes: Number.isFinite(maxModelOutputBytes)
-            ? Math.max(0, Math.floor(maxModelOutputBytes))
-            : 0,
+          maxModelOutputBytes: Number.isFinite(maxModelOutputBytes) ? Math.max(0, Math.floor(maxModelOutputBytes)) : 0,
         }),
   };
 }
@@ -54,7 +54,10 @@ function getToolInvocations(message: MastraDBMessage): MastraToolInvocationPart[
 }
 
 function hasToolInvocations(message: MastraDBMessage): boolean {
-  return getMessageParts(message).some(part => part.type === 'tool-invocation') || getTopLevelToolInvocations(message).length > 0;
+  return (
+    getMessageParts(message).some(part => part.type === 'tool-invocation') ||
+    getTopLevelToolInvocations(message).length > 0
+  );
 }
 
 function hasTopLevelTextContent(message: MastraDBMessage): boolean {
@@ -84,7 +87,14 @@ function safeJsonStringify(value: unknown): string | null {
  * The recognized object shapes mirror LanguageModelV2ToolResultOutput. Primitive and array handling
  * remain for backwards compatibility with existing ToolCallFilter callers that stored legacy output.
  */
-function modelOutputToText(modelOutput: unknown): string | null {
+function modelOutputToText(
+  modelOutput: unknown,
+  traversal: { seen: WeakSet<object>; depth: number; nodes: number } = {
+    seen: new WeakSet<object>(),
+    depth: 0,
+    nodes: 0,
+  },
+): string | null {
   if (typeof modelOutput === 'string') {
     return modelOutput;
   }
@@ -93,51 +103,63 @@ function modelOutputToText(modelOutput: unknown): string | null {
     return String(modelOutput);
   }
 
-  if (Array.isArray(modelOutput)) {
-    const text = modelOutput
-      .map(part => modelOutputToText(part))
-      .filter((part): part is string => Boolean(part))
-      .join('\n');
-    return text || null;
-  }
-
   if (!modelOutput || typeof modelOutput !== 'object') {
     return null;
   }
 
-  const output = modelOutput as Record<string, unknown>;
-  switch (output.type) {
-    case 'text':
-    case 'error-text':
-      return typeof output.value === 'string'
-        ? output.value
-        : typeof output.text === 'string'
-          ? output.text
-          : null;
-    case 'json':
-    case 'error-json':
-      return Object.hasOwn(output, 'value') ? safeJsonStringify(output.value) : null;
-    case 'content': {
-      if (!Array.isArray(output.value)) return null;
-      const text = output.value
-        .flatMap(part => {
-          if (!part || typeof part !== 'object') return [];
-          const contentPart = part as Record<string, unknown>;
-          if (contentPart.type !== 'text') return [];
-          const value = typeof contentPart.text === 'string' ? contentPart.text : contentPart.value;
-          return typeof value === 'string' ? [value] : [];
-        })
+  if (
+    traversal.seen.has(modelOutput) ||
+    traversal.depth >= MAX_MODEL_OUTPUT_TRAVERSAL_DEPTH ||
+    traversal.nodes >= MAX_MODEL_OUTPUT_TRAVERSAL_NODES
+  ) {
+    return null;
+  }
+
+  traversal.seen.add(modelOutput);
+  traversal.depth += 1;
+  traversal.nodes += 1;
+
+  try {
+    if (Array.isArray(modelOutput)) {
+      const text = modelOutput
+        .map(part => modelOutputToText(part, traversal))
+        .filter((part): part is string => Boolean(part))
         .join('\n');
       return text || null;
     }
-    default:
-      // Preserve the two legacy wrapper shapes ToolCallFilter already accepted, but never stringify
-      // arbitrary objects. This fails closed for media and unknown provider-specific output.
-      if (typeof output.text === 'string') return output.text;
-      if (!Object.hasOwn(output, 'type') && Object.hasOwn(output, 'value')) {
-        return modelOutputToText(output.value);
+
+    const output = modelOutput as Record<string, unknown>;
+    switch (output.type) {
+      case 'text':
+      case 'error-text':
+        return typeof output.value === 'string' ? output.value : typeof output.text === 'string' ? output.text : null;
+      case 'json':
+      case 'error-json':
+        return Object.hasOwn(output, 'value') ? safeJsonStringify(output.value) : null;
+      case 'content': {
+        if (!Array.isArray(output.value)) return null;
+        const text = output.value
+          .flatMap(part => {
+            if (!part || typeof part !== 'object') return [];
+            const contentPart = part as Record<string, unknown>;
+            if (contentPart.type !== 'text') return [];
+            const value = typeof contentPart.text === 'string' ? contentPart.text : contentPart.value;
+            return typeof value === 'string' ? [value] : [];
+          })
+          .join('\n');
+        return text || null;
       }
-      return null;
+      default:
+        // Preserve the two legacy wrapper shapes ToolCallFilter already accepted, but never stringify
+        // arbitrary objects. This fails closed for media and unknown provider-specific output.
+        if (typeof output.text === 'string') return output.text;
+        if (!Object.hasOwn(output, 'type') && Object.hasOwn(output, 'value')) {
+          return modelOutputToText(output.value, traversal);
+        }
+        return null;
+    }
+  } finally {
+    traversal.depth -= 1;
   }
 }
 
@@ -190,7 +212,11 @@ function buildContent(
   parts: MastraDBMessage['content']['parts'],
   toolInvocations: MastraDBMessage['content']['toolInvocations'],
 ): MastraDBMessage['content'] {
-  const { toolInvocations: _originalToolInvocations, ...contentWithoutToolInvocations } = message.content;
+  const {
+    toolInvocations: _originalToolInvocations,
+    providerMetadata: _providerMetadata,
+    ...contentWithoutToolInvocations
+  } = message.content;
   const updatedContent: MastraDBMessage['content'] = {
     ...contentWithoutToolInvocations,
     parts,

@@ -9,6 +9,8 @@ import type { MemoryStorage } from '../../storage';
 import { filterToolCallMessages } from '../tool-call-filter-utils';
 import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
 
+const DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES = 16 * 1024;
+
 export type MessageHistoryToolCallFilterOptions = Pick<
   ToolCallFilteringOptions,
   'exclude' | 'preserveModelOutput' | 'maxModelOutputBytes'
@@ -239,7 +241,10 @@ export class MessageHistory implements Processor {
 
     return this.toolCallFilter === undefined
       ? filteredMessages
-      : filterToolCallMessages(filteredMessages, this.toolCallFilter);
+      : filterToolCallMessages(filteredMessages, {
+          ...this.toolCallFilter,
+          maxModelOutputBytes: this.toolCallFilter.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
+        });
   }
 
   async processOutputResult(
