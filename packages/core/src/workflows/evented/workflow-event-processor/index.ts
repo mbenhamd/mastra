@@ -342,7 +342,7 @@ export class WorkflowEventProcessor extends EventProcessor {
                     resultPointer: { kind: 'retained-terminal-result', workflowName: workflow.id, runId },
                     resumeMetadata: {
                       wasResume: parentWorkflow.resume === true,
-                      resumeSteps: parentWorkflow.resumeSteps,
+                      resumeSteps: parentWorkflow.resumeSteps ?? [],
                     },
                   },
                   ...(parentWorkflow.recoveryAncestry ?? []),
@@ -411,6 +411,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           requestContext,
           recoveryAncestry,
         });
+        if (admission.status === 'parent_terminal') return;
         if (admission.status !== 'admitted' && admission.status !== 'already_admitted') {
           throw new MastraError({
             id:
@@ -452,6 +453,20 @@ export class WorkflowEventProcessor extends EventProcessor {
         }
       }
     }
+
+    // Announce the run only after durable nested admission succeeds. A stale
+    // child start rejected by a terminal parent must remain invisible to
+    // stream/watch consumers because no child execution will follow it.
+    await this.mastra.pubsub.publish(`workflow.events.v2.${runId}`, {
+      type: 'watch',
+      runId,
+      data: {
+        type: 'workflow-start',
+        payload: {
+          runId,
+        },
+      },
+    });
 
     if (shouldPersist && workflowsStore) {
       await workflowsStore.persistWorkflowSnapshot({
@@ -3018,20 +3033,6 @@ export class WorkflowEventProcessor extends EventProcessor {
         );
         return false;
       }
-    }
-
-    if (type === 'workflow.start' || type === 'workflow.resume') {
-      const { runId } = workflowData;
-      await this.mastra.pubsub.publish(`workflow.events.v2.${runId}`, {
-        type: 'watch',
-        runId,
-        data: {
-          type: 'workflow-start',
-          payload: {
-            runId,
-          },
-        },
-      });
     }
 
     // For the cleanup-path events (`workflow.fail`/`workflow.end`/

@@ -63,6 +63,23 @@ describe('workflow terminal graph fingerprint', () => {
     expect(createWorkflowTerminalGraphFingerprint(original)).toBe(createWorkflowTerminalGraphFingerprint(stored));
   });
 
+  it('treats explicit undefined optional step fields like JSON-omitted fields', () => {
+    const original = graph();
+    const conditional = original[3];
+    if (conditional?.type !== 'conditional') throw new Error('invalid fixture');
+    conditional.steps[0]!.step = {
+      ...conditional.steps[0]!.step,
+      component: undefined,
+      mapConfig: undefined,
+      canSuspend: undefined,
+      serializedStepFlow: undefined,
+    };
+
+    expect(createWorkflowTerminalGraphFingerprint(original)).toBe(
+      createWorkflowTerminalGraphFingerprint(JSON.parse(JSON.stringify(original)) as SerializedStepFlowEntry[]),
+    );
+  });
+
   it('changes for execution-semantic graph changes', () => {
     const original = graph();
     const changedConcurrency = graph();

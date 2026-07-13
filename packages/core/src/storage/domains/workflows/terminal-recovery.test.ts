@@ -38,19 +38,20 @@ async function completeRoot(
   workflows: WorkflowsInMemory,
   db: InMemoryDB,
   run: { workflowName: string; runId: string },
+  terminalStatus: 'success' | 'failed' | 'canceled' = 'failed',
 ) {
-  await workflows.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+  await workflows.persistWorkflowSnapshot({ ...run, snapshot: createParentSnapshot(run.runId) });
   const claim = await workflows.claimWorkflowTerminalization({
     ...run,
     eventKey: `${run.runId}-terminal`,
-    terminalStatus: 'failed',
+    terminalStatus,
     ownerId: 'owner',
     leaseMs: 10_000,
   });
   if (claim.status !== 'acquired') throw new Error('Expected acquired root');
   const snapshot: WorkflowRunState = {
-    ...createEmptyWorkflowSnapshot(run.runId),
-    status: 'failed',
+    ...createParentSnapshot(run.runId),
+    status: terminalStatus,
     context: { __state: { terminal: true } } as WorkflowRunState['context'],
     value: { terminal: true },
   };
@@ -60,7 +61,7 @@ async function completeRoot(
     claimToken: claim.record.claimToken,
     claimGeneration: claim.record.claimGeneration,
     snapshot,
-    recoveryEnvelope: createTerminalRecoveryEnvelope({ ...run, snapshot, terminalStatus: 'failed' }),
+    recoveryEnvelope: createTerminalRecoveryEnvelope({ ...run, snapshot, terminalStatus }),
   });
   const key = JSON.stringify([run.workflowName, run.runId]);
   const journal = db.workflowTerminalizations.get(key);
@@ -73,6 +74,21 @@ async function completeRoot(
     leaseExpiresAt: undefined,
     completedAt: journal.updatedAt,
   });
+}
+
+function nestedAdmission(
+  parent: { workflowName: string; runId: string },
+  child: { workflowName: string; runId: string },
+) {
+  return {
+    ...parent,
+    stepId: 'nested',
+    nestedWorkflowName: child.workflowName,
+    nestedRunId: child.runId,
+    result: { status: 'running' as const, payload: {} },
+    requestContext: {},
+    recoveryAncestry: ancestry(child, parent),
+  };
 }
 
 describe('WorkflowsInMemory terminal recovery storage', () => {
@@ -202,6 +218,80 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
         ancestry: ancestry(orphanChild, deletedRoot),
       }),
     ).rejects.toThrow('parent evidence is unavailable');
+  });
+
+  it.each(['success', 'failed', 'canceled'] as const)(
+    'rejects late atomic admission after cleanup of a %s parent without mutating canonical state',
+    async terminalStatus => {
+      const db = new InMemoryDB();
+      const workflows = new WorkflowsInMemory({ db });
+      const parent = { workflowName: `late-${terminalStatus}-parent`, runId: 'parent-run' };
+      const child = { workflowName: `late-${terminalStatus}-child`, runId: 'child-run' };
+      await completeRoot(workflows, db, parent, terminalStatus);
+      await expect(
+        workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date(Date.now() + 1) }),
+      ).resolves.toEqual({ status: 'deleted', count: 1 });
+      const before = JSON.stringify(await workflows.loadWorkflowSnapshot(parent));
+
+      await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toEqual({
+        status: 'parent_terminal',
+      });
+      expect(JSON.stringify(await workflows.loadWorkflowSnapshot(parent))).toBe(before);
+      await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+    },
+  );
+
+  it('retains a completed parent recovery root when atomic admission wins first', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'admission-first-parent', runId: 'parent-run' };
+    const child = { workflowName: 'admission-first-child', runId: 'child-run' };
+    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+    await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toMatchObject({
+      status: 'admitted',
+    });
+    const claim = await workflows.claimWorkflowTerminalization({
+      ...parent,
+      eventKey: 'admission-first-terminal',
+      terminalStatus: 'failed',
+      ownerId: 'owner',
+      leaseMs: 10_000,
+    });
+    if (claim.status !== 'acquired') throw new Error('Expected acquired parent');
+    const current = await workflows.loadWorkflowSnapshot(parent);
+    if (!current) throw new Error('Expected admitted parent snapshot');
+    const terminal: WorkflowRunState = {
+      ...current,
+      status: 'failed',
+      context: { ...current.context, __state: { terminal: true } },
+      value: { terminal: true },
+    };
+    await workflows.persistWorkflowTerminalState({
+      ...parent,
+      ownerId: claim.record.ownerId,
+      claimToken: claim.record.claimToken,
+      claimGeneration: claim.record.claimGeneration,
+      snapshot: terminal,
+      recoveryEnvelope: createTerminalRecoveryEnvelope({ ...parent, snapshot: terminal, terminalStatus: 'failed' }),
+    });
+    const key = JSON.stringify([parent.workflowName, parent.runId]);
+    const journal = db.workflowTerminalizations.get(key);
+    if (!journal) throw new Error('Expected parent journal');
+    db.workflowTerminalizations.set(key, {
+      ...journal,
+      phase: 'complete',
+      ownerId: undefined,
+      claimToken: undefined,
+      leaseExpiresAt: undefined,
+      completedAt: journal.updatedAt,
+    });
+
+    await expect(
+      workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date(Date.now() + 1) }),
+    ).resolves.toEqual({ status: 'deleted', count: 0 });
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toMatchObject({ status: 'found' });
   });
 
   it('atomically preserves foreach ownership assigned by concurrent sibling calls', async () => {

@@ -336,8 +336,8 @@ describe('WorkflowsPG terminalization journal', () => {
       );
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = snapshot #- '{context,__state}'
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = envelope #- '{finalState}'
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -348,15 +348,15 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'missing_receipt',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{context,__state}', '{"final":true}'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{finalState}', '{"final":true}'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{result,status}', '"failed"'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{terminalResult,status}', '"failed"'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -367,20 +367,20 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'missing_receipt',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{result,status}', '"success"'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{terminalResult,status}', '"success"'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
 
-      const retainedSnapshotBackup = await pool.query<{ snapshot: unknown }>(
-        `SELECT snapshot FROM mastra_workflow_terminal_snapshots
+      const retainedSnapshotBackup = await pool.query<{ envelope: unknown }>(
+        `SELECT envelope FROM mastra_workflow_terminal_snapshots_v2
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = to_jsonb('{'::text)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = '{}'::jsonb
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -388,9 +388,9 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'corrupt_child_terminal_state',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots SET snapshot = $1
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET envelope = $1
          WHERE workflow_name = $2 AND run_id = $3`,
-        [JSON.stringify(retainedSnapshotBackup.rows[0]!.snapshot), child.workflowName, child.runId],
+        [JSON.stringify(retainedSnapshotBackup.rows[0]!.envelope), child.workflowName, child.runId],
       );
 
       await pool.query(

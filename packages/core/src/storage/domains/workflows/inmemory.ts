@@ -1245,6 +1245,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const run = this.db.workflows.get(parentKey);
     if (!run?.snapshot) return { status: 'missing_run' };
     const snapshot = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
+    if (snapshot.status === 'success' || snapshot.status === 'failed' || snapshot.status === 'canceled') {
+      return { status: 'parent_terminal' };
+    }
     const recovery = createWorkflowTerminalRecoveryAncestryRecord(
       operation.nestedWorkflowName,
       operation.nestedRunId,

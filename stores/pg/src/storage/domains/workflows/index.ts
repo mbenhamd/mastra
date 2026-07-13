@@ -259,12 +259,17 @@ export class WorkflowsPG extends WorkflowsStorage {
     });
   }
 
-  private async lockWorkflowParentRevision(t: TxClient, workflowName: string, runId: string): Promise<number> {
-    await t.none(
+  private async lockWorkflowParentRevisionWithPresence(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+  ): Promise<{ generation: number; created: boolean }> {
+    const inserted = await t.oneOrNone<{ generation: number | string }>(
       `INSERT INTO ${this.workflowParentRevisionTableName()}
        (workflow_name, run_id, generation, updated_at)
        VALUES ($1, $2, 0, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)
-       ON CONFLICT (workflow_name, run_id) DO NOTHING`,
+       ON CONFLICT (workflow_name, run_id) DO NOTHING
+       RETURNING generation`,
       [workflowName, runId],
     );
     const row = await t.one<{ generation: number | string }>(
@@ -277,7 +282,11 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (!Number.isSafeInteger(generation) || generation < 0) {
       throw new TypeError('Invalid workflow parent revision generation');
     }
-    return generation;
+    return { generation, created: inserted !== null };
+  }
+
+  private async lockWorkflowParentRevision(t: TxClient, workflowName: string, runId: string): Promise<number> {
+    return (await this.lockWorkflowParentRevisionWithPresence(t, workflowName, runId)).generation;
   }
 
   private async bumpWorkflowParentRevision(
@@ -1317,6 +1326,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (Number.isNaN(olderThan)) throw new TypeError('olderThan must be a valid Date');
     try {
       return await this.#db.client.tx(async t => {
+        const identity = JSON.stringify([operation.workflowName, operation.runId]);
+        await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [identity]);
         const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
         if (!context.record && !context.snapshotExists) return { status: 'missing_run', count: 0 };
         const eligible =
@@ -2658,14 +2669,38 @@ export class WorkflowsPG extends WorkflowsStorage {
               immediate.source.iterationIndex === operation.forEachIndex);
         if (!expectedSource) return { status: 'ancestry_conflict' };
 
-        const revision = await this.lockWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
+          t,
+          operation.workflowName,
+          operation.runId,
+        );
         const parentRow = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
           [operation.workflowName, operation.runId],
         );
-        if (!parentRow) return { status: 'missing_run' };
+        if (!parentRow) {
+          if (revisionLock.created) {
+            await t.none(
+              `DELETE FROM ${this.workflowParentRevisionTableName()}
+               WHERE workflow_name = $1 AND run_id = $2`,
+              [operation.workflowName, operation.runId],
+            );
+          }
+          return { status: 'missing_run' };
+        }
         const snapshot = typeof parentRow.snapshot === 'string' ? JSON.parse(parentRow.snapshot) : parentRow.snapshot;
+        if (snapshot.status === 'success' || snapshot.status === 'failed' || snapshot.status === 'canceled') {
+          if (revisionLock.created) {
+            await t.none(
+              `DELETE FROM ${this.workflowParentRevisionTableName()}
+               WHERE workflow_name = $1 AND run_id = $2`,
+              [operation.workflowName, operation.runId],
+            );
+          }
+          return { status: 'parent_terminal' };
+        }
+        const revision = revisionLock.generation;
         validateWorkflowTerminalRecoveryParentFrameGraphBinding(immediate, snapshot.serializedStepGraph);
 
         const parentRecoveryRow = await t.oneOrNone<Record<string, unknown>>(

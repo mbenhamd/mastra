@@ -297,6 +297,115 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     await mastra.shutdown();
   });
 
+  it('does not announce a child when atomic admission rejects a terminal parent', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'terminal-parent-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'success',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    await expect(
+      processor.start({
+        workflow: workflow('child'),
+        workflowId: 'child',
+        runId: 'late-child-run',
+        executionPath: [0],
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        prevResult: { status: 'success', output: {} },
+        requestContext: {},
+        parentWorkflow: {
+          workflowId: 'parent',
+          runId: parentRunId,
+          stepId: 'child',
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepGraph: parentGraph,
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: { status: 'success', output: {} },
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(persist).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    await expect(
+      workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: 'late-child-run' }),
+    ).resolves.toBeNull();
+    await mastra.shutdown();
+  });
+
+  it('announces accepted top-level and nested starts before scheduling their first step', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+    const startArgs = {
+      workflow: workflow('top-level'),
+      workflowId: 'top-level',
+      runId: 'top-level-run',
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success' as const, output: {} },
+      requestContext: {},
+    };
+
+    await processor.start(startArgs);
+    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+      ['workflow.events.v2.top-level-run', 'watch'],
+      ['workflows', 'workflow.step.run'],
+    ]);
+
+    publish.mockClear();
+    const parentRunId = 'accepted-parent-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    await processor.start({
+      ...startArgs,
+      workflow: workflow('child'),
+      workflowId: 'child',
+      runId: 'accepted-child-run',
+      parentWorkflow: {
+        workflowId: 'parent',
+        runId: parentRunId,
+        stepId: 'child',
+        executionPath: [0],
+        resume: false,
+        stepResults: {},
+        stepGraph: parentGraph,
+        activeStepsPath: {},
+        resumeSteps: [],
+        resumeData: undefined,
+        input: { status: 'success', output: {} },
+      },
+    });
+    expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+      ['workflow.events.v2.accepted-child-run', 'watch'],
+      ['workflows', 'workflow.step.run'],
+    ]);
+    await mastra.shutdown();
+  });
+
   it('reuses immutable retained ancestry when a nested child resumes', async () => {
     const { mastra, workflows, processor } = await setup();
     const parentRunId = 'resume-parent-run';

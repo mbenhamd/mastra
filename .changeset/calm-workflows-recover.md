@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Added authenticated terminal recovery envelopes for continuous workflows. Supported workflow stores now atomically admit nested runs, retain exact terminal results and final state, bind recursive graph ancestry, and preserve one child run per foreach iteration.
+Added authenticated terminal recovery envelopes for continuous workflows. Supported workflow stores now atomically admit nested runs, retain exact terminal results and final state, bind recursive graph ancestry, preserve one child run per foreach iteration, and reject late admission after the parent is terminal.
 
 Check the recovery capability before using the new contract:
 

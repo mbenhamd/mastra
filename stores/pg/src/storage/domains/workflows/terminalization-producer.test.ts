@@ -162,7 +162,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
 
   it('atomically converges concurrent producers and retains dispatch evidence after normal deletion', async () => {
     const workflowName = `terminal-producer-${randomUUID()}`;
-    const { run, fence, snapshot } = await createTerminalRun(workflowName, 'run', 'resource-terminal');
+    const { run, fence } = await createTerminalRun(workflowName, 'run', 'resource-terminal');
 
     try {
       const results = await Promise.all([
@@ -419,7 +419,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
 
     try {
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots AS retained
+        `UPDATE mastra_workflow_terminal_snapshots_v2 AS retained
          SET created_at = journal.updated_at + 1
          FROM mastra_workflow_terminalizations AS journal
          WHERE retained.workflow_name = journal.workflow_name AND retained.run_id = journal.run_id
@@ -435,7 +435,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
         }),
       ).rejects.toThrow('Invalid workflow terminal snapshot journal link');
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots AS retained
+        `UPDATE mastra_workflow_terminal_snapshots_v2 AS retained
          SET created_at = journal.updated_at
          FROM mastra_workflow_terminalizations AS journal
          WHERE retained.workflow_name = journal.workflow_name AND retained.run_id = journal.run_id
@@ -478,7 +478,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
       );
       await expect(
         workflowsA.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' }),
-      ).rejects.toThrow('Invalid workflow terminal recovery envelope');
+      ).rejects.toThrow('Invalid workflow terminal snapshot record');
     } finally {
       await cleanup(workflowName);
     }

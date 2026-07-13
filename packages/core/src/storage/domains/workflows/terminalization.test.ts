@@ -904,7 +904,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
     const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
     const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
     if (!retained) throw new Error('Expected retained child snapshot');
-    delete retained.snapshot.context.__state;
+    delete (retained.envelope as Partial<typeof retained.envelope>).finalState;
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
@@ -918,7 +918,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
     const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
     const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
     if (!retained) throw new Error('Expected retained child snapshot');
-    retained.snapshot.result = { status: 'failed' } as never;
+    retained.envelope.terminalResult = { status: 'failed' } as never;
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),

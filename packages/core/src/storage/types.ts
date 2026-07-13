@@ -239,7 +239,9 @@ export type AdmitWorkflowNestedRunResult =
       stepResults: Record<string, StepResult<any, any, any, any>>;
       recovery: WorkflowTerminalRecoveryAncestryRecord;
     }
-  | { status: 'ownership_conflict' | 'ancestry_conflict' | 'missing_run' | 'unsupported' };
+  | {
+      status: 'ownership_conflict' | 'ancestry_conflict' | 'parent_terminal' | 'missing_run' | 'unsupported';
+    };
 
 export type WorkflowTerminalEffectDescriptor =
   | {

@@ -500,7 +500,7 @@ describe('workflow terminal parent patch semantics', () => {
     });
     parent.requestContext = parentRequestContext;
     const child = retained();
-    child.snapshot.requestContext = { child: true };
+    child.envelope.requestContextPatch = { child: true };
 
     const next = applyWorkflowTerminalParentContinuationPatch({
       contract: contractFor(parent),
@@ -649,7 +649,7 @@ describe('workflow terminal parent patch semantics', () => {
       parentError: inheritedErrorWithMessage('p'.repeat(600_000)),
     };
     const aggregateChild = retained();
-    aggregateChild.snapshot.requestContext = {
+    aggregateChild.envelope.requestContextPatch = {
       childError: inheritedErrorWithMessage('c'.repeat(600_000)),
     };
     expect(
