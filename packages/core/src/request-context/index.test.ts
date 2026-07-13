@@ -310,5 +310,18 @@ describe('RequestContext', () => {
       expect(new TextEncoder().encode(JSON.stringify(serialized)).byteLength).toBeLessThanOrEqual(16_384);
       expect(serialized['[TRUNCATED]']).toBe(true);
     });
+
+    it('preserves the first entry when bounded keys collide', () => {
+      const ctx = new RequestContext();
+      const sharedPrefix = 'a'.repeat(2_048);
+      const boundedKey = `${'a'.repeat(2_037)}[TRUNCATED]`;
+      ctx.set(`${sharedPrefix}-first`, 'first-value');
+      ctx.set(`${sharedPrefix}-second`, 'second-value');
+
+      const serialized = ctx.serializeForSpan();
+      expect(serialized[boundedKey]).toBe('first-value');
+      expect(JSON.stringify(serialized)).not.toContain('second-value');
+      expect(serialized['[TRUNCATED]']).toBe(true);
+    });
   });
 });

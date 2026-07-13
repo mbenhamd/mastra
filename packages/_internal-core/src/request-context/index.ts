@@ -360,19 +360,18 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
       }
 
       const previous = Object.getOwnPropertyDescriptor(safe, safeKey);
+      if (safeKey === SPAN_TRUNCATION_MARKER || previous) {
+        keyCount += 1;
+        truncated = true;
+        continue;
+      }
       setSpanSnapshotEntry(safe, safeKey, safeValue);
       if (spanSnapshotByteLength(safe) > SPAN_CONTEXT_MAX_TOTAL_BYTES) {
-        if (previous) {
-          Object.defineProperty(safe, safeKey, previous);
-        } else {
-          delete safe[safeKey];
-        }
+        delete safe[safeKey];
         truncated = true;
         break;
       }
-      if (!previous) {
-        emittedKeys.push(safeKey);
-      }
+      emittedKeys.push(safeKey);
       keyCount += 1;
     }
     if (truncated || keyCount < this.registry.size) {
