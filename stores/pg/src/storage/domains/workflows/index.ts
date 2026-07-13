@@ -1062,6 +1062,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       consumerId: input.consumerId,
     };
     validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
     try {
       return await this.#db.client.tx(async t => {
@@ -1135,6 +1136,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       consumerId: input.consumerId,
     };
     validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
     try {
       return await this.#db.client.tx(async t => {

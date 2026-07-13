@@ -242,6 +242,18 @@ describe('WorkflowsPG terminal destination receipts', () => {
     await expect(workflowsA.getWorkflowTerminalDestinationReceipt({ ...missing, claimToken: '' })).rejects.toThrow(
       'claimToken must be a well-formed non-empty string',
     );
+    await expect(
+      workflowsA.reserveWorkflowTerminalDestinationReceipt({
+        ...missing,
+        workflowName: 'w'.repeat(513),
+      }),
+    ).rejects.toThrow('workflowName must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
+      workflowsA.getWorkflowTerminalDestinationReceipt({
+        ...missing,
+        runId: `run${String.fromCharCode(0xd800)}`,
+      }),
+    ).rejects.toThrow('runId must be a well-formed non-empty string no longer than 512 characters');
   });
 
   it('fails closed on corrupt effect and receipt evidence and detects dual logical rows', async () => {

@@ -288,6 +288,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         receipt: WorkflowTerminalDestinationReceiptRecord | undefined;
       } {
     validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
     validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
     const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);

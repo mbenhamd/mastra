@@ -281,6 +281,18 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
     await expect(workflows.getWorkflowTerminalDestinationReceipt({ ...missing, claimToken: '' })).rejects.toThrow(
       'claimToken must be a well-formed non-empty string',
     );
+    await expect(
+      workflows.reserveWorkflowTerminalDestinationReceipt({
+        ...missing,
+        workflowName: 'w'.repeat(513),
+      }),
+    ).rejects.toThrow('workflowName must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
+      workflows.getWorkflowTerminalDestinationReceipt({
+        ...missing,
+        runId: `run${String.fromCharCode(0xd800)}`,
+      }),
+    ).rejects.toThrow('runId must be a well-formed non-empty string no longer than 512 characters');
   });
 
   it('fails closed on corrupt present evidence before a stale fence but lets the fence mask missing evidence', async () => {
