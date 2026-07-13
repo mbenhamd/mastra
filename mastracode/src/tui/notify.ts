@@ -49,15 +49,14 @@ export function sendNotification(
 function sendSystemNotification(reason: NotificationReason, message?: string): void {
   if (process.platform === 'darwin') {
     const title = 'Mastra Code';
-    const body = message || reasonToMessage(reason);
-    // The message can contain arbitrary text (including model output), so:
-    // - escape backslashes before quotes for the AppleScript string literal
-    // - pass the script via execFile args so no shell is involved
-    // (CodeQL js/incomplete-sanitization)
-    const escaped = body.replaceAll('\0', '\uFFFD').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const script = `display notification "${escaped}" with title "${title}"`;
+    const body = (message || reasonToMessage(reason)).replaceAll('\0', '\uFFFD');
+    // Keep the AppleScript static and pass notification content through argv.
+    // This avoids both a command shell and a second AppleScript escaping layer
+    // for arbitrary model or tool output. `--` also prevents content that
+    // begins with an option-like prefix from being parsed by osascript.
+    const script = 'on run argv\n' + 'display notification (item 1 of argv) with title (item 2 of argv)\n' + 'end run';
     try {
-      execFile('osascript', ['-e', script], () => {
+      execFile('osascript', ['-e', script, '--', body, title], () => {
         // Best-effort: ignore asynchronous notification failures
       });
     } catch {

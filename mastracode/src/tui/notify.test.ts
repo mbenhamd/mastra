@@ -23,8 +23,8 @@ describe('sendNotification', () => {
     vi.restoreAllMocks();
   });
 
-  it('passes escaped notification text to osascript without a shell', () => {
-    const message = 'Backslash \\ and quote " and shell \'; do evil';
+  it('passes notification text as data to a static AppleScript without a shell', () => {
+    const message = 'Backslash \\ and quote " and shell \'; do evil\n-e unexpected';
 
     sendNotification('agent_done', { mode: 'system', message });
 
@@ -34,7 +34,10 @@ describe('sendNotification', () => {
     expect(command).toBe('osascript');
     expect(args).toEqual([
       '-e',
-      String.raw`display notification "Backslash \\ and quote \" and shell '; do evil" with title "Mastra Code"`,
+      'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run',
+      '--',
+      message,
+      'Mastra Code',
     ]);
     expect(() => callback(new Error('osascript unavailable'))).not.toThrow();
   });
@@ -48,7 +51,13 @@ describe('sendNotification', () => {
 
     expect(mocks.execFile).toHaveBeenCalledWith(
       'osascript',
-      ['-e', 'display notification "Before�after" with title "Mastra Code"'],
+      [
+        '-e',
+        'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run',
+        '--',
+        'Before�after',
+        'Mastra Code',
+      ],
       expect.any(Function),
     );
     expect(mocks.exec).not.toHaveBeenCalled();
