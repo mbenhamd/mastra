@@ -2,4 +2,4 @@
 '@mastra/memory': minor
 ---
 
-Added Memory.deleteResource() for deleting resource-scoped working memory.
+Added Memory.deleteResource() to delete a resource and its working memory without deleting threads or messages.

@@ -2,4 +2,4 @@
 '@mastra/pg': minor
 ---
 
-Added PostgreSQL resource-scoped working memory deletion with idempotent semantics.
+Added PostgreSQL support for deleting a resource and its working memory without deleting threads or messages. Repeated calls are safe.

@@ -1522,6 +1522,8 @@ describe('Memory', () => {
 
         expect(result.success).toBe(false);
         expect(result.reason).toContain('duplicate');
+        const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
+        expect(workingMemoryMutexes.size).toBe(0);
       });
 
       it('should reject appending empty template to existing data', async () => {
@@ -2453,6 +2455,8 @@ describe('Memory', () => {
 
       expect(operationOrder).toEqual(['update', 'delete']);
       await expect(memoryStore.getResourceById({ resourceId: 'resource-delete-race' })).resolves.toBeNull();
+      const workingMemoryMutexes = Reflect.get(memory, 'updateWorkingMemoryMutexes') as Map<string, unknown>;
+      expect(workingMemoryMutexes.size).toBe(0);
     });
 
     it('passes observation options to the ObservationalMemory engine', async () => {

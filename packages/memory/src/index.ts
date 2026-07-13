@@ -804,19 +804,33 @@ export class Memory extends MastraMemory {
     }
   }
 
-  private updateWorkingMemoryMutexes = new Map<string, Mutex>();
+  private updateWorkingMemoryMutexes = new Map<string, { mutex: Mutex; references: number }>();
 
-  private getWorkingMemoryMutex(mutexKey: string): Mutex {
-    const existingMutex = this.updateWorkingMemoryMutexes.get(mutexKey);
-    if (existingMutex) return existingMutex;
+  private async acquireWorkingMemoryMutex(mutexKey: string): Promise<() => void> {
+    let entry = this.updateWorkingMemoryMutexes.get(mutexKey);
+    if (!entry) {
+      entry = { mutex: new Mutex(), references: 0 };
+      this.updateWorkingMemoryMutexes.set(mutexKey, entry);
+    }
+    entry.references += 1;
 
-    const mutex = new Mutex();
-    this.updateWorkingMemoryMutexes.set(mutexKey, mutex);
-    return mutex;
+    const release = await entry.mutex.acquire();
+    return () => {
+      release();
+      entry.references -= 1;
+      if (entry.references === 0 && this.updateWorkingMemoryMutexes.get(mutexKey) === entry) {
+        this.updateWorkingMemoryMutexes.delete(mutexKey);
+      }
+    };
   }
 
   private async withWorkingMemoryMutex<T>(mutexKey: string, operation: () => Promise<T>): Promise<T> {
-    return this.getWorkingMemoryMutex(mutexKey).runExclusive(operation);
+    const release = await this.acquireWorkingMemoryMutex(mutexKey);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -847,7 +861,7 @@ export class Memory extends MastraMemory {
     // each call could overwrite the other call
     // so get an in memory mutex to make sure this.getWorkingMemory() returns up to date data each time
     const mutexKey = scope === `resource` ? `resource-${resourceId}` : `thread-${threadId}`;
-    const release = await this.getWorkingMemoryMutex(mutexKey).acquire();
+    const release = await this.acquireWorkingMemoryMutex(mutexKey);
 
     try {
       const existingWorkingMemory = (await this.getWorkingMemory({ threadId, resourceId, memoryConfig })) || '';
