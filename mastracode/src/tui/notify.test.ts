@@ -2,12 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   exec: vi.fn(),
-  execFile: vi.fn(),
+  child: {
+    on: vi.fn(),
+    stdin: {
+      on: vi.fn(),
+      end: vi.fn(),
+    },
+  },
+  spawn: vi.fn(),
 }));
 
 vi.mock('node:child_process', () => ({
   exec: mocks.exec,
-  execFile: mocks.execFile,
+  spawn: mocks.spawn,
 }));
 
 import { sendNotification } from './notify.js';
@@ -15,7 +22,11 @@ import { sendNotification } from './notify.js';
 describe('sendNotification', () => {
   beforeEach(() => {
     mocks.exec.mockReset();
-    mocks.execFile.mockReset();
+    mocks.child.on.mockReset();
+    mocks.child.stdin.on.mockReset();
+    mocks.child.stdin.end.mockReset();
+    mocks.spawn.mockReset();
+    mocks.spawn.mockReturnValue(mocks.child);
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
   });
 
@@ -28,38 +39,28 @@ describe('sendNotification', () => {
 
     sendNotification('agent_done', { mode: 'system', message });
 
-    expect(mocks.execFile).toHaveBeenCalledTimes(1);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
     expect(mocks.exec).not.toHaveBeenCalled();
-    const [command, args, callback] = mocks.execFile.mock.calls[0]!;
-    expect(command).toBe('osascript');
-    expect(args).toEqual([
-      '-e',
+    expect(mocks.spawn).toHaveBeenCalledWith('/usr/bin/osascript', ['-', message, 'Mastra Code'], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
+    expect(mocks.child.stdin.end).toHaveBeenCalledWith(
       'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run',
-      '--',
-      message,
-      'Mastra Code',
-    ]);
-    expect(() => callback(new Error('osascript unavailable'))).not.toThrow();
+    );
+    expect(mocks.child.on).toHaveBeenCalledWith('error', expect.any(Function));
+    expect(mocks.child.stdin.on).toHaveBeenCalledWith('error', expect.any(Function));
   });
 
   it('replaces NUL bytes and ignores synchronous notifier failures', () => {
-    mocks.execFile.mockImplementationOnce(() => {
+    mocks.spawn.mockImplementationOnce(() => {
       throw new Error('invalid argument');
     });
 
     expect(() => sendNotification('agent_done', { mode: 'system', message: 'Before\0after' })).not.toThrow();
 
-    expect(mocks.execFile).toHaveBeenCalledWith(
-      'osascript',
-      [
-        '-e',
-        'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run',
-        '--',
-        'Before�after',
-        'Mastra Code',
-      ],
-      expect.any(Function),
-    );
+    expect(mocks.spawn).toHaveBeenCalledWith('/usr/bin/osascript', ['-', 'Before�after', 'Mastra Code'], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
     expect(mocks.exec).not.toHaveBeenCalled();
   });
 
@@ -68,7 +69,7 @@ describe('sendNotification', () => {
 
     sendNotification('agent_done', { mode: 'system', message: 'Done' });
 
-    expect(mocks.execFile).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
     expect(mocks.exec).not.toHaveBeenCalled();
   });
 });
