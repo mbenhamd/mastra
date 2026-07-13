@@ -8,7 +8,7 @@ packages:
 
 # Memory.deleteResource()
 
-The `.deleteResource()` method deletes a resource record and the working memory stored on that record. It doesn't inspect or mutate associated threads, messages, or thread metadata.
+The `.deleteResource()` method deletes a resource record and the working memory stored on that record. It doesn't inspect or mutate associated threads, messages, observational-memory records, or thread metadata.
 
 ## Usage example
 
@@ -28,7 +28,7 @@ Calling the method for a resource that doesn't exist resolves successfully.
 
 This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record.
 
-Only the resource record is affected. If an application also stored working-memory content in preserved thread metadata, remove that content through the application's bounded thread lifecycle. For account-erasure workflows, stop new writers, drain in-flight work, compose the required thread and message operations, call this method, and then verify that all targeted records remain absent.
+Only the resource record is affected. If an application also stored working-memory content in preserved thread metadata or resource-scoped observational memory, remove that content through the application's bounded lifecycle. For account-erasure workflows, stop new writers, drain in-flight work, compose the required thread, message, and observational-memory operations, call this method, and then verify that all targeted records remain absent.
 
 ## Parameters
 

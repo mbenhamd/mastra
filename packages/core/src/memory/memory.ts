@@ -553,9 +553,10 @@ https://mastra.ai/en/docs/memory/overview`,
   /**
    * Delete a resource record, including working memory stored on that record.
    *
-   * Associated thread and message records, including thread metadata, are not
-   * inspected or mutated. Concrete memory implementations must opt into this
-   * operation so existing custom implementations remain source compatible.
+   * Associated thread, message, and observational-memory records, including
+   * thread metadata, are not inspected or mutated. Concrete memory
+   * implementations must opt into this operation so existing custom
+   * implementations remain source compatible.
    *
    * @param resourceId - The resource ID to delete
    */

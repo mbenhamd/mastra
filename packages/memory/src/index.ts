@@ -684,7 +684,8 @@ export class Memory extends MastraMemory {
 
   /**
    * Delete a resource record, including working memory stored on that record.
-   * Associated threads, messages, and thread metadata are preserved.
+   * Associated threads, messages, observational memory, and thread metadata
+   * are preserved.
    */
   async deleteResource(resourceId: string): Promise<void> {
     await this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
