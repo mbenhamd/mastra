@@ -13,4 +13,4 @@ if (capabilities?.journalVersion !== 1 || capabilities.producerOutboxVersion !==
 }
 ```
 
-Supported stores preserve the terminal result needed for retry and return the same parent-workflow or finish delivery intent across repeated preparation attempts. Normal workflow-run deletion does not discard incomplete delivery evidence.
+Supported stores preserve the terminal result and resource identity needed for retry and return the same parent-workflow or finish delivery intent across repeated preparation attempts. Normal workflow-run deletion does not discard incomplete delivery evidence.

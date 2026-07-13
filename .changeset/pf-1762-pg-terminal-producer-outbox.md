@@ -2,7 +2,7 @@
 '@mastra/pg': patch
 ---
 
-PostgreSQL storage can now preserve terminal workflow delivery evidence after normal workflow-run deletion, so an interrupted parent-workflow or finish delivery can be resumed after restart.
+PostgreSQL storage can now preserve terminal workflow delivery evidence, including the effective resource identity, after normal workflow-run deletion, so an interrupted parent-workflow or finish delivery can be resumed after restart.
 
 Check for the exact producer capability before enabling durable terminal delivery:
 

@@ -216,7 +216,7 @@ export interface GetWorkflowTerminalEffectForDispatchInput extends GetWorkflowTe
 }
 
 export type GetWorkflowTerminalEffectForDispatchResult =
-  | { status: 'found'; effect: WorkflowTerminalEffectRecord; snapshot: WorkflowRunState }
+  | { status: 'found'; effect: WorkflowTerminalEffectRecord; snapshot: WorkflowRunState; resourceId?: string }
   | {
       status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
       record: WorkflowTerminalizationObservation;

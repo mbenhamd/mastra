@@ -408,17 +408,19 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       if (this.db.workflowTerminalSnapshots.has(journalKey)) {
         throw new TypeError('Workflow terminal state already retained');
       }
+      const resourceId = operation.resourceId ?? existingRun.resourceId;
       const retained: WorkflowTerminalSnapshotRecord = {
         version: 1,
         workflowName: operation.workflowName,
         runId: operation.runId,
+        ...(resourceId === undefined ? {} : { resourceId }),
         terminalStatus: result.record.terminalStatus,
         snapshot: cloneRunData(result.snapshot),
         createdAt: result.record.updatedAt,
       };
       this.db.workflows.set(workflowKey, {
         ...existingRun,
-        resourceId: operation.resourceId ?? existingRun.resourceId,
+        resourceId,
         snapshot: result.snapshot,
         updatedAt: now,
       });
@@ -467,7 +469,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (result.status === 'prepared' || result.status === 'already_prepared') {
       const retained = this.db.workflowTerminalSnapshots.get(journalKey);
       if (!retained) return { status: 'missing_terminal_state' };
-      validateWorkflowTerminalSnapshotJournalLink(retained, result.record, operation.workflowName, operation.runId);
+      validateWorkflowTerminalSnapshotJournalLink(retained, existingJournal!, operation.workflowName, operation.runId);
     }
     if (result.status === 'prepared') {
       this.db.workflowTerminalEffects.set(effectKey, copyWorkflowTerminalEffectRecord(result.effect));
@@ -475,6 +477,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       return { status: result.status, effect: copyWorkflowTerminalEffectRecord(result.effect) };
     }
     if (result.status === 'already_prepared') {
+      if (operation.leaseMs !== undefined) {
+        this.db.workflowTerminalizations.set(journalKey, copyWorkflowTerminalizationRecord(result.record));
+      }
       return { status: result.status, effect: copyWorkflowTerminalEffectRecord(result.effect) };
     }
     if (result.status === 'effect_conflict') {
@@ -529,7 +534,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return 'record' in result
       ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
       : result.status === 'found'
-        ? { ...result, snapshot: cloneRunData(retained!.snapshot) }
+        ? {
+            ...result,
+            snapshot: cloneRunData(retained!.snapshot),
+            ...(retained!.resourceId === undefined ? {} : { resourceId: retained!.resourceId }),
+          }
         : result;
   }
 

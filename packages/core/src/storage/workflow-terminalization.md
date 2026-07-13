@@ -39,7 +39,7 @@ The live claim owner performs these storage operations:
 1. `claimWorkflowTerminalization()` accepts the first `(eventKey, terminalStatus)` for a run and returns an owner ID, opaque claim token, generation, and bounded lease.
 2. `persistWorkflowTerminalState()` atomically replaces the normal terminal snapshot, retains an immutable terminal artifact, and advances `terminalization_pending` to `run_state_persisted`.
 3. `prepareWorkflowTerminalEffect()` atomically inserts one immutable intent and advances to `parent_outbox_pending` or `finish_outbox_pending`.
-4. `getWorkflowTerminalEffectForDispatch()` returns the full intent and retained terminal snapshot only to the current live fenced owner.
+4. `getWorkflowTerminalEffectForDispatch()` returns the full intent, retained terminal snapshot, and retained resource identity only to the current live fenced owner.
 
 The generic phase compare-and-set cannot create `run_state_persisted`, either `*_outbox_pending` phase, or either `*_effect_recorded` phase. Those transitions belong to specialized atomic methods. A later destination-receipt capability is responsible for proving application and is the only contract allowed to enter an `*_effect_recorded` phase.
 
@@ -68,6 +68,7 @@ The producer protocol guarantees:
 - the journal capability's atomic canonical terminal snapshot plus phase persistence;
 - one adapter-materialized terminal snapshot value driving both canonical and retained writes;
 - retention of the exact terminal artifact independently from the normal run row;
+- retention of the effective resource identity needed to reconstruct finish delivery after normal run deletion;
 - one immutable producer intent per run and effect kind;
 - stable keys across retries and broker event re-publication;
 - retention of incomplete journal, terminal artifact, and intent evidence after run deletion.

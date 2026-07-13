@@ -24,10 +24,20 @@ describe('WorkflowsPG terminalization journal', () => {
   });
 
   async function cleanup(workflowName: string): Promise<void> {
-    await pool.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   function withStatefulIdentity<T extends { workflowName: string; runId: string }>(

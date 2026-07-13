@@ -32,7 +32,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
 
   async function createTerminalRun(
     workflows: WorkflowsStorage,
-    run: { workflowName: string; runId: string },
+    run: { workflowName: string; runId: string; resourceId?: string },
     eventKey = `${run.runId}-event`,
   ) {
     await workflows.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
@@ -85,7 +85,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
   it('retains an isolated immutable snapshot while the canonical run remains replaceable', async () => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
-    const run = { workflowName: 'retained-workflow', runId: 'retained-run' };
+    const run = { workflowName: 'retained-workflow', runId: 'retained-run', resourceId: 'resource-retained' };
     const { snapshot } = await createTerminalRun(workflows, run);
 
     expect(workflows.getWorkflowTerminalizationCapabilities()).toEqual({
@@ -98,6 +98,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       version: 1,
       workflowName: run.workflowName,
       runId: run.runId,
+      resourceId: run.resourceId,
       terminalStatus: 'failed',
       snapshot: { status: 'failed', context: { marker: { output: { retained: true } } } },
     });
@@ -119,7 +120,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
   it('prepares one immutable finish intent and returns retained state only to the live fence', async () => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
-    const run = { workflowName: 'finish-workflow', runId: 'finish-run' };
+    const run = { workflowName: 'finish-workflow', runId: 'finish-run', resourceId: 'resource-finish' };
     const { fence } = await createTerminalRun(workflows, run);
     const prepare = {
       ...fence,
@@ -135,19 +136,24 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     if (prepared.status !== 'prepared') throw new Error('Expected prepared effect');
     expect(prepared.effect.effectKey).toMatch(/^wte:v1:[a-f0-9]{64}$/);
     expect(prepared.effect.payloadHash).toMatch(/^sha256:[a-f0-9]{64}$/);
-    await expect(workflows.prepareWorkflowTerminalEffect(prepare)).resolves.toMatchObject({
+    vi.advanceTimersByTime(9_000);
+    await expect(workflows.prepareWorkflowTerminalEffect({ ...prepare, leaseMs: 10_000 })).resolves.toMatchObject({
       status: 'already_prepared',
       effect: { effectKey: prepared.effect.effectKey },
     });
+    expect(db.workflowTerminalizations.get(runKey(run))?.leaseExpiresAt).toBe(now.getTime() + 19_000);
+    vi.advanceTimersByTime(2_000);
     await expect(
       workflows.getWorkflowTerminalEffectForDispatch({ ...fence, claimToken: 'wrong-token', kind: 'workflow-finish' }),
     ).resolves.toMatchObject({ status: 'fence_conflict' });
 
+    await workflows.deleteWorkflowRunById(run);
     const dispatch = await workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' });
     expect(dispatch).toMatchObject({
       status: 'found',
       effect: { effectKey: prepared.effect.effectKey },
       snapshot: { status: 'failed', context: { marker: { output: { retained: true } } } },
+      resourceId: run.resourceId,
     });
     if (dispatch.status !== 'found') throw new Error('Expected dispatch evidence');
     dispatch.effect.effectKey = 'caller-mutated';
@@ -158,6 +164,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       status: 'found',
       effect: { effectKey: prepared.effect.effectKey },
       snapshot: { status: 'failed' },
+      resourceId: run.resourceId,
     });
   });
 
@@ -226,6 +233,26 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     await expect(
       workflows.getWorkflowTerminalEffectForDispatch({ ...missing, claimToken: '', kind: 'workflow-finish' }),
     ).rejects.toThrow('claimToken must be a well-formed non-empty string');
+    await expect(
+      workflows.claimWorkflowTerminalization({
+        workflowName: 'w'.repeat(513),
+        runId: missing.runId,
+        eventKey: 'event',
+        terminalStatus: 'failed',
+        ownerId: missing.ownerId,
+        leaseMs: 10_000,
+      }),
+    ).rejects.toThrow('workflowName must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
+      workflows.claimWorkflowTerminalization({
+        workflowName: missing.workflowName,
+        runId: 'r'.repeat(513),
+        eventKey: 'event',
+        terminalStatus: 'failed',
+        ownerId: missing.ownerId,
+        leaseMs: 10_000,
+      }),
+    ).rejects.toThrow('runId must be a well-formed non-empty string no longer than 512 characters');
 
     let propertyReads = 0;
     const proxyEffect = new Proxy(
@@ -248,6 +275,19 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     const workflows = new WorkflowsInMemory({ db });
     const run = { workflowName: 'forged-workflow', runId: 'forged-run' };
     const { fence } = await createTerminalRun(workflows, run);
+    const retainedKey = runKey(run);
+    const originalRetained = db.workflowTerminalSnapshots.get(retainedKey);
+    if (!originalRetained) throw new Error('Expected retained terminal state');
+    vi.advanceTimersByTime(1_000);
+    db.workflowTerminalSnapshots.set(retainedKey, { ...originalRetained, createdAt: originalRetained.createdAt + 500 });
+    await expect(
+      workflows.prepareWorkflowTerminalEffect({
+        ...fence,
+        expectedPhase: 'run_state_persisted',
+        effect: { kind: 'workflow-finish' },
+      }),
+    ).rejects.toThrow('Invalid workflow terminal snapshot journal link');
+    db.workflowTerminalSnapshots.set(retainedKey, originalRetained);
     await workflows.prepareWorkflowTerminalEffect({
       ...fence,
       expectedPhase: 'run_state_persisted',
@@ -260,7 +300,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     for (const forged of [
       { ...original, payloadHash: `sha256:${'0'.repeat(64)}` },
       { ...original, sourceEventKey: 'forged-event' },
-      { ...original, createdAt: original.createdAt - 1 },
+      { ...original, createdAt: originalRetained.createdAt - 1 },
     ]) {
       db.workflowTerminalEffects.set(key, forged);
       await expect(
@@ -280,9 +320,9 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     ).rejects.toThrow('Invalid workflow terminal effect kind');
     db.workflowTerminalEffects.delete(parentKey);
 
-    const retained = db.workflowTerminalSnapshots.get(runKey(run));
+    const retained = db.workflowTerminalSnapshots.get(retainedKey);
     if (!retained) throw new Error('Expected retained terminal state');
-    db.workflowTerminalSnapshots.set(runKey(run), { ...retained, terminalStatus: 'success' });
+    db.workflowTerminalSnapshots.set(retainedKey, { ...retained, terminalStatus: 'success' });
     await expect(workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' })).rejects.toThrow(
       'Invalid workflow terminal snapshot journal link',
     );

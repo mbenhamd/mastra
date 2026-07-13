@@ -437,6 +437,7 @@ export interface WorkflowTerminalSnapshotRecord {
   version: 1;
   workflowName: string;
   runId: string;
+  resourceId?: string;
   terminalStatus: WorkflowTerminalStatus;
   snapshot: WorkflowRunState;
   createdAt: number;

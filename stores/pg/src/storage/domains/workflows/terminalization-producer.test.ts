@@ -15,6 +15,20 @@ describe('WorkflowsPG terminal producer outbox', () => {
   const workflowsA = new WorkflowsPG({ pool });
   const workflowsB = new WorkflowsPG({ pool });
 
+  function assertSafeTestSqlIdentifier(value: string): string {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value)) {
+      throw new Error(`Unsafe test SQL identifier: ${value}`);
+    }
+    return value;
+  }
+
+  function assertSafeTestSqlLiteral(value: string): string {
+    if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+      throw new Error(`Unsafe test SQL literal: ${value}`);
+    }
+    return value;
+  }
+
   beforeAll(async () => {
     await workflowsA.init();
   });
@@ -24,14 +38,24 @@ describe('WorkflowsPG terminal producer outbox', () => {
   });
 
   async function cleanup(workflowName: string): Promise<void> {
-    await pool.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
-    await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
-  async function createTerminalRun(workflowName: string, runId: string) {
-    const run = { workflowName, runId };
+  async function createTerminalRun(workflowName: string, runId: string, resourceId?: string) {
+    const run = { workflowName, runId, resourceId };
     await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
     const claim = await workflowsA.claimWorkflowTerminalization({
       ...run,
@@ -78,7 +102,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
 
   it('atomically converges concurrent producers and retains dispatch evidence after normal deletion', async () => {
     const workflowName = `terminal-producer-${randomUUID()}`;
-    const { run, fence, snapshot } = await createTerminalRun(workflowName, 'run');
+    const { run, fence, snapshot } = await createTerminalRun(workflowName, 'run', 'resource-terminal');
 
     try {
       const results = await Promise.all([
@@ -99,14 +123,34 @@ describe('WorkflowsPG terminal producer outbox', () => {
       );
       expect(effects).toHaveLength(2);
       expect(effects[1]).toEqual(effects[0]);
+      const beforeRenewal = await pool.query<{ lease_expires_at: string }>(
+        `SELECT lease_expires_at FROM mastra_workflow_terminalizations WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await expect(
+        workflowsA.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: { kind: 'workflow-finish' },
+          leaseMs: 20_000,
+        }),
+      ).resolves.toMatchObject({ status: 'already_prepared' });
+      const afterRenewal = await pool.query<{ lease_expires_at: string }>(
+        `SELECT lease_expires_at FROM mastra_workflow_terminalizations WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(Number(afterRenewal.rows[0]?.lease_expires_at)).toBeGreaterThan(
+        Number(beforeRenewal.rows[0]?.lease_expires_at),
+      );
       await expect(
         workflowsA.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' }),
-      ).resolves.toEqual({ status: 'found', effect: effects[0], snapshot });
+      ).resolves.toEqual({ status: 'found', effect: effects[0], snapshot, resourceId: run.resourceId });
 
       await workflowsA.deleteWorkflowRunById(run);
       await expect(
         workflowsB.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' }),
-      ).resolves.toEqual({ status: 'found', effect: effects[0], snapshot });
+      ).resolves.toEqual({ status: 'found', effect: effects[0], snapshot, resourceId: run.resourceId });
     } finally {
       await cleanup(workflowName);
     }
@@ -189,17 +233,39 @@ describe('WorkflowsPG terminal producer outbox', () => {
     await expect(
       workflowsA.getWorkflowTerminalEffectForDispatch({ ...missing, claimToken: '', kind: 'workflow-finish' }),
     ).rejects.toThrow('claimToken must be a well-formed non-empty string');
+    await expect(
+      workflowsA.claimWorkflowTerminalization({
+        workflowName: 'w'.repeat(513),
+        runId: missing.runId,
+        eventKey: 'event',
+        terminalStatus: 'failed',
+        ownerId: missing.ownerId,
+        leaseMs: 10_000,
+      }),
+    ).rejects.toThrow('workflowName must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
+      workflowsA.claimWorkflowTerminalization({
+        workflowName: missing.workflowName,
+        runId: 'r'.repeat(513),
+        eventKey: 'event',
+        terminalStatus: 'failed',
+        ownerId: missing.ownerId,
+        leaseMs: 10_000,
+      }),
+    ).rejects.toThrow('runId must be a well-formed non-empty string no longer than 512 characters');
   });
 
   it('rolls back canonical, retained, and journal state when either evidence write fails', async () => {
     const exerciseFailure = async (stage: 'retained' | 'journal') => {
-      const workflowName = `terminal-rollback-${stage}-${randomUUID()}`;
+      const workflowName = assertSafeTestSqlLiteral(`terminal-rollback-${stage}-${randomUUID()}`);
       const runId = 'run';
       const run = { workflowName, runId };
       const suffix = randomUUID().replaceAll('-', '');
-      const functionName = `pf1762_fail_${suffix}`;
-      const triggerName = `pf1762_trigger_${suffix}`;
-      const table = stage === 'retained' ? 'mastra_workflow_terminal_snapshots' : 'mastra_workflow_terminalizations';
+      const functionName = assertSafeTestSqlIdentifier(`pf1762_fail_${suffix}`);
+      const triggerName = assertSafeTestSqlIdentifier(`pf1762_trigger_${suffix}`);
+      const table = assertSafeTestSqlIdentifier(
+        stage === 'retained' ? 'mastra_workflow_terminal_snapshots' : 'mastra_workflow_terminalizations',
+      );
       await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
       const claim = await workflowsA.claimWorkflowTerminalization({
         ...run,
@@ -258,6 +324,30 @@ describe('WorkflowsPG terminal producer outbox', () => {
     const { run, fence } = await createTerminalRun(workflowName, 'run');
 
     try {
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots AS retained
+         SET created_at = journal.updated_at + 1
+         FROM mastra_workflow_terminalizations AS journal
+         WHERE retained.workflow_name = journal.workflow_name AND retained.run_id = journal.run_id
+           AND retained.workflow_name = $1 AND retained.run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await expect(
+        workflowsA.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: { kind: 'workflow-finish' },
+        }),
+      ).rejects.toThrow('Invalid workflow terminal snapshot journal link');
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots AS retained
+         SET created_at = journal.updated_at
+         FROM mastra_workflow_terminalizations AS journal
+         WHERE retained.workflow_name = journal.workflow_name AND retained.run_id = journal.run_id
+           AND retained.workflow_name = $1 AND retained.run_id = $2`,
+        [run.workflowName, run.runId],
+      );
       await workflowsA.prepareWorkflowTerminalEffect({
         ...fence,
         expectedPhase: 'run_state_persisted',
@@ -341,8 +431,8 @@ describe('WorkflowsPG terminal producer outbox', () => {
         [run.workflowName, run.runId],
       );
       const suffix = randomUUID().replaceAll('-', '');
-      const functionName = `pf1762_cleanup_fail_${suffix}`;
-      const triggerName = `pf1762_cleanup_trigger_${suffix}`;
+      const functionName = assertSafeTestSqlIdentifier(`pf1762_cleanup_fail_${suffix}`);
+      const triggerName = assertSafeTestSqlIdentifier(`pf1762_cleanup_trigger_${suffix}`);
       await pool.query(
         `CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
@@ -366,6 +456,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
           'mastra_workflow_terminal_effects',
           'mastra_workflow_terminal_snapshots',
         ]) {
+          assertSafeTestSqlIdentifier(table);
           const count = await pool.query<{ count: string }>(
             `SELECT count(*)::text AS count FROM ${table} WHERE workflow_name = $1 AND run_id = $2`,
             [run.workflowName, run.runId],
@@ -387,6 +478,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
         'mastra_workflow_terminal_effects',
         'mastra_workflow_terminal_snapshots',
       ]) {
+        assertSafeTestSqlIdentifier(table);
         const count = await pool.query<{ count: string }>(
           `SELECT count(*)::text AS count FROM ${table} WHERE workflow_name = $1 AND run_id = $2`,
           [run.workflowName, run.runId],
@@ -404,6 +496,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
     expect(ddl).toContain('mastra_workflow_terminal_snapshots');
     expect(ddl).toContain('"parent_execution_path" JSONB');
     expect(ddl).toContain('"effect_key" TEXT NOT NULL UNIQUE');
+    expect(ddl).toContain('"resource_id" TEXT');
     expect(ddl).toContain('"snapshot" JSONB NOT NULL');
 
     const custom = WorkflowsPG.getExportDDL('tenant').join('\n');

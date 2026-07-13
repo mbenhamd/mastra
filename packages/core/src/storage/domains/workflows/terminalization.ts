@@ -125,6 +125,8 @@ export function validateWorkflowTerminalizationLeaseMs(leaseMs: number): void {
 }
 
 export function validateWorkflowTerminalizationClaim(input: ClaimWorkflowTerminalizationInput): void {
+  validateWorkflowTerminalizationIdentity(input.workflowName, 'workflowName', 512);
+  validateWorkflowTerminalizationIdentity(input.runId, 'runId', 512);
   validateWorkflowTerminalizationIdentity(input.eventKey, 'eventKey', 1024);
   validateWorkflowTerminalizationIdentity(input.ownerId, 'ownerId', 256);
   if (!['success', 'failed', 'canceled'].includes(input.terminalStatus)) {
@@ -604,10 +606,13 @@ export function prepareWorkflowTerminalEffectRecord(
   const desired = createWorkflowTerminalEffectRecord(fence.record, input, now);
   if (fence.record.phase === targetPhase) {
     if (!existingEffect) return { status: 'missing_effect' };
+    const leaseExpiresAt =
+      input.leaseMs === undefined ? undefined : getWorkflowTerminalizationLeaseExpiry(now, input.leaseMs);
+    const record = leaseExpiresAt === undefined ? fence.record : { ...fence.record, leaseExpiresAt, updatedAt: now };
     return sameWorkflowTerminalEffect(existingEffect, desired)
       ? {
           status: 'already_prepared',
-          record: copyWorkflowTerminalizationRecord(fence.record),
+          record: copyWorkflowTerminalizationRecord(record),
           effect: copyWorkflowTerminalEffectRecord(existingEffect),
         }
       : {

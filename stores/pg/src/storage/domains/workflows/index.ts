@@ -436,6 +436,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   private decodeTerminalSnapshotRow(row: Record<string, unknown>, now: number): WorkflowTerminalSnapshotRecord {
     const version = typeof row.version === 'string' ? Number(row.version) : row.version;
     const createdAt = typeof row.created_at === 'string' ? Number(row.created_at) : row.created_at;
+    const resourceId = row.resource_id === null || row.resource_id === undefined ? undefined : row.resource_id;
     let snapshot = row.snapshot;
     if (typeof snapshot === 'string') snapshot = JSON.parse(snapshot);
     if (
@@ -446,6 +447,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       typeof row.run_id !== 'string' ||
       row.run_id.length === 0 ||
       row.run_id.length > 512 ||
+      (resourceId !== undefined && typeof resourceId !== 'string') ||
       !['success', 'failed', 'canceled'].includes(row.terminal_status as string) ||
       typeof createdAt !== 'number' ||
       !Number.isSafeInteger(createdAt) ||
@@ -463,6 +465,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       version: 1,
       workflowName: row.workflow_name,
       runId: row.run_id,
+      ...(resourceId === undefined ? {} : { resourceId }),
       terminalStatus: row.terminal_status as WorkflowTerminalSnapshotRecord['terminalStatus'],
       snapshot: snapshot as WorkflowRunState,
       createdAt,
@@ -491,7 +494,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   ): Promise<void> {
     const timestamp = new Date(now);
     const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
-    await t.none(
+    const canonical = await t.one<{ resource_id: string | null }>(
       `INSERT INTO ${this.workflowSnapshotTableName()} AS current_snapshot
        (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -499,7 +502,8 @@ export class WorkflowsPG extends WorkflowsStorage {
          "resourceId" = COALESCE(EXCLUDED."resourceId", current_snapshot."resourceId"),
          snapshot = EXCLUDED.snapshot,
          "updatedAt" = EXCLUDED."updatedAt",
-         "updatedAtZ" = EXCLUDED."updatedAtZ"`,
+         "updatedAtZ" = EXCLUDED."updatedAtZ"
+       RETURNING "resourceId" AS resource_id`,
       [
         input.workflowName,
         input.runId,
@@ -513,9 +517,9 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
     await t.none(
       `INSERT INTO ${this.terminalSnapshotTableName()}
-       (workflow_name, run_id, version, terminal_status, snapshot, created_at)
-       VALUES ($1, $2, 1, $3, $4, $5)`,
-      [input.workflowName, input.runId, snapshot.status, sanitizedSnapshot, now],
+       (workflow_name, run_id, version, resource_id, terminal_status, snapshot, created_at)
+       VALUES ($1, $2, 1, $3, $4, $5, $6)`,
+      [input.workflowName, input.runId, canonical.resource_id, snapshot.status, sanitizedSnapshot, now],
     );
   }
 
@@ -784,7 +788,12 @@ export class WorkflowsPG extends WorkflowsStorage {
             context.now,
           );
           if (!retained) return { status: 'missing_terminal_state' };
-          validateWorkflowTerminalSnapshotJournalLink(retained, result.record, operation.workflowName, operation.runId);
+          validateWorkflowTerminalSnapshotJournalLink(
+            retained,
+            context.record!,
+            operation.workflowName,
+            operation.runId,
+          );
         }
         if (result.status === 'prepared') {
           await this.insertTerminalEffectRecord(t, result.effect);
@@ -792,6 +801,9 @@ export class WorkflowsPG extends WorkflowsStorage {
           return { status: result.status, effect: result.effect };
         }
         if (result.status === 'already_prepared') {
+          if (operation.leaseMs !== undefined) {
+            await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+          }
           return { status: result.status, effect: result.effect };
         }
         if (result.status === 'effect_conflict') {
@@ -871,7 +883,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         return 'record' in result
           ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
           : result.status === 'found'
-            ? { ...result, snapshot: retained!.snapshot }
+            ? {
+                ...result,
+                snapshot: retained!.snapshot,
+                ...(retained!.resourceId === undefined ? {} : { resourceId: retained!.resourceId }),
+              }
             : result;
       });
     } catch (error) {
@@ -1000,6 +1016,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       "workflow_name" TEXT NOT NULL,
       "run_id" TEXT NOT NULL,
       "version" INTEGER NOT NULL,
+      "resource_id" TEXT,
       "terminal_status" TEXT NOT NULL,
       "snapshot" JSONB NOT NULL,
       "created_at" BIGINT NOT NULL,
