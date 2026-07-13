@@ -43,6 +43,31 @@ describe('WorkflowsInMemory getWorkflowRunById', () => {
     });
   });
 
+  it('prefers the later insertion when matching runs have the same creation time', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const runId = 'same-millisecond-run-id';
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'first-workflow',
+      runId,
+      snapshot: makeSnapshot(runId, 'running'),
+      createdAt,
+    });
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'second-workflow',
+      runId,
+      snapshot: makeSnapshot(runId, 'success'),
+      createdAt,
+    });
+
+    await expect(workflows.getWorkflowRunById({ runId })).resolves.toMatchObject({
+      workflowName: 'second-workflow',
+      snapshot: { status: 'success' },
+    });
+  });
+
   it('filters by an explicitly provided workflowName', async () => {
     const store = new InMemoryStore();
     const workflows = (await store.getStore('workflows'))!;
