@@ -59,7 +59,7 @@ const noopInputProcessor: Processor = {
   processInput: async ({ messages }) => messages,
 };
 
-function buildAgentWithProcessor() {
+function buildAgentWithProcessor(idGenerator?: () => string) {
   const storage = new InMemoryStore();
   const agent = new Agent({
     id: AGENT_ID,
@@ -70,6 +70,7 @@ function buildAgentWithProcessor() {
   });
   const mastra = new Mastra({
     agents: { [AGENT_ID]: agent },
+    idGenerator,
     storage,
     logger: false,
   });
@@ -99,6 +100,20 @@ describe('agent processor-workflow storage noise (issue #17137 follow-up to #173
 
     const processorLookups = seen.filter(s => s.id === PROCESSOR_WORKFLOW_ID);
     expect(processorLookups).toEqual([]);
+  });
+
+  it('uses registered storage for a custom-generated processor run ID', async () => {
+    const runId = 'deterministic-processor-run-id';
+    const { mastra, storage } = buildAgentWithProcessor(() => runId);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const read = vi.spyOn(workflowsStore, 'getWorkflowRunById');
+
+    await mastra.getAgent(AGENT_ID).generate('Hello!');
+
+    expect(read).toHaveBeenCalledWith({
+      runId,
+      workflowName: PROCESSOR_WORKFLOW_ID,
+    });
   });
 
   it('does not persist a snapshot for the internal processor workflow on generate', async () => {
