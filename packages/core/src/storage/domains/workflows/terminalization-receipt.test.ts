@@ -10,6 +10,7 @@ import { WorkflowsInMemory } from './inmemory';
 import {
   MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT,
   createWorkflowTerminalDestinationReceiptRecord,
+  getWorkflowTerminalDestinationReceiptRecord,
   validateWorkflowTerminalDestinationReceiptIntegrity,
 } from './terminalization';
 
@@ -320,6 +321,17 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       receipt => receipt.receiptKey === reserved.receipt.receiptKey,
     );
     if (!storedReceipt) throw new Error('Expected receipt');
+    const journal = db.workflowTerminalizations.get(runKey(ready.run));
+    if (!journal) throw new Error('Expected journal');
+    expect(() =>
+      getWorkflowTerminalDestinationReceiptRecord(
+        journal,
+        storedEffect,
+        createWorkflowTerminalDestinationReceiptRecord(storedEffect, 'other-consumer', Date.now()),
+        input,
+        Date.now(),
+      ),
+    ).toThrow('Conflicting workflow terminal destination receipt identity');
     const physicalReceiptKey = JSON.stringify([storedReceipt.effectKey, storedReceipt.consumerId]);
     db.workflowTerminalDestinationReceipts.set(physicalReceiptKey, {
       ...storedReceipt,

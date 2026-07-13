@@ -880,10 +880,10 @@ export function getWorkflowTerminalDestinationReceiptRecord(
   if (fence.status !== 'ok') return fence;
   if (!effect || effect.kind !== input.effectKind) return { status: 'missing_effect' };
   if (!receipt) return { status: 'missing_receipt' };
-  if (receipt.consumerId !== input.consumerId || receipt.effectKind !== input.effectKind) {
-    return { status: 'missing_receipt' };
-  }
   validateWorkflowTerminalDestinationReceiptIntegrity(receipt, effect, now);
+  if (receipt.consumerId !== input.consumerId || receipt.effectKind !== input.effectKind) {
+    throw new TypeError('Conflicting workflow terminal destination receipt identity');
+  }
   return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt) };
 }
 
