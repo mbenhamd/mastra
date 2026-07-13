@@ -704,8 +704,7 @@ export class Mastra<
     [topic: string]: ((event: Event, cb?: () => Promise<void>) => Promise<void>)[];
   } = {};
   #internalMastraWorkflows: Record<string, AnyWorkflow> = {};
-  #runScopedWorkflowTimestamps = new Map<string, number>();
-  static readonly INTERNAL_WORKFLOW_TTL_MS = 30 * 60 * 1000;
+  #runScopedInternalWorkflows = new Map<string, Map<string, AnyWorkflow>>();
   // Server cache for temporary persistence and durable agent resumable streams
   #serverCache: MastraServerCache;
   // Cache for stored agents to allow in-memory modifications (like model changes) to persist across requests
@@ -744,7 +743,11 @@ export class Mastra<
                   runId?.startsWith('sched_wf_') === true;
 
                 if (isOwnedHere) {
-                  return target.publish(topic, event, { ...options, localOnly: true });
+                  return target.publish(
+                    topic,
+                    { ...event, data: { ...data, __mastraInternalWorkflow: true } },
+                    { ...options, localOnly: true },
+                  );
                 }
               } else if (topic.startsWith('workflow.events.v2.')) {
                 return target.publish(topic, event, { ...options, localOnly: true });
@@ -1927,7 +1930,7 @@ export class Mastra<
 
     const scheduler = new WorkflowScheduler({
       schedulesStore,
-      pubsub: this.#pubsub,
+      pubsub: this.pubsub,
       config: this.#schedulerConfig,
     });
     if (this.#logger) {
@@ -2995,30 +2998,32 @@ export class Mastra<
       logger: this.getLogger(),
     });
     if (runId) {
-      const key = `${workflow.id}:${runId}`;
-      this.#internalMastraWorkflows[key] = workflow;
-      this.#runScopedWorkflowTimestamps.set(key, Date.now());
-      this.#sweepStaleRunScopedWorkflows();
+      let runs = this.#runScopedInternalWorkflows.get(workflow.id);
+      if (!runs) {
+        runs = new Map();
+        this.#runScopedInternalWorkflows.set(workflow.id, runs);
+      }
+      runs.set(runId, workflow);
     } else {
       this.#internalMastraWorkflows[workflow.id] = workflow;
     }
   }
 
   __unregisterInternalWorkflow(id: string, runId: string) {
-    const key = `${id}:${runId}`;
-    delete this.#internalMastraWorkflows[key];
-    this.#runScopedWorkflowTimestamps.delete(key);
+    const runs = this.#runScopedInternalWorkflows.get(id);
+    runs?.delete(runId);
+    if (runs?.size === 0) this.#runScopedInternalWorkflows.delete(id);
   }
 
   __hasInternalWorkflow(id: string, runId?: string): boolean {
     return runId
-      ? !!this.#internalMastraWorkflows[`${id}:${runId}`] || !!this.#internalMastraWorkflows[id]
+      ? !!this.#runScopedInternalWorkflows.get(id)?.has(runId) || !!this.#internalMastraWorkflows[id]
       : !!this.#internalMastraWorkflows[id];
   }
 
   __getInternalWorkflow(id: string, runId?: string): AnyWorkflow {
     const workflow = runId
-      ? (this.#internalMastraWorkflows[`${id}:${runId}`] ?? this.#internalMastraWorkflows[id])
+      ? (this.#runScopedInternalWorkflows.get(id)?.get(runId) ?? this.#internalMastraWorkflows[id])
       : this.#internalMastraWorkflows[id];
     if (!workflow) {
       throw new MastraError({
@@ -3052,37 +3057,6 @@ export class Mastra<
     }
 
     return false;
-  }
-
-  #ownsWorkflow(workflowId: string, runId: string, parentWorkflow: unknown): boolean {
-    if (this.#ownsInternalWorkflow(workflowId, runId, parentWorkflow)) return true;
-
-    const workflows = this.#workflows as Record<string, AnyWorkflow> | undefined;
-    const ownsPublicWorkflow = (id: string) =>
-      !!workflows?.[id] || Object.values(workflows ?? {}).some(workflow => workflow.id === id);
-    if (ownsPublicWorkflow(workflowId)) return true;
-
-    let parent = parentWorkflow as { workflowId?: string; runId?: string; parentWorkflow?: unknown } | undefined;
-    const seen = new Set<unknown>();
-    let depth = 0;
-    while (parent && depth < 16 && !seen.has(parent)) {
-      seen.add(parent);
-      if (parent.workflowId && ownsPublicWorkflow(parent.workflowId)) return true;
-      parent = parent.parentWorkflow as typeof parent;
-      depth += 1;
-    }
-
-    return false;
-  }
-
-  #sweepStaleRunScopedWorkflows() {
-    const now = Date.now();
-    for (const [key, registeredAt] of this.#runScopedWorkflowTimestamps) {
-      if (now - registeredAt > Mastra.INTERNAL_WORKFLOW_TTL_MS) {
-        delete this.#internalMastraWorkflows[key];
-        this.#runScopedWorkflowTimestamps.delete(key);
-      }
-    }
   }
 
   /**
@@ -4726,10 +4700,24 @@ export class Mastra<
    * should nack/return 5xx so the broker retries.
    */
   public async handleWorkflowEvent(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
+    if (!this.__shouldProcessWorkflowEvent(event)) return { ok: true };
     if (!this.#workflowEventProcessor) {
       this.#workflowEventProcessor = new WorkflowEventProcessor({ mastra: this });
     }
     return this.#workflowEventProcessor.handle(event);
+  }
+
+  /** @internal Shared ownership gate for push, pull, and HTTP workflow ingress. */
+  public __shouldProcessWorkflowEvent(event: Event): boolean {
+    const data = event.data as Record<string, unknown> | undefined;
+    if (data?.__mastraInternalWorkflow !== true) return true;
+    const workflowId = data.workflowId;
+    const runId = data.runId;
+    return (
+      typeof workflowId === 'string' &&
+      typeof runId === 'string' &&
+      this.#ownsInternalWorkflow(workflowId, runId, data.parentWorkflow)
+    );
   }
 
   /**
@@ -4858,8 +4846,7 @@ export class Mastra<
           const cb: EventCallback = (event, ack) => {
             const data = event.data as Record<string, unknown> | undefined;
             const workflowId = data?.workflowId as string | undefined;
-            const runId = data?.runId as string | undefined;
-            if (workflowId && runId && !this.#ownsWorkflow(workflowId, runId, data?.parentWorkflow)) {
+            if (!this.__shouldProcessWorkflowEvent(event)) {
               this.#logger?.debug?.('Skipping workflow event not owned by this Mastra instance', {
                 workflowId,
                 eventType: event.type,
@@ -5167,7 +5154,7 @@ export class Mastra<
     } = {},
   ): Promise<void> {
     const deps: WorkerDeps = {
-      pubsub: this.#pubsub,
+      pubsub: this.pubsub,
       storage: this.#storage!,
       logger: this.#logger as unknown as IMastraLogger,
       mastra: this,

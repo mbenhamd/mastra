@@ -26,7 +26,7 @@ class PushOnlyPubSub extends EventEmitterPubSub {
   }
 }
 
-function makeStartEvent(workflowId: string, runId: string): Event {
+function makeStartEvent(workflowId: string, runId: string, internal = true): Event {
   return {
     type: 'workflow.start',
     runId,
@@ -38,6 +38,7 @@ function makeStartEvent(workflowId: string, runId: string): Event {
       prevResult: { status: 'success', output: {} },
       activeSteps: {},
       requestContext: {},
+      ...(internal ? { __mastraInternalWorkflow: true } : {}),
     },
   } as Event;
 }
@@ -121,7 +122,7 @@ describe('cross-process workflow event guard', () => {
     const spyA = vi.spyOn(mastraA, 'handleWorkflowEvent');
     const spyB = vi.spyOn(mastraB, 'handleWorkflowEvent');
 
-    await sharedPubSub.publish('workflows', makeStartEvent('my-public-workflow', 'run-pub'));
+    await sharedPubSub.publish('workflows', makeStartEvent('my-public-workflow', 'run-pub', false));
     await vi.waitFor(
       () => {
         expect(spyA).toHaveBeenCalled();
@@ -154,9 +155,9 @@ describe('cross-process workflow event guard', () => {
     const spyB = vi.spyOn(mastraB, 'handleWorkflowEvent');
 
     await sharedPubSub.publish('workflows', {
-      ...makeStartEvent('nested-child', 'nested-run'),
+      ...makeStartEvent('nested-child', 'nested-run', false),
       data: {
-        ...makeStartEvent('nested-child', 'nested-run').data,
+        ...makeStartEvent('nested-child', 'nested-run', false).data,
         parentWorkflow: {
           workflowId: 'public-root',
           runId: 'public-run',
@@ -249,6 +250,7 @@ describe('cross-process workflow event guard', () => {
         prevResult: { status: 'success', output: {} },
         activeSteps: {},
         requestContext: {},
+        __mastraInternalWorkflow: true,
         parentWorkflow: {
           workflowId: 'execution-workflow',
           runId: 'run-owner',
