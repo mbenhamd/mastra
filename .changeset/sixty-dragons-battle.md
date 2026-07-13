@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Improved transient workflow performance by skipping guaranteed-miss storage reads for fresh built-in run IDs while retaining collision checks for explicit and custom-generated IDs.
+Improved transient workflow performance by avoiding unnecessary storage checks for new runs. Runs with caller-provided or custom-generated IDs still consult storage.

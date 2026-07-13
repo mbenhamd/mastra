@@ -1594,7 +1594,16 @@ export class EventedWorkflow<
       throw new Error('Uncommitted step flow changes detected. Call .commit() to register the steps.');
     }
 
-    const runIdToUse = options?.runId || randomUUID();
+    const usesCustomGeneratedRunId = !options?.runId && Boolean(this.mastra?.getIdGenerator());
+    const runIdToUse =
+      options?.runId ||
+      this.mastra?.generateId({
+        idType: 'run',
+        source: 'workflow',
+        entityId: this.id,
+        resourceId: options?.resourceId,
+      }) ||
+      randomUUID();
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
 
@@ -1644,7 +1653,7 @@ export class EventedWorkflow<
     // retaining collision/status checks for persistent runs and caller-owned
     // run IDs.
     const existingRun =
-      shouldPersistSnapshot || options?.runId
+      shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId
         ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
         : undefined;
 
