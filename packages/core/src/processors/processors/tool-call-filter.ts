@@ -2,7 +2,11 @@ import type { MastraDBMessage, MessageList } from '../../agent/message-list';
 import type { RequestContext } from '../../request-context';
 
 import type { ProcessInputStepArgs, ProcessInputStepResult, Processor } from '../index';
-import { filterToolCallMessages, normalizeToolCallFilterExclude } from '../tool-call-filter-utils';
+import {
+  filterToolCallMessages,
+  normalizeToolCallFilterExclude,
+  normalizeToolCallFilterMaxModelOutputBytes,
+} from '../tool-call-filter-utils';
 import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
 
 export type ToolCallFilterOptions = ToolCallFilteringOptions & {
@@ -38,7 +42,9 @@ export class ToolCallFilter implements Processor {
     this.exclude = normalizeToolCallFilterExclude(exclude);
     this.filterAfterToolSteps = resolvedOptions.filterAfterToolSteps;
     this.preserveModelOutput = resolvedOptions.preserveModelOutput ?? false;
-    this.maxModelOutputBytes = resolvedOptions.maxModelOutputBytes;
+    this.maxModelOutputBytes = normalizeToolCallFilterMaxModelOutputBytes(
+      (resolvedOptions as { maxModelOutputBytes?: unknown }).maxModelOutputBytes,
+    );
   }
 
   async processInput(args: {

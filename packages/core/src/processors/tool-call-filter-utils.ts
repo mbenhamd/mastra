@@ -37,6 +37,16 @@ export function normalizeToolCallFilterExclude(exclude: unknown): string[] | 'al
   return exclude;
 }
 
+export function normalizeToolCallFilterMaxModelOutputBytes(maxModelOutputBytes: unknown): number | undefined {
+  if (maxModelOutputBytes === undefined) return undefined;
+  if (typeof maxModelOutputBytes !== 'number' || !Number.isFinite(maxModelOutputBytes) || maxModelOutputBytes < 0) {
+    throw new TypeError(
+      'Tool call filter options.maxModelOutputBytes must be a finite non-negative number when provided',
+    );
+  }
+  return Math.floor(maxModelOutputBytes);
+}
+
 function getOwnDataProperty(value: object, key: PropertyKey): OwnDataProperty {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
   if (!descriptor) return { kind: 'missing' };
@@ -47,14 +57,16 @@ function getOwnDataProperty(value: object, key: PropertyKey): OwnDataProperty {
 function normalizeOptions(options: ToolCallFilteringOptions | null): NormalizedToolCallFilteringOptions {
   const resolvedOptions = options ?? {};
   const exclude = (resolvedOptions as { exclude?: unknown }).exclude;
-  const maxModelOutputBytes = resolvedOptions.maxModelOutputBytes;
+  const maxModelOutputBytes = normalizeToolCallFilterMaxModelOutputBytes(
+    (resolvedOptions as { maxModelOutputBytes?: unknown }).maxModelOutputBytes,
+  );
   return {
     exclude: normalizeToolCallFilterExclude(exclude),
     preserveModelOutput: resolvedOptions.preserveModelOutput ?? false,
     ...(maxModelOutputBytes === undefined
       ? {}
       : {
-          maxModelOutputBytes: Number.isFinite(maxModelOutputBytes) ? Math.max(0, Math.floor(maxModelOutputBytes)) : 0,
+          maxModelOutputBytes,
         }),
   };
 }
@@ -467,7 +479,7 @@ function modelOutputToText(
         }
         return text.length > 0 ? text.join('') : null;
       }
-      default:
+      default: {
         // Preserve the two legacy wrapper shapes ToolCallFilter already accepted, but never stringify
         // arbitrary objects. This fails closed for media and unknown provider-specific output.
         const textProperty = getOwnDataProperty(output, 'text');
@@ -483,6 +495,7 @@ function modelOutputToText(
           }
         }
         return null;
+      }
     }
   } finally {
     traversal.depth -= 1;

@@ -55,6 +55,21 @@ describe('ToolCallFilter', () => {
       );
     });
 
+    it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '64'])(
+      'rejects malformed runtime maxModelOutputBytes input: %j',
+      maxModelOutputBytes => {
+        expect(() => new ToolCallFilter({ maxModelOutputBytes } as any)).toThrow(
+          'Tool call filter options.maxModelOutputBytes must be a finite non-negative number when provided',
+        );
+      },
+    );
+
+    it('rejects malformed runtime maxModelOutputBytes input in the shared filter utility', () => {
+      expect(() => filterToolCallMessages([], { maxModelOutputBytes: -1 })).toThrow(
+        'Tool call filter options.maxModelOutputBytes must be a finite non-negative number when provided',
+      );
+    });
+
     it('should exclude all tool calls and tool results', async () => {
       const filter = new ToolCallFilter();
 
