@@ -886,7 +886,10 @@ export class MemoryPG extends MemoryStorage {
           id: createStorageErrorId('PG', 'LIST_MESSAGES', 'INVALID_THREAD_ID'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { threadId: Array.isArray(threadId) ? String(threadId) : String(threadId) },
+          details: {
+            hasThreadId: threadId !== undefined && threadId !== null,
+            threadIdCount: Array.isArray(threadId) ? threadId.length : 1,
+          },
         },
         new Error('threadId must be a non-empty string or array of non-empty strings'),
       );
@@ -899,7 +902,8 @@ export class MemoryPG extends MemoryStorage {
         category: ErrorCategory.USER,
         text: 'Page number must be non-negative',
         details: {
-          threadId: Array.isArray(threadId) ? threadId.join(',') : threadId,
+          hasThreadId: true,
+          threadIdCount: threadIds.length,
           page,
         },
       });
@@ -1040,7 +1044,7 @@ export class MemoryPG extends MemoryStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.USER,
           details: {
-            resourceId: resourceId ?? '',
+            hasResourceId,
           },
         },
         new Error('resourceId is required'),
@@ -1055,7 +1059,7 @@ export class MemoryPG extends MemoryStorage {
         category: ErrorCategory.USER,
         text: 'Page number must be non-negative',
         details: {
-          resourceId,
+          hasResourceId,
           page,
         },
       });

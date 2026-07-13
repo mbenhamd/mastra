@@ -1,6 +1,7 @@
 import { getErrorFromUnknown, MastraError } from '@mastra/core/error';
 import type { QueryResult } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
+import { RoutingDbClient } from '../../client';
 import type { DbClient, TxClient } from '../../client';
 import { MemoryPG } from './index';
 
@@ -176,6 +177,39 @@ describe('MemoryPG list read failures', () => {
     expect(serialized).not.toContain(sensitiveCauseText);
     expect(serialized).not.toContain('SECRET_CONNECTION_STRING');
     expect(caught.cause).not.toBe(cause);
+  });
+
+  it.each([
+    {
+      name: 'invalid thread identifier',
+      invoke: (memory: MemoryPG) => memory.listMessages({ threadId: [sensitiveId, ''], page: 0 }),
+    },
+    {
+      name: 'invalid thread page',
+      invoke: (memory: MemoryPG) => memory.listMessages({ threadId: sensitiveId, page: -1 }),
+    },
+    {
+      name: 'invalid resource page',
+      invoke: (memory: MemoryPG) => memory.listMessagesByResourceId({ resourceId: sensitiveId, page: -1 }),
+    },
+  ])('does not serialize identifiers for $name through direct or routed clients', async ({ invoke }) => {
+    for (const client of [new ReadDbClient(), new RoutingDbClient(new ReadDbClient())]) {
+      const memory = new MemoryPG({ client });
+      const logger = createLogger();
+      memory.__setLogger(logger as any);
+
+      const caught = await invoke(memory).catch(error => error as MastraError);
+
+      expect(caught).toBeInstanceOf(MastraError);
+      const serialized = JSON.stringify({
+        message: caught.message,
+        cause: caught.cause,
+        details: caught.details,
+        publicError: caught.toJSON(),
+        logs: [logger.error.mock.calls, logger.trackException.mock.calls],
+      });
+      expect(serialized).not.toContain(sensitiveId);
+    }
   });
 
   it('returns empty thread data only after a successful empty query', async () => {
