@@ -3,7 +3,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { MessageList } from '../agent';
 import type { MastraMessageV1, StorageThreadType } from '../memory/types';
 import { deepMerge } from '../utils';
-import type { MemoryStorage } from './domains';
+import { MemoryStorage } from './domains';
 import { InMemoryStore } from './mock';
 
 describe('InMemoryStore - Thread Sorting', () => {
@@ -498,5 +498,15 @@ describe('InMemoryStore - listMessagesById', () => {
     expect(result.messages).toHaveLength(thread1Messages.length + resource2Messages.length);
     expect(result.messages.some(msg => msg.resourceId === threads[0]?.resourceId)).toBe(true);
     expect(result.messages.some(msg => msg.resourceId === threads[2]?.resourceId)).toBe(true);
+  });
+});
+
+describe('InMemoryStore - resource deletion', () => {
+  it('fails explicitly when a storage adapter does not implement resource deletion', async () => {
+    const unsupportedMemory = Object.create(MemoryStorage.prototype) as MemoryStorage;
+
+    await expect(unsupportedMemory.deleteResource({ resourceId: 'resource-delete' })).rejects.toThrow(
+      'Resource deletion is not implemented by this storage adapter',
+    );
   });
 });

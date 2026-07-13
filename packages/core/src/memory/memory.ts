@@ -551,6 +551,20 @@ https://mastra.ai/en/docs/memory/overview`,
   abstract deleteThread(threadId: string): Promise<void>;
 
   /**
+   * Delete a resource record, including working memory stored on that record.
+   *
+   * Associated thread, message, and observational-memory records, including
+   * thread metadata, are not inspected or mutated. Concrete memory
+   * implementations must opt into this operation so existing custom
+   * implementations remain source compatible.
+   *
+   * @param resourceId - The resource ID to delete
+   */
+  async deleteResource(_resourceId: string): Promise<void> {
+    throw new Error(`Resource deletion is not implemented by this memory (${this.constructor.name}).`);
+  }
+
+  /**
    * Helper method to add a single message to a thread
    * @param threadId - The thread to add the message to
    * @param content - The message content

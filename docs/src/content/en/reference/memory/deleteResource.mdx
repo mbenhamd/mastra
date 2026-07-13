@@ -1,0 +1,64 @@
+---
+title: "Reference: Memory.deleteResource() | Memory"
+description: "API reference for `Memory.deleteResource()`, which deletes a resource record and the working memory stored on it."
+packages:
+  - "@mastra/core"
+  - "@mastra/memory"
+---
+
+# Memory.deleteResource()
+
+The `.deleteResource()` method deletes a resource record and the working memory stored on that record. It doesn't inspect or mutate associated threads, messages, observational-memory records, or thread metadata.
+
+## Usage example
+
+```typescript
+const memory = await agent.getMemory()
+
+await memory?.deleteResource('resource-123')
+```
+
+On supported adapters, calling the method for a resource that doesn't exist resolves successfully.
+
+## Storage support
+
+`Memory.deleteResource()` is implemented by the in-memory and PostgreSQL storage adapters. Other adapters and custom memory implementations throw a not-implemented error unless they provide their own `deleteResource()` implementation.
+
+## Deletion scope
+
+This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record.
+
+Calls made through the same `Memory` instance are serialized with its resource-scoped working-memory writes. Separate `Memory` instances and processes require application-level writer coordination.
+
+Only the resource record is affected. If an application also stored working-memory content in preserved thread metadata or resource-scoped observational memory, remove that content through the application's bounded lifecycle. For account-erasure workflows, stop new writers, drain in-flight work, compose the required thread, message, and observational-memory operations, call this method, and then verify that all targeted records remain absent.
+
+## Parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'resourceId',
+    type: 'string',
+    description: 'Resource ID to delete',
+    isOptional: false,
+  },
+]}
+/>
+
+## Returns
+
+<PropertiesTable
+  content={[
+  {
+    name: 'void',
+    type: 'Promise<void>',
+    description: 'A promise that resolves when the resource record is deleted or already absent',
+  },
+]}
+/>
+
+## Related
+
+- [Memory class reference](/reference/memory/memory-class)
+- [Working memory](/docs/memory/working-memory)
+- [deleteMessages](/reference/memory/deleteMessages)
