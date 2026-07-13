@@ -45,6 +45,7 @@ import {
   validateWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalEffectJournalLink,
   validateWorkflowTerminalizationFence,
+  validateWorkflowTerminalizationRunIdentity,
   validateWorkflowTerminalSnapshotJournalLink,
 } from './terminalization';
 
@@ -506,6 +507,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       kind: materializeWorkflowTerminalEffectKind(input.kind),
     };
     validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
     const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
     const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
     const existingJournal = this.db.workflowTerminalizations.get(journalKey);

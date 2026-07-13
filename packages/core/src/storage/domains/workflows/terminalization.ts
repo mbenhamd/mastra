@@ -124,9 +124,13 @@ export function validateWorkflowTerminalizationLeaseMs(leaseMs: number): void {
   }
 }
 
-export function validateWorkflowTerminalizationClaim(input: ClaimWorkflowTerminalizationInput): void {
+export function validateWorkflowTerminalizationRunIdentity(input: { workflowName: string; runId: string }): void {
   validateWorkflowTerminalizationIdentity(input.workflowName, 'workflowName', 512);
   validateWorkflowTerminalizationIdentity(input.runId, 'runId', 512);
+}
+
+export function validateWorkflowTerminalizationClaim(input: ClaimWorkflowTerminalizationInput): void {
+  validateWorkflowTerminalizationRunIdentity(input);
   validateWorkflowTerminalizationIdentity(input.eventKey, 'eventKey', 1024);
   validateWorkflowTerminalizationIdentity(input.ownerId, 'ownerId', 256);
   if (!['success', 'failed', 'canceled'].includes(input.terminalStatus)) {
@@ -497,8 +501,7 @@ function validateWorkflowTerminalEffectInput(
   input: PrepareWorkflowTerminalEffectInput,
 ): WorkflowTerminalEffectDescriptor {
   validateWorkflowTerminalizationFence(input);
-  validateWorkflowTerminalizationIdentity(input.workflowName, 'workflowName', 512);
-  validateWorkflowTerminalizationIdentity(input.runId, 'runId', 512);
+  validateWorkflowTerminalizationRunIdentity(input);
   if (input.leaseMs !== undefined) validateWorkflowTerminalizationLeaseMs(input.leaseMs);
   return materializeWorkflowTerminalEffectDescriptor(input.effect);
 }

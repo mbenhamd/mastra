@@ -24,6 +24,7 @@ import {
   validateWorkflowTerminalEffectJournalLink,
   validateWorkflowTerminalSnapshotJournalLink,
   validateWorkflowTerminalizationFence,
+  validateWorkflowTerminalizationRunIdentity,
 } from '@mastra/core/storage';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -839,6 +840,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       kind: materializeWorkflowTerminalEffectKind(input.kind),
     };
     validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
     try {
       return await this.#db.client.tx(async t => {
         const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);

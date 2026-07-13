@@ -234,6 +234,20 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       workflows.getWorkflowTerminalEffectForDispatch({ ...missing, claimToken: '', kind: 'workflow-finish' }),
     ).rejects.toThrow('claimToken must be a well-formed non-empty string');
     await expect(
+      workflows.getWorkflowTerminalEffectForDispatch({
+        ...missing,
+        workflowName: 'w'.repeat(513),
+        kind: 'workflow-finish',
+      }),
+    ).rejects.toThrow('workflowName must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
+      workflows.getWorkflowTerminalEffectForDispatch({
+        ...missing,
+        runId: `run${String.fromCharCode(0xd800)}`,
+        kind: 'workflow-finish',
+      }),
+    ).rejects.toThrow('runId must be a well-formed non-empty string no longer than 512 characters');
+    await expect(
       workflows.claimWorkflowTerminalization({
         workflowName: 'w'.repeat(513),
         runId: missing.runId,
