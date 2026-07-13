@@ -404,14 +404,14 @@ export class MemoryPG extends MemoryStorage {
     try {
       // Validate pagination input before normalization
       // This ensures page === 0 when perPageInput === false
-      this.validatePaginationInput(page, perPageInput ?? 100);
-    } catch (error) {
+      this.validatePaginationInput(page, perPageInput === undefined ? 100 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: error instanceof Error ? error.message : 'Invalid pagination parameters',
-        details: { page, ...(perPageInput !== undefined && { perPage: perPageInput }) },
+        text: 'Invalid pagination parameters',
+        details: this.getSafePaginationDetails(page, perPageInput),
       });
     }
 
@@ -420,13 +420,13 @@ export class MemoryPG extends MemoryStorage {
     // Validate metadata keys to prevent SQL injection
     try {
       this.validateMetadataKeys(filter?.metadata);
-    } catch (error) {
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_METADATA_KEY'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: error instanceof Error ? error.message : 'Invalid metadata key',
-        details: { metadataKeys: filter?.metadata ? Object.keys(filter.metadata).join(', ') : '' },
+        text: 'Invalid metadata filter',
+        details: { hasMetadataFilter: filter?.metadata !== undefined },
       });
     }
 
@@ -846,6 +846,20 @@ export class MemoryPG extends MemoryStorage {
     return error;
   }
 
+  private getSafePaginationDetails(page: unknown, perPage: unknown) {
+    const hasValidPage = typeof page === 'number' && Number.isFinite(page) && Number.isSafeInteger(page) && page >= 0;
+    const hasValidPerPage =
+      perPage === undefined ||
+      perPage === false ||
+      (typeof perPage === 'number' && Number.isFinite(perPage) && Number.isSafeInteger(perPage) && perPage >= 0);
+
+    return {
+      hasValidPage,
+      hasValidPerPage,
+      hasValidPaginationCombination: perPage !== false || page === 0,
+    };
+  }
+
   public async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messageIds.length === 0) return { messages: [] };
     const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
@@ -895,16 +909,18 @@ export class MemoryPG extends MemoryStorage {
       );
     }
 
-    if (page < 0) {
+    try {
+      this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Page number must be non-negative',
+        text: 'Invalid pagination parameters',
         details: {
           hasThreadId: true,
           threadIdCount: threadIds.length,
-          page,
+          ...this.getSafePaginationDetails(page, perPageInput),
         },
       });
     }
@@ -1051,16 +1067,17 @@ export class MemoryPG extends MemoryStorage {
       );
     }
 
-    // Validate page parameter
-    if (page < 0) {
+    try {
+      this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
+    } catch {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Page number must be non-negative',
+        text: 'Invalid pagination parameters',
         details: {
           hasResourceId,
-          page,
+          ...this.getSafePaginationDetails(page, perPageInput),
         },
       });
     }

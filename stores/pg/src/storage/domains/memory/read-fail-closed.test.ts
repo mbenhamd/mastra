@@ -266,6 +266,44 @@ describe('MemoryPG list read failures', () => {
       invoke: (memory: MemoryPG) =>
         memory.listMessagesByResourceId({ resourceId: { value: sensitiveId } as unknown as string }),
     },
+    {
+      name: 'invalid thread-list page runtime value',
+      invoke: (memory: MemoryPG) => memory.listThreads({ page: sensitiveId as unknown as number }),
+    },
+    {
+      name: 'invalid thread-list per-page runtime value',
+      invoke: (memory: MemoryPG) => memory.listThreads({ perPage: sensitiveId as unknown as number }),
+    },
+    {
+      name: 'invalid message-list page runtime value',
+      invoke: (memory: MemoryPG) =>
+        memory.listMessages({ threadId: 'thread-1', page: sensitiveId as unknown as number }),
+    },
+    {
+      name: 'invalid message-list per-page runtime value',
+      invoke: (memory: MemoryPG) =>
+        memory.listMessages({ threadId: 'thread-1', perPage: sensitiveId as unknown as number }),
+    },
+    {
+      name: 'invalid resource-list page runtime value',
+      invoke: (memory: MemoryPG) =>
+        memory.listMessagesByResourceId({
+          resourceId: 'resource-1',
+          page: sensitiveId as unknown as number,
+        }),
+    },
+    {
+      name: 'invalid resource-list per-page runtime value',
+      invoke: (memory: MemoryPG) =>
+        memory.listMessagesByResourceId({
+          resourceId: 'resource-1',
+          perPage: sensitiveId as unknown as number,
+        }),
+    },
+    {
+      name: 'invalid metadata key',
+      invoke: (memory: MemoryPG) => memory.listThreads({ filter: { metadata: { [`bad-${sensitiveId}`]: true } } }),
+    },
   ])('does not serialize identifiers for $name through direct or routed clients', async ({ invoke }) => {
     for (const client of [new ReadDbClient(), new RoutingDbClient(new ReadDbClient())]) {
       const memory = new MemoryPG({ client });
