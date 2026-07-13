@@ -1036,7 +1036,7 @@ export class MemoryPG extends MemoryStorage {
     const { resourceId, include, filter, perPage: perPageInput, page = 0, orderBy } = args;
 
     // Validate that resourceId is provided
-    const hasResourceId = resourceId !== undefined && resourceId !== null && resourceId.trim() !== '';
+    const hasResourceId = typeof resourceId === 'string' && resourceId.trim() !== '';
     if (!hasResourceId) {
       throw new MastraError(
         {

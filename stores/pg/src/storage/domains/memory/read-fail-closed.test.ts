@@ -197,6 +197,11 @@ describe('MemoryPG list read failures', () => {
       name: 'invalid resource page',
       invoke: (memory: MemoryPG) => memory.listMessagesByResourceId({ resourceId: sensitiveId, page: -1 }),
     },
+    {
+      name: 'non-string resource identifier',
+      invoke: (memory: MemoryPG) =>
+        memory.listMessagesByResourceId({ resourceId: { value: sensitiveId } as unknown as string }),
+    },
   ])('does not serialize identifiers for $name through direct or routed clients', async ({ invoke }) => {
     for (const client of [new ReadDbClient(), new RoutingDbClient(new ReadDbClient())]) {
       const memory = new MemoryPG({ client });
