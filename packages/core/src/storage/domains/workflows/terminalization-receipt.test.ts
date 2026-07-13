@@ -387,7 +387,7 @@ describe('WorkflowsInMemory terminal destination receipts', () => {
       status: 'fence_conflict',
     });
     await expect(workflows.getWorkflowTerminalDestinationReceipt(input)).rejects.toThrow(
-      'Invalid workflow terminal snapshot journal link',
+      'Invalid workflow terminal snapshot createdAt',
     );
     db.workflowTerminalSnapshots.set(runKey(ready.run), retained);
 

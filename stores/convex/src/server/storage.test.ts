@@ -235,6 +235,36 @@ describe('mastraStorage workflow snapshot merge operations', () => {
     expect(typeof testCtx.patches[0]?.data.updatedAt).toBe('string');
   });
 
+  it('persists __proto__ as an own step result without changing the context prototype', async () => {
+    const snapshot = {
+      runId: 'run-1',
+      status: 'running',
+      context: {},
+      requestContext: {},
+    };
+    const testCtx = createWorkflowSnapshotCtx(JSON.stringify(snapshot));
+
+    const result = await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+      op: 'mergeWorkflowStepResult',
+      tableName: TABLE_WORKFLOW_SNAPSHOT,
+      workflowName: 'workflow-a',
+      runId: 'run-1',
+      stepId: '__proto__',
+      result: JSON.stringify({ status: 'running', payload: { safe: true } }),
+      requestContext: JSON.stringify({}),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const patchedSnapshot = JSON.parse(testCtx.patches[0]?.data.snapshot as string);
+    expect(Object.getPrototypeOf(patchedSnapshot.context)).toBe(Object.prototype);
+    expect(Object.hasOwn(patchedSnapshot.context, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(patchedSnapshot.context, '__proto__')?.value).toEqual({
+      status: 'running',
+      payload: { safe: true },
+    });
+  });
+
   it('applies pending marker resets without trusting stale sibling values or status', async () => {
     const snapshot = {
       runId: 'run-1',

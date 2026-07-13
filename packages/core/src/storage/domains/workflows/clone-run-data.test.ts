@@ -47,6 +47,30 @@ describe('cloneRunData', () => {
     expect(out).not.toBe(src);
   });
 
+  it('preserves an own __proto__ data property without mutating the clone prototype', () => {
+    const src: Record<string, unknown> = {};
+    Object.defineProperty(src, '__proto__', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: { nestedRunId: 'durable-child' },
+    });
+
+    const out = cloneRunData(src);
+
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(Object.hasOwn(out, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(out, '__proto__')).toMatchObject({
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: { nestedRunId: 'durable-child' },
+    });
+    expect(Object.getOwnPropertyDescriptor(out, '__proto__')?.value).not.toBe(
+      Object.getOwnPropertyDescriptor(src, '__proto__')?.value,
+    );
+  });
+
   // ── Arrays ──────────────────────────────────────────────────────────
 
   it('deep-clones arrays', () => {
@@ -170,6 +194,22 @@ describe('cloneRunData', () => {
     expect(out.name).toBe('TypeError');
     expect((out as Record<string, unknown>).code).toBe('ERR_INVALID');
     expect((out as Record<string, unknown>).statusCode).toBe(400);
+  });
+
+  it('preserves an Error own __proto__ data property without mutating its prototype', () => {
+    const src = new Error('magic-key');
+    Object.defineProperty(src, '__proto__', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: { safe: true },
+    });
+
+    const out = cloneRunData(src);
+
+    expect(Object.getPrototypeOf(out)).toBe(Error.prototype);
+    expect(Object.hasOwn(out, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(out, '__proto__')?.value).toEqual({ safe: true });
   });
 
   it('clones Error.cause recursively', () => {

@@ -1,6 +1,8 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import type {
+  StepResult,
+  WorkflowRunState,
   WorkflowTerminalDestinationReceiptRecord,
   WorkflowTerminalEffectRecord,
   WorkflowTerminalizationClaimedRecord,
@@ -10,23 +12,30 @@ import type {
 } from '../../../workflows';
 import {
   copyWorkflowTerminalParentContinuationContract,
+  createWorkflowTerminalGraphFingerprint,
   getWorkflowTerminalEffectIntegrity,
+  materializeWorkflowTerminalParentContinuationChildProjection,
   validateWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalParentContinuationIntegrity,
+  WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
 } from '../../../workflows/terminal-continuation';
 import {
   copyWorkflowTerminalRecoveryAncestry,
-  copyWorkflowTerminalRecoveryEnvelope,
   getWorkflowTerminalRecoveryAncestryHash,
-  getWorkflowTerminalRecoveryEnvelopeHash,
+  materializeWorkflowTerminalCanonicalJsonObject,
   materializeWorkflowTerminalRecoveryEnvelope,
   validateWorkflowTerminalRecoveryEnvelopeIntegrity,
-  validateWorkflowTerminalRecoveryGraphBinding,
 } from '../../../workflows/terminal-recovery';
 import type {
   WorkflowTerminalRecoveryAncestryV1,
   WorkflowTerminalRecoveryEnvelopeRecordV1,
+  WorkflowTerminalRecoveryEnvelopeV1,
 } from '../../../workflows/terminal-recovery';
+import {
+  getMaterializedWorkflowTerminalRecoveryEnvelopeHash,
+  validateMaterializedWorkflowTerminalRecoveryEnvelope,
+  validateMaterializedWorkflowTerminalRecoveryGraphBinding,
+} from '../../../workflows/terminal-recovery/envelope';
 export {
   applyWorkflowTerminalParentContinuationPatch,
   copyWorkflowTerminalParentContinuationContract,
@@ -38,9 +47,12 @@ export {
 } from '../../../workflows/terminal-continuation';
 import type {
   AdvanceWorkflowTerminalizationInput,
+  AdmitWorkflowNestedRunInput,
   ApplyWorkflowTerminalParentEffectInput,
+  BindWorkflowNestedRunOwnershipInput,
   ClaimWorkflowTerminalizationInput,
   GetWorkflowTerminalEffectForDispatchInput,
+  GetWorkflowRunTerminalStatusInput,
   GetWorkflowTerminalDestinationReceiptInput,
   GetWorkflowTerminalContinuationPlanInput,
   PersistWorkflowTerminalStateInput,
@@ -54,6 +66,7 @@ import type {
   WorkflowTerminalizationObservation,
   WorkflowTerminalRecoveryAncestryRecord,
 } from '../../types';
+import { mergeWorkflowStepResult } from '../../workflow-snapshot';
 
 type InternalClaimWorkflowTerminalizationResult =
   | {
@@ -94,6 +107,14 @@ type InternalPersistWorkflowTerminalStateResult =
   | {
       status: 'invalid_snapshot' | 'invalid_recovery_envelope' | 'missing_recovery_ancestry' | 'missing_record';
     };
+
+type InternalPersistWorkflowTerminalStateAuthorizationResult =
+  | { status: 'authorized'; record: WorkflowTerminalizationRecord }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | { status: 'missing_record' };
 
 type InternalPrepareWorkflowTerminalEffectResult =
   | {
@@ -191,6 +212,282 @@ const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTermina
 export const MAX_WORKFLOW_TERMINALIZATION_LEASE_MS = 86_400_000;
 export const MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH = 256;
 export const MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT = 8;
+
+type WorkflowNestedRunOwnershipOperation = Pick<
+  BindWorkflowNestedRunOwnershipInput,
+  'workflowName' | 'runId' | 'stepId' | 'nestedRunId' | 'forEachIndex' | 'result' | 'requestContext'
+>;
+
+export type BindWorkflowNestedRunOwnershipRecordResult =
+  | { status: 'bound' | 'already_bound'; snapshot: WorkflowRunState }
+  | { status: 'ownership_conflict' };
+
+function ownDataValue(value: unknown, key: PropertyKey): unknown {
+  if (value === null || typeof value !== 'object') return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** @internal Captures a workflow identity without executing inherited or accessor state. */
+export function captureWorkflowRunIdentity(
+  input: GetWorkflowRunTerminalStatusInput,
+): GetWorkflowRunTerminalStatusInput {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('Workflow identity must be an own-data payload');
+  }
+  const workflowName = Object.getOwnPropertyDescriptor(input, 'workflowName');
+  const runId = Object.getOwnPropertyDescriptor(input, 'runId');
+  if (!workflowName?.enumerable || !('value' in workflowName)) {
+    throw new TypeError('Workflow identity workflowName must be own data');
+  }
+  if (!runId?.enumerable || !('value' in runId)) {
+    throw new TypeError('Workflow identity runId must be own data');
+  }
+  validateWorkflowTerminalizationIdentity(workflowName.value, 'workflowName', 512);
+  validateWorkflowTerminalizationIdentity(runId.value, 'runId', 512);
+  return { workflowName: workflowName.value as string, runId: runId.value as string };
+}
+
+function requiredOwnAdmissionData(input: unknown, key: keyof AdmitWorkflowNestedRunInput): unknown {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('Nested workflow admission must be an own-data payload');
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  if (!descriptor?.enumerable || !('value' in descriptor)) {
+    throw new TypeError(`Nested workflow admission ${key} must be own data`);
+  }
+  return descriptor.value;
+}
+
+function optionalOwnAdmissionData(input: object, key: keyof AdmitWorkflowNestedRunInput): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  if (!descriptor) return undefined;
+  if (!descriptor.enumerable || !('value' in descriptor)) {
+    throw new TypeError(`Nested workflow admission ${key} must be own data`);
+  }
+  return descriptor.value;
+}
+
+/** @internal Captures the admission envelope once without executing inherited or accessor state. */
+export function captureWorkflowNestedRunAdmissionInput(
+  input: AdmitWorkflowNestedRunInput,
+): AdmitWorkflowNestedRunInput {
+  const workflowName = requiredOwnAdmissionData(input, 'workflowName') as string;
+  const runId = requiredOwnAdmissionData(input, 'runId') as string;
+  const stepId = requiredOwnAdmissionData(input, 'stepId') as string;
+  const nestedWorkflowName = requiredOwnAdmissionData(input, 'nestedWorkflowName') as string;
+  const nestedRunId = requiredOwnAdmissionData(input, 'nestedRunId') as string;
+  const result = requiredOwnAdmissionData(input, 'result') as AdmitWorkflowNestedRunInput['result'];
+  const requestContext = requiredOwnAdmissionData(
+    input,
+    'requestContext',
+  ) as AdmitWorkflowNestedRunInput['requestContext'];
+  const recoveryAncestry = requiredOwnAdmissionData(
+    input,
+    'recoveryAncestry',
+  ) as AdmitWorkflowNestedRunInput['recoveryAncestry'];
+  const expectedChildGraphFingerprint = requiredOwnAdmissionData(input, 'expectedChildGraphFingerprint') as string;
+  const forEachIndex = optionalOwnAdmissionData(input, 'forEachIndex') as number | undefined;
+  const initialChildSnapshot = optionalOwnAdmissionData(
+    input,
+    'initialChildSnapshot',
+  ) as AdmitWorkflowNestedRunInput['initialChildSnapshot'];
+  return {
+    workflowName,
+    runId,
+    stepId,
+    nestedWorkflowName,
+    nestedRunId,
+    result,
+    requestContext,
+    recoveryAncestry,
+    expectedChildGraphFingerprint,
+    ...(forEachIndex === undefined ? {} : { forEachIndex }),
+    ...(initialChildSnapshot === undefined ? {} : { initialChildSnapshot }),
+  };
+}
+
+const WORKFLOW_NESTED_RUN_STATUSES = [
+  'running',
+  'success',
+  'failed',
+  'tripwire',
+  'suspended',
+  'waiting',
+  'pending',
+  'canceled',
+  'bailed',
+  'paused',
+] as const;
+const WORKFLOW_NESTED_RUN_TERMINAL_STATUSES = ['success', 'failed', 'tripwire', 'canceled', 'bailed'] as const;
+type WorkflowNestedRunTerminalStatus = (typeof WORKFLOW_NESTED_RUN_TERMINAL_STATUSES)[number];
+
+export type WorkflowNestedRunRetainedSnapshotInspection =
+  | { status: 'retained'; graphFingerprint: string }
+  | { status: 'terminal'; terminalStatus: WorkflowNestedRunTerminalStatus; graphFingerprint: string }
+  | { status: 'conflict' };
+
+/** @internal Inspects retained child state without trusting prototypes, accessors, or stale graph identity. */
+export function inspectWorkflowNestedRunRetainedSnapshot(
+  snapshot: unknown,
+  nestedRunId: string,
+  expectedGraphFingerprint?: string,
+): WorkflowNestedRunRetainedSnapshotInspection {
+  try {
+    if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return { status: 'conflict' };
+    if (ownDataValue(snapshot, 'runId') !== nestedRunId) return { status: 'conflict' };
+    const status = ownDataValue(snapshot, 'status');
+    if (
+      typeof status !== 'string' ||
+      !WORKFLOW_NESTED_RUN_STATUSES.includes(status as (typeof WORKFLOW_NESTED_RUN_STATUSES)[number])
+    ) {
+      return { status: 'conflict' };
+    }
+    const timestamp = ownDataValue(snapshot, 'timestamp');
+    if (!Number.isSafeInteger(timestamp) || (timestamp as number) < 0) return { status: 'conflict' };
+    const context = ownDataValue(snapshot, 'context');
+    if (context === null || typeof context !== 'object' || Array.isArray(context)) return { status: 'conflict' };
+    const graphFingerprint = createWorkflowTerminalGraphFingerprint(
+      ownDataValue(snapshot, 'serializedStepGraph') as WorkflowRunState['serializedStepGraph'],
+    );
+    if (
+      WORKFLOW_NESTED_RUN_TERMINAL_STATUSES.includes(status as (typeof WORKFLOW_NESTED_RUN_TERMINAL_STATUSES)[number])
+    ) {
+      return { status: 'terminal', terminalStatus: status as WorkflowNestedRunTerminalStatus, graphFingerprint };
+    }
+    if (expectedGraphFingerprint !== undefined && graphFingerprint !== expectedGraphFingerprint) {
+      return { status: 'conflict' };
+    }
+    return { status: 'retained', graphFingerprint };
+  } catch {
+    return { status: 'conflict' };
+  }
+}
+
+/** @internal Validates one scalar or foreach child-ownership coordinate. */
+export function validateWorkflowNestedRunOwnershipInput(input: WorkflowNestedRunOwnershipOperation): void {
+  validateWorkflowTerminalizationIdentity(input.workflowName, 'workflowName', 512);
+  validateWorkflowTerminalizationIdentity(input.runId, 'runId', 512);
+  validateWorkflowTerminalizationIdentity(input.stepId, 'stepId', 512);
+  validateWorkflowTerminalizationIdentity(input.nestedRunId, 'nestedRunId', 512);
+  if (input.forEachIndex !== undefined && (!Number.isSafeInteger(input.forEachIndex) || input.forEachIndex < 0)) {
+    throw new TypeError('forEachIndex must be a non-negative safe integer');
+  }
+}
+
+/** @internal Validates an atomic nested-child initialization payload. */
+export function validateWorkflowNestedRunInitialSnapshot(
+  input: AdmitWorkflowNestedRunInput['initialChildSnapshot'],
+  nestedRunId: string,
+  expectedChildGraphFingerprint: string,
+): AdmitWorkflowNestedRunInput['initialChildSnapshot'] {
+  if (!/^sha256:[a-f0-9]{64}$/.test(expectedChildGraphFingerprint)) {
+    throw new TypeError('expectedChildGraphFingerprint must be a canonical SHA-256 fingerprint');
+  }
+  if (input === undefined) return undefined;
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('Initial nested workflow snapshot must be an own-data payload');
+  }
+  const snapshotDescriptor = Object.getOwnPropertyDescriptor(input, 'snapshot');
+  const resourceIdDescriptor = Object.getOwnPropertyDescriptor(input, 'resourceId');
+  if (!snapshotDescriptor?.enumerable || !('value' in snapshotDescriptor)) {
+    throw new TypeError('Initial nested workflow snapshot must be an own-data payload');
+  }
+  if (resourceIdDescriptor && (!resourceIdDescriptor.enumerable || !('value' in resourceIdDescriptor))) {
+    throw new TypeError('Initial nested workflow resourceId must be own data');
+  }
+  const resourceId = resourceIdDescriptor?.value;
+  if (resourceId !== undefined) {
+    validateWorkflowTerminalizationIdentity(resourceId, 'resourceId', 512);
+  }
+  const snapshot = materializeWorkflowTerminalCanonicalJsonObject(
+    snapshotDescriptor.value,
+    'initialChildSnapshot.snapshot',
+  ) as unknown as WorkflowRunState;
+  const runId = ownDataValue(snapshot, 'runId');
+  const status = ownDataValue(snapshot, 'status');
+  const timestamp = ownDataValue(snapshot, 'timestamp');
+  const context = ownDataValue(snapshot, 'context');
+  const serializedStepGraph = ownDataValue(snapshot, 'serializedStepGraph') as WorkflowRunState['serializedStepGraph'];
+  if (
+    runId !== nestedRunId ||
+    status !== 'running' ||
+    !Number.isSafeInteger(timestamp) ||
+    (timestamp as number) < 0 ||
+    context === null ||
+    typeof context !== 'object' ||
+    Array.isArray(context)
+  ) {
+    throw new TypeError('Initial nested workflow snapshot must be a valid running child snapshot');
+  }
+  if (createWorkflowTerminalGraphFingerprint(serializedStepGraph) !== expectedChildGraphFingerprint) {
+    throw new TypeError('Initial nested workflow snapshot graph does not match the expected child graph');
+  }
+  return {
+    snapshot,
+    ...(resourceId === undefined ? {} : { resourceId }),
+  };
+}
+
+/** @internal Pure canonical nested-child ownership transition shared by storage adapters. */
+export function bindWorkflowNestedRunOwnershipRecord(
+  snapshot: WorkflowRunState,
+  input: WorkflowNestedRunOwnershipOperation,
+): BindWorkflowNestedRunOwnershipRecordResult {
+  validateWorkflowNestedRunOwnershipInput(input);
+  const current = ownDataValue(snapshot.context, input.stepId);
+  const currentMetadataValue = ownDataValue(current, 'metadata');
+  const currentMetadata =
+    currentMetadataValue !== null && typeof currentMetadataValue === 'object' ? currentMetadataValue : {};
+  const incomingMetadataValue = ownDataValue(input.result, 'metadata');
+  const incomingMetadata =
+    incomingMetadataValue !== null && typeof incomingMetadataValue === 'object' ? incomingMetadataValue : {};
+  const incomingWorkflowMetadataValue = ownDataValue(incomingMetadata, '__workflow_meta');
+  const incomingWorkflowMetadata =
+    incomingWorkflowMetadataValue !== null && typeof incomingWorkflowMetadataValue === 'object'
+      ? incomingWorkflowMetadataValue
+      : {};
+  const workflowMetadataValue = ownDataValue(currentMetadata, '__workflow_meta');
+  const workflowMetadata =
+    workflowMetadataValue !== null && typeof workflowMetadataValue === 'object' ? workflowMetadataValue : {};
+  const iterationRunsValue = ownDataValue(workflowMetadata, WORKFLOW_TERMINAL_FOREACH_RUN_KEY);
+  const iterationRuns = iterationRunsValue !== null && typeof iterationRunsValue === 'object' ? iterationRunsValue : {};
+  const existing =
+    input.forEachIndex === undefined
+      ? ownDataValue(currentMetadata, 'nestedRunId')
+      : ownDataValue(iterationRuns, String(input.forEachIndex));
+  if (existing !== undefined && existing !== input.nestedRunId) return { status: 'ownership_conflict' };
+
+  const updatedSnapshot: WorkflowRunState = {
+    ...snapshot,
+    context: { ...snapshot.context },
+    requestContext: { ...snapshot.requestContext },
+  };
+  if (existing === input.nestedRunId) return { status: 'already_bound', snapshot: updatedSnapshot };
+
+  const metadata =
+    input.forEachIndex === undefined
+      ? { ...currentMetadata, ...incomingMetadata, nestedRunId: input.nestedRunId }
+      : {
+          ...currentMetadata,
+          ...incomingMetadata,
+          __workflow_meta: {
+            ...workflowMetadata,
+            ...incomingWorkflowMetadata,
+            [WORKFLOW_TERMINAL_FOREACH_RUN_KEY]: {
+              ...iterationRuns,
+              [String(input.forEachIndex)]: input.nestedRunId,
+            },
+          },
+        };
+  mergeWorkflowStepResult({
+    snapshot: updatedSnapshot,
+    stepId: input.stepId,
+    result: { ...input.result, metadata } as StepResult<any, any, any, any>,
+    requestContext: input.requestContext,
+  });
+  return { status: 'bound', snapshot: updatedSnapshot };
+}
 
 function isWellFormedUnicode(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -495,6 +792,48 @@ function hashFramedParts(domain: string, parts: readonly string[]): string {
   return hash.digest('hex');
 }
 
+/** @internal Authenticates a retained terminal record, including explicit resource presence. */
+export function getWorkflowTerminalSnapshotRecordHash(
+  retained: Pick<
+    WorkflowTerminalSnapshotRecord,
+    'version' | 'workflowName' | 'runId' | 'resourceId' | 'terminalStatus' | 'envelopeHash' | 'createdAt'
+  >,
+): `sha256:${string}` {
+  if (retained.version !== 1) throw new TypeError('Invalid workflow terminal snapshot version');
+  validateWorkflowTerminalizationIdentity(retained.workflowName, 'workflowName', 512);
+  validateWorkflowTerminalizationIdentity(retained.runId, 'runId', 512);
+  if (retained.resourceId !== undefined) {
+    validateWorkflowTerminalizationIdentity(retained.resourceId, 'resourceId', 512);
+  }
+  if (!['success', 'failed', 'canceled'].includes(retained.terminalStatus)) {
+    throw new TypeError('Invalid workflow terminal snapshot status');
+  }
+  if (!/^sha256:[a-f0-9]{64}$/.test(retained.envelopeHash)) {
+    throw new TypeError('Invalid workflow terminal recovery envelope hash');
+  }
+  if (!Number.isSafeInteger(retained.createdAt) || retained.createdAt < 0) {
+    throw new TypeError('Invalid workflow terminal snapshot createdAt');
+  }
+  const resourceParts =
+    retained.resourceId === undefined ? ['resource-id-absent'] : ['resource-id-present', retained.resourceId];
+  return `sha256:${hashFramedParts('mastra.workflow-terminal-snapshot-record.v1', [
+    String(retained.version),
+    retained.workflowName,
+    retained.runId,
+    retained.terminalStatus,
+    retained.envelopeHash,
+    String(retained.createdAt),
+    ...resourceParts,
+  ])}`;
+}
+
+/** @internal Fails closed when any authenticated retained-record field was altered. */
+export function validateWorkflowTerminalSnapshotRecordIntegrity(retained: WorkflowTerminalSnapshotRecord): void {
+  if (retained.recordHash !== getWorkflowTerminalSnapshotRecordHash(retained)) {
+    throw new TypeError('Invalid workflow terminal snapshot record integrity');
+  }
+}
+
 /** @internal Fails closed when a persisted intent is not evidence for its owning journal. */
 export function validateWorkflowTerminalEffectJournalLink(
   effect: WorkflowTerminalEffectRecord,
@@ -524,6 +863,7 @@ export function validateWorkflowTerminalSnapshotJournalLink(
   workflowName: string,
   runId: string,
 ): void {
+  validateWorkflowTerminalSnapshotRecordIntegrity(retained);
   validateWorkflowTerminalRecoveryEnvelopeIntegrity(
     { version: retained.version, envelopeHash: retained.envelopeHash, envelope: retained.envelope },
     { workflowName, runId, terminalStatus: journal.terminalStatus },
@@ -551,7 +891,9 @@ export function validateWorkflowTerminalEffectRecoveryLink(
     effect.workflowName !== retained.workflowName ||
     effect.runId !== retained.runId ||
     effect.terminalStatus !== retained.terminalStatus ||
-    effect.recoveryEnvelopeHash !== retained.envelopeHash
+    effect.recoveryEnvelopeHash !== retained.envelopeHash ||
+    effect.retainedRecordHash !== retained.recordHash ||
+    effect.resourceId !== retained.resourceId
   ) {
     throw new TypeError('Invalid workflow terminal effect recovery link');
   }
@@ -665,6 +1007,8 @@ export function createWorkflowTerminalEffectRecord(
     sourceEventKey: journal.eventKey,
     terminalStatus: journal.terminalStatus,
     recoveryEnvelopeHash: retained.envelopeHash,
+    retainedRecordHash: retained.recordHash,
+    ...(retained.resourceId === undefined ? {} : { resourceId: retained.resourceId }),
     createdAt: now,
   };
   const effect =
@@ -691,6 +1035,8 @@ function sameWorkflowTerminalEffect(left: WorkflowTerminalEffectRecord, right: W
     left.sourceEventKey !== right.sourceEventKey ||
     left.terminalStatus !== right.terminalStatus ||
     left.recoveryEnvelopeHash !== right.recoveryEnvelopeHash ||
+    left.retainedRecordHash !== right.retainedRecordHash ||
+    left.resourceId !== right.resourceId ||
     left.payloadHash !== right.payloadHash
   ) {
     return false;
@@ -1403,16 +1749,15 @@ export function finalizeWorkflowTerminalParentApplicationRecords(
   };
 }
 
-/** @internal Atomically certifies that the canonical run snapshot is terminal. */
-export function persistWorkflowTerminalStateRecord(
+/** @internal Authorizes terminal-state persistence before an adapter locks canonical run state. */
+export function authorizeWorkflowTerminalStateRecord(
   existing: WorkflowTerminalizationRecord | undefined,
-  existingAncestry: WorkflowTerminalRecoveryAncestryRecord | undefined,
-  input: PersistWorkflowTerminalStateInput,
+  input: Pick<
+    PersistWorkflowTerminalStateInput,
+    'workflowName' | 'runId' | 'ownerId' | 'claimToken' | 'claimGeneration' | 'leaseMs'
+  >,
   now: number,
-  materializeSnapshot: (
-    snapshot: PersistWorkflowTerminalStateInput['snapshot'],
-  ) => PersistWorkflowTerminalStateInput['snapshot'],
-): InternalPersistWorkflowTerminalStateResult {
+): InternalPersistWorkflowTerminalStateAuthorizationResult {
   validateWorkflowTerminalizationFence(input);
   validateWorkflowTerminalizationClock(now);
   if (input.leaseMs !== undefined) validateWorkflowTerminalizationLeaseMs(input.leaseMs);
@@ -1430,26 +1775,75 @@ export function persistWorkflowTerminalStateRecord(
   if (existing.phase !== 'terminalization_pending') {
     return { status: 'phase_conflict', record: copyWorkflowTerminalizationRecord(existing) };
   }
+  return { status: 'authorized', record: copyWorkflowTerminalizationRecord(existing) };
+}
+
+/** @internal Atomically certifies that the canonical run snapshot is terminal. */
+export function persistWorkflowTerminalStateRecord(
+  existing: WorkflowTerminalizationRecord | undefined,
+  existingAncestry: WorkflowTerminalRecoveryAncestryRecord | undefined,
+  input: PersistWorkflowTerminalStateInput,
+  now: number,
+  materializeSnapshot: (
+    snapshot: PersistWorkflowTerminalStateInput['snapshot'],
+  ) => PersistWorkflowTerminalStateInput['snapshot'],
+  materializeRecoveryEnvelope: (
+    envelope: PersistWorkflowTerminalStateInput['recoveryEnvelope'],
+  ) => WorkflowTerminalRecoveryEnvelopeV1 = materializeWorkflowTerminalRecoveryEnvelope,
+): InternalPersistWorkflowTerminalStateResult {
+  const authorization = authorizeWorkflowTerminalStateRecord(existing, input, now);
+  if (authorization.status !== 'authorized') return authorization;
   if (!input.snapshot || typeof input.snapshot !== 'object' || Array.isArray(input.snapshot)) {
+    return { status: 'invalid_snapshot' };
+  }
+  let inputSnapshot: PersistWorkflowTerminalStateInput['snapshot'];
+  try {
+    inputSnapshot = materializeSnapshot(input.snapshot);
+  } catch {
+    return { status: 'invalid_snapshot' };
+  }
+  try {
+    if (
+      !inputSnapshot ||
+      typeof inputSnapshot !== 'object' ||
+      Array.isArray(inputSnapshot) ||
+      inputSnapshot.runId !== input.runId ||
+      inputSnapshot.status !== authorization.record.terminalStatus
+    ) {
+      return { status: 'invalid_snapshot' };
+    }
+    createWorkflowTerminalGraphFingerprint(inputSnapshot.serializedStepGraph);
+  } catch {
     return { status: 'invalid_snapshot' };
   }
   let recovery: WorkflowTerminalRecoveryEnvelopeRecordV1;
   try {
-    const envelope = materializeWorkflowTerminalRecoveryEnvelope(input.recoveryEnvelope);
-    validateWorkflowTerminalRecoveryGraphBinding(envelope, {
-      childSerializedStepGraph: input.snapshot.serializedStepGraph,
+    const envelope = materializeRecoveryEnvelope(input.recoveryEnvelope);
+    validateMaterializedWorkflowTerminalRecoveryGraphBinding(envelope, {
+      childSerializedStepGraph: inputSnapshot.serializedStepGraph,
     });
+    const envelopeHash = getMaterializedWorkflowTerminalRecoveryEnvelopeHash(envelope);
+    validateMaterializedWorkflowTerminalRecoveryEnvelope(
+      envelope,
+      {
+        workflowName: input.workflowName,
+        runId: input.runId,
+        terminalStatus: authorization.record.terminalStatus,
+      },
+      envelopeHash,
+    );
     recovery = {
       version: 1 as const,
-      envelopeHash: getWorkflowTerminalRecoveryEnvelopeHash(envelope),
-      envelope: copyWorkflowTerminalRecoveryEnvelope(envelope),
+      envelopeHash,
+      // materializeWorkflowTerminalRecoveryEnvelope already returned an owned,
+      // detached canonical value. Re-entering public validation/copy helpers
+      // here would repeatedly traverse an envelope that may be up to 8 MiB.
+      envelope,
     };
-    validateWorkflowTerminalRecoveryEnvelopeIntegrity(recovery, {
-      workflowName: input.workflowName,
-      runId: input.runId,
-      terminalStatus: existing.terminalStatus,
-    });
     if (envelope.ancestry.length > 0) {
+      // Nested envelopes must fit the exact aggregate budget that native
+      // parent continuation consumes. Root envelopes have no parent consumer.
+      materializeWorkflowTerminalParentContinuationChildProjection(envelope, now);
       if (!existingAncestry) return { status: 'missing_recovery_ancestry' };
       validateWorkflowTerminalRecoveryAncestryRecord(existingAncestry, {
         workflowName: input.workflowName,
@@ -1465,14 +1859,15 @@ export function persistWorkflowTerminalStateRecord(
   } catch {
     return { status: 'invalid_recovery_envelope' };
   }
-  const inputSnapshot = materializeSnapshot(input.snapshot);
+  const projectedSnapshot = { ...inputSnapshot };
+  delete projectedSnapshot.error;
+  if (authorization.record.terminalStatus === 'failed') {
+    projectedSnapshot.error = recovery.envelope.terminalResult
+      .error as PersistWorkflowTerminalStateInput['snapshot']['error'];
+  }
   const snapshot = materializeSnapshot({
-    ...inputSnapshot,
+    ...projectedSnapshot,
     result: recovery.envelope.terminalResult,
-    error:
-      existing.terminalStatus === 'failed'
-        ? (recovery.envelope.terminalResult.error as PersistWorkflowTerminalStateInput['snapshot']['error'])
-        : undefined,
     context: {
       ...inputSnapshot.context,
       __state: recovery.envelope.finalState as never,
@@ -1480,7 +1875,7 @@ export function persistWorkflowTerminalStateRecord(
     value: recovery.envelope.finalState as PersistWorkflowTerminalStateInput['snapshot']['value'],
     requestContext: recovery.envelope.requestContextPatch,
   });
-  if (!snapshot || snapshot.runId !== input.runId || snapshot.status !== existing.terminalStatus) {
+  if (!snapshot || snapshot.runId !== input.runId || snapshot.status !== authorization.record.terminalStatus) {
     return { status: 'invalid_snapshot' };
   }
   const leaseExpiresAt =
@@ -1490,7 +1885,7 @@ export function persistWorkflowTerminalStateRecord(
     snapshot,
     recovery,
     record: {
-      ...existing,
+      ...authorization.record,
       phase: 'run_state_persisted',
       updatedAt: now,
       ...(leaseExpiresAt === undefined ? {} : { leaseExpiresAt }),

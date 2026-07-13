@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import { InMemoryDB, WorkflowsInMemory, createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WorkflowsPG } from '.';
@@ -54,4 +54,66 @@ describe('WorkflowsPG terminal final state', () => {
       await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
     }
   });
+
+  it('preserves an application clock ahead of PostgreSQL during exact final-state replacement', async () => {
+    const workflowName = `terminal-final-state-skew-${randomUUID()}`;
+    const runId = 'run';
+    const memory = new WorkflowsInMemory({ db: new InMemoryDB() });
+    const applicationTimestamp = Date.now() + 60_000;
+    try {
+      for (const store of [memory, workflows] as const) {
+        const snapshot = createEmptyWorkflowSnapshot(runId);
+        snapshot.status = 'running';
+        snapshot.timestamp = applicationTimestamp;
+        await store.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+        await expect(
+          store.updateWorkflowState({
+            workflowName,
+            runId,
+            opts: { status: 'success', finalState: { exact: true } },
+          }),
+        ).resolves.toMatchObject({ status: 'success', timestamp: applicationTimestamp });
+        await expect(store.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+          status: 'success',
+          timestamp: applicationTimestamp,
+        });
+      }
+    } finally {
+      await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+    }
+  });
+
+  it.each([
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['unsafe', Number.MAX_SAFE_INTEGER + 1],
+  ] as const)(
+    'rejects a %s retained timestamp before exact final-state replacement across adapters',
+    async (_label, timestamp) => {
+      const workflowName = `terminal-final-state-clock-${randomUUID()}`;
+      const runId = 'run';
+      const memory = new WorkflowsInMemory({ db: new InMemoryDB() });
+      try {
+        for (const store of [memory, workflows] as const) {
+          const snapshot = createEmptyWorkflowSnapshot(runId);
+          snapshot.status = 'running';
+          snapshot.timestamp = timestamp;
+          await store.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+          await expect(
+            store.updateWorkflowState({
+              workflowName,
+              runId,
+              opts: { status: 'success', finalState: { exact: true } },
+            }),
+          ).rejects.toThrow();
+          await expect(store.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+            status: 'running',
+            timestamp,
+          });
+        }
+      } finally {
+        await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+      }
+    },
+  );
 });

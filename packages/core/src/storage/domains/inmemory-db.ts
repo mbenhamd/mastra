@@ -61,6 +61,11 @@ import type { ScorerDefinitionVersion } from './scorer-definitions';
 import type { SkillVersion } from './skills';
 import type { WorkspaceVersion } from './workspaces';
 
+export interface WorkflowTerminalParentRevisionState {
+  generation: number;
+  terminalStatus: 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | null;
+}
+
 class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminalDestinationReceiptRecord> {
   readonly #physicalKeysByEffect = new Map<string, Set<string>>();
   readonly #physicalKeysByLogicalEffect = new Map<string, Set<string>>();
@@ -180,8 +185,8 @@ export class InMemoryDB {
   readonly workflowTerminalDestinationReceipts = new WorkflowTerminalDestinationReceiptMap();
   /** Immutable continuation plans keyed by their canonical receipt identity. */
   readonly workflowTerminalContinuationPlans = new Map<string, WorkflowTerminalContinuationPlanRecord>();
-  /** Opaque monotonic revisions for atomic parent-application compare-and-set. */
-  readonly workflowTerminalParentRevisions = new Map<string, number>();
+  /** Opaque monotonic revisions plus an immutable terminal-status latch for parent recovery. */
+  readonly workflowTerminalParentRevisions = new Map<string, WorkflowTerminalParentRevisionState>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];

@@ -1,5 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from './index';
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext, isInfrastructureRequestContextKey } from './index';
+
+describe('isInfrastructureRequestContextKey', () => {
+  it.each([
+    'mastra__authToken',
+    'mastra__resourceId',
+    'mastra__future',
+    'mastra:tasks',
+    'mastra:goal',
+    '__mastraInternal',
+    '__harnessChannelReservedTools',
+    'harness',
+    'channel',
+    'MastraMemory',
+    'browser',
+    'user',
+    'userPermissions',
+    'userRoles',
+  ])('classifies %s as infrastructure-owned', key => {
+    expect(isInfrastructureRequestContextKey(key)).toBe(true);
+  });
+
+  it.each(['app', 'tenantId', 'mastra_', 'mastra', '__mastr', '__harnes'])('keeps %s application-owned', key => {
+    expect(isInfrastructureRequestContextKey(key)).toBe(false);
+  });
+});
 
 describe('RequestContext', () => {
   describe('constructor', () => {

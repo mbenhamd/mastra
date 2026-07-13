@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   InMemoryDB,
+  WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
   WorkflowsInMemory,
   createEmptyWorkflowSnapshot,
   createWorkflowTerminalGraphFingerprint,
+  validateWorkflowTerminalEffectIntegrity,
 } from '@mastra/core/storage';
 import type { WorkflowRunState, WorkflowTerminalRecoveryAncestryV1 } from '@mastra/core/workflows';
 import { getWorkflowTerminalRecoveryEnvelopeHash } from '@mastra/core/workflows';
@@ -15,6 +17,7 @@ import { WorkflowsPG } from '.';
 const NESTED_PARENT_GRAPH: WorkflowRunState['serializedStepGraph'] = [
   { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
 ];
+const EMPTY_CHILD_GRAPH_FINGERPRINT = createWorkflowTerminalGraphFingerprint([]);
 
 function createParentSnapshot(runId: string): WorkflowRunState {
   return { ...createEmptyWorkflowSnapshot(runId), serializedStepGraph: NESTED_PARENT_GRAPH };
@@ -44,7 +47,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       await pool.query(`DELETE FROM mastra_workflow_terminal_continuation_plans_v2 WHERE workflow_name = $1`, [
         workflowName,
       ]);
-      await pool.query(`DELETE FROM mastra_workflow_terminal_destination_receipts WHERE workflow_name = $1`, [
+      await pool.query(`DELETE FROM mastra_workflow_terminal_destination_receipts_v2 WHERE workflow_name = $1`, [
         workflowName,
       ]);
       await pool.query(`DELETE FROM mastra_workflow_terminal_effects_v2 WHERE workflow_name = $1`, [workflowName]);
@@ -113,11 +116,41 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       stepId: 'nested',
       nestedWorkflowName: child.workflowName,
       nestedRunId: child.runId,
+      expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
       result: { status: 'running' as const, payload: {} },
       requestContext: {},
       recoveryAncestry: ancestry(child, parent),
     };
   }
+
+  it('observes missing, nonterminal, and terminal durable run status after canonical row deletion', async () => {
+    const suffix = randomUUID();
+    const run = { workflowName: `status-run-${suffix}`, runId: 'run' };
+    try {
+      await expect(workflowsA.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'missing_run' });
+      await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+      await expect(workflowsA.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'nonterminal' });
+      await expect(
+        workflowsA.claimWorkflowTerminalization({
+          ...run,
+          eventKey: 'status-terminal',
+          terminalStatus: 'failed',
+          ownerId: 'status-owner',
+          leaseMs: 10_000,
+        }),
+      ).resolves.toMatchObject({ status: 'acquired' });
+      await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1 AND run_id = $2`, [
+        run.workflowName,
+        run.runId,
+      ]);
+      await expect(workflowsB.getWorkflowRunTerminalStatus(run)).resolves.toEqual({
+        status: 'terminal',
+        terminalStatus: 'failed',
+      });
+    } finally {
+      await cleanup([run.workflowName]);
+    }
+  });
 
   it('atomically admits graph-bound ownership and ancestry with read-only exact replay', async () => {
     const suffix = randomUUID();
@@ -143,24 +176,55 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       stepId: 'nested',
       nestedWorkflowName: child.workflowName,
       nestedRunId: child.runId,
+      expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
       result: { status: 'running' as const, payload: {} },
       requestContext: {},
       recoveryAncestry: childAncestry,
     };
     try {
-      await expect(workflowsA.admitWorkflowNestedRun(admission)).resolves.toMatchObject({ status: 'admitted' });
+      await expect(workflowsA.admitWorkflowNestedRun(admission)).resolves.toMatchObject({
+        status: 'admitted',
+        childSnapshotState: 'not_requested',
+      });
       const before = await pool.query(
         `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
         [parent.workflowName, parent.runId],
       );
-      await expect(workflowsB.admitWorkflowNestedRun(admission)).resolves.toMatchObject({
+      const repairSnapshot = {
+        ...createEmptyWorkflowSnapshot(child.runId),
+        status: 'running' as const,
+        context: { __state: { checkpoint: 'repaired' } } as WorkflowRunState['context'],
+        value: { checkpoint: 'repaired' },
+      };
+      await expect(
+        workflowsB.admitWorkflowNestedRun({
+          ...admission,
+          initialChildSnapshot: { resourceId: 'repaired-resource', snapshot: repairSnapshot },
+        }),
+      ).resolves.toMatchObject({
         status: 'already_admitted',
+        childSnapshotState: 'initialized',
       });
       const after = await pool.query(
         `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
         [parent.workflowName, parent.runId],
       );
       expect(after.rows[0]?.generation).toBe(before.rows[0]?.generation);
+      await expect(
+        workflowsA.admitWorkflowNestedRun({
+          ...admission,
+          initialChildSnapshot: {
+            snapshot: { ...repairSnapshot, value: { checkpoint: 'must-not-replace' } },
+          },
+        }),
+      ).resolves.toMatchObject({ status: 'already_admitted', childSnapshotState: 'retained' });
+      await expect(workflowsA.getWorkflowRunById(child)).resolves.toMatchObject({
+        resourceId: 'repaired-resource',
+        snapshot: {
+          context: { __state: { checkpoint: 'repaired' } },
+          value: { checkpoint: 'repaired' },
+        },
+      });
 
       const conflictingChild = { workflowName: `other-child-${suffix}`, runId: 'other-run' };
       const conflictingAncestry = ancestry(conflictingChild, parent);
@@ -193,6 +257,256 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       });
     } finally {
       await cleanup([parent.workflowName, child.workflowName, `other-child-${suffix}`, `forged-child-${suffix}`]);
+    }
+  });
+
+  it('atomically converges concurrent child initialization without replacing the winner', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `init-race-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `init-race-child-${suffix}`, runId: 'child-run' };
+    const parentGraph: WorkflowRunState['serializedStepGraph'] = [
+      { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+    ];
+    await workflowsA.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parent.runId),
+        serializedStepGraph: parentGraph,
+        context: { nested: { status: 'running', payload: {}, metadata: {} } } as WorkflowRunState['context'],
+      },
+    });
+    const childAncestry = ancestry(child, parent);
+    childAncestry[0]!.parentGraphFingerprint = createWorkflowTerminalGraphFingerprint(parentGraph);
+    const admission = {
+      ...parent,
+      stepId: 'nested',
+      nestedWorkflowName: child.workflowName,
+      nestedRunId: child.runId,
+      expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
+      result: { status: 'running' as const, payload: {} },
+      requestContext: {},
+      recoveryAncestry: childAncestry,
+    };
+    const withInitial = (winner: string) => ({
+      ...admission,
+      initialChildSnapshot: {
+        resourceId: `resource-${winner}`,
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'running' as const,
+          context: { __state: { winner } } as WorkflowRunState['context'],
+          value: { winner },
+        },
+      },
+    });
+
+    try {
+      const results = await Promise.all([
+        workflowsA.admitWorkflowNestedRun(withInitial('a')),
+        workflowsB.admitWorkflowNestedRun(withInitial('b')),
+      ]);
+      expect(results.map(result => result.status).sort()).toEqual(['admitted', 'already_admitted']);
+      expect(
+        results
+          .flatMap(result =>
+            result.status === 'admitted' || result.status === 'already_admitted' ? [result.childSnapshotState] : [],
+          )
+          .sort(),
+      ).toEqual(['initialized', 'retained']);
+      const retained = await workflowsA.getWorkflowRunById(child);
+      expect(retained).toMatchObject({
+        resourceId: expect.stringMatching(/^resource-[ab]$/),
+        snapshot: { context: { __state: { winner: expect.stringMatching(/^[ab]$/) } } },
+      });
+      const winner = (retained?.snapshot as WorkflowRunState).value as { winner: string };
+
+      await expect(workflowsB.admitWorkflowNestedRun(withInitial('replay'))).resolves.toMatchObject({
+        status: 'already_admitted',
+        childSnapshotState: 'retained',
+      });
+      await expect(workflowsA.getWorkflowRunById(child)).resolves.toMatchObject({
+        resourceId: `resource-${winner.winner}`,
+        snapshot: { context: { __state: { winner: winner.winner } }, value: { winner: winner.winner } },
+      });
+    } finally {
+      await cleanup([parent.workflowName, child.workflowName]);
+    }
+  });
+
+  it('does not resurrect a terminal child whose canonical snapshot was deleted', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `terminal-child-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `terminal-child-${suffix}`, runId: 'child-run' };
+    try {
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+      await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+      await expect(
+        workflowsA.claimWorkflowTerminalization({
+          ...child,
+          eventKey: 'terminal-child-event',
+          terminalStatus: 'failed',
+          ownerId: 'terminal-child-owner',
+          leaseMs: 10_000,
+        }),
+      ).resolves.toMatchObject({ status: 'acquired' });
+      await pool.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1 AND run_id = $2`, [
+        child.workflowName,
+        child.runId,
+      ]);
+      const parentBefore = await workflowsA.loadWorkflowSnapshot(parent);
+      await expect(workflowsA.getWorkflowRunTerminalStatus(child)).resolves.toEqual({
+        status: 'terminal',
+        terminalStatus: 'failed',
+      });
+
+      await expect(
+        workflowsB.admitWorkflowNestedRun({
+          ...nestedAdmission(parent, child),
+          initialChildSnapshot: { snapshot: { ...createEmptyWorkflowSnapshot(child.runId), status: 'running' } },
+        }),
+      ).resolves.toEqual({ status: 'child_terminal' });
+
+      await expect(workflowsA.loadWorkflowSnapshot(child)).resolves.toBeNull();
+      await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+    } finally {
+      await cleanup([parent.workflowName, child.workflowName]);
+    }
+  });
+
+  it.each([
+    ['wrong-run', { runId: 'forged-run' }],
+    ['unknown-status', { status: 'unknown' }],
+    ['graph-drift', { serializedStepGraph: [{ type: 'step', step: { id: 'drifted', component: 'WORKFLOW' } }] }],
+  ] as const)('rejects retained child %s without partial admission writes', async (label, patch) => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `conflict-parent-${label}-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `conflict-child-${label}-${suffix}`, runId: 'child-run' };
+    try {
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+      await workflowsA.persistWorkflowSnapshot({
+        ...child,
+        snapshot: { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as WorkflowRunState,
+      });
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        child.workflowName,
+        child.runId,
+      ]);
+      const parentBefore = await workflowsA.loadWorkflowSnapshot(parent);
+
+      await expect(workflowsB.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toEqual({
+        status: 'child_snapshot_conflict',
+      });
+
+      const revision = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      expect(revision.rowCount).toBe(0);
+      await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+    } finally {
+      await cleanup([parent.workflowName, child.workflowName]);
+    }
+  });
+
+  it.each(['own', 'inherited'] as const)(
+    'rejects an initial child snapshot with a nested %s toJSON hook without executing or writing it',
+    async placement => {
+      const suffix = randomUUID();
+      const parent = { workflowName: `tojson-parent-${placement}-${suffix}`, runId: 'parent-run' };
+      const child = { workflowName: `tojson-child-${placement}-${suffix}`, runId: 'child-run' };
+      try {
+        await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+        const parentBefore = await workflowsA.loadWorkflowSnapshot(parent);
+        let calls = 0;
+        const toJSON = () => {
+          calls += 1;
+          return { runId: 'forged-run' };
+        };
+        const payload = {};
+        if (placement === 'own') {
+          Object.defineProperty(payload, 'toJSON', { configurable: true, value: toJSON });
+        } else {
+          Object.setPrototypeOf(payload, { toJSON });
+        }
+        const snapshot = {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'running' as const,
+          context: { nested: { status: 'success', output: payload } } as WorkflowRunState['context'],
+          value: { payload },
+        };
+
+        await expect(
+          workflowsB.admitWorkflowNestedRun({
+            ...nestedAdmission(parent, child),
+            initialChildSnapshot: { snapshot },
+          }),
+        ).rejects.toThrow('Invalid workflow terminal recovery data at initialChildSnapshot.snapshot');
+        expect(calls).toBe(0);
+        await expect(workflowsA.loadWorkflowSnapshot(child)).resolves.toBeNull();
+        await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+          status: 'missing_ancestry',
+        });
+        await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+      } finally {
+        await cleanup([parent.workflowName, child.workflowName]);
+      }
+    },
+  );
+
+  it.each([
+    ['scalar', undefined],
+    ['foreach', 2],
+  ] as const)('binds an own __proto__ %s child slot identically across adapters', async (_label, forEachIndex) => {
+    const suffix = randomUUID();
+    const memory = new WorkflowsInMemory({ db: new InMemoryDB() });
+    const parent = { workflowName: `magic-owner-${suffix}`, runId: 'parent-run' };
+    const stores = [memory, workflowsA] as const;
+    const observations: unknown[] = [];
+    try {
+      for (const store of stores) {
+        await store.persistWorkflowSnapshot({ ...parent, snapshot: createEmptyWorkflowSnapshot(parent.runId) });
+        const operation = {
+          ...parent,
+          stepId: '__proto__',
+          nestedRunId: 'durable-child',
+          ...(forEachIndex === undefined ? {} : { forEachIndex }),
+          result: {
+            status: 'running' as const,
+            payload: { safe: true },
+            metadata: { caller: 'preserved', __workflow_meta: { caller: 'preserved' } },
+          },
+          requestContext: { admitted: true },
+        };
+        const bound = await store.bindWorkflowNestedRunOwnership(operation);
+        expect(bound.status).toBe('bound');
+        if (bound.status !== 'bound') throw new Error(`Expected bound, received ${bound.status}`);
+        const replay = await store.bindWorkflowNestedRunOwnership(operation);
+        expect(replay.status).toBe('already_bound');
+        const conflict = await store.bindWorkflowNestedRunOwnership({ ...operation, nestedRunId: 'other-child' });
+        expect(conflict).toEqual({ status: 'ownership_conflict' });
+
+        const snapshot = await store.loadWorkflowSnapshot(parent);
+        const ownStep = Object.getOwnPropertyDescriptor(snapshot?.context ?? {}, '__proto__')?.value;
+        expect(Object.hasOwn(snapshot?.context ?? {}, '__proto__')).toBe(true);
+        expect(Object.getPrototypeOf(snapshot?.context ?? {})).toBe(Object.prototype);
+        observations.push({ ownStep, requestContext: snapshot?.requestContext });
+        if (forEachIndex === undefined) {
+          expect(ownStep?.metadata?.nestedRunId).toBe('durable-child');
+        } else {
+          expect(ownStep?.metadata?.__workflow_meta?.[WORKFLOW_TERMINAL_FOREACH_RUN_KEY]?.[String(forEachIndex)]).toBe(
+            'durable-child',
+          );
+        }
+      }
+      expect(observations[1]).toEqual(observations[0]);
+    } finally {
+      await cleanup([parent.workflowName]);
     }
   });
 
@@ -234,6 +548,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
           stepId: 'nested',
           nestedWorkflowName: child.workflowName,
           nestedRunId: child.runId,
+          expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
           result: { status: 'running', payload: {} },
           requestContext: {},
           recoveryAncestry: childAncestry,
@@ -301,6 +616,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         value: { stale: 'must-be-replaced' },
         requestContext: { tenant: 'tenant-a' },
       };
+      const applicationClock = Date.now() + 60_000;
       const recoveryEnvelope = createTerminalRecoveryEnvelope({
         ...child,
         snapshot,
@@ -309,6 +625,8 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         terminalResult: {
           status: 'failed',
           error: new Error('parity failure', { cause: new Error('parity cause') }),
+          startedAt: applicationClock,
+          endedAt: applicationClock + 1,
         },
       });
       for (const [index, store] of stores.entries()) {
@@ -348,9 +666,12 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       });
       expect(recovered[1].effect).toMatchObject({
         effectKey: recovered[0].effect.effectKey,
-        payloadHash: recovered[0].effect.payloadHash,
         recoveryEnvelopeHash: recovered[0].effect.recoveryEnvelopeHash,
       });
+      for (const result of recovered) {
+        expect(() => validateWorkflowTerminalEffectIntegrity(result.effect)).not.toThrow();
+        expect(result.effect.retainedRecordHash).toBe(result.recovery.recordHash);
+      }
     } finally {
       await cleanup([child.workflowName, parent.workflowName]);
     }
@@ -400,6 +721,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
         const persisted = await workflowsA.loadWorkflowSnapshot(run);
         expect(persisted?.result).toEqual(terminalResult);
         expect(persisted?.error).toEqual(expectedError);
+        expect(Object.hasOwn(persisted ?? {}, 'error')).toBe(expectedError !== undefined);
       } finally {
         await cleanup([run.workflowName]);
       }
@@ -535,6 +857,7 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
           stepId: 'each',
           nestedWorkflowName: child.workflowName,
           nestedRunId,
+          expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
           forEachIndex,
           result: { status: 'running' as const, payload: ['a', 'b'], output: [null, null], startedAt: 1 },
           requestContext: { ownership: true },
@@ -771,6 +1094,72 @@ describe('WorkflowsPG terminal recovery envelope parity', () => {
       }
     },
   );
+
+  it('makes the first terminal claim authoritative before terminal snapshot persistence', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `claimed-terminal-parent-${suffix}`, runId: 'parent-run' };
+    const ancestryChild = { workflowName: `claimed-terminal-ancestry-${suffix}`, runId: 'child-run' };
+    const admissionChild = { workflowName: `claimed-terminal-admission-${suffix}`, runId: 'child-run' };
+    await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+
+    try {
+      await expect(
+        workflowsA.claimWorkflowTerminalization({
+          ...parent,
+          eventKey: 'parent-terminal',
+          terminalStatus: 'failed',
+          ownerId: 'owner',
+          leaseMs: 10_000,
+        }),
+      ).resolves.toMatchObject({ status: 'acquired' });
+      const marker = await pool.query<{ terminal_status: string | null }>(
+        `SELECT terminal_status FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(marker.rows[0]?.terminal_status).toBe('failed');
+      await expect(
+        workflowsA.persistWorkflowTerminalRecoveryAncestry({
+          ...ancestryChild,
+          ancestry: ancestry(ancestryChild, parent),
+        }),
+      ).rejects.toThrow('parent evidence is unavailable');
+      await expect(workflowsA.admitWorkflowNestedRun(nestedAdmission(parent, admissionChild))).resolves.toEqual({
+        status: 'parent_terminal',
+      });
+    } finally {
+      await cleanup([ancestryChild.workflowName, admissionChild.workflowName, parent.workflowName]);
+    }
+  });
+
+  it('rejects a terminal canonical parent even when a journal exists and the marker was cleared', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `journal-terminal-parent-${suffix}`, runId: 'parent-run' };
+    const child = { workflowName: `journal-terminal-child-${suffix}`, runId: 'child-run' };
+    await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+
+    try {
+      await claim(workflowsA, parent, 'success');
+      await workflowsA.persistWorkflowSnapshot({
+        ...parent,
+        snapshot: { ...createParentSnapshot(parent.runId), status: 'success' },
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_parent_revisions SET terminal_status = NULL
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+
+      await expect(
+        workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry: ancestry(child, parent) }),
+      ).rejects.toThrow('parent evidence is unavailable');
+      await expect(workflowsA.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+    } finally {
+      await cleanup([child.workflowName, parent.workflowName]);
+    }
+  });
 
   it('retains terminal ancestry evidence after journal cleanup and a running snapshot rewrite', async () => {
     const suffix = randomUUID();

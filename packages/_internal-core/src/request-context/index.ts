@@ -50,6 +50,34 @@ export const MASTRA_VERSIONS_KEY = 'mastra__versions';
  */
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
+/**
+ * Bare request-context slots populated and owned by Mastra runtime surfaces.
+ * Namespaced framework slots are covered by {@link isInfrastructureRequestContextKey}.
+ */
+const INFRASTRUCTURE_REQUEST_CONTEXT_KEYS: ReadonlySet<string> = new Set([
+  'harness',
+  'channel',
+  'MastraMemory',
+  'browser',
+  'user',
+  'userPermissions',
+  'userRoles',
+]);
+
+/**
+ * Returns whether a request-context key is owned by Mastra infrastructure and
+ * therefore must not be supplied or overwritten by application-level patches.
+ */
+export function isInfrastructureRequestContextKey(key: string): boolean {
+  return (
+    INFRASTRUCTURE_REQUEST_CONTEXT_KEYS.has(key) ||
+    key.startsWith('mastra__') ||
+    key.startsWith('mastra:') ||
+    key.startsWith('__mastra') ||
+    key.startsWith('__harness')
+  );
+}
+
 const SPAN_CONTEXT_MAX_KEYS = 100;
 const SPAN_CONTEXT_MAX_STRING_BYTES = 2_048;
 const SPAN_CONTEXT_MAX_TOTAL_BYTES = 16_384;

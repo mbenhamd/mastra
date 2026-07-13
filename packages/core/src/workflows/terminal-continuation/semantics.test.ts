@@ -13,6 +13,7 @@ import {
 } from './semantics';
 
 const RECOVERY_ENVELOPE_HASH = `sha256:${'e'.repeat(64)}` as const;
+const RETAINED_RECORD_HASH = `sha256:${'f'.repeat(64)}` as const;
 
 const mergePatch = {
   kind: 'merge-child-terminal',
@@ -93,6 +94,7 @@ function effect(
     sourceEventKey: 'event',
     terminalStatus,
     recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+    retainedRecordHash: RETAINED_RECORD_HASH,
     payloadHash: `sha256:${'d'.repeat(64)}`,
     createdAt: 20,
     parentWorkflowName: 'parent',
@@ -119,6 +121,7 @@ function retained(
     terminalStatus,
     createdAt: 20,
     envelopeHash: RECOVERY_ENVELOPE_HASH,
+    recordHash: RETAINED_RECORD_HASH,
     envelope: {
       version: 1,
       workflowName: 'child',
@@ -156,6 +159,68 @@ function contractFor(snapshot: WorkflowRunState, overrides: Record<string, unkno
 }
 
 describe('workflow terminal parent patch semantics', () => {
+  it('applies one aggregate child-projection budget at the exact node boundary', () => {
+    const finalState = { values: Array.from({ length: 2_045 }, () => null) };
+    const terminalResult = { status: 'success' };
+    const applyAt = (requestContextLength: number) => {
+      const parent = parentSnapshot();
+      const child = retained('success', terminalResult);
+      child.envelope.finalState = finalState;
+      child.envelope.requestContextPatch = {
+        values: Array.from({ length: requestContextLength }, () => null),
+      };
+      return applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(parent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: parent,
+        retainedChild: child,
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      });
+    };
+
+    expect(() => applyAt(2_048)).not.toThrow();
+    expect(() => applyAt(2_049)).toThrow(/node limit/);
+  });
+
+  it.each([
+    ['non-object metadata', { status: 'success', metadata: 'invalid' }, /metadata must be a normalized data object/],
+    ['non-monotonic timestamps', { status: 'success', startedAt: 21, endedAt: 20 }, /must be monotonic/],
+  ])('rejects producer-invalid %s through the actual parent patch', (_label, result, message) => {
+    const parent = parentSnapshot();
+    expect(() =>
+      applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(parent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: parent,
+        retainedChild: retained('success', result),
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(message);
+  });
+
+  it('accepts an application result clock ahead of retained database evidence', () => {
+    const parent = parentSnapshot();
+    parent.timestamp = 50;
+    const next = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(parent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: parent,
+      retainedChild: retained('success', { status: 'success', startedAt: 30, endedAt: 31 }),
+      storageTimestamp: 50,
+      executionMode: 'continuous',
+    });
+
+    expect(next).toMatchObject({ timestamp: 50, context: { nested: { startedAt: 10, endedAt: 31 } } });
+  });
+
   it('applies scalar success without mutating either snapshot', () => {
     const parent = parentSnapshot();
     const child = retained();
@@ -485,6 +550,55 @@ describe('workflow terminal parent patch semantics', () => {
       observedAt: '2026-01-01T00:00:00.000Z',
     });
     expect(next.value).toEqual({ nested: { observedAt: '2026-01-01T00:00:00.000Z' } });
+  });
+
+  it('preserves parent infrastructure context and applies only application-owned child keys', () => {
+    const parent = parentSnapshot();
+    parent.requestContext = {
+      mastra__resourceId: 'trusted-resource',
+      mastra__threadId: 'trusted-thread',
+      mastra__versions: { defaultStatus: 'published' },
+      __mastraInternal: 'trusted-internal',
+      user: { id: 'trusted-user' },
+      shared: 'parent',
+    };
+    const child = retained();
+    child.envelope.requestContextPatch = {
+      mastra__resourceId: 'untrusted-resource',
+      mastra__threadId: 'untrusted-thread',
+      mastra__versions: { defaultStatus: 'draft' },
+      mastra__future: 'untrusted-future-slot',
+      'mastra:tasks': 'untrusted-tasks',
+      __mastraInternal: 'untrusted-internal',
+      __harnessChannelReservedTools: ['untrusted-tool'],
+      user: { id: 'untrusted-user' },
+      shared: 'child',
+      custom: true,
+    };
+
+    const next = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(parent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: parent,
+      retainedChild: child,
+      storageTimestamp: 30,
+      executionMode: 'continuous',
+    });
+
+    expect(next.requestContext).toEqual({
+      mastra__resourceId: 'trusted-resource',
+      mastra__threadId: 'trusted-thread',
+      mastra__versions: { defaultStatus: 'published' },
+      __mastraInternal: 'trusted-internal',
+      user: { id: 'trusted-user' },
+      shared: 'child',
+      custom: true,
+    });
+    expect(next.requestContext).not.toHaveProperty('mastra__future');
+    expect(next.requestContext).not.toHaveProperty('mastra:tasks');
+    expect(next.requestContext).not.toHaveProperty('__harnessChannelReservedTools');
   });
 
   it('canonicalizes existing parent request context before applying the child overlay', () => {

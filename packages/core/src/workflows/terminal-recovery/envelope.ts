@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
+import { isInfrastructureRequestContextKey } from '../../request-context';
 import {
   MAX_TERMINAL_PATH_LENGTH,
   createWorkflowTerminalGraphFingerprint,
@@ -31,7 +32,6 @@ import type {
 } from './types';
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
-const AUTH_TOKEN_KEY = 'mastra__authToken';
 
 function fail(field: string, reason: string): never {
   throw new TypeError(`Invalid workflow terminal recovery envelope at ${field}: ${reason}`);
@@ -354,8 +354,9 @@ export function materializeWorkflowTerminalRecoveryEnvelope(
     read(input, 'requestContextPatch'),
     'requestContextPatch',
   );
-  if (Object.hasOwn(requestContextPatch, AUTH_TOKEN_KEY))
-    fail('requestContextPatch', 'contains a framework credential');
+  if (Object.keys(requestContextPatch).some(isInfrastructureRequestContextKey)) {
+    fail('requestContextPatch', 'contains an infrastructure-owned key');
+  }
   const ancestry = materializeWorkflowTerminalRecoveryAncestry(read(input, 'ancestry'));
   if (ancestry[0] && (ancestry[0].childWorkflowName !== workflowName || ancestry[0].childRunId !== runId)) {
     fail('ancestry[0]', 'does not start at the terminal child');
@@ -389,13 +390,15 @@ export function getWorkflowTerminalRecoveryEnvelopeHash(
   return getMaterializedWorkflowTerminalRecoveryEnvelopeHash(envelope);
 }
 
-function getMaterializedWorkflowTerminalRecoveryEnvelopeHash(
+/** @internal Call only with an envelope returned by materializeWorkflowTerminalRecoveryEnvelope. */
+export function getMaterializedWorkflowTerminalRecoveryEnvelopeHash(
   envelope: WorkflowTerminalRecoveryEnvelopeV1,
 ): WorkflowTerminalSha256 {
   return hashFramed('mastra.workflow-terminal-recovery-envelope.v1', JSON.stringify(envelope));
 }
 
-function validateMaterializedWorkflowTerminalRecoveryEnvelope(
+/** @internal Call only with an envelope returned by materializeWorkflowTerminalRecoveryEnvelope. */
+export function validateMaterializedWorkflowTerminalRecoveryEnvelope(
   envelope: WorkflowTerminalRecoveryEnvelopeV1,
   expected: WorkflowTerminalRecoveryEnvelopeExpectedBinding,
   computedEnvelopeHash?: WorkflowTerminalSha256,
@@ -483,7 +486,14 @@ export function validateWorkflowTerminalRecoveryGraphBinding(
   input: WorkflowTerminalRecoveryEnvelopeV1,
   binding: WorkflowTerminalRecoveryGraphBinding,
 ): void {
-  const envelope = materializeWorkflowTerminalRecoveryEnvelope(input);
+  validateMaterializedWorkflowTerminalRecoveryGraphBinding(materializeWorkflowTerminalRecoveryEnvelope(input), binding);
+}
+
+/** @internal Call only with an envelope returned by materializeWorkflowTerminalRecoveryEnvelope. */
+export function validateMaterializedWorkflowTerminalRecoveryGraphBinding(
+  envelope: WorkflowTerminalRecoveryEnvelopeV1,
+  binding: WorkflowTerminalRecoveryGraphBinding,
+): void {
   const bindingInput = descriptors(binding, 'graphBinding');
   exactKeys(
     bindingInput,

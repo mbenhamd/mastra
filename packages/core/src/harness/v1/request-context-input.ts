@@ -1,3 +1,4 @@
+import { isInfrastructureRequestContextKey } from '../../request-context';
 import type { JsonValue, PersistedRequestContextInput } from '../../storage/domains/harness';
 
 import { assertJsonValue, isPlainJsonObject } from './canonical-json';
@@ -20,23 +21,8 @@ export interface RequestContextInput {
   app?: Record<string, JsonValue>;
 }
 
-/**
- * Explicit reserved top-level request-context keys (§4.4c). `mastra__*` and `__mastra*` prefixes
- * are additionally rejected by {@link rejectNonAppKey}. The set is not exhaustive: ANY key other
- * than `app` is rejected, so future Harness/Mastra/server-owned slots are covered without edits.
- */
-const RESERVED_REQUEST_CONTEXT_KEYS: ReadonlySet<string> = new Set([
-  'harness',
-  'channel',
-  'MastraMemory',
-  'browser',
-  'user',
-  'userPermissions',
-  'userRoles',
-]);
-
 function rejectNonAppKey(key: string, path: string): never {
-  if (RESERVED_REQUEST_CONTEXT_KEYS.has(key) || key.startsWith('mastra__') || key.startsWith('__mastra')) {
+  if (isInfrastructureRequestContextKey(key)) {
     throw new HarnessValidationError(
       `${path}.${key}`,
       `request-context key "${key}" is infrastructure-owned and cannot be supplied by callers`,

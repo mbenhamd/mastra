@@ -104,10 +104,22 @@ function dataDescriptors(value: object, field: string): Record<PropertyKey, Prop
   return Object.getOwnPropertyDescriptors(value) as Record<PropertyKey, PropertyDescriptor>;
 }
 
-function inheritedErrorString(error: Error, key: 'name' | 'message', fallback: string, field: string): string {
+function inheritedErrorString(
+  error: Error,
+  key: 'name' | 'message',
+  fallback: string,
+  field: string,
+  depth: number,
+  state: CanonicalState,
+): string {
   let current: object | null = error;
+  let prototypeHops = 0;
   while (current) {
+    if (depth + prototypeHops > MAX_WORKFLOW_TERMINAL_RECOVERY_VALUE_DEPTH) {
+      fail(field, 'Error prototype depth limit exceeded');
+    }
     if (isProxy(current)) fail(field, 'proxy prototypes are not allowed');
+    if (prototypeHops > 0) consumeNode(state, field);
     const descriptor = Object.getOwnPropertyDescriptor(current, key);
     if (descriptor) {
       if (!('value' in descriptor)) fail(field, `${key} must be a data property`);
@@ -116,6 +128,7 @@ function inheritedErrorString(error: Error, key: 'name' | 'message', fallback: s
       return validateWorkflowTerminalRecoveryString(descriptor.value, `${field}.${key}`);
     }
     current = Object.getPrototypeOf(current);
+    prototypeHops++;
   }
   return fallback;
 }
@@ -134,8 +147,8 @@ function normalizeError(
     const ownKeys = Reflect.ownKeys(descriptors);
     consumeEntries(state, ownKeys.length + 2, field);
     const output: WorkflowTerminalCanonicalJsonObject = {};
-    const message = inheritedErrorString(error, 'message', '', field);
-    const name = inheritedErrorString(error, 'name', 'Error', field);
+    const message = inheritedErrorString(error, 'message', '', field, depth, state);
+    const name = inheritedErrorString(error, 'name', 'Error', field, depth, state);
     consumeBytes(state, 'message', `${field} key`);
     consumeBytes(state, message, `${field}.message`);
     consumeBytes(state, 'name', `${field} key`);
@@ -169,6 +182,14 @@ function normalizeError(
         if (descriptor.value === undefined) continue;
         const cause = normalizeValue(descriptor.value, `${field}.cause`, depth + 1, state, false);
         defineData(output, 'cause', cause);
+        continue;
+      }
+      // AggregateError owns a standard non-enumerable `errors` array. Treat it
+      // as native diagnostic data rather than as an arbitrary custom field.
+      if (key === 'errors') {
+        if (!Array.isArray(descriptor.value)) fail(`${field}.errors`, 'must be a dense array');
+        const errors = normalizeValue(descriptor.value, `${field}.errors`, depth + 1, state, false);
+        defineData(output, 'errors', errors);
         continue;
       }
       if (!descriptor.enumerable) fail(`${field}.${key}`, 'custom Error fields must be enumerable');

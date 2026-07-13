@@ -21,11 +21,11 @@ Version 1 retains:
 
 It never retains executable step graphs, workflow instances, callbacks, tools,
 provider clients, request objects, raw parent snapshots, complete captured
-`stepResults`, or raw resume payloads. The framework credential key
-`mastra__authToken` is rejected. Application-defined request-context keys are
-not classified heuristically; producers must supply an allowlisted projection
-and must not place provider tokens, authorization headers, or other secrets in
-that patch.
+`stepResults`, or raw resume payloads. Framework-owned request-context names
+(`mastra__*`, `mastra:*`, `__mastra*`, `__harness*`, and known bare
+infrastructure slots) are rejected.
+Producers must supply an allowlisted application projection and must not place
+provider tokens, authorization headers, or other secrets in that patch.
 
 Ancestry is captured before a durable nested child begins execution. A new
 child for which `shouldPersistSnapshot` returns `false` remains outside this
@@ -36,6 +36,13 @@ canonical envelope. A parent effect includes that envelope hash in its payload
 integrity, so the continuation contract and destination receipt transitively
 bind the exact retained result, error, final state, request-context patch,
 graph identity, and ancestry.
+
+Nested child identity is deterministic for one parent run and exact graph
+coordinate, so broker redelivery before admission does not invent a second
+child. Restart and time travel reuse retained ownership when it exists; a new
+execution generation requires a new parent run identity. This is durable
+identity, not exactly-once dispatch: a nonterminal admitted child may still be
+redispatched until a dedicated durable child-start outbox owns publication.
 
 ## Canonical data rules
 
@@ -58,20 +65,30 @@ iterators, or provider code.
 ## Runtime and storage boundary
 
 Supported storage adapters atomically retain pre-terminal ancestry together
-with parent ownership admission, separately from the replaceable child workflow
-snapshot. Terminal persistence produces the same envelope and hash in every
+with parent ownership admission and create the initial durable child snapshot
+when it is absent. Exact replay repairs a missing initial row after an admission
+crash but never replaces retained running or suspended progress. Later workflow
+snapshot updates remain independently replaceable. Every admission carries the
+expected child graph fingerprint even when no initializer is requested, so a
+nonpersisting durable replay cannot dispatch retained state from a different
+graph. A terminal child marker or snapshot returns `child_terminal` without
+resurrecting a deleted canonical row. Malformed, wrong-run, unknown-status, or
+graph-drifted retained state returns `child_snapshot_conflict`; these failure
+paths write neither parent ownership nor recovery ancestry. Terminal persistence produces the same envelope and hash in every
 adapter and validates them on every read. Nested scalar ownership is stored as
 `nestedRunId`; concurrent foreach ownership is stored as
 `iterationRunIds[index]` under the established workflow metadata key. Matching
-ownership-and-ancestry replay is read-only and does not reapply the transient
-running result or request-context projection; an ancestry, graph, or ownership
-mismatch writes neither half.
+ownership-and-ancestry replay does not reapply the transient running result or
+request-context projection; aside from create-if-absent child initialization it
+is read-only. An ancestry, graph, or ownership mismatch writes neither half.
 
 Recovery v1 accepts continuous execution only. PF-1780 owns planner invocation,
 bounded CAS/replan, committed framework-action dispatch, and runtime cutover.
-PF-1783 owns loop callback retry semantics. PF-1800 owns durable per-step
-recovery. No callback exactly-once, broker ACK, publication, merge, package
-release, or deployment behavior is introduced here.
+PF-1783 owns iteration-scoped nested-loop ownership and loop callback retry
+semantics; durable nested workflow loop execution fails before child dispatch
+until that coordinate contract exists. PF-1800 owns durable per-step recovery.
+No callback exactly-once, broker ACK, publication, merge, package release, or
+deployment behavior is introduced here.
 
 ## Verification
 

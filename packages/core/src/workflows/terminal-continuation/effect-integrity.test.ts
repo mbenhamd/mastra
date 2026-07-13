@@ -4,6 +4,7 @@ import type { WorkflowTerminalEffectRecord } from '../types';
 import { getWorkflowTerminalEffectIntegrity, validateWorkflowTerminalEffectIntegrity } from './effect-integrity';
 
 const RECOVERY_ENVELOPE_HASH = `sha256:${'1'.repeat(64)}` as const;
+const RETAINED_RECORD_HASH = `sha256:${'2'.repeat(64)}` as const;
 
 function effect(): Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }> {
   const identity = {
@@ -14,6 +15,7 @@ function effect(): Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflo
     kind: 'parent-workflow-step-end' as const,
     terminalStatus: 'success' as const,
     recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+    retainedRecordHash: RETAINED_RECORD_HASH,
     parentWorkflowName: 'parent',
     parentRunId: 'parent-run',
     parentStepId: 'nested',
@@ -57,9 +59,10 @@ describe('workflow terminal effect integrity', () => {
       sourceEventKey: 'evt/✓',
       terminalStatus: 'failed' as const,
       recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+      retainedRecordHash: RETAINED_RECORD_HASH,
       createdAt: 7,
       effectKey: 'wte:v1:3596b803a4c8fd49eec6d4b43851ce46bf8c27d86cf7f02263c3aab3b3f5e705',
-      payloadHash: 'sha256:6e30dabb6e83ba46780d40df60146c6ddcc0b6458f1f0b1f6bff1f54770aff70',
+      payloadHash: 'sha256:625fbac919e7ddce1f24aec529c4a74f8e2a86e0d52f830f9611a2389063d3ec',
     };
     const parent = {
       version: 1 as const,
@@ -69,13 +72,14 @@ describe('workflow terminal effect integrity', () => {
       sourceEventKey: 'evt/✓',
       terminalStatus: 'success' as const,
       recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+      retainedRecordHash: RETAINED_RECORD_HASH,
       parentWorkflowName: 'parent-δ',
       parentRunId: 'parent:1',
       parentStepId: 'nested-λ',
       parentExecutionPath: [12, 3],
       createdAt: 8,
       effectKey: 'wte:v1:a2259834ba6e16c819189443c3eb7061a81fa56ca03ec58d5197b5f09d961034',
-      payloadHash: 'sha256:0238cfee8559a4fbb56b34e6ad2b9905888aae53d57d0456bf3fd87a17bb3fab',
+      payloadHash: 'sha256:5c09305b23b148e943c9383784ff498294c47365e9d02176480b64782acff67b',
     };
     expect(getWorkflowTerminalEffectIntegrity(root)).toEqual({
       effectKey: root.effectKey,

@@ -123,6 +123,41 @@ describe('workflow terminal recovery canonical JSON', () => {
     expect(customGetter).not.toHaveBeenCalled();
   });
 
+  it('serializes bounded AggregateError members from Promise.any failures', async () => {
+    const aggregate = await Promise.any([
+      Promise.reject(new Error('first')),
+      Promise.reject(Object.assign(new Error('second'), { code: 'E_SECOND' })),
+    ]).catch((error: unknown) => error);
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    const canonical = materializeWorkflowTerminalCanonicalJson({ error: aggregate }) as Record<string, any>;
+    expect(canonical.error).toMatchObject({
+      name: 'AggregateError',
+      errors: [
+        { name: 'Error', message: 'first' },
+        { name: 'Error', message: 'second', code: 'E_SECOND' },
+      ],
+    });
+
+    const sparse = new AggregateError([]);
+    Object.defineProperty(sparse, 'errors', { configurable: true, value: new Array(1) });
+    expect(() => materializeWorkflowTerminalCanonicalJson({ error: sparse })).toThrow(/dense/);
+  });
+
+  it('bounds native Error prototype traversal without invoking proxy prototypes', () => {
+    const error = new Error('deep');
+    let prototype: object = Error.prototype;
+    for (let index = 0; index <= MAX_WORKFLOW_TERMINAL_RECOVERY_VALUE_DEPTH; index++) {
+      prototype = Object.create(prototype);
+    }
+    Object.setPrototypeOf(error, prototype);
+    expect(() => materializeWorkflowTerminalCanonicalJson({ error })).toThrow(/Error prototype depth limit/);
+
+    const prototypeTrap = vi.fn(() => Error.prototype);
+    Object.setPrototypeOf(error, new Proxy({}, { getPrototypeOf: prototypeTrap }));
+    expect(() => materializeWorkflowTerminalCanonicalJson({ error })).toThrow(/proxy prototypes/);
+    expect(prototypeTrap).not.toHaveBeenCalled();
+  });
+
   it('enforces envelope and Error stack byte limits', () => {
     expect(() =>
       materializeWorkflowTerminalCanonicalJson({

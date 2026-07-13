@@ -12,6 +12,7 @@ import {
 } from './planner';
 
 const RECOVERY_ENVELOPE_HASH = `sha256:${'a'.repeat(64)}` as const;
+const RETAINED_RECORD_HASH = `sha256:${'b'.repeat(64)}` as const;
 
 function effect(
   parentExecutionPath: number[] = [0],
@@ -27,6 +28,7 @@ function effect(
     sourceEventKey: 'event',
     terminalStatus,
     recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+    retainedRecordHash: RETAINED_RECORD_HASH,
     parentWorkflowName: 'parent',
     parentRunId: 'parent-run',
     parentStepId,
@@ -910,7 +912,7 @@ describe('workflow terminal parent continuation planner', () => {
     const parent = snapshot(graph);
     (parent.context.nested as any).metadata.iterationCount = 3;
     expect(createWorkflowTerminalLoopDecisionRequest(input(parent)).decisionKey).toBe(
-      'sha256:c178caa655135b19cf705eb9780df56ac386d24d3817bc3a38ff00b3dba44c05',
+      'sha256:c5f9fda68bbf9aea8e138786b17b241a77ab8b1d17727fe4525202aab9390b66',
     );
 
     const wrongOwner = structuredClone(parent);
@@ -919,7 +921,7 @@ describe('workflow terminal parent continuation planner', () => {
       action: {
         kind: 'quarantine',
         reason: 'plan-conflict',
-        conflictDigest: 'sha256:629084ad195fd98810262b2bf6bba1032d360dde2eebbd843ac29d576669cfed',
+        conflictDigest: 'sha256:ccdbf77fac5089b730ed0ea82c4546928dc076ca089191a2f08b4f80a5b081db',
       },
     });
   });

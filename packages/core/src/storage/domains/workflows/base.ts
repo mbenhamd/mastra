@@ -8,6 +8,8 @@ import type {
   DeleteCompletedWorkflowTerminalizationsResult,
   GetWorkflowTerminalizationInput,
   GetWorkflowTerminalizationResult,
+  GetWorkflowRunTerminalStatusInput,
+  GetWorkflowRunTerminalStatusResult,
   GetWorkflowTerminalEffectForDispatchInput,
   GetWorkflowTerminalEffectForDispatchResult,
   GetWorkflowTerminalDestinationReceiptInput,
@@ -68,6 +70,12 @@ export abstract class WorkflowsStorage extends StorageDomain {
   }
 
   async getWorkflowTerminalization(_input: GetWorkflowTerminalizationInput): Promise<GetWorkflowTerminalizationResult> {
+    return { status: 'unsupported' };
+  }
+
+  async getWorkflowRunTerminalStatus(
+    _input: GetWorkflowRunTerminalStatusInput,
+  ): Promise<GetWorkflowRunTerminalStatusResult> {
     return { status: 'unsupported' };
   }
 

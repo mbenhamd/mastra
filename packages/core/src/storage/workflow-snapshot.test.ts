@@ -179,4 +179,22 @@ describe('mergeWorkflowStepResult', () => {
 
     expect(context.foreach.output).toEqual([{ __mastra_pending__: true, value: 'user-data' }]);
   });
+
+  it('stores __proto__ as an own step result without mutating the context prototype', () => {
+    const snapshot = createEmptyWorkflowSnapshot('run-1');
+    const prototype = Object.getPrototypeOf(snapshot.context);
+    const result = { status: 'running', payload: { safe: true } } as any;
+
+    const context = mergeWorkflowStepResult({
+      snapshot,
+      stepId: '__proto__',
+      result,
+      requestContext: {},
+    });
+
+    expect(Object.getPrototypeOf(snapshot.context)).toBe(prototype);
+    expect(Object.hasOwn(snapshot.context, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(snapshot.context, '__proto__')?.value).toEqual(result);
+    expect(Object.hasOwn(context, '__proto__')).toBe(true);
+  });
 });

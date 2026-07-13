@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { createEmptyWorkflowSnapshot, createWorkflowTerminalGraphFingerprint } from '@mastra/core/storage';
+import {
+  createEmptyWorkflowSnapshot,
+  createWorkflowTerminalGraphFingerprint,
+  getWorkflowTerminalSnapshotRecordHash,
+} from '@mastra/core/storage';
 import type { WorkflowRunState, WorkflowTerminalRecoveryAncestryV1 } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -57,6 +61,40 @@ describe('WorkflowsPG terminal producer outbox', () => {
     } finally {
       client.release();
     }
+  }
+
+  async function refreshTerminalSnapshotRecordHash(workflowName: string, runId: string): Promise<void> {
+    const retained = await pool.query<{
+      version: string;
+      workflow_name: string;
+      run_id: string;
+      resource_id: string | null;
+      terminal_status: 'success' | 'failed' | 'canceled';
+      envelope_hash: string;
+      created_at: string;
+    }>(
+      `SELECT version::text, workflow_name, run_id, resource_id, terminal_status,
+              envelope_hash, created_at::text
+       FROM mastra_workflow_terminal_snapshots_v2
+       WHERE workflow_name = $1 AND run_id = $2`,
+      [workflowName, runId],
+    );
+    const row = retained.rows[0];
+    if (!row) throw new Error('Expected retained workflow terminal snapshot');
+    const recordHash = getWorkflowTerminalSnapshotRecordHash({
+      version: Number(row.version) as 1,
+      workflowName: row.workflow_name,
+      runId: row.run_id,
+      ...(row.resource_id === null ? {} : { resourceId: row.resource_id }),
+      terminalStatus: row.terminal_status,
+      envelopeHash: row.envelope_hash,
+      createdAt: Number(row.created_at),
+    });
+    await pool.query(
+      `UPDATE mastra_workflow_terminal_snapshots_v2 SET record_hash = $1
+       WHERE workflow_name = $2 AND run_id = $3`,
+      [recordHash, workflowName, runId],
+    );
   }
 
   async function createTerminalRun(
@@ -165,6 +203,24 @@ describe('WorkflowsPG terminal producer outbox', () => {
     const { run, fence } = await createTerminalRun(workflowName, 'run', 'resource-terminal');
 
     try {
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET resource_id = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        ['redirected-before-prepare', run.workflowName, run.runId],
+      );
+      await expect(
+        workflowsA.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: { kind: 'workflow-finish' },
+        }),
+      ).rejects.toThrow('Invalid workflow terminal snapshot record');
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET resource_id = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [run.resourceId, run.workflowName, run.runId],
+      );
+
       const results = await Promise.all([
         workflowsA.prepareWorkflowTerminalEffect({
           ...fence,
@@ -183,6 +239,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
       );
       expect(effects).toHaveLength(2);
       expect(effects[1]).toEqual(effects[0]);
+      expect(effects[0]?.resourceId).toBe(run.resourceId);
       const beforeRenewal = await pool.query<{ lease_expires_at: string }>(
         `SELECT lease_expires_at FROM mastra_workflow_terminalizations WHERE workflow_name = $1 AND run_id = $2`,
         [run.workflowName, run.runId],
@@ -213,6 +270,20 @@ describe('WorkflowsPG terminal producer outbox', () => {
           envelope: { terminalStatus: 'failed', finalState: { retained: true } },
         },
       });
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET resource_id = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        ['redirected-resource', run.workflowName, run.runId],
+      );
+      await expect(
+        workflowsA.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' }),
+      ).rejects.toThrow('Invalid workflow terminal snapshot record');
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET resource_id = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [run.resourceId, run.workflowName, run.runId],
+      );
 
       await workflowsA.deleteWorkflowRunById(run);
       await expect(
@@ -426,6 +497,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
            AND retained.workflow_name = $1 AND retained.run_id = $2`,
         [run.workflowName, run.runId],
       );
+      await refreshTerminalSnapshotRecordHash(run.workflowName, run.runId);
       await new Promise(resolve => setTimeout(resolve, 5));
       await expect(
         workflowsA.prepareWorkflowTerminalEffect({
@@ -442,6 +514,7 @@ describe('WorkflowsPG terminal producer outbox', () => {
            AND retained.workflow_name = $1 AND retained.run_id = $2`,
         [run.workflowName, run.runId],
       );
+      await refreshTerminalSnapshotRecordHash(run.workflowName, run.runId);
       await workflowsA.prepareWorkflowTerminalEffect({
         ...fence,
         expectedPhase: 'run_state_persisted',

@@ -114,6 +114,20 @@ export type GetWorkflowTerminalizationResult =
   | { status: 'found'; record: WorkflowTerminalizationObservation }
   | { status: 'missing_record' | 'missing_run' | 'unsupported' };
 
+export interface GetWorkflowRunTerminalStatusInput {
+  workflowName: string;
+  runId: string;
+}
+
+export type DurableWorkflowRunTerminalStatus = Extract<
+  WorkflowRunStatus,
+  'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed'
+>;
+
+export type GetWorkflowRunTerminalStatusResult =
+  | { status: 'terminal'; terminalStatus: DurableWorkflowRunTerminalStatus }
+  | { status: 'nonterminal' | 'missing_run' | 'unsupported' };
+
 export interface AdvanceWorkflowTerminalizationInput extends GetWorkflowTerminalizationInput {
   ownerId: string;
   claimToken: string;
@@ -160,7 +174,7 @@ export interface PersistWorkflowTerminalStateInput extends GetWorkflowTerminaliz
   claimToken: string;
   claimGeneration: number;
   snapshot: WorkflowRunState;
-  /** Canonicalized once in core before either adapter crosses its storage boundary. */
+  /** Canonicalized exactly once at the adapter's authorized persistence boundary. */
   recoveryEnvelope: WorkflowTerminalRecoveryEnvelopeInputV1;
   resourceId?: string;
   leaseMs?: number;
@@ -229,6 +243,13 @@ export type BindWorkflowNestedRunOwnershipResult =
 export interface AdmitWorkflowNestedRunInput extends BindWorkflowNestedRunOwnershipInput {
   nestedWorkflowName: string;
   recoveryAncestry: WorkflowTerminalRecoveryAncestryV1;
+  /** Canonical graph identity expected for retained or newly initialized child state. */
+  expectedChildGraphFingerprint: string;
+  /** Initial child state created only when the durable child row is absent. */
+  initialChildSnapshot?: {
+    snapshot: WorkflowRunState;
+    resourceId?: string;
+  };
 }
 
 export type AdmitWorkflowNestedRunResult =
@@ -236,9 +257,17 @@ export type AdmitWorkflowNestedRunResult =
       status: 'admitted' | 'already_admitted';
       stepResults: Record<string, StepResult<any, any, any, any>>;
       recovery: WorkflowTerminalRecoveryAncestryRecord;
+      childSnapshotState: 'initialized' | 'retained' | 'not_requested';
     }
   | {
-      status: 'ownership_conflict' | 'ancestry_conflict' | 'parent_terminal' | 'missing_run' | 'unsupported';
+      status:
+        | 'ownership_conflict'
+        | 'ancestry_conflict'
+        | 'parent_terminal'
+        | 'child_terminal'
+        | 'child_snapshot_conflict'
+        | 'missing_run'
+        | 'unsupported';
     };
 
 export type WorkflowTerminalEffectDescriptor =
@@ -375,6 +404,7 @@ export type GetWorkflowTerminalParentContextResult =
         | 'missing_terminal_state'
         | 'missing_parent'
         | 'corrupt_parent_state'
+        | 'parent_conflict'
         | 'missing_record'
         | 'missing_run'
         | 'unsupported';

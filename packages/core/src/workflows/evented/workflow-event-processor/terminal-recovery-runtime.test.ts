@@ -5,7 +5,13 @@ import { MockStore } from '../../../storage/mock';
 import { createEmptyWorkflowSnapshot } from '../../../storage/workflow-snapshot';
 import type { WorkflowRunState } from '../../../workflows/types';
 import { WORKFLOW_TERMINAL_FOREACH_RUN_KEY } from '../../terminal-continuation';
-import { WorkflowEventProcessor, resolveNestedWorkflowOwnedRunId } from '.';
+import {
+  WorkflowEventProcessor,
+  createNestedWorkflowRunId,
+  resolveNestedWorkflowDispatchRunId,
+  resolveNestedWorkflowLoopIteration,
+  resolveNestedWorkflowOwnedRunId,
+} from '.';
 import type { ProcessorArgs } from '.';
 
 class ExposedWorkflowEventProcessor extends WorkflowEventProcessor {
@@ -23,6 +29,10 @@ class ExposedWorkflowEventProcessor extends WorkflowEventProcessor {
 
   start(args: ProcessorArgs & { initialState?: Record<string, any> }) {
     return this.processWorkflowStart(args);
+  }
+
+  runStep(args: ProcessorArgs) {
+    return this.processWorkflowStepRun(args);
   }
 }
 
@@ -75,6 +85,245 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     expect(resolveNestedWorkflowOwnedRunId({ metadata, isForEach: true, forEachIndex: 1 })).toBe('iteration-one');
     expect(resolveNestedWorkflowOwnedRunId({ metadata, isForEach: true })).toBeUndefined();
     expect(resolveNestedWorkflowOwnedRunId({ metadata, isForEach: false })).toBe('scalar-run');
+  });
+
+  it('ignores inherited, accessor, and non-enumerable ownership without executing accessors', () => {
+    let accessorReads = 0;
+    const scalarMetadata = Object.create({ nestedRunId: 'inherited-run' });
+    Object.defineProperty(scalarMetadata, 'nestedRunId', {
+      enumerable: true,
+      get: () => {
+        accessorReads += 1;
+        return 'accessor-run';
+      },
+    });
+    expect(resolveNestedWorkflowOwnedRunId({ metadata: scalarMetadata, isForEach: false })).toBeUndefined();
+
+    const iterationRuns = Object.create({ '0': 'inherited-iteration' });
+    Object.defineProperty(iterationRuns, '0', {
+      enumerable: true,
+      get: () => {
+        accessorReads += 1;
+        return 'accessor-iteration';
+      },
+    });
+    const foreachMetadata = {
+      __workflow_meta: { [WORKFLOW_TERMINAL_FOREACH_RUN_KEY]: iterationRuns },
+    };
+    expect(
+      resolveNestedWorkflowOwnedRunId({ metadata: foreachMetadata, isForEach: true, forEachIndex: 0 }),
+    ).toBeUndefined();
+
+    const loopMetadata = Object.create({ iterationCount: 9 });
+    Object.defineProperty(loopMetadata, 'iterationCount', {
+      enumerable: true,
+      get: () => {
+        accessorReads += 1;
+        return 10;
+      },
+    });
+    expect(resolveNestedWorkflowLoopIteration(loopMetadata)).toBe(0);
+    expect(accessorReads).toBe(0);
+
+    const base = {
+      parentWorkflowId: 'parent',
+      parentRunId: 'parent-run',
+      nestedWorkflowId: 'child',
+      stepId: 'child',
+      executionPath: [0],
+    };
+    expect(resolveNestedWorkflowDispatchRunId({ ...base, ownedRunId: undefined })).toBe(
+      createNestedWorkflowRunId(base),
+    );
+  });
+
+  it('fails closed on malformed retained scalar and foreach owner identities', () => {
+    const invalidOwners: unknown[] = ['', 'x'.repeat(513), `run${String.fromCharCode(0xd800)}`, null, 42];
+    const base = {
+      parentWorkflowId: 'parent',
+      parentRunId: 'parent-run',
+      nestedWorkflowId: 'child',
+      stepId: 'child',
+      executionPath: [0],
+    };
+    for (const ownedRunId of invalidOwners) {
+      expect(() =>
+        resolveNestedWorkflowOwnedRunId({ metadata: { nestedRunId: ownedRunId }, isForEach: false }),
+      ).toThrow(TypeError);
+      expect(() =>
+        resolveNestedWorkflowOwnedRunId({
+          metadata: { __workflow_meta: { [WORKFLOW_TERMINAL_FOREACH_RUN_KEY]: { '0': ownedRunId } } },
+          isForEach: true,
+          forEachIndex: 0,
+        }),
+      ).toThrow(TypeError);
+      if (typeof ownedRunId === 'string') {
+        expect(() => resolveNestedWorkflowDispatchRunId({ ...base, ownedRunId })).toThrow(TypeError);
+      }
+    }
+    for (const forEachIndex of [-1, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() =>
+        resolveNestedWorkflowOwnedRunId({
+          metadata: { __workflow_meta: { [WORKFLOW_TERMINAL_FOREACH_RUN_KEY]: { [String(forEachIndex)]: 'run' } } },
+          isForEach: true,
+          forEachIndex,
+        }),
+      ).toThrow(TypeError);
+    }
+  });
+
+  it('derives one nested run id per canonical broker-delivery coordinate', () => {
+    const base = {
+      parentWorkflowId: 'parent',
+      parentRunId: 'parent-run',
+      nestedWorkflowId: 'child',
+      stepId: 'child',
+      executionPath: [0],
+    };
+    expect(createNestedWorkflowRunId(base)).toBe(createNestedWorkflowRunId(base));
+    expect(createNestedWorkflowRunId(base)).not.toBe(createNestedWorkflowRunId({ ...base, executionPath: [1] }));
+    expect(createNestedWorkflowRunId({ ...base, loopIteration: 1 })).not.toBe(
+      createNestedWorkflowRunId({ ...base, loopIteration: 2 }),
+    );
+    expect(resolveNestedWorkflowDispatchRunId({ ...base, ownedRunId: 'retained-run' })).toBe('retained-run');
+    expect(resolveNestedWorkflowDispatchRunId(base)).not.toBe(
+      resolveNestedWorkflowDispatchRunId({ ...base, parentRunId: 'new-execution-generation' }),
+    );
+  });
+
+  it('rejects unbounded or non-canonical nested execution coordinates', () => {
+    const base = {
+      parentWorkflowId: 'parent',
+      parentRunId: 'parent-run',
+      nestedWorkflowId: 'child',
+      stepId: 'child',
+      executionPath: [0],
+    };
+    for (const field of ['parentWorkflowId', 'parentRunId', 'nestedWorkflowId', 'stepId'] as const) {
+      expect(() => createNestedWorkflowRunId({ ...base, [field]: 'x'.repeat(513) })).toThrow(TypeError);
+    }
+    expect(() => createNestedWorkflowRunId({ ...base, executionPath: Array(257).fill(0) })).toThrow(TypeError);
+    expect(() => createNestedWorkflowRunId({ ...base, executionPath: [Number.MAX_SAFE_INTEGER + 1] })).toThrow(
+      TypeError,
+    );
+    expect(() => createNestedWorkflowRunId({ ...base, executionPath: Array(2) })).toThrow(TypeError);
+    expect(() => createNestedWorkflowRunId({ ...base, loopIteration: Number.MAX_SAFE_INTEGER + 1 })).toThrow(TypeError);
+    expect(() =>
+      resolveNestedWorkflowDispatchRunId({ ...base, executionPath: Array(257).fill(0), ownedRunId: 'retained-run' }),
+    ).toThrow(TypeError);
+  });
+
+  it('publishes the same child run id when an ordinary nested start is redelivered', async () => {
+    const { mastra, processor } = await setup();
+    const nestedStep = { id: 'child', component: 'WORKFLOW' as const, options: {} };
+    const parentWorkflow = {
+      id: 'parent',
+      stepGraph: [{ type: 'step' as const, step: nestedStep }],
+      serializedStepGraph: [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }],
+      retryConfig: { attempts: 0 },
+      options: {},
+    } as unknown as ProcessorArgs['workflow'];
+    const args: ProcessorArgs = {
+      workflow: parentWorkflow,
+      workflowId: 'parent',
+      runId: 'parent-run',
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success', output: {} },
+      requestContext: {},
+    };
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    await processor.runStep(structuredClone(args));
+    await processor.runStep(structuredClone(args));
+
+    const starts = publish.mock.calls
+      .map(([, event]) => event)
+      .filter(event => event.type === 'workflow.start') as Array<{ data: { runId: string } }>;
+    expect(starts).toHaveLength(2);
+    expect(starts[0]!.data.runId).toMatch(/^wfn:v1:[a-f0-9]{64}$/);
+    expect(starts[1]!.data.runId).toBe(starts[0]!.data.runId);
+    await mastra.shutdown();
+  });
+
+  it('evaluates persistence once and gates a retained nested loop before admission or dispatch', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'loop-parent-run';
+    const childRunId = 'loop-child-run';
+    const parentGraph = [
+      {
+        type: 'loop' as const,
+        step: { id: 'child', component: 'WORKFLOW' },
+        serializedCondition: { id: 'condition', fn: '() => false' },
+        loopType: 'dountil' as const,
+      },
+    ];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const shouldPersistSnapshot = vi.fn(() => false);
+    const childWorkflow = {
+      ...workflow('child'),
+      options: { shouldPersistSnapshot },
+    } as ProcessorArgs['workflow'];
+    const parentWorkflow = {
+      workflowId: 'parent',
+      runId: parentRunId,
+      stepId: 'child',
+      executionPath: [0],
+      resume: false,
+      stepResults: {},
+      stepGraph: parentGraph,
+      activeStepsPath: {},
+      resumeSteps: [],
+      resumeData: undefined,
+      input: { status: 'success' as const, output: {} },
+    } as ProcessorArgs['parentWorkflow'];
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    const args: ProcessorArgs = {
+      workflow: childWorkflow,
+      workflowId: 'child',
+      runId: childRunId,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success', output: {} },
+      requestContext: {},
+      parentWorkflow,
+    };
+    await expect(processor.start(args)).resolves.toBeUndefined();
+    expect(shouldPersistSnapshot).toHaveBeenCalledTimes(1);
+
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'child',
+      runId: childRunId,
+      snapshot: { ...createEmptyWorkflowSnapshot(childRunId), status: 'suspended' },
+    });
+    publish.mockClear();
+    await expect(
+      processor.start({
+        ...args,
+        resumeSteps: ['inner'],
+        parentWorkflow: { ...parentWorkflow, resume: true, resumeSteps: ['child', 'inner'] },
+      }),
+    ).rejects.toMatchObject({ id: 'MASTRA_WORKFLOW_DURABLE_NESTED_LOOP_OWNERSHIP_UNSUPPORTED' });
+    expect(shouldPersistSnapshot).toHaveBeenCalledTimes(2);
+    expect(shouldPersistSnapshot).toHaveBeenLastCalledWith({
+      stepResults: {},
+      workflowStatus: 'running',
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await mastra.shutdown();
   });
 
   it('passes exact event-local final state to success, failure, and cancellation terminal writes', async () => {
@@ -344,6 +593,454 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     await expect(
       workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: 'late-child-run' }),
     ).resolves.toBeNull();
+    await mastra.shutdown();
+  });
+
+  it('fails closed before dispatch when a recovery-capable store has no durable parent snapshot', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const transientWorkflow = workflow('child');
+    transientWorkflow.options.shouldPersistSnapshot = () => false;
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+
+    await expect(
+      processor.start({
+        workflow: transientWorkflow,
+        workflowId: 'child',
+        runId: 'missing-parent-child-run',
+        executionPath: [0],
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        prevResult: { status: 'success', output: {} },
+        requestContext: {},
+        parentWorkflow: {
+          workflowId: 'parent',
+          runId: 'missing-parent-run',
+          stepId: 'child',
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepGraph: [{ type: 'step', step: { id: 'child', component: 'WORKFLOW' } }],
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: { status: 'success', output: {} },
+        },
+      }),
+    ).rejects.toMatchObject({ id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_PARENT_MISSING' });
+    expect(persist).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    await mastra.shutdown();
+  });
+
+  it.each(['terminal-snapshot', 'terminal-marker', 'terminal-tombstone'] as const)(
+    'does not dispatch a nonpersisting child with no child evidence under a parent %s',
+    async terminalEvidence => {
+      const { mastra, workflows, processor } = await setup();
+      const parentRunId = `transient-terminal-parent-${terminalEvidence}`;
+      const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+      await workflows.persistWorkflowSnapshot({
+        workflowName: 'parent',
+        runId: parentRunId,
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(parentRunId),
+          status: terminalEvidence === 'terminal-snapshot' ? 'success' : 'running',
+          serializedStepGraph: parentGraph,
+        },
+      });
+      if (terminalEvidence !== 'terminal-snapshot') {
+        await expect(
+          workflows.claimWorkflowTerminalization({
+            workflowName: 'parent',
+            runId: parentRunId,
+            eventKey: 'parent-terminal-event',
+            terminalStatus: 'failed',
+            ownerId: 'parent-terminal-owner',
+            leaseMs: 10_000,
+          }),
+        ).resolves.toMatchObject({ status: 'acquired' });
+        if (terminalEvidence === 'terminal-tombstone') {
+          await workflows.deleteWorkflowRunById({ workflowName: 'parent', runId: parentRunId });
+        }
+      }
+      const transientWorkflow = workflow('child');
+      transientWorkflow.options.shouldPersistSnapshot = () => false;
+      const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+      const publish = vi.spyOn(mastra.pubsub, 'publish');
+      persist.mockClear();
+
+      await expect(
+        processor.start({
+          workflow: transientWorkflow,
+          workflowId: 'child',
+          runId: `transient-child-${terminalEvidence}`,
+          executionPath: [0],
+          stepResults: {},
+          activeStepsPath: {},
+          resumeSteps: [],
+          prevResult: { status: 'success', output: {} },
+          requestContext: {},
+          parentWorkflow: {
+            workflowId: 'parent',
+            runId: parentRunId,
+            stepId: 'child',
+            executionPath: [0],
+            resume: false,
+            stepResults: {},
+            stepGraph: parentGraph,
+            activeStepsPath: {},
+            resumeSteps: [],
+            resumeData: undefined,
+            input: { status: 'success', output: {} },
+          },
+        }),
+      ).resolves.toBeUndefined();
+      expect(persist).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      await mastra.shutdown();
+    },
+  );
+
+  it.each(['terminal-snapshot', 'terminal-journal', 'terminal-tombstone'] as const)(
+    'does not rewrite or republish an already-admitted child with an existing %s',
+    async terminalEvidence => {
+      const { mastra, workflows, processor } = await setup();
+      const parentRunId = `redelivery-parent-${terminalEvidence}`;
+      const childRunId = `redelivery-child-${terminalEvidence}`;
+      const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+      await workflows.persistWorkflowSnapshot({
+        workflowName: 'parent',
+        runId: parentRunId,
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(parentRunId),
+          status: 'running',
+          serializedStepGraph: parentGraph,
+        },
+      });
+      const args = {
+        workflow: workflow('child'),
+        workflowId: 'child',
+        runId: childRunId,
+        executionPath: [0],
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        prevResult: { status: 'success' as const, output: {} },
+        requestContext: {},
+        parentWorkflow: {
+          workflowId: 'parent',
+          runId: parentRunId,
+          stepId: 'child',
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepGraph: parentGraph,
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: { status: 'success' as const, output: {} },
+        },
+      } satisfies ProcessorArgs;
+      const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+      const publish = vi.spyOn(mastra.pubsub, 'publish');
+      await processor.start(args);
+
+      if (terminalEvidence === 'terminal-snapshot') {
+        await workflows.persistWorkflowSnapshot({
+          workflowName: 'child',
+          runId: childRunId,
+          snapshot: { ...createEmptyWorkflowSnapshot(childRunId), status: 'success' },
+        });
+      } else {
+        await expect(
+          workflows.claimWorkflowTerminalization({
+            workflowName: 'child',
+            runId: childRunId,
+            eventKey: 'terminal-event',
+            terminalStatus: 'failed',
+            ownerId: 'terminal-owner',
+            leaseMs: 10_000,
+          }),
+        ).resolves.toMatchObject({ status: 'acquired' });
+        if (terminalEvidence === 'terminal-tombstone') {
+          await workflows.deleteWorkflowRunById({ workflowName: 'child', runId: childRunId });
+        }
+      }
+      persist.mockClear();
+      publish.mockClear();
+
+      const replayWorkflow = workflow('child');
+      if (terminalEvidence === 'terminal-tombstone') {
+        replayWorkflow.options.shouldPersistSnapshot = () => false;
+      }
+      await expect(processor.start({ ...args, workflow: replayWorkflow })).resolves.toBeUndefined();
+
+      expect(persist).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      const retained = expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves;
+      if (terminalEvidence === 'terminal-tombstone') {
+        await retained.toBeNull();
+      } else {
+        await retained.toMatchObject({ status: terminalEvidence === 'terminal-snapshot' ? 'success' : 'running' });
+      }
+      await mastra.shutdown();
+    },
+  );
+
+  it('fails closed when only retained ancestry remains for a nonpersisting child replay', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'ancestry-only-parent-run';
+    const childRunId = 'ancestry-only-child-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const args = {
+      workflow: workflow('child'),
+      workflowId: 'child',
+      runId: childRunId,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success' as const, output: {} },
+      requestContext: {},
+      parentWorkflow: {
+        workflowId: 'parent',
+        runId: parentRunId,
+        stepId: 'child',
+        executionPath: [0],
+        resume: false,
+        stepResults: {},
+        stepGraph: parentGraph,
+        activeStepsPath: {},
+        resumeSteps: [],
+        resumeData: undefined,
+        input: { status: 'success' as const, output: {} },
+      },
+    } satisfies ProcessorArgs;
+    await processor.start(args);
+    await workflows.deleteWorkflowRunById({ workflowName: 'child', runId: childRunId });
+    const replayWorkflow = workflow('child');
+    replayWorkflow.options.shouldPersistSnapshot = () => false;
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+    persist.mockClear();
+    publish.mockClear();
+
+    await expect(processor.start({ ...args, workflow: replayWorkflow })).rejects.toMatchObject({
+      id: 'MASTRA_WORKFLOW_NESTED_RUN_RETAINED_SNAPSHOT_MISSING',
+    });
+    expect(persist).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    await mastra.shutdown();
+  });
+
+  it.each(['running', 'suspended'] as const)(
+    'redispatches an already-admitted %s child without replacing retained progress',
+    async childStatus => {
+      const { mastra, workflows, processor } = await setup();
+      const parentRunId = `progress-parent-${childStatus}`;
+      const childRunId = `progress-child-${childStatus}`;
+      const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+      await workflows.persistWorkflowSnapshot({
+        workflowName: 'parent',
+        runId: parentRunId,
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(parentRunId),
+          status: 'running',
+          serializedStepGraph: parentGraph,
+        },
+      });
+      const args = {
+        workflow: workflow('child'),
+        workflowId: 'child',
+        runId: childRunId,
+        executionPath: [0],
+        stepResults: {},
+        activeStepsPath: {},
+        resumeSteps: [],
+        prevResult: { status: 'success' as const, output: {} },
+        requestContext: {},
+        parentWorkflow: {
+          workflowId: 'parent',
+          runId: parentRunId,
+          stepId: 'child',
+          executionPath: [0],
+          resume: false,
+          stepResults: {},
+          stepGraph: parentGraph,
+          activeStepsPath: {},
+          resumeSteps: [],
+          resumeData: undefined,
+          input: { status: 'success' as const, output: {} },
+        },
+      } satisfies ProcessorArgs;
+
+      await processor.start(args);
+      const admitted = await workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId });
+      if (!admitted) throw new Error('Expected admitted child snapshot');
+      const retained: WorkflowRunState = {
+        ...admitted,
+        status: childStatus,
+        timestamp: admitted.timestamp + 1,
+        context: {
+          ...admitted.context,
+          completed: { status: 'success', output: { preserved: true } },
+          __state: { checkpoint: childStatus },
+        } as WorkflowRunState['context'],
+        value: { checkpoint: childStatus },
+        ...(childStatus === 'suspended'
+          ? { suspendedPaths: { awaiting: [0] }, resumeLabels: { resume: { stepId: 'awaiting' } } }
+          : {}),
+      };
+      await workflows.persistWorkflowSnapshot({ workflowName: 'child', runId: childRunId, snapshot: retained });
+      const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+      const publish = vi.spyOn(mastra.pubsub, 'publish');
+      persist.mockClear();
+      publish.mockClear();
+
+      await expect(processor.start(args)).resolves.toBeUndefined();
+
+      expect(persist).not.toHaveBeenCalled();
+      await expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves.toEqual(
+        retained,
+      );
+      expect(publish.mock.calls.map(([channel, event]) => [channel, event.type])).toEqual([
+        [`workflow.events.v2.${childRunId}`, 'watch'],
+        ['workflows', 'workflow.step.run'],
+      ]);
+      await mastra.shutdown();
+    },
+  );
+
+  it('rejects retained child graph drift on a nonpersisting durable replay before publication', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'graph-drift-parent-run';
+    const childRunId = 'graph-drift-child-run';
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const args = {
+      workflow: workflow('child'),
+      workflowId: 'child',
+      runId: childRunId,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success' as const, output: {} },
+      requestContext: {},
+      parentWorkflow: {
+        workflowId: 'parent',
+        runId: parentRunId,
+        stepId: 'child',
+        executionPath: [0],
+        resume: false,
+        stepResults: {},
+        stepGraph: parentGraph,
+        activeStepsPath: {},
+        resumeSteps: [],
+        resumeData: undefined,
+        input: { status: 'success' as const, output: {} },
+      },
+    } satisfies ProcessorArgs;
+    await processor.start(args);
+
+    const driftedWorkflow = workflow('child', [{ type: 'step', step: { id: 'drifted', component: 'WORKFLOW' } }]);
+    driftedWorkflow.options.shouldPersistSnapshot = () => false;
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const publish = vi.spyOn(mastra.pubsub, 'publish');
+    persist.mockClear();
+    publish.mockClear();
+
+    await expect(processor.start({ ...args, workflow: driftedWorkflow })).rejects.toMatchObject({
+      id: 'MASTRA_WORKFLOW_NESTED_RUN_CHILD_SNAPSHOT_CONFLICT',
+    });
+    expect(persist).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    await mastra.shutdown();
+  });
+
+  it('does not overwrite progress injected after atomic admission and before start publication completes', async () => {
+    const { mastra, workflows, processor } = await setup();
+    const parentRunId = 'barrier-parent-run';
+    const childRunId = 'barrier-child-run';
+    const childWorkflow = workflow('child');
+    const parentGraph = [{ type: 'step' as const, step: { id: 'child', component: 'WORKFLOW' } }];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: parentRunId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parentRunId),
+        status: 'running',
+        serializedStepGraph: parentGraph,
+      },
+    });
+    const progress: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(childRunId),
+      status: 'running',
+      serializedStepGraph: childWorkflow.serializedStepGraph,
+      context: {
+        completed: { status: 'success', output: { durable: true } },
+        __state: { checkpoint: 'after-admission' },
+      } as WorkflowRunState['context'],
+      value: { checkpoint: 'after-admission' },
+    };
+    const persist = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    let injected = false;
+    vi.spyOn(mastra.pubsub, 'publish').mockImplementation(async (channel, event) => {
+      if (!injected && channel === `workflow.events.v2.${childRunId}`) {
+        injected = true;
+        await workflows.persistWorkflowSnapshot({ workflowName: 'child', runId: childRunId, snapshot: progress });
+      }
+      void event;
+    });
+
+    await processor.start({
+      workflow: childWorkflow,
+      workflowId: 'child',
+      runId: childRunId,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success', output: {} },
+      requestContext: {},
+      parentWorkflow: {
+        workflowId: 'parent',
+        runId: parentRunId,
+        stepId: 'child',
+        executionPath: [0],
+        resume: false,
+        stepResults: {},
+        stepGraph: parentGraph,
+        activeStepsPath: {},
+        resumeSteps: [],
+        resumeData: undefined,
+        input: { status: 'success', output: {} },
+      },
+    });
+
+    expect(injected).toBe(true);
+    expect(persist).toHaveBeenCalledTimes(1);
+    await expect(workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: childRunId })).resolves.toEqual(
+      progress,
+    );
     await mastra.shutdown();
   });
 

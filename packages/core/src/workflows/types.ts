@@ -413,6 +413,10 @@ interface WorkflowTerminalEffectRecordBase {
   terminalStatus: WorkflowTerminalStatus;
   /** Hash of the canonical retained recovery envelope authorized by this effect. */
   recoveryEnvelopeHash: `sha256:${string}`;
+  /** Hash of the complete retained terminal record, including resource presence. */
+  retainedRecordHash: `sha256:${string}`;
+  /** Optional canonical finish-delivery resource identity bound into payloadHash. */
+  resourceId?: string;
   payloadHash: string;
   createdAt: number;
 }
@@ -443,6 +447,8 @@ export interface WorkflowTerminalSnapshotRecord {
   resourceId?: string;
   terminalStatus: WorkflowTerminalStatus;
   envelopeHash: `sha256:${string}`;
+  /** Authenticates the envelope binding and explicit present/absent resource identity. */
+  recordHash: `sha256:${string}`;
   envelope: WorkflowTerminalRecoveryEnvelopeV1;
   createdAt: number;
 }

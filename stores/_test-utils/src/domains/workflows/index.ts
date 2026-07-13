@@ -1006,7 +1006,10 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
             runId,
             terminalStatus: 'failed',
             executionMode: 'continuous',
-            terminalResult: { status: 'failed', error: 'terminal test failure' },
+            terminalResult: {
+              status: 'failed',
+              error: { name: 'Error', message: 'terminal test failure' },
+            },
             finalState: snapshot.value ?? {},
             requestContextPatch: snapshot.requestContext ?? {},
             childGraphFingerprint: createWorkflowTerminalGraphFingerprint(snapshot.serializedStepGraph),

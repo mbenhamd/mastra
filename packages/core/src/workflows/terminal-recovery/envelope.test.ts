@@ -105,6 +105,17 @@ describe('workflow terminal recovery envelope', () => {
   it('enforces terminal result and request-context policy', () => {
     expect(() =>
       materializeWorkflowTerminalRecoveryEnvelope(
+        input({
+          terminalStatus: 'failed',
+          terminalResult: { error: { name: 'Error', message: 'missing status' } },
+        }),
+      ),
+    ).toThrow(/terminalResult.status.*does not match/);
+    expect(() =>
+      materializeWorkflowTerminalRecoveryEnvelope(input({ terminalStatus: 'canceled', terminalResult: {} })),
+    ).toThrow(/terminalResult.status.*does not match/);
+    expect(() =>
+      materializeWorkflowTerminalRecoveryEnvelope(
         input({ terminalStatus: 'failed', terminalResult: { status: 'failed' } }),
       ),
     ).toThrow(/requires an error/);
@@ -120,9 +131,23 @@ describe('workflow terminal recovery envelope', () => {
         input({ terminalResult: { status: 'success', error: { message: 'contradiction' } } }),
       ),
     ).toThrow(/non-failed result/);
-    expect(() =>
-      materializeWorkflowTerminalRecoveryEnvelope(input({ requestContextPatch: { mastra__authToken: 'secret' } })),
-    ).toThrow(/framework credential/);
+    for (const key of [
+      'mastra__authToken',
+      'mastra__resourceId',
+      'mastra__threadId',
+      'mastra__versions',
+      'mastra__future',
+      'mastra:tasks',
+      'mastra:goal',
+      '__mastraInternal',
+      '__harnessChannelReservedTools',
+      'user',
+      'channel',
+    ]) {
+      expect(() =>
+        materializeWorkflowTerminalRecoveryEnvelope(input({ requestContextPatch: { [key]: 'untrusted' } })),
+      ).toThrow(/infrastructure-owned key/);
+    }
     expect(
       materializeWorkflowTerminalRecoveryEnvelope(input({ requestContextPatch: undefined })).requestContextPatch,
     ).toEqual({});

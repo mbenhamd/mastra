@@ -94,7 +94,7 @@ export function canonicalPlannerPath(value: unknown, field: string): number[] {
   return entries.map((entry, index) => canonicalPlannerInteger(entry, `${field}[${index}]`));
 }
 
-function structuralString(value: unknown, field: string, maxLength: number): string {
+export function canonicalPlannerStructuralString(value: unknown, field: string, maxLength: number): string {
   const isWellFormed = (input: string) => {
     for (let index = 0; index < input.length; index += 1) {
       const code = input.charCodeAt(index);
@@ -133,6 +133,8 @@ function materializeEffect(
     'sourceEventKey',
     'terminalStatus',
     'recoveryEnvelopeHash',
+    'retainedRecordHash',
+    'resourceId',
     'parentWorkflowName',
     'parentRunId',
     'parentStepId',
@@ -140,23 +142,34 @@ function materializeEffect(
     'payloadHash',
     'createdAt',
   ];
-  exactKeys(descriptors, keys, keys, 'effect');
+  exactKeys(
+    descriptors,
+    keys,
+    keys.filter(key => key !== 'resourceId'),
+    'effect',
+  );
   const terminalStatus = read(descriptors, 'terminalStatus');
   if (read(descriptors, 'version') !== 1 || read(descriptors, 'kind') !== 'parent-workflow-step-end') {
     throw new TypeError('effect must be a version 1 parent-workflow-step-end effect');
   }
   if (!CHILD_STATUSES.has(terminalStatus)) throw new TypeError('effect terminalStatus is invalid');
-  const effectKey = structuralString(read(descriptors, 'effectKey'), 'effect.effectKey', 256);
-  const payloadHash = structuralString(read(descriptors, 'payloadHash'), 'effect.payloadHash', 256);
-  const recoveryEnvelopeHash = structuralString(
+  const effectKey = canonicalPlannerStructuralString(read(descriptors, 'effectKey'), 'effect.effectKey', 256);
+  const payloadHash = canonicalPlannerStructuralString(read(descriptors, 'payloadHash'), 'effect.payloadHash', 256);
+  const recoveryEnvelopeHash = canonicalPlannerStructuralString(
     read(descriptors, 'recoveryEnvelopeHash'),
     'effect.recoveryEnvelopeHash',
+    256,
+  );
+  const retainedRecordHash = canonicalPlannerStructuralString(
+    read(descriptors, 'retainedRecordHash'),
+    'effect.retainedRecordHash',
     256,
   );
   if (
     !/^wte:v1:[a-f0-9]{64}$/.test(effectKey) ||
     !/^sha256:[a-f0-9]{64}$/.test(payloadHash) ||
-    !/^sha256:[a-f0-9]{64}$/.test(recoveryEnvelopeHash)
+    !/^sha256:[a-f0-9]{64}$/.test(recoveryEnvelopeHash) ||
+    !/^sha256:[a-f0-9]{64}$/.test(retainedRecordHash)
   ) {
     throw new TypeError('effect hashes are invalid');
   }
@@ -164,14 +177,26 @@ function materializeEffect(
     version: 1,
     effectKey,
     kind: 'parent-workflow-step-end',
-    workflowName: structuralString(read(descriptors, 'workflowName'), 'effect.workflowName', 512),
-    runId: structuralString(read(descriptors, 'runId'), 'effect.runId', 512),
-    sourceEventKey: structuralString(read(descriptors, 'sourceEventKey'), 'effect.sourceEventKey', 1024),
+    workflowName: canonicalPlannerStructuralString(read(descriptors, 'workflowName'), 'effect.workflowName', 512),
+    runId: canonicalPlannerStructuralString(read(descriptors, 'runId'), 'effect.runId', 512),
+    sourceEventKey: canonicalPlannerStructuralString(
+      read(descriptors, 'sourceEventKey'),
+      'effect.sourceEventKey',
+      1024,
+    ),
     terminalStatus: terminalStatus as 'success' | 'failed' | 'canceled',
     recoveryEnvelopeHash: recoveryEnvelopeHash as `sha256:${string}`,
-    parentWorkflowName: structuralString(read(descriptors, 'parentWorkflowName'), 'effect.parentWorkflowName', 512),
-    parentRunId: structuralString(read(descriptors, 'parentRunId'), 'effect.parentRunId', 512),
-    parentStepId: structuralString(read(descriptors, 'parentStepId'), 'effect.parentStepId', 512),
+    retainedRecordHash: retainedRecordHash as `sha256:${string}`,
+    ...(Object.prototype.hasOwnProperty.call(descriptors, 'resourceId')
+      ? { resourceId: canonicalPlannerStructuralString(read(descriptors, 'resourceId'), 'effect.resourceId', 512) }
+      : {}),
+    parentWorkflowName: canonicalPlannerStructuralString(
+      read(descriptors, 'parentWorkflowName'),
+      'effect.parentWorkflowName',
+      512,
+    ),
+    parentRunId: canonicalPlannerStructuralString(read(descriptors, 'parentRunId'), 'effect.parentRunId', 512),
+    parentStepId: canonicalPlannerStructuralString(read(descriptors, 'parentStepId'), 'effect.parentStepId', 512),
     parentExecutionPath: canonicalPlannerPath(read(descriptors, 'parentExecutionPath'), 'effect.parentExecutionPath'),
     payloadHash,
     createdAt: canonicalPlannerInteger(read(descriptors, 'createdAt'), 'effect.createdAt'),
@@ -212,7 +237,7 @@ function materializeMetadata(
   if (descriptors.nestedRunId) {
     result.nestedRunId =
       typeof descriptors.nestedRunId.value === 'string'
-        ? structuralString(descriptors.nestedRunId.value, `${field}.nestedRunId`, 512)
+        ? canonicalPlannerStructuralString(descriptors.nestedRunId.value, `${field}.nestedRunId`, 512)
         : null;
   }
   if (descriptors.iterationCount) {
@@ -372,7 +397,7 @@ export function materializeWorkflowTerminalParentPlanningView(input: unknown): W
   if (!Array.isArray(graph)) throw new TypeError('parentSnapshot.serializedStepGraph must be an array');
   const graphFingerprint = createWorkflowTerminalGraphFingerprint(graph);
   const parentSnapshot = {
-    runId: structuralString(read(snapshotDescriptors, 'runId'), 'parentSnapshot.runId', 512),
+    runId: canonicalPlannerStructuralString(read(snapshotDescriptors, 'runId'), 'parentSnapshot.runId', 512),
     status: status as WorkflowRunStatus,
     serializedStepGraph: graph,
     context: materializeContext(read(snapshotDescriptors, 'context'), graph, effect),
@@ -388,7 +413,7 @@ export function materializeWorkflowTerminalParentPlanningView(input: unknown): W
     version: 1,
     effect,
     graphFingerprint,
-    parentRevision: structuralString(read(descriptors, 'parentRevision'), 'parentRevision', 256),
+    parentRevision: canonicalPlannerStructuralString(read(descriptors, 'parentRevision'), 'parentRevision', 256),
     parentSnapshot,
     ...(descriptors.evaluatedDecision ? { evaluatedDecision: descriptors.evaluatedDecision.value } : {}),
   };

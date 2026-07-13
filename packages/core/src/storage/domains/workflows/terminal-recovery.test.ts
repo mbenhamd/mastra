@@ -9,6 +9,7 @@ import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 const NESTED_PARENT_GRAPH: WorkflowRunState['serializedStepGraph'] = [
   { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
 ];
+const EMPTY_CHILD_GRAPH_FINGERPRINT = createWorkflowTerminalGraphFingerprint([]);
 
 function createParentSnapshot(runId: string): WorkflowRunState {
   return { ...createEmptyWorkflowSnapshot(runId), serializedStepGraph: NESTED_PARENT_GRAPH };
@@ -85,6 +86,7 @@ function nestedAdmission(
     stepId: 'nested',
     nestedWorkflowName: child.workflowName,
     nestedRunId: child.runId,
+    expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
     result: { status: 'running' as const, payload: {} },
     requestContext: {},
     recoveryAncestry: ancestry(child, parent),
@@ -92,6 +94,50 @@ function nestedAdmission(
 }
 
 describe('WorkflowsInMemory terminal recovery storage', () => {
+  it('observes missing, nonterminal, terminal, and corrupt durable run status without executing identity accessors', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const run = { workflowName: 'status-run', runId: 'run' };
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'missing_run' });
+    await workflows.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'nonterminal' });
+    await expect(
+      workflows.claimWorkflowTerminalization({
+        ...run,
+        eventKey: 'status-terminal',
+        terminalStatus: 'failed',
+        ownerId: 'status-owner',
+        leaseMs: 10_000,
+      }),
+    ).resolves.toMatchObject({ status: 'acquired' });
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).resolves.toEqual({
+      status: 'terminal',
+      terminalStatus: 'failed',
+    });
+
+    let accessorReads = 0;
+    const accessorIdentity = { runId: 'alternate-run' } as { workflowName: string; runId: string };
+    Object.defineProperty(accessorIdentity, 'workflowName', {
+      enumerable: true,
+      get() {
+        accessorReads += 1;
+        return accessorReads === 1 ? run.workflowName : 'alternate-workflow';
+      },
+    });
+    await expect(workflows.getWorkflowRunTerminalStatus(accessorIdentity)).rejects.toThrow(
+      'Workflow identity workflowName must be own data',
+    );
+    expect(accessorReads).toBe(0);
+
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const revision = db.workflowTerminalParentRevisions.get(key);
+    if (!revision) throw new Error('Expected durable status revision');
+    db.workflowTerminalParentRevisions.set(key, { ...revision, terminalStatus: 'unknown' as never });
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).rejects.toThrow(
+      'Invalid workflow parent terminal status',
+    );
+  });
+
   it('atomically admits ownership plus graph-bound ancestry and makes exact replay read-only', async () => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
@@ -117,18 +163,50 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
       stepId: 'nested',
       nestedWorkflowName: child.workflowName,
       nestedRunId: child.runId,
+      expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
       result: { status: 'running' as const, payload: {} },
       requestContext: {},
       recoveryAncestry: childAncestry,
     };
+    const initializedAdmission = {
+      ...admission,
+      initialChildSnapshot: {
+        resourceId: 'child-resource',
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'running' as const,
+          context: { __state: { winner: 'first' } } as WorkflowRunState['context'],
+          value: { winner: 'first' },
+        },
+      },
+    };
 
-    await expect(workflows.admitWorkflowNestedRun(admission)).resolves.toMatchObject({ status: 'admitted' });
+    await expect(workflows.admitWorkflowNestedRun(initializedAdmission)).resolves.toMatchObject({
+      status: 'admitted',
+      childSnapshotState: 'initialized',
+    });
     const revisionKey = JSON.stringify([parent.workflowName, parent.runId]);
     const revision = db.workflowTerminalParentRevisions.get(revisionKey);
-    await expect(workflows.admitWorkflowNestedRun(admission)).resolves.toMatchObject({
+    await expect(
+      workflows.admitWorkflowNestedRun({
+        ...initializedAdmission,
+        initialChildSnapshot: {
+          snapshot: {
+            ...initializedAdmission.initialChildSnapshot.snapshot,
+            context: { __state: { winner: 'replay' } } as WorkflowRunState['context'],
+            value: { winner: 'replay' },
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
       status: 'already_admitted',
+      childSnapshotState: 'retained',
     });
     expect(db.workflowTerminalParentRevisions.get(revisionKey)).toBe(revision);
+    await expect(workflows.getWorkflowRunById(child)).resolves.toMatchObject({
+      resourceId: 'child-resource',
+      snapshot: { context: { __state: { winner: 'first' } }, value: { winner: 'first' } },
+    });
 
     const conflictingChild = { workflowName: 'other-child', runId: 'other-run' };
     const conflictingAncestry = ancestry(conflictingChild, parent);
@@ -168,6 +246,176 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
       workflows.getWorkflowTerminalRecoveryAncestry({ workflowName: 'forged-child', runId: 'forged-run' }),
     ).resolves.toEqual({ status: 'missing_ancestry' });
   });
+
+  it('repairs an admitted child missing its initial snapshot without permitting later replacement', async () => {
+    const workflows = new WorkflowsInMemory({ db: new InMemoryDB() });
+    const parent = { workflowName: 'repair-parent', runId: 'parent-run' };
+    const child = { workflowName: 'repair-child', runId: 'child-run' };
+    const parentGraph: WorkflowRunState['serializedStepGraph'] = [
+      { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+    ];
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: { ...createEmptyWorkflowSnapshot(parent.runId), serializedStepGraph: parentGraph },
+    });
+    const childAncestry = ancestry(child, parent);
+    childAncestry[0]!.parentGraphFingerprint = createWorkflowTerminalGraphFingerprint(parentGraph);
+    const admission = {
+      ...parent,
+      stepId: 'nested',
+      nestedWorkflowName: child.workflowName,
+      nestedRunId: child.runId,
+      expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
+      result: { status: 'running' as const, payload: {} },
+      requestContext: {},
+      recoveryAncestry: childAncestry,
+    };
+
+    await expect(workflows.admitWorkflowNestedRun(admission)).resolves.toMatchObject({
+      status: 'admitted',
+      childSnapshotState: 'not_requested',
+    });
+    await expect(workflows.loadWorkflowSnapshot(child)).resolves.toBeNull();
+    const repair = {
+      ...admission,
+      initialChildSnapshot: {
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'running' as const,
+          context: { __state: { checkpoint: 'repaired' } } as WorkflowRunState['context'],
+          value: { checkpoint: 'repaired' },
+        },
+      },
+    };
+    await expect(workflows.admitWorkflowNestedRun(repair)).resolves.toMatchObject({
+      status: 'already_admitted',
+      childSnapshotState: 'initialized',
+    });
+    await expect(
+      workflows.admitWorkflowNestedRun({
+        ...repair,
+        initialChildSnapshot: {
+          snapshot: {
+            ...repair.initialChildSnapshot.snapshot,
+            value: { checkpoint: 'must-not-replace' },
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ status: 'already_admitted', childSnapshotState: 'retained' });
+    await expect(workflows.loadWorkflowSnapshot(child)).resolves.toMatchObject({
+      context: { __state: { checkpoint: 'repaired' } },
+      value: { checkpoint: 'repaired' },
+    });
+  });
+
+  it('does not resurrect a terminal child whose canonical snapshot was deleted', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'terminal-child-parent', runId: 'parent-run' };
+    const child = { workflowName: 'terminal-child', runId: 'child-run' };
+    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+    await workflows.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+    await expect(
+      workflows.claimWorkflowTerminalization({
+        ...child,
+        eventKey: 'terminal-child-event',
+        terminalStatus: 'failed',
+        ownerId: 'terminal-child-owner',
+        leaseMs: 10_000,
+      }),
+    ).resolves.toMatchObject({ status: 'acquired' });
+    const childKey = JSON.stringify([child.workflowName, child.runId]);
+    db.workflows.delete(childKey);
+    const parentBefore = await workflows.loadWorkflowSnapshot(parent);
+    await expect(workflows.getWorkflowRunTerminalStatus(child)).resolves.toEqual({
+      status: 'terminal',
+      terminalStatus: 'failed',
+    });
+
+    await expect(
+      workflows.admitWorkflowNestedRun({
+        ...nestedAdmission(parent, child),
+        initialChildSnapshot: { snapshot: { ...createEmptyWorkflowSnapshot(child.runId), status: 'running' } },
+      }),
+    ).resolves.toEqual({ status: 'child_terminal' });
+
+    await expect(workflows.loadWorkflowSnapshot(child)).resolves.toBeNull();
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+      status: 'missing_ancestry',
+    });
+    await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+  });
+
+  it.each([
+    ['wrong run identity', { runId: 'forged-run' }],
+    ['unknown status', { status: 'unknown' }],
+    ['graph drift', { serializedStepGraph: [{ type: 'step', step: { id: 'drifted', component: 'WORKFLOW' } }] }],
+  ] as const)('rejects retained child %s without partial admission writes', async (_label, patch) => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: `conflict-parent-${_label}`, runId: 'parent-run' };
+    const child = { workflowName: `conflict-child-${_label}`, runId: 'child-run' };
+    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+    await workflows.persistWorkflowSnapshot({
+      ...child,
+      snapshot: { ...createEmptyWorkflowSnapshot(child.runId), ...patch } as WorkflowRunState,
+    });
+    const childKey = JSON.stringify([child.workflowName, child.runId]);
+    db.workflowTerminalParentRevisions.delete(childKey);
+    const parentBefore = await workflows.loadWorkflowSnapshot(parent);
+
+    await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, child))).resolves.toEqual({
+      status: 'child_snapshot_conflict',
+    });
+
+    expect(db.workflowTerminalParentRevisions.has(childKey)).toBe(false);
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+      status: 'missing_ancestry',
+    });
+    await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+  });
+
+  it.each(['own', 'inherited'] as const)(
+    'rejects an initial child snapshot with a nested %s toJSON hook without executing or writing it',
+    async placement => {
+      const db = new InMemoryDB();
+      const workflows = new WorkflowsInMemory({ db });
+      const parent = { workflowName: `tojson-parent-${placement}`, runId: 'parent-run' };
+      const child = { workflowName: `tojson-child-${placement}`, runId: 'child-run' };
+      await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+      const parentBefore = await workflows.loadWorkflowSnapshot(parent);
+      let calls = 0;
+      const toJSON = () => {
+        calls += 1;
+        return { runId: 'forged-run' };
+      };
+      const payload = {};
+      if (placement === 'own') {
+        Object.defineProperty(payload, 'toJSON', { configurable: true, value: toJSON });
+      } else {
+        Object.setPrototypeOf(payload, { toJSON });
+      }
+      const snapshot = {
+        ...createEmptyWorkflowSnapshot(child.runId),
+        status: 'running' as const,
+        context: { nested: { status: 'success', output: payload } } as WorkflowRunState['context'],
+        value: { payload },
+      };
+
+      await expect(
+        workflows.admitWorkflowNestedRun({
+          ...nestedAdmission(parent, child),
+          initialChildSnapshot: { snapshot },
+        }),
+      ).rejects.toThrow('Invalid workflow terminal recovery data at initialChildSnapshot.snapshot');
+      expect(calls).toBe(0);
+      await expect(workflows.loadWorkflowSnapshot(child)).resolves.toBeNull();
+      await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+      await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBefore);
+    },
+  );
 
   it('persists immutable ancestry without requiring a canonical child run', async () => {
     const workflows = new WorkflowsInMemory({ db: new InMemoryDB() });
@@ -243,6 +491,117 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
     },
   );
 
+  it.each(['tripwire', 'bailed'] as const)(
+    'rejects ancestry and atomic admission against a directly persisted %s parent',
+    async terminalStatus => {
+      const db = new InMemoryDB();
+      const workflows = new WorkflowsInMemory({ db });
+      const parent = { workflowName: `direct-${terminalStatus}-parent`, runId: 'parent-run' };
+      const ancestryChild = { workflowName: `direct-${terminalStatus}-ancestry`, runId: 'child-run' };
+      const admissionChild = { workflowName: `direct-${terminalStatus}-admission`, runId: 'child-run' };
+      await workflows.persistWorkflowSnapshot({
+        ...parent,
+        snapshot: { ...createParentSnapshot(parent.runId), status: terminalStatus },
+      });
+
+      await expect(
+        workflows.persistWorkflowTerminalRecoveryAncestry({
+          ...ancestryChild,
+          ancestry: ancestry(ancestryChild, parent),
+        }),
+      ).rejects.toThrow('parent evidence is unavailable');
+      await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, admissionChild))).resolves.toEqual({
+        status: 'parent_terminal',
+      });
+      expect(db.workflowTerminalParentRevisions.get(JSON.stringify([parent.workflowName, parent.runId]))).toMatchObject(
+        {
+          terminalStatus,
+        },
+      );
+    },
+  );
+
+  it('makes the first terminal claim authoritative before terminal snapshot persistence', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'claimed-terminal-parent', runId: 'parent-run' };
+    const ancestryChild = { workflowName: 'claimed-terminal-ancestry', runId: 'child-run' };
+    const admissionChild = { workflowName: 'claimed-terminal-admission', runId: 'child-run' };
+    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: createParentSnapshot(parent.runId) });
+
+    await expect(
+      workflows.claimWorkflowTerminalization({
+        ...parent,
+        eventKey: 'parent-terminal',
+        terminalStatus: 'failed',
+        ownerId: 'owner',
+        leaseMs: 10_000,
+      }),
+    ).resolves.toMatchObject({ status: 'acquired' });
+
+    expect(db.workflowTerminalParentRevisions.get(JSON.stringify([parent.workflowName, parent.runId]))).toMatchObject({
+      terminalStatus: 'failed',
+    });
+    await expect(
+      workflows.persistWorkflowTerminalRecoveryAncestry({
+        ...ancestryChild,
+        ancestry: ancestry(ancestryChild, parent),
+      }),
+    ).rejects.toThrow('parent evidence is unavailable');
+    await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, admissionChild))).resolves.toEqual({
+      status: 'parent_terminal',
+    });
+  });
+
+  it('retains terminal ancestry exclusion after journal cleanup and a running snapshot rewrite', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'terminal-marker-parent', runId: 'parent-run' };
+    const ancestryChild = { workflowName: 'terminal-marker-ancestry', runId: 'child-run' };
+    const admissionChild = { workflowName: 'terminal-marker-admission', runId: 'child-run' };
+    await completeRoot(workflows, db, parent, 'failed');
+    await expect(
+      workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date(Date.now() + 1) }),
+    ).resolves.toEqual({ status: 'deleted', count: 1 });
+
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: { ...createParentSnapshot(parent.runId), status: 'running' },
+    });
+    await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toMatchObject({ status: 'running' });
+    await expect(
+      workflows.persistWorkflowTerminalRecoveryAncestry({
+        ...ancestryChild,
+        ancestry: ancestry(ancestryChild, parent),
+      }),
+    ).rejects.toThrow('parent evidence is unavailable');
+    await expect(workflows.admitWorkflowNestedRun(nestedAdmission(parent, admissionChild))).resolves.toEqual({
+      status: 'parent_terminal',
+    });
+    expect(db.workflowTerminalParentRevisions.get(JSON.stringify([parent.workflowName, parent.runId]))).toMatchObject({
+      terminalStatus: 'failed',
+    });
+  });
+
+  it('fails cleanup before deleting evidence when the terminal marker contradicts the journal', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'conflicting-terminal-marker-parent', runId: 'parent-run' };
+    await completeRoot(workflows, db, parent, 'failed');
+    const key = JSON.stringify([parent.workflowName, parent.runId]);
+    const revision = db.workflowTerminalParentRevisions.get(key);
+    if (!revision) throw new Error('Expected parent revision');
+    db.workflowTerminalParentRevisions.set(key, { ...revision, terminalStatus: 'success' });
+
+    await expect(
+      workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date(Date.now() + 1) }),
+    ).rejects.toThrow('terminal marker conflicts with authoritative terminal status');
+
+    expect(db.workflowTerminalizations.has(key)).toBe(true);
+    expect(db.workflowTerminalSnapshots.has(key)).toBe(true);
+    expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({ terminalStatus: 'success' });
+  });
+
   it('retains a completed parent recovery root when atomic admission wins first', async () => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
@@ -316,6 +675,7 @@ describe('WorkflowsInMemory terminal recovery storage', () => {
         stepId: 'each',
         nestedWorkflowName: child.workflowName,
         nestedRunId,
+        expectedChildGraphFingerprint: EMPTY_CHILD_GRAPH_FINGERPRINT,
         forEachIndex,
         result: { status: 'running' as const, payload: ['a', 'b'], output: [null, null] },
         requestContext: {},
