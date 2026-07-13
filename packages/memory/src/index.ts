@@ -606,10 +606,12 @@ export class Memory extends MastraMemory {
 
       // For resource scope, update the resource's working memory
       if (scope === 'resource' && resourceId) {
-        const memoryStore = await this.getMemoryStore();
-        await memoryStore.updateResource({
-          resourceId,
-          workingMemory,
+        await this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
+          const memoryStore = await this.getMemoryStore();
+          await memoryStore.updateResource({
+            resourceId,
+            workingMemory,
+          });
         });
       }
       // For thread scope, the metadata is already saved with the thread
@@ -685,8 +687,10 @@ export class Memory extends MastraMemory {
    * Threads and messages associated with the resource are preserved.
    */
   async deleteResource(resourceId: string): Promise<void> {
-    const memoryStore = await this.getMemoryStore();
-    await memoryStore.deleteResource({ resourceId });
+    await this.withWorkingMemoryMutex(`resource-${resourceId}`, async () => {
+      const memoryStore = await this.getMemoryStore();
+      await memoryStore.deleteResource({ resourceId });
+    });
   }
 
   /**
@@ -769,13 +773,7 @@ export class Memory extends MastraMemory {
 
       // Use mutex to prevent race conditions when multiple concurrent calls update the same resource/thread
       const mutexKey = scope === 'resource' ? `resource-${resourceId}` : `thread-${threadId}`;
-      const mutex = this.updateWorkingMemoryMutexes.has(mutexKey)
-        ? this.updateWorkingMemoryMutexes.get(mutexKey)!
-        : new Mutex();
-      this.updateWorkingMemoryMutexes.set(mutexKey, mutex);
-      const release = await mutex.acquire();
-
-      try {
+      await this.withWorkingMemoryMutex(mutexKey, async () => {
         const memoryStore = await this.getMemoryStore();
         if (scope === 'resource' && resourceId) {
           await memoryStore.updateResource({
@@ -797,9 +795,7 @@ export class Memory extends MastraMemory {
             },
           });
         }
-      } finally {
-        release();
-      }
+      });
 
       span?.end({ output: { success: true } });
     } catch (error) {
@@ -809,6 +805,20 @@ export class Memory extends MastraMemory {
   }
 
   private updateWorkingMemoryMutexes = new Map<string, Mutex>();
+
+  private getWorkingMemoryMutex(mutexKey: string): Mutex {
+    const existingMutex = this.updateWorkingMemoryMutexes.get(mutexKey);
+    if (existingMutex) return existingMutex;
+
+    const mutex = new Mutex();
+    this.updateWorkingMemoryMutexes.set(mutexKey, mutex);
+    return mutex;
+  }
+
+  private async withWorkingMemoryMutex<T>(mutexKey: string, operation: () => Promise<T>): Promise<T> {
+    return this.getWorkingMemoryMutex(mutexKey).runExclusive(operation);
+  }
+
   /**
    * @warning experimental! can be removed or changed at any time
    */
@@ -831,17 +841,13 @@ export class Memory extends MastraMemory {
     if (!config.workingMemory?.enabled) {
       throw new Error('Working memory is not enabled for this memory instance');
     }
+    const scope = config.workingMemory.scope || 'resource';
 
     // If the agent calls the update working memory tool multiple times simultaneously
     // each call could overwrite the other call
     // so get an in memory mutex to make sure this.getWorkingMemory() returns up to date data each time
-    const mutexKey =
-      memoryConfig?.workingMemory?.scope === `resource` ? `resource-${resourceId}` : `thread-${threadId}`;
-    const mutex = this.updateWorkingMemoryMutexes.has(mutexKey)
-      ? this.updateWorkingMemoryMutexes.get(mutexKey)!
-      : new Mutex();
-    this.updateWorkingMemoryMutexes.set(mutexKey, mutex);
-    const release = await mutex.acquire();
+    const mutexKey = scope === `resource` ? `resource-${resourceId}` : `thread-${threadId}`;
+    const release = await this.getWorkingMemoryMutex(mutexKey).acquire();
 
     try {
       const existingWorkingMemory = (await this.getWorkingMemory({ threadId, resourceId, memoryConfig })) || '';
@@ -911,8 +917,6 @@ ${workingMemory}`;
         workingMemory = workingMemory.replaceAll(templateWithUnixLineEndings, '');
         workingMemory = workingMemory.replaceAll(templateWithWindowsLineEndings, '');
       }
-
-      const scope = config.workingMemory.scope || 'resource';
 
       // Guard: If resource-scoped working memory is enabled but no resourceId is provided, throw an error
       if (scope === 'resource' && !resourceId) {

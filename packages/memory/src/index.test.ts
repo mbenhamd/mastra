@@ -2406,6 +2406,55 @@ describe('Memory', () => {
       await expect(memoryStore.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
     });
 
+    it('waits for an in-flight resource working memory write before deleting the resource', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { workingMemory: { enabled: true, scope: 'resource' } },
+      });
+      const memoryStore = (await storage.getStore('memory'))!;
+      const originalUpdateResource = memoryStore.updateResource.bind(memoryStore);
+      const originalDeleteResource = memoryStore.deleteResource.bind(memoryStore);
+      const operationOrder: string[] = [];
+      let markUpdateStarted!: () => void;
+      let releaseUpdate!: () => void;
+      const updateStarted = new Promise<void>(resolve => {
+        markUpdateStarted = resolve;
+      });
+      const updateBlocked = new Promise<void>(resolve => {
+        releaseUpdate = resolve;
+      });
+
+      vi.spyOn(memoryStore, 'updateResource').mockImplementation(async args => {
+        markUpdateStarted();
+        await updateBlocked;
+        const result = await originalUpdateResource(args);
+        operationOrder.push('update');
+        return result;
+      });
+      const deleteSpy = vi.spyOn(memoryStore, 'deleteResource').mockImplementation(async args => {
+        await originalDeleteResource(args);
+        operationOrder.push('delete');
+      });
+
+      const updatePromise = memory.updateWorkingMemory({
+        threadId: 'thread-delete-race',
+        resourceId: 'resource-delete-race',
+        workingMemory: 'private working memory',
+      });
+      await updateStarted;
+
+      const deletePromise = memory.deleteResource('resource-delete-race');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      releaseUpdate();
+      await Promise.all([updatePromise, deletePromise]);
+
+      expect(operationOrder).toEqual(['update', 'delete']);
+      await expect(memoryStore.getResourceById({ resourceId: 'resource-delete-race' })).resolves.toBeNull();
+    });
+
     it('passes observation options to the ObservationalMemory engine', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({

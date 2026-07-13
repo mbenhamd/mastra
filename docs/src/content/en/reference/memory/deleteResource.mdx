@@ -20,6 +20,14 @@ await memory?.deleteResource('resource-123')
 
 Calling the method for a resource that doesn't exist resolves successfully.
 
+## Storage support
+
+`Memory.deleteResource()` is implemented by the in-memory and PostgreSQL storage adapters. Other adapters and custom memory implementations throw a not-implemented error unless they provide their own `deleteResource()` implementation.
+
+## Deletion scope
+
+This method performs a point-in-time deletion. It doesn't create a tombstone, revoke access, or prevent a later authorized working memory update from recreating the resource record. For account-erasure workflows, stop new writers and drain in-flight work before calling this method, then verify that the record remains absent.
+
 ## Parameters
 
 <PropertiesTable

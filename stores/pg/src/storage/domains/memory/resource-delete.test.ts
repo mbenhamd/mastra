@@ -1,44 +1,11 @@
 import { MastraError } from '@mastra/core/error';
-import type { QueryResult } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
-import type { DbClient, QueryValues, TxClient } from '../../client';
+import type { DbClient } from '../../client';
 import { MemoryPG } from './index';
 
-class DeleteDbClient implements DbClient {
-  readonly $pool = {} as DbClient['$pool'];
-  readonly none = vi.fn(async (_query: string, _values?: QueryValues): Promise<null> => null);
-
-  connect(): Promise<never> {
-    throw new Error('not implemented');
-  }
-
-  async one<T = any>(): Promise<T> {
-    throw new Error('not implemented');
-  }
-
-  async oneOrNone<T = any>(): Promise<T | null> {
-    throw new Error('not implemented');
-  }
-
-  async any<T = any>(): Promise<T[]> {
-    throw new Error('not implemented');
-  }
-
-  async manyOrNone<T = any>(): Promise<T[]> {
-    throw new Error('not implemented');
-  }
-
-  async many<T = any>(): Promise<T[]> {
-    throw new Error('not implemented');
-  }
-
-  async query(): Promise<QueryResult> {
-    throw new Error('not implemented');
-  }
-
-  async tx<T>(_callback: (t: TxClient) => Promise<T>): Promise<T> {
-    throw new Error('not implemented');
-  }
+function createDeleteDbClient() {
+  const none = vi.fn(async (): Promise<null> => null);
+  return { client: { none } as unknown as DbClient, none };
 }
 
 function createLogger() {
@@ -53,29 +20,21 @@ function createLogger() {
 
 describe('MemoryPG.deleteResource', () => {
   it('deletes only the requested resource row and treats absence as success', async () => {
-    const client = new DeleteDbClient();
+    const { client, none } = createDeleteDbClient();
     const memory = new MemoryPG({ client });
 
     await memory.deleteResource({ resourceId: 'resource-1' });
     await memory.deleteResource({ resourceId: 'resource-1' });
 
-    expect(client.none).toHaveBeenCalledTimes(2);
-    expect(client.none).toHaveBeenNthCalledWith(
-      1,
-      'DELETE FROM "public"."mastra_resources" WHERE id = $1',
-      ['resource-1'],
-    );
-    expect(client.none).toHaveBeenNthCalledWith(
-      2,
-      'DELETE FROM "public"."mastra_resources" WHERE id = $1',
-      ['resource-1'],
-    );
+    expect(none).toHaveBeenCalledTimes(2);
+    expect(none).toHaveBeenNthCalledWith(1, 'DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']);
+    expect(none).toHaveBeenNthCalledWith(2, 'DELETE FROM "public"."mastra_resources" WHERE id = $1', ['resource-1']);
   });
 
   it('rejects storage failures without retaining driver details', async () => {
-    const client = new DeleteDbClient();
+    const { client, none } = createDeleteDbClient();
     const driverError = new Error('connectionString=SECRET query=DELETE');
-    client.none.mockRejectedValueOnce(driverError);
+    none.mockRejectedValueOnce(driverError);
     const memory = new MemoryPG({ client });
     const logger = createLogger();
     memory.__setLogger(logger as any);

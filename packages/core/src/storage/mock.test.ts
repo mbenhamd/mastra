@@ -3,7 +3,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { MessageList } from '../agent';
 import type { MastraMessageV1, StorageThreadType } from '../memory/types';
 import { deepMerge } from '../utils';
-import type { MemoryStorage } from './domains';
+import { MemoryStorage } from './domains';
 import { InMemoryStore } from './mock';
 
 describe('InMemoryStore - Thread Sorting', () => {
@@ -502,72 +502,11 @@ describe('InMemoryStore - listMessagesById', () => {
 });
 
 describe('InMemoryStore - resource deletion', () => {
-  it('deletes only the requested resource record and is idempotent', async () => {
-    const store = new InMemoryStore();
-    const memory = (await store.getStore('memory'))!;
-    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+  it('fails explicitly when a storage adapter does not implement resource deletion', async () => {
+    const unsupportedMemory = Object.create(MemoryStorage.prototype) as MemoryStorage;
 
-    await memory.saveResource({
-      resource: {
-        id: 'resource-delete',
-        workingMemory: 'private working memory',
-        metadata: { owner: 'delete' },
-        createdAt,
-        updatedAt: createdAt,
-      },
-    });
-    await memory.saveResource({
-      resource: {
-        id: 'resource-keep',
-        workingMemory: 'keep working memory',
-        metadata: { owner: 'keep' },
-        createdAt,
-        updatedAt: createdAt,
-      },
-    });
-
-    await memory.saveThread({
-      thread: {
-        id: 'thread-delete-resource',
-        resourceId: 'resource-delete',
-        title: 'Preserved thread',
-        metadata: {},
-        createdAt,
-        updatedAt: createdAt,
-      },
-    });
-    const messages = new MessageList()
-      .add(
-        [
-          {
-            id: 'message-delete-resource',
-            threadId: 'thread-delete-resource',
-            resourceId: 'resource-delete',
-            role: 'user',
-            content: 'Preserved message',
-            type: 'text',
-            createdAt,
-          },
-        ],
-        'memory',
-      )
-      .get.all.db();
-    await memory.saveMessages({ messages });
-
-    await memory.deleteResource({ resourceId: 'resource-delete' });
-    await expect(memory.deleteResource({ resourceId: 'resource-delete' })).resolves.toBeUndefined();
-
-    await expect(memory.getResourceById({ resourceId: 'resource-delete' })).resolves.toBeNull();
-    await expect(memory.getResourceById({ resourceId: 'resource-keep' })).resolves.toMatchObject({
-      id: 'resource-keep',
-      workingMemory: 'keep working memory',
-    });
-    await expect(memory.getThreadById({ threadId: 'thread-delete-resource' })).resolves.toMatchObject({
-      id: 'thread-delete-resource',
-      resourceId: 'resource-delete',
-    });
-    await expect(memory.listMessagesById({ messageIds: ['message-delete-resource'] })).resolves.toMatchObject({
-      messages: [expect.objectContaining({ id: 'message-delete-resource', resourceId: 'resource-delete' })],
-    });
+    await expect(unsupportedMemory.deleteResource({ resourceId: 'resource-delete' })).rejects.toThrow(
+      'Resource deletion is not implemented by this storage adapter',
+    );
   });
 });
