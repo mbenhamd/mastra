@@ -16,7 +16,7 @@ function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
     allowNullPrototype: true,
     typeError: 'workflow terminal effect must be a plain data object',
     fieldsError: 'workflow terminal effect contains symbol or accessor fields',
-    maxKeys: 13,
+    maxKeys: 14,
     maxKeysError: 'workflow terminal effect contains unknown, missing, symbol, or accessor fields',
   });
 }
