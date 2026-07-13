@@ -170,6 +170,70 @@ describe('MemoryPG list read failures', () => {
     },
   );
 
+  it.each(failureOperations)(
+    '$operation sanitizes user-classified failures from the read pipeline',
+    async ({ operation, invoke }) => {
+      const pipelineError = new MastraError({
+        id: 'INVALID_STORED_MESSAGE',
+        domain: 'AGENT',
+        category: 'USER',
+        text: `Invalid stored message ${sensitiveId}`,
+        details: { receivedMessage: sensitiveId },
+      });
+      const memory = new MemoryPG({ client: new ReadDbClient({ failure: pipelineError }) });
+      const logger = createLogger();
+      memory.__setLogger(logger as any);
+
+      const caught = await invoke(memory).catch(error => error as MastraError);
+
+      expect(caught).toBeInstanceOf(MastraError);
+      expect(caught).not.toBe(pipelineError);
+      expect(caught.id).toContain(operation);
+      expect(caught.category).toBe('THIRD_PARTY');
+      expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveId);
+      expect(JSON.stringify([logger.error.mock.calls, logger.trackException.mock.calls])).not.toContain(sensitiveId);
+    },
+  );
+
+  it.each([
+    {
+      operation: 'LIST_MESSAGES_BY_ID',
+      invoke: (row: typeof messageRow) =>
+        new MemoryPG({ client: new ReadDbClient({ manyResults: [[row]] }) }).listMessagesById({
+          messageIds: [sensitiveId],
+        }),
+    },
+    {
+      operation: 'LIST_MESSAGES',
+      invoke: (row: typeof messageRow) =>
+        new MemoryPG({
+          client: new ReadDbClient({ oneResults: [{ count: '1' }], manyResults: [[row]] }),
+        }).listMessages({ threadId: sensitiveId }),
+    },
+    {
+      operation: 'LIST_MESSAGES_BY_RESOURCE_ID',
+      invoke: (row: typeof messageRow) =>
+        new MemoryPG({
+          client: new ReadDbClient({ oneResults: [{ count: '1' }], manyResults: [[row]] }),
+        }).listMessagesByResourceId({ resourceId: sensitiveId }),
+    },
+  ])('$operation sanitizes malformed stored message errors', async ({ operation, invoke }) => {
+    const malformedRow = {
+      ...messageRow,
+      id: sensitiveId,
+      content: 'null',
+      threadId: sensitiveId,
+      resourceId: sensitiveId,
+    };
+
+    const caught = await invoke(malformedRow).catch(error => error as MastraError);
+
+    expect(caught).toBeInstanceOf(MastraError);
+    expect(caught.id).toContain(operation);
+    expect(caught.category).toBe('THIRD_PARTY');
+    expect(JSON.stringify(caught.toJSON())).not.toContain(sensitiveId);
+  });
+
   it('does not serialize a driver error that already exposes toJSON', async () => {
     const cause = Object.assign(new Error(sensitiveCauseText), {
       toJSON: () => ({ message: sensitiveCauseText, connectionString: 'SECRET_CONNECTION_STRING' }),
