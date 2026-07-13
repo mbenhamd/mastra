@@ -20,6 +20,7 @@ import {
   runCountDeprecationMessage,
   validateStepSuspendData,
 } from '../utils';
+import { addWorkflowResumeLabel, createWorkflowResumeLabels } from './resume-labels';
 
 export class StepExecutor extends MastraBase {
   protected mastra?: Mastra;
@@ -170,16 +171,16 @@ export class StepExecutor extends MastraBase {
                     throw validationError;
                   }
                   // Build resume labels if provided
-                  const resumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
+                  const resumeLabels = createWorkflowResumeLabels();
                   if (suspendOptions?.resumeLabel) {
                     const labels = Array.isArray(suspendOptions.resumeLabel)
                       ? suspendOptions.resumeLabel
                       : [suspendOptions.resumeLabel];
                     for (const label of labels) {
-                      resumeLabels[label] = {
+                      addWorkflowResumeLabel(resumeLabels, label, {
                         stepId: step.id,
                         foreachIndex: params.foreachIdx,
-                      };
+                      });
                     }
                   }
                   suspended = {

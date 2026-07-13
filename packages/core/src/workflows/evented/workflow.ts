@@ -67,6 +67,7 @@ import type { AgentStepOptions } from '../workflow';
 import { EventedExecutionEngine } from './execution-engine';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
 import type { TripwireChunk } from './helpers';
+import { assertWorkflowResumeLabel, readWorkflowResumeLabels } from './resume-labels';
 import { WorkflowEventProcessor } from './workflow-event-processor';
 
 export type EventedEngineType = {};
@@ -2088,6 +2089,7 @@ export class EventedRun<
       includeResumeLabels?: boolean;
     };
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    if (params.label !== undefined) assertWorkflowResumeLabel(params.label);
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     if (!workflowsStore) {
       throw new Error('Cannot resume workflow: workflows store is required');
@@ -2105,15 +2107,19 @@ export class EventedRun<
       throw new Error('This workflow run was not suspended');
     }
 
-    if (params.label !== undefined && (typeof params.label !== 'string' || params.label.length === 0)) {
-      throw new Error('Resume label must be a non-empty string');
-    }
-
     // Resolve only own data properties. A plain-object label map inherits keys such as
     // "__proto__", which must not be treated as stored resume metadata.
+    const snapshotResumeLabels = (() => {
+      if (params.label === undefined) return undefined;
+      try {
+        return readWorkflowResumeLabels(snapshot?.resumeLabels);
+      } catch {
+        throw new Error('Resume label was not found for this workflow run');
+      }
+    })();
     const hasSnapshotResumeLabel =
-      params.label !== undefined && Object.prototype.hasOwnProperty.call(snapshot?.resumeLabels ?? {}, params.label);
-    const snapshotResumeLabel = hasSnapshotResumeLabel ? snapshot?.resumeLabels?.[params.label!] : undefined;
+      params.label !== undefined && Object.prototype.hasOwnProperty.call(snapshotResumeLabels ?? {}, params.label);
+    const snapshotResumeLabel = hasSnapshotResumeLabel ? snapshotResumeLabels?.[params.label!] : undefined;
     const hasSnapshotResumePath =
       snapshotResumeLabel?.stepId !== undefined &&
       Object.prototype.hasOwnProperty.call(snapshot?.suspendedPaths ?? {}, snapshotResumeLabel.stepId);
@@ -2166,6 +2172,13 @@ export class EventedRun<
     // sensitive values and can be arbitrarily large when this API is called dynamically.
     if (params.label !== undefined && !isValidSnapshotResumeLabel) {
       throw new Error('Resume label was not found for this workflow run');
+    }
+    if (
+      params.label !== undefined &&
+      params.forEachIndex !== undefined &&
+      params.forEachIndex !== snapshotResumeLabel?.foreachIndex
+    ) {
+      throw new Error('Resume label does not match the requested foreach index');
     }
 
     // Label takes precedence over step param
@@ -2275,7 +2288,7 @@ export class EventedRun<
           stepResults: snapshot?.context as any,
           resumePayload: resumeDataToUse,
           resumePath,
-          forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+          forEachIndex: snapshotResumeLabel?.foreachIndex ?? params.forEachIndex,
           label: params.label,
         },
         pubsub: this.mastra.pubsub,

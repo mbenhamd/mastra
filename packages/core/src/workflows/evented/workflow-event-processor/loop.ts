@@ -3,6 +3,7 @@ import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { Mastra } from '../../../mastra';
 import { resolveCurrentState } from '../helpers';
+import { createWorkflowResumeLabels, mergeWorkflowResumeLabels } from '../resume-labels';
 import type { StepExecutor } from '../step-executor';
 import { createPendingMarker } from '../types';
 import type { ProcessorArgs } from '.';
@@ -234,16 +235,18 @@ export async function processWorkflowForEach(
     const pendingIterations = currentResult.output.filter((r: any) => r === null || r?.status === 'suspended');
     if (pendingIterations.length > 0) {
       // Collect resumeLabels from all suspended iterations
-      const collectedResumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
+      const collectedResumeLabels = createWorkflowResumeLabels();
       for (let i = 0; i < currentResult.output.length; i++) {
         const iterResult = currentResult.output[i];
         if (iterResult?.status === 'suspended' && iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-          for (const [label, target] of Object.entries(iterResult.suspendPayload.__workflow_meta.resumeLabels)) {
-            collectedResumeLabels[label] = {
-              ...(target as { stepId: string; foreachIndex?: number }),
+          mergeWorkflowResumeLabels(
+            collectedResumeLabels,
+            iterResult.suspendPayload.__workflow_meta.resumeLabels,
+            target => ({
+              ...target,
               foreachIndex: i,
-            };
-          }
+            }),
+          );
         }
       }
 

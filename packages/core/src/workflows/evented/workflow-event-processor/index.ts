@@ -17,6 +17,7 @@ import type {
 import type { Workflow } from '../../../workflows/workflow';
 import { createRestartExecutionParams, createTimeTravelExecutionParams, validateStepResumeData } from '../../utils';
 import { resolveCurrentState } from '../helpers';
+import { createWorkflowResumeLabels, mergeWorkflowResumeLabels, readWorkflowResumeLabels } from '../resume-labels';
 import { StepExecutor } from '../step-executor';
 import { EventedWorkflow } from '../workflow';
 import { processWorkflowForEach, processWorkflowLoop } from './loop';
@@ -536,15 +537,11 @@ export class WorkflowEventProcessor extends EventProcessor {
       const propagatedPath =
         suspendedStepId && existingPath[0] !== suspendedStepId ? [suspendedStepId, ...existingPath] : existingPath;
 
-      const resumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
-      const nestedResumeLabels = prevResult.suspendPayload?.__workflow_meta?.resumeLabels ?? {};
-
-      for (const label of Object.keys(nestedResumeLabels)) {
-        resumeLabels[label] = {
-          stepId: parentWorkflow.stepId,
-          foreachIndex: nestedResumeLabels[label].foreachIndex,
-        };
-      }
+      const resumeLabels = createWorkflowResumeLabels();
+      mergeWorkflowResumeLabels(resumeLabels, prevResult.suspendPayload?.__workflow_meta?.resumeLabels, target => ({
+        stepId: parentWorkflow.stepId,
+        foreachIndex: target.foreachIndex,
+      }));
 
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.step.end',
@@ -972,9 +969,17 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId: nestedRunId,
         });
 
+        const nestedResumeLabels = (() => {
+          if (resumeLabel === undefined) return undefined;
+          try {
+            return readWorkflowResumeLabels(snapshot?.resumeLabels);
+          } catch {
+            return undefined;
+          }
+        })();
         const hasNestedResumeLabel =
-          resumeLabel !== undefined && Object.prototype.hasOwnProperty.call(snapshot?.resumeLabels ?? {}, resumeLabel);
-        const nestedResumeLabel = hasNestedResumeLabel ? snapshot?.resumeLabels?.[resumeLabel!] : undefined;
+          resumeLabel !== undefined && Object.prototype.hasOwnProperty.call(nestedResumeLabels ?? {}, resumeLabel);
+        const nestedResumeLabel = hasNestedResumeLabel ? nestedResumeLabels?.[resumeLabel!] : undefined;
         const isValidNestedResumeLabel =
           nestedResumeLabel !== null &&
           typeof nestedResumeLabel === 'object' &&
@@ -1677,7 +1682,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     let skippedCount = 0;
     const allResults: Record<string, any> = {};
     const suspendedPaths: Record<string, number[]> = {};
-    const resumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
+    const resumeLabels = createWorkflowResumeLabels();
 
     branchEntry.steps.forEach((branch, idx) => {
       if (!isExecutableStep(branch)) {
@@ -1700,7 +1705,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       } else if (res.status === 'suspended') {
         suspendedCount++;
         suspendedPaths[branch.step.id] = [parentIdx, idx];
-        Object.assign(resumeLabels, res.suspendPayload?.__workflow_meta?.resumeLabels ?? {});
+        mergeWorkflowResumeLabels(resumeLabels, res.suspendPayload?.__workflow_meta?.resumeLabels);
       }
       // failed / canceled branches short-circuit the workflow before reaching here
     });
@@ -2042,7 +2047,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (suspendedCount > 0) {
           // Some iterations are suspended - emit workflow suspend
           // Build aggregated suspend metadata from all suspended iterations
-          const collectedResumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
+          const collectedResumeLabels = createWorkflowResumeLabels();
           // suspendedPaths maps stepId -> executionPath, using the step ID (not stepId[index])
           const suspendedPaths: Record<string, number[]> = {
             [step.step.id]: [executionPath[0]!],
@@ -2053,12 +2058,14 @@ export class WorkflowEventProcessor extends EventProcessor {
             if (iterResult && typeof iterResult === 'object' && iterResult.status === 'suspended') {
               // Collect resume labels
               if (iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-                for (const [label, target] of Object.entries(iterResult.suspendPayload.__workflow_meta.resumeLabels)) {
-                  collectedResumeLabels[label] = {
-                    ...(target as { stepId: string; foreachIndex?: number }),
+                mergeWorkflowResumeLabels(
+                  collectedResumeLabels,
+                  iterResult.suspendPayload.__workflow_meta.resumeLabels,
+                  target => ({
+                    ...target,
                     foreachIndex: i,
-                  };
-                }
+                  }),
+                );
               }
             }
           }
@@ -2279,8 +2286,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
 
       // Extract resume labels from suspend payload metadata
-      const resumeLabels: Record<string, { stepId: string; foreachIndex?: number }> =
-        prevResult.suspendPayload?.__workflow_meta?.resumeLabels ?? {};
+      const resumeLabels = readWorkflowResumeLabels(prevResult.suspendPayload?.__workflow_meta?.resumeLabels);
 
       // Check shouldPersistSnapshot option - default to true if not specified
       const shouldPersist =
