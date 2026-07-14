@@ -28,17 +28,31 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   stacked feature PR to prove a new trusted-base validation target before that
   policy branch reaches `main`.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
-  runs explicit affected-package checks for Okta Auth, Internal Core, Deployer,
-  MCP, Memory, Server, AI SDK, shared Storage Test Utils, PostgreSQL, and Redis, and
-  executes each supported changed Vitest file in full. Storage Test Utils
+  runs explicit affected-package checks for Okta Auth, Internal Core, CLI,
+  Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
+  PostgreSQL, and Redis, and
+  executes each supported changed Vitest file in full. The stateful Core Agent
+  signal suite is the sole exception: the validator maps changed lines to named
+  `it()`/`test()` cases with the TypeScript AST and runs each selected case in a
+  fresh Vitest process. Before execution, pinned Vitest collection must resolve
+  the leaf selector to exactly one full test identity; the JSON reporter must
+  then prove that same file, suite path, and leaf was the sole passing case.
+  The validator exercises a unique nested identity and a duplicate-leaf
+  fail-closed case after its Core prerequisite checks on every run. Duplicate
+  or ambiguous leaf names fail closed. Two named PubSub failure-injection fixtures map to their
+  owning regression cases; all other changes to shared setup or helpers in that
+  file fail closed because they cannot be covered safely by case selection. Storage Test Utils
   changes must include a changed Vitest file in that workspace so shared
   conformance helpers cannot pass without execution. Okta Auth runs its package
   build and lint; Deployer runs
-  explicit Memory, Agent Builder, Server, and Hono prerequisite builds before
-  its package typecheck, build, lint, and changed-test coverage. This avoids the
-  unrelated package failures in Deployer's broad Turbo dependency closure. MCP
-  runs its package typecheck, build, lint, and changed-test coverage. Nested
-  fixture manifests are not treated as workspace boundaries. Server changes run
+  explicit Memory, Agent Builder, Server, Hono, and Deployer builds before its
+  package typecheck, lint, and changed-test coverage. CLI builds its Deployer
+  chain and direct Loggers dependency, then runs package typecheck, lint, and
+  changed-test coverage. Codemod runs package typecheck, build, lint, and
+  changed-test coverage. The PF-1880 real-process integration tests are owned by
+  those targets; other integration-test filename variants still fail closed.
+  This avoids unrelated package failures in broad Turbo dependency closures.
+  Server changes run
   the package build, lint, Core-import boundary check, permission freshness
   check, both `SERVER_ROUTES` generators, and changed-test coverage. Route
   contract changes additionally typecheck the focused Client SDK route
@@ -48,21 +62,24 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   generated Client SDK route types, CLI API metadata, and Core permission
   interfaces are mapped narrowly to the Server validation lane. Route
   regeneration fails unless both route artifacts are tracked and unchanged
-  from the PR head. Route-surface changes also run Server route consistency and
-  API-manifest tests, scoped TypeScript checks over each generated module and
-  its consumers, and focused Client SDK Harness and CLI descriptor tests. The
-  Server permission check owns the generated RBAC interface. Server package
-  manifest changes fail closed before package-owned commands run. This allows
-  route and permission PRs to commit canonical output without granting general
-  validation coverage to the Client SDK, CLI, or Core workspaces.
-  The validator discovers
+  from the PR head. The Server permission check owns the generated RBAC
+  interface. Server package manifest changes fail closed before package-owned
+  commands run. This allows route and permission PRs to commit canonical output
+  without granting general validation coverage to the Client SDK, CLI, or Core
+  workspaces. MCP runs its package typecheck, build, lint, and changed-test
+  coverage. Nested
+  fixture manifests are not treated as workspace boundaries. The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
-  target. Root dependency graph changes also fail closed until broad workspace
-  validation is available. The Server package manifest also fails closed so a
-  PR cannot redefine the scripts that constitute its own gate. Non-workspace
-  changes must match the explicit
-  CI-rollout or changeset-metadata allowlist; other root paths fail closed.
+  target. A lockfile change is compared from the PR merge base and accepted only
+  when every changed importer also changes its own manifest and content outside
+  the importer sections remains unchanged; root manifests, workspace
+  configuration, unrelated importers, non-importer dependency-graph churn, and
+  unowned lockfile-only changes still fail closed. Supported package checks use
+  path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
+  fixer and Vitest configuration files receive scripts TypeScript validation
+  plus changed-test execution. Other non-workspace changes must match the
+  explicit CI-rollout or changeset-metadata allowlist and fail closed otherwise.
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
   The deterministic, in-process Core Harness real-agent E2E suite is explicitly
   allowlisted and runs through Vitest because it uses a mock language model and
@@ -85,10 +102,16 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   a dedicated fork-safe workflow provides their required setup.
   Store-provider tests other than the provisioned PostgreSQL and Redis suites
   fail closed for the same reason.
-- Actual `mastracode/**` changes run the MastraCode build and E2E suite in the
-  targeted validator. The canonical MastraCode workflow stays available by
-  manual dispatch in the fork, but Core-only fork PRs do not run its broad
-  dependency build while the fork has unrelated package-build baseline errors.
+- Actual `mastracode/**` changes build the GitHub Signals test prerequisite,
+  run changed-file ESLint, and execute the PF-1878 login-dialog, event-dispatch,
+  and notification Vitest files in full. Each of those three production files
+  must remain a regular file and change with its matching regular test; every
+  other MastraCode production JS/TS source, unit test, and nested E2E test fails closed until the targeted
+  validator owns its workspace build prerequisites and test configuration. The
+  canonical MastraCode build and E2E workflow stays available by manual dispatch
+  in the fork; the targeted validator does not report those broad suites as PR
+  coverage while current `main` has unrelated MastraCode and dependency-build
+  baseline errors.
 - The workflow has `contents: read`, does not receive repository secrets, and
   checks out with persisted credentials disabled. Its validation script is
   loaded from the PR's trusted base commit. The first same-repository rollout
