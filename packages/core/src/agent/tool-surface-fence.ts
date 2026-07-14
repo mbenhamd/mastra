@@ -119,10 +119,21 @@ export interface ToolSurfaceFence {
   readonly originalToolSnapshots?: Readonly<Record<string, ToolObjectSnapshot>>;
 }
 
+interface RegisteredToolSurfaceFence {
+  readonly fence: ToolSurfaceFence;
+  readonly ownerId?: string;
+  readonly state: 'active' | 'suspended';
+}
+
+declare const suspendedToolSurfaceFenceLease: unique symbol;
+export type SuspendedToolSurfaceFenceLease = {
+  readonly [suspendedToolSurfaceFenceLease]: true;
+};
+
 // Keep enforcement state outside RequestContext's public key/value bag. A
 // processor can read and mutate that bag, so storing the registry there would
 // let it widen its own replacement ceiling.
-const toolSurfaceFenceRegistries = new WeakMap<RequestContext, Map<string, ToolSurfaceFence>>();
+const toolSurfaceFenceRegistries = new WeakMap<RequestContext, Map<string, RegisteredToolSurfaceFence>>();
 const toolSurfaceRestoreRegistries = new WeakMap<RequestContext, Map<string, readonly string[]>>();
 
 function runKey(runId?: string): string {
@@ -528,12 +539,13 @@ export function stampToolSurfaceFence(
   requestContext: RequestContext,
   runId: string | undefined,
   tools: Record<string, unknown>,
+  ownerId?: string,
 ): ToolSurfaceFence {
   const registry = getOrCreateRegistry(toolSurfaceFenceRegistries, requestContext);
   const key = runKey(runId);
   if (registry.has(key)) {
     throw new Error(
-      `Cannot replace the retained tool surface for active run ${runId ?? '<default>'}; clear its existing fence only after terminal cleanup or explicit resume reconstruction.`,
+      `Cannot replace the retained tool surface for active run ${runId ?? '<default>'}; refusing a concurrent execution until terminal cleanup or explicit resume reconstruction.`,
     );
   }
   if (registry.size >= MAX_RETAINED_FENCES_PER_CONTEXT) {
@@ -542,8 +554,40 @@ export function stampToolSurfaceFence(
     );
   }
   const fence = immutableFence(tools, Object.keys(tools));
-  registry.set(key, fence);
+  registry.set(key, { fence, ownerId, state: 'active' });
   return fence;
+}
+
+/** Transfer a suspended run's fence to exactly one resume execution. */
+export function claimToolSurfaceFence(
+  requestContext: RequestContext,
+  runId: string | undefined,
+  ownerId: string,
+): ToolSurfaceFence | undefined {
+  const registry = toolSurfaceFenceRegistries.get(requestContext);
+  const key = runKey(runId);
+  const registered = registry?.get(key);
+  if (!registered) return undefined;
+  if (registered.state !== 'suspended') {
+    throw new Error(
+      `Cannot resume replacement tool surface for run ${runId ?? '<unknown>'}: another execution still owns the active fence.`,
+    );
+  }
+  registry!.set(key, { fence: registered.fence, ownerId, state: 'active' });
+  return registered.fence;
+}
+
+/** Mark an owned fence as resumable only after the execution has durably suspended. */
+export function suspendToolSurfaceFence(
+  requestContext: RequestContext,
+  runId: string | undefined,
+  ownerId: string,
+): void {
+  const registry = toolSurfaceFenceRegistries.get(requestContext);
+  const key = runKey(runId);
+  const registered = registry?.get(key);
+  if (!registered || registered.ownerId !== ownerId) return;
+  registry!.set(key, { ...registered, state: 'suspended' });
 }
 
 /** Read the immutable tool ceiling for one execution run. */
@@ -551,14 +595,44 @@ export function readToolSurfaceFence(
   requestContext: RequestContext | undefined,
   runId?: string,
 ): ToolSurfaceFence | undefined {
-  return requestContext ? toolSurfaceFenceRegistries.get(requestContext)?.get(runKey(runId)) : undefined;
+  return requestContext ? toolSurfaceFenceRegistries.get(requestContext)?.get(runKey(runId))?.fence : undefined;
 }
 
-/** Clear only one execution run's prior ceiling when a RequestContext is reused. */
-export function clearToolSurfaceFence(requestContext: RequestContext, runId?: string): void {
+/** Clear one run's ceiling, optionally only while the caller still owns it. */
+export function clearToolSurfaceFence(requestContext: RequestContext, runId?: string, ownerId?: string): boolean {
   const registry = toolSurfaceFenceRegistries.get(requestContext);
-  registry?.delete(runKey(runId));
+  const key = runKey(runId);
+  const registered = registry?.get(key);
+  if (!registered || (ownerId !== undefined && registered.ownerId !== ownerId)) return false;
+  registry!.delete(key);
   if (registry?.size === 0) toolSurfaceFenceRegistries.delete(requestContext);
+  return true;
+}
+
+/** Capture one exact suspended generation without exposing its execution owner. */
+export function captureSuspendedToolSurfaceFenceLease(
+  requestContext: RequestContext,
+  runId?: string,
+): SuspendedToolSurfaceFenceLease | undefined {
+  const registered = toolSurfaceFenceRegistries.get(requestContext)?.get(runKey(runId));
+  return registered?.state === 'suspended' ? (registered as unknown as SuspendedToolSurfaceFenceLease) : undefined;
+}
+
+/** Clear a parked ceiling only if it is still the exact captured suspension. */
+export function clearSuspendedToolSurfaceFence(
+  requestContext: RequestContext,
+  runId: string | undefined,
+  lease: SuspendedToolSurfaceFenceLease,
+): boolean {
+  const registry = toolSurfaceFenceRegistries.get(requestContext);
+  const key = runKey(runId);
+  const registered = registry?.get(key);
+  if (registered !== (lease as unknown as RegisteredToolSurfaceFence) || registered.state !== 'suspended') {
+    return false;
+  }
+  registry!.delete(key);
+  if (registry!.size === 0) toolSurfaceFenceRegistries.delete(requestContext);
+  return true;
 }
 
 /** Stage a persisted name ceiling for the next replacement assembly of one run. */
@@ -642,11 +716,22 @@ export function enforceToolSurfaceFence(
   return providerTools;
 }
 
-/** Restrict active tool names to the same immutable execution ceiling. */
-export function enforceActiveToolsFence(activeTools: readonly string[] | undefined, fence: ToolSurfaceFence): string[] {
-  if (activeTools === undefined) return [...fence.allowedNames];
+/** Recreate the complete trusted tool map for a same-process resume. */
+export function materializeToolSurfaceFence(fence: ToolSurfaceFence): Record<string, unknown> {
+  return enforceToolSurfaceFence(fence.originalTools as Record<string, unknown>, fence);
+}
+
+/** Restrict active names to the immutable ceiling and the tools still visible after processing. */
+export function enforceActiveToolsFence(
+  activeTools: readonly string[] | undefined,
+  fence: ToolSurfaceFence,
+  visibleToolNames: Iterable<string> = fence.allowedNames,
+): string[] {
   const allowedNames = new Set(fence.allowedNames);
-  return activeTools.filter(toolName => allowedNames.has(toolName));
+  const visibleNames = new Set(visibleToolNames);
+  return (activeTools ?? fence.allowedNames).filter(
+    toolName => allowedNames.has(toolName) && visibleNames.has(toolName),
+  );
 }
 
 /** Fail before provider invocation when a forced tool choice is outside the ceiling. */

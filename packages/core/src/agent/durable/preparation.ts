@@ -28,6 +28,7 @@ import { createWorkflowInput } from './utils/serialize-state';
 interface DurablePreparationAgent {
   id: string;
   name?: string;
+  getDefaultOptions(opts: { requestContext: RequestContext }): AgentExecutionOptions | Promise<AgentExecutionOptions>;
   getInstructions(opts: { requestContext: RequestContext }): AgentInstructions | Promise<AgentInstructions>;
   getModel(opts: { requestContext: RequestContext }): MastraLanguageModel | Promise<MastraLanguageModel>;
   getModelList(requestContext: RequestContext): Promise<AgentModelManagerConfig[] | null>;
@@ -46,6 +47,7 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext;
     memoryConfig?: MemoryConfig;
     autoResumeSuspendedTools?: boolean;
+    _toolSurfaceFenceOwnerId?: string;
   }): Promise<Record<string, CoreTool>>;
   listInputProcessors(requestContext?: RequestContext): Promise<InputProcessorOrWorkflow[]>;
   listOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
@@ -128,6 +130,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 1. Generate IDs
   const runId = providedRunId ?? crypto.randomUUID();
   const messageId = crypto.randomUUID();
+  const runtimeBindingId = crypto.randomUUID();
 
   // 2. Get request context
   const requestContext = providedRequestContext ?? new RequestContext();
@@ -249,6 +252,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   }
   // 7. Convert tools to CoreTool format for execution
   let tools: Record<string, CoreTool> = {};
+  const toolSurfaceFenceOwnerId = crypto.randomUUID();
   try {
     tools = await typedAgent.getToolsForExecution({
       toolsets: execOptions?.toolsets,
@@ -260,16 +264,23 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext,
       memoryConfig: execOptions?.memory?.options,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      _toolSurfaceFenceOwnerId: toolSurfaceFenceOwnerId,
     });
   } catch (error) {
     logger?.warn?.(`[DurableAgent] Error converting tools: ${error}`);
-    if (execOptions?.toolsetsMode === 'replace') {
+    // getToolsForExecution merges agent defaults internally. Re-resolve only
+    // on this exceptional path so an inherited replacement mode cannot be
+    // mistaken for append mode and silently continue with an empty surface.
+    const defaultOptions = await typedAgent.getDefaultOptions({ requestContext });
+    if ((execOptions?.toolsetsMode ?? defaultOptions.toolsetsMode) === 'replace') {
       throw error;
     }
   }
   const replacementFence = readToolSurfaceFence(requestContext, runId);
-  const toolSurfaceFence = replacementFence ? [...replacementFence.allowedNames] : undefined;
-  if (replacementFence) clearToolSurfaceFence(requestContext, runId);
+  const ownsReplacementFence = replacementFence
+    ? clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId)
+    : false;
+  const toolSurfaceFence = ownsReplacementFence ? [...replacementFence!.allowedNames] : undefined;
 
   // 8. Get model (and model list if configured)
   const model = await typedAgent.getModel({ requestContext });
@@ -336,6 +347,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 13. Create serialized workflow input
   const workflowInput = createWorkflowInput({
     runId,
+    runtimeBindingId,
     agentId: agent.id,
     agentName: agent.name,
     messageList,
@@ -346,7 +358,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     options: {
       maxSteps: execOptions?.maxSteps,
       toolChoice: execOptions?.toolChoice as any,
-      activeTools: execOptions?.activeTools,
+      activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
       toolSurfaceFence,
       temperature: execOptions?.modelSettings?.temperature,
       // Durable runs serialize their options, so a function-valued global approval policy
@@ -376,6 +388,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
 
   // 14. Create registry entry for non-serializable state
   const registryEntry: RunRegistryEntry = {
+    runtimeBindingId,
     tools,
     saveQueueManager,
     memory,
@@ -396,7 +409,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     processorStates,
     backgroundTaskManager,
     backgroundTasksConfig,
-    cleanup: () => clearToolSurfaceFence(requestContext, runId),
   };
 
   return {

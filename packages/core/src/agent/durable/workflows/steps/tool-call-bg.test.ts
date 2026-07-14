@@ -32,6 +32,7 @@ const { emitChunkEvent } = await import('../../stream-adapter');
 const { resolveTool: _resolveTool } = await import('../../utils/resolve-runtime');
 
 const RUN_ID = 'run-bg-1';
+const RUNTIME_BINDING_ID = 'binding-bg-1';
 const AGENT_ID = 'agent-1';
 const TOOL_NAME = 'research';
 const TOOL_CALL_ID = 'call-1';
@@ -51,6 +52,7 @@ function baseInput() {
 function makeInitData(overrides: Record<string, any> = {}) {
   return {
     runId: RUN_ID,
+    runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: AGENT_ID,
     options: { requireToolApproval: false },
     state: {
@@ -81,6 +83,7 @@ function setupRegistry(overrides: Record<string, any> = {}) {
   const bgManager = { config: {}, listTasks: vi.fn() };
 
   const entry = {
+    runtimeBindingId: RUNTIME_BINDING_ID,
     tools: {
       [TOOL_NAME]: {
         execute: vi.fn().mockResolvedValue({ summary: 'done' }),
@@ -121,6 +124,53 @@ afterEach(() => {
 });
 
 describe('durable tool-call background task dispatch', () => {
+  it('fails closed when a replacement run loses its registry before tool dispatch', async () => {
+    await expect(
+      executeStep(
+        mockPubsub(),
+        makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: [TOOL_NAME] } }),
+      ),
+    ).rejects.toThrow(/Cannot reconstruct replacement tool implementations/);
+  });
+
+  it('fails closed when a replacement registry loses an allowed implementation before dispatch', async () => {
+    setupRegistry({ tools: {} });
+    const backingExecute = vi.fn().mockResolvedValue('backing');
+    vi.mocked(_resolveTool).mockReturnValue({ execute: backingExecute } as any);
+
+    await expect(
+      executeStep(
+        mockPubsub(),
+        makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: [TOOL_NAME] } }),
+      ),
+    ).rejects.toThrow(/has no own concrete implementation/);
+    expect(backingExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch an out-of-fence registry tool or a same-name backing tool', async () => {
+    const allowedExecute = vi.fn().mockResolvedValue('allowed');
+    const hiddenExecute = vi.fn().mockResolvedValue('hidden');
+    const backingExecute = vi.fn().mockResolvedValue('backing');
+    setupRegistry({
+      tools: {
+        allowedTool: { execute: allowedExecute },
+        hiddenTool: { execute: hiddenExecute },
+      },
+    });
+    vi.mocked(_resolveTool).mockReturnValue({ execute: backingExecute } as any);
+
+    const result = await executeStep(
+      mockPubsub(),
+      makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: ['allowedTool'] } }),
+      { ...baseInput(), toolName: 'hiddenTool' },
+    );
+
+    expect(result.error).toEqual(expect.objectContaining({ name: 'ToolNotFoundError' }));
+    expect(allowedExecute).not.toHaveBeenCalled();
+    expect(hiddenExecute).not.toHaveBeenCalled();
+    expect(backingExecute).not.toHaveBeenCalled();
+  });
+
   it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {
     const pubsub = mockPubsub();
     setupRegistry();

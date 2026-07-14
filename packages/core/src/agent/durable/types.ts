@@ -178,6 +178,11 @@ export interface DurableAgenticWorkflowInput {
   __workflowKind: 'durable-agent';
   /** Unique identifier for this execution run */
   runId: string;
+  /**
+   * Unpredictable binding to the exact non-serializable registry entry for this run.
+   * Optional only when reading workflows persisted before runtime bindings were introduced.
+   */
+  runtimeBindingId?: string;
   /** Agent identifier */
   agentId: string;
   /** Agent name for logging/tracing */
@@ -420,6 +425,8 @@ export interface RegistryModelListEntry {
  * Registry entry for a single run's non-serializable state
  */
 export interface RunRegistryEntry {
+  /** Must match the durable workflow input before any retained runtime dependency is used */
+  runtimeBindingId: string;
   /** Resolved tools with execute functions */
   tools: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */

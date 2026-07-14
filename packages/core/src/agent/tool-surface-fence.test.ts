@@ -3,6 +3,9 @@ import { z } from 'zod/v4';
 
 import { RequestContext } from '../request-context';
 import {
+  captureSuspendedToolSurfaceFenceLease,
+  claimToolSurfaceFence,
+  clearSuspendedToolSurfaceFence,
   clearToolSurfaceFence,
   consumeToolSurfaceFenceRestore,
   createToolSurfaceFence,
@@ -11,6 +14,7 @@ import {
   readToolSurfaceFence,
   stageToolSurfaceFenceRestore,
   stampToolSurfaceFence,
+  suspendToolSurfaceFence,
 } from './tool-surface-fence';
 
 describe('replacement tool surface fence', () => {
@@ -317,5 +321,37 @@ describe('replacement tool surface fence', () => {
       /Cannot replace the retained tool surface for active run run-1/,
     );
     expect(readToolSurfaceFence(requestContext, 'run-1')).toBe(originalFence);
+  });
+
+  it('leases an active fence so colliding and stale executions cannot replace or clear it', () => {
+    const requestContext = new RequestContext();
+    const first = stampToolSurfaceFence(requestContext, 'shared-run', { modeTool: {} }, 'owner-a');
+
+    expect(() => stampToolSurfaceFence(requestContext, 'shared-run', { hiddenTool: {} }, 'owner-b')).toThrow(
+      /concurrent execution/,
+    );
+    expect(clearToolSurfaceFence(requestContext, 'shared-run', 'owner-b')).toBe(false);
+    expect(readToolSurfaceFence(requestContext, 'shared-run')).toBe(first);
+
+    suspendToolSurfaceFence(requestContext, 'shared-run', 'owner-a');
+    expect(claimToolSurfaceFence(requestContext, 'shared-run', 'owner-b')).toBe(first);
+    expect(clearToolSurfaceFence(requestContext, 'shared-run', 'owner-a')).toBe(false);
+    expect(clearToolSurfaceFence(requestContext, 'shared-run', 'owner-b')).toBe(true);
+    expect(readToolSurfaceFence(requestContext, 'shared-run')).toBeUndefined();
+  });
+
+  it('does not clear a newer suspension after a resume execution claims and re-suspends it', () => {
+    const requestContext = new RequestContext();
+    const fence = stampToolSurfaceFence(requestContext, 'shared-run', { modeTool: {} }, 'suspend-owner');
+
+    suspendToolSurfaceFence(requestContext, 'shared-run', 'suspend-owner');
+    const staleLease = captureSuspendedToolSurfaceFenceLease(requestContext, 'shared-run')!;
+    expect(claimToolSurfaceFence(requestContext, 'shared-run', 'resume-owner')).toBe(fence);
+    suspendToolSurfaceFence(requestContext, 'shared-run', 'resume-owner');
+
+    expect(clearSuspendedToolSurfaceFence(requestContext, 'shared-run', staleLease)).toBe(false);
+    expect(readToolSurfaceFence(requestContext, 'shared-run')).toBe(fence);
+    const currentLease = captureSuspendedToolSurfaceFenceLease(requestContext, 'shared-run')!;
+    expect(clearSuspendedToolSurfaceFence(requestContext, 'shared-run', currentLease)).toBe(true);
   });
 });

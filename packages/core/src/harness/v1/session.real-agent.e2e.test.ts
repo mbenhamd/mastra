@@ -43,9 +43,14 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
+import { AgentThreadOutputDrainError } from '../../agent/thread-stream-runtime';
+import { PubSub } from '../../events/pubsub';
+import type { Event, EventCallback, SubscribeOptions } from '../../events/types';
+import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
+import { askUser } from '../../tools/builtin';
 
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
@@ -107,6 +112,104 @@ function newHarness(agent: Agent<any, any, any>) {
   });
 }
 
+class DelayedDeliveryPubSub extends PubSub {
+  private readonly subscribers = new Map<string, Set<EventCallback>>();
+  private rejectedEvent = false;
+  private matchingEventCount = 0;
+
+  constructor(
+    private readonly delayMs: number,
+    private readonly rejectEventType?: 'run-registered' | 'run-completed' | 'run-suspended',
+    private readonly rejectEventOccurrence = 1,
+    /** Undefined rejects before delivery; a number delivers first, waits, then rejects. */
+    private readonly rejectAfterDeliveryDelayMs?: number,
+  ) {
+    super();
+  }
+
+  override get supportedModes(): ReadonlyArray<'pull' | 'push'> {
+    return ['pull', 'push'];
+  }
+
+  async publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    if ((event.data as { type?: string } | undefined)?.type === this.rejectEventType) {
+      this.matchingEventCount++;
+    }
+    const shouldReject =
+      !this.rejectedEvent &&
+      this.matchingEventCount === this.rejectEventOccurrence &&
+      (event.data as { type?: string } | undefined)?.type === this.rejectEventType;
+    if (shouldReject) {
+      this.rejectedEvent = true;
+    }
+    if (shouldReject && this.rejectAfterDeliveryDelayMs === undefined) {
+      throw new Error(`injected ${this.rejectEventType} publication failure`);
+    }
+    const delivered = { ...event, id: crypto.randomUUID(), createdAt: new Date() };
+    await Promise.all([...(this.subscribers.get(topic) ?? [])].map(callback => callback(delivered)));
+    if (shouldReject) {
+      await new Promise(resolve => setTimeout(resolve, this.rejectAfterDeliveryDelayMs));
+      throw new Error(`injected ${this.rejectEventType} publication failure after delivery`);
+    }
+  }
+
+  async subscribe(topic: string, callback: EventCallback, _options?: SubscribeOptions): Promise<void> {
+    const callbacks = this.subscribers.get(topic) ?? new Set<EventCallback>();
+    callbacks.add(callback);
+    this.subscribers.set(topic, callbacks);
+  }
+
+  async unsubscribe(topic: string, callback: EventCallback): Promise<void> {
+    this.subscribers.get(topic)?.delete(callback);
+  }
+
+  async flush(): Promise<void> {}
+}
+
+function sequentialApprovalFixture() {
+  const firstExecute = vi.fn(async () => ({ first: true }));
+  const secondExecute = vi.fn(async () => ({ second: true }));
+  const firstApproval = createTool({
+    id: 'firstApproval',
+    description: 'first approval',
+    inputSchema: z.object({}),
+    requireApproval: true,
+    execute: firstExecute,
+  });
+  const secondApproval = createTool({
+    id: 'secondApproval',
+    description: 'second approval',
+    inputSchema: z.object({}),
+    requireApproval: true,
+    execute: secondExecute,
+  });
+  let callCount = 0;
+  const model = new MockLanguageModelV2({
+    doStream: async () => {
+      callCount++;
+      return {
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream:
+          callCount === 1
+            ? toolCallStream('first-approval-call', 'firstApproval', '{}')
+            : callCount === 2
+              ? toolCallStream('second-approval-call', 'secondApproval', '{}')
+              : textStream(['unexpected retry']),
+      };
+    },
+  });
+  const agent = new Agent({
+    id: 'default',
+    name: 'default',
+    instructions: 'request both approvals in order',
+    model,
+    tools: { firstApproval, secondApproval },
+  });
+  return { agent, firstExecute, secondExecute };
+}
+
 /** Wait until `predicate()` is true, polling the microtask/timer queue. */
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -161,6 +264,40 @@ describe('Harness v1 real-agent E2E — S1 streamed text', () => {
       expect(agentEnd.finishReason).toBe('complete');
       // runId is consistent across the turn's events.
       expect(textDeltas.every(e => e.runId === agentEnd.runId)).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('rejects instead of hanging when the terminal event cannot be published', async () => {
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: textStream(['done']),
+      }),
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'reply', model });
+    const pubsub = new DelayedDeliveryPubSub(0, 'run-completed');
+    const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+    const harness = new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-terminal-failure', threadId: { fresh: true } });
+
+      const rejection = await session.message({ content: 'finish' }).then(
+        () => undefined,
+        error => error,
+      );
+
+      expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+      expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+      expect(((rejection as { cause: AgentThreadOutputDrainError }).cause as AgentThreadOutputDrainError).reason).toBe(
+        'terminal-publish-failed',
+      );
     } finally {
       await harness.shutdown();
     }
@@ -360,13 +497,15 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
   it('captures, hides, and reapplies the replacement fence across approval suspend and resume', async () => {
     const modeExecute = vi.fn(async () => 'approved');
     const substitutedExecute = vi.fn(async () => 'substituted');
-    const modeTool = createTool({
-      id: 'modeTool',
-      description: 'approval-bearing mode tool',
-      inputSchema: z.object({}),
-      requireApproval: true,
-      execute: modeExecute,
-    });
+    const modeTool = Object.freeze(
+      createTool({
+        id: 'modeTool',
+        description: 'approval-bearing mode tool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: modeExecute,
+      }),
+    );
     const substitutedModeTool = createTool({
       id: 'substitutedModeTool',
       description: 'processor substitution attempt',
@@ -511,6 +650,178 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
     }
   });
 
+  it('retains the replacement surface when ask_user pre-registers the pending question', async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream:
+          ++callCount === 1
+            ? toolCallStream(
+                'question-call',
+                'ask_user',
+                JSON.stringify({
+                  question: 'Continue?',
+                  options: [{ label: 'yes' }, { label: 'no' }],
+                  selectionMode: 'single_select',
+                }),
+              )
+            : textStream(['question resumed']),
+      }),
+    });
+    const agent = new Agent({
+      id: 'replacement-question-resume-agent',
+      name: 'replacement-question-resume-agent',
+      instructions: 'ask one question',
+      model,
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { ask_user: askUser },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-question-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'ask before continuing' })) as any;
+
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'question',
+        toolSurfaceFence: ['ask_user'],
+      });
+
+      const resumed = (await session.respondToQuestion({ answer: 'yes' })) as any;
+
+      expect(resumed.text).toBe('question resumed');
+      expect(session.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('clears a pre-registered question when its suspended terminal cannot be published', async () => {
+    let activeRunId: string | undefined;
+    const preRegisteredQuestion = createTool({
+      id: 'preRegisteredQuestion',
+      description: 'register a question before suspending',
+      inputSchema: z.object({ questionId: z.string() }),
+      outputSchema: z.object({ answer: z.unknown() }),
+      suspendSchema: z.object({}),
+      resumeSchema: z.object({ answer: z.unknown() }),
+      execute: async (_input, ctx) => {
+        const input = _input as { questionId: string };
+        const resumeData = ctx.agent?.resumeData as { answer: unknown } | undefined;
+        if (resumeData !== undefined) return resumeData;
+        const harnessContext = ctx.requestContext?.get('harness') as
+          | {
+              registerQuestion?: (params: {
+                questionId: string;
+                question: string;
+                runId: string;
+                toolCallId: string;
+              }) => Promise<void>;
+            }
+          | undefined;
+        if (!activeRunId || !ctx.agent?.suspend || !harnessContext?.registerQuestion) {
+          throw new Error('expected a Harness agent execution context');
+        }
+        await harnessContext.registerQuestion({
+          questionId: input.questionId,
+          question: 'Continue?',
+          runId: activeRunId,
+          toolCallId: input.questionId,
+        });
+        await ctx.agent.suspend({});
+        return { answer: undefined };
+      },
+    });
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount <= 2
+              ? toolCallStream(
+                  `failed-question-call-${callCount}`,
+                  'preRegisteredQuestion',
+                  JSON.stringify({ questionId: `failed-question-call-${callCount}` }),
+                )
+              : textStream(['question resumed after retry']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'failed-question-terminal-agent',
+      name: 'failed-question-terminal-agent',
+      instructions: 'ask one question',
+      model,
+    });
+    const pubsub = new DelayedDeliveryPubSub(25, 'run-completed');
+    const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+    const harness = new Harness({
+      mastra,
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { preRegisteredQuestion },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'failed-question-terminal-user', threadId: { fresh: true } });
+      let earlyResponse: Promise<unknown> | undefined;
+      session.subscribe(event => {
+        if (event.type === 'agent_start') activeRunId = event.runId;
+        if (event.type !== 'question_pending' || earlyResponse !== undefined) return;
+        earlyResponse = session.respondToQuestion({ answer: 'yes' }).then(
+          () => undefined,
+          error => error,
+        );
+      });
+      const rejection = await session.message({ content: 'ask before continuing' }).then(
+        () => undefined,
+        error => error,
+      );
+
+      await waitFor(() => earlyResponse !== undefined, 'early question response attempt');
+      expect(earlyResponse).toBeDefined();
+      await expect(earlyResponse).resolves.toMatchObject({ name: 'HarnessBusyError', code: 'harness.busy' });
+      expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+      expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+      expect(session.getRecord().pendingResume).toBeUndefined();
+      expect(session.isBusy()).toBe(false);
+
+      const suspended = (await session.message({ content: 'ask again' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'question',
+        toolSurfaceFence: ['preRegisteredQuestion'],
+      });
+      const resumed = (await session.respondToQuestion({ answer: 'yes' })) as any;
+      expect(resumed.text).toBe('question resumed after retry');
+      expect(session.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('fails closed after the suspended run loses its process-local replacement implementations', async () => {
     const approvedExecute = vi.fn(async () => 'must not run');
     const approvalTool = createTool({
@@ -587,6 +898,276 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
 // ===========================================================================
 
 describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
+  it('rejects and leaves no resumable state when a suspended terminal event cannot be published', async () => {
+    const approvalTool = createTool({
+      id: 'failedSuspendApproval',
+      description: 'approval with a rejected suspended terminal event',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: async () => ({ approved: true }),
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: toolCallStream('failed-suspend-call', 'failedSuspendApproval', '{}'),
+      }),
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use failedSuspendApproval',
+      model,
+      tools: { failedSuspendApproval: approvalTool },
+    });
+    const pubsub = new DelayedDeliveryPubSub(0, 'run-suspended');
+    const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+    const harness = new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-suspend-failure', threadId: { fresh: true } });
+
+      const rejection = await session.message({ content: 'request approval' }).then(
+        () => undefined,
+        error => error,
+      );
+
+      expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+      expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+      expect(((rejection as { cause: AgentThreadOutputDrainError }).cause as AgentThreadOutputDrainError).reason).toBe(
+        'terminal-publish-failed',
+      );
+      expect(session.getRecord().pendingResume).toBeUndefined();
+      expect(session.isBusy()).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it.each([
+    ['run-completed', 1, 'terminal-publish-failed', undefined, 'before delivery'],
+    ['run-registered', 2, 'registration-publish-failed', undefined, 'before delivery'],
+    ['run-registered', 2, 'registration-publish-failed', 25, 'after partial delivery'],
+  ] as const)(
+    'terminalizes an executed resume before surfacing a %s publication failure %s',
+    async (rejectedEventType, rejectedEventOccurrence, expectedReason, rejectAfterDeliveryDelayMs, _deliveryLabel) => {
+      const execute = vi.fn(async () => ({ approved: true }));
+      const approvalTool = createTool({
+        id: 'failedCompletedTerminalApproval',
+        description: 'approval whose resumed completion terminal cannot be published',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute,
+      });
+      let callCount = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          callCount++;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream:
+              callCount === 1
+                ? toolCallStream('failed-completed-terminal-call', 'failedCompletedTerminalApproval', '{}')
+                : textStream(['completed despite terminal publication failure']),
+          };
+        },
+      });
+      const agent = new Agent({
+        id: 'default',
+        name: 'default',
+        instructions: 'use failedCompletedTerminalApproval',
+        model,
+        tools: { failedCompletedTerminalApproval: approvalTool },
+      });
+      const pubsub = new DelayedDeliveryPubSub(
+        0,
+        rejectedEventType,
+        rejectedEventOccurrence,
+        rejectAfterDeliveryDelayMs,
+      );
+      const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+      const harness = new Harness({
+        mastra,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      try {
+        const session = await harness.session({
+          resourceId: `u-resume-${rejectedEventType}-failure-${rejectAfterDeliveryDelayMs ?? 'before'}`,
+          threadId: { fresh: true },
+        });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+        const suspended = (await session.message({ content: 'request approval' })) as any;
+        expect(suspended.finishReason).toBe('suspended');
+
+        const rejection = await session.respondToToolApproval({ approved: true }).then(
+          () => undefined,
+          error => error,
+        );
+
+        expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+        expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+        expect(
+          ((rejection as { cause: AgentThreadOutputDrainError }).cause as AgentThreadOutputDrainError).reason,
+        ).toBe(expectedReason);
+        expect(execute).toHaveBeenCalledOnce();
+        expect(session.getRecord().pendingResume).toBeUndefined();
+        expect(session.isBusy()).toBe(false);
+        expect(
+          events.filter(event => event.type === 'tool_end' && event.toolCallId === 'failed-completed-terminal-call'),
+        ).toEqual([
+          expect.objectContaining({
+            type: 'tool_end',
+            toolName: 'failedCompletedTerminalApproval',
+            output: { approved: true },
+            isError: false,
+          }),
+        ]);
+        await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+        expect(execute).toHaveBeenCalledOnce();
+      } finally {
+        await harness.shutdown();
+      }
+    },
+  );
+
+  it.each([
+    ['run-suspended publication', 'run-suspended', 'direct response', undefined, 'terminal-publish-failed'],
+    ['run-suspended publication', 'run-suspended', 'inbox response', 'resuspend-response', 'terminal-publish-failed'],
+    ['run-registered publication', 'run-registered', 'direct response', undefined, 'registration-publish-failed'],
+    [
+      'run-registered publication',
+      'run-registered',
+      'inbox response',
+      'registration-response',
+      'registration-publish-failed',
+    ],
+  ] as const)(
+    'terminalizes an undeliverable re-suspension after a failed %s (%s; %s)',
+    async (_failureLabel, rejectedEventType, _responseLabel, responseId, expectedReason) => {
+      const { agent, firstExecute, secondExecute } = sequentialApprovalFixture();
+      const pubsub = new DelayedDeliveryPubSub(0, rejectedEventType, 2);
+      const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+      const harness = new Harness({
+        mastra,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      try {
+        const session = await harness.session({
+          resourceId: `u-resuspend-${rejectedEventType}-failure-${responseId ?? 'direct'}`,
+          threadId: { fresh: true },
+        });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+        const suspended = (await session.message({ content: 'request first approval' })) as any;
+        expect(suspended.finishReason).toBe('suspended');
+
+        const rejection = await session
+          .respondToToolApproval({ approved: true, ...(responseId !== undefined ? { responseId } : {}) })
+          .then(
+            () => undefined,
+            error => error,
+          );
+
+        expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+        expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+        expect((rejection as { cause: AgentThreadOutputDrainError }).cause.reason).toBe(expectedReason);
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+        expect(session.getRecord().pendingResume).toBeUndefined();
+        expect(session.isBusy()).toBe(false);
+        if (responseId !== undefined) {
+          expect(session.getRecord().inboxResponseReceipts?.[responseId]).toMatchObject({
+            status: 'failed',
+            retryable: false,
+          });
+        }
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'resume_failed', runId: suspended.runId, retryable: false }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'agent_end', runId: suspended.runId, finishReason: 'error' }),
+        );
+        const firstToolEnds = events.filter(
+          event => event.type === 'tool_end' && event.toolCallId === 'first-approval-call',
+        );
+        expect(firstToolEnds).toEqual([
+          expect.objectContaining({
+            type: 'tool_end',
+            toolName: 'firstApproval',
+            output: { first: true },
+            isError: false,
+          }),
+        ]);
+        const firstToolEndIndex = events.indexOf(firstToolEnds[0]!);
+        const failedAgentEndIndex = events.findIndex(
+          event => event.type === 'agent_end' && event.runId === suspended.runId && event.finishReason === 'error',
+        );
+        expect(failedAgentEndIndex).toBeGreaterThan(firstToolEndIndex);
+        if (rejectedEventType === 'run-suspended') {
+          const secondStartIndex = events.findIndex(
+            event => event.type === 'tool_start' && event.toolCallId === 'second-approval-call',
+          );
+          const secondEndIndex = events.findIndex(
+            event => event.type === 'tool_end' && event.toolCallId === 'second-approval-call',
+          );
+          const failedAgentEndAfterSecondIndex = events.findIndex(
+            event => event.type === 'agent_end' && event.runId === suspended.runId && event.finishReason === 'error',
+          );
+          const runCompletedIndex = events.findIndex(
+            event => event.type === 'run_completed' && event.runId === suspended.runId,
+          );
+          expect(secondStartIndex).toBeGreaterThanOrEqual(0);
+          expect(secondEndIndex).toBeGreaterThan(secondStartIndex);
+          expect(failedAgentEndAfterSecondIndex).toBeGreaterThan(secondEndIndex);
+          expect(runCompletedIndex).toBeGreaterThan(failedAgentEndAfterSecondIndex);
+          expect(events[secondEndIndex]).toMatchObject({
+            type: 'tool_end',
+            toolName: 'secondApproval',
+            isError: true,
+            output: { aborted: true },
+          });
+          expect(
+            events.filter(event => event.type === 'tool_end' && event.toolCallId === 'second-approval-call'),
+          ).toHaveLength(1);
+          expect(events[runCompletedIndex]).toMatchObject({
+            type: 'run_completed',
+            status: 'failed',
+            toolRollup: {
+              errors: 1,
+              perTool: {
+                firstApproval: { count: 1, errors: 0 },
+                secondApproval: { count: 1, errors: 1 },
+              },
+            },
+          });
+        } else {
+          const runCompleted = events.find(event => event.type === 'run_completed' && event.runId === suspended.runId);
+          expect(runCompleted).toMatchObject({
+            type: 'run_completed',
+            status: 'failed',
+            toolRollup: {
+              count: 1,
+              errors: 0,
+              perTool: { firstApproval: { count: 1, errors: 0 } },
+            },
+          });
+        }
+        await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+      } finally {
+        await harness.shutdown();
+      }
+    },
+  );
+
   it('a requireApproval tool suspends the real run; respondToToolApproval resumes it to complete', async () => {
     const findUser = createTool({
       id: 'findUser',
@@ -670,13 +1251,12 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       // suspension event is "followed by either a tool_end (after resume) or an
       // agent_end (after abort)" on the live subscriber stream. The resume run
       // reuses the suspended run's `runId`, which the long-lived thread
-      // subscription has already recorded in its `seenRunIds`, so that
-      // subscription dedups the re-registered resume run. `_resume`
-      // (session.ts) therefore drains the resume run's OWN `fullStream` through
-      // `_emitForChunk` (`_drainResumeStream`) so the approved tool's `tool_end`
-      // and the post-approval `text_delta` surface LIVE before the terminal
-      // `agent_end:complete`. (A UI streams the continuation after approval; it
-      // does not have to read the tool result from display-state / FullOutput.)
+      // subscription releases the suspended segment's run id after its terminal
+      // delivery, so the re-registered resume segment is queued on that same
+      // sole consumer. Its output-drain barrier keeps the approved `tool_end`
+      // and post-approval `text_delta` ahead of `agent_end:complete`. (A UI
+      // streams the continuation after approval; it does not have to read the
+      // tool result from display-state / FullOutput.)
       const postResumeEvents = events.slice(eventsAtSuspend);
       const postResumeTypes = postResumeEvents.map(e => e.type);
 
@@ -706,6 +1286,71 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       // After the resume terminalizes, the display state's pending slot clears
       // (the captured approval registration is consumed).
       expect(session.getDisplayState().pending == null).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('waits for delayed subscription delivery before terminalizing a resumed run', async () => {
+    const approvalTool = createTool({
+      id: 'delayedApproval',
+      description: 'approval over delayed pubsub',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: async () => ({ approved: true }),
+    });
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('delayed-approval-call', 'delayedApproval', '{}')
+              : textStream(['delayed ', 'resume']),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'use delayedApproval',
+      model,
+      tools: { delayedApproval: approvalTool },
+    });
+    const pubsub = new DelayedDeliveryPubSub(15);
+    const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+    const harness = new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-delayed', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      const suspended = (await session.message({ content: 'run delayed approval' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      const eventsAtSuspend = events.length;
+
+      await session.respondToToolApproval({ approved: true });
+
+      const resumedEvents = events.slice(eventsAtSuspend);
+      const resumedTypes = resumedEvents.map(event => event.type);
+      const toolEndIndex = resumedTypes.indexOf('tool_end');
+      const lastTextIndex = resumedTypes.lastIndexOf('text_delta');
+      const agentEndIndex = resumedTypes.lastIndexOf('agent_end');
+      expect(toolEndIndex).toBeGreaterThanOrEqual(0);
+      expect(lastTextIndex).toBeGreaterThan(toolEndIndex);
+      expect(agentEndIndex).toBeGreaterThan(lastTextIndex);
+      expect(
+        resumedEvents
+          .slice(agentEndIndex + 1)
+          .filter(event => event.type === 'tool_start' || event.type === 'tool_end' || event.type === 'text_delta'),
+      ).toEqual([]);
+      expect(session.getRecord().pendingResume).toBeUndefined();
     } finally {
       await harness.shutdown();
     }
@@ -776,6 +1421,259 @@ describe('Harness v1 real-agent E2E — S4 settlement evidence', () => {
       expect(completed!.signalId.length).toBeGreaterThan(0);
       expect(completed!.runId.length).toBeGreaterThan(0);
       expect(session.getRecord().pendingQueue).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it.each([
+    ['run-suspended', 'terminal-publish-failed'],
+    ['run-registered', 'registration-publish-failed'],
+  ] as const)(
+    'fails owned signal evidence when a resumed segment cannot publish %s',
+    async (rejectedEventType, expectedReason) => {
+      const { agent, firstExecute, secondExecute } = sequentialApprovalFixture();
+      const pubsub = new DelayedDeliveryPubSub(0, rejectedEventType, 2);
+      const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+      const harness = new Harness({
+        mastra,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      try {
+        const session = await harness.session({
+          resourceId: `u-resuspend-signal-${rejectedEventType}-failure`,
+          threadId: { fresh: true },
+        });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+
+        const handle = await session.signal({ content: 'request first approval' });
+        const suspended = await handle.result;
+        expect(suspended.finishReason).toBe('suspended');
+        await waitFor(
+          () => session.getRecord().pendingResume !== undefined && !session.isRunning(),
+          'owned signal suspension to become resumable',
+        );
+
+        const rejection = await session.respondToToolApproval({ approved: true }).then(
+          () => undefined,
+          error => error,
+        );
+
+        expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+        expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+        expect((rejection as { cause: AgentThreadOutputDrainError }).cause.reason).toBe(expectedReason);
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+        expect(session.getRecord().pendingResume).toBeUndefined();
+        expect(session.isBusy()).toBe(false);
+        expect(await session.lookupMessageResult(handle.id)).toMatchObject({
+          status: 'failed',
+          signalId: handle.id,
+          runId: handle.runId,
+        });
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'signal_failed', signalId: handle.id, runId: handle.runId }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'resume_failed', runId: handle.runId, retryable: false }),
+        );
+        await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+      } finally {
+        await harness.shutdown();
+      }
+    },
+  );
+
+  it.each([
+    ['run-suspended', 'terminal-publish-failed'],
+    ['run-registered', 'registration-publish-failed'],
+  ] as const)(
+    'fails and removes queued work when a resumed segment cannot publish %s',
+    async (rejectedEventType, expectedReason) => {
+      const { agent, firstExecute, secondExecute } = sequentialApprovalFixture();
+      const pubsub = new DelayedDeliveryPubSub(0, rejectedEventType, 2);
+      const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+      const harness = new Harness({
+        mastra,
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+      });
+      try {
+        const session = await harness.session({
+          resourceId: `u-resuspend-queue-${rejectedEventType}-failure`,
+          threadId: { fresh: true },
+        });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+        const queuedOutcome = session.queue({ content: 'request first approval' }).then(
+          value => ({ value }),
+          error => ({ error }),
+        );
+        await waitFor(
+          () => session.getRecord().pendingResume?.queuedItemId !== undefined && !session.isRunning(),
+          'queued suspension to become resumable',
+        );
+        const pending = session.getRecord().pendingResume!;
+        const queuedItemId = pending.queuedItemId!;
+
+        const rejection = await session.respondToToolApproval({ approved: true }).then(
+          () => undefined,
+          error => error,
+        );
+        const outcome = await queuedOutcome;
+
+        expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+        expect((rejection as { cause?: unknown }).cause).toBeInstanceOf(AgentThreadOutputDrainError);
+        expect((rejection as { cause: AgentThreadOutputDrainError }).cause.reason).toBe(expectedReason);
+        expect(outcome).toEqual({ error: expect.objectContaining({ code: 'harness.internal' }) });
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+        expect(session.getRecord().pendingResume).toBeUndefined();
+        expect(session.getRecord().pendingQueue).toEqual([]);
+        expect(session.isBusy()).toBe(false);
+        expect(await session.lookupQueueResult(queuedItemId)).toMatchObject({
+          status: 'failed',
+          queuedItemId,
+          runId: pending.runId,
+        });
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'queue_failed', queuedItemId, runId: pending.runId }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'resume_failed', runId: pending.runId, retryable: false }),
+        );
+        expect(events.filter(event => event.type === 'tool_end' && event.toolCallId === 'first-approval-call')).toEqual(
+          [
+            expect.objectContaining({
+              type: 'tool_end',
+              toolName: 'firstApproval',
+              output: { first: true },
+              isError: false,
+              queuedItemId,
+            }),
+          ],
+        );
+        for (const terminalEvent of events.filter(
+          event =>
+            event.runId === pending.runId &&
+            (event.type === 'resume_failed' || event.type === 'agent_end' || event.type === 'run_completed'),
+        )) {
+          expect(terminalEvent).toMatchObject({ queuedItemId });
+        }
+        if (rejectedEventType === 'run-suspended') {
+          expect(events).toContainEqual(
+            expect.objectContaining({
+              type: 'tool_end',
+              toolCallId: 'second-approval-call',
+              queuedItemId,
+              isError: true,
+            }),
+          );
+        }
+        await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
+        expect(firstExecute).toHaveBeenCalledOnce();
+        expect(secondExecute).not.toHaveBeenCalled();
+      } finally {
+        await harness.shutdown();
+      }
+    },
+  );
+
+  it('force-closes streamed tools and releases a queued resume when undeliverable terminalization storage fails', async () => {
+    const { agent, firstExecute, secondExecute } = sequentialApprovalFixture();
+    const pubsub = new DelayedDeliveryPubSub(0, 'run-suspended', 2);
+    const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
+    const harness = new Harness({
+      mastra,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({
+        resourceId: 'u-resuspend-queue-terminalization-storage-failure',
+        threadId: { fresh: true },
+      });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      const firstOutcome = session.queue({ content: 'request first approval' }).then(
+        value => ({ value }),
+        error => ({ error }),
+      );
+      await waitFor(
+        () => session.getRecord().pendingResume?.queuedItemId !== undefined && !session.isRunning(),
+        'first queued suspension to become resumable',
+      );
+      const firstPending = session.getRecord().pendingResume!;
+      const firstQueuedItemId = firstPending.queuedItemId!;
+      const secondOutcome = session.queue({ content: 'next queued item' });
+
+      vi.spyOn(session as any, '_terminalizeUndeliverableResuspension').mockRejectedValueOnce(
+        new Error('injected terminalization storage failure'),
+      );
+      const rejection = await session.respondToToolApproval({ approved: true }).then(
+        () => undefined,
+        error => error,
+      );
+
+      expect(rejection).toMatchObject({ name: 'HarnessExecutionError' });
+      expect(firstExecute).toHaveBeenCalledOnce();
+      expect(secondExecute).not.toHaveBeenCalled();
+      expect(session.getRecord().pendingResume).toMatchObject({
+        queuedItemId: firstQueuedItemId,
+        resumedAt: expect.any(Number),
+      });
+      const secondToolStartIndex = events.findIndex(
+        event => event.type === 'tool_start' && event.toolCallId === 'second-approval-call',
+      );
+      const secondToolEnds = events.filter(
+        event => event.type === 'tool_end' && event.toolCallId === 'second-approval-call',
+      );
+      expect(secondToolStartIndex).toBeGreaterThanOrEqual(0);
+      expect(secondToolEnds).toEqual([
+        expect.objectContaining({
+          type: 'tool_end',
+          toolName: 'secondApproval',
+          queuedItemId: firstQueuedItemId,
+          isError: true,
+          output: expect.objectContaining({ aborted: true }),
+        }),
+      ]);
+      expect(events.indexOf(secondToolEnds[0]!)).toBeGreaterThan(secondToolStartIndex);
+      expect({
+        currentQueuedItemId: (session as any)._currentQueuedItemId,
+        draining: (session as any)._draining,
+        hasActiveTurn: (session as any)._currentTurnAbortController !== undefined,
+        hasRecoveryTimer: (session as any)._queuedResumeRecoveryTimer !== undefined,
+      }).toEqual({
+        // The recovery kick releases the completed resume owner, then the
+        // durable pending re-establishes this correlation while it waits for
+        // the stale deadline. The armed timer—not an external API call—owns
+        // the next transition.
+        currentQueuedItemId: firstQueuedItemId,
+        draining: false,
+        hasActiveTurn: false,
+        hasRecoveryTimer: true,
+      });
+
+      await (session as any)._flushUpdate((record: any) => ({
+        ...record,
+        pendingResume: { ...record.pendingResume, resumedAt: Date.now() - 30_001 },
+      }));
+      await session._kickQueueDrain();
+
+      expect(await firstOutcome).toEqual({
+        error: expect.objectContaining({ code: 'harness.queue_resume_recovery_stale' }),
+      });
+      await expect(secondOutcome).resolves.toMatchObject({ text: 'unexpected retry' });
+      expect(session.getRecord().pendingResume).toBeUndefined();
+      expect(session.getRecord().pendingQueue).toEqual([]);
+      expect(session.getRecord().queueAdmissionReceipts?.[firstQueuedItemId]).toMatchObject({ status: 'failed' });
+      expect(firstExecute).toHaveBeenCalledOnce();
+      expect(secondExecute).not.toHaveBeenCalled();
     } finally {
       await harness.shutdown();
     }

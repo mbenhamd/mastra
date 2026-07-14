@@ -1132,6 +1132,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             currentStep.activeTools = enforceActiveToolsFence(
               currentStep.activeTools as string[] | undefined,
               toolSurfaceFence,
+              Object.keys(currentStep.tools ?? {}),
             ) as typeof currentStep.activeTools;
             enforceToolChoiceFence(currentStep.toolChoice as any, toolSurfaceFence);
           }

@@ -65,9 +65,15 @@ describe('Session.signal()', () => {
     const call = agent.streamCalls[0]!;
     expect((call.options as { runId: string }).runId).toBe(handle.runId);
 
-    const messages = call.messages as { __isCreatedSignal?: boolean; type?: string; contents?: unknown };
+    const messages = call.messages as {
+      __isCreatedSignal?: boolean;
+      type?: string;
+      tagName?: string;
+      contents?: unknown;
+    };
     expect(messages.__isCreatedSignal).toBe(true);
-    expect(messages.type).toBe('user-message');
+    expect(messages.type).toBe('user');
+    expect(messages.tagName).toBe('user');
     expect(messages.contents).toBe('hi');
   });
 

@@ -17,8 +17,9 @@ import {
   parseToolApprovalDecision,
   parseToolApprovalGrant,
 } from '../../../tool-call-identity';
+import { createToolSurfaceFence } from '../../../tool-surface-fence';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type { DurableToolCallInput, SerializableDurableOptions, AgentSuspendedEventData } from '../../types';
 import { resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
@@ -144,6 +145,7 @@ export function createDurableToolCallStep() {
       // Get context from init data (the parent workflow input)
       const initData = getInitData<{
         runId: string;
+        runtimeBindingId?: string;
         agentId: string;
         options: SerializableDurableOptions;
         state: {
@@ -154,7 +156,7 @@ export function createDurableToolCallStep() {
         };
       }>();
 
-      const { runId, options: agentOptions, state } = initData;
+      const { runId, runtimeBindingId, options: agentOptions, state } = initData;
       const logger = (mastra as any)?.getLogger?.();
       const identityDigest = createToolCallIdentityDigest({ toolCallId, toolName, args });
 
@@ -167,10 +169,22 @@ export function createDurableToolCallStep() {
       }
 
       // 1. Resolve the tool from global registry first, then Mastra
-      const registryEntry = globalRunRegistry.get(runId);
-      let tool = registryEntry?.tools?.[toolName];
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      if (!registryEntry && agentOptions.toolSurfaceFence !== undefined) {
+        throw new Error(
+          `[DurableAgent:${initData.agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
+        );
+      }
+      const replacementToolNames =
+        agentOptions.toolSurfaceFence !== undefined ? new Set(agentOptions.toolSurfaceFence) : undefined;
+      if (registryEntry && replacementToolNames) {
+        // Revalidate at the side-effect boundary. A crash/restart can resume
+        // directly at this step after the LLM step's earlier validation.
+        createToolSurfaceFence(registryEntry.tools, replacementToolNames);
+      }
+      let tool = replacementToolNames?.has(toolName) === false ? undefined : registryEntry?.tools?.[toolName];
 
-      if (!tool) {
+      if (!tool && replacementToolNames === undefined) {
         tool = resolveTool(toolName, mastra as Mastra);
       }
 
@@ -213,9 +227,9 @@ export function createDurableToolCallStep() {
       // Note: In foreach mode, the message list from the registry may be available
       // but for durability, we access what's available through the registry
       let messageList: MessageList | undefined;
-      // For local execution, the globalRunRegistry might have an ExtendedRunRegistry entry
-      // that stores the messageList. We cast and check safely.
-      const extendedEntry = globalRunRegistry.get(runId) as any;
+      // For local execution, the bound global entry may be an ExtendedRunRegistry entry
+      // that stores the MessageList. Reuse the already binding-checked value.
+      const extendedEntry = registryEntry as any;
       if (extendedEntry?.messageList) {
         messageList = extendedEntry.messageList;
       }

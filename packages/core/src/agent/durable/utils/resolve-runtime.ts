@@ -11,7 +11,8 @@ import type { CoreTool } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
-import { globalRunRegistry } from '../run-registry';
+import { createToolSurfaceFence } from '../../tool-surface-fence';
+import { getBoundRunRegistryEntry } from '../run-registry';
 import type {
   SerializableDurableState,
   SerializableModelConfig,
@@ -84,7 +85,12 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
 
   // 2. Check global registry first (for local/test execution)
   // This is necessary because workflow steps don't have direct access to DurableAgent's registry
-  const globalEntry = globalRunRegistry.get(runId);
+  const globalEntry = getBoundRunRegistryEntry(runId, input.runtimeBindingId);
+  if (globalEntry && input.options?.toolSurfaceFence !== undefined) {
+    // This also rejects stale persisted name ceilings whose concrete tool was
+    // omitted or replaced with an accessor/undefined registry value.
+    createToolSurfaceFence(globalEntry.tools, input.options.toolSurfaceFence);
+  }
   let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
   let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;

@@ -100,6 +100,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     agentSpan,
     methodType,
     memory,
+    isResume: !!resumeContext,
     backgroundTaskEnabled: backgroundTaskManager?.config?.enabled,
   });
 

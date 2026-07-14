@@ -246,7 +246,7 @@ describe('Session.message() — default path', () => {
     // CreatedAgentSignal whose contents is the caller-supplied prompt.
     expect(agent.calls).toHaveLength(1);
     expect(agent.calls[0]!.type).toBe('stream');
-    expect((agent.calls[0]!.messages as { type: string; contents: unknown }).type).toBe('user-message');
+    expect((agent.calls[0]!.messages as { type: string; contents: unknown }).type).toBe('user');
     expect(extractSignalContents(agent.calls[0]!.messages)).toBe('hi');
   });
 

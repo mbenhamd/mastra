@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableBackgroundTaskCheckStep } from './background-task-check';
 
+vi.mock('../../../../workflows', () => ({
+  createStep: (config: unknown) => config,
+}));
+
 function makeRunningTask(id: string) {
   return {
     id,
@@ -40,9 +44,11 @@ function setupRegistry({
   const bgManager = { listTasks, waitForNextTask, config: {} } as any;
 
   const runId = 'run-1';
+  const runtimeBindingId = 'binding-run-1';
   const agentId = 'a1';
 
   globalRunRegistry.set(runId, {
+    runtimeBindingId,
     backgroundTaskManager: bgManager,
     backgroundTasksConfig: waitTimeoutMs ? { waitTimeoutMs } : undefined,
     tools: {},
@@ -51,6 +57,7 @@ function setupRegistry({
 
   const getInitData = () => ({
     runId,
+    runtimeBindingId,
     agentId,
     options: skipBgTaskWait ? { skipBgTaskWait } : undefined,
     state: { threadId: 'thread-1', resourceId: 'user-1' },
@@ -66,14 +73,15 @@ afterEach(() => {
 describe('createDurableBackgroundTaskCheckStep', () => {
   it('passes through unchanged when no manager is configured', async () => {
     const runId = 'run-no-mgr';
-    globalRunRegistry.set(runId, { tools: {}, model: {} as any } as any);
+    const runtimeBindingId = 'binding-no-mgr';
+    globalRunRegistry.set(runId, { runtimeBindingId, tools: {}, model: {} as any } as any);
 
     const step = createDurableBackgroundTaskCheckStep();
     const input = baseInput();
     const result = await (step as any).execute({
       inputData: input,
       retryCount: 0,
-      getInitData: () => ({ runId, agentId: 'a1' }),
+      getInitData: () => ({ runId, runtimeBindingId, agentId: 'a1' }),
     });
 
     expect(result).toBe(input);

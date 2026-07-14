@@ -610,6 +610,18 @@ describe('Harness server routes', () => {
 
   it('returns a session snapshot response with an ETag from the session version', async () => {
     const record = makeRecord({
+      pendingResume: {
+        itemId: 'tool-approval:call-1',
+        kind: 'tool-approval',
+        runId: 'run-1',
+        toolCallId: 'call-1',
+        toolName: 'approvedTool',
+        requestedAt: 250,
+        runtimeDependencies: { agentId: 'internal-agent' },
+        requestContext: { tenantSecret: 'internal-context' },
+        toolSurfaceFence: ['approvedTool'],
+        payload: { approved: true },
+      } as SessionRecord['pendingResume'],
       assistantDrafts: {
         'run-1': {
           runId: 'run-1',
@@ -653,9 +665,11 @@ describe('Harness server routes', () => {
     expect(harness.session).not.toHaveBeenCalled();
     expect(body).toMatchObject({
       summary: { sessionId: 'session-1', lifecycle: 'active' },
+      pendingInbox: [{ itemId: 'tool-approval:call-1', kind: 'tool-approval' }],
       displayState: {
         version: 1,
         sessionId: 'session-1',
+        pending: { itemId: 'tool-approval:call-1', kind: 'tool-approval' },
         assistantDrafts: {
           'run-1': {
             text: 'recovered partial answer',
@@ -666,6 +680,12 @@ describe('Harness server routes', () => {
       },
       tokenUsage: { totalTokens: 3 },
     });
+    expect(body.pendingInbox[0]).not.toHaveProperty('runtimeDependencies');
+    expect(body.pendingInbox[0]).not.toHaveProperty('requestContext');
+    expect(body.pendingInbox[0]).not.toHaveProperty('toolSurfaceFence');
+    expect(body.displayState.pending).not.toHaveProperty('runtimeDependencies');
+    expect(body.displayState.pending).not.toHaveProperty('requestContext');
+    expect(body.displayState.pending).not.toHaveProperty('toolSurfaceFence');
   });
 
   it('returns read-only channel diagnostics for the authenticated resource', async () => {

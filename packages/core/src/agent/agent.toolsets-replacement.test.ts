@@ -2,11 +2,18 @@ import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
+import { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
+import { InMemoryStore } from '../storage';
 import { createTool } from '../tools';
 import { convertArrayToReadableStream } from './__tests__/mock-model';
 import { Agent } from './agent';
-import { readToolSurfaceFence, stageToolSurfaceFenceRestore } from './tool-surface-fence';
+import {
+  clearToolSurfaceFence,
+  readToolSurfaceFence,
+  stageToolSurfaceFenceRestore,
+  stampToolSurfaceFence,
+} from './tool-surface-fence';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -425,4 +432,165 @@ describe('Agent replacement toolsets', () => {
     expect(readToolSurfaceFence(requestContext, 'run-a')).toBeUndefined();
     expect(readToolSurfaceFence(requestContext, 'run-b')).toBeUndefined();
   });
+
+  it('assembles replacement execution tools without retaining a caller-visible run fence', async () => {
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop' as const,
+        usage,
+        content: [],
+        warnings: [],
+      }),
+    });
+    const agent = new Agent({ id: 'assembly-agent', name: 'assembly-agent', instructions: 'test', model });
+    const requestContext = new RequestContext();
+    const modeTool = testTool('modeTool');
+    const options = {
+      runId: 'assembly-run',
+      requestContext,
+      toolsetsMode: 'replace' as const,
+      toolsets: { mode: { modeTool } },
+    };
+
+    expect(Object.keys(await agent.getToolsForExecution(options))).toEqual(['modeTool']);
+    expect(Object.keys(await agent.getToolsForExecution(options))).toEqual(['modeTool']);
+    expect(readToolSurfaceFence(requestContext, 'assembly-run')).toBeUndefined();
+
+    const directFence = stampToolSurfaceFence(
+      requestContext,
+      'assembly-run',
+      { directTool: testTool('directTool') },
+      'direct-owner',
+    );
+    expect(directFence.allowedNames).toEqual(['directTool']);
+    expect(clearToolSurfaceFence(requestContext, 'assembly-run', 'direct-owner')).toBe(true);
+  });
+
+  it('rejects a colliding run ID without clearing the first execution fence', async () => {
+    let releaseFirst!: () => void;
+    let markStarted!: () => void;
+    const firstStarted = new Promise<void>(resolve => {
+      markStarted = resolve;
+    });
+    const firstGate = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    const visibleToolNames: string[][] = [];
+    const model = new MockLanguageModelV2({
+      doGenerate: async options => {
+        visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
+        markStarted();
+        await firstGate;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage,
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({ id: 'colliding-agent', name: 'colliding-agent', instructions: 'test', model });
+    const requestContext = new RequestContext();
+    const first = agent.generate('first', {
+      runId: 'shared-run',
+      requestContext,
+      toolsetsMode: 'replace',
+      toolsets: { first: { firstTool: testTool('firstTool') } },
+    });
+    await firstStarted;
+
+    await expect(
+      agent.generate('second', {
+        runId: 'shared-run',
+        requestContext,
+        toolsetsMode: 'replace',
+        toolsets: { second: { secondTool: testTool('secondTool') } },
+      }),
+    ).rejects.toThrow(/another execution|active replacement tool surface|concurrent execution/);
+    expect(readToolSurfaceFence(requestContext, 'shared-run')?.allowedNames).toEqual(['firstTool']);
+
+    releaseFirst();
+    await first;
+    expect(visibleToolNames).toEqual([['firstTool']]);
+    expect(readToolSurfaceFence(requestContext, 'shared-run')).toBeUndefined();
+  });
+
+  it(
+    'retains the original replacement surface across direct Agent suspension and resume',
+    { timeout: 30_000 },
+    async () => {
+      const visibleToolNames: string[][] = [];
+      const approvedExecute = vi.fn().mockResolvedValue('approved');
+      let callCount = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async options => {
+          visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
+          callCount++;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream(
+              callCount === 1
+                ? [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: 'initial', modelId: 'mock', timestamp: new Date(0) },
+                    {
+                      type: 'tool-call',
+                      toolCallId: 'approval-call',
+                      toolName: 'approvalTool',
+                      input: '{}',
+                      providerExecuted: false,
+                    },
+                    { type: 'finish', finishReason: 'tool-calls', usage },
+                  ]
+                : [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: 'resumed', modelId: 'mock', timestamp: new Date(0) },
+                    { type: 'text-start', id: 'text-1' },
+                    { type: 'text-delta', id: 'text-1', delta: 'done' },
+                    { type: 'text-end', id: 'text-1' },
+                    { type: 'finish', finishReason: 'stop', usage },
+                  ],
+            ),
+          };
+        },
+      });
+      const agent = new Agent({
+        id: 'resume-replacement-agent',
+        name: 'resume-replacement-agent',
+        instructions: 'test',
+        model,
+        tools: { adminTool: testTool('adminTool') },
+      });
+      new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+      const requestContext = new RequestContext();
+      const approvalTool = createTool({
+        id: 'approvalTool',
+        description: 'approvalTool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: approvedExecute,
+      });
+      const initial = await agent.stream('start', {
+        runId: 'resume-replacement-run',
+        requestContext,
+        toolsetsMode: 'replace',
+        toolsets: { approval: { approvalTool } },
+      });
+      const suspended = await initial.getFullOutput();
+      expect(suspended.finishReason).toBe('suspended');
+
+      const resumed = await agent.resumeStream(
+        { approved: true },
+        { runId: initial.runId, toolCallId: 'approval-call', requestContext },
+      );
+      await resumed.getFullOutput();
+
+      expect(visibleToolNames).toEqual([['approvalTool'], ['approvalTool']]);
+      expect(approvedExecute).toHaveBeenCalledOnce();
+      expect(readToolSurfaceFence(requestContext, initial.runId)).toBeUndefined();
+    },
+  );
 });

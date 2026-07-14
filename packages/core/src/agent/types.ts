@@ -268,6 +268,8 @@ export interface AgentThreadSubscription<OUTPUT = unknown> {
   activeRunId: () => string | null;
   abort: () => boolean;
   unsubscribe: () => void;
+  /** @internal Resolves after this subscription has consumed the exact output segment. */
+  _waitForOutputDrain?: (output: MastraModelOutput<any>) => Promise<void> | undefined;
 }
 
 export type ToolsetsInput = Record<string, ToolsInput>;
@@ -909,6 +911,8 @@ export type AgentExecuteOnFinishOptions = {
   threadExists: boolean;
   structuredOutput?: boolean;
   overrideScorers?: MastraScorers | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig }>;
+  /** Internal tool-fence lease for this execution. */
+  _toolSurfaceFenceOwnerId?: string;
 };
 
 export type AgentMethodType = 'generate' | 'stream' | 'generateLegacy' | 'streamLegacy';

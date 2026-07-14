@@ -24,16 +24,19 @@ import {
 } from '../../../tool-surface-fence';
 import { isSupportedLanguageModel } from '../../../utils';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent, emitStepStartEvent } from '../../stream-adapter';
 import type { DurableAgenticWorkflowInput, DurableLLMStepOutput, DurableToolCallInput } from '../../types';
 import { resolveRuntimeDependencies, resolveModelFromListEntry } from '../../utils/resolve-runtime';
+import { modelListEntrySchema } from '../shared/schemas';
 
 /**
  * Input schema for the durable LLM execution step
  */
 const durableLLMInputSchema = z.object({
   runId: z.string(),
+  // Optional for workflows persisted before runtime registry bindings existed.
+  runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
   messageListState: z.any(), // SerializedMessageListState
@@ -47,22 +50,7 @@ const durableLLMInputSchema = z.object({
     providerOptions: z.record(z.string(), z.any()).optional(),
   }),
   // Model list for fallback support (when agent configured with array of models)
-  modelList: z
-    .array(
-      z.object({
-        id: z.string(),
-        config: z.object({
-          provider: z.string(),
-          modelId: z.string(),
-          specificationVersion: z.string().optional(),
-          originalConfig: z.union([z.string(), z.record(z.string(), z.any())]).optional(),
-          providerOptions: z.record(z.string(), z.any()).optional(),
-        }),
-        maxRetries: z.number(),
-        enabled: z.boolean(),
-      }),
-    )
-    .optional(),
+  modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
   state: z.any(),
   messageId: z.string(),
@@ -212,7 +200,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 currentTools as unknown as Record<string, unknown>,
                 toolSurfaceFence,
               ) as ToolSet;
-              currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
+              currentActiveTools = enforceActiveToolsFence(
+                currentActiveTools,
+                toolSurfaceFence,
+                Object.keys(currentTools),
+              );
               enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
             }
             let currentModelSettings = { temperature: execOptions.temperature };
@@ -252,7 +244,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   }
                 : undefined;
 
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
             const executionAbortSignal = (registryEntry as any)?.abortSignal ?? abortSignal;
             if (registryEntry?.inputProcessors?.length) {
               const inputStepWriter = pubsub
@@ -313,7 +305,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   currentTools as unknown as Record<string, unknown>,
                   toolSurfaceFence,
                 ) as ToolSet;
-                currentActiveTools = enforceActiveToolsFence(currentActiveTools, toolSurfaceFence);
+                currentActiveTools = enforceActiveToolsFence(
+                  currentActiveTools,
+                  toolSurfaceFence,
+                  Object.keys(currentTools),
+                );
                 enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
               }
               currentModelSettings = {
@@ -643,7 +639,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             });
 
             // Try processAPIError if error processors are available
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
             if (registryEntry?.errorProcessors?.length) {
               try {
                 const runner = new ProcessorRunner({

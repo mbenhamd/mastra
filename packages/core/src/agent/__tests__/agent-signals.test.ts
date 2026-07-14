@@ -154,6 +154,30 @@ class BlockingRunCompletedPubSub extends EventEmitterPubSub {
   }
 }
 
+class DeliverThenRejectRegistrationPubSub extends EventEmitterPubSub {
+  #rejected = false;
+
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    await super.publish(topic, event);
+    if (!this.#rejected && (event as { data?: { type?: string } }).data?.type === 'run-registered') {
+      this.#rejected = true;
+      throw new Error('injected registration failure after subscriber delivery');
+    }
+  }
+}
+
+class RejectFirstRunCompletedPubSub extends EventEmitterPubSub {
+  #rejected = false;
+
+  override async publish(topic: string, event: Parameters<PubSub['publish']>[1]): Promise<void> {
+    if (!this.#rejected && (event as { data?: { type?: string } }).data?.type === 'run-completed') {
+      this.#rejected = true;
+      throw new Error('injected first terminal publication failure');
+    }
+    await super.publish(topic, event);
+  }
+}
+
 async function readNextRun(iterator: AsyncIterator<any>) {
   let runId: string | undefined;
   let text = '';
@@ -792,6 +816,134 @@ describe('Agent signals', () => {
     expect(subscribedRun.value.text).toBe('future response');
 
     subscription.unsubscribe();
+  });
+
+  it('does not reject a partially delivered registration until its enqueued stream is drained', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new DeliverThenRejectRegistrationPubSub();
+    const agent = { id: 'partial-registration-agent' } as Agent<any, any, any, any>;
+    const threadId = 'partial-registration-thread';
+    const resourceId = 'partial-registration-user';
+    const runId = 'partial-registration-run';
+    const parts = [
+      { type: 'start', runId },
+      { type: 'tool-call', runId, payload: { toolCallId: 'late-tool', toolName: 'lookup', args: {} } },
+      {
+        type: 'finish',
+        runId,
+        payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+      },
+    ];
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          for (const part of parts) controller.enqueue(part);
+          controller.close();
+        },
+      }),
+      _waitUntilFinished: () => Promise.resolve(),
+    } as any;
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+
+    const completion = runtime.registerRun(
+      agent,
+      output,
+      { memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    void completion?.catch(() => {});
+    const outputDrain = subscription._waitForOutputDrain!(output)!;
+    let settled = false;
+    void outputDrain.finally(() => (settled = true)).catch(() => {});
+
+    await nextTick();
+    expect(settled).toBe(false);
+
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const received = [];
+    for (let index = 0; index < parts.length; index++) {
+      received.push((await iterator.next()).value);
+    }
+    // Advance once more so the per-output generator observes the source close
+    // and acknowledges that no buffered chunk can surface after rejection.
+    const waitingForNextRun = iterator.next();
+
+    await expect(outputDrain).rejects.toMatchObject({
+      name: 'AgentThreadOutputDrainError',
+      reason: 'registration-publish-failed',
+    });
+    expect(received).toEqual(parts);
+
+    subscription.unsubscribe();
+    await waitingForNextRun;
+  });
+
+  it('removes a failed terminal without a drain waiter before the same run id is reused', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new RejectFirstRunCompletedPubSub();
+    const agent = { id: 'failed-terminal-reuse-agent' } as Agent<any, any, any, any>;
+    const threadId = 'failed-terminal-reuse-thread';
+    const resourceId = 'failed-terminal-reuse-user';
+    const runId = 'failed-terminal-reuse-run';
+    const target = { memory: { thread: threadId, resource: resourceId } } as any;
+    const createOutput = (text: string) =>
+      ({
+        runId,
+        status: 'running',
+        fullStream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'start', runId });
+            controller.enqueue({ type: 'text-delta', runId, payload: { id: 'text-1', text } });
+            controller.enqueue({
+              type: 'finish',
+              runId,
+              payload: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, finishReason: 'stop' },
+            });
+            controller.close();
+          },
+        }),
+        _waitUntilFinished: () => Promise.resolve(),
+      }) as any;
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+
+    try {
+      const firstOutput = createOutput('first');
+      const firstCompletion = runtime.registerRun(agent, firstOutput, target, pubsub)!;
+      // Deliberately do not call `_waitForOutputDrain(firstOutput)`: terminal
+      // rejection cleanup must be owned by the subscription itself.
+      await expect(firstCompletion).rejects.toMatchObject({
+        name: 'AgentThreadOutputDrainError',
+        reason: 'terminal-publish-failed',
+      });
+      await expect(
+        withTimeout(readNextRun(iterator), 'Timed out draining the failed first output'),
+      ).resolves.toMatchObject({ value: { runId, text: 'first' } });
+
+      runtime.reserveRun({ ...target, runId }, pubsub, agent.id);
+      const secondOutput = createOutput('second');
+      const secondCompletion = runtime.registerRun(agent, secondOutput, target, pubsub)!;
+      const secondDrain = subscription._waitForOutputDrain!(secondOutput)!;
+      const secondRun = readNextRun(iterator);
+
+      await expect(secondCompletion).resolves.toBeUndefined();
+      await expect(withTimeout(secondRun, 'Timed out draining the reused run id')).resolves.toMatchObject({
+        value: { runId, text: 'second' },
+      });
+      // Advance the generator through the stream close so the second output's
+      // own terminal can satisfy its drain barrier. A stale first-output entry
+      // would leave this promise unresolved.
+      const waitingForNextRun = iterator.next();
+      await expect(withTimeout(secondDrain, 'Reused run id terminal was correlated to the wrong output')).resolves.toBe(
+        undefined,
+      );
+      subscription.unsubscribe();
+      await waitingForNextRun;
+    } finally {
+      subscription.unsubscribe();
+    }
   });
 
   it('delivers each thread run to multiple same-runtime subscribers', async () => {
@@ -2035,10 +2187,7 @@ describe('Agent signals', () => {
       // Drive and await the finalizer so run-suspended has propagated to the
       // subscriber; the approval marker must keep the thread blocked (active).
       finishSuspended();
-      await withTimeout(
-        suspendedCompletion ?? Promise.resolve(),
-        'Timed out waiting for approval-suspended finalizer',
-      );
+      await withTimeout(suspendedCompletion ?? Promise.resolve(), 'Timed out waiting for approval-suspended finalizer');
       await nextTick();
       expect(runtime.getThreadState({ resourceId, threadId })).toBe('active');
 

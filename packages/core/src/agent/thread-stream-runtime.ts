@@ -33,6 +33,49 @@ const REJECTED_RUN_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
 const MAX_REJECTED_RUN_TOMBSTONES = 1000;
 const ABORTED_RUN_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
 const MAX_ABORTED_RUN_TOMBSTONES = 1000;
+const TERMINAL_PUBLISH_TIMEOUT_MS = 10_000;
+const TERMINAL_DELIVERY_TIMEOUT_MS = 30_000;
+
+export type AgentThreadOutputDrainErrorReason =
+  | 'subscription-closed'
+  | 'stream-stopped'
+  | 'registration-publish-failed'
+  | 'terminal-publish-failed'
+  | 'terminal-delivery-timeout';
+
+/** Internal failure for the subscription barrier that makes terminal delivery observable. */
+export class AgentThreadOutputDrainError extends Error {
+  readonly name = 'AgentThreadOutputDrainError';
+
+  constructor(
+    readonly reason: AgentThreadOutputDrainErrorReason,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+  }
+}
+
+/** Teardown may wake a terminal model result without replacing that already-known result. */
+export function isAgentThreadOutputDrainTeardownError(error: unknown): boolean {
+  return (
+    error instanceof AgentThreadOutputDrainError &&
+    (error.reason === 'subscription-closed' || error.reason === 'stream-stopped')
+  );
+}
+
+async function waitWithTimeout<T>(work: Promise<T>, timeoutMs: number, timeoutError: () => Error): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError()), timeoutMs);
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 export let defaultAgentThreadPubSub: PubSub = new EventEmitterPubSub();
 
@@ -178,6 +221,8 @@ function createRuntimeState(): AgentThreadRuntimeState {
 export class AgentThreadStreamRuntime {
   #id = randomUUID();
   #statesByPubSub = new WeakMap<PubSub, AgentThreadRuntimeState>();
+  #threadOutputRegistrations = new WeakMap<object, Promise<void>>();
+  #threadOutputTerminals = new WeakMap<object, Promise<void>>();
 
   #getPubSub(pubsub?: PubSub): PubSub {
     return pubsub ?? defaultAgentThreadPubSub;
@@ -257,6 +302,44 @@ export class AgentThreadStreamRuntime {
       runId: event.runId,
       data: event,
     });
+  }
+
+  async #publishRegistrationAndWait(pubsub: PubSub | undefined, key: string, runId: string): Promise<void> {
+    try {
+      await this.#publishAndWait(pubsub, key, { type: 'run-registered', runId });
+    } catch (error) {
+      if (error instanceof AgentThreadOutputDrainError) throw error;
+      throw new AgentThreadOutputDrainError(
+        'registration-publish-failed',
+        `Failed to publish run-registered for agent thread run ${runId}`,
+        error,
+      );
+    }
+  }
+
+  async #publishTerminalAndWait(
+    pubsub: PubSub | undefined,
+    key: string,
+    event: Extract<AgentThreadStreamRuntimeEvent, { type: 'run-completed' | 'run-suspended' }>,
+  ): Promise<void> {
+    try {
+      await waitWithTimeout(
+        this.#publishAndWait(pubsub, key, event),
+        TERMINAL_PUBLISH_TIMEOUT_MS,
+        () =>
+          new AgentThreadOutputDrainError(
+            'terminal-publish-failed',
+            `Timed out publishing ${event.type} for agent thread run ${event.runId}`,
+          ),
+      );
+    } catch (error) {
+      if (error instanceof AgentThreadOutputDrainError) throw error;
+      throw new AgentThreadOutputDrainError(
+        'terminal-publish-failed',
+        `Failed to publish ${event.type} for agent thread run ${event.runId}`,
+        error,
+      );
+    }
   }
 
   #markApprovalSuspendedFromPart(pubsub: PubSub | undefined, runId: string, part: unknown) {
@@ -937,11 +1020,7 @@ export class AgentThreadStreamRuntime {
    * (those must still flow to the resumed run). Returns true if a stale
    * approval-suspended record was cleared for this thread key.
    */
-  #clearApprovalSuspendedRunForResume(
-    state: AgentThreadRuntimeState,
-    runId: string,
-    key: string,
-  ): boolean {
+  #clearApprovalSuspendedRunForResume(state: AgentThreadRuntimeState, runId: string, key: string): boolean {
     if (!state.approvalSuspendedRunIds.has(runId)) return false;
     const reservedKey = state.threadKeysByRunId.get(runId);
     if (reservedKey !== undefined && reservedKey !== key) return false;
@@ -1143,7 +1222,16 @@ export class AgentThreadStreamRuntime {
       state.pendingOutputWaiters.delete(output.runId);
       for (const waiter of waiters) waiter.resolve(output);
     }
-    const registrationPublish = this.#publishAndWait(pubsub, key, { type: 'run-registered', runId: output.runId });
+    // Registration is part of the subscriber's delivery barrier just like the
+    // terminal event. Normalize its rejection so a provider run that already
+    // executed cannot become retryable merely because PubSub rejected the
+    // segment's run-registered publication.
+    const registrationPublish = this.#publishRegistrationAndWait(pubsub, key, output.runId);
+    // The Harness output-drain waiter may not attach until the model has already
+    // produced FullOutput. Mark the promise observed immediately while retaining
+    // the original rejecting promise below for that later waiter.
+    void registrationPublish.catch(() => {});
+    this.#threadOutputRegistrations.set(output, registrationPublish);
     state.registrationPublishesByRunId.set(output.runId, registrationPublish);
     const broadcast = registrationPublish.then(() => this.#broadcastStream(output, broadcastSource, pubsub, key));
     state.broadcastsByRunId.set(output.runId, broadcast);
@@ -1223,42 +1311,83 @@ export class AgentThreadStreamRuntime {
     if (state.watchedThreadRunIds.has(record.runId)) return;
     state.watchedThreadRunIds.add(record.runId);
 
+    let terminalSettled = false;
+    let resolveTerminal!: () => void;
+    let rejectTerminal!: (error: AgentThreadOutputDrainError) => void;
+    const terminal = new Promise<void>((resolve, reject) => {
+      resolveTerminal = () => {
+        if (terminalSettled) return;
+        terminalSettled = true;
+        resolve();
+      };
+      rejectTerminal = error => {
+        if (terminalSettled) return;
+        terminalSettled = true;
+        reject(error);
+      };
+    });
+    this.#threadOutputTerminals.set(record.output, terminal);
+    void terminal.catch(() => {});
+
     const completion = record.output._waitUntilFinished().finally(async () => {
-      await state.registrationPublishesByRunId.get(record.runId)?.catch(() => {});
-      state.registrationPublishesByRunId.delete(record.runId);
-      await state.broadcastsByRunId.get(record.runId)?.catch(() => {});
-      state.broadcastsByRunId.delete(record.runId);
-      state.watchedThreadRunIds.delete(record.runId);
-      this.#cleanupPreparedRun(state, record.runId);
-
-      // An approval-suspended run is paused, not finished: surface run-suspended and
-      // leave its records in place so a later resume can re-attach to the same thread.
-      if (record.output.status === 'suspended' && this.#isApprovalSuspendedRun(state, record.runId)) {
-        this.#publish(pubsub, key, { type: 'run-suspended', runId: record.runId });
-        return;
-      }
-
-      state.approvalSuspendedRunIds.delete(record.runId);
-      this.#forgetCallerSignalsForRun(state, record.runId);
-      let publishError: unknown;
       try {
-        await this.#publishAndWait(pubsub, key, { type: 'run-completed', runId: record.runId });
-      } catch (err) {
-        publishError = err;
-      }
-      if (state.activeThreadRunIds.get(key) === record.runId) {
-        state.activeThreadRunIds.delete(key);
-      }
-      if (state.threadKeysByRunId.get(record.runId) === key) {
-        state.threadKeysByRunId.delete(record.runId);
-      }
-      try {
-        await this.#drainPendingSignals(state, pubsub, key, record);
-      } finally {
+        await state.registrationPublishesByRunId.get(record.runId)?.catch(() => {});
+        state.registrationPublishesByRunId.delete(record.runId);
+        await state.broadcastsByRunId.get(record.runId)?.catch(() => {});
+        state.broadcastsByRunId.delete(record.runId);
+        state.watchedThreadRunIds.delete(record.runId);
+        this.#cleanupPreparedRun(state, record.runId);
+
+        // An approval-suspended run is paused, not finished: surface run-suspended and
+        // leave its records in place so a later resume can re-attach to the same thread.
+        if (record.output.status === 'suspended' && this.#isApprovalSuspendedRun(state, record.runId)) {
+          await this.#publishTerminalAndWait(pubsub, key, { type: 'run-suspended', runId: record.runId });
+          resolveTerminal();
+          return;
+        }
+
+        state.approvalSuspendedRunIds.delete(record.runId);
+        this.#forgetCallerSignalsForRun(state, record.runId);
+        await this.#publishTerminalAndWait(pubsub, key, { type: 'run-completed', runId: record.runId });
+        resolveTerminal();
+        if (state.activeThreadRunIds.get(key) === record.runId) {
+          state.activeThreadRunIds.delete(key);
+        }
+        if (state.threadKeysByRunId.get(record.runId) === key) {
+          state.threadKeysByRunId.delete(record.runId);
+        }
+        try {
+          await this.#drainPendingSignals(state, pubsub, key, record);
+        } finally {
+          state.threadRunsById.delete(record.runId);
+          this.#resolveReservationWaiters(state, record.runId);
+        }
+      } catch (error) {
+        if (terminalSettled) throw error;
+        const terminalError =
+          error instanceof AgentThreadOutputDrainError
+            ? error
+            : new AgentThreadOutputDrainError(
+                'terminal-publish-failed',
+                `Failed to finalize terminal delivery for agent thread run ${record.runId}`,
+                error,
+              );
+        rejectTerminal(terminalError);
+        state.approvalSuspendedRunIds.delete(record.runId);
+        state.pendingSignalsByThread.delete(key);
+        if (state.activeThreadRunIds.get(key) === record.runId) {
+          state.activeThreadRunIds.delete(key);
+        }
+        if (state.threadKeysByRunId.get(record.runId) === key) {
+          state.threadKeysByRunId.delete(record.runId);
+        }
         state.threadRunsById.delete(record.runId);
+        this.#forgetCallerSignalsForRun(state, record.runId);
         this.#resolveReservationWaiters(state, record.runId);
+        this.#rememberRejectedRunError(state, record.runId, terminalError);
+        void this.#drainPendingIdleSignals(state, pubsub, key).catch(() => {});
+        throw terminalError;
       }
-      if (publishError) throw publishError;
     });
     void completion.catch(() => {});
     return completion;
@@ -1294,7 +1423,7 @@ export class AgentThreadStreamRuntime {
       if (queue.length > 0) {
         const nextRecord = state.threadRunsById.get(output.runId);
         if (nextRecord) {
-          this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
         }
       }
       return;
@@ -1343,7 +1472,7 @@ export class AgentThreadStreamRuntime {
         if ((state.pendingContinuationsByThread.get(key)?.length ?? 0) > 0) {
           const nextRecord = state.threadRunsById.get(output.runId);
           if (nextRecord) {
-            this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+            void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
           }
         }
       })
@@ -1386,7 +1515,7 @@ export class AgentThreadStreamRuntime {
       queue.push(pending);
       state.pendingContinuationsByThread.set(key, queue);
       if (activeRecord) {
-        this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+        void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       }
       return { accepted: true, runId };
     }
@@ -1451,7 +1580,7 @@ export class AgentThreadStreamRuntime {
       if ((idleQueue?.length ?? 0) > 0) {
         const nextRecord = state.threadRunsById.get(output.runId);
         if (nextRecord) {
-          this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
         }
       }
     } catch {
@@ -1569,6 +1698,13 @@ export class AgentThreadStreamRuntime {
     const seenRunIds = new Set<string>();
     const pendingRuns: AgentThreadRunRecord<any>[] = [];
     const waiters: Array<() => void> = [];
+    const drainedOutputs = new WeakSet<object>();
+    const enqueuedOutputs = new WeakSet<object>();
+    const streamDrainedOutputs = new WeakSet<object>();
+    const terminalOutputs = new WeakSet<object>();
+    const outputsByRunId = new Map<string, MastraModelOutput<unknown>[]>();
+    const outputDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
+    const streamDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
     const remoteRuns = new Map<
       string,
       { parts: unknown[]; waiters: Array<() => void>; done: boolean; stream: ReadableStream<unknown> }
@@ -1577,6 +1713,159 @@ export class AgentThreadStreamRuntime {
 
     const wake = () => {
       while (waiters.length) waiters.shift()?.();
+    };
+
+    const settleOutputDrainIfReady = (output: MastraModelOutput<unknown>) => {
+      if (!streamDrainedOutputs.has(output) || !terminalOutputs.has(output)) return;
+      drainedOutputs.add(output);
+      const pending = outputDrainWaiters.get(output);
+      outputDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.resolve();
+    };
+
+    const markOutputStreamDrained = (output: MastraModelOutput<unknown>) => {
+      streamDrainedOutputs.add(output);
+      const pending = streamDrainWaiters.get(output);
+      streamDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.resolve();
+      settleOutputDrainIfReady(output);
+    };
+
+    const removeTrackedOutput = (runId: string, output: MastraModelOutput<unknown>) => {
+      const outputs = outputsByRunId.get(runId);
+      if (!outputs) return;
+      const index = outputs.indexOf(output);
+      if (index === -1) return;
+      outputs.splice(index, 1);
+      if (outputs.length === 0) {
+        outputsByRunId.delete(runId);
+        // A rejected terminal has no delivery event to release the run-id
+        // admission guard. Once its exact output is gone, permit a legitimate
+        // later segment (approval resume/retry) to reuse the same run id.
+        seenRunIds.delete(runId);
+      }
+    };
+
+    const markRunTerminalDelivered = (runId: string) => {
+      const outputs = outputsByRunId.get(runId);
+      const output = outputs?.shift();
+      if (outputs?.length === 0) outputsByRunId.delete(runId);
+      if (!output) return;
+      terminalOutputs.add(output);
+      settleOutputDrainIfReady(output);
+    };
+
+    const rejectOutputDrain = (output: MastraModelOutput<unknown>, error: Error) => {
+      const pending = outputDrainWaiters.get(output);
+      outputDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.reject(error);
+    };
+
+    const rejectStreamDrain = (output: MastraModelOutput<unknown>, error: Error) => {
+      const pending = streamDrainWaiters.get(output);
+      streamDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.reject(error);
+    };
+
+    const waitForStreamDrain = (output: MastraModelOutput<unknown>): Promise<void> => {
+      if (streamDrainedOutputs.has(output)) return Promise.resolve();
+      if (done) {
+        return Promise.reject(
+          new AgentThreadOutputDrainError(
+            'subscription-closed',
+            'Thread subscription closed before output stream drain completed',
+          ),
+        );
+      }
+      const pending = streamDrainWaiters.get(output) ?? new Set();
+      let waiter!: { resolve: () => void; reject: (error: Error) => void };
+      const drained = new Promise<void>((resolve, reject) => {
+        waiter = { resolve, reject };
+      });
+      pending.add(waiter);
+      streamDrainWaiters.set(output, pending);
+      return drained.finally(() => {
+        pending.delete(waiter);
+        if (pending.size === 0) streamDrainWaiters.delete(output);
+      });
+    };
+
+    const rejectAfterEnqueuedStreamDrain = async (
+      output: MastraModelOutput<unknown>,
+      error: unknown,
+    ): Promise<never> => {
+      // A PubSub can invoke this subscription and then reject later in the same
+      // publish. Once enqueued, the segment is observable regardless of the
+      // publication promise's outcome. Do not let its failure reach Session
+      // until every buffered part has crossed the subscription generator; turn
+      // teardown can then close all tools that actually started, with no later
+      // tool_start appearing after the failure terminal.
+      if (enqueuedOutputs.has(output) && !streamDrainedOutputs.has(output)) {
+        try {
+          await waitForStreamDrain(output);
+        } catch {
+          // Explicit subscription teardown stops the generator and is therefore
+          // also a safe boundary after which this segment cannot emit more parts.
+        }
+      }
+      removeTrackedOutput(output.runId, output);
+      throw error;
+    };
+
+    const waitForOutputDrain = (output: MastraModelOutput<unknown>): Promise<void> | undefined => {
+      const registration = this.#threadOutputRegistrations.get(output);
+      const terminal = this.#threadOutputTerminals.get(output);
+      // Duck-typed Agent overrides may return an output without registering it
+      // with the thread runtime. There is no subscription segment to drain in
+      // that case, so preserve their existing direct completion contract.
+      if (!registration) return undefined;
+      if (drainedOutputs.has(output)) return Promise.resolve();
+      if (done) {
+        return Promise.reject(
+          new AgentThreadOutputDrainError(
+            'subscription-closed',
+            'Thread subscription closed before output drain completed',
+          ),
+        );
+      }
+      const pending = outputDrainWaiters.get(output) ?? new Set();
+      let waiter!: { resolve: () => void; reject: (error: Error) => void };
+      const drained = new Promise<void>((resolve, reject) => {
+        waiter = { resolve, reject };
+      });
+      pending.add(waiter);
+      outputDrainWaiters.set(output, pending);
+      return registration
+        .then(
+          async () => {
+            if (terminal) {
+              try {
+                await terminal;
+              } catch (error) {
+                await rejectAfterEnqueuedStreamDrain(output, error);
+              }
+            }
+            try {
+              await waitWithTimeout(
+                drained,
+                TERMINAL_DELIVERY_TIMEOUT_MS,
+                () =>
+                  new AgentThreadOutputDrainError(
+                    'terminal-delivery-timeout',
+                    `Thread subscription did not observe terminal delivery for agent run ${output.runId}`,
+                  ),
+              );
+            } catch (error) {
+              await rejectAfterEnqueuedStreamDrain(output, error);
+            }
+          },
+          error => rejectAfterEnqueuedStreamDrain(output, error),
+        )
+        .catch(error => {
+          pending.delete(waiter);
+          if (pending.size === 0) outputDrainWaiters.delete(output);
+          throw error;
+        });
     };
 
     const activeRunId = () => {
@@ -1593,6 +1882,18 @@ export class AgentThreadStreamRuntime {
     const enqueueRun = (record: AgentThreadRunRecord<any>) => {
       if (done || seenRunIds.has(record.runId)) return;
       seenRunIds.add(record.runId);
+      enqueuedOutputs.add(record.output);
+      const outputs = outputsByRunId.get(record.runId) ?? [];
+      outputs.push(record.output);
+      outputsByRunId.set(record.runId, outputs);
+      // The per-run correlation queue exists even when no caller uses the
+      // internal output-drain waiter. A rejected terminal has no delivery event
+      // that could shift this output, so observe the runtime's terminal promise
+      // and remove this exact object on failure.
+      queueMicrotask(() => {
+        const terminal = this.#threadOutputTerminals.get(record.output);
+        void terminal?.catch(() => removeTrackedOutput(record.runId, record.output));
+      });
       pendingRuns.push(record);
       wake();
     };
@@ -1670,6 +1971,7 @@ export class AgentThreadStreamRuntime {
         return;
       }
       if (data.type === 'run-completed' || data.type === 'run-aborted' || data.type === 'run-suspended') {
+        markRunTerminalDelivered(data.runId);
         if (
           (data.type !== 'run-suspended' || !state.approvalSuspendedRunIds.has(data.runId)) &&
           state.activeThreadRunIds.get(key) === data.runId
@@ -1709,6 +2011,12 @@ export class AgentThreadStreamRuntime {
       if (done) return;
       done = true;
       void resolvedPubSub.unsubscribe(topic, onEvent).catch(() => {});
+      const error = new AgentThreadOutputDrainError(
+        'subscription-closed',
+        'Thread subscription closed before output drain completed',
+      );
+      for (const [output] of outputDrainWaiters) rejectOutputDrain(output as MastraModelOutput<unknown>, error);
+      for (const [output] of streamDrainWaiters) rejectStreamDrain(output as MastraModelOutput<unknown>, error);
       wake();
     };
 
@@ -1716,6 +2024,7 @@ export class AgentThreadStreamRuntime {
       activeRunId,
       abort: () => this.abortThread(options, resolvedPubSub),
       unsubscribe,
+      _waitForOutputDrain: waitForOutputDrain,
       stream: (async function* () {
         try {
           while (!done || pendingRuns.length > 0) {
@@ -1730,9 +2039,25 @@ export class AgentThreadStreamRuntime {
             // Reading `output.fullStream` directly would let one subscriber lock
             // and drain the shared stream, starving every other subscriber.
             const subscriberStream = run.createSubscriberStream?.() ?? run.output.fullStream;
-            for await (const part of subscriberStream) {
-              yield part as any;
-              if (done) break;
+            let fullyDrained = false;
+            try {
+              for await (const part of subscriberStream) {
+                yield part as any;
+                if (done) break;
+              }
+              fullyDrained = !done;
+            } finally {
+              if (fullyDrained) {
+                markOutputStreamDrained(run.output);
+              } else {
+                rejectOutputDrain(
+                  run.output,
+                  new AgentThreadOutputDrainError(
+                    'stream-stopped',
+                    'Thread subscription stopped before output drain completed',
+                  ),
+                );
+              }
             }
           }
         } finally {
@@ -1795,7 +2120,7 @@ export class AgentThreadStreamRuntime {
       const idleQueue = state.pendingIdleSignalsByThread.get(key) ?? [];
       idleQueue.push({ agent, signal, runId: queuedRunId, resourceId, threadId, streamOptions: queuedStreamOptions });
       state.pendingIdleSignalsByThread.set(key, idleQueue);
-      this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+      void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       return { accepted: true, runId: queuedRunId, signal };
     }
 
@@ -1993,7 +2318,7 @@ export class AgentThreadStreamRuntime {
             signal: this.#serializeSignal(signal),
             sourceId: this.#id,
           });
-          this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
           return acceptSignal({ accepted: true, runId, signal });
         }
       }
@@ -2082,7 +2407,7 @@ export class AgentThreadStreamRuntime {
       state.pendingIdleSignalsByThread.set(key, idleQueue);
       state.pendingIdleThreadKeysByRunId.set(runId, key);
       if (activeRecord) {
-        this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+        void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       }
       return acceptSignal({ accepted: true, runId, signal });
     }
