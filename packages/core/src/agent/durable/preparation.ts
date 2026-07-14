@@ -16,7 +16,12 @@ import type { AgentExecutionOptions } from '../agent.types';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
-import { clearToolSurfaceFence, readToolSurfaceFence } from '../tool-surface-fence';
+import {
+  clearToolSurfaceFence,
+  createToolSurfaceFence,
+  materializeToolSurfaceFence,
+  readToolSurfaceFence,
+} from '../tool-surface-fence';
 import type { AgentInstructions, AgentModelManagerConfig, ToolsetsInput, ToolsInput } from '../types';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import { createWorkflowInput } from './utils/serialize-state';
@@ -399,10 +404,22 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     messageId,
   });
 
-  // 14. Create registry entry for non-serializable state
+  // 14. Create registry entry for non-serializable state.
+  // For a replacement run, capture an immutable surface bound to the ORIGINAL
+  // fenced implementations now, before any per-step input processor can mutate
+  // the shared `tools` map in place. The tool-call step dispatches from this
+  // instead of re-snapshotting the mutable registry object.
+  const replacementToolSurface =
+    toolSurfaceFence !== undefined
+      ? (Object.freeze(materializeToolSurfaceFence(createToolSurfaceFence(tools, toolSurfaceFence))) as Record<
+          string,
+          CoreTool
+        >)
+      : undefined;
   const registryEntry: RunRegistryEntry = {
     runtimeBindingId,
     tools,
+    replacementToolSurface,
     saveQueueManager,
     memory,
     model,

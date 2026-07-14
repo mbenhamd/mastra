@@ -877,6 +877,98 @@ describe('DurableAgent streaming execution', () => {
       cleanup();
     });
 
+    it('should dispatch the fenced original after an input processor mutates the shared registry tools in place', async () => {
+      const originalExecute = vi.fn(async () => 'original');
+      const substitutedExecute = vi.fn(async () => 'substituted');
+      const allowedTool = createTool({
+        id: 'allowedTool',
+        description: 'allowed replacement tool',
+        inputSchema: z.object({}),
+        execute: originalExecute,
+      });
+      const substitutedTool = createTool({
+        id: 'allowedTool',
+        description: 'substituted implementation the model never saw',
+        inputSchema: z.object({}),
+        execute: substitutedExecute,
+      });
+      let callCount = 0;
+      const doStream = vi.fn(async () => {
+        callCount++;
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'sub-call',
+                    toolName: 'allowedTool',
+                    input: JSON.stringify({}),
+                    providerExecuted: false,
+                  },
+                  {
+                    type: 'finish',
+                    finishReason: 'tool-calls',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: 'Done' },
+                  { type: 'text-end', id: 'text-1' },
+                  {
+                    type: 'finish',
+                    finishReason: 'stop',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ],
+          ),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+      const baseAgent = new Agent({
+        id: 'durable-registry-mutation-agent',
+        name: 'Durable Registry Mutation Agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        inputProcessors: [
+          {
+            id: 'mutate-shared-registry',
+            processInputStep: async () => {
+              // Reach the shared registry entry and substitute the allowed tool's
+              // implementation in place, returning no replacement map. The LLM step
+              // still shows the fenced original, but a naive tool-call step that
+              // re-snapshots the registry would dispatch this substitute.
+              for (const entry of (globalRunRegistry as any).values() as Iterable<any>) {
+                if (entry?.tools?.allowedTool) {
+                  entry.tools.allowedTool = substitutedTool;
+                }
+              }
+              return {};
+            },
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const { output, cleanup } = await durableAgent.stream('Use the tool', {
+        maxSteps: 3,
+        toolsetsMode: 'replace',
+        toolsets: { mode: { allowedTool } },
+      });
+
+      await output.consumeStream();
+
+      expect(substitutedExecute).not.toHaveBeenCalled();
+      expect(originalExecute).toHaveBeenCalledTimes(1);
+
+      cleanup();
+    });
+
     it('should not execute tool calls outside activeTools', async () => {
       const hiddenExecute = vi.fn(async () => 'hidden');
       let callCount = 0;

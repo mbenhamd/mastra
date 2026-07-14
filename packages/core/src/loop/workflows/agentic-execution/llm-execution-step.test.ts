@@ -1113,6 +1113,64 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     expect(ownKeysCalls).toBe(1);
   });
 
+  it('propagates the replacement tool surface fence into each iteration output', async () => {
+    const requestContext = new RequestContext();
+    const modeTool = createTool({
+      id: 'modeTool',
+      description: 'approved replacement tool',
+      inputSchema: z.object({}),
+      execute: vi.fn(),
+    });
+    const doStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'tool-call', toolCallId: 'mode-call', toolName: 'modeTool', input: '{}' },
+        { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+      ]),
+      request: {},
+      response: { headers: undefined },
+      warnings: [],
+    }));
+    const tools = { modeTool };
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'test-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'mock-model-id',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream,
+          } as any,
+        },
+      ],
+      tools,
+      requestContext,
+      streamState: { serialize: vi.fn(), deserialize: vi.fn() },
+      _internal: { generateId: () => 'generated-id' },
+      logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any,
+    } as unknown as OuterLLMRun<typeof tools>);
+    stampToolSurfaceFence(requestContext, 'test-run', tools);
+    const executeParams = createExecuteParams(createIterationInput());
+
+    // The initial payload carries the fence, but a later iteration rebuilds the
+    // iteration data from scratch. The output must re-emit the ceiling so a suspend
+    // on this iteration keeps the fence a fresh-process resume needs.
+    const result = await llmExecutionStep.execute(executeParams);
+
+    expect(result.toolSurfaceFence).toEqual(['modeTool']);
+  });
+
   it('runs processLLMRequest before invoking the model without persisting prompt changes', async () => {
     const processLLMRequest = vi.fn(async ({ prompt }: any) => ({
       prompt: prompt.map((message: any) =>
@@ -1727,6 +1785,87 @@ describe('createLLMExecutionStep gateway provider tools', () => {
     expect(result.output.toolCalls).toEqual([
       expect.objectContaining({ toolCallId: 'fallback-call', toolName: 'echo' }),
     ]);
+  });
+
+  it('keeps an already-emitted tool call when a later tool call is interjected by a signal', async () => {
+    const signal = createSignal({
+      id: 'interjected-signal',
+      type: 'user',
+      contents: 'Actually stop and answer this instead',
+    });
+    // Drain order: pre-stream drain, then the top-of-loop drain for each tool-call
+    // chunk. The first tool-call is drained clean (emitted to the stream); the
+    // second observes the queued signal and is discarded before it reaches the stream.
+    const drainPendingSignals = vi
+      .fn()
+      .mockReturnValueOnce([]) // pre-stream drain
+      .mockReturnValueOnce([]) // emitted-call top-of-loop drain
+      .mockReturnValueOnce([signal]) // interjected-call top-of-loop drain
+      .mockReturnValue([]);
+    const doStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'tool-call', toolCallId: 'emitted-call', toolName: 'echo', input: '{"text":"emitted"}' },
+        { type: 'tool-call', toolCallId: 'interjected-call', toolName: 'echo', input: '{"text":"interjected"}' },
+        { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+      ]),
+      request: {},
+      response: { headers: undefined },
+      warnings: [],
+    }));
+    const tools = {
+      echo: createTool({
+        id: 'echo',
+        description: 'Echo input text',
+        inputSchema: z.object({ text: z.string() }),
+        execute: vi.fn(async ({ text }) => ({ text })),
+      }),
+    };
+
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      models: [
+        {
+          id: 'test-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'mock-model-id',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream,
+          } as any,
+        },
+      ],
+      tools,
+      streamState: { serialize: vi.fn(), deserialize: vi.fn() },
+      _internal: {
+        generateId: () => 'generated-id',
+        drainPendingSignals,
+      },
+      logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as any,
+    } as unknown as OuterLLMRun<typeof tools>);
+
+    const result = await llmExecutionStep.execute(createExecuteParams(createIterationInput()));
+
+    // The emitted call is kept for execution; the interjected (never-surfaced) call is dropped.
+    expect(result.output.toolCalls).toEqual([
+      expect.objectContaining({ toolCallId: 'emitted-call', toolName: 'echo' }),
+    ]);
+    expect(result.output.toolCalls).not.toContainEqual(expect.objectContaining({ toolCallId: 'interjected-call' }));
+    // The emitted tool call really was surfaced to the stream before the interjection.
+    const enqueuedToolCallIds = (controller.enqueue as Mock).mock.calls
+      .map(([chunk]) => (chunk?.type === 'tool-call' ? chunk.payload?.toolCallId : undefined))
+      .filter(Boolean);
+    expect(enqueuedToolCallIds).toContain('emitted-call');
+    expect(enqueuedToolCallIds).not.toContain('interjected-call');
   });
 
   it('emits a processor_run span when an error processor handles an API error', async () => {

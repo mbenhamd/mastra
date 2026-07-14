@@ -7,6 +7,7 @@ import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
 import { ChunkFrom } from '../../../../stream/types';
+import type { CoreTool } from '../../../../tools/types';
 import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { SuspendOptions } from '../../../../workflows/step';
@@ -17,7 +18,7 @@ import {
   parseToolApprovalDecision,
   parseToolApprovalGrant,
 } from '../../../tool-call-identity';
-import { createToolSurfaceFence } from '../../../tool-surface-fence';
+import { createToolSurfaceFence, materializeToolSurfaceFence } from '../../../tool-surface-fence';
 import { DurableStepIds } from '../../constants';
 import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
@@ -177,26 +178,38 @@ export function createDurableToolCallStep() {
       }
       const replacementToolNames =
         agentOptions.toolSurfaceFence !== undefined ? new Set(agentOptions.toolSurfaceFence) : undefined;
+      // For a replacement run, never dispatch from the mutable registry object.
+      // Select from the immutable surface bound to the fenced originals captured at
+      // preparation; fall back to re-materializing the fence when that surface is
+      // unavailable. Either way an in-place processor mutation of `registryEntry.tools`
+      // cannot swap the executable the model was shown a fenced original for.
+      let toolSourceMap: Record<string, CoreTool> | undefined = registryEntry?.tools;
       if (registryEntry && replacementToolNames) {
         // Revalidate at the side-effect boundary. A crash/restart can resume
-        // directly at this step after the LLM step's earlier validation.
-        createToolSurfaceFence(registryEntry.tools, replacementToolNames);
+        // directly at this step after the LLM step's earlier validation, and this
+        // rebuild also fails closed on a partial registry.
+        toolSourceMap =
+          registryEntry.replacementToolSurface ??
+          (materializeToolSurfaceFence(createToolSurfaceFence(registryEntry.tools, replacementToolNames)) as Record<
+            string,
+            CoreTool
+          >);
       }
-      let tool = replacementToolNames?.has(toolName) === false ? undefined : registryEntry?.tools?.[toolName];
+      let tool = replacementToolNames?.has(toolName) === false ? undefined : toolSourceMap?.[toolName];
 
       if (!tool && replacementToolNames === undefined) {
         tool = resolveTool(toolName, mastra as Mastra);
       }
 
-      const toolKey = registryEntry?.tools?.[toolName]
+      const toolKey = toolSourceMap?.[toolName]
         ? toolName
-        : Object.entries(registryEntry?.tools ?? {}).find(([, registeredTool]) => registeredTool === tool)?.[0];
+        : Object.entries(toolSourceMap ?? {}).find(([, registeredTool]) => registeredTool === tool)?.[0];
       const effectiveActiveTools = activeTools === null ? undefined : (activeTools ?? agentOptions.activeTools);
       const activeToolKey = toolKey ?? toolName;
       const isHiddenByActiveTools = effectiveActiveTools !== undefined && !effectiveActiveTools.includes(activeToolKey);
 
       if (!tool || isHiddenByActiveTools) {
-        const registeredToolNames = Object.keys(registryEntry?.tools ?? {});
+        const registeredToolNames = Object.keys(toolSourceMap ?? {});
         const fenceScopedToolNames =
           replacementToolNames === undefined
             ? registeredToolNames

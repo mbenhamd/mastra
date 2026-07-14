@@ -876,6 +876,19 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let activeFallbackModelIndex = inputData.fallbackModelIndex || 0;
       let executedStepModel: string | undefined;
       let hadInterjectedSignals = false;
+      // Tool-call ids already surfaced to the stream when a follow-up signal
+      // interjected. Only tool calls that were NOT yet emitted are discarded;
+      // already-visible calls must still be executed so they never orphan.
+      let emittedToolCallIds: Set<string> | undefined;
+      // Persisted name-only replacement ceiling. The initial agentic-loop payload
+      // carries it, but each iteration rebuilds LLMIterationData from scratch, so
+      // re-emit it here or a suspend on a later iteration would lose the fence a
+      // fresh-process resume needs to reconstruct the original replacement surface.
+      const persistedToolSurfaceFence =
+        readToolSurfaceFence(requestContext, runId)?.allowedNames ?? inputData.toolSurfaceFence;
+      const toolSurfaceFencePassthrough = persistedToolSurfaceFence
+        ? { toolSurfaceFence: [...persistedToolSurfaceFence] }
+        : {};
       const maxErrorProcessorRetries = maxProcessorRetries ?? (errorProcessors?.length ? 10 : undefined);
       const { outputStream, callBail, runState, stepTools, stepWorkspace, processAPIErrorRetry } =
         await executeStreamWithFallbackModels<{
@@ -1562,6 +1575,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
             if (interjectedSignals.length > 0) {
               hadInterjectedSignals = true;
+              // processOutputStream returns early on the tool-call chunk that
+              // observed the pending signal, so that call was never enqueued or
+              // collected. Any tool-call chunk that DID reach collectedChunks was
+              // already surfaced to the stream and must still be executed.
+              emittedToolCallIds = new Set(
+                collectedChunks
+                  .filter(chunk => chunk.type === 'tool-call')
+                  .map(chunk => (chunk.payload as { toolCallId?: string } | undefined)?.toolCallId)
+                  .filter((toolCallId): toolCallId is string => typeof toolCallId === 'string'),
+              );
               messageList.markResponseMessageBoundary(currentStep.messageId);
               outputStream.messageId = rotateResponseMessageId();
               for (const signal of interjectedSignals) {
@@ -1925,6 +1948,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           messages,
           processorRetryCount: nextProcessorRetryCount,
           ...(activeFallbackModelIndex > 0 ? { fallbackModelIndex: activeFallbackModelIndex } : {}),
+          ...toolSurfaceFencePassthrough,
         };
       }
 
@@ -1951,7 +1975,15 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       // Tool calls are added to the message list inline during stream processing (case 'tool-call').
       // Tool results (including deferred provider results) are handled inline (case 'tool-result').
-      const toolCalls = (hadInterjectedSignals ? [] : (outputStream._getImmediateToolCalls() ?? [])).map(chunk => {
+      // On an interjected signal, discard only the tool calls that were not yet
+      // surfaced to the stream. Dropping an already-emitted call would strand a
+      // visible tool invocation with no execution and no result.
+      const immediateToolCalls = outputStream._getImmediateToolCalls() ?? [];
+      const toolCalls = (
+        hadInterjectedSignals
+          ? immediateToolCalls.filter(chunk => emittedToolCallIds?.has(chunk.payload.toolCallId))
+          : immediateToolCalls
+      ).map(chunk => {
         const tool = stepTools?.[chunk.payload.toolName] || findProviderToolByName(stepTools, chunk.payload.toolName);
         return {
           ...chunk.payload,
@@ -2178,6 +2210,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         processorRetryCount: nextProcessorRetryCount,
         processorRetryFeedback: retryFeedbackText,
         ...(nextFallbackModelIndex > 0 ? { fallbackModelIndex: nextFallbackModelIndex } : {}),
+        ...toolSurfaceFencePassthrough,
       };
     },
   });

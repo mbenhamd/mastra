@@ -429,6 +429,14 @@ export interface RunRegistryEntry {
   runtimeBindingId: string;
   /** Resolved tools with execute functions */
   tools: Record<string, CoreTool>;
+  /**
+   * Immutable, fenced replacement surface captured from the original tools at
+   * preparation time (replacement runs only). The tool-call step dispatches from
+   * this instead of the mutable `tools` map so a processor that mutates the shared
+   * registry in place cannot swap the executable behind an allowed name after the
+   * model was shown the fenced original.
+   */
+  replacementToolSurface?: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
   saveQueueManager?: SaveQueueManager;
   /** Memory instance for thread creation and message persistence */
