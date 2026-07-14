@@ -30,6 +30,37 @@ export interface RequireFGAOptions extends CheckFGAOptions {
   metadata?: Record<string, unknown>;
 }
 
+// Conversion provenance is deliberately tied to the final in-process tool
+// object. Keeping it outside the AI SDK-compatible object shape prevents raw
+// tools from forging an agent or MCP authorization identity.
+interface BuiltToolFGAProvenance {
+  resourceId: string;
+  getFGAProvider: () => IFGAProvider | undefined;
+}
+
+const builtToolFGAProvenance = new WeakMap<object, BuiltToolFGAProvenance>();
+
+/** @internal Bind the canonical FGA identity selected during tool conversion. */
+export function bindBuiltToolFGAResourceId<T extends object>(
+  tool: T,
+  resourceId: string,
+  getFGAProvider: () => IFGAProvider | undefined,
+): T {
+  builtToolFGAProvenance.set(tool, { resourceId, getFGAProvider });
+  return tool;
+}
+
+/** @internal Read conversion provenance; unregistered tools fail closed to their standalone identity. */
+export function getBuiltToolFGAResourceId(tool: unknown): string | undefined {
+  return typeof tool === 'object' && tool !== null ? builtToolFGAProvenance.get(tool)?.resourceId : undefined;
+}
+
+/** @internal Whether this converted tool will enforce the same provider during execution. */
+export function builtToolEnforcesFGAProvider(tool: unknown, fgaProvider: IFGAProvider): boolean {
+  if (typeof tool !== 'object' || tool === null) return false;
+  return builtToolFGAProvenance.get(tool)?.getFGAProvider() === fgaProvider;
+}
+
 function mergeFGAContext({
   context,
   requestContext,

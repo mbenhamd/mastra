@@ -13,7 +13,13 @@ import {
 } from '@mastra/schema-compat';
 import type { JSONSchema7Definition } from 'json-schema';
 import { z } from 'zod/v4';
-import { MastraFGAPermissions } from '../../auth/ee';
+import {
+  getAgentToolFGAResourceId,
+  getMCPToolFGAResourceId,
+  getStandaloneToolFGAResourceId,
+  MastraFGAPermissions,
+} from '../../auth/ee';
+import { bindBuiltToolFGAResourceId } from '../../auth/ee/fga-check';
 import { backgroundOverrideJsonSchema, backgroundOverrideZodSchema } from '../../background-tasks';
 import { MastraBase } from '../../base';
 import { ErrorCategory, MastraError, ErrorDomain } from '../../error';
@@ -21,7 +27,7 @@ import type { Mastra } from '../../mastra';
 import { SpanType, wrapMastra, EntityType, getOrCreateSpan, createObservabilityContext } from '../../observability';
 import type { AnySpan } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
-import { RequestContext } from '../../request-context';
+import { isInfrastructureRequestContextKey, RequestContext } from '../../request-context';
 import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { StandardSchemaWithJSON } from '../../schema';
 import { getNeedsApprovalFn, isVercelTool, isProviderDefinedTool } from '../../tools/toolchecks';
@@ -60,6 +66,16 @@ interface LogMessageOptions {
   start: string;
   error: string;
   logData: Record<string, unknown>;
+}
+
+function resolveToolFGAResourceId(tool: ToolToConvert, options: ToolOptions): string {
+  const mcpMeta =
+    !isVercelTool(tool) && 'mcpMetadata' in tool ? (tool as { mcpMetadata?: McpMetadata }).mcpMetadata : undefined;
+  return mcpMeta?.serverName
+    ? getMCPToolFGAResourceId(mcpMeta.serverName, options.name)
+    : options.agentId
+      ? getAgentToolFGAResourceId(options.agentId, options.name)
+      : getStandaloneToolFGAResourceId(options.name);
 }
 
 /**
@@ -193,6 +209,14 @@ export class CoreToolBuilder extends MastraBase {
   private originalTool: ToolToConvert;
   private options: ToolOptions;
   private logType?: LogType;
+
+  private bindFGAResourceId<T extends object>(tool: T): T {
+    return bindBuiltToolFGAResourceId(
+      tool,
+      resolveToolFGAResourceId(this.originalTool, this.options),
+      () => (this.options.mastra as any)?.getServer?.()?.fga,
+    );
+  }
 
   constructor(input: {
     originalTool: ToolToConvert;
@@ -450,7 +474,7 @@ export class CoreToolBuilder extends MastraBase {
         }
       }
 
-      return {
+      const providerTool = {
         ...(processedOutputSchema ? { outputSchema: processedOutputSchema } : {}),
         type: 'provider-defined' as const,
         id: tool.id as `${string}.${string}`,
@@ -472,7 +496,8 @@ export class CoreToolBuilder extends MastraBase {
         toModelOutput: 'toModelOutput' in this.originalTool ? this.originalTool.toModelOutput : undefined,
         transform: 'transform' in this.originalTool ? this.originalTool.transform : undefined,
         inputExamples: 'inputExamples' in this.originalTool ? this.originalTool.inputExamples : undefined,
-      } as unknown as (CoreTool & { id: `${string}.${string}` }) | undefined;
+      } as unknown as CoreTool & { id: `${string}.${string}` };
+      return this.bindFGAResourceId(providerTool);
     }
 
     return undefined;
@@ -514,6 +539,7 @@ export class CoreToolBuilder extends MastraBase {
     // Extract MCP metadata once with proper typing to avoid repeated unsafe casts
     const mcpMeta =
       !isVercelTool(tool) && 'mcpMetadata' in tool ? (tool as { mcpMetadata?: McpMetadata }).mcpMetadata : undefined;
+    const fgaResourceId = resolveToolFGAResourceId(tool, options);
 
     const execFunction = async (args: unknown, execOptions: MastraToolInvocationOptions, toolSpan?: AnySpan) => {
       try {
@@ -558,6 +584,7 @@ export class CoreToolBuilder extends MastraBase {
             memory: options.memory,
             runId: options.runId,
             requestContext: execOptions.requestContext ?? options.requestContext ?? new RequestContext(),
+            actor: execOptions.actor,
             // Workspace for file operations and command execution
             // Execution-time workspace (from prepareStep/processInputStep) takes precedence over build-time workspace
             workspace: execOptions.workspace ?? options.workspace,
@@ -703,12 +730,22 @@ export class CoreToolBuilder extends MastraBase {
 
     return async (args: unknown, execOptions?: MastraToolInvocationOptions) => {
       let logger = options.logger || this.logger;
+      const actor = execOptions?.actor;
 
       // Create tool span early so validation failures are always observable.
       // Prefer execution-time tracingContext (passed at runtime for VNext methods)
       // Fall back to build-time context for Legacy methods (AI SDK v4 doesn't support passing custom options)
       const tracingContext = execOptions?.tracingContext || options.tracingContext;
-      const toolRequestContext = execOptions?.requestContext ?? options.requestContext;
+      const executionRequestContext = execOptions?.requestContext;
+      const toolRequestContext =
+        executionRequestContext && options.requestContext && executionRequestContext !== options.requestContext
+          ? new RequestContext<unknown>([
+              ...Array.from(options.requestContext.entries() as IterableIterator<[string, unknown]>),
+              ...Array.from(executionRequestContext.entries() as IterableIterator<[string, unknown]>).filter(
+                ([key]) => !isInfrastructureRequestContextKey(key) || !options.requestContext?.has(key),
+              ),
+            ])
+          : (executionRequestContext ?? options.requestContext);
       const toolSpan = getOrCreateSpan({
         type: mcpMeta ? SpanType.MCP_TOOL_CALL : SpanType.TOOL_CALL,
         name: mcpMeta ? `mcp_tool: '${options.name}' on '${mcpMeta.serverName}'` : `tool: '${options.name}'`,
@@ -735,18 +772,13 @@ export class CoreToolBuilder extends MastraBase {
       const fgaProvider = (options.mastra as any)?.getServer?.()?.fga;
       const user = toolRequestContext?.get('user');
       if (fgaProvider) {
-        const { getAgentToolFGAResourceId, getMCPToolFGAResourceId, getStandaloneToolFGAResourceId, requireFGA } =
-          await import('../../auth/ee/fga-check');
-        const toolResourceId = mcpMeta?.serverName
-          ? getMCPToolFGAResourceId(mcpMeta.serverName, options.name)
-          : options.agentId
-            ? getAgentToolFGAResourceId(options.agentId, options.name)
-            : getStandaloneToolFGAResourceId(options.name);
+        const { requireFGA } = await import('../../auth/ee/fga-check');
         await requireFGA({
           fgaProvider,
           user,
-          resource: { type: 'tool', id: toolResourceId },
+          resource: { type: 'tool', id: fgaResourceId },
           permission: MastraFGAPermissions.TOOLS_EXECUTE,
+          actor,
           requestContext: toolRequestContext,
           context: {
             resourceId: options.resourceId,
@@ -785,7 +817,11 @@ export class CoreToolBuilder extends MastraBase {
         return await new Promise((resolve, reject) => {
           setImmediate(async () => {
             try {
-              const result = await execFunction(args, execOptions!, toolSpan);
+              const result = await execFunction(
+                args,
+                { ...execOptions!, requestContext: toolRequestContext },
+                toolSpan,
+              );
               resolve(result);
             } catch (err) {
               reject(err);
@@ -838,16 +874,16 @@ export class CoreToolBuilder extends MastraBase {
         ('name' in builtTool && typeof builtTool.name === 'string' ? builtTool.name : null) ||
         builtTool.id.split('.')[1] ||
         builtTool.id;
-      return {
+      return this.bindFGAResourceId({
         ...rest,
         type: builtTool.type,
         id: builtTool.id,
         name,
         args: builtTool.args,
-      } as VercelToolV5;
+      } as VercelToolV5);
     }
 
-    return base as VercelToolV5;
+    return this.bindFGAResourceId(base as VercelToolV5);
   }
 
   build(): CoreTool {
@@ -1004,7 +1040,7 @@ export class CoreToolBuilder extends MastraBase {
         : undefined,
     };
 
-    return {
+    return this.bindFGAResourceId({
       ...definition,
       id: 'id' in this.originalTool ? this.originalTool.id : undefined,
       parameters: processedInputSchema ?? z.object({}),
@@ -1022,6 +1058,6 @@ export class CoreToolBuilder extends MastraBase {
       // Preserve tool-level background config so the agentic loop can pick it up
       // from the converted CoreTool at dispatch time.
       backgroundConfig: this.options.backgroundConfig,
-    } as unknown as CoreTool;
+    } as unknown as CoreTool);
   }
 }

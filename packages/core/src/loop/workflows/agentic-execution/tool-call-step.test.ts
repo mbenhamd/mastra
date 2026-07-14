@@ -2132,6 +2132,12 @@ describe('createToolCallStep requestContext forwarding', () => {
     args: { key: 'value' },
   });
 
+  const makeFgaProvider = () => ({
+    require: vi.fn().mockResolvedValue(undefined),
+    check: vi.fn(),
+    filterAccessible: vi.fn(),
+  });
+
   const makeExecuteParams = (overrides: any = {}) => ({
     runId: 'ctx-run-id',
     workflowId: 'ctx-workflow-id',
@@ -2239,6 +2245,213 @@ describe('createToolCallStep requestContext forwarding', () => {
 
     expect(capturedOptions).toBeDefined();
     expect(capturedOptions!.requestContext).toBe(requestContext);
+  });
+
+  it('forwards a trusted actor through the FGA precheck and tool invocation', async () => {
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
+    const actor = { actorKind: 'system', sourceWorkflow: 'nightly-workflow' } as const;
+    const fgaProvider = makeFgaProvider();
+    const mastra = { getServer: () => ({ fga: fgaProvider }) };
+    let capturedOptions: MastraToolInvocationOptions | undefined;
+    const tools = {
+      'ctx-tool': {
+        execute: vi.fn((_args: any, opts: MastraToolInvocationOptions) => {
+          capturedOptions = opts;
+          return Promise.resolve({ ok: true });
+        }),
+      },
+    };
+
+    const toolCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      runId: 'ctx-run',
+      streamState,
+      agentId: 'agent-1',
+      actor,
+      mastra: mastra as any,
+    } as any);
+
+    await toolCallStep.execute(makeExecuteParams({ requestContext }));
+
+    expect(fgaProvider.require).not.toHaveBeenCalled();
+    expect(capturedOptions?.actor).toBe(actor);
+  });
+
+  it('uses one converted identity and the authoritative live principal for channel tools', async () => {
+    const requestContext = new RequestContext();
+    const user = { id: 'channel-user', canAuthorize: vi.fn().mockReturnValue(true) };
+    requestContext.set('user', user);
+    const executionRequestContext = new RequestContext();
+    const projectedUser = JSON.parse(JSON.stringify(user));
+    executionRequestContext.set('user', projectedUser);
+    expect(projectedUser.canAuthorize).toBeUndefined();
+    const fgaProvider = makeFgaProvider();
+    const mastra = { getServer: () => ({ fga: fgaProvider }) };
+    const channelTool = createTool({
+      id: 'channel-tool',
+      description: 'Channel tool',
+      inputSchema: z.object({ key: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+    const builtChannelTool = new CoreToolBuilder({
+      originalTool: channelTool,
+      options: {
+        name: 'channel-tool',
+        requestContext,
+        mastra: mastra as any,
+      },
+    }).build();
+    const inputData = { ...makeInputData(), toolName: 'channel-tool' };
+
+    const toolCallStep = createToolCallStep({
+      tools: { 'channel-tool': builtChannelTool },
+      messageList,
+      controller,
+      runId: 'ctx-run',
+      streamState,
+      agentId: 'agent-1',
+      mastra: mastra as any,
+    } as any);
+
+    await toolCallStep.execute(makeExecuteParams({ inputData, requestContext: executionRequestContext }));
+
+    expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ resource: { type: 'tool', id: 'channel-tool' } }),
+    );
+  });
+
+  it('authorizes a converted browser tool with its canonical identity when its builder has no FGA provider', async () => {
+    const requestContext = new RequestContext();
+    const user = { id: 'browser-user' };
+    requestContext.set('user', user);
+    const fgaProvider = makeFgaProvider();
+    const mastra = { getServer: () => ({ fga: fgaProvider }) };
+    const browserTool = createTool({
+      id: 'browser-click',
+      description: 'Click in the browser',
+      inputSchema: z.object({ key: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+    const builtBrowserTool = new CoreToolBuilder({
+      originalTool: browserTool,
+      options: {
+        name: 'browser-click',
+        agentId: 'agent-1',
+        requestContext,
+        mastra: undefined,
+      },
+    }).build();
+    const inputData = { ...makeInputData(), toolName: 'browser-click' };
+
+    const toolCallStep = createToolCallStep({
+      tools: { 'browser-click': builtBrowserTool },
+      messageList,
+      controller,
+      runId: 'ctx-run',
+      streamState,
+      agentId: 'agent-1',
+      mastra: mastra as any,
+    } as any);
+
+    await toolCallStep.execute(makeExecuteParams({ inputData, requestContext }));
+
+    expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ resource: { type: 'tool', id: 'agent-1:browser-click' } }),
+    );
+  });
+
+  it.each([
+    {
+      shape: 'own forged marker and MCP-like metadata',
+      createRawTool: () => ({
+        inputSchema: z.object({ key: z.string() }),
+        mcpMetadata: { serverName: 'untrusted-metadata' },
+        _mastraFgaResourceId: 'victim-agent:ctx-tool',
+        execute: vi.fn().mockResolvedValue({ ok: true }),
+      }),
+    },
+    {
+      shape: 'inherited forged marker',
+      createRawTool: () =>
+        Object.assign(Object.create({ _mastraFgaResourceId: 'victim-agent:ctx-tool' }), {
+          inputSchema: z.object({ key: z.string() }),
+          execute: vi.fn().mockResolvedValue({ ok: true }),
+        }),
+    },
+  ])('keeps a raw AI SDK tool with $shape on the standalone identity', async ({ createRawTool }) => {
+    const requestContext = new RequestContext();
+    const user = { id: 'sdk-user' };
+    requestContext.set('user', user);
+    const fgaProvider = makeFgaProvider();
+    const mastra = { getServer: () => ({ fga: fgaProvider }) };
+
+    const toolCallStep = createToolCallStep({
+      tools: { 'ctx-tool': createRawTool() },
+      messageList,
+      controller,
+      runId: 'ctx-run',
+      streamState,
+      agentId: 'agent-1',
+      mastra: mastra as any,
+    } as any);
+
+    await toolCallStep.execute(makeExecuteParams({ requestContext }));
+
+    expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ resource: { type: 'tool', id: 'ctx-tool' } }),
+    );
+  });
+
+  it('uses one selected identity for locally executed provider-defined tools', async () => {
+    const requestContext = new RequestContext();
+    const user = { id: 'provider-user' };
+    requestContext.set('user', user);
+    const fgaProvider = makeFgaProvider();
+    const mastra = { getServer: () => ({ fga: fgaProvider }) };
+    const providerTool = {
+      type: 'provider-defined' as const,
+      id: 'provider.search' as const,
+      description: 'Provider search',
+      inputSchema: z.object({ key: z.string() }),
+      execute: vi.fn().mockResolvedValue({ ok: true }),
+    };
+    const builtProviderTool = new CoreToolBuilder({
+      originalTool: providerTool as any,
+      options: {
+        name: 'provider-search',
+        agentId: 'agent-1',
+        requestContext,
+        mastra: mastra as any,
+      },
+    }).build();
+    const inputData = { ...makeInputData(), toolName: 'provider-search' };
+
+    const toolCallStep = createToolCallStep({
+      tools: { 'provider-search': builtProviderTool },
+      messageList,
+      controller,
+      runId: 'ctx-run',
+      streamState,
+      agentId: 'agent-1',
+      mastra: mastra as any,
+    } as any);
+
+    await toolCallStep.execute(makeExecuteParams({ inputData, requestContext }));
+
+    expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ resource: { type: 'tool', id: 'agent-1:provider-search' } }),
+    );
   });
 });
 

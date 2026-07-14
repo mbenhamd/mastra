@@ -1,9 +1,12 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../agent';
+import { Mastra } from '../mastra';
+import { MockMemory } from '../memory/mock';
 import { RequestContext } from '../request-context';
 import { createTool } from '../tools';
+import { LocalFilesystem, Workspace } from '../workspace';
 import type { InputProcessor, ProcessInputStepArgs } from './index';
 
 /**
@@ -16,6 +19,62 @@ import type { InputProcessor, ProcessInputStepArgs } from './index';
  * original requestContext so that tool.execute() receives it in the context.
  */
 describe('Processor-returned tools receive requestContext', () => {
+  const createToolCallingModel = (toolName: string, onProviderTools?: (tools: unknown) => void) => {
+    let callCount = 0;
+
+    return new MockLanguageModelV2({
+      doStream: async ({ tools }) => {
+        callCount++;
+        onProviderTools?.(tools);
+
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  {
+                    type: 'response-metadata',
+                    id: 'id-0',
+                    modelId: '__GATEWAY_OPENAI_MODEL__',
+                    timestamp: new Date(0),
+                  },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'call-1',
+                    toolName,
+                    input: JSON.stringify({ query: 'test' }),
+                  },
+                  {
+                    type: 'finish',
+                    finishReason: 'tool-calls',
+                    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                  },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  {
+                    type: 'response-metadata',
+                    id: 'id-1',
+                    modelId: '__GATEWAY_OPENAI_MODEL__',
+                    timestamp: new Date(0),
+                  },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: 'Done.' },
+                  { type: 'text-end', id: 'text-1' },
+                  {
+                    type: 'finish',
+                    finishReason: 'stop',
+                    usage: { inputTokens: 15, outputTokens: 10, totalTokens: 25 },
+                  },
+                ],
+          ),
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        };
+      },
+    });
+  };
+
   it('should forward requestContext to tools added by processInputStep', async () => {
     let capturedRequestContext: RequestContext | undefined;
 
@@ -254,5 +313,173 @@ describe('Processor-returned tools receive requestContext', () => {
 
     expect(existingToolContext).toBeDefined();
     expect(existingToolContext!.get('tenantId')).toBe('tenant-abc');
+  });
+
+  it('forwards Mastra, memory, workspace, and thread context to processor-added tools', async () => {
+    let capturedContext: Record<string, any> | undefined;
+    const memory = new MockMemory();
+    const workspace = new Workspace({
+      id: 'processor-workspace',
+      name: 'Processor Workspace',
+      filesystem: new LocalFilesystem({ basePath: process.cwd() }),
+    });
+    const mastra = new Mastra();
+    const dynamicTool = createTool({
+      id: 'context-tool',
+      description: 'Capture the complete dynamically loaded tool context',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async (_input, context) => {
+        capturedContext = context;
+        return 'captured';
+      },
+    });
+    const processor = {
+      id: 'context-tool-injector',
+      processInputStep: async (args: ProcessInputStepArgs) => ({
+        tools: { ...(args.tools ?? {}), 'context-tool': dynamicTool },
+      }),
+    } as InputProcessor;
+    const requestContext = new RequestContext();
+    requestContext.set('tenantId', 'tenant-context');
+    const providerTools: unknown[] = [];
+    const agent = new Agent({
+      id: 'processor-context-agent',
+      name: 'Processor Context Agent',
+      instructions: 'Use the context tool.',
+      model: createToolCallingModel('context-tool', tools => providerTools.push(tools)),
+      mastra,
+      memory,
+      workspace,
+      inputProcessors: [processor],
+    });
+
+    const stream = await agent.stream('Capture the context', {
+      maxSteps: 2,
+      requestContext,
+      memory: { thread: 'thread-context', resource: 'resource-context' },
+    });
+    const errors: unknown[] = [];
+    for await (const chunk of stream.fullStream) {
+      if (chunk.type === 'error') {
+        errors.push(chunk.payload.error);
+      }
+    }
+
+    expect(errors).toEqual([]);
+    expect(capturedContext).toBeDefined();
+    expect(capturedContext?.mastra).toBeDefined();
+    expect(capturedContext?.mastra).not.toBe(mastra);
+    expect(capturedContext?.mastra.getLogger()).toBe(mastra.getLogger());
+    expect(capturedContext?.memory).toBe(memory);
+    expect(capturedContext?.workspace).toBe(workspace);
+    expect(capturedContext?.agent?.threadId).toBe('thread-context');
+    expect(capturedContext?.agent?.resourceId).toBe('resource-context');
+    expect(capturedContext?.requestContext).toBe(requestContext);
+    expect(capturedContext?.writer?.write).toEqual(expect.any(Function));
+    expect(capturedContext?.writer?.custom).toEqual(expect.any(Function));
+
+    const serializedProviderTools = JSON.stringify(providerTools[0]);
+    expect(serializedProviderTools).not.toContain('tenant-context');
+    expect(serializedProviderTools).not.toContain('thread-context');
+    expect(serializedProviderTools).not.toContain('resource-context');
+    expect(serializedProviderTools).not.toContain('processor-workspace');
+  });
+
+  it('authorizes processor-added tools with the owning agent identity', async () => {
+    const fgaProvider = {
+      require: vi.fn().mockResolvedValue(undefined),
+      check: vi.fn(),
+      filterAccessible: vi.fn(),
+    };
+    const mastra = new Mastra({ logger: false, server: { fga: fgaProvider } });
+    const dynamicTool = createTool({
+      id: 'authorized-context-tool',
+      description: 'Exercise agent-scoped authorization for a processor-added tool',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async () => 'authorized',
+    });
+    const processor = {
+      id: 'authorized-context-tool-injector',
+      processInputStep: async () => ({ tools: { 'authorized-context-tool': dynamicTool } }),
+    } as InputProcessor;
+    const requestContext = new RequestContext();
+    const user = { id: 'processor-tool-user' };
+    requestContext.set('user', user);
+    const agent = new Agent({
+      id: 'processor-fga-agent',
+      name: 'Processor FGA Agent',
+      instructions: 'Use the authorized context tool.',
+      model: createToolCallingModel('authorized-context-tool'),
+      mastra,
+      inputProcessors: [processor],
+    });
+
+    const stream = await agent.stream('Authorize the processor-added tool', {
+      maxSteps: 2,
+      requestContext,
+      memory: { thread: 'fga-thread', resource: 'fga-resource' },
+    });
+    for await (const _chunk of stream.fullStream) {
+      // Drain the stream so the processor-added tool executes.
+    }
+
+    expect(fgaProvider.require).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({
+        resource: { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
+        permission: 'tools:execute',
+        context: expect.objectContaining({
+          resourceId: 'fga-resource',
+          requestContext,
+          metadata: expect.objectContaining({
+            agentId: 'processor-fga-agent',
+            agentName: 'Processor FGA Agent',
+            threadId: 'fga-thread',
+            executionResourceId: 'fga-resource',
+          }),
+        }),
+      }),
+    );
+    const toolAuthorizations = fgaProvider.require.mock.calls
+      .map(([, authorization]) => authorization.resource)
+      .filter(resource => resource.type === 'tool');
+    expect(toolAuthorizations).toEqual([{ type: 'tool', id: 'processor-fga-agent:authorized-context-tool' }]);
+  });
+
+  it('keeps optional context absent for processor-added tools', async () => {
+    let capturedContext: Record<string, any> | undefined;
+    const dynamicTool = createTool({
+      id: 'optional-context-tool',
+      description: 'Capture absent optional context',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async (_input, context) => {
+        capturedContext = context;
+        return 'captured';
+      },
+    });
+    const processor = {
+      id: 'optional-context-tool-injector',
+      processInputStep: async () => ({ tools: { 'optional-context-tool': dynamicTool } }),
+    } as InputProcessor;
+    const agent = new Agent({
+      id: 'processor-optional-context-agent',
+      name: 'Processor Optional Context Agent',
+      instructions: 'Use the optional context tool.',
+      model: createToolCallingModel('optional-context-tool'),
+      inputProcessors: [processor],
+    });
+
+    const stream = await agent.stream('Capture absent context', { maxSteps: 2 });
+    for await (const _chunk of stream.fullStream) {
+      // Drain the stream so the processor-added tool executes.
+    }
+
+    expect(capturedContext).toBeDefined();
+    expect(capturedContext?.mastra).toBeUndefined();
+    expect(capturedContext?.memory).toBeUndefined();
+    expect(capturedContext?.workspace).toBeUndefined();
+    expect(capturedContext?.agent?.threadId).toBeUndefined();
+    expect(capturedContext?.agent?.resourceId).toBeUndefined();
+    expect(capturedContext?.requestContext).toBeInstanceOf(RequestContext);
   });
 });
