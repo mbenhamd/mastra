@@ -1149,18 +1149,31 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const toolFgaProvider = mastra?.getServer?.()?.fga;
         if (toolFgaProvider) {
           const fgaUser = requestContext?.get('user');
-          const { checkFGA, FGADeniedError } = await import('../../../auth/ee/fga-check');
+          const {
+            checkFGA,
+            FGADeniedError,
+            getAgentToolFGAResourceId,
+            getMCPToolFGAResourceId,
+            getStandaloneToolFGAResourceId,
+          } = await import('../../../auth/ee/fga-check');
+          const mcpServerName = (tool as { mcpMetadata?: { serverName?: unknown } }).mcpMetadata?.serverName;
+          const toolResourceId =
+            typeof mcpServerName === 'string' && mcpServerName
+              ? getMCPToolFGAResourceId(mcpServerName, inputData.toolName)
+              : agentId
+                ? getAgentToolFGAResourceId(agentId, inputData.toolName)
+                : getStandaloneToolFGAResourceId(inputData.toolName);
           if (!fgaUser) {
             throw new FGADeniedError(
               { id: 'unknown' },
-              { type: 'tool', id: inputData.toolName },
+              { type: 'tool', id: toolResourceId },
               MastraFGAPermissions.TOOLS_EXECUTE,
             );
           }
           await checkFGA({
             fgaProvider: toolFgaProvider,
             user: fgaUser,
-            resource: { type: 'tool', id: inputData.toolName },
+            resource: { type: 'tool', id: toolResourceId },
             permission: MastraFGAPermissions.TOOLS_EXECUTE,
           });
         }

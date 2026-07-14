@@ -430,6 +430,13 @@ describe('Processor-returned tools receive requestContext', () => {
         }),
       }),
     );
+    const toolAuthorizations = fgaProvider.require.mock.calls
+      .map(([, authorization]) => authorization.resource)
+      .filter(resource => resource.type === 'tool');
+    expect(toolAuthorizations).toEqual([
+      { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
+      { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
+    ]);
   });
 
   it('keeps optional context absent for processor-added tools', async () => {
