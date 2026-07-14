@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   mergeWorkflowStepResult,
@@ -5,18 +6,41 @@ import {
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
   WorkflowsStorage,
+  MAX_WORKFLOW_TERMINALIZATION_LEASE_MS,
+  advanceWorkflowTerminalizationRecord,
+  claimWorkflowTerminalizationRecord,
   createStorageErrorId,
+  observeWorkflowTerminalizationRecord,
+  persistWorkflowTerminalStateRecord,
+  releaseWorkflowTerminalizationRecord,
+  validateWorkflowTerminalizationClaim,
+  validateWorkflowTerminalizationFence,
 } from '@mastra/core/storage';
 import type {
+  AdvanceWorkflowTerminalizationInput,
+  AdvanceWorkflowTerminalizationResult,
+  ClaimWorkflowTerminalizationInput,
+  ClaimWorkflowTerminalizationResult,
+  DeleteCompletedWorkflowTerminalizationsInput,
+  DeleteCompletedWorkflowTerminalizationsResult,
+  GetWorkflowTerminalizationInput,
+  GetWorkflowTerminalizationResult,
+  PersistWorkflowTerminalStateInput,
+  PersistWorkflowTerminalStateResult,
+  ReleaseWorkflowTerminalizationInput,
+  ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
   WorkflowRuns,
   CreateIndexOptions,
 } from '@mastra/core/storage';
-import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
-import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
+import type { StepResult, WorkflowRunState, WorkflowTerminalizationRecord } from '@mastra/core/workflows';
+import type { TxClient } from '../../client';
+import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+
+const TABLE_WORKFLOW_TERMINALIZATIONS = 'mastra_workflow_terminalizations';
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -58,7 +82,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   #indexes?: CreateIndexOptions[];
 
   /** Tables managed by this domain */
-  static readonly MANAGED_TABLES = [TABLE_WORKFLOW_SNAPSHOT] as const;
+  static readonly MANAGED_TABLES = [TABLE_WORKFLOW_SNAPSHOT, TABLE_WORKFLOW_TERMINALIZATIONS] as const;
 
   constructor(config: PgDomainConfig) {
     super();
@@ -72,6 +96,424 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   supportsConcurrentUpdates(): boolean {
     return true;
+  }
+
+  supportsWorkflowTerminalizationJournal(): boolean {
+    return true;
+  }
+
+  private terminalizationTableName(): string {
+    return getTableName({
+      indexName: TABLE_WORKFLOW_TERMINALIZATIONS,
+      schemaName: getSchemaName(this.#schema),
+    });
+  }
+
+  private workflowSnapshotTableName(): string {
+    return getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
+  }
+
+  private decodeTerminalizationRow(row: Record<string, unknown>, now: number): WorkflowTerminalizationRecord {
+    const toSafeInteger = (value: unknown, field: string): number => {
+      const parsed = typeof value === 'string' ? Number(value) : value;
+      if (typeof parsed !== 'number' || !Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new TypeError(`Invalid workflow terminalization ${field}`);
+      }
+      return parsed;
+    };
+    const record = {
+      version: toSafeInteger(row.version, 'version'),
+      eventKey: row.event_key,
+      terminalStatus: row.terminal_status,
+      phase: row.phase,
+      ownerId: row.owner_id ?? undefined,
+      claimToken: row.claim_token ?? undefined,
+      claimGeneration: toSafeInteger(row.claim_generation, 'claim_generation'),
+      leaseExpiresAt:
+        row.lease_expires_at === null || row.lease_expires_at === undefined
+          ? undefined
+          : toSafeInteger(row.lease_expires_at, 'lease_expires_at'),
+      createdAt: toSafeInteger(row.created_at, 'created_at'),
+      updatedAt: toSafeInteger(row.updated_at, 'updated_at'),
+      completedAt:
+        row.completed_at === null || row.completed_at === undefined
+          ? undefined
+          : toSafeInteger(row.completed_at, 'completed_at'),
+    } as WorkflowTerminalizationRecord;
+
+    const phases = new Set([
+      'terminalization_pending',
+      'run_state_persisted',
+      'parent_outbox_pending',
+      'parent_effect_recorded',
+      'finish_outbox_pending',
+      'finish_effect_recorded',
+      'complete',
+    ]);
+    const validOptionalIdentity = (value: unknown, maxLength: number) =>
+      value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= maxLength);
+    if (
+      record.version !== 1 ||
+      typeof record.eventKey !== 'string' ||
+      record.eventKey.length === 0 ||
+      record.eventKey.length > 1024 ||
+      !['success', 'failed', 'canceled'].includes(record.terminalStatus) ||
+      !phases.has(record.phase) ||
+      record.claimGeneration <= 0 ||
+      !validOptionalIdentity(record.ownerId, 256) ||
+      !validOptionalIdentity(record.claimToken, 256) ||
+      record.createdAt > now ||
+      record.updatedAt > now ||
+      record.createdAt > record.updatedAt ||
+      (record.phase === 'complete' &&
+        (record.ownerId !== undefined ||
+          record.claimToken !== undefined ||
+          record.leaseExpiresAt !== undefined ||
+          record.completedAt === undefined ||
+          record.completedAt !== record.updatedAt)) ||
+      (record.phase !== 'complete' &&
+        (record.completedAt !== undefined ||
+          (record.ownerId === undefined) !== (record.claimToken === undefined) ||
+          (record.claimToken === undefined) !== (record.leaseExpiresAt === undefined) ||
+          (record.leaseExpiresAt !== undefined &&
+            (record.leaseExpiresAt <= record.updatedAt ||
+              record.leaseExpiresAt - record.updatedAt > MAX_WORKFLOW_TERMINALIZATION_LEASE_MS))))
+    ) {
+      throw new TypeError('Invalid workflow terminalization record');
+    }
+    return record;
+  }
+
+  private async getTerminalizationContext(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+  ): Promise<{ record?: WorkflowTerminalizationRecord; snapshotExists: boolean; now: number }> {
+    await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify([workflowName, runId])]);
+    const row = await t.oneOrNone<Record<string, unknown>>(
+      `SELECT * FROM ${this.terminalizationTableName()}
+       WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+      [workflowName, runId],
+    );
+    const snapshot = await t.oneOrNone<{ exists: boolean }>(
+      `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+       WHERE workflow_name = $1 AND run_id = $2`,
+      [workflowName, runId],
+    );
+    const time = await t.one<{ now_ms: string }>(
+      `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms`,
+    );
+    const now = Number(time.now_ms);
+    if (!Number.isSafeInteger(now)) throw new TypeError('Invalid PostgreSQL terminalization clock');
+    return {
+      record: row ? this.decodeTerminalizationRow(row, now) : undefined,
+      snapshotExists: Boolean(snapshot),
+      now,
+    };
+  }
+
+  private async getTerminalizationObservation(
+    workflowName: string,
+    runId: string,
+  ): Promise<GetWorkflowTerminalizationResult> {
+    const row = await this.#db.client.one<Record<string, unknown>>(
+      `SELECT terminalization.*,
+              terminalization.run_id IS NOT NULL AS terminalization_exists,
+              snapshot.run_id IS NOT NULL AS snapshot_exists,
+              floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS observation_now_ms
+       FROM (SELECT $1::text AS workflow_name, $2::text AS run_id) AS identity
+       LEFT JOIN ${this.terminalizationTableName()} AS terminalization
+         ON terminalization.workflow_name = identity.workflow_name AND terminalization.run_id = identity.run_id
+       LEFT JOIN ${this.workflowSnapshotTableName()} AS snapshot
+         ON snapshot.workflow_name = identity.workflow_name AND snapshot.run_id = identity.run_id`,
+      [workflowName, runId],
+    );
+    if (row.terminalization_exists) {
+      const now = Number(row.observation_now_ms);
+      if (!Number.isSafeInteger(now)) throw new TypeError('Invalid PostgreSQL terminalization clock');
+      return {
+        status: 'found',
+        record: observeWorkflowTerminalizationRecord(this.decodeTerminalizationRow(row, now)),
+      };
+    }
+    return row.snapshot_exists ? { status: 'missing_record' } : { status: 'missing_run' };
+  }
+
+  private async saveTerminalizationRecord(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    record: WorkflowTerminalizationRecord,
+  ): Promise<void> {
+    await t.none(
+      `INSERT INTO ${this.terminalizationTableName()}
+       (workflow_name, run_id, version, event_key, terminal_status, phase, owner_id, claim_token,
+        claim_generation, lease_expires_at, created_at, updated_at, completed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       ON CONFLICT (workflow_name, run_id) DO UPDATE SET
+         version = EXCLUDED.version,
+         event_key = EXCLUDED.event_key,
+         terminal_status = EXCLUDED.terminal_status,
+         phase = EXCLUDED.phase,
+         owner_id = EXCLUDED.owner_id,
+         claim_token = EXCLUDED.claim_token,
+         claim_generation = EXCLUDED.claim_generation,
+         lease_expires_at = EXCLUDED.lease_expires_at,
+         updated_at = EXCLUDED.updated_at,
+         completed_at = EXCLUDED.completed_at`,
+      [
+        workflowName,
+        runId,
+        record.version,
+        record.eventKey,
+        record.terminalStatus,
+        record.phase,
+        record.ownerId ?? null,
+        record.claimToken ?? null,
+        record.claimGeneration,
+        record.leaseExpiresAt ?? null,
+        record.createdAt,
+        record.updatedAt,
+        record.completedAt ?? null,
+      ],
+    );
+  }
+
+  private async saveTerminalWorkflowSnapshot(
+    t: TxClient,
+    input: PersistWorkflowTerminalStateInput,
+    snapshot: WorkflowRunState,
+    now: number,
+  ): Promise<void> {
+    const timestamp = new Date(now);
+    const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
+    await t.none(
+      `INSERT INTO ${this.workflowSnapshotTableName()} AS current_snapshot
+       (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (workflow_name, run_id) DO UPDATE SET
+         "resourceId" = COALESCE(EXCLUDED."resourceId", current_snapshot."resourceId"),
+         snapshot = EXCLUDED.snapshot,
+         "updatedAt" = EXCLUDED."updatedAt",
+         "updatedAtZ" = EXCLUDED."updatedAtZ"`,
+      [
+        input.workflowName,
+        input.runId,
+        input.resourceId,
+        sanitizedSnapshot,
+        timestamp,
+        timestamp,
+        timestamp,
+        timestamp,
+      ],
+    );
+  }
+
+  private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
+    if (error instanceof TypeError || error instanceof RangeError) throw error;
+    throw new MastraError(
+      {
+        id: createStorageErrorId('PG', operation, 'FAILED'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.THIRD_PARTY,
+        details: { workflowName, runId },
+      },
+      error,
+    );
+  }
+
+  async claimWorkflowTerminalization(
+    input: ClaimWorkflowTerminalizationInput,
+  ): Promise<ClaimWorkflowTerminalizationResult> {
+    const operation: ClaimWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      eventKey: input.eventKey,
+      terminalStatus: input.terminalStatus,
+      ownerId: input.ownerId,
+      leaseMs: input.leaseMs,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationClaim(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const result = claimWorkflowTerminalizationRecord(context.record, operation, context.now, randomUUID());
+        if (result.status === 'acquired' || result.status === 'renewed') {
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+          return result;
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'CLAIM_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async getWorkflowTerminalization(input: GetWorkflowTerminalizationInput): Promise<GetWorkflowTerminalizationResult> {
+    const operation: GetWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+    };
+    try {
+      return await this.getTerminalizationObservation(operation.workflowName, operation.runId);
+    } catch (error) {
+      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error);
+    }
+  }
+
+  async advanceWorkflowTerminalization(
+    input: AdvanceWorkflowTerminalizationInput,
+  ): Promise<AdvanceWorkflowTerminalizationResult> {
+    const operation: AdvanceWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      expectedPhase: input.expectedPhase,
+      nextPhase: input.nextPhase,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const result = advanceWorkflowTerminalizationRecord(context.record, operation, context.now);
+        if (result.status === 'advanced') {
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'ADVANCE_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async releaseWorkflowTerminalization(
+    input: ReleaseWorkflowTerminalizationInput,
+  ): Promise<ReleaseWorkflowTerminalizationResult> {
+    const operation: ReleaseWorkflowTerminalizationInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const result = releaseWorkflowTerminalizationRecord(context.record, operation, context.now);
+        if (result.status === 'released') {
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'RELEASE_WORKFLOW_TERMINALIZATION',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async deleteCompletedWorkflowTerminalizations(
+    input: DeleteCompletedWorkflowTerminalizationsInput,
+  ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
+    const operation: DeleteCompletedWorkflowTerminalizationsInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      olderThan: input.olderThan,
+    };
+    const olderThan = operation.olderThan.getTime();
+    if (Number.isNaN(olderThan)) throw new TypeError('olderThan must be a valid Date');
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run', count: 0 };
+        const result = await t.query(
+          `DELETE FROM ${this.terminalizationTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 AND phase = 'complete'
+             AND completed_at IS NOT NULL AND completed_at < $3`,
+          [operation.workflowName, operation.runId, olderThan],
+        );
+        return { status: 'deleted', count: result.rowCount ?? 0 };
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'DELETE_COMPLETED_WORKFLOW_TERMINALIZATIONS',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
+  }
+
+  async persistWorkflowTerminalState(
+    input: PersistWorkflowTerminalStateInput,
+  ): Promise<PersistWorkflowTerminalStateResult> {
+    // Materialize the complete operation envelope before acquiring the
+    // transaction lock. A stateful accessor must not split one atomic call
+    // across different workflow identities or fences.
+    const operation: PersistWorkflowTerminalStateInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      snapshot: input.snapshot,
+      resourceId: input.resourceId,
+      leaseMs: input.leaseMs,
+    };
+    validateWorkflowTerminalizationFence(operation);
+    try {
+      return await this.#db.client.tx(async t => {
+        const context = await this.getTerminalizationContext(t, operation.workflowName, operation.runId);
+        if (!context.record && !context.snapshotExists) return { status: 'missing_run' };
+        const result = persistWorkflowTerminalStateRecord(context.record, operation, context.now, snapshot =>
+          JSON.parse(sanitizeJsonForPg(JSON.stringify(snapshot))),
+        );
+        if (result.status === 'advanced') {
+          if (!context.snapshotExists) return { status: 'missing_run' };
+          await this.saveTerminalWorkflowSnapshot(t, operation, result.snapshot, context.now);
+          await this.saveTerminalizationRecord(t, operation.workflowName, operation.runId, result.record);
+          return { status: 'persisted', record: observeWorkflowTerminalizationRecord(result.record) };
+        }
+        return 'record' in result
+          ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+          : result;
+      });
+    } catch (error) {
+      return this.terminalizationError(
+        'PERSIST_WORKFLOW_TERMINAL_STATE',
+        operation.workflowName,
+        operation.runId,
+        error,
+      );
+    }
   }
 
   private parseWorkflowRun(row: Record<string, any>): WorkflowRun {
@@ -109,31 +551,74 @@ export class WorkflowsPG extends WorkflowsStorage {
         includeAllConstraints: true,
       }),
     );
+    statements.push(WorkflowsPG.getTerminalizationTableDDL(schemaName));
+    for (const index of WorkflowsPG.getDefaultIndexDefs(schemaName)) {
+      statements.push(generateIndexSQL(index, schemaName));
+    }
 
     return statements;
   }
 
-  /**
-   * Returns default index definitions for the workflows domain tables.
-   * Currently no default indexes are defined for workflows.
-   */
-  getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    return [];
+  /** Returns the terminalization recovery and retention indexes. */
+  static getDefaultIndexDefs(_schemaName?: string): CreateIndexOptions[] {
+    return [
+      {
+        name: 'mastra_workflow_terminalizations_phase_lease_idx',
+        table: TABLE_WORKFLOW_TERMINALIZATIONS,
+        columns: ['phase', 'lease_expires_at'],
+      },
+      {
+        name: 'mastra_workflow_terminalizations_completed_idx',
+        table: TABLE_WORKFLOW_TERMINALIZATIONS,
+        columns: ['completed_at'],
+      },
+    ];
   }
 
-  /**
-   * Creates default indexes for optimal query performance.
-   * Currently no default indexes are defined for workflows.
-   */
+  private static getTerminalizationTableDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_TERMINALIZATIONS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `CREATE TABLE IF NOT EXISTS ${tableName} (
+      "workflow_name" TEXT NOT NULL,
+      "run_id" TEXT NOT NULL,
+      "version" INTEGER NOT NULL,
+      "event_key" TEXT NOT NULL,
+      "terminal_status" TEXT NOT NULL,
+      "phase" TEXT NOT NULL,
+      "owner_id" TEXT,
+      "claim_token" TEXT,
+      "claim_generation" BIGINT NOT NULL,
+      "lease_expires_at" BIGINT,
+      "created_at" BIGINT NOT NULL,
+      "updated_at" BIGINT NOT NULL,
+      "completed_at" BIGINT,
+      PRIMARY KEY ("workflow_name", "run_id")
+    );`;
+  }
+
+  getDefaultIndexDefinitions(): CreateIndexOptions[] {
+    return WorkflowsPG.getDefaultIndexDefs(this.#schema);
+  }
+
+  /** Creates the terminalization recovery and retention indexes. */
   async createDefaultIndexes(): Promise<void> {
     if (this.#skipDefaultIndexes) {
       return;
     }
-    // No default indexes for workflows domain
+    for (const indexDef of this.getDefaultIndexDefinitions()) {
+      try {
+        await this.#db.createIndex(indexDef);
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create workflow index ${indexDef.name}:`, error);
+      }
+    }
   }
 
   async init(): Promise<void> {
     await this.#db.createTable({ tableName: TABLE_WORKFLOW_SNAPSHOT, schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT] });
+    await this.#db.client.none(WorkflowsPG.getTerminalizationTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
@@ -162,7 +647,9 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   async dangerouslyClearAll(): Promise<void> {
-    await this.#db.clearTable({ tableName: TABLE_WORKFLOW_SNAPSHOT });
+    await this.#db.client.none(
+      `TRUNCATE TABLE ${this.terminalizationTableName()}, ${this.workflowSnapshotTableName()} CASCADE`,
+    );
   }
 
   async updateWorkflowResults({

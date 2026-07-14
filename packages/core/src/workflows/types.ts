@@ -361,6 +361,45 @@ export type WorkflowStateField =
   | 'requestContext'
   | 'tracingContext';
 
+/**
+ * Durable phases for terminal workflow-event handling.
+ *
+ * @internal The journal is runtime coordination metadata. It isn't a workflow
+ * step and must not be projected as one by storage readers.
+ */
+export type WorkflowTerminalizationPhase =
+  | 'terminalization_pending'
+  | 'run_state_persisted'
+  | 'parent_outbox_pending'
+  | 'parent_effect_recorded'
+  | 'finish_outbox_pending'
+  | 'finish_effect_recorded'
+  | 'complete';
+
+export type WorkflowTerminalStatus = 'success' | 'failed' | 'canceled';
+
+/** @internal */
+export interface WorkflowTerminalizationRecord {
+  version: 1;
+  eventKey: string;
+  terminalStatus: WorkflowTerminalStatus;
+  phase: WorkflowTerminalizationPhase;
+  ownerId?: string;
+  claimToken?: string;
+  claimGeneration: number;
+  leaseExpiresAt?: number;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+/** A live journal claim with every fencing credential present. */
+export type WorkflowTerminalizationClaimedRecord = WorkflowTerminalizationRecord & {
+  ownerId: string;
+  claimToken: string;
+  leaseExpiresAt: number;
+};
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;

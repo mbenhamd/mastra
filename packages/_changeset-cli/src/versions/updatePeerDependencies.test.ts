@@ -34,6 +34,17 @@ const packages = {
     dir: '/packages/memory',
     relativeDir: 'packages/memory',
   },
+  '@mastra/pg': {
+    packageJson: {
+      name: '@mastra/pg',
+      version: '1.0.0',
+      peerDependencies: {
+        '@mastra/core': 'workspace:*',
+      },
+    },
+    dir: '/stores/pg',
+    relativeDir: 'stores/pg',
+  },
   '@mastra/standalone': {
     packageJson: {
       name: '@mastra/standalone',
@@ -189,6 +200,18 @@ describe('updatePeerDependencies', () => {
 
     expect(updatedPeerDeps.directUpdatedPackages).toEqual(['@mastra/server']);
     expect(updatedPeerDeps.indirectUpdatedPackages).toEqual(['@mastra/memory']);
+  });
+
+  it('preserves workspace protocol peers when core and the dependent package get a major bump', async () => {
+    const versionBumps: VersionBumps = {
+      '@mastra/core': 'major',
+      '@mastra/pg': 'major',
+    };
+    const updatedPeerDeps = await updatePeerDependencies(versionBumps);
+
+    expect(updatedPeerDeps.directUpdatedPackages).toEqual([]);
+    expect(updatedPeerDeps.indirectUpdatedPackages).toEqual(['@mastra/server', '@mastra/memory']);
+    expect(packages['@mastra/pg'].packageJson.peerDependencies['@mastra/core']).toBe('workspace:*');
   });
 
   it('should update nothing when core & server got bumped to minor', async () => {
