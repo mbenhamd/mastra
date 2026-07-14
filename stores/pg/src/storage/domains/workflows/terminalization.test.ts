@@ -27,6 +27,9 @@ describe('WorkflowsPG terminalization journal', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`DELETE FROM mastra_workflow_terminal_destination_receipts WHERE workflow_name = $1`, [
+        workflowName,
+      ]);
       await client.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
@@ -560,6 +563,7 @@ describe('WorkflowsPG terminalization journal', () => {
     expect(ddl).toContain('PRIMARY KEY ("workflow_name", "run_id")');
     expect(ddl).toContain('mastra_workflow_terminalizations_phase_lease_idx');
     expect(ddl).toContain('mastra_workflow_terminalizations_completed_idx');
+    expect(ddl).toContain('mastra_workflow_terminal_destination_receipts_lookup_idx');
 
     const schemaName = 'tenant_identifier';
     const customSchemaDDL = WorkflowsPG.getExportDDL(schemaName).join('\n');
@@ -589,6 +593,77 @@ describe('WorkflowsPG terminalization journal', () => {
       );
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+    }
+  });
+
+  it('enforces the receipt version and closed state matrix in fresh exported DDL', async () => {
+    const schema = `r${randomUUID().replaceAll('-', '').slice(0, 4)}`;
+    const table = `"${schema}"."mastra_workflow_terminal_destination_receipts"`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    try {
+      const ddl = WorkflowsPG.getExportDDL(schema).find(
+        statement => statement.startsWith('CREATE TABLE') && statement.includes('terminal_destination_receipts'),
+      );
+      if (!ddl) throw new Error('receipt DDL missing');
+      await pool.query(ddl);
+      const insert = async (
+        suffix: string,
+        applicationState: string,
+        dispatchState: string,
+        updatedAt: number,
+        appliedAt: number | null,
+        dispatchPendingAt: number | null,
+        destinationAppliedAt: number | null,
+        quarantinedAt: number | null,
+        version = 1,
+      ) =>
+        pool.query(
+          `INSERT INTO ${table}
+           (version, workflow_name, run_id, effect_key, consumer_id, receipt_key, effect_kind,
+            producer_payload_hash, destination_hash, application_state, dispatch_state, created_at, updated_at,
+            applied_at, dispatch_pending_at, destination_applied_at, quarantined_at)
+           VALUES ($1, 'workflow', 'run', $2, $3, $4, 'workflow-finish', 'payload', 'destination',
+             $5, $6, 100, $7, $8, $9, $10, $11)`,
+          [
+            version,
+            `effect-${suffix}`,
+            `consumer-${suffix}`,
+            `receipt-${suffix}`,
+            applicationState,
+            dispatchState,
+            updatedAt,
+            appliedAt,
+            dispatchPendingAt,
+            destinationAppliedAt,
+            quarantinedAt,
+          ],
+        );
+
+      await insert('reserved', 'reserved', 'none', 100, null, null, null, null);
+      await insert('applied', 'applied', 'none', 110, 110, null, null, null);
+      await insert('pending', 'applied', 'pending', 120, 110, 120, null, null);
+      await insert('destination', 'applied', 'destination_applied', 130, 110, 120, 130, null);
+      await insert('quarantined', 'quarantined', 'none', 140, null, null, null, 140);
+
+      await expect(insert('bad-applied', 'applied', 'none', 110, null, null, null, null)).rejects.toThrow();
+      await expect(insert('bad-pending', 'applied', 'pending', 120, 110, null, null, null)).rejects.toThrow();
+      await expect(insert('predated-pending', 'applied', 'pending', 120, 90, 120, null, null)).rejects.toThrow();
+      await expect(
+        insert('bad-destination', 'applied', 'destination_applied', 130, 110, 120, null, null),
+      ).rejects.toThrow();
+      await expect(
+        insert('predated-destination', 'applied', 'destination_applied', 130, 90, 120, 130, null),
+      ).rejects.toThrow();
+      await expect(insert('bad-quarantine', 'quarantined', 'none', 140, null, null, null, null)).rejects.toThrow();
+      await expect(insert('bad-version', 'reserved', 'none', 100, null, null, null, null, 2)).rejects.toThrow();
+      await expect(
+        pool.query(`UPDATE ${table} SET created_at = 200 WHERE effect_key = 'effect-reserved'`),
+      ).rejects.toThrow();
+      await expect(
+        pool.query(`UPDATE ${table} SET created_at = -1, updated_at = -1 WHERE effect_key = 'effect-reserved'`),
+      ).rejects.toThrow();
+    } finally {
+      await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     }
   });
 

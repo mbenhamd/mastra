@@ -1,5 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import type { StepResult, WorkflowRunState, WorkflowTerminalSnapshotRecord } from '../../../workflows';
+import type {
+  StepResult,
+  WorkflowRunState,
+  WorkflowTerminalDestinationReceiptRecord,
+  WorkflowTerminalEffectRecord,
+  WorkflowTerminalSnapshotRecord,
+  WorkflowTerminalizationRecord,
+} from '../../../workflows';
 import { normalizePerPage } from '../../base';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -12,10 +19,14 @@ import type {
   GetWorkflowTerminalizationResult,
   GetWorkflowTerminalEffectForDispatchInput,
   GetWorkflowTerminalEffectForDispatchResult,
+  GetWorkflowTerminalDestinationReceiptInput,
+  GetWorkflowTerminalDestinationReceiptResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
   PrepareWorkflowTerminalEffectInput,
   PrepareWorkflowTerminalEffectResult,
+  ReserveWorkflowTerminalDestinationReceiptInput,
+  ReserveWorkflowTerminalDestinationReceiptResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   StorageWorkflowRun,
@@ -33,6 +44,8 @@ import {
   claimWorkflowTerminalizationRecord,
   copyWorkflowTerminalizationRecord,
   copyWorkflowTerminalEffectRecord,
+  copyWorkflowTerminalDestinationReceiptRecord,
+  getWorkflowTerminalDestinationReceiptRecord,
   getWorkflowTerminalEffectForDispatchRecord,
   materializeWorkflowTerminalEffectDescriptor,
   materializeWorkflowTerminalEffectKind,
@@ -40,12 +53,15 @@ import {
   observeWorkflowTerminalEffectRecord,
   persistWorkflowTerminalStateRecord,
   prepareWorkflowTerminalEffectRecord,
+  reserveWorkflowTerminalDestinationReceiptRecord,
   releaseWorkflowTerminalizationRecord,
   validateWorkflowTerminalizationClaim,
   validateWorkflowTerminalEffectIntegrity,
   validateWorkflowTerminalEffectJournalLink,
+  validateWorkflowTerminalDestinationReceiptIntegrity,
   validateWorkflowTerminalizationFence,
   validateWorkflowTerminalizationRunIdentity,
+  validateWorkflowTerminalizationIdentity,
   validateWorkflowTerminalSnapshotJournalLink,
 } from './terminalization';
 
@@ -237,7 +253,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowTerminalizationCapabilities(): WorkflowTerminalizationCapabilities {
-    return { journalVersion: 1, producerOutboxVersion: 1 };
+    return { journalVersion: 1, producerOutboxVersion: 1, destinationReceiptVersion: 1 };
   }
 
   private getTerminalizationKey(workflowName: string, runId: string): string {
@@ -246,6 +262,53 @@ export class WorkflowsInMemory extends WorkflowsStorage {
 
   private getTerminalEffectKey(workflowName: string, runId: string, kind: string): string {
     return JSON.stringify([workflowName, runId, kind]);
+  }
+
+  private getTerminalDestinationReceipt(
+    effect: WorkflowTerminalEffectRecord,
+    consumerId: string,
+  ): WorkflowTerminalDestinationReceiptRecord | undefined {
+    const matches = this.db.workflowTerminalDestinationReceipts.findMatches(effect, consumerId);
+    if (matches.length > 1) {
+      throw new TypeError('Conflicting workflow terminal destination receipt storage');
+    }
+    return matches[0];
+  }
+
+  private resolveTerminalDestinationReceiptPreflight(
+    operation: ReserveWorkflowTerminalDestinationReceiptInput | GetWorkflowTerminalDestinationReceiptInput,
+    now: number,
+  ):
+    | { status: 'missing_run' }
+    | {
+        status: 'found';
+        journalKey: string;
+        journal: WorkflowTerminalizationRecord | undefined;
+        effect: WorkflowTerminalEffectRecord | undefined;
+        receipt: WorkflowTerminalDestinationReceiptRecord | undefined;
+      } {
+    validateWorkflowTerminalizationFence(operation);
+    validateWorkflowTerminalizationRunIdentity(operation);
+    validateWorkflowTerminalizationIdentity(operation.consumerId, 'consumerId', 256);
+    const journalKey = this.getTerminalizationKey(operation.workflowName, operation.runId);
+    const workflowKey = this.getWorkflowKey(operation.workflowName, operation.runId);
+    const journal = this.db.workflowTerminalizations.get(journalKey);
+    if (!journal && !this.db.workflows.has(workflowKey)) return { status: 'missing_run' };
+    const effect = this.db.workflowTerminalEffects.get(
+      this.getTerminalEffectKey(operation.workflowName, operation.runId, operation.effectKind),
+    );
+    if (effect && journal) {
+      validateWorkflowTerminalEffectIntegrity(effect);
+      validateWorkflowTerminalEffectJournalLink(effect, journal, operation.workflowName, operation.runId);
+    }
+    const receipt = effect ? this.getTerminalDestinationReceipt(effect, operation.consumerId) : undefined;
+    if (effect && receipt) {
+      validateWorkflowTerminalDestinationReceiptIntegrity(receipt, effect, now);
+      if (receipt.consumerId !== operation.consumerId) {
+        throw new TypeError('Conflicting workflow terminal destination receipt storage');
+      }
+    }
+    return { status: 'found', journalKey, journal, effect, receipt };
   }
 
   async claimWorkflowTerminalization(
@@ -371,6 +434,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         this.getTerminalEffectKey(operation.workflowName, operation.runId, 'workflow-finish'),
       );
       this.db.workflowTerminalSnapshots.delete(key);
+      for (const [receiptKey, receipt] of this.db.workflowTerminalDestinationReceipts) {
+        if (receipt.workflowName === operation.workflowName && receipt.runId === operation.runId) {
+          this.db.workflowTerminalDestinationReceipts.delete(receiptKey);
+        }
+      }
       return { status: 'deleted', count: 1 };
     }
     return { status: 'deleted', count: 0 };
@@ -544,11 +612,82 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         : result;
   }
 
+  async reserveWorkflowTerminalDestinationReceipt(
+    input: ReserveWorkflowTerminalDestinationReceiptInput,
+  ): Promise<ReserveWorkflowTerminalDestinationReceiptResult> {
+    const operation: ReserveWorkflowTerminalDestinationReceiptInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      effectKind: materializeWorkflowTerminalEffectKind(input.effectKind),
+      consumerId: input.consumerId,
+    };
+    const now = Date.now();
+    const preflight = this.resolveTerminalDestinationReceiptPreflight(operation, now);
+    if (preflight.status === 'missing_run') return preflight;
+    const { journalKey, journal, effect, receipt: existingReceipt } = preflight;
+    const existingReceiptCount = effect ? this.db.workflowTerminalDestinationReceipts.countForEffect(effect) : 0;
+    const result = reserveWorkflowTerminalDestinationReceiptRecord(
+      journal,
+      effect,
+      existingReceipt,
+      existingReceiptCount,
+      operation,
+      now,
+    );
+    if (result.status === 'reserved' || result.status === 'already_exists') {
+      const retained = this.db.workflowTerminalSnapshots.get(journalKey);
+      if (!retained) return { status: 'missing_terminal_state' };
+      validateWorkflowTerminalSnapshotJournalLink(retained, journal!, operation.workflowName, operation.runId);
+      if (result.status === 'reserved') {
+        this.db.workflowTerminalDestinationReceipts.set(
+          JSON.stringify([result.receipt.effectKey, result.receipt.consumerId]),
+          copyWorkflowTerminalDestinationReceiptRecord(result.receipt),
+        );
+      }
+      return { status: result.status, receipt: copyWorkflowTerminalDestinationReceiptRecord(result.receipt) };
+    }
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result;
+  }
+
+  async getWorkflowTerminalDestinationReceipt(
+    input: GetWorkflowTerminalDestinationReceiptInput,
+  ): Promise<GetWorkflowTerminalDestinationReceiptResult> {
+    const operation: GetWorkflowTerminalDestinationReceiptInput = {
+      workflowName: input.workflowName,
+      runId: input.runId,
+      ownerId: input.ownerId,
+      claimToken: input.claimToken,
+      claimGeneration: input.claimGeneration,
+      effectKind: materializeWorkflowTerminalEffectKind(input.effectKind),
+      consumerId: input.consumerId,
+    };
+    const now = Date.now();
+    const preflight = this.resolveTerminalDestinationReceiptPreflight(operation, now);
+    if (preflight.status === 'missing_run') return preflight;
+    const { journalKey, journal, effect, receipt } = preflight;
+    const result = getWorkflowTerminalDestinationReceiptRecord(journal, effect, receipt, operation, now);
+    if (result.status === 'found') {
+      const retained = this.db.workflowTerminalSnapshots.get(journalKey);
+      if (!retained) return { status: 'missing_terminal_state' };
+      validateWorkflowTerminalSnapshotJournalLink(retained, journal!, operation.workflowName, operation.runId);
+      return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(result.receipt) };
+    }
+    return 'record' in result
+      ? { status: result.status, record: observeWorkflowTerminalizationRecord(result.record) }
+      : result;
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     this.db.workflows.clear();
     this.db.workflowTerminalizations.clear();
     this.db.workflowTerminalEffects.clear();
     this.db.workflowTerminalSnapshots.clear();
+    this.db.workflowTerminalDestinationReceipts.clear();
   }
 
   private getWorkflowKey(workflowName: string, runId: string): string {

@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import type {
+  WorkflowTerminalDestinationReceiptRecord,
   WorkflowTerminalEffectRecord,
   WorkflowTerminalizationClaimedRecord,
   WorkflowTerminalSnapshotRecord,
@@ -11,10 +12,12 @@ import type {
   AdvanceWorkflowTerminalizationInput,
   ClaimWorkflowTerminalizationInput,
   GetWorkflowTerminalEffectForDispatchInput,
+  GetWorkflowTerminalDestinationReceiptInput,
   PersistWorkflowTerminalStateInput,
   PrepareWorkflowTerminalEffectInput,
   WorkflowTerminalEffectDescriptor,
   ReleaseWorkflowTerminalizationInput,
+  ReserveWorkflowTerminalDestinationReceiptInput,
   WorkflowTerminalEffectObservation,
   WorkflowTerminalizationObservation,
 } from '../../types';
@@ -77,6 +80,25 @@ type InternalGetWorkflowTerminalEffectForDispatchResult =
     }
   | { status: 'missing_effect' | 'missing_record' };
 
+type InternalReserveWorkflowTerminalDestinationReceiptResult =
+  | {
+      status: 'reserved' | 'already_exists';
+      receipt: WorkflowTerminalDestinationReceiptRecord;
+    }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | { status: 'consumer_limit_reached' | 'missing_effect' | 'missing_record' };
+
+type InternalGetWorkflowTerminalDestinationReceiptResult =
+  | { status: 'found'; receipt: WorkflowTerminalDestinationReceiptRecord }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationRecord;
+    }
+  | { status: 'missing_receipt' | 'missing_effect' | 'missing_record' };
+
 const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTerminalizationPhase[]> = {
   terminalization_pending: [],
   run_state_persisted: [],
@@ -89,6 +111,7 @@ const NEXT_PHASES: Record<WorkflowTerminalizationPhase, readonly WorkflowTermina
 
 export const MAX_WORKFLOW_TERMINALIZATION_LEASE_MS = 86_400_000;
 export const MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH = 256;
+export const MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT = 8;
 
 function isWellFormedUnicode(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -199,6 +222,12 @@ export function observeWorkflowTerminalEffectRecord(
     payloadHash: effect.payloadHash,
     createdAt: effect.createdAt,
   };
+}
+
+export function copyWorkflowTerminalDestinationReceiptRecord(
+  receipt: WorkflowTerminalDestinationReceiptRecord,
+): WorkflowTerminalDestinationReceiptRecord {
+  return { ...receipt };
 }
 
 /** Removes credentials that would let an observer impersonate the live claim owner. */
@@ -383,6 +412,9 @@ export function validateWorkflowTerminalEffectJournalLink(
   runId: string,
 ): void {
   if (
+    ![effect.createdAt, journal.createdAt, journal.updatedAt].every(
+      value => Number.isSafeInteger(value) && value >= 0,
+    ) ||
     effect.workflowName !== workflowName ||
     effect.runId !== runId ||
     effect.sourceEventKey !== journal.eventKey ||
@@ -402,6 +434,9 @@ export function validateWorkflowTerminalSnapshotJournalLink(
   runId: string,
 ): void {
   if (
+    ![retained.createdAt, journal.createdAt, journal.updatedAt].every(
+      value => Number.isSafeInteger(value) && value >= 0,
+    ) ||
     retained.workflowName !== workflowName ||
     retained.runId !== runId ||
     retained.terminalStatus !== journal.terminalStatus ||
@@ -661,6 +696,195 @@ export function getWorkflowTerminalEffectForDispatchRecord(
   if (fence.status !== 'ok') return fence;
   if (!existingEffect) return { status: 'missing_effect' };
   return { status: 'found', effect: copyWorkflowTerminalEffectRecord(existingEffect) };
+}
+
+function getWorkflowTerminalEffectDestinationHash(effect: WorkflowTerminalEffectRecord): string {
+  const destination =
+    effect.kind === 'parent-workflow-step-end'
+      ? [
+          effect.parentWorkflowName,
+          effect.parentRunId,
+          effect.parentStepId,
+          String(effect.parentExecutionPath.length),
+          ...effect.parentExecutionPath.map(String),
+        ]
+      : [effect.workflowName, effect.runId];
+  return `sha256:${hashFramedParts('mastra.workflow-terminal-destination.v1', [effect.kind, ...destination])}`;
+}
+
+export function createWorkflowTerminalDestinationReceiptRecord(
+  effect: WorkflowTerminalEffectRecord,
+  consumerId: string,
+  now: number,
+): WorkflowTerminalDestinationReceiptRecord {
+  validateWorkflowTerminalEffectIntegrity(effect);
+  validateWorkflowTerminalizationIdentity(consumerId, 'consumerId', 256);
+  validateWorkflowTerminalizationClock(now);
+  if (!Number.isSafeInteger(effect.createdAt) || effect.createdAt < 0) {
+    throw new TypeError('Invalid workflow terminal effect createdAt');
+  }
+  if (now < effect.createdAt) {
+    throw new TypeError('workflow terminal destination receipt cannot predate its producer effect');
+  }
+  return {
+    version: 1,
+    receiptKey: `wtr:v1:${hashFramedParts('mastra.workflow-terminal-receipt.identity.v1', [
+      '1',
+      effect.effectKey,
+      consumerId,
+    ])}`,
+    workflowName: effect.workflowName,
+    runId: effect.runId,
+    effectKey: effect.effectKey,
+    consumerId,
+    effectKind: effect.kind,
+    producerPayloadHash: effect.payloadHash,
+    destinationHash: getWorkflowTerminalEffectDestinationHash(effect),
+    applicationState: 'reserved',
+    dispatchState: 'none',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function validateWorkflowTerminalDestinationReceiptIntegrity(
+  receipt: WorkflowTerminalDestinationReceiptRecord,
+  effect: WorkflowTerminalEffectRecord,
+  now: number,
+): void {
+  validateWorkflowTerminalizationClock(now);
+  const expected = createWorkflowTerminalDestinationReceiptRecord(effect, receipt.consumerId, effect.createdAt);
+  const validApplication = ['reserved', 'applied', 'quarantined'].includes(receipt.applicationState);
+  const validDispatch = ['none', 'pending', 'destination_applied'].includes(receipt.dispatchState);
+  const validState =
+    (receipt.applicationState === 'reserved' &&
+      receipt.dispatchState === 'none' &&
+      receipt.updatedAt === receipt.createdAt &&
+      receipt.appliedAt === undefined &&
+      receipt.dispatchPendingAt === undefined &&
+      receipt.destinationAppliedAt === undefined &&
+      receipt.quarantinedAt === undefined) ||
+    (receipt.applicationState === 'applied' &&
+      receipt.appliedAt !== undefined &&
+      receipt.quarantinedAt === undefined &&
+      ((receipt.dispatchState === 'none' &&
+        receipt.updatedAt === receipt.appliedAt &&
+        receipt.dispatchPendingAt === undefined &&
+        receipt.destinationAppliedAt === undefined) ||
+        (receipt.dispatchState === 'pending' &&
+          receipt.dispatchPendingAt !== undefined &&
+          receipt.appliedAt <= receipt.dispatchPendingAt &&
+          receipt.updatedAt === receipt.dispatchPendingAt &&
+          receipt.destinationAppliedAt === undefined) ||
+        (receipt.dispatchState === 'destination_applied' &&
+          receipt.dispatchPendingAt !== undefined &&
+          receipt.destinationAppliedAt !== undefined &&
+          receipt.appliedAt <= receipt.dispatchPendingAt &&
+          receipt.dispatchPendingAt <= receipt.destinationAppliedAt &&
+          receipt.updatedAt === receipt.destinationAppliedAt))) ||
+    (receipt.applicationState === 'quarantined' &&
+      receipt.dispatchState === 'none' &&
+      receipt.appliedAt === undefined &&
+      receipt.dispatchPendingAt === undefined &&
+      receipt.destinationAppliedAt === undefined &&
+      receipt.quarantinedAt !== undefined &&
+      receipt.updatedAt === receipt.quarantinedAt);
+  const timestamps = [
+    receipt.appliedAt,
+    receipt.dispatchPendingAt,
+    receipt.destinationAppliedAt,
+    receipt.quarantinedAt,
+  ].filter((value): value is number => value !== undefined);
+  if (
+    receipt.version !== 1 ||
+    receipt.receiptKey !== expected.receiptKey ||
+    receipt.workflowName !== effect.workflowName ||
+    receipt.runId !== effect.runId ||
+    receipt.effectKey !== effect.effectKey ||
+    receipt.effectKind !== effect.kind ||
+    receipt.producerPayloadHash !== effect.payloadHash ||
+    receipt.destinationHash !== expected.destinationHash ||
+    !Number.isSafeInteger(receipt.createdAt) ||
+    receipt.createdAt < effect.createdAt ||
+    receipt.createdAt > now ||
+    !validApplication ||
+    !validDispatch ||
+    !validState ||
+    !Number.isSafeInteger(receipt.updatedAt) ||
+    receipt.updatedAt < receipt.createdAt ||
+    receipt.updatedAt > now ||
+    timestamps.some(value => !Number.isSafeInteger(value) || value < receipt.createdAt || value > receipt.updatedAt)
+  ) {
+    throw new TypeError('Invalid workflow terminal destination receipt integrity');
+  }
+}
+
+function sameWorkflowTerminalDestinationReceipt(
+  left: WorkflowTerminalDestinationReceiptRecord,
+  right: WorkflowTerminalDestinationReceiptRecord,
+): boolean {
+  return (
+    left.version === right.version &&
+    left.receiptKey === right.receiptKey &&
+    left.workflowName === right.workflowName &&
+    left.runId === right.runId &&
+    left.effectKey === right.effectKey &&
+    left.consumerId === right.consumerId &&
+    left.effectKind === right.effectKind &&
+    left.producerPayloadHash === right.producerPayloadHash &&
+    left.destinationHash === right.destinationHash
+  );
+}
+
+export function reserveWorkflowTerminalDestinationReceiptRecord(
+  journal: WorkflowTerminalizationRecord | undefined,
+  effect: WorkflowTerminalEffectRecord | undefined,
+  existingReceipt: WorkflowTerminalDestinationReceiptRecord | undefined,
+  existingReceiptCount: number,
+  input: ReserveWorkflowTerminalDestinationReceiptInput,
+  now: number,
+): InternalReserveWorkflowTerminalDestinationReceiptResult {
+  validateWorkflowTerminalizationIdentity(input.consumerId, 'consumerId', 256);
+  materializeWorkflowTerminalEffectKind(input.effectKind);
+  const fence = checkLiveWorkflowTerminalizationFence(journal, input, now);
+  if (fence.status !== 'ok') return fence;
+  if (!effect || effect.kind !== input.effectKind) return { status: 'missing_effect' };
+  const desired = createWorkflowTerminalDestinationReceiptRecord(effect, input.consumerId, now);
+  if (!existingReceipt) {
+    if (
+      !Number.isSafeInteger(existingReceiptCount) ||
+      existingReceiptCount < 0 ||
+      existingReceiptCount >= MAX_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS_PER_EFFECT
+    ) {
+      return { status: 'consumer_limit_reached' };
+    }
+    return { status: 'reserved', receipt: desired };
+  }
+  validateWorkflowTerminalDestinationReceiptIntegrity(existingReceipt, effect, now);
+  if (!sameWorkflowTerminalDestinationReceipt(existingReceipt, desired)) {
+    throw new TypeError('Conflicting workflow terminal destination receipt identity');
+  }
+  return { status: 'already_exists', receipt: copyWorkflowTerminalDestinationReceiptRecord(existingReceipt) };
+}
+
+export function getWorkflowTerminalDestinationReceiptRecord(
+  journal: WorkflowTerminalizationRecord | undefined,
+  effect: WorkflowTerminalEffectRecord | undefined,
+  receipt: WorkflowTerminalDestinationReceiptRecord | undefined,
+  input: GetWorkflowTerminalDestinationReceiptInput,
+  now: number,
+): InternalGetWorkflowTerminalDestinationReceiptResult {
+  validateWorkflowTerminalizationIdentity(input.consumerId, 'consumerId', 256);
+  materializeWorkflowTerminalEffectKind(input.effectKind);
+  const fence = checkLiveWorkflowTerminalizationFence(journal, input, now);
+  if (fence.status !== 'ok') return fence;
+  if (!effect || effect.kind !== input.effectKind) return { status: 'missing_effect' };
+  if (!receipt) return { status: 'missing_receipt' };
+  validateWorkflowTerminalDestinationReceiptIntegrity(receipt, effect, now);
+  if (receipt.consumerId !== input.consumerId || receipt.effectKind !== input.effectKind) {
+    throw new TypeError('Conflicting workflow terminal destination receipt identity');
+  }
+  return { status: 'found', receipt: copyWorkflowTerminalDestinationReceiptRecord(receipt) };
 }
 
 /** @internal Atomically certifies that the canonical run snapshot is terminal. */

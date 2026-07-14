@@ -443,6 +443,70 @@ export interface WorkflowTerminalSnapshotRecord {
   createdAt: number;
 }
 
+/**
+ * @internal Consumer-scoped terminal destination evidence.
+ *
+ * PF-1770 only creates `reserved` / `none` records. Later specialized atomic
+ * application APIs own all other state transitions.
+ */
+interface WorkflowTerminalDestinationReceiptRecordBase {
+  version: 1;
+  receiptKey: string;
+  workflowName: string;
+  runId: string;
+  effectKey: string;
+  consumerId: string;
+  effectKind: WorkflowTerminalEffectKind;
+  producerPayloadHash: string;
+  destinationHash: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type WorkflowTerminalDestinationReceiptRecord = WorkflowTerminalDestinationReceiptRecordBase &
+  (
+    | {
+        applicationState: 'reserved';
+        dispatchState: 'none';
+        appliedAt?: never;
+        dispatchPendingAt?: never;
+        destinationAppliedAt?: never;
+        quarantinedAt?: never;
+      }
+    | {
+        applicationState: 'applied';
+        dispatchState: 'none';
+        appliedAt: number;
+        dispatchPendingAt?: never;
+        destinationAppliedAt?: never;
+        quarantinedAt?: never;
+      }
+    | {
+        applicationState: 'applied';
+        dispatchState: 'pending';
+        appliedAt: number;
+        dispatchPendingAt: number;
+        destinationAppliedAt?: never;
+        quarantinedAt?: never;
+      }
+    | {
+        applicationState: 'applied';
+        dispatchState: 'destination_applied';
+        appliedAt: number;
+        dispatchPendingAt: number;
+        destinationAppliedAt: number;
+        quarantinedAt?: never;
+      }
+    | {
+        applicationState: 'quarantined';
+        dispatchState: 'none';
+        appliedAt?: never;
+        dispatchPendingAt?: never;
+        destinationAppliedAt?: never;
+        quarantinedAt: number;
+      }
+  );
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;

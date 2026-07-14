@@ -10,10 +10,14 @@ import type {
   GetWorkflowTerminalizationResult,
   GetWorkflowTerminalEffectForDispatchInput,
   GetWorkflowTerminalEffectForDispatchResult,
+  GetWorkflowTerminalDestinationReceiptInput,
+  GetWorkflowTerminalDestinationReceiptResult,
   PersistWorkflowTerminalStateInput,
   PersistWorkflowTerminalStateResult,
   PrepareWorkflowTerminalEffectInput,
   PrepareWorkflowTerminalEffectResult,
+  ReserveWorkflowTerminalDestinationReceiptInput,
+  ReserveWorkflowTerminalDestinationReceiptResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
   UpdateWorkflowStateOptions,
@@ -87,6 +91,18 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async getWorkflowTerminalEffectForDispatch(
     _input: GetWorkflowTerminalEffectForDispatchInput,
   ): Promise<GetWorkflowTerminalEffectForDispatchResult> {
+    return { status: 'unsupported' };
+  }
+
+  async reserveWorkflowTerminalDestinationReceipt(
+    _input: ReserveWorkflowTerminalDestinationReceiptInput,
+  ): Promise<ReserveWorkflowTerminalDestinationReceiptResult> {
+    return { status: 'unsupported' };
+  }
+
+  async getWorkflowTerminalDestinationReceipt(
+    _input: GetWorkflowTerminalDestinationReceiptInput,
+  ): Promise<GetWorkflowTerminalDestinationReceiptResult> {
     return { status: 'unsupported' };
   }
 
