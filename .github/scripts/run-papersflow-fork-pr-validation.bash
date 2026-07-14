@@ -799,8 +799,6 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
-: "${BASE_SHA:?BASE_SHA is required}"
-: "${HEAD_SHA:?HEAD_SHA is required}"
 
 validation_started_at=$SECONDS
 validation_budget_seconds=$((50 * 60))
@@ -833,21 +831,267 @@ run_with_validation_budget() {
   timeout --kill-after=30s "${timeout_seconds}s" "$@"
 }
 
+run_isolated_vitest_case() {
+  local test_workspace="$1"
+  local vitest_file="$2"
+  local test_name="$3"
+  local test_pattern="$4"
+  local expected_test=""
+  local list_result=""
+  local status=0
+  local test_result=""
+  local timeout_seconds=""
+
+  list_result="$(mktemp)"
+  expected_test="$(mktemp)"
+  test_result="$(mktemp)"
+
+  if ! timeout_seconds="$(remaining_validation_seconds 240)"; then
+    echo "Validation budget exhausted before collecting Agent signal test: $test_name" >&2
+    rm -f "$list_result" "$expected_test" "$test_result"
+    return 124
+  fi
+
+  echo "Collecting changed Agent signal test: $test_name"
+  if timeout --kill-after=30s "${timeout_seconds}s" \
+    pnpm --dir "$test_workspace" exec vitest list \
+      --json -t "$test_pattern" "$vitest_file" > "$list_result"; then
+    status=0
+  else
+    status=$?
+    echo "Vitest could not collect the selected Agent signal case: $test_name" >&2
+    rm -f "$list_result" "$expected_test" "$test_result"
+    return "$status"
+  fi
+
+  if ! node - "$list_result" "$expected_test" "$test_name" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+try {
+  const listed = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const selectedTitle = process.argv[4];
+  if (!Array.isArray(listed)) {
+    throw new Error('Vitest list did not return an array.');
+  }
+  if (listed.length !== 1) {
+    throw new Error(
+      `Expected exactly one collected Vitest test for ${JSON.stringify(selectedTitle)}; found ${listed.length}.`,
+    );
+  }
+
+  const [expected] = listed;
+  if (!expected || typeof expected.name !== 'string' || typeof expected.file !== 'string') {
+    throw new Error('Vitest list returned an entry without a test name and file.');
+  }
+  fs.writeFileSync(
+    process.argv[3],
+    JSON.stringify({
+      file: path.resolve(expected.file),
+      name: expected.name,
+    }),
+  );
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+}
+NODE
+  then
+    echo "The selected Agent signal case is not uniquely collectable; failing closed." >&2
+    rm -f "$list_result" "$expected_test" "$test_result"
+    return 1
+  fi
+
+  if ! timeout_seconds="$(remaining_validation_seconds 240)"; then
+    echo "Validation budget exhausted before Agent signal test: $test_name" >&2
+    rm -f "$list_result" "$expected_test" "$test_result"
+    return 124
+  fi
+
+  echo "Running changed Agent signal test in isolation: $test_name"
+  if timeout --kill-after=30s "${timeout_seconds}s" \
+    pnpm --dir "$test_workspace" exec vitest run \
+      --reporter=dot --reporter=json --outputFile.json="$test_result" \
+      -t "$test_pattern" "$vitest_file"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if (( status == 0 )); then
+    if node - "$test_result" "$expected_test" "$test_name" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+try {
+  const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const expected = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+  const selectedTitle = process.argv[4];
+  const passed = [];
+
+  for (const testFile of result.testResults ?? []) {
+    for (const assertion of testFile.assertionResults ?? []) {
+      if (assertion.status === 'passed') passed.push({ assertion, file: testFile.name });
+    }
+  }
+
+  if (result.numPassedTests !== 1 || result.numFailedTests !== 0 || passed.length !== 1) {
+    throw new Error(
+      `Expected exactly one passing Vitest assertion and no failures; reporter recorded ` +
+        `${result.numPassedTests ?? 0} passed, ${result.numFailedTests ?? 0} failed, and ` +
+        `${passed.length} passing assertion entries.`,
+    );
+  }
+
+  const [{ assertion, file }] = passed;
+  const reporterIdentity = [...(assertion.ancestorTitles ?? []), assertion.title].join(' > ');
+  if (assertion.title !== selectedTitle) {
+    throw new Error(
+      `Vitest passed ${JSON.stringify(assertion.title)} instead of selected case ${JSON.stringify(selectedTitle)}.`,
+    );
+  }
+  if (reporterIdentity !== expected.name) {
+    throw new Error(
+      `Vitest reporter identity ${JSON.stringify(reporterIdentity)} does not match collected identity ` +
+        `${JSON.stringify(expected.name)}.`,
+    );
+  }
+  if (typeof file !== 'string' || path.resolve(file) !== expected.file) {
+    throw new Error(
+      `Vitest reporter file ${JSON.stringify(file)} does not match collected file ${JSON.stringify(expected.file)}.`,
+    );
+  }
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+}
+NODE
+    then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+
+  rm -f "$list_result" "$expected_test" "$test_result"
+  return "$status"
+}
+
+run_vitest_selection_regressions() (
+  local duplicate_file=""
+  local fixture_dir=""
+  local test_log=""
+  local test_workspace="packages/core"
+  local unique_file=""
+
+  if [[ ! -f "$test_workspace/package.json" ]]; then
+    echo "Vitest selection self-test requires the packages/core workspace." >&2
+    return 1
+  fi
+
+  fixture_dir="$(mktemp -d "$test_workspace/src/papersflow-vitest-selection.XXXXXX")"
+  test_log="$(mktemp)"
+  trap 'rm -rf "$fixture_dir"; rm -f "$test_log"' EXIT
+
+  unique_file="$fixture_dir/unique-nested.test.ts"
+  cat > "$unique_file" <<'TEST'
+import { describe, expect, it } from 'vitest';
+
+describe('outer suite', () => {
+  describe('inner suite', () => {
+    it('unique nested case', () => {
+      expect(true).toBe(true);
+    });
+  });
+});
+TEST
+
+  run_isolated_vitest_case \
+    "$test_workspace" "${unique_file#"$test_workspace"/}" \
+    'unique nested case' 'unique nested case$'
+
+  duplicate_file="$fixture_dir/duplicate-leaf.test.ts"
+  cat > "$duplicate_file" <<'TEST'
+import { describe, expect, it } from 'vitest';
+
+describe('passing sibling', () => {
+  it('duplicate leaf', () => {
+    expect(true).toBe(true);
+  });
+});
+
+describe('second sibling', () => {
+  it('duplicate leaf', () => {
+    expect(true).toBe(true);
+  });
+});
+TEST
+
+  if run_isolated_vitest_case \
+    "$test_workspace" "${duplicate_file#"$test_workspace"/}" \
+    'duplicate leaf' 'duplicate leaf$' > "$test_log" 2>&1; then
+    echo "Duplicate-leaf Vitest selection unexpectedly passed." >&2
+    return 1
+  fi
+  if ! grep -Fq 'Expected exactly one collected Vitest test for "duplicate leaf"; found 2.' "$test_log"; then
+    echo "Duplicate-leaf Vitest selection failed for an unexpected reason:" >&2
+    cat "$test_log" >&2
+    return 1
+  fi
+
+  echo "Vitest selection regressions passed: unique nested identity and duplicate-leaf fail-closed behavior."
+  rm -rf "$fixture_dir"
+  rm -f "$test_log"
+  trap - EXIT
+)
+
+case "${1:-}" in
+  --self-test-vitest-selection)
+    run_vitest_selection_regressions
+    exit
+    ;;
+  '') ;;
+  *)
+    echo "Unknown validator argument: $1" >&2
+    exit 2
+    ;;
+esac
+
+: "${BASE_SHA:?BASE_SHA is required}"
+: "${HEAD_SHA:?HEAD_SHA is required}"
+
+merge_base_sha="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+
 changed_files="$(mktemp)"
+changed_lockfile_importers="$(mktemp)"
 changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
 delegated_docs_tests="$(mktemp)"
+deleted_tests="$(mktemp)"
+fixer_test_result="$(mktemp)"
+root_vitest_config_list="$(mktemp)"
 unowned_files="$(mktemp)"
 unsupported_inputs="$(mktemp)"
+missing_mastracode_tests="$(mktemp)"
+unsupported_mastracode_tests="$(mktemp)"
+unsupported_mastracode_sources="$(mktemp)"
 unsupported_tests="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$unowned_files" "$unsupported_inputs" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
 # can hide the source owner from a name-only diff.
-git diff --no-renames --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "$changed_files"
+git diff --no-renames --name-only --diff-filter=ACMRTD "${merge_base_sha}..${HEAD_SHA}" | sort > "$changed_files"
+
+# Deleted Vitest files never reach the changed-test runner (it only enqueues
+# files that exist at the proposed head), so removed coverage in owned
+# workspaces would otherwise be accepted silently. Collect deletions here and
+# fail closed on them below.
+git diff --no-renames --name-only --diff-filter=D "${merge_base_sha}..${HEAD_SHA}" |
+  grep -E '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' |
+  sort > "$deleted_tests" || true
 
 echo "Changed files:"
 cat "$changed_files"
@@ -898,8 +1142,12 @@ echo "Changed workspaces:"
 cat "$changed_workspaces"
 
 while IFS= read -r workspace; do
+  if [[ ! -f "$workspace/package.json" ]]; then
+    printf '%s\n' "$workspace" >> "$unsupported_workspaces"
+    continue
+  fi
   case "$workspace" in
-    auth/okta | packages/_internal-core | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -914,20 +1162,152 @@ while IFS= read -r file; do
       .github/workflows/lint-docs.yml | \
       .github/workflows/lint.yml | \
       .github/workflows/mastracode-e2e.yml | \
-      .github/workflows/papersflow-fork-pr.yml) ;;
+      .github/workflows/papersflow-fork-pr.yml | \
+      pnpm-lock.yaml | \
+      scripts/commonjs-tsc-fixer.js | \
+      scripts/commonjs-tsc-fixer.test.ts | \
+      scripts/tsconfig.json | \
+      scripts/vitest.config.ts | \
+      vitest.config.ts) ;;
     *) printf '%s\n' "$file" >> "$unsupported_inputs" ;;
   esac
 done < "$unowned_files"
 
-grep -E '^(package\.json|packages/server/package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|patches/)' "$changed_files" \
+grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" \
   >> "$unsupported_inputs" || true
 # Server validation invokes package-owned scripts. Reject manifest edits before
 # any PR-controlled Server command can weaken or replace those checks.
 grep -Fx 'packages/server/package.json' "$changed_files" >> "$unsupported_inputs" || true
 
-sort -u -o "$unsupported_inputs" "$unsupported_inputs"
+if grep -Fxq 'pnpm-lock.yaml' "$changed_files"; then
+  node - "$merge_base_sha" "$HEAD_SHA" > "$changed_lockfile_importers" <<'NODE'
+const { execFileSync } = require('node:child_process');
 
-if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" ]]; then
+function lockfileSections(sha) {
+  const lockfile = execFileSync('git', ['show', `${sha}:pnpm-lock.yaml`], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const lines = lockfile.split('\n');
+  const sections = new Map();
+  const start = lines.indexOf('importers:');
+  if (start < 0) return { importers: sections, nonImporterGraph: lockfile };
+
+  let importer;
+  let body = [];
+  let end = lines.length;
+  const flush = () => {
+    if (importer !== undefined) sections.set(importer, body.join('\n'));
+  };
+
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line && !line.startsWith(' ')) {
+      end = index;
+      break;
+    }
+    const match = /^  (\S.*):$/.exec(line);
+    if (match) {
+      flush();
+      importer = match[1].replace(/^'|'$/g, '').replace(/''/g, "'");
+      body = [];
+    } else if (importer !== undefined) {
+      body.push(line);
+    }
+  }
+  flush();
+  return {
+    importers: sections,
+    nonImporterGraph: [...lines.slice(0, start), ...lines.slice(end)].join('\n'),
+  };
+}
+
+const before = lockfileSections(process.argv[2]);
+const after = lockfileSections(process.argv[3]);
+if (before.nonImporterGraph !== after.nonImporterGraph) {
+  console.log('__PAPERSFLOW_NON_IMPORTER_GRAPH__');
+}
+const importers = new Set([...before.importers.keys(), ...after.importers.keys()]);
+for (const importer of [...importers].sort()) {
+  if (before.importers.get(importer) !== after.importers.get(importer)) console.log(importer);
+}
+NODE
+
+  lockfile_importers_match_manifests=true
+  if [[ ! -s "$changed_lockfile_importers" ]]; then
+    lockfile_importers_match_manifests=false
+  fi
+  while IFS= read -r importer; do
+    if [[ "$importer" == "__PAPERSFLOW_NON_IMPORTER_GRAPH__" ]]; then
+      lockfile_importers_match_manifests=false
+      echo "Lockfile content outside importer sections changed without an owned validation target." >&2
+      continue
+    fi
+    manifest="${importer}/package.json"
+    if [[ "$importer" == "." ]]; then
+      manifest="package.json"
+    fi
+    if ! grep -Fxq "$manifest" "$changed_files"; then
+      lockfile_importers_match_manifests=false
+      echo "Lockfile importer changed without its manifest: $importer" >&2
+    fi
+  done < "$changed_lockfile_importers"
+
+  if [[ "$lockfile_importers_match_manifests" == false ]]; then
+    printf '%s\n' 'pnpm-lock.yaml' >> "$unsupported_inputs"
+  fi
+fi
+
+git_regular_file_at_head() {
+  git ls-tree "$HEAD_SHA" -- "$1" | grep -Eq '^100(644|755) blob '
+}
+
+while IFS= read -r file; do
+  if [[ "$file" =~ ^mastracode/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+    if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
+      if ! git_regular_file_at_head "$file"; then
+        printf '%s\n' "$file" >> "$missing_mastracode_tests"
+      else
+        case "$file" in
+          mastracode/src/tui/components/login-dialog.test.ts | \
+            mastracode/src/tui/event-dispatch.test.ts | \
+            mastracode/src/tui/notify.test.ts) ;;
+          *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
+        esac
+      fi
+      continue
+    fi
+    required_test=""
+    case "$file" in
+      mastracode/src/tui/components/login-dialog.ts)
+        required_test="mastracode/src/tui/components/login-dialog.test.ts"
+        ;;
+      mastracode/src/tui/event-dispatch.ts)
+        required_test="mastracode/src/tui/event-dispatch.test.ts"
+        ;;
+      mastracode/src/tui/notify.ts)
+        required_test="mastracode/src/tui/notify.test.ts"
+        ;;
+      *)
+        printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
+        ;;
+    esac
+    if [[ -n "$required_test" ]]; then
+      if ! git_regular_file_at_head "$file" ||
+        ! grep -Fxq "$required_test" "$changed_files" ||
+        ! git_regular_file_at_head "$required_test"; then
+        printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
+      fi
+    fi
+  fi
+done < "$changed_files"
+
+sort -u -o "$unsupported_inputs" "$unsupported_inputs"
+sort -u -o "$missing_mastracode_tests" "$missing_mastracode_tests"
+sort -u -o "$unsupported_mastracode_tests" "$unsupported_mastracode_tests"
+sort -u -o "$unsupported_mastracode_sources" "$unsupported_mastracode_sources"
+
+if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_tests" || -s "$missing_mastracode_tests" || -s "$unsupported_mastracode_tests" || -s "$unsupported_mastracode_sources" ]]; then
   if [[ -s "$unsupported_workspaces" ]]; then
     echo "These changed workspaces do not have an owned fork-safe validation target:" >&2
     cat "$unsupported_workspaces" >&2
@@ -935,6 +1315,22 @@ if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" ]]; then
   if [[ -s "$unsupported_inputs" ]]; then
     echo "These non-workspace or root dependency-graph changes require dedicated validation:" >&2
     cat "$unsupported_inputs" >&2
+  fi
+  if [[ -s "$deleted_tests" ]]; then
+    echo "These Vitest files are deleted at the proposed head, so this validator cannot re-run their coverage:" >&2
+    cat "$deleted_tests" >&2
+  fi
+  if [[ -s "$unsupported_mastracode_sources" ]]; then
+    echo "These MastraCode production sources are outside the three owned source-and-test pairs:" >&2
+    cat "$unsupported_mastracode_sources" >&2
+  fi
+  if [[ -s "$missing_mastracode_tests" ]]; then
+    echo "These changed MastraCode tests do not exist as regular files at the proposed head and cannot run:" >&2
+    cat "$missing_mastracode_tests" >&2
+  fi
+  if [[ -s "$unsupported_mastracode_tests" ]]; then
+    echo "These MastraCode tests are outside the three owned regression files:" >&2
+    cat "$unsupported_mastracode_tests" >&2
   fi
   echo "Failing closed instead of reporting Core-only validation as workspace coverage." >&2
   exit 1
@@ -1059,6 +1455,30 @@ console.log('Client SDK route consumers accept generated route types.');
 NODE
 }
 
+server_prerequisites_built=false
+ensure_server_prerequisites() {
+  if [[ "$server_prerequisites_built" == true ]]; then
+    return
+  fi
+
+  run_with_validation_budget 900 pnpm --filter ./packages/memory --fail-if-no-match build:lib
+  run_with_validation_budget 900 pnpm --filter ./packages/agent-builder --fail-if-no-match build
+  run_with_validation_budget 900 pnpm --filter ./packages/server --fail-if-no-match build:lib
+  server_prerequisites_built=true
+}
+
+deployer_prerequisites_built=false
+ensure_deployer_prerequisites() {
+  if [[ "$deployer_prerequisites_built" == true ]]; then
+    return
+  fi
+
+  ensure_server_prerequisites
+  run_with_validation_budget 900 pnpm --filter ./server-adapters/hono --fail-if-no-match build
+  run_with_validation_budget 900 pnpm --filter ./packages/deployer --fail-if-no-match build:lib
+  deployer_prerequisites_built=true
+}
+
 mapfile -t prettier_files < <(
   while IFS= read -r file; do
     if [[ -f "$file" && "$file" =~ \.(cjs|css|js|json|jsx|md|mdx|mjs|ts|tsx|ya?ml)$ ]]; then
@@ -1072,36 +1492,100 @@ if (( ${#prettier_files[@]} > 0 )); then
 fi
 
 run_with_validation_budget 900 pnpm build:core
-run_with_validation_budget 600 pnpm --filter @mastra/core check
+run_with_validation_budget 600 pnpm --filter ./packages/core --fail-if-no-match check
+if [[ -z "${MOCK_PNPM_LOG:-}" ]]; then
+  # The Vitest selection self-check drives real pnpm/vitest processes. Inside
+  # the validator's own fixture harness pnpm is a command-logging mock, so the
+  # self-check cannot run there; production runs never set MOCK_PNPM_LOG.
+  run_vitest_selection_regressions
+fi
 
 if workspace_changed auth/okta; then
-  run_with_validation_budget 900 pnpm --filter @mastra/auth-okta build
-  run_with_validation_budget 600 pnpm --filter @mastra/auth-okta lint
+  run_with_validation_budget 900 pnpm --filter ./auth/okta --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./auth/okta --fail-if-no-match lint
 fi
 
 if workspace_changed packages/_internal-core; then
   run_with_validation_budget 600 pnpm --dir packages/_internal-core typecheck
 fi
 
+if workspace_changed packages/server; then
+  ensure_server_prerequisites
+  run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./packages/server --fail-if-no-match lint
+  run_with_validation_budget 300 pnpm --filter ./packages/server --fail-if-no-match check:core-imports
+fi
+
 if workspace_changed packages/deployer; then
-  run_with_validation_budget 900 pnpm --filter @mastra/memory build:lib
-  run_with_validation_budget 900 pnpm --filter @mastra/agent-builder build
-  run_with_validation_budget 900 pnpm --filter @mastra/server build:lib
-  run_with_validation_budget 900 pnpm --filter @mastra/hono build
-  run_with_validation_budget 600 pnpm --filter @mastra/deployer exec tsc --noEmit
-  run_with_validation_budget 900 pnpm --filter @mastra/deployer build:lib
-  run_with_validation_budget 600 pnpm --filter @mastra/deployer lint
+  ensure_deployer_prerequisites
+  run_with_validation_budget 600 pnpm --filter ./packages/deployer --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./packages/deployer --fail-if-no-match lint
+fi
+
+if workspace_changed packages/cli; then
+  ensure_deployer_prerequisites
+  run_with_validation_budget 900 pnpm --filter ./packages/loggers --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./packages/cli --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./packages/cli --fail-if-no-match lint
+fi
+
+if workspace_changed packages/codemod; then
+  run_with_validation_budget 600 pnpm --filter ./packages/codemod --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./packages/codemod --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./packages/codemod --fail-if-no-match lint
+fi
+
+if grep -Eq '^(scripts/(commonjs-tsc-fixer\.(js|test\.ts)|tsconfig\.json|vitest\.config\.ts)|vitest\.config\.ts)$' "$changed_files"; then
+  # scripts/tsconfig.json includes the root vitest.config.ts, so this also
+  # type-checks root Vitest config changes.
+  run_with_validation_budget 600 pnpm exec tsc --project scripts/tsconfig.json --noEmit
+fi
+
+if grep -Fxq 'scripts/commonjs-tsc-fixer.js' "$changed_files"; then
+  # The scripts tsconfig only type-checks the fixer's test and config, so a
+  # changed JS fixer must run its Vitest regressions to be validated.
+  echo "Running the CommonJS fixer Vitest regressions for the changed scripts/commonjs-tsc-fixer.js"
+  run_with_validation_budget 600 pnpm exec vitest run \
+    --config scripts/vitest.config.ts \
+    --reporter=dot --reporter=json --outputFile.json="$fixer_test_result" \
+    commonjs-tsc-fixer.test.ts
+  node - "$fixer_test_result" <<'NODE'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.numPassedTests < 1 || result.numFailedTests !== 0) {
+  console.error('The CommonJS fixer Vitest regressions did not record a passing run.');
+  process.exit(1);
+}
+NODE
+fi
+
+if grep -Fxq 'vitest.config.ts' "$changed_files"; then
+  # Type-checking alone does not execute the root config's project discovery.
+  # Prove the changed root Vitest config still loads and resolves its
+  # discovered projects by collecting the fixer suite through it.
+  echo "Collecting the scripts project through the changed root vitest.config.ts"
+  run_with_validation_budget 600 pnpm exec vitest list \
+    --config vitest.config.ts --project scripts \
+    --json="$root_vitest_config_list" commonjs-tsc-fixer.test.ts
+  node - "$root_vitest_config_list" <<'NODE'
+const fs = require('node:fs');
+const listed = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (!Array.isArray(listed) || listed.length < 1) {
+  console.error('The root Vitest config smoke did not collect any scripts-project tests.');
+  process.exit(1);
+}
+NODE
 fi
 
 if workspace_changed packages/memory; then
-  run_with_validation_budget 600 pnpm --filter @mastra/memory check
-  run_with_validation_budget 900 pnpm --filter @mastra/memory build:lib
+  run_with_validation_budget 600 pnpm --filter ./packages/memory --fail-if-no-match check
+  run_with_validation_budget 900 pnpm --filter ./packages/memory --fail-if-no-match build:lib
 fi
 
 if workspace_changed packages/mcp; then
-  run_with_validation_budget 600 pnpm --filter @mastra/mcp exec tsc --noEmit
-  run_with_validation_budget 900 pnpm --filter @mastra/mcp build:lib
-  run_with_validation_budget 600 pnpm --filter @mastra/mcp lint
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./packages/mcp --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match lint
 fi
 
 if workspace_changed packages/server; then
@@ -1159,12 +1643,12 @@ if workspace_changed packages/server; then
 fi
 
 if workspace_changed client-sdks/ai-sdk; then
-  run_with_validation_budget 600 pnpm --filter @mastra/ai-sdk exec tsc --noEmit
-  run_with_validation_budget 900 pnpm --filter @mastra/ai-sdk build:lib
+  run_with_validation_budget 600 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 900 pnpm --filter ./client-sdks/ai-sdk --fail-if-no-match build:lib
 fi
 
 if workspace_changed stores/pg; then
-  run_with_validation_budget 600 pnpm --filter @mastra/pg exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./stores/pg --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 900 pnpm turbo build --filter ./stores/pg
 fi
 
@@ -1174,8 +1658,19 @@ if workspace_changed stores/redis; then
 fi
 
 if workspace_changed mastracode; then
-  run_with_validation_budget 900 pnpm run build:mastracode
-  run_with_validation_budget 1200 pnpm --filter ./mastracode run e2e:test -- --reporter=dot
+  # MastraCode's Vitest setup mocks this workspace package, but Vite still
+  # resolves its exported dist entry before applying the mock.
+  run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
+  mapfile -t mastracode_lint_files < <(
+    while IFS= read -r file; do
+      if [[ -f "$file" && "$file" =~ ^mastracode/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
+        printf '%s\n' "$file"
+      fi
+    done < "$changed_files"
+  )
+  if (( ${#mastracode_lint_files[@]} > 0 )); then
+    run_with_validation_budget 600 pnpm exec eslint "${mastracode_lint_files[@]}"
+  fi
 fi
 
 is_explicit_fork_safe_test() {
@@ -1577,7 +2072,7 @@ test_runtime_surface_has_unsupported_runtime() {
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
     if [[ -f "$file" ]] && grep -Eq \
-      '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$|\.test-d\.ts$' \
+      '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' \
       <<< "$file"; then
       printf '%s\n' "$file"
     fi
@@ -1627,10 +2122,19 @@ if (( ${#detected_tests[@]} > 0 )); then
       # provider calls, containers, or other external infrastructure.
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
-      "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]] || \
+      "$file" == mastracode/e2e/* || \
+      "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || \
       grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == mastracode/* && \
+      "$file" != mastracode/src/tui/components/login-dialog.test.ts && \
+      "$file" != mastracode/src/tui/event-dispatch.test.ts && \
+      "$file" != mastracode/src/tui/notify.test.ts ]]; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
+      "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
+      "$file" != packages/codemod/src/lib/transform.integration.test.ts && \
+      "$file" != packages/deployer/src/deploy/log.integration.test.ts && \
       "$file" != stores/pg/* && "$file" != stores/redis/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == stores/* && "$file" != stores/_test-utils/* && \
@@ -1671,7 +2175,7 @@ if [[ -s "$unsupported_tests" ]]; then
 fi
 
 if workspace_changed stores/_test-utils &&
-  ! grep -Eq '^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$' "$changed_tests"; then
+  ! grep -Eq '^stores/_test-utils/.*\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$' "$changed_tests"; then
   echo "Storage test utility changes must include a changed Vitest file in stores/_test-utils." >&2
   echo "Failing closed instead of accepting unexecuted shared conformance helpers." >&2
   exit 1
@@ -1685,23 +2189,214 @@ fi
 echo "Changed test files:"
 cat "$changed_tests"
 
+select_changed_agent_signal_tests() {
+  local file="$1"
+  local output_file="$2"
+
+  node - "$merge_base_sha" "$HEAD_SHA" "$file" > "$output_file" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const ts = require('typescript');
+
+const [baseSha, headSha, file] = process.argv.slice(2);
+const readSource = sha => execFileSync('git', ['show', `${sha}:${file}`], { encoding: 'utf8' });
+const diff = execFileSync('git', ['diff', '--unified=0', '--no-color', baseSha, headSha, '--', file], {
+  encoding: 'utf8',
+});
+
+const oldRanges = [];
+const newRanges = [];
+for (const line of diff.split('\n')) {
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+  if (!match) continue;
+  const oldCount = match[2] === undefined ? 1 : Number(match[2]);
+  const newCount = match[4] === undefined ? 1 : Number(match[4]);
+  if (oldCount > 0) oldRanges.push([Number(match[1]), Number(match[1]) + oldCount - 1]);
+  if (newCount > 0) newRanges.push([Number(match[3]), Number(match[3]) + newCount - 1]);
+}
+
+function rootIdentifier(expression) {
+  let current = expression;
+  while (ts.isPropertyAccessExpression(current) || ts.isCallExpression(current)) {
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? current.text : undefined;
+}
+
+function collectTests(source) {
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const tests = [];
+  function visit(node) {
+    if (ts.isCallExpression(node) && ['it', 'test'].includes(rootIdentifier(node.expression))) {
+      const name = node.arguments[0];
+      if (name && (ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name))) {
+        tests.push({
+          name: name.text,
+          start: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+          end: sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return tests;
+}
+
+const knownSharedFixtureTests = new Map([
+  [
+    'DeliverThenRejectRegistrationPubSub',
+    ['does not reject a partially delivered registration until its enqueued stream is drained'],
+  ],
+  [
+    'RejectFirstRunCompletedPubSub',
+    ['removes a failed terminal without a drain waiter before the same run id is reused'],
+  ],
+]);
+
+function collectKnownSharedFixtures(source) {
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const fixtures = [];
+  function visit(node) {
+    if (ts.isClassDeclaration(node) && node.name && knownSharedFixtureTests.has(node.name.text)) {
+      fixtures.push({
+        name: node.name.text,
+        start: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+        end: sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+      });
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return fixtures;
+}
+
+function namesForRanges(source, tests, ranges, revision) {
+  const names = new Set();
+  const fixtures = collectKnownSharedFixtures(source);
+  const sourceLines = source.split('\n');
+  for (const [start, end] of ranges) {
+    for (let line = start; line <= end; line += 1) {
+      if ((sourceLines[line - 1] ?? '').trim() === '') continue;
+      const containing = tests.filter(test => test.start <= line && test.end >= line);
+      if (containing.length > 0) {
+        containing.sort((left, right) => left.end - left.start - (right.end - right.start));
+        names.add(containing[0].name);
+        continue;
+      }
+      const fixture = fixtures.find(candidate => candidate.start <= line && candidate.end >= line);
+      if (!fixture) {
+        throw new Error(
+          `${file} changes lines ${start}-${end} outside a named it()/test() case or owned shared fixture in ` +
+            `${revision}; the fork validator cannot safely select coverage for this shared setup change.`,
+        );
+      }
+      for (const testName of knownSharedFixtureTests.get(fixture.name) ?? []) names.add(testName);
+    }
+  }
+  return names;
+}
+
+const baseSource = readSource(baseSha);
+const headSource = readSource(headSha);
+const baseTests = collectTests(baseSource);
+const headTests = collectTests(headSource);
+const headNameCounts = new Map();
+for (const test of headTests) headNameCounts.set(test.name, (headNameCounts.get(test.name) ?? 0) + 1);
+const headNames = new Set(headTests.map(test => test.name));
+const selected = new Set(namesForRanges(headSource, headTests, newRanges, headSha));
+for (const name of namesForRanges(baseSource, baseTests, oldRanges, baseSha)) {
+  if (headNames.has(name)) selected.add(name);
+}
+for (const name of selected) {
+  if (!headNames.has(name)) throw new Error(`Selected Agent signal test does not exist at ${headSha}: ${name}`);
+  if (headNameCounts.get(name) !== 1) {
+    throw new Error(
+      `Selected Agent signal test name is not unique at ${headSha}: ${name}; ` +
+        `found ${headNameCounts.get(name)} declarations.`,
+    );
+  }
+}
+if (selected.size === 0) {
+  throw new Error(`No runnable changed test cases were selected for ${file}.`);
+}
+
+const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+for (const name of [...selected].sort()) {
+  process.stdout.write(`${name}\t${escapeRegex(name)}$\n`);
+}
+NODE
+}
+
 test_status=0
 while IFS= read -r file; do
   status=0
   test_dir=""
+  test_workspace=""
   search_dir="$(dirname "$file")"
 
-  while [[ "$search_dir" != "." && "$search_dir" != "/" ]]; do
+  workspace_search_dir="$search_dir"
+  while [[ "$workspace_search_dir" != "/" ]]; do
+    if [[ "$workspace_search_dir" != "." && -f "$workspace_search_dir/package.json" && \
+      "$workspace_search_dir" != */__fixtures__/* ]]; then
+      test_workspace="$workspace_search_dir"
+      break
+    fi
+    if [[ "$workspace_search_dir" == "." ]]; then
+      break
+    fi
+    workspace_search_dir="$(dirname "$workspace_search_dir")"
+  done
+
+  while [[ "$search_dir" != "/" ]]; do
     if [[ -f "$search_dir/vitest.config.ts" || -f "$search_dir/vitest.config.mts" || \
       -f "$search_dir/vitest.config.js" || -f "$search_dir/vitest.config.mjs" || \
       -f "$search_dir/vitest.config.cjs" || -f "$search_dir/vite.config.ts" || \
       -f "$search_dir/vite.config.mts" || -f "$search_dir/vite.config.js" || \
       -f "$search_dir/vite.config.mjs" || -f "$search_dir/vite.config.cjs" ]]; then
-      test_dir="$search_dir"
+      if [[ "$search_dir" == "." || -f "$search_dir/package.json" ]]; then
+        test_dir="$search_dir"
+        break
+      fi
+    fi
+    if [[ "$search_dir" == "." ]]; then
       break
     fi
     search_dir="$(dirname "$search_dir")"
   done
+
+  if [[ "$test_dir" == "." ]]; then
+    test_dir=""
+  fi
+
+  if [[ "$file" == packages/core/src/agent/__tests__/agent-signals.test.ts ]]; then
+    selected_tests="$(mktemp)"
+    set +e
+    select_changed_agent_signal_tests "$file" "$selected_tests"
+    status=$?
+    set -e
+    if (( status != 0 )); then
+      echo "Unable to select isolated Agent signal tests; failing closed." >&2
+      rm -f "$selected_tests"
+      test_status=$status
+      continue
+    fi
+
+    while IFS=$'\t' read -r test_name test_pattern; do
+      set +e
+      run_isolated_vitest_case \
+        "$test_workspace" "${file#"$test_workspace"/}" "$test_name" "$test_pattern"
+      status=$?
+      set -e
+      if (( status != 0 )); then
+        break
+      fi
+    done < "$selected_tests"
+    rm -f "$selected_tests"
+    if (( status != 0 )); then
+      test_status=$status
+    fi
+    continue
+  fi
 
   if [[ -n "$test_dir" ]]; then
     relative_file="${file#"$test_dir"/}"
@@ -1754,7 +2449,14 @@ NODE
       break
     fi
     set +e
-    timeout --kill-after=30s "${timeout_seconds}s" pnpm exec vitest run --typecheck.only --reporter=dot "$file"
+    vitest_command=(pnpm exec vitest)
+    vitest_file="$file"
+    if [[ -n "$test_workspace" ]]; then
+      vitest_command=(pnpm --dir "$test_workspace" exec vitest)
+      vitest_file="${file#"$test_workspace"/}"
+    fi
+    timeout --kill-after=30s "${timeout_seconds}s" \
+      "${vitest_command[@]}" run --typecheck.only --reporter=dot "$vitest_file"
     status=$?
     set -e
   else
@@ -1766,10 +2468,16 @@ NODE
     echo "Running changed test file in full: $file"
     test_result="$(mktemp)"
     set +e
+    vitest_command=(pnpm exec vitest)
+    vitest_file="$file"
+    if [[ -n "$test_workspace" ]]; then
+      vitest_command=(pnpm --dir "$test_workspace" exec vitest)
+      vitest_file="${file#"$test_workspace"/}"
+    fi
     timeout --kill-after=30s "${timeout_seconds}s" \
-      pnpm exec vitest run \
+      "${vitest_command[@]}" run \
         --reporter=dot --reporter=json --outputFile.json="$test_result" \
-        "$file"
+        "$vitest_file"
     status=$?
     set -e
 
