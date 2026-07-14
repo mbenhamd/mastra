@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+VALIDATOR_REPOSITORY_ROOT="$(git rev-parse --show-toplevel)"
+TYPESCRIPT_MODULE_PATH="$VALIDATOR_REPOSITORY_ROOT/node_modules/typescript"
+readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
+
 run_validator_self_tests() {
   local validator_path
   local test_root
@@ -23,10 +27,16 @@ run_validator_self_tests() {
   mkdir -p \
     "$fixture_repo/client-sdks/client-js/src" \
     "$fixture_repo/packages/cli/src/commands/api" \
+    "$fixture_repo/packages/core/src/auth/ee/interfaces" \
     "$fixture_repo/packages/core/src/harness/v1" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
+    "$fixture_repo/node_modules" \
     "$mock_bin"
+  # The production validator is copied to RUNNER_TEMP and resolves TypeScript
+  # from the checked-out repository. Mirror that installed dependency in the
+  # isolated fixture rather than resolving modules relative to BASH_SOURCE.
+  ln -s "$TYPESCRIPT_MODULE_PATH" "$fixture_repo/node_modules/typescript"
 
   # The single-quoted lines are intentionally emitted into the mock pnpm
   # executable and expand only when that fixture command runs.
@@ -67,12 +77,17 @@ run_validator_self_tests() {
     printf '%s\n' '{}' > packages/cli/package.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
+    printf '%s\n' "export const permission = 'base';" \
+      > packages/core/src/auth/ee/interfaces/permissions.generated.ts
     printf '%s\n' '{}' > packages/server/package.json
     printf '%s\n' 'export default {};' > packages/server/vitest.config.ts
     printf '%s\n' "export const route = 'base';" > packages/server/src/server/server-adapter/routes/index.ts
     printf '%s\n' "export const routeTypes = 'base';" > client-sdks/client-js/src/route-types.generated.ts
     printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
-    printf '%s\n' "import { it } from 'vitest';" "it('favorites', () => {});" \
+    printf '%s\n' 'export const favoriteFixture = true;' \
+      > packages/server/src/server/handlers/favorites-helper.ts
+    printf '%s\n' "import { it } from 'vitest';" "import { favoriteFixture } from './favorites-helper';" \
+      "it('favorites', () => favoriteFixture);" \
       > packages/server/src/server/handlers/favorites.integration.test.ts
     printf '%s\n' "import { it } from 'vitest';" "it('harness', () => {});" \
       > packages/core/src/harness/v1/session.real-agent.e2e.test.ts
@@ -124,6 +139,36 @@ run_validator_self_tests() {
   assert_contains '--filter @mastra/server check:permissions' "$command_log"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "export const permission = 'head';" \
+      > packages/core/src/auth/ee/interfaces/permissions.generated.ts
+    git add .
+    git commit -q -m 'generated permissions only'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/generated-permissions-only.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'packages/server' "$output"
+  assert_contains '--filter @mastra/server check:permissions' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    git mv \
+      packages/core/src/auth/ee/interfaces/permissions.generated.ts \
+      packages/core/src/auth/ee/interfaces/permissions-renamed.ts
+    git commit -q -m 'rename generated permissions artifact'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/generated-permissions-rename.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'packages/server' "$output"
+  assert_contains '--filter @mastra/server check:permissions' "$command_log"
 
   : > "$command_log"
   output="$test_root/permission-failure.log"
@@ -237,6 +282,195 @@ run_validator_self_tests() {
     exit 1
   fi
   assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "void import('./favorites-network-helper.js', { with: {} });" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    printf '%s\n' "import { createServer } from 'node:http';" \
+      'export const networkFixture = createServer;' \
+      > packages/server/src/server/handlers/favorites-network-helper.ts
+    git add .
+    git commit -q -m 'add unsafe dynamic import with options'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-dynamic-import-options-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unsafe dynamic import-with-options fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { createServer } from 'node:http2';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test require an HTTP2 server'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-http2-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'HTTP2-dependent favorites fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { networkFixture } from './favorites-network-helper.js';" \
+      >> packages/server/src/server/handlers/favorites-helper.ts
+    printf '%s\n' "import { createServer } from 'http';" \
+      'export const networkFixture = createServer;' \
+      > packages/server/src/server/handlers/favorites-network-helper.ts
+    git add .
+    git commit -q -m 'add transitive unsafe favorites helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-transitive-helper-runtime-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unsafe transitive favorites helper fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "// Documentation example only: import './not-a-real-module';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'add import example comment'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-comment-import-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains \
+    'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' \
+    "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { createServer } from 'http';" \
+      'export const serverFixture = createServer;' \
+      > packages/server/src/server/handlers/server-network-helper.ts
+    printf '%s\n' "import { it } from 'vitest';" \
+      "import { serverFixture } from './server-network-helper.js';" \
+      "it('server helper', () => serverFixture);" \
+      > packages/server/src/server/handlers/server-helper.test.ts
+    git add .
+    git commit -q -m 'add unsafe Server unit-test helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-unit-helper-runtime-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unsafe Server unit-test helper fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/server-helper.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { execSync } from 'child_process';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test execute a bare process import'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-bare-process-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Bare process import in favorites fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { createServer } from 'http';" \
+      >> packages/server/src/server/handlers/favorites-helper.ts
+    git add .
+    git commit -q -m 'make imported favorites helper require a network primitive'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-helper-runtime-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unsafe imported favorites helper fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { GenericContainer } from 'testcontainers';" \
+      "import { it } from 'vitest';" "it('container test', () => GenericContainer);" \
+      > packages/server/src/server/handlers/container.test.ts
+    git add .
+    git commit -q -m 'add non-fork-safe Server unit test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-unit-runtime-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unsafe Server unit-test fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/container.test.ts' "$output"
   assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
 
   head_sha="$(
@@ -393,7 +627,10 @@ unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
 trap 'rm -f "$changed_files" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$unowned_files" "$unsupported_inputs" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
-git diff --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "$changed_files"
+# Treat renames as a delete plus an add so both ownership boundaries are
+# validated. Otherwise moving a generated artifact out of its canonical path
+# can hide the source owner from a name-only diff.
+git diff --no-renames --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "$changed_files"
 
 echo "Changed files:"
 cat "$changed_files"
@@ -401,16 +638,17 @@ cat "$changed_files"
 is_server_generated_artifact() {
   case "$1" in
     client-sdks/client-js/src/route-types.generated.ts | \
-      packages/cli/src/commands/api/route-metadata.generated.ts) return 0 ;;
+      packages/cli/src/commands/api/route-metadata.generated.ts | \
+      packages/core/src/auth/ee/interfaces/permissions.generated.ts) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 while IFS= read -r file; do
   if is_server_generated_artifact "$file"; then
-    # These exact generated consumers are owned by SERVER_ROUTES. Route changes
-    # must be able to commit their regenerated output without granting general
-    # fork-validation coverage to the Client SDK or CLI workspaces.
+    # These exact generated consumers are owned by Server route/permission
+    # sources. Their output can be committed without granting general fork
+    # validation coverage to the Client SDK, CLI, or Core workspaces.
     printf '%s\n' "packages/server" >> "$workspace_candidates"
     continue
   fi
@@ -578,21 +816,312 @@ is_explicit_fork_safe_test() {
   esac
 }
 
-explicit_fork_safe_test_has_unsupported_runtime() {
-  local file="$1"
+analyze_test_runtime_surface() {
+  local mode="$1"
+  local file="$2"
 
-  # Exact-path exceptions remain conditional on their reviewed in-process
-  # contract. Fail closed before the filename exception if a later edit adds a
-  # browser runner, credentials, external provider/storage packages, or direct
-  # network/process primitives.
-  grep -Fq 'process.env' "$file" ||
-    grep -Eq \
-      "['\"](@playwright/test|testcontainers|@ai-sdk/[^'\"]+|@anthropic-ai/sdk|@google/generative-ai|@mastra/(astra|chroma|clickhouse|cloudflare|cloudflare-d1|convex|couchbase|dsql|duckdb|dynamodb|elasticsearch|lance|libsql|mongodb|mssql|mysql|opensearch|pg|pinecone|qdrant|redis|s3vectors|spanner|turbopuffer|upstash|vectorize)(/[^'\"]*)?|node:(child_process|dns|http|https|net|tls)(/[^'\"]*)?)['\"]" \
-      "$file" ||
-    grep -Eq \
-      "(from[[:space:]]+|import[[:space:]]+|import[[:space:]]*\\(|require[[:space:]]*\\()[[:space:]]*['\"](ollama|openai)['\"]" \
-      "$file" ||
-    grep -Eq '(^|[^[:alnum:]_])(fetch|WebSocket)[[:space:]]*\(' "$file"
+  node - \
+    "$mode" \
+    "$BASE_SHA" \
+    "$file" \
+    "$changed_files" \
+    "$TYPESCRIPT_MODULE_PATH" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const [mode, baseSha, entryFile, changedFilesPath, typescriptModulePath] = process.argv.slice(2);
+const ts = require(typescriptModulePath);
+const repositoryRoot = process.cwd();
+const changedFiles = new Set(fs.readFileSync(changedFilesPath, 'utf8').split('\n').filter(Boolean));
+
+function repositoryPath(file) {
+  const relative = path.relative(repositoryRoot, file);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Resolved test dependency escapes the repository: ${file}`);
+  }
+  return relative.split(path.sep).join('/');
+}
+
+function scriptKind(file) {
+  switch (path.extname(file)) {
+    case '.js':
+    case '.cjs':
+    case '.mjs':
+      return ts.ScriptKind.JS;
+    case '.jsx':
+      return ts.ScriptKind.JSX;
+    case '.tsx':
+      return ts.ScriptKind.TSX;
+    case '.json':
+      return ts.ScriptKind.JSON;
+    default:
+      return ts.ScriptKind.TS;
+  }
+}
+
+function sourceFile(file, source) {
+  return ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind(file));
+}
+
+function importDeclarationHasRuntimeValue(node) {
+  const clause = node.importClause;
+  if (!clause) return true;
+  if (clause.isTypeOnly) return false;
+  if (clause.name) return true;
+  if (ts.isNamespaceImport(clause.namedBindings)) return true;
+  return clause.namedBindings?.elements.some(element => !element.isTypeOnly) ?? false;
+}
+
+function exportDeclarationHasRuntimeValue(node) {
+  if (node.isTypeOnly) return false;
+  if (!node.exportClause || !ts.isNamedExports(node.exportClause)) return true;
+  return node.exportClause.elements.some(element => !element.isTypeOnly);
+}
+
+function runtimeModuleSpecifiers(file, source) {
+  const specifiers = new Set();
+  const parsed = sourceFile(file, source);
+  const visit = node => {
+    if (
+      ts.isImportDeclaration(node) &&
+      importDeclarationHasRuntimeValue(node) &&
+      ts.isStringLiteralLike(node.moduleSpecifier)
+    ) {
+      specifiers.add(node.moduleSpecifier.text);
+    } else if (
+      ts.isExportDeclaration(node) &&
+      exportDeclarationHasRuntimeValue(node) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteralLike(node.moduleSpecifier)
+    ) {
+      specifiers.add(node.moduleSpecifier.text);
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      !node.isTypeOnly &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      node.moduleReference.expression &&
+      ts.isStringLiteralLike(node.moduleReference.expression)
+    ) {
+      specifiers.add(node.moduleReference.expression.text);
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require')) &&
+      node.arguments.length >= 1 &&
+      ts.isStringLiteralLike(node.arguments[0])
+    ) {
+      specifiers.add(node.arguments[0].text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return specifiers;
+}
+
+function loadCompilerOptions() {
+  const fallback = {
+    allowJs: true,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    resolveJsonModule: true,
+  };
+  const configPath = ts.findConfigFile(path.dirname(path.resolve(entryFile)), ts.sys.fileExists, 'tsconfig.json');
+  if (!configPath) return fallback;
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
+  return {
+    ...fallback,
+    ...ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options,
+  };
+}
+
+const compilerOptions = loadCompilerOptions();
+
+function resolveLocalImport(importer, specifier, failOnUnresolved) {
+  if (!specifier.startsWith('.')) return undefined;
+  const resolved = ts.resolveModuleName(specifier, importer, compilerOptions, ts.sys).resolvedModule;
+  if (!resolved) {
+    if (failOnUnresolved) throw new Error(`Cannot resolve local test dependency ${specifier} from ${importer}`);
+    return undefined;
+  }
+  const resolvedFile = path.resolve(resolved.resolvedFileName);
+  repositoryPath(resolvedFile);
+  return resolvedFile;
+}
+
+const baseSourceCache = new Map();
+function readBaseSource(file) {
+  const relative = repositoryPath(file);
+  if (baseSourceCache.has(relative)) return baseSourceCache.get(relative);
+  let source;
+  try {
+    source = execFileSync('git', ['show', `${baseSha}:${relative}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    source = undefined;
+  }
+  baseSourceCache.set(relative, source);
+  return source;
+}
+
+function collectGraph(readSource, failOnUnresolved) {
+  const entry = path.resolve(entryFile);
+  const queue = [entry];
+  const visited = new Set();
+  while (queue.length > 0) {
+    const file = queue.shift();
+    const relative = repositoryPath(file);
+    if (visited.has(relative)) continue;
+    const source = readSource(file);
+    if (source === undefined) continue;
+    visited.add(relative);
+    for (const specifier of runtimeModuleSpecifiers(file, source)) {
+      const dependency = resolveLocalImport(file, specifier, failOnUnresolved);
+      if (dependency) queue.push(dependency);
+    }
+  }
+  return visited;
+}
+
+const headGraph = collectGraph(file => fs.readFileSync(file, 'utf8'), true);
+const baseGraph = collectGraph(readBaseSource, false);
+const surface = new Set(
+  [...headGraph].filter(file => file === entryFile || changedFiles.has(file) || !baseGraph.has(file)),
+);
+surface.add(entryFile);
+
+const bannedMastraPackages = new Set([
+  'astra',
+  'chroma',
+  'clickhouse',
+  'cloudflare',
+  'cloudflare-d1',
+  'convex',
+  'couchbase',
+  'dsql',
+  'duckdb',
+  'dynamodb',
+  'elasticsearch',
+  'lance',
+  'libsql',
+  'mongodb',
+  'mssql',
+  'mysql',
+  'opensearch',
+  'pg',
+  'pinecone',
+  'qdrant',
+  'redis',
+  's3vectors',
+  'spanner',
+  'turbopuffer',
+  'upstash',
+  'vectorize',
+]);
+const bannedBuiltins = new Set([
+  'child_process',
+  'cluster',
+  'dgram',
+  'dns',
+  'http',
+  'http2',
+  'https',
+  'net',
+  'tls',
+  'worker_threads',
+]);
+
+function unsupportedModuleReason(specifier) {
+  if (specifier === '@playwright/test' || specifier === 'testcontainers') return specifier;
+  if (specifier.startsWith('@ai-sdk/')) return specifier;
+  if (specifier === '@anthropic-ai/sdk' || specifier === '@google/generative-ai') return specifier;
+  if (specifier === 'ollama' || specifier === 'openai') return specifier;
+  if (specifier.startsWith('@mastra/')) {
+    const packageName = specifier.slice('@mastra/'.length).split('/')[0];
+    if (bannedMastraPackages.has(packageName)) return specifier;
+  }
+  const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
+  if (bannedBuiltins.has(bareSpecifier.split('/')[0])) return specifier;
+  return undefined;
+}
+
+function propertyName(node) {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node) && node.argumentExpression && ts.isStringLiteralLike(node.argumentExpression)) {
+    return node.argumentExpression.text;
+  }
+  return undefined;
+}
+
+function unsupportedRuntimeReasons(file, source) {
+  const reasons = new Set();
+  for (const specifier of runtimeModuleSpecifiers(file, source)) {
+    const reason = unsupportedModuleReason(specifier);
+    if (reason) reasons.add(`module ${reason}`);
+  }
+  const parsed = sourceFile(file, source);
+  const visit = node => {
+    if (
+      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'process' &&
+      propertyName(node) === 'env'
+    ) {
+      reasons.add('process.env');
+    }
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const expression = node.expression;
+      const name = ts.isIdentifier(expression)
+        ? expression.text
+        : ts.isPropertyAccessExpression(expression)
+          ? expression.name.text
+          : undefined;
+      if (name === 'fetch' || name === 'WebSocket') reasons.add(`${name}()`);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return reasons;
+}
+
+if (mode === 'surface') {
+  process.stdout.write([...surface].sort().join('\n'));
+} else if (mode === 'unsupported') {
+  const findings = [];
+  for (const file of [...surface].sort()) {
+    const absoluteFile = path.resolve(file);
+    for (const reason of unsupportedRuntimeReasons(absoluteFile, fs.readFileSync(absoluteFile, 'utf8'))) {
+      findings.push(`${file}: ${reason}`);
+    }
+  }
+  process.stdout.write(findings.join('\n'));
+} else {
+  throw new Error(`Unknown test-runtime analysis mode: ${mode}`);
+}
+NODE
+}
+
+list_test_runtime_surface() {
+  analyze_test_runtime_surface surface "$1"
+}
+
+test_runtime_surface_has_unsupported_runtime() {
+  local file="$1"
+  local findings=""
+
+  if ! findings="$(analyze_test_runtime_surface unsupported "$file")"; then
+    echo "Could not inspect the local runtime dependency surface for test: $file" >&2
+    return 0
+  fi
+  if [[ -n "$findings" ]]; then
+    echo "Unsupported fork-test runtime surface for $file:" >&2
+    printf '%s\n' "$findings" >&2
+    return 0
+  fi
+  return 1
 }
 
 mapfile -t detected_tests < <(
@@ -605,12 +1134,37 @@ mapfile -t detected_tests < <(
   done < "$changed_files"
 )
 
+# A changed or newly reachable local dependency of an exact-path exception
+# changes the runtime contract of that test even when the test file is untouched.
+for explicit_test in \
+  packages/core/src/harness/v1/session.real-agent.e2e.test.ts \
+  packages/server/src/server/handlers/favorites.integration.test.ts; do
+  [[ -f "$explicit_test" ]] || continue
+  if surface="$(list_test_runtime_surface "$explicit_test")"; then
+    while IFS= read -r source_file; do
+      if grep -Fxq "$source_file" "$changed_files"; then
+        detected_tests+=("$explicit_test")
+        break
+      fi
+    done <<< "$surface"
+  else
+    printf '%s\n' "$explicit_test" >> "$unsupported_tests"
+  fi
+done
+
+if (( ${#detected_tests[@]} > 0 )); then
+  mapfile -t detected_tests < <(printf '%s\n' "${detected_tests[@]}" | sort -u)
+fi
+
 if (( ${#detected_tests[@]} > 0 )); then
   for file in "${detected_tests[@]}"; do
     if [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$delegated_docs_tests"
     elif is_explicit_fork_safe_test "$file" &&
-      explicit_fork_safe_test_has_unsupported_runtime "$file"; then
+      test_runtime_surface_has_unsupported_runtime "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == packages/server/* ]] &&
+      test_runtime_surface_has_unsupported_runtime "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == packages/core/src/harness/v1/session.real-agent.e2e.test.ts ]]; then
       # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
