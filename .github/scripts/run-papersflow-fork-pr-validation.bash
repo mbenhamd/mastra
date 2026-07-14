@@ -1721,20 +1721,27 @@ if workspace_changed packages/server; then
     run_with_validation_budget 600 \
       pnpm --dir packages/server exec vitest run src/server/server-adapter/routes/permissions.test.ts --reporter=dot
   fi
-  run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
-  run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
-  # Compare generator output against the immutable PR head, not the mutable
-  # index or a movable HEAD: a PR-controlled generator could stage or commit
-  # its own output and pass an index-relative diff without that content being
-  # part of the reviewed head commit.
-  if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
-    echo "Validation checkout no longer matches the pull request head commit ${HEAD_SHA}." >&2
-    echo "A generator or package script moved HEAD; failing closed." >&2
+  # Anchor artifact freshness to the commit the workflow checked out. In CI
+  # that is the pull_request merge commit, whose second parent must be the PR
+  # head; local and fixture runs check out the head directly. Capturing the
+  # anchor before the generators run means a PR-controlled generator that
+  # stages or commits its own output still diffs against reviewed content.
+  server_artifact_anchor="$(git rev-parse HEAD)"
+  if [[ "$server_artifact_anchor" != "$HEAD_SHA" && \
+    "$(git rev-parse --quiet --verify 'HEAD^2' 2>/dev/null || true)" != "$HEAD_SHA" ]]; then
+    echo "Validation checkout matches neither the pull request head ${HEAD_SHA} nor a merge of it." >&2
+    echo "Failing closed instead of validating unreviewed content." >&2
     exit 1
   fi
-  if ! git cat-file -e "${HEAD_SHA}:client-sdks/client-js/src/route-types.generated.ts" 2>/dev/null || \
-    ! git cat-file -e "${HEAD_SHA}:packages/cli/src/commands/api/route-metadata.generated.ts" 2>/dev/null || \
-    ! git diff --exit-code "$HEAD_SHA" -- \
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
+  if [[ "$(git rev-parse HEAD)" != "$server_artifact_anchor" ]]; then
+    echo "A generator or package script moved HEAD during Server validation; failing closed." >&2
+    exit 1
+  fi
+  if ! git cat-file -e "${server_artifact_anchor}:client-sdks/client-js/src/route-types.generated.ts" 2>/dev/null || \
+    ! git cat-file -e "${server_artifact_anchor}:packages/cli/src/commands/api/route-metadata.generated.ts" 2>/dev/null || \
+    ! git diff --exit-code "$server_artifact_anchor" -- \
       client-sdks/client-js/src/route-types.generated.ts \
       packages/cli/src/commands/api/route-metadata.generated.ts; then
     echo "Generated Server route artifacts are stale or missing from the pull request." >&2
