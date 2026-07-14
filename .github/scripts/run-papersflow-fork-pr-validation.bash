@@ -800,6 +800,115 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 
 
+run_stagehand_validation_self_test() {
+  local script_path test_root test_repo stub_bin command_log base_sha head_sha deleted_test_sha deletion_log
+  local restored_test_sha renamed_test_sha rename_log
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  test_repo="$test_root/repo"
+  stub_bin="$test_root/bin"
+  command_log="$test_root/commands.log"
+  trap 'rm -rf "$test_root"' RETURN
+
+  mkdir -p "$test_repo/browser/stagehand/src/__tests__" "$test_repo/packages/core/src" "$stub_bin"
+  cat > "$stub_bin/pnpm" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${VALIDATION_COMMAND_LOG:?}"
+
+if [[ "$*" == *'--dir packages/core exec vitest list '* ]]; then
+  test_file="${!#}"
+  absolute_file="$(pwd)/packages/core/$test_file"
+  if [[ "$*" == *'duplicate leaf$'* ]]; then
+    printf '[{"name":"passing sibling > duplicate leaf","file":"%s"},{"name":"second sibling > duplicate leaf","file":"%s"}]\n' \
+      "$absolute_file" "$absolute_file"
+  else
+    printf '[{"name":"outer suite > inner suite > unique nested case","file":"%s"}]\n' "$absolute_file"
+  fi
+  exit 0
+fi
+
+if [[ "$*" == *'--dir packages/core exec vitest run '* ]]; then
+  test_file="${!#}"
+  absolute_file="$(pwd)/packages/core/$test_file"
+  output_file=''
+  for argument in "$@"; do
+    if [[ "$argument" == --outputFile.json=* ]]; then
+      output_file="${argument#--outputFile.json=}"
+    fi
+  done
+  : "${output_file:?Vitest JSON output path is required}"
+  printf '{"numPassedTests":1,"numFailedTests":0,"testResults":[{"name":"%s","assertionResults":[{"status":"passed","ancestorTitles":["outer suite","inner suite"],"title":"unique nested case"}]}]}\n' \
+    "$absolute_file" > "$output_file"
+fi
+STUB
+  chmod +x "$stub_bin/pnpm"
+
+  git -C "$test_repo" init --quiet
+  git -C "$test_repo" config user.email validator@example.invalid
+  git -C "$test_repo" config user.name 'Fork validator self-test'
+  printf '{"name":"@mastra/stagehand"}\n' > "$test_repo/browser/stagehand/package.json"
+  printf '{"name":"@mastra/core"}\n' > "$test_repo/packages/core/package.json"
+  printf 'export type BrowserConfig = {}\n' > "$test_repo/browser/stagehand/src/types.ts"
+  printf 'export {}\n' > "$test_repo/browser/stagehand/src/__tests__/profile-lifecycle.test.ts"
+  git -C "$test_repo" add .
+  git -C "$test_repo" commit --quiet -m base
+  base_sha="$(git -C "$test_repo" rev-parse HEAD)"
+  printf 'export type BrowserConfig = { recording?: boolean }\n' > "$test_repo/browser/stagehand/src/types.ts"
+  git -C "$test_repo" commit --quiet -am head
+  head_sha="$(git -C "$test_repo" rev-parse HEAD)"
+
+  (
+    cd "$test_repo"
+    PATH="$stub_bin:$PATH" VALIDATION_COMMAND_LOG="$command_log" BASE_SHA="$base_sha" HEAD_SHA="$head_sha" \
+      bash "$script_path"
+  )
+
+  grep -Fx -- 'build:core' "$command_log"
+  grep -Fx -- '--filter ./browser/stagehand --fail-if-no-match build' "$command_log"
+  grep -Fx -- '--filter ./browser/stagehand --fail-if-no-match lint' "$command_log"
+  grep -Fx -- \
+    '--dir browser/stagehand exec vitest run --reporter=dot --exclude src/__tests__/profile-lifecycle.test.ts' \
+    "$command_log"
+
+  rm "$test_repo/browser/stagehand/src/__tests__/profile-lifecycle.test.ts"
+  git -C "$test_repo" commit --quiet -am 'delete browser-dependent test'
+  deleted_test_sha="$(git -C "$test_repo" rev-parse HEAD)"
+  deletion_log="$test_root/deletion.log"
+  if (
+    cd "$test_repo"
+    PATH="$stub_bin:$PATH" VALIDATION_COMMAND_LOG="$command_log" BASE_SHA="$head_sha" HEAD_SHA="$deleted_test_sha" \
+      bash "$script_path"
+  ) 2> "$deletion_log"; then
+    echo 'Stagehand fork validation accepted deletion of profile-lifecycle.test.ts.' >&2
+    return 1
+  fi
+  grep -Fx -- 'browser/stagehand/src/__tests__/profile-lifecycle.test.ts' "$deletion_log"
+  grep -F -- 'Failing closed instead of' "$deletion_log"
+
+  printf 'export {}\n' > "$test_repo/browser/stagehand/src/__tests__/profile-lifecycle.test.ts"
+  git -C "$test_repo" add browser/stagehand/src/__tests__/profile-lifecycle.test.ts
+  git -C "$test_repo" commit --quiet -m 'restore browser-dependent test'
+  restored_test_sha="$(git -C "$test_repo" rev-parse HEAD)"
+  git -C "$test_repo" mv \
+    browser/stagehand/src/__tests__/profile-lifecycle.test.ts \
+    browser/stagehand/src/profile-lifecycle.ts
+  git -C "$test_repo" commit --quiet -m 'rename browser-dependent test'
+  renamed_test_sha="$(git -C "$test_repo" rev-parse HEAD)"
+  rename_log="$test_root/rename.log"
+  if (
+    cd "$test_repo"
+    PATH="$stub_bin:$PATH" VALIDATION_COMMAND_LOG="$command_log" \
+      BASE_SHA="$restored_test_sha" HEAD_SHA="$renamed_test_sha" bash "$script_path"
+  ) 2> "$rename_log"; then
+    echo 'Stagehand fork validation accepted renaming profile-lifecycle.test.ts.' >&2
+    return 1
+  fi
+  grep -Fx -- 'browser/stagehand/src/__tests__/profile-lifecycle.test.ts' "$rename_log"
+  grep -F -- 'Failing closed instead of' "$rename_log"
+  echo 'Stagehand fork-validation self-test passed.'
+}
+
 validation_started_at=$SECONDS
 validation_budget_seconds=$((50 * 60))
 validation_reserve_seconds=120
@@ -1046,6 +1155,10 @@ TEST
 )
 
 case "${1:-}" in
+  --self-test-stagehand)
+    run_stagehand_validation_self_test
+    exit
+    ;;
   --self-test-vitest-selection)
     run_vitest_selection_regressions
     exit
@@ -1147,7 +1260,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | stores/_test-utils | stores/pg | stores/redis | mastracode | docs) ;;
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
@@ -1503,6 +1616,13 @@ fi
 if workspace_changed auth/okta; then
   run_with_validation_budget 900 pnpm --filter ./auth/okta --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter ./auth/okta --fail-if-no-match lint
+fi
+
+if workspace_changed browser/stagehand; then
+  run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./browser/stagehand --fail-if-no-match lint
+  run_with_validation_budget 900 pnpm --dir browser/stagehand exec vitest run \
+    --reporter=dot --exclude src/__tests__/profile-lifecycle.test.ts
 fi
 
 if workspace_changed packages/_internal-core; then
@@ -2071,9 +2191,10 @@ test_runtime_surface_has_unsupported_runtime() {
 
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
-    if [[ -f "$file" ]] && grep -Eq \
-      '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' \
-      <<< "$file"; then
+    if [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]] ||
+      { [[ -f "$file" ]] && grep -Eq \
+        '\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$|\.test-d\.ts$' \
+        <<< "$file"; }; then
       printf '%s\n' "$file"
     fi
   done < "$changed_files"
@@ -2121,6 +2242,8 @@ if (( ${#detected_tests[@]} > 0 )); then
       # exercises real route handlers against InMemoryStore without credentials,
       # provider calls, containers, or other external infrastructure.
       printf '%s\n' "$file" >> "$changed_tests"
+    elif [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]]; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
       "$file" == mastracode/e2e/* || \
       "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || \

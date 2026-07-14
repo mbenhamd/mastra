@@ -28,7 +28,7 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   stacked feature PR to prove a new trusted-base validation target before that
   policy branch reaches `main`.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
-  runs explicit affected-package checks for Okta Auth, Internal Core, CLI,
+  runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
   PostgreSQL, and Redis, and
   executes each supported changed Vitest file in full. The stateful Core Agent
@@ -102,6 +102,12 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   a dedicated fork-safe workflow provides their required setup.
   Store-provider tests other than the provisioned PostgreSQL and Redis suites
   fail closed for the same reason.
+- Stagehand changes build and lint the package, then run its browser-independent
+  Vitest suite. The `profile-lifecycle` test remains fail-closed because it
+  requires a configured Chrome executable; changing, deleting, or renaming that test requires a
+  dedicated browser-capable validation lane. Maintainers can exercise the
+  workspace classification and command selection locally with
+  `.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-stagehand`.
 - Actual `mastracode/**` changes build the GitHub Signals test prerequisite,
   run changed-file ESLint, and execute the PF-1878 login-dialog, event-dispatch,
   and notification Vitest files in full. Each of those three production files
