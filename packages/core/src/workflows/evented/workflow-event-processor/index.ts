@@ -3010,7 +3010,7 @@ export class WorkflowEventProcessor extends EventProcessor {
    * - `ok: false, retry: true` — transient failure, the transport should
    *   nack/redeliver (or, for HTTP push, return 5xx so the broker retries).
    * - `ok: false, retry: false` — terminal/poison failure, the transport
-   *   should drop the event (or return 4xx for HTTP push).
+   *   should acknowledge the event without redelivery.
    */
   async handle(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
     const data = event.data as { workflowId?: unknown; runId?: unknown } | undefined;
@@ -3028,7 +3028,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       // different worker or a new process receives the event because the broker
       // carries `deliveryAttempt` with the logical event.
       if (event.type !== 'workflow.fail' && deliveryAttempt > WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS) {
-        return this.#publishTerminalFailure(
+        return await this.#publishTerminalFailure(
           event,
           deliveryAttempt,
           new MastraError({
@@ -3064,7 +3064,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         return { ok: false, retry: true };
       }
 
-      return this.#publishTerminalFailure(event, deliveryAttempt, getErrorFromUnknown(err));
+      return await this.#publishTerminalFailure(event, deliveryAttempt, getErrorFromUnknown(err));
     } finally {
       if (internalEventGeneration !== undefined) {
         this.mastra.__endInternalWorkflowEvent(workflowId!, runId!, internalEventGeneration, terminalEventHandled);
@@ -3187,7 +3187,7 @@ export class WorkflowEventProcessor extends EventProcessor {
    */
   async process(event: Event, ack?: () => Promise<void>) {
     const result = await this.handle(event);
-    if (result.ok) {
+    if (result.ok || !result.retry) {
       try {
         await ack?.();
       } catch (e) {
