@@ -59,9 +59,23 @@ jobs:
           cache: true
           cache_dependency_path: pnpm-lock.yaml
 
+      - name: Resolve trusted base
+        id: trusted-base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # github.event.pull_request.base.sha is pinned when the PR is opened
+          # and goes stale as the base branch advances, so validator and policy
+          # upgrades on the protected base never reach already-open PRs.
+          # Resolve the CURRENT protected-base tip instead: it is exactly as
+          # trusted (same protected ref) and strictly fresher, and it matches
+          # the merge commit this workflow actually checks out.
+          git fetch --no-tags origin "${BASE_REF}"
+          echo "sha=$(git rev-parse "origin/${BASE_REF}")" >> "$GITHUB_OUTPUT"
+
       - name: Reject dependency-graph changes before install
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # pnpm install executes lifecycle scripts resolved from PR-controlled
@@ -99,7 +113,7 @@ jobs:
 
       - name: Validate fork PR
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
