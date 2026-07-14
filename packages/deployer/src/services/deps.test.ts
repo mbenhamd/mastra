@@ -84,6 +84,31 @@ describe('Deps process arguments', () => {
     });
   });
 
+  it('does not expose home or private-registry credentials to pack lifecycle scripts', async () => {
+    vi.stubEnv('HOME', '/home/mastra');
+    vi.stubEnv('USERPROFILE', String.raw`C:\Users\mastra`);
+    vi.stubEnv('HTTPS_PROXY', 'https://proxy.example.com');
+    vi.stubEnv('NPM_TOKEN', 'test-npm-token');
+    vi.stubEnv('NODE_AUTH_TOKEN', 'test-node-auth-token');
+    vi.stubEnv('YARN_NPM_AUTH_TOKEN', 'test-yarn-token');
+    vi.stubEnv('npm_config_registry', 'https://registry.example.com');
+    vi.stubEnv('npm_config_//registry.example.com/:_authToken', 'test-private-registry-token');
+    const { deps, root } = await createDeps('npm');
+
+    await deps.pack({ dir: root, destination: 'output', sanitizedName: '' });
+
+    const env = mocks.runProcess.mock.calls[0]?.[0].env;
+    expect(env).toEqual(expect.objectContaining({ PATH: process.env.PATH }));
+    expect(env).not.toHaveProperty('HOME');
+    expect(env).not.toHaveProperty('USERPROFILE');
+    expect(env).not.toHaveProperty('HTTPS_PROXY');
+    expect(env).not.toHaveProperty('NPM_TOKEN');
+    expect(env).not.toHaveProperty('NODE_AUTH_TOKEN');
+    expect(env).not.toHaveProperty('YARN_NPM_AUTH_TOKEN');
+    expect(env).not.toHaveProperty('npm_config_registry');
+    expect(env).not.toHaveProperty('npm_config_//registry.example.com/:_authToken');
+  });
+
   it('preserves home, proxy, and private-registry package-manager configuration', async () => {
     vi.stubEnv('HOME', '/home/mastra');
     vi.stubEnv('HTTPS_PROXY', 'https://proxy.example.com');

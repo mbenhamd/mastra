@@ -1,7 +1,6 @@
 import { win32 } from 'node:path';
 import { Writable } from 'node:stream';
 import type { IMastraLogger } from '@mastra/core/logger';
-import { execa } from 'execa';
 import { onExit } from 'signal-exit';
 
 const PACKAGE_MANAGER_TIMEOUT_MS = 15 * 60_000;
@@ -51,6 +50,7 @@ async function killProcessTree(subprocess: KillableSubprocess, signal: NodeJS.Si
 
   if (process.platform === 'win32') {
     try {
+      const { execa } = await import('execa');
       const result = await execa(getTaskkillPath(), ['/T', '/F', '/PID', String(pid)], {
         reject: false,
         stdio: 'ignore',
@@ -187,6 +187,7 @@ export function createChildProcessLogger({
     };
     let removeExitCleanup = () => {};
     try {
+      const { execa } = await import('execa');
       const subprocess = execa(cmd, args, {
         ...(root ? { cwd: root } : {}),
         env,

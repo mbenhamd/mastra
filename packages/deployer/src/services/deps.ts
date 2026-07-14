@@ -10,12 +10,9 @@ import { createChildProcessLogger } from '../deploy/log.js';
 
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
-const PROCESS_BOOTSTRAP_ENV_KEYS = [
-  'PATH',
-  'SystemRoot',
-  'ComSpec',
-  'PATHEXT',
-  'WINDIR',
+const PROCESS_BOOTSTRAP_ENV_KEYS = ['PATH', 'SystemRoot', 'ComSpec', 'PATHEXT', 'WINDIR'] as const;
+
+const PACKAGE_MANAGER_REGISTRY_ENV_KEYS = [
   'HOME',
   'USERPROFILE',
   'HOMEDRIVE',
@@ -70,9 +67,18 @@ function isPackageManagerNetworkOrAuthConfig(key: string): boolean {
   );
 }
 
-function getProcessBootstrapEnv(): Record<string, string> {
+function getProcessBootstrapEnv({ registryAccess = true }: { registryAccess?: boolean } = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of PROCESS_BOOTSTRAP_ENV_KEYS) {
+    const value = process.env[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  if (!registryAccess) {
+    return env;
+  }
+  for (const key of PACKAGE_MANAGER_REGISTRY_ENV_KEYS) {
     const value = process.env[key];
     if (value) {
       env[key] = value;
@@ -175,7 +181,7 @@ export class Deps extends MastraBase {
     return cpLogger({
       cmd: this.packageManager,
       args,
-      env: getProcessBootstrapEnv(),
+      env: getProcessBootstrapEnv({ registryAccess: false }),
     });
   }
 
