@@ -3,7 +3,7 @@
  */
 
 import type { ModelConfiguration as StagehandModelConfiguration } from '@browserbasehq/stagehand';
-import type { BrowserConfig as BaseBrowserConfig } from '@mastra/core/browser';
+import type { BrowserConfig as BaseBrowserConfig, BrowserRecordingOptions } from '@mastra/core/browser';
 import type { StagehandToolName } from './tools/constants';
 
 /**
