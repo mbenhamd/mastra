@@ -21,6 +21,7 @@ import {
   StreamErrorRetryProcessor,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
+import { TaskSignalProvider } from '@mastra/core/signals';
 import { InMemoryDB, InMemoryHarness, MastraCompositeStore } from '@mastra/core/storage';
 import { DuckDBStore } from '@mastra/duckdb';
 
@@ -55,7 +56,6 @@ import { getDynamicWorkspace, getGoalJudgeTools } from './agents/workspace.js';
 import { AuthStorage } from './auth/storage.js';
 import { DEFAULT_CONFIG_DIR, validateConfigDirName } from './constants.js';
 import { createOutcomeScorer, createEfficiencyScorer } from './evals/scorers/index.js';
-import { GithubSignals } from './github-signals/index.js';
 import { createHarnessV1SubagentAgents, MastraCodeHarnessRuntime } from './harness/index.js';
 import { HookManager } from './hooks/index.js';
 import { createMcpManager } from './mcp/index.js';
