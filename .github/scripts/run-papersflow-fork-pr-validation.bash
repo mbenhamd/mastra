@@ -209,6 +209,11 @@ if (( ${#detected_tests[@]} > 0 )); then
   for file in "${detected_tests[@]}"; do
     if [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$delegated_docs_tests"
+    elif [[ "$file" == packages/core/src/harness/v1/session.real-agent.e2e.test.ts ]]; then
+      # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
+      # language model and InMemoryStore and requires no provider credentials or
+      # external service beyond the standard Core test environment.
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
       "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]] || \
       grep -Eq "['\"]@playwright/test['\"]" "$file"; then

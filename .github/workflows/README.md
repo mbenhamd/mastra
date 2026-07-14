@@ -47,10 +47,12 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   validation is available. Non-workspace changes must match the explicit
   CI-rollout or changeset-metadata allowlist; other root paths fail closed.
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
-  Other Playwright files, `e2e-tests/**`, nested integration-test packages,
-  integration-test filename variants, explicit provider E2E files, and
-  PostgreSQL pooler/performance suites fail closed until a dedicated fork-safe
-  workflow provides their required setup.
+  The deterministic, in-process Core Harness real-agent E2E suite is explicitly
+  allowlisted and runs through Vitest because it uses a mock language model and
+  `InMemoryStore`. Other Playwright files, `e2e-tests/**`, nested
+  integration-test packages, integration-test filename variants, explicit
+  provider E2E files, and PostgreSQL pooler/performance suites fail closed until
+  a dedicated fork-safe workflow provides their required setup.
   Store-provider tests other than the provisioned PostgreSQL and Redis suites
   fail closed for the same reason.
 - Actual `mastracode/**` changes run the MastraCode build and E2E suite in the
