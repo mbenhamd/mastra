@@ -23,6 +23,7 @@ run_validator_self_tests() {
   mkdir -p \
     "$fixture_repo/client-sdks/client-js/src" \
     "$fixture_repo/packages/cli/src/commands/api" \
+    "$fixture_repo/packages/core/src/harness/v1" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
     "$mock_bin"
@@ -37,8 +38,16 @@ run_validator_self_tests() {
     'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
     'fi' \
+    'if [[ " $* " == *" generate:route-types "* && ! -f client-sdks/client-js/src/route-types.generated.ts ]]; then' \
+    '  mkdir -p client-sdks/client-js/src' \
+    '  printf '\''%s\n'\'' "export const routeTypes = '\''regenerated'\'';" > client-sdks/client-js/src/route-types.generated.ts' \
+    'fi' \
     'if [[ " $* " == *" generate:api-cli-route-metadata "* && "${MOCK_STALE_CLI_METADATA:-0}" == 1 ]]; then' \
     '  printf '\''%s\n'\'' "// regenerated" >> packages/cli/src/commands/api/route-metadata.generated.ts' \
+    'fi' \
+    'if [[ " $* " == *" generate:api-cli-route-metadata "* && ! -f packages/cli/src/commands/api/route-metadata.generated.ts ]]; then' \
+    '  mkdir -p packages/cli/src/commands/api' \
+    '  printf '\''%s\n'\'' "export const routeMetadata = '\''regenerated'\'';" > packages/cli/src/commands/api/route-metadata.generated.ts' \
     'fi' \
     'for argument in "$@"; do' \
     '  case "$argument" in' \
@@ -54,6 +63,10 @@ run_validator_self_tests() {
     git config user.email validator@example.test
     git config user.name 'Fork validator fixture'
     printf '%s\n' '{}' > package.json
+    printf '%s\n' '{}' > client-sdks/client-js/package.json
+    printf '%s\n' '{}' > packages/cli/package.json
+    printf '%s\n' '{}' > packages/core/package.json
+    printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
     printf '%s\n' '{}' > packages/server/package.json
     printf '%s\n' 'export default {};' > packages/server/vitest.config.ts
     printf '%s\n' "export const route = 'base';" > packages/server/src/server/server-adapter/routes/index.ts
@@ -61,6 +74,8 @@ run_validator_self_tests() {
     printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
     printf '%s\n' "import { it } from 'vitest';" "it('favorites', () => {});" \
       > packages/server/src/server/handlers/favorites.integration.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('harness', () => {});" \
+      > packages/core/src/harness/v1/session.real-agent.e2e.test.ts
     printf '%s\n' "import { it } from 'vitest';" "it('external', () => {});" \
       > packages/server/src/server/handlers/external.integration.test.ts
     git add .
@@ -148,6 +163,141 @@ run_validator_self_tests() {
     cat "$output" >&2
     exit 1
   fi
+  assert_contains 'Generated Server route artifacts are stale or missing from the pull request.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "export const routeTypes = 'head';" > client-sdks/client-js/src/route-types.generated.ts
+    git add .
+    git commit -q -m 'generated route types only'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/generated-route-types-only.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'packages/server' "$output"
+  assert_contains '--filter @mastra/server generate:route-types' "$command_log"
+  assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "export const routeMetadata = 'head';" > packages/cli/src/commands/api/route-metadata.generated.ts
+    git add .
+    git commit -q -m 'generated CLI metadata only'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/generated-cli-metadata-only.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'packages/server' "$output"
+  assert_contains '--filter @mastra/server generate:route-types' "$command_log"
+  assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    git rm -q client-sdks/client-js/src/route-types.generated.ts
+    git commit -q -m 'delete generated route types'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/deleted-route-types.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Deleted generated route types fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server' "$output"
+  assert_contains 'Generated Server route artifacts are stale or missing from the pull request.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import '@playwright/test';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test require Playwright'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-playwright-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Playwright-dependent favorites fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'const providerApiKey = process.env.PROVIDER_API_KEY;' \
+      >> packages/core/src/harness/v1/session.real-agent.e2e.test.ts
+    git add .
+    git commit -q -m 'make Harness test require provider credentials'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/harness-provider-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Provider-dependent Harness fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/harness/v1/session.real-agent.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('harness update', () => {});" \
+      >> packages/core/src/harness/v1/session.real-agent.e2e.test.ts
+    git add .
+    git commit -q -m 'safe Harness E2E change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/harness-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains \
+    'Running changed test file in full: packages/core/src/harness/v1/session.real-agent.e2e.test.ts' \
+    "$output"
+  assert_contains 'src/harness/v1/session.real-agent.e2e.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    git rm -q packages/cli/src/commands/api/route-metadata.generated.ts
+    git commit -q -m 'delete generated CLI metadata'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/deleted-cli-metadata.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Deleted generated CLI metadata fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server' "$output"
   assert_contains 'Generated Server route artifacts are stale or missing from the pull request.' "$output"
 
   head_sha="$(
@@ -420,6 +570,31 @@ if workspace_changed mastracode; then
   run_with_validation_budget 1200 pnpm --filter ./mastracode run e2e:test -- --reporter=dot
 fi
 
+is_explicit_fork_safe_test() {
+  case "$1" in
+    packages/core/src/harness/v1/session.real-agent.e2e.test.ts | \
+      packages/server/src/server/handlers/favorites.integration.test.ts) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+explicit_fork_safe_test_has_unsupported_runtime() {
+  local file="$1"
+
+  # Exact-path exceptions remain conditional on their reviewed in-process
+  # contract. Fail closed before the filename exception if a later edit adds a
+  # browser runner, credentials, external provider/storage packages, or direct
+  # network/process primitives.
+  grep -Fq 'process.env' "$file" ||
+    grep -Eq \
+      "['\"](@playwright/test|testcontainers|@ai-sdk/[^'\"]+|@anthropic-ai/sdk|@google/generative-ai|@mastra/(astra|chroma|clickhouse|cloudflare|cloudflare-d1|convex|couchbase|dsql|duckdb|dynamodb|elasticsearch|lance|libsql|mongodb|mssql|mysql|opensearch|pg|pinecone|qdrant|redis|s3vectors|spanner|turbopuffer|upstash|vectorize)(/[^'\"]*)?|node:(child_process|dns|http|https|net|tls)(/[^'\"]*)?)['\"]" \
+      "$file" ||
+    grep -Eq \
+      "(from[[:space:]]+|import[[:space:]]+|import[[:space:]]*\\(|require[[:space:]]*\\()[[:space:]]*['\"](ollama|openai)['\"]" \
+      "$file" ||
+    grep -Eq '(^|[^[:alnum:]_])(fetch|WebSocket)[[:space:]]*\(' "$file"
+}
+
 mapfile -t detected_tests < <(
   while IFS= read -r file; do
     if [[ -f "$file" ]] && grep -Eq \
@@ -434,6 +609,9 @@ if (( ${#detected_tests[@]} > 0 )); then
   for file in "${detected_tests[@]}"; do
     if [[ "$file" == docs/* ]] && grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$delegated_docs_tests"
+    elif is_explicit_fork_safe_test "$file" &&
+      explicit_fork_safe_test_has_unsupported_runtime "$file"; then
+      printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == packages/core/src/harness/v1/session.real-agent.e2e.test.ts ]]; then
       # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
       # language model and InMemoryStore and requires no provider credentials or

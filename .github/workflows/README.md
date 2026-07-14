@@ -57,7 +57,11 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   allowlisted and runs through Vitest because it uses a mock language model and
   `InMemoryStore`. The exact Server favorites integration suite is also
   allowlisted because it exercises route handlers exclusively against
-  `InMemoryStore`; other integration-named Server tests remain fail-closed.
+  `InMemoryStore`. Both exact-path exceptions are content-conditioned: edits
+  that add Playwright, environment credentials, external provider or storage
+  packages, or direct network/process primitives fail closed before the path
+  exception is considered. Other integration-named Server tests remain
+  fail-closed.
   Other Playwright files, `e2e-tests/**`, nested
   integration-test packages, integration-test filename variants, explicit
   provider E2E files, and PostgreSQL pooler/performance suites fail closed until
@@ -87,9 +91,11 @@ or command plan:
 ```
 
 The fixtures use an isolated temporary Git repository and mocked package
-commands. They prove Server permission and route-generation selection, reject
-stale generated output, run the exact fork-safe favorites integration test, and
-keep other integration-named tests fail-closed.
+commands. They prove Server permission and route-generation selection, map
+each generated artifact back to Server even when it is the only changed file,
+reject stale or deleted generated output, run the exact fork-safe favorites
+integration test, reject exact-path tests that gain unsafe runtime
+requirements, and keep other integration-named tests fail-closed.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
