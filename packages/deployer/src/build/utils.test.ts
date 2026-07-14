@@ -27,6 +27,13 @@ describe('upsertMastraDir', () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  it('creates a missing .gitignore with the Mastra output rule', () => {
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('.mastra\n');
+    expect(statSync(`${directory}/.mastra`).isDirectory()).toBe(true);
+  });
+
   it('updates the supplied directory without executing a shell command', () => {
     writeFileSync(`${directory}/.gitignore`, 'dist');
 
