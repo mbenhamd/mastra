@@ -5,6 +5,7 @@ import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import { MODEL_TOKENS } from '../../../../../../docs/src/plugins/remark-model-tokens/models';
 import { MessageList } from '../../../agent/message-list';
+import { createSignal } from '../../../agent/signals';
 import { stampToolSurfaceFence } from '../../../agent/tool-surface-fence';
 import { SpanType } from '../../../observability';
 import { ProviderHistoryCompat } from '../../../processors/provider-history-compat';
@@ -1619,6 +1620,113 @@ describe('createLLMExecutionStep gateway provider tools', () => {
 
     expect(secondModelStream).toHaveBeenCalledTimes(2);
     expect(firstModelStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves fallback tool calls after an interjected primary attempt fails', async () => {
+    const responseProcessor = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('primary response processor failed'))
+      .mockResolvedValue(undefined);
+    const signal = createSignal({
+      id: 'interjected-signal',
+      type: 'user',
+      contents: 'Use the fallback result',
+    });
+    const drainPendingSignals = vi.fn().mockReturnValueOnce([]).mockReturnValueOnce([signal]).mockReturnValue([]);
+    const primaryStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'text-start', id: 'primary-text' },
+        { type: 'text-delta', id: 'primary-text', delta: 'Discarded primary response' },
+        { type: 'text-end', id: 'primary-text' },
+        { type: 'finish', finishReason: 'stop', usage: testUsage },
+      ]),
+      request: {},
+      response: { headers: undefined },
+      warnings: [],
+    }));
+    const fallbackStream = vi.fn(async () => ({
+      stream: convertArrayToReadableStream([
+        {
+          type: 'tool-call',
+          toolCallId: 'fallback-call',
+          toolName: 'echo',
+          input: '{"text":"fallback"}',
+        },
+        { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+      ]),
+      request: {},
+      response: { headers: undefined },
+      warnings: [],
+    }));
+    const tools = {
+      echo: createTool({
+        id: 'echo',
+        description: 'Echo input text',
+        inputSchema: z.object({ text: z.string() }),
+        execute: vi.fn(async ({ text }) => ({ text })),
+      }),
+    };
+
+    const llmExecutionStep = createLLMExecutionStep({
+      agentId: 'test-agent',
+      messageId: 'msg-0',
+      runId: 'test-run',
+      startTimestamp: Date.now(),
+      methodType: 'stream',
+      controller,
+      outputWriter: vi.fn(),
+      messageList,
+      inputProcessors: [{ id: 'fail-primary-response', processLLMResponse: responseProcessor }],
+      models: [
+        {
+          id: 'primary-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'primary-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: primaryStream,
+          } as any,
+        },
+        {
+          id: 'fallback-model',
+          maxRetries: 0,
+          model: {
+            specificationVersion: 'v2' as const,
+            provider: 'mock-provider',
+            modelId: 'fallback-model',
+            supportedUrls: {},
+            doGenerate: vi.fn(),
+            doStream: fallbackStream,
+          } as any,
+        },
+      ],
+      tools,
+      streamState: {
+        serialize: vi.fn(),
+        deserialize: vi.fn(),
+      },
+      _internal: {
+        generateId: () => 'generated-id',
+        drainPendingSignals,
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+        debug: vi.fn(),
+      } as any,
+    } as unknown as OuterLLMRun<typeof tools>);
+
+    const result = await llmExecutionStep.execute(createExecuteParams(createIterationInput()));
+
+    expect(primaryStream).toHaveBeenCalledTimes(1);
+    expect(fallbackStream).toHaveBeenCalledTimes(1);
+    expect(responseProcessor).toHaveBeenCalledTimes(2);
+    expect(result.output.toolCalls).toEqual([
+      expect.objectContaining({ toolCallId: 'fallback-call', toolName: 'echo' }),
+    ]);
   });
 
   it('emits a processor_run span when an error processor handles an API error', async () => {

@@ -890,6 +890,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           logger,
           activeFallbackModelIndex,
         )(async (modelConfig, isLastModel) => {
+          hadInterjectedSignals = false;
           activeFallbackModelIndex = models.findIndex(candidate => candidate.id === modelConfig.id);
           const model = modelConfig.model;
           const modelHeaders = modelConfig.headers;
