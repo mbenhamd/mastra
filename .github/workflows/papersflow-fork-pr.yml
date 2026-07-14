@@ -2,7 +2,9 @@ name: PapersFlow Fork PR Validation
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - 'ci/**'
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -56,6 +58,28 @@ jobs:
           package_json_file: package.json
           cache: true
           cache_dependency_path: pnpm-lock.yaml
+
+      - name: Reject dependency-graph changes before install
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # pnpm install executes lifecycle scripts resolved from PR-controlled
+          # manifests. Reject manifest and patch changes BEFORE any install
+          # runs, not after. pnpm-lock.yaml stays with the post-install trusted
+          # validator: pnpm 11 ignores dependency build scripts without an
+          # onlyBuiltDependencies allowlist, so a lockfile diff alone cannot
+          # execute code at install time.
+          mapfile -t manifest_changes < <(
+            git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+              package.json pnpm-workspace.yaml patches \
+              packages/server/package.json
+          )
+          if (( ${#manifest_changes[@]} > 0 )); then
+            echo "These dependency-graph changes require dedicated validation and are rejected before install:" >&2
+            printf '%s\n' "${manifest_changes[@]}" >&2
+            exit 1
+          fi
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
