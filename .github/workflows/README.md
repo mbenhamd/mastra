@@ -24,6 +24,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 
 - PR code runs only in the unprivileged `pull_request` sandbox on ephemeral
   GitHub-hosted `ubuntu-24.04` runners.
+- The validator also runs for PRs targeting `ci/**` policy branches, allowing a
+  stacked feature PR to prove a new trusted-base validation target before that
+  policy branch reaches `main`.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Internal Core, Deployer,
   MCP, Memory, Server, AI SDK, shared Storage Test Utils, PostgreSQL, and Redis, and
