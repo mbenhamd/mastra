@@ -2,8 +2,8 @@ import path from 'node:path';
 
 import { Agent } from '@mastra/core/agent';
 import type { PubSub } from '@mastra/core/events';
-import { Harness } from '@mastra/core/harness';
 import type {
+  Harness,
   HeartbeatHandler,
   HarnessConfig,
   HarnessEvent,
@@ -12,7 +12,7 @@ import type {
   HarnessRequestContext,
   Session,
 } from '@mastra/core/harness';
-import { GatewayRegistry, PROVIDER_REGISTRY } from '@mastra/core/llm';
+import { PROVIDER_REGISTRY } from '@mastra/core/llm';
 import type { ProviderConfig } from '@mastra/core/llm';
 import {
   AgentsMDInjector,
@@ -37,14 +37,14 @@ import { getDynamicInstructions } from './agents/instructions.js';
 import { getDynamicMemory } from './agents/memory.js';
 import {
   createMastraCodeGateway,
-  createMastraCodeModelCatalogProvider,
   getDynamicModel,
   getGoalJudgeModel,
   resolveModel,
 } from './agents/model.js';
-import { buildMode } from './agents/modes/build.js';
-import { fastMode } from './agents/modes/explore.js';
-import { planMode } from './agents/modes/plan.js';
+// import { createMastraCodeModelCatalogProvider } from './agents/model.js';
+// import { buildMode } from './agents/modes/build.js';
+// import { fastMode } from './agents/modes/explore.js';
+// import { planMode } from './agents/modes/plan.js';
 import { getStaticallyLoadedInstructionPaths } from './agents/prompts/agent-instructions.js';
 // import { executeSubagent } from './agents/subagents/execute.js';
 // import { exploreSubagent } from './agents/subagents/explore.js';
@@ -255,7 +255,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   )
     .replace(/\/+$/, '')
     .replace(/\/v1$/, '');
-  const mastraCodeGateway = createMastraCodeGateway({
+  const _mastraCodeGateway = createMastraCodeGateway({
     mastraGatewayBaseUrl,
     mastraGatewayApiKey: mgApiKey,
     routeThroughMastraGateway: false,
@@ -539,7 +539,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     },
   });
 
-  const defaultSubagents = [exploreSubagent, planSubagent, executeSubagent];
+  const _defaultSubagents = [exploreSubagent, planSubagent, executeSubagent];
 
   const defaultModes: HarnessMode<Record<string, unknown>>[] = [
     {
@@ -574,7 +574,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       handler: () => syncGateways(),
     },
   ];
-  const heartbeatHandlers = config?.heartbeatHandlers ?? defaultHeartbeatHandlers;
+  const _heartbeatHandlers = config?.heartbeatHandlers ?? defaultHeartbeatHandlers;
 
   // Build lightweight provider access for resolving built-in packs at startup.
   // Anthropic/OpenAI use AuthStorage; other providers use env API keys.
