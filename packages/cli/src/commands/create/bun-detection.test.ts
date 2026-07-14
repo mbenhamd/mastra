@@ -52,6 +52,7 @@ vi.mock('fs/promises', () => ({
     mkdir: vi.fn().mockResolvedValue(undefined),
     readFile: vi.fn().mockResolvedValue(JSON.stringify({ scripts: {}, engines: {} })),
     writeFile: vi.fn().mockResolvedValue(undefined),
+    appendFile: vi.fn().mockResolvedValue(undefined),
     rm: mocks.mockRm,
   },
 }));

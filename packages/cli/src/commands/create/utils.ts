@@ -15,6 +15,43 @@ function getInitArgs(pm: PackageManager): string[] {
   return pm === 'pnpm' ? ['init'] : ['init', '-y'];
 }
 
+export const MASTRA_GITIGNORE_ENTRIES = [
+  'output.txt',
+  'node_modules',
+  'dist',
+  '.mastra',
+  '.env.development',
+  '.env',
+  '*.db',
+  '*.db-*',
+  '.netlify',
+  '.vercel',
+] as const;
+
+/**
+ * Appends the Mastra ignore entries to `.gitignore` without clobbering entries
+ * that a package-manager initializer (for example `bun init -y`) already
+ * generated. Existing content is preserved and duplicates are skipped.
+ */
+export async function ensureGitignoreEntries(
+  gitignorePath: string,
+  entries: readonly string[] = MASTRA_GITIGNORE_ENTRIES,
+): Promise<void> {
+  let existing = '';
+  try {
+    existing = await fs.readFile(gitignorePath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const existingEntries = new Set(existing.split(/\r?\n/).map(line => line.trim()));
+  const missingEntries = entries.filter(entry => !existingEntries.has(entry));
+  if (missingEntries.length === 0) return;
+
+  const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
+  await fs.appendFile(gitignorePath, `${separator}${missingEntries.join('\n')}\n`);
+}
+
 async function initializePackageJson(pm: PackageManager, timeout?: number): Promise<void> {
   await execa(pm, getInitArgs(pm), {
     timeout,
@@ -296,22 +333,9 @@ onlyBuiltDependencies:
 
     s.start('Adding .gitignore');
     try {
-      await fs.writeFile(
-        '.gitignore',
-        [
-          'output.txt',
-          'node_modules',
-          'dist',
-          '.mastra',
-          '.env.development',
-          '.env',
-          '*.db',
-          '*.db-*',
-          '.netlify',
-          '.vercel',
-          '',
-        ].join('\n'),
-      );
+      // Merge instead of overwrite: `bun init -y` (and future initializers)
+      // may already have generated a .gitignore whose entries must survive.
+      await ensureGitignoreEntries('.gitignore');
     } catch (error) {
       throw new Error(`Failed to create .gitignore: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
