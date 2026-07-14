@@ -2,7 +2,6 @@
  * Event dispatcher: maps HarnessEvent types to extracted handler functions.
  */
 import type { HarnessEvent, HarnessThread, TaskItemSnapshot } from '@mastra/core/harness';
-import type { AskUserSelectionMode } from '@mastra/core/tools';
 
 import { getCurrentGitBranchAsync } from '../utils/project.js';
 import {
@@ -24,7 +23,6 @@ import {
   handleOMBufferingFailed,
   handleOMActivation,
   handleOMThreadTitleUpdated,
-  handleAskQuestion,
   handleSandboxAccessRequest,
   handleToolSuspension,
   handlePlanApproval,
@@ -402,7 +400,6 @@ export async function dispatchEvent(event: HarnessEvent, ectx: EventHandlerConte
     case 'plan_approved':
       // Handled directly in onApprove callback to ensure proper sequencing
       break;
-    }
 
     case 'display_state_changed':
       // The Harness emits this after every event with the updated display state.
