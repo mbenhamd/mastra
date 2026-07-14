@@ -1179,6 +1179,7 @@ changed_files="$(mktemp)"
 changed_lockfile_importers="$(mktemp)"
 changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
+forced_mastracode_tests="$(mktemp)"
 delegated_docs_tests="$(mktemp)"
 deleted_tests="$(mktemp)"
 fixer_test_result="$(mktemp)"
@@ -1191,7 +1192,7 @@ unsupported_mastracode_sources="$(mktemp)"
 unsupported_tests="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$forced_mastracode_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
@@ -1384,7 +1385,8 @@ while IFS= read -r file; do
         case "$file" in
           mastracode/src/tui/components/login-dialog.test.ts | \
             mastracode/src/tui/event-dispatch.test.ts | \
-            mastracode/src/tui/notify.test.ts) ;;
+            mastracode/src/tui/notify.test.ts | \
+            mastracode/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
       fi
@@ -1401,15 +1403,26 @@ while IFS= read -r file; do
       mastracode/src/tui/notify.ts)
         required_test="mastracode/src/tui/notify.test.ts"
         ;;
+      mastracode/src/utils/signals-pubsub.ts)
+        required_test="mastracode/src/utils/__tests__/signals-pubsub.test.ts"
+        ;;
+      mastracode/src/index.ts)
+        # Composition root: no unit suite owns it; the mastracode lane's
+        # build:mastracode compiles it and the owned TUI suites exercise its
+        # wiring. Restoration-only edits are accepted under the build gate.
+        ;;
       *)
         printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
         ;;
     esac
     if [[ -n "$required_test" ]]; then
-      if ! git_regular_file_at_head "$file" ||
-        ! grep -Fxq "$required_test" "$changed_files" ||
-        ! git_regular_file_at_head "$required_test"; then
+      if ! git_regular_file_at_head "$file" || ! git_regular_file_at_head "$required_test"; then
         printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
+      elif ! grep -Fxq "$required_test" "$changed_files"; then
+        # The paired suite exists but was not edited: force it to RUN so the
+        # source change is still executed against its owned coverage instead
+        # of failing closed on parse-only or restoration commits.
+        printf '%s\n' "$required_test" >> "$forced_mastracode_tests"
       fi
     fi
   fi
@@ -1434,7 +1447,7 @@ if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_t
     cat "$deleted_tests" >&2
   fi
   if [[ -s "$unsupported_mastracode_sources" ]]; then
-    echo "These MastraCode production sources are outside the three owned source-and-test pairs:" >&2
+    echo "These MastraCode production sources are outside the owned source-and-test pairs:" >&2
     cat "$unsupported_mastracode_sources" >&2
   fi
   if [[ -s "$missing_mastracode_tests" ]]; then
@@ -2259,7 +2272,8 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif [[ "$file" == mastracode/* && \
       "$file" != mastracode/src/tui/components/login-dialog.test.ts && \
       "$file" != mastracode/src/tui/event-dispatch.test.ts && \
-      "$file" != mastracode/src/tui/notify.test.ts ]]; then
+      "$file" != mastracode/src/tui/notify.test.ts && \
+      "$file" != mastracode/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
@@ -2290,6 +2304,11 @@ if server_route_source_changed; then
     >> "$changed_tests"
 fi
 
+if [[ -s "$forced_mastracode_tests" ]]; then
+  echo "Forcing owned MastraCode suites to run for source-only changes:"
+  sort -u "$forced_mastracode_tests"
+  sort -u "$forced_mastracode_tests" >> "$changed_tests"
+fi
 sort -u -o "$changed_tests" "$changed_tests"
 
 if [[ -s "$delegated_docs_tests" ]]; then
