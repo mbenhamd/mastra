@@ -155,11 +155,16 @@ async function killProcessTree(subprocess: KillableSubprocess, signal: NodeJS.Si
 }
 
 function registerProcessTreeExitCleanup(subprocess: KillableSubprocess): () => void {
-  if (process.platform === 'win32') {
-    return () => {};
-  }
-
   return onExit(() => {
+    if (process.platform === 'win32') {
+      try {
+        subprocess.kill('SIGKILL');
+      } catch {
+        // The process already exited before the parent cleanup callback ran.
+      }
+      return;
+    }
+
     const pid = subprocess.pid;
     if (!pid) return;
 

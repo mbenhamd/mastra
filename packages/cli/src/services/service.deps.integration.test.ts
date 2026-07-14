@@ -21,8 +21,12 @@ describe('DepsService subprocess lifecycle', () => {
       await writeFile(
         executable,
         `#!/usr/bin/env node
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
-fs.writeFileSync(process.argv.at(-1), String(process.pid));
+const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], {
+  stdio: 'ignore',
+});
+fs.writeFileSync(process.argv.at(-1), String(child.pid));
 process.on('SIGTERM', () => {});
 setInterval(() => {}, 1_000);
 `,

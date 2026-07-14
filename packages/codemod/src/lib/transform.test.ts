@@ -194,6 +194,33 @@ describe('transform runner', () => {
     }
   });
 
+  it.runIf(process.platform !== 'win32')(
+    'terminates the direct subprocess on a simulated Windows parent exit',
+    async () => {
+      const subprocess = Object.assign(Promise.resolve({ stdout: '' }), {
+        pid: 43_214,
+        kill: vi.fn(() => true),
+      });
+      mocks.execa.mockReturnValueOnce(subprocess);
+      let exitCleanup!: () => void;
+      mocks.onExit.mockImplementationOnce(callback => {
+        exitCleanup = callback;
+        return vi.fn();
+      });
+      const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+      try {
+        const result = transform('v1/agent-abort-signal', '.', {}, { logStatus: false });
+        exitCleanup();
+        await result;
+
+        expect(subprocess.kill).toHaveBeenCalledWith('SIGKILL');
+      } finally {
+        platform.mockRestore();
+      }
+    },
+  );
+
   it('passes shell-control-looking text as inert argument data', async () => {
     await transform(
       'v1/agent-abort-signal',

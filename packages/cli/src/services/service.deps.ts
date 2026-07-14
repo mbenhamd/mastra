@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
+import type { ResultPromise } from 'execa';
 import { getPackageManagerAddArgs } from '../utils/package-manager';
 import type { PackageManager } from '../utils/package-manager';
 
@@ -10,6 +11,78 @@ type InstallPackagesOptions = {
   timeout?: number;
   cancelSignal?: AbortSignal;
 };
+
+const FORCE_KILL_DELAY_MS = 1_000;
+
+function getTaskkillPath(): string {
+  const configuredWindowsRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  const windowsRoot =
+    configuredWindowsRoot && path.win32.isAbsolute(configuredWindowsRoot) ? configuredWindowsRoot : 'C:\\Windows';
+  return path.win32.join(windowsRoot, 'System32', 'taskkill.exe');
+}
+
+async function terminateInstallTree(subprocess: ResultPromise, signal: NodeJS.Signals): Promise<void> {
+  const pid = subprocess.pid;
+  if (!pid) {
+    subprocess.kill(signal);
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const result = await execa(getTaskkillPath(), ['/T', '/F', '/PID', String(pid)], {
+        reject: false,
+        stdio: 'ignore',
+        timeout: 5_000,
+      });
+      if (result.exitCode === 0) return;
+    } catch {
+      // Fall through when taskkill is unavailable.
+    }
+  } else {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+      // Fall through when the process group could not be reached.
+    }
+  }
+
+  subprocess.kill(signal);
+}
+
+function scheduleInstallTreeTermination(subprocess: ResultPromise, timeout?: number, cancelSignal?: AbortSignal) {
+  let terminationStarted = false;
+  const terminate = () => {
+    if (terminationStarted) return;
+    terminationStarted = true;
+
+    if (process.platform === 'win32') {
+      void terminateInstallTree(subprocess, 'SIGKILL').catch(() => {});
+      return;
+    }
+
+    void terminateInstallTree(subprocess, 'SIGTERM').catch(() => {});
+    const forceKillTimer = setTimeout(() => {
+      void terminateInstallTree(subprocess, 'SIGKILL').catch(() => {});
+    }, FORCE_KILL_DELAY_MS);
+    forceKillTimer.unref();
+  };
+
+  const timeoutTimer = timeout === undefined ? undefined : setTimeout(terminate, timeout);
+  timeoutTimer?.unref();
+  if (cancelSignal?.aborted) {
+    terminate();
+  } else {
+    cancelSignal?.addEventListener('abort', terminate, { once: true });
+  }
+
+  return () => {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    cancelSignal?.removeEventListener('abort', terminate);
+  };
+}
 
 export class DepsService {
   readonly packageManager: PackageManager;
@@ -64,14 +137,22 @@ export class DepsService {
       installArgs.push(pm === 'bun' ? '-d' : '-D');
     }
 
-    return execa(pm, [...installArgs, ...packages], {
+    const subprocess = execa(pm, [...installArgs, ...packages], {
       all: true,
       stdio: 'pipe',
       timeout: options.timeout,
       cancelSignal: options.cancelSignal,
       killSignal: 'SIGTERM',
-      forceKillAfterDelay: 1_000,
+      forceKillAfterDelay: FORCE_KILL_DELAY_MS,
+      detached: process.platform !== 'win32',
     });
+    const clearTreeTermination = scheduleInstallTreeTermination(subprocess, options.timeout, options.cancelSignal);
+
+    try {
+      return await subprocess;
+    } finally {
+      clearTreeTermination();
+    }
   }
 
   public async checkDependencies(dependencies: string[]): Promise<string> {

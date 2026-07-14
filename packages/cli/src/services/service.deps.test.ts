@@ -47,6 +47,7 @@ describe('DepsService.installPackages', () => {
         cancelSignal: undefined,
         killSignal: 'SIGTERM',
         forceKillAfterDelay: 1_000,
+        detached: process.platform !== 'win32',
       });
       expect(mocks.execa.mock.calls[0]?.[2]).not.toHaveProperty('shell');
     },
@@ -84,7 +85,47 @@ describe('DepsService.installPackages', () => {
         cancelSignal: controller.signal,
         killSignal: 'SIGTERM',
         forceKillAfterDelay: 1_000,
+        detached: process.platform !== 'win32',
       });
     },
   );
+
+  it.runIf(process.platform !== 'win32')('terminates the install process group when timeout expires', async () => {
+    vi.useFakeTimers();
+    const subprocess = Object.assign(new Promise<never>(() => {}), {
+      pid: 43_210,
+      kill: vi.fn(() => true),
+    });
+    mocks.execa.mockReturnValueOnce(subprocess);
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+
+    try {
+      void new DepsService('npm').installPackages(['typescript'], { timeout: 500 });
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      expect(kill).toHaveBeenCalledWith(-43_210, 'SIGTERM');
+      expect(kill).toHaveBeenCalledWith(-43_210, 'SIGKILL');
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('terminates the install process group for an already-aborted signal', () => {
+    const controller = new AbortController();
+    controller.abort();
+    const subprocess = Object.assign(new Promise<never>(() => {}), {
+      pid: 43_211,
+      kill: vi.fn(() => true),
+    });
+    mocks.execa.mockReturnValueOnce(subprocess);
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+
+    try {
+      void new DepsService('npm').installPackages(['typescript'], { cancelSignal: controller.signal });
+      expect(kill).toHaveBeenCalledWith(-43_211, 'SIGTERM');
+    } finally {
+      kill.mockRestore();
+    }
+  });
 });
