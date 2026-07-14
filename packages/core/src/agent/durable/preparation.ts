@@ -152,6 +152,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const resourceId = execOptions?.memory?.resource;
   let threadObject: StorageThreadType | undefined;
   let threadExists = false;
+  let processorMemory: MastraMemory | undefined;
+  let createdThreadDuringPreparation = false;
 
   // 5. Create MessageList
   const messageList = new MessageList({
@@ -218,20 +220,23 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   if (inputProcessors.length > 0) {
     try {
       // Set MastraMemory context so processors that need it (OM, message history) can access it
-      const memory = await typedAgent.getMemory({ requestContext });
+      processorMemory = await typedAgent.getMemory({ requestContext });
       const memoryConfig = execOptions?.memory?.options;
-      if (memory && threadId && resourceId) {
-        const existingThread = await memory.getThreadById({ threadId });
-        threadObject =
-          existingThread ??
-          (await memory.createThread({
+      if (processorMemory && threadId && resourceId) {
+        const existingThread = await processorMemory.getThreadById({ threadId });
+        if (existingThread) {
+          threadObject = existingThread;
+        } else {
+          threadObject = await processorMemory.createThread({
             threadId,
             metadata: thread?.metadata,
             title: thread?.title,
             memoryConfig,
             resourceId,
             saveThread: true,
-          }));
+          });
+          createdThreadDuringPreparation = true;
+        }
         threadExists = true;
         requestContext.set('MastraMemory', { thread: threadObject, resourceId, memoryConfig });
       }
@@ -273,6 +278,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     // mistaken for append mode and silently continue with an empty surface.
     const defaultOptions = await typedAgent.getDefaultOptions({ requestContext });
     if ((execOptions?.toolsetsMode ?? defaultOptions.toolsetsMode) === 'replace') {
+      clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId);
+      if (createdThreadDuringPreparation && processorMemory && threadId) {
+        try {
+          await processorMemory.deleteThread(threadId);
+        } catch (rollbackError) {
+          logger?.warn?.(`[DurableAgent] Error rolling back preparation thread: ${rollbackError}`);
+        }
+      }
       throw error;
     }
   }

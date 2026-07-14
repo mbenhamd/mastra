@@ -10,6 +10,7 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
 import { RequestContext } from '../../../request-context';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
@@ -662,6 +663,56 @@ describe('DurableAgent streaming execution', () => {
         /resolve to the same name/,
       );
       expect(globalRunRegistry.has('invalid-default-replacement-run')).toBe(false);
+    });
+
+    it('should roll back only a newly created processor thread when replacement tool conversion fails', async () => {
+      const memory = new MockMemory();
+      const invalidToolsets = {
+        invalid: {
+          'duplicate name': createTool({
+            id: 'first-memory',
+            description: 'normalizes to duplicate_name',
+            inputSchema: z.object({}),
+            execute: async () => 'first',
+          }),
+          duplicate_name: createTool({
+            id: 'second-memory',
+            description: 'collides after normalization',
+            inputSchema: z.object({}),
+            execute: async () => 'second',
+          }),
+        },
+      };
+      const baseAgent = new Agent({
+        id: 'durable-invalid-replacement-memory-agent',
+        name: 'Durable Invalid Replacement Memory Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        memory,
+        inputProcessors: [{ id: 'noop-processor', processInputStep: () => ({}) }],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-new-thread-run',
+          memory: { thread: 'new-preparation-thread', resource: 'resource' },
+          toolsetsMode: 'replace',
+          toolsets: invalidToolsets,
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(await memory.getThreadById({ threadId: 'new-preparation-thread' })).toBeNull();
+
+      await memory.createThread({ threadId: 'existing-preparation-thread', resourceId: 'resource' });
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-existing-thread-run',
+          memory: { thread: 'existing-preparation-thread', resource: 'resource' },
+          toolsetsMode: 'replace',
+          toolsets: invalidToolsets,
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(await memory.getThreadById({ threadId: 'existing-preparation-thread' })).not.toBeNull();
     });
 
     it('should allow input processors to clear activeTools for LLM request and tool execution', async () => {
