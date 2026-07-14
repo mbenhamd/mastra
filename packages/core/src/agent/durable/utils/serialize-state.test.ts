@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CoreTool } from '../../../tools/types';
-import { serializeToolMetadata } from './serialize-state';
+import { createRuntimeDependencyFingerprint, serializeToolMetadata } from './serialize-state';
 
 type ApprovalMetadataToolFixture = CoreTool & {
   requireApproval?: boolean;
@@ -75,5 +75,24 @@ describe('serializeToolMetadata', () => {
     } as ApprovalMetadataToolFixture);
 
     expect(metadata.requireApproval).toBe(true);
+  });
+});
+
+describe('createRuntimeDependencyFingerprint', () => {
+  it('distinguishes backing service configuration for otherwise identical services', () => {
+    class RuntimeService {
+      readonly id = 'shared-service';
+      constructor(
+        readonly storage: { root: string },
+        readonly createdAt = new Date(),
+      ) {}
+    }
+
+    expect(createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' }))).not.toBe(
+      createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-b' })),
+    );
+    expect(createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' }))).toBe(
+      createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' })),
+    );
   });
 });

@@ -83,6 +83,15 @@ export function normalizeToolRecoverySchema(schema: unknown): unknown {
   }
 }
 
+/** Preserve both portable JSON shape and runtime-only validation behavior for binding checks. */
+export function normalizeToolRecoverySchemaIdentity(schema: unknown): unknown {
+  if (schema === undefined) return undefined;
+  return {
+    jsonSchema: normalizeToolRecoverySchema(schema),
+    runtimeSchema: normalizeRecoveryValue(schema, new Map(), '$runtimeSchema'),
+  };
+}
+
 /** Hash every execution-affecting tool capability using deterministic object ordering. */
 export function createToolRecoveryFingerprint(value: unknown): string {
   return createHash('sha256')

@@ -1359,6 +1359,24 @@ describe.each([
       }
     });
 
+    it('rejects message continuation when only a persisted suspended run owns the thread', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-1', 'resource-1');
+      const { agent: restartedAgent } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+
+      await expect(
+        restartedAgent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          approved: true,
+          messages: [{ role: 'user', content: 'continue' }],
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_ACTIVE_RUN' });
+      expect((await restartedAgent.listSuspendedRuns({ resourceId: 'resource-1' })).runs).toHaveLength(1);
+    }, 30000);
+
     it('approves a suspended run after a simulated restart (in-memory state lost)', async () => {
       const storage = new InMemoryStore();
       const { agent } = createSuspendedSetup({ storage });

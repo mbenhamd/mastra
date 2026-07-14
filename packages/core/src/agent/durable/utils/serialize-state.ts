@@ -1,12 +1,10 @@
-import { createHash } from 'node:crypto';
 import type { JSONSchema7 } from 'json-schema';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import type { MemoryConfig } from '../../../memory/types';
 import type { VersionOverrides } from '../../../request-context';
-import { normalizeToolRecoverySchema } from '../../../tools/recovery-fingerprint';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchema } from '../../../tools/recovery-fingerprint';
 import type { CoreTool } from '../../../tools/types';
 import type { MessageList } from '../../message-list';
-import { stableStringify } from '../../message-list/cache/stable-stringify';
 import type { AgentModelManagerConfig } from '../../types';
 import type {
   SerializableToolMetadata,
@@ -36,15 +34,31 @@ export function createRuntimeDependencyFingerprint(value: unknown): string | und
   );
   const constructorSource =
     typeof record.constructor === 'function' ? Function.prototype.toString.call(record.constructor) : undefined;
-  return createHash('sha256')
-    .update(
-      stableStringify({
-        constructorName: (value as any).constructor?.name,
-        constructorSource,
-        scalarIdentity,
-      }),
-    )
-    .digest('hex');
+  const volatileKeys = new Set([
+    'createdAt',
+    'lastAccessedAt',
+    '_status',
+    '_destroyPromise',
+    '_filesystemRequestCache',
+    '_sandboxRequestCache',
+    '_sandboxKeyCache',
+    '_skills',
+    '_lsp',
+    '_logger',
+    'logger',
+  ]);
+  const configurationIdentity = Object.fromEntries(
+    Object.keys(record)
+      .filter(key => !Object.prototype.hasOwnProperty.call(scalarIdentity, key) && !volatileKeys.has(key))
+      .sort()
+      .map(key => [key, record[key]]),
+  );
+  return createToolRecoveryFingerprint({
+    constructorName: (value as any).constructor?.name,
+    constructorSource,
+    scalarIdentity,
+    configurationIdentity,
+  });
 }
 
 /**

@@ -3,7 +3,9 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { Mastra } from '../../../mastra';
 import { RequestContext } from '../../../request-context';
+import { InMemoryStore } from '../../../storage';
 import type { WorkflowFinishCallbackResult } from '../../../workflows/types';
 import { Agent } from '../../agent';
 import { EventedAgent } from '../evented-agent';
@@ -130,6 +132,57 @@ describe('EventedAgent requestContext forwarding', () => {
     } finally {
       cleanup();
     }
+  });
+
+  it('preserves terminal snapshot status when deletion retries fail', async () => {
+    const storage = new InMemoryStore();
+    const baseAgent = new Agent({
+      id: 'evented-terminal-delete-failure-agent',
+      name: 'Evented Terminal Delete Failure Agent',
+      instructions: 'Test terminal cleanup failure',
+      model: createTextModel('Done') as LanguageModelV2,
+    });
+    const outerDelete = vi.fn().mockRejectedValue(new Error('outer delete unavailable'));
+    const pubsub = new EventEmitterPubSub();
+    pubsubs.push(pubsub);
+    const eventedAgent = new (class extends EventedAgent {
+      cleanupTerminal(runId: string) {
+        return this.deleteTerminalRunSnapshots(runId);
+      }
+
+      override getWorkflow() {
+        return { deleteWorkflowRunById: outerDelete } as unknown as ReturnType<EventedAgent['getWorkflow']>;
+      }
+    })({ agent: baseAgent, pubsub });
+    eventedAgent.__setMastra(new Mastra({ storage, logger: false }));
+    const workflows = (await storage.getStore('workflows'))!;
+    const runId = 'terminal-delete-failure-run';
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'durable-agentic-loop',
+      runId,
+      snapshot: { status: 'failed', context: { failure: true }, resumeLabels: {} } as any,
+    });
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'durable-agentic-execution',
+      runId,
+      snapshot: { status: 'tripwire', context: { tripwire: true }, resumeLabels: {} } as any,
+    });
+    const persistSnapshot = vi.spyOn(workflows, 'persistWorkflowSnapshot');
+    const nestedDelete = vi
+      .spyOn(workflows, 'deleteWorkflowRunById')
+      .mockRejectedValue(new Error('nested delete unavailable'));
+
+    await eventedAgent.cleanupTerminal(runId);
+
+    expect(outerDelete).toHaveBeenCalledTimes(2);
+    expect(nestedDelete).toHaveBeenCalledTimes(2);
+    expect(persistSnapshot).not.toHaveBeenCalled();
+    expect(await workflows.getWorkflowRunById({ workflowName: 'durable-agentic-loop', runId })).toMatchObject({
+      snapshot: { status: 'failed', context: { failure: true } },
+    });
+    expect(await workflows.getWorkflowRunById({ workflowName: 'durable-agentic-execution', runId })).toMatchObject({
+      snapshot: { status: 'tripwire', context: { tripwire: true } },
+    });
   });
 
   it('reports rejected background execution once and releases its runtime pin', async () => {

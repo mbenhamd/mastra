@@ -23,6 +23,7 @@ import type {
   DurableToolCallOutput,
   SerializableScorersConfig,
 } from '../types';
+import { mapDurableIterationToLLMInput } from './map-llm-input';
 import {
   modelConfigSchema,
   modelListEntrySchema,
@@ -137,18 +138,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
     .map(
       async ({ inputData }) => {
         const state = inputData as IterationState;
-        return {
-          runId: state.runId,
-          agentId: state.agentId,
-          agentName: state.agentName,
-          messageListState: state.messageListState,
-          toolsMetadata: state.toolsMetadata,
-          modelConfig: state.modelConfig,
-          modelList: state.modelList,
-          options: state.options,
-          state: state.state,
-          messageId: state.messageId,
-        };
+        return mapDurableIterationToLLMInput(state);
       },
       { id: 'map-to-llm-input' },
     )

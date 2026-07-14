@@ -4,7 +4,7 @@ import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
 import type { SuspendOptions } from '../workflows';
-import { createToolRecoveryFingerprint, normalizeToolRecoverySchema } from './recovery-fingerprint';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
 import type {
   McpMetadata,
   MCPToolProperties,
@@ -284,11 +284,11 @@ export class Tool<
       id: opts.id,
       description: opts.description,
       schemas: {
-        input: normalizeToolRecoverySchema(opts.inputSchema),
-        output: normalizeToolRecoverySchema(opts.outputSchema),
-        suspend: normalizeToolRecoverySchema(opts.suspendSchema),
-        resume: normalizeToolRecoverySchema(opts.resumeSchema),
-        requestContext: normalizeToolRecoverySchema(opts.requestContextSchema),
+        input: normalizeToolRecoverySchemaIdentity(opts.inputSchema),
+        output: normalizeToolRecoverySchemaIdentity(opts.outputSchema),
+        suspend: normalizeToolRecoverySchemaIdentity(opts.suspendSchema),
+        resume: normalizeToolRecoverySchemaIdentity(opts.resumeSchema),
+        requestContext: normalizeToolRecoverySchemaIdentity(opts.requestContextSchema),
       },
       execute: opts.execute,
       requireApproval: opts.requireApproval,

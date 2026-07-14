@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createToolRecoveryFingerprint } from './recovery-fingerprint';
+import { z } from 'zod';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
 
 describe('createToolRecoveryFingerprint', () => {
   it('distinguishes regular-expression source and flags', () => {
@@ -55,6 +56,29 @@ describe('createToolRecoveryFingerprint', () => {
     );
     expect(createToolRecoveryFingerprint(new Date('2026-01-01T00:00:00.000Z'))).not.toBe(
       createToolRecoveryFingerprint({ $date: '2026-01-01T00:00:00.000Z' }),
+    );
+  });
+
+  it('includes runtime-only schema refinements and transforms', () => {
+    const minimumTwo = z.string().refine(value => value.length > 2);
+    const minimumThree = z.string().refine(value => value.length > 3);
+    const upper = z.string().transform(value => value.toUpperCase());
+    const lower = z.string().transform(value => value.toLowerCase());
+
+    expect(createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(minimumTwo))).not.toBe(
+      createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(minimumThree)),
+    );
+    expect(createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(upper))).not.toBe(
+      createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(lower)),
+    );
+  });
+
+  it('keeps equivalent object schemas stable across property order', () => {
+    const first = z.object({ value: z.string(), count: z.number() });
+    const second = z.object({ count: z.number(), value: z.string() });
+
+    expect(createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(first))).toBe(
+      createToolRecoveryFingerprint(normalizeToolRecoverySchemaIdentity(second)),
     );
   });
 });

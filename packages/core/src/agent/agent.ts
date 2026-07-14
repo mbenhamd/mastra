@@ -8955,24 +8955,6 @@ export class Agent<
       });
     }
 
-    if (hasMessages && approved) {
-      const continuation = agentThreadStreamRuntime.continueWithMessages(
-        this as Agent<any, any, any, any>,
-        messages,
-        {
-          resourceId,
-          threadId,
-          runId: executionOptions.runId,
-          streamOptions: deepMerge(
-            (streamOptions ?? {}) as Record<string, unknown>,
-            executionOptions as Record<string, unknown>,
-          ) as unknown as AgentExecutionOptions<OUTPUT>,
-        },
-        this.getPubSub(),
-      );
-      return { accepted: continuation.accepted, runId: continuation.runId, toolCallId: options.toolCallId };
-    }
-
     const activeRunId = this.getActiveThreadRunId({ threadId, resourceId });
     let runId: string | undefined;
     let recoveredToolCallId = options.toolCallId;
@@ -9042,6 +9024,32 @@ export class Agent<
           `but run "${activeRunId}" currently owns thread "${threadId}". Resolve the active run first.`,
         details: { threadId, resourceId, agentName: this.name, runId, activeRunId },
       });
+    }
+    if (hasMessages) {
+      if (!activeRunId) {
+        throw new MastraError({
+          id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_ACTIVE_RUN',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: `Agent "${this.name}" sendToolApproval() only accepts messages while an in-memory run owns thread "${threadId}".`,
+          details: { threadId, resourceId, agentName: this.name },
+        });
+      }
+      const continuation = agentThreadStreamRuntime.continueWithMessages(
+        this as Agent<any, any, any, any>,
+        messages,
+        {
+          resourceId,
+          threadId,
+          runId: executionOptions.runId,
+          streamOptions: deepMerge(
+            (streamOptions ?? {}) as Record<string, unknown>,
+            executionOptions as Record<string, unknown>,
+          ) as unknown as AgentExecutionOptions<OUTPUT>,
+        },
+        this.getPubSub(),
+      );
+      return { accepted: continuation.accepted, runId: continuation.runId, toolCallId: options.toolCallId };
     }
     if (!runId) {
       throw new MastraError({

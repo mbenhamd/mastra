@@ -33,6 +33,7 @@ import type { SuspendOptions } from '../../workflows';
 import {
   createToolRecoveryFingerprint as hashToolRecoveryFingerprint,
   normalizeToolRecoverySchema,
+  normalizeToolRecoverySchemaIdentity,
 } from '../recovery-fingerprint';
 import { ToolStream } from '../stream';
 import type {
@@ -87,7 +88,10 @@ function createToolRecoveryFingerprint(
       suspend: normalizeToolRecoverySchema(schemas.suspend),
       resume: normalizeToolRecoverySchema(schemas.resume),
     },
-    requestContextSchema: normalizeToolRecoverySchema(candidate.requestContextSchema),
+    originalSchemaIdentity: normalizeToolRecoverySchemaIdentity(
+      candidate.inputSchema ?? candidate.parameters ?? candidate.schema,
+    ),
+    requestContextSchema: normalizeToolRecoverySchemaIdentity(candidate.requestContextSchema),
     execute: candidate.execute,
     requireApproval: candidate.requireApproval,
     builderRequireApproval: options.requireApproval,

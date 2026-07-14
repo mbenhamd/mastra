@@ -544,36 +544,24 @@ export class DurableAgent<
   /** Best-effort deletion of the outer and nested snapshots for a terminal run. */
   protected async deleteTerminalRunSnapshots(runId: string): Promise<void> {
     const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
-    const deleteOrTombstone = async (workflowName: string, deletion: () => Promise<void>) => {
+    const deleteWithRetry = async (deletion: () => Promise<void>) => {
       try {
         await deletion();
         return;
       } catch {
-        // Retry once for transient driver failures before replacing any stale
-        // suspended row with a terminal tombstone.
+        // Retry once for transient driver failures. If both attempts fail,
+        // preserve the original terminal row and its status for later cleanup.
         try {
           await deletion();
           return;
         } catch (cause) {
-          if (workflowsStore) {
-            try {
-              await workflowsStore.persistWorkflowSnapshot({
-                workflowName,
-                runId,
-                snapshot: { status: 'success', context: {}, resumeLabels: {} } as any,
-              });
-              return;
-            } catch {
-              // Surface the original deletion failure to logging below.
-            }
-          }
           throw cause;
         }
       }
     };
     const deletions = await Promise.allSettled([
-      deleteOrTombstone(DurableStepIds.AGENTIC_LOOP, () => this.getWorkflow().deleteWorkflowRunById(runId)),
-      deleteOrTombstone(DurableStepIds.AGENTIC_EXECUTION, async () => {
+      deleteWithRetry(() => this.getWorkflow().deleteWorkflowRunById(runId)),
+      deleteWithRetry(async () => {
         await workflowsStore?.deleteWorkflowRunById({
           runId,
           workflowName: DurableStepIds.AGENTIC_EXECUTION,
