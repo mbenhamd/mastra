@@ -1109,14 +1109,30 @@ if workspace_changed packages/server; then
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
   run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
   run_with_validation_budget 300 pnpm --filter @mastra/server check:permissions
+  if grep -Fxq 'packages/server/src/server/server-adapter/routes/permissions.ts' "$changed_files" || \
+    grep -Fxq 'packages/core/src/auth/ee/interfaces/permissions.generated.ts' "$changed_files"; then
+    # check:permissions only proves the generated RBAC table is self-consistent
+    # with getEffectivePermission. Permission-source changes must also pass the
+    # semantics suite that encodes what callers rely on.
+    run_with_validation_budget 600 \
+      pnpm --dir packages/server exec vitest run src/server/server-adapter/routes/permissions.test.ts --reporter=dot
+  fi
   run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
   run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
-  if ! git diff --exit-code -- \
-    client-sdks/client-js/src/route-types.generated.ts \
-    packages/cli/src/commands/api/route-metadata.generated.ts || \
-    ! git ls-files --error-unmatch -- \
+  # Compare generator output against the immutable PR head, not the mutable
+  # index or a movable HEAD: a PR-controlled generator could stage or commit
+  # its own output and pass an index-relative diff without that content being
+  # part of the reviewed head commit.
+  if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+    echo "Validation checkout no longer matches the pull request head commit ${HEAD_SHA}." >&2
+    echo "A generator or package script moved HEAD; failing closed." >&2
+    exit 1
+  fi
+  if ! git cat-file -e "${HEAD_SHA}:client-sdks/client-js/src/route-types.generated.ts" 2>/dev/null || \
+    ! git cat-file -e "${HEAD_SHA}:packages/cli/src/commands/api/route-metadata.generated.ts" 2>/dev/null || \
+    ! git diff --exit-code "$HEAD_SHA" -- \
       client-sdks/client-js/src/route-types.generated.ts \
-      packages/cli/src/commands/api/route-metadata.generated.ts >/dev/null; then
+      packages/cli/src/commands/api/route-metadata.generated.ts; then
     echo "Generated Server route artifacts are stale or missing from the pull request." >&2
     echo "Run both @mastra/server route generators and commit their output." >&2
     exit 1
@@ -1234,7 +1250,7 @@ function exportDeclarationHasRuntimeValue(node) {
   return node.exportClause.elements.some(element => !element.isTypeOnly);
 }
 
-function runtimeModuleSpecifiers(file, source) {
+function runtimeModuleSpecifiers(file, source, computedSpecifiers) {
   const specifiers = new Set();
   const parsed = sourceFile(file, source);
   const visit = node => {
@@ -1262,11 +1278,15 @@ function runtimeModuleSpecifiers(file, source) {
     } else if (
       ts.isCallExpression(node) &&
       (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-        (ts.isIdentifier(node.expression) && node.expression.text === 'require')) &&
-      node.arguments.length >= 1 &&
-      ts.isStringLiteralLike(node.arguments[0])
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
     ) {
-      specifiers.add(node.arguments[0].text);
+      if (node.arguments.length >= 1 && ts.isStringLiteralLike(node.arguments[0])) {
+        specifiers.add(node.arguments[0].text);
+      } else if (computedSpecifiers) {
+        // A computed specifier hides the loaded module from this literal-only
+        // scan, so the caller must fail closed instead of trusting the graph.
+        computedSpecifiers.add(node.getText(parsed).slice(0, 120));
+      }
     }
     ts.forEachChild(node, visit);
   };
@@ -1432,12 +1452,32 @@ function propertyName(node) {
   return undefined;
 }
 
+function isTypePosition(node) {
+  const parent = node.parent;
+  return Boolean(parent && (ts.isTypeReferenceNode(parent) || ts.isTypeQueryNode(parent)));
+}
+
+function isDeclaredNamePosition(node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) return true;
+  if (ts.isPropertyAssignment(parent) && parent.name === node) return true;
+  if (ts.isPropertySignature(parent) && parent.name === node) return true;
+  if (ts.isMethodDeclaration(parent) && parent.name === node) return true;
+  if (ts.isBindingElement(parent) && parent.propertyName === node) return true;
+  return false;
+}
+
+// Aliasing any of these globals (const request = fetch, const { env } = process,
+// const load = require) strips the name this literal scanner keys on, so every
+// value-position reference outside the directly supported shapes fails closed.
 function unsupportedRuntimeReasons(file, source) {
   const reasons = new Set();
   const wasReachableFromExactTest = baseGraph.has(repositoryPath(file));
   const baseSource = readBaseSource(file);
   const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
-  for (const specifier of runtimeModuleSpecifiers(file, source)) {
+  const computedSpecifiers = new Set();
+  for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers)) {
     const reason = unsupportedModuleReason(specifier);
     if (reason) reasons.add(`module ${reason}`);
     if (
@@ -1449,24 +1489,47 @@ function unsupportedRuntimeReasons(file, source) {
       reasons.add(`unreviewed external module ${specifier}`);
     }
   }
+  for (const occurrence of computedSpecifiers) {
+    reasons.add(`computed module specifier ${occurrence}`);
+  }
   const parsed = sourceFile(file, source);
-  const visit = node => {
-    if (
-      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === 'process' &&
-      propertyName(node) === 'env'
-    ) {
-      reasons.add('process.env');
+  const flagGlobalReference = (node, name) => {
+    if (isDeclaredNamePosition(node) || isTypePosition(node)) return;
+    const parent = node.parent;
+    if (name === 'process') {
+      const isMemberReceiver =
+        parent &&
+        (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+        parent.expression === node;
+      if (isMemberReceiver) {
+        if (propertyName(parent) === 'env') reasons.add('process.env');
+        return;
+      }
+      reasons.add('process alias');
+      return;
     }
-    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-      const expression = node.expression;
-      const name = ts.isIdentifier(expression)
-        ? expression.text
-        : ts.isPropertyAccessExpression(expression)
-          ? expression.name.text
-          : undefined;
-      if (name === 'fetch' || name === 'WebSocket') reasons.add(`${name}()`);
+    if (name === 'require') {
+      if (parent && ts.isCallExpression(parent) && parent.expression === node) return;
+      reasons.add('require alias');
+      return;
+    }
+    if (name === 'createRequire') {
+      reasons.add('createRequire()');
+      return;
+    }
+    const isDirectCall =
+      parent && (ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === node;
+    reasons.add(isDirectCall ? `${name}()` : `${name} alias`);
+  };
+  const visit = node => {
+    if (ts.isIdentifier(node) && ['process', 'require', 'createRequire', 'fetch', 'WebSocket'].includes(node.text)) {
+      flagGlobalReference(node, node.text);
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const accessedName = propertyName(node);
+      if (['process', 'fetch', 'WebSocket'].includes(accessedName)) {
+        // globalThis.process / globalThis['fetch'] and deeper receiver chains.
+        flagGlobalReference(node, accessedName);
+      }
     }
     ts.forEachChild(node, visit);
   };
