@@ -43,7 +43,7 @@ describe('Session.setGoal — admission', () => {
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     const events = record(session, ['goal_set', 'goal_cleared']);
 
-    const goal = await session.setGoal({ objective: 'ship the thing', kickoff: false });
+    const _goal = await session.setGoal({ objective: 'ship the thing', kickoff: false });
 
     expect(goal.objective).toBe('ship the thing');
     expect(goal.status).toBe('active');
@@ -342,7 +342,7 @@ describe('Session goal — continuation wording (TUI parity)', () => {
     });
     const events = record(session, ['queue_full_dropped']);
 
-    const goal = await session.setGoal({ objective: 'ship the thing' });
+    const _goal = await session.setGoal({ objective: 'ship the thing' });
 
     expect(session.getRecord().pendingQueue).toEqual([
       expect.objectContaining({ id: existing.queuedItemId, admissionId: 'goal-full-existing' }),

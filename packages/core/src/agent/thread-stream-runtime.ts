@@ -1632,7 +1632,7 @@ export class AgentThreadStreamRuntime {
       if (queue.length > 0) {
         const nextRecord = state.threadRunsById.get(output.runId);
         if (nextRecord) {
-          this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
         }
       }
       return;
@@ -1708,7 +1708,7 @@ export class AgentThreadStreamRuntime {
         if ((state.pendingContinuationsByThread.get(key)?.length ?? 0) > 0) {
           const nextRecord = state.threadRunsById.get(output.runId);
           if (nextRecord) {
-            this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+            void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
           }
         }
       })
@@ -1758,7 +1758,7 @@ export class AgentThreadStreamRuntime {
       queue.push(pending);
       state.pendingContinuationsByThread.set(key, queue);
       if (activeRecord) {
-        this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+        void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       }
       return { accepted: true, runId };
     }
@@ -1862,7 +1862,7 @@ export class AgentThreadStreamRuntime {
       if ((idleQueue?.length ?? 0) > 0) {
         const nextRecord = state.threadRunsById.get(output.runId);
         if (nextRecord) {
-          this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, nextRecord);
         }
       }
     } catch (err) {
@@ -2360,7 +2360,7 @@ export class AgentThreadStreamRuntime {
       const idleQueue = state.pendingIdleSignalsByThread.get(key) ?? [];
       idleQueue.push({ agent, signal, runId: queuedRunId, resourceId, threadId, streamOptions: queuedStreamOptions });
       state.pendingIdleSignalsByThread.set(key, idleQueue);
-      this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+      void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       return {
         signal,
         runId: queuedRunId,
@@ -2595,7 +2595,7 @@ export class AgentThreadStreamRuntime {
             signal: this.#serializeSignal(signal),
             sourceId: this.#id,
           });
-          this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+          void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
           return acceptSignal(
             {
               signal,
@@ -2745,7 +2745,7 @@ export class AgentThreadStreamRuntime {
       state.pendingIdleSignalsByThread.set(key, idleQueue);
       state.pendingIdleThreadKeysByRunId.set(runId, key);
       if (activeRecord) {
-        this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
+        void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
       }
       return acceptSignal(
         {

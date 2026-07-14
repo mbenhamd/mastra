@@ -20,13 +20,12 @@ import {
   HarnessStorageThreadDeleteFenceUnsupportedError,
 } from '../../storage/domains/harness/base';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
-import { createHarnessOperatorThreadController } from './harness';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { InMemoryMemory } from '../../storage/domains/memory/inmemory';
 import { InMemoryStore } from '../../storage/mock';
 import { MockAgent, setupHarness } from './__test-utils__';
 import { HarnessConfigError, HarnessStorageError, HarnessThreadNotFoundError } from './errors';
-import { Harness } from './harness';
+import { createHarnessOperatorThreadController, Harness  } from './harness';
 
 const externalSessionStorageOwnerMetadataKey = '__mastraHarnessExternalSessionStorageOwner';
 const harnessThreadDeleteInProgressMetadataKey = '__mastraHarnessThreadDeleteInProgress';

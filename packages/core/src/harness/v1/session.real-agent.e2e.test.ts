@@ -38,11 +38,11 @@
  * `Agent` class; only the LANGUAGE MODEL is mocked (deterministic, no network).
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
-import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent';
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';

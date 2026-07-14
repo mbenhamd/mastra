@@ -9,14 +9,14 @@
  * on the same turn. These tests drive Agent.convertTools() directly with a
  * crafted channel-bound RequestContext.
  */
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
-import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 
+import type { AgentChannels } from '../channels/agent-channels';
 import { RequestContext } from '../request-context';
 import { createTool } from '../tools';
-import type { AgentChannels } from '../channels/agent-channels';
 
 import { Agent } from './agent';
 import {

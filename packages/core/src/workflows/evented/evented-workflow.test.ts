@@ -21,7 +21,7 @@ import { z } from 'zod/v4';
 import { Agent } from '../../agent';
 import { MastraNonRetryableError } from '../../error';
 import { EventEmitterPubSub } from '../../events/event-emitter';
-import type { EventCallback, SubscribeOptions } from '../../events/types';
+import type { SubscribeOptions } from '../../events/types';
 import { Mastra } from '../../mastra';
 import type { Processor } from '../../processors';
 import { ProcessorStepSchema } from '../../processors/step-schema';

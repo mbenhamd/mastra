@@ -3,7 +3,6 @@ import type { BackgroundTaskManager } from '../../../background-tasks';
 import type { AgentBackgroundConfig } from '../../../background-tasks/types';
 import type { SystemMessage } from '../../../llm';
 import { createRunScope } from '../../../mastra/run-scope';
-import { INITIAL_SIGNAL_ECHOES_KEY } from './run-scope-keys';
 import type { MastraMemory } from '../../../memory/memory';
 import type { MemoryConfigInternal, StorageThreadType } from '../../../memory/types';
 import type { Span, SpanType } from '../../../observability';
@@ -20,6 +19,7 @@ import type { AgentMethodType } from '../../types';
 import { createMapResultsStep } from './map-results-step';
 import { createPrepareMemoryStep } from './prepare-memory-step';
 import { createPrepareToolsStep } from './prepare-tools-step';
+import { INITIAL_SIGNAL_ECHOES_KEY } from './run-scope-keys';
 import type { AgentCapabilities } from './schema';
 import { createStreamStep } from './stream-step';
 

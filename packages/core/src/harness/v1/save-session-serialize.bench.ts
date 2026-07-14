@@ -78,7 +78,7 @@ function buildLargeRecord(opts: { queueItems: number; receipts: number; transcri
 const RECORD = buildLargeRecord({ queueItems: 90, receipts: 90, transcript: 400 });
 
 // Report approximate serialized size once at module load (visible in bench stderr/log).
-// eslint-disable-next-line no-console
+ 
 console.error(`[save-session-serialize.bench] approx JSON size: ${(JSON.stringify(RECORD).length / 1024).toFixed(1)} KB`);
 
 const BOUNDED = { time: 1000, iterations: 100, warmupIterations: 10, warmupTime: 200 } as const;
