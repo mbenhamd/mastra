@@ -66,6 +66,8 @@ export const durableAgenticOutputSchema = z.object({
  */
 export const baseDurableAgenticInputSchema = z.object({
   runId: z.string(),
+  // Optional for workflows persisted before runtime registry bindings existed.
+  runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
   messageListState: z.any(),
@@ -83,6 +85,8 @@ export const baseDurableAgenticInputSchema = z.object({
 export const baseIterationStateSchema = z.object({
   // Original input fields
   runId: z.string(),
+  // Optional for workflows persisted before runtime registry bindings existed.
+  runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
   messageListState: z.any(),

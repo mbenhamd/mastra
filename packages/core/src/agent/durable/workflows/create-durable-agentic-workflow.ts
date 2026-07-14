@@ -13,7 +13,7 @@ import { PUBSUB_SYMBOL } from '../../../workflows/constants';
 import { createWorkflow } from '../../../workflows/create';
 import { MessageList } from '../../message-list';
 import { DurableStepIds, DurableAgentDefaults } from '../constants';
-import { globalRunRegistry } from '../run-registry';
+import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';
 import { emitChunkEvent, emitFinishEvent, emitIterationCompleteEvent } from '../stream-adapter';
 import type {
   DurableToolCallInput,
@@ -56,6 +56,8 @@ export interface DurableAgenticWorkflowOptions {
 const durableAgenticInputSchema = z.object({
   __workflowKind: z.literal('durable-agent'),
   runId: z.string(),
+  // Optional for workflows persisted before runtime registry bindings existed.
+  runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
   messageListState: z.any(),
@@ -180,6 +182,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         const state = inputData as IterationState;
         return {
           runId: state.runId,
+          runtimeBindingId: state.runtimeBindingId,
           agentId: state.agentId,
           agentName: state.agentName,
           messageListState: state.messageListState,
@@ -633,7 +636,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
           const finalText = lastStep?.text;
 
           // Run output processors (processOutputResult) if available
-          const registryEntry = globalRunRegistry.get(state.runId);
+          const registryEntry = getBoundRunRegistryEntry(state.runId, state.runtimeBindingId);
           if (registryEntry?.outputProcessors?.length) {
             try {
               const { ProcessorRunner } = await import('../../../processors/runner');

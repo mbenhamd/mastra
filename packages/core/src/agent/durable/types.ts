@@ -175,6 +175,8 @@ export interface SerializableDurableOptions {
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'tool'; toolName: string };
   /** Tool names enabled for this execution */
   activeTools?: string[];
+  /** Immutable tool-name ceiling for replacement toolset executions */
+  toolSurfaceFence?: string[];
   /** Serializable LLM call settings (temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, stopSequences, seed). Headers are excluded — see RunRegistryEntry. */
   modelSettings?: SerializableModelSettings;
   /** Whether to require tool approval globally */
@@ -244,6 +246,11 @@ export interface DurableAgenticWorkflowInput {
   __workflowKind: 'durable-agent';
   /** Unique identifier for this execution run */
   runId: string;
+  /**
+   * Unpredictable binding to the exact non-serializable registry entry for this run.
+   * Optional only when reading workflows persisted before runtime bindings were introduced.
+   */
+  runtimeBindingId?: string;
   /** Agent identifier */
   agentId: string;
   /** Agent name for logging/tracing */
@@ -548,6 +555,8 @@ export interface RegistryModelListEntry {
  * Registry entry for a single run's non-serializable state
  */
 export interface RunRegistryEntry {
+  /** Must match the durable workflow input before any retained runtime dependency is used */
+  runtimeBindingId: string;
   /**
    * Marks a minimal cross-process placeholder entry (e.g. seeded by
    * @mastra/inngest resume() to carry an abort controller). Placeholder
@@ -558,6 +567,14 @@ export interface RunRegistryEntry {
   isPlaceholder?: boolean;
   /** Resolved tools with execute functions */
   tools: Record<string, CoreTool>;
+  /**
+   * Immutable, fenced replacement surface captured from the original tools at
+   * preparation time (replacement runs only). The tool-call step dispatches from
+   * this instead of the mutable `tools` map so a processor that mutates the shared
+   * registry in place cannot swap the executable behind an allowed name after the
+   * model was shown the fenced original.
+   */
+  replacementToolSurface?: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
   saveQueueManager?: SaveQueueManager;
   /** Memory instance for thread creation and message persistence */

@@ -375,7 +375,24 @@ await agent.generate('Check the forecast', {
 })
 ```
 
-See the [`Agent.generate()` reference](/reference/agents/generate) for all runtime options including `toolsets`, `clientTools`, and `prepareStep`.
+### Replace all tool sources
+
+Set `toolsetsMode: 'replace'` to expose only the supplied per-execution toolsets. Replacement excludes assigned tools, memory tools, client tools, agents, workflows, workspace tools, skills, channel tools, browser tools, and processor-loaded tools.
+
+```typescript title="src/mastra/agents/restricted-run.ts"
+await agent.generate('Run the approved operation', {
+  toolsets: {
+    approved: { approvedTool },
+  },
+  toolsetsMode: 'replace',
+})
+```
+
+Mastra snapshots the replacement names, executable functions, and nested tool configuration for the execution. After each input-processor pass it materializes a fresh trusted tool map from that snapshot. Input processors can narrow the set for a step, but they can't expand it, replace an allowed implementation, or mutate the configuration used by later model or execution calls. An empty `toolsets` object creates a tool-free execution. Durable reconstruction fails closed if the original replacement implementations are no longer available after a process restart.
+
+Replacement fences are cleared when runs terminate or resume. To keep caller-retained `RequestContext` instances bounded when suspended runs are abandoned, Mastra allows at most 64 simultaneously retained replacement fences per context. Use a distinct context or finish or resume existing runs before starting more.
+
+See the [`Agent.generate()` reference](/reference/agents/generate) for all runtime options including `toolsets`, `toolsetsMode`, `clientTools`, and `prepareStep`.
 
 ## Control `toolName` in stream responses
 

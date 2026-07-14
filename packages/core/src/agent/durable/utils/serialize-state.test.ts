@@ -500,3 +500,9 @@ describe('serializeToolMetadata approval metadata', () => {
     expect(metadata.requireApproval).toBe(true);
   });
 });
+
+describe('serializeDurableOptions', () => {
+  it('persists the immutable replacement tool ceiling', () => {
+    expect(serializeDurableOptions({ toolSurfaceFence: ['modeTool'] }).toolSurfaceFence).toEqual(['modeTool']);
+  });
+});

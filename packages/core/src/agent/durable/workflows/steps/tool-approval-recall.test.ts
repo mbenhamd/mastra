@@ -39,6 +39,7 @@ vi.mock('../../stream-adapter', () => ({
 }));
 
 const RUN_ID = 'run-approval-1';
+const RUNTIME_BINDING_ID = 'binding-approval-1';
 const AGENT_ID = 'agent-1';
 const TOOL_NAME = 'findUserTool';
 const TOOL_CALL_ID = 'call-1';
@@ -55,6 +56,7 @@ function mockPubsub() {
 function makeInitData() {
   return {
     runId: RUN_ID,
+    runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: AGENT_ID,
     options: { requireToolApproval: true },
     state: { threadId: THREAD_ID, resourceId: RESOURCE_ID, memoryConfig: undefined, threadExists: true },
@@ -63,6 +65,7 @@ function makeInitData() {
 
 function setupRegistry(execute: (...args: any[]) => any) {
   globalRunRegistry.set(RUN_ID, {
+    runtimeBindingId: RUNTIME_BINDING_ID,
     tools: { [TOOL_NAME]: { execute } },
     requireToolApproval: true,
     model: {} as any,

@@ -342,6 +342,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
                 threadExists: memoryData.threadExists,
                 structuredOutput: !!options.structuredOutput?.schema,
                 overrideScorers: options.scorers,
+                _toolSurfaceFenceOwnerId: options._toolSurfaceFenceOwnerId,
               });
             } catch (e) {
               capabilities.logger.error('Error saving memory on finish', {

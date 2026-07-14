@@ -22,6 +22,12 @@ import type { MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
 import type { CreatedAgentSignal } from '../signals';
 import { mastraDBMessageToSignal } from '../signals';
+import {
+  clearToolSurfaceFence,
+  createToolSurfaceFence,
+  materializeToolSurfaceFence,
+  readToolSurfaceFence,
+} from '../tool-surface-fence';
 import { TripWire } from '../trip-wire';
 import type {
   AgentInstructions,
@@ -107,6 +113,7 @@ interface DurablePreparationAgent {
   }): Promise<Record<string, { scorer: unknown; sampling?: unknown }> | undefined>;
   getToolsForExecution(opts: {
     toolsets?: ToolsetsInput;
+    toolsetsMode?: AgentExecutionOptions['toolsetsMode'];
     clientTools?: ToolsInput;
     threadId?: string;
     resourceId?: string;
@@ -117,6 +124,7 @@ interface DurablePreparationAgent {
     hooks?: ToolHooks;
     delegation?: DelegationConfig;
     methodType?: AgentMethodType;
+    _toolSurfaceFenceOwnerId?: string;
   }): Promise<Record<string, CoreTool>>;
   listInputProcessors(requestContext?: RequestContext): Promise<InputProcessorOrWorkflow[]>;
   listOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
@@ -224,6 +232,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 1. Generate IDs
   const runId = providedRunId ?? crypto.randomUUID();
   const messageId = crypto.randomUUID();
+  const runtimeBindingId = crypto.randomUUID();
 
   // 2. Get request context
   const requestContext = providedRequestContext ?? new RequestContext();
@@ -263,6 +272,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const resourceId = execOptions?.memory?.resource;
   let threadObject: StorageThreadType | undefined;
   let threadExists = false;
+  let processorMemory: MastraMemory | undefined;
+  let createdThreadDuringPreparation = false;
 
   // 5. Create MessageList
   const messageList = new MessageList({
@@ -339,19 +350,25 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // saved by the update-working-memory tool but never read back into the prompt.
   // Setting the context first keeps read (inject) and write (tool) in sync.
   const memory = await typedAgent.getMemory({ requestContext });
+  // Tracked so a failed replacement-mode preparation below can roll back a
+  // thread this preparation created (never a pre-existing one).
+  processorMemory = memory;
   const memoryConfig = execOptions?.memory?.options;
   if (memory && threadId && resourceId) {
     const existingThread = await memory.getThreadById({ threadId });
-    threadObject =
-      existingThread ??
-      (await memory.createThread({
+    if (existingThread) {
+      threadObject = existingThread;
+    } else {
+      threadObject = await memory.createThread({
         threadId,
         metadata: thread?.metadata,
         title: thread?.title,
         memoryConfig,
         resourceId,
         saveThread: true,
-      }));
+      });
+      createdThreadDuringPreparation = true;
+    }
     threadExists = true;
     requestContext.set('MastraMemory', { thread: threadObject, resourceId, memoryConfig });
   } else {
@@ -464,12 +481,13 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       }
     }
   }
-
   // 7. Convert tools to CoreTool format for execution
   let tools: Record<string, CoreTool> = {};
+  const toolSurfaceFenceOwnerId = crypto.randomUUID();
   try {
     tools = await typedAgent.getToolsForExecution({
       toolsets: execOptions?.toolsets,
+      toolsetsMode: execOptions?.toolsetsMode,
       clientTools: execOptions?.clientTools,
       threadId,
       resourceId,
@@ -480,10 +498,31 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       hooks: execOptions?.hooks,
       delegation: execOptions?.delegation,
       methodType,
+      _toolSurfaceFenceOwnerId: toolSurfaceFenceOwnerId,
     });
   } catch (error) {
     logger?.warn?.(`[DurableAgent] Error converting tools: ${error}`);
+    // getToolsForExecution merges agent defaults internally. Re-resolve only
+    // on this exceptional path so an inherited replacement mode cannot be
+    // mistaken for append mode and silently continue with an empty surface.
+    const defaultOptions = await typedAgent.getDefaultOptions({ requestContext });
+    if ((execOptions?.toolsetsMode ?? defaultOptions.toolsetsMode) === 'replace') {
+      clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId);
+      if (createdThreadDuringPreparation && processorMemory && threadId) {
+        try {
+          await processorMemory.deleteThread(threadId);
+        } catch (rollbackError) {
+          logger?.warn?.(`[DurableAgent] Error rolling back preparation thread: ${rollbackError}`);
+        }
+      }
+      throw error;
+    }
   }
+  const replacementFence = readToolSurfaceFence(requestContext, runId);
+  const ownsReplacementFence = replacementFence
+    ? clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId)
+    : false;
+  const toolSurfaceFence = ownsReplacementFence ? [...replacementFence!.allowedNames] : undefined;
 
   // 8. Get model (and model list if configured)
   const model = await typedAgent.getModel({ requestContext });
@@ -579,6 +618,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 13. Create serialized workflow input
   const workflowInput = createWorkflowInput({
     runId,
+    runtimeBindingId,
     agentId: publicAgentId,
     agentName: publicAgentName,
     messageList,
@@ -589,7 +629,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     options: {
       maxSteps: execOptions?.maxSteps,
       toolChoice: execOptions?.toolChoice as any,
-      activeTools: execOptions?.activeTools,
+      activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
+      toolSurfaceFence,
       modelSettings: execOptions?.modelSettings as any,
       // Function-form approval policies are closures that can't ride on the
       // serialized workflow input — the live closure is parked on the run
@@ -638,9 +679,22 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     requestContextEntries: requestContextEntriesSnapshot,
   });
 
-  // 14. Create registry entry for non-serializable state
+  // 14. Create registry entry for non-serializable state.
+  // For a replacement run, capture an immutable surface bound to the ORIGINAL
+  // fenced implementations now, before any per-step input processor can mutate
+  // the shared `tools` map in place. The tool-call step dispatches from this
+  // instead of re-snapshotting the mutable registry object.
+  const replacementToolSurface =
+    toolSurfaceFence !== undefined
+      ? (Object.freeze(materializeToolSurfaceFence(createToolSurfaceFence(tools, toolSurfaceFence))) as Record<
+          string,
+          CoreTool
+        >)
+      : undefined;
   const registryEntry: RunRegistryEntry = {
+    runtimeBindingId,
     tools,
+    replacementToolSurface,
     saveQueueManager,
     memory,
     model,
@@ -765,7 +819,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           schema: toStandardSchema(execOptions.structuredOutput.schema),
         }
       : undefined,
-    cleanup: () => {},
   };
 
   return {

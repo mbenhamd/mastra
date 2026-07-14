@@ -17,7 +17,8 @@ import type { CoreTool, RequireToolApproval } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
-import { globalRunRegistry } from '../run-registry';
+import { createToolSurfaceFence } from '../../tool-surface-fence';
+import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';
 import type {
   RunRegistryEntry,
   SerializableDurableState,
@@ -130,21 +131,7 @@ export class DurableProcessorRebuildError extends Error {
 export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions): Promise<ResolvedRuntimeDependencies> {
   const { mastra, runId, agentId, input, logger } = options;
 
-  // 1. Deserialize MessageList
-  // Reuse the existing MessageList from the registry if available so that
-  // external consumers (e.g. the stream adapter) that hold a reference to it
-  // see the updated state.  Creating a new instance each iteration would
-  // orphan those references (their newResponseMessages Set would point at
-  // stale objects).
-  const existingEntry = globalRunRegistry.get(runId);
-  const messageList = existingEntry?.messageList
-    ? existingEntry.messageList.deserialize(input.messageListState)
-    : new MessageList({
-        threadId: input.state.threadId,
-        resourceId: input.state.resourceId,
-      }).deserialize(input.messageListState);
-
-  // 2. Check global registry first (for local/test execution).
+  // 1. Check global registry first (for local/test execution).
   // This is necessary because workflow steps don't have direct access to
   // DurableAgent's registry.
   //
@@ -162,10 +149,33 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // are detected by the explicit `isPlaceholder` flag or by the absence of a
   // real model instance (every in-process seeding site stores the live model;
   // placeholders and metadata-only stubs do not).
-  const globalEntry = globalRunRegistry.get(runId);
+  //
+  // The bound read runs BEFORE the MessageList reuse below so a caller-reused
+  // runId can never rebind an older workflow to a newer run's runtime
+  // dependencies (or clobber its MessageList) — it throws on binding mismatch.
+  const globalEntry = getBoundRunRegistryEntry(runId, input.runtimeBindingId);
   const registryModel = globalEntry?.model as (MastraLanguageModel & { __metadataOnly?: boolean }) | undefined;
   const hasHydratedEntry =
     !!globalEntry && globalEntry.isPlaceholder !== true && !!registryModel && registryModel.__metadataOnly !== true;
+  if (globalEntry && hasHydratedEntry && input.options?.toolSurfaceFence !== undefined) {
+    // This also rejects stale persisted name ceilings whose concrete tool was
+    // omitted or replaced with an accessor/undefined registry value.
+    createToolSurfaceFence(globalEntry.tools, input.options.toolSurfaceFence);
+  }
+
+  // 2. Deserialize MessageList
+  // Reuse the existing MessageList from the registry if available so that
+  // external consumers (e.g. the stream adapter) that hold a reference to it
+  // see the updated state.  Creating a new instance each iteration would
+  // orphan those references (their newResponseMessages Set would point at
+  // stale objects).
+  const messageList = globalEntry?.messageList
+    ? globalEntry.messageList.deserialize(input.messageListState)
+    : new MessageList({
+        threadId: input.state.threadId,
+        resourceId: input.state.resourceId,
+      }).deserialize(input.messageListState);
+
   let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
   let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
@@ -183,6 +193,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // through and rebuild from the Mastra instance.
   if (hasHydratedEntry) {
     logger?.debug?.(`[DurableAgent:${agentId}] Using model and tools from global registry for run ${runId}`);
+  } else if ((input.options?.toolSurfaceFence?.length ?? 0) > 0) {
+    throw new Error(
+      `[DurableAgent:${agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
+    );
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
@@ -194,6 +208,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       const resolveRequestContext = restoreRequestContext(input.requestContextEntries);
 
       tools = await agent.getToolsForExecution({
+        ...(input.options?.toolSurfaceFence ? { toolsets: {}, toolsetsMode: 'replace' as const } : {}),
         runId,
         threadId: input.state.threadId,
         resourceId: input.state.resourceId,
@@ -264,8 +279,12 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   if (rehydratedFromMastra) {
     const rebuilt: Partial<RunRegistryEntry> = {
       // The entry now carries real runtime state — drop the placeholder mark
-      // so sibling steps in this process trust it instead of rebuilding.
-      isPlaceholder: false,
+      // so sibling steps in this process trust it instead of rebuilding. A
+      // trusted entry must also carry the workflow input's runtime binding or
+      // every later bound read would reject it; inputs persisted before
+      // runtime bindings existed stay marked as untrusted carriers.
+      isPlaceholder: input.runtimeBindingId === undefined,
+      ...(input.runtimeBindingId !== undefined ? { runtimeBindingId: input.runtimeBindingId } : {}),
       tools,
       model,
       modelList,
@@ -385,7 +404,10 @@ export async function rebuildRunToolsFromMastra(options: {
       existing.memory ??= memory;
       existing.saveQueueManager ??= saveQueueManager;
     } else {
-      globalRunRegistry.set(runId, patch as RunRegistryEntry);
+      // The patch has no model and no runtime binding — register it as an
+      // untrusted placeholder carrier so bound reads never mistake it for the
+      // prepared run's runtime dependencies.
+      globalRunRegistry.set(runId, { isPlaceholder: true, ...patch } as RunRegistryEntry);
     }
 
     return { tools, workspace, memory, saveQueueManager };

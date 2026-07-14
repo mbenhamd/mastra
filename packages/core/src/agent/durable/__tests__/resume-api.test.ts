@@ -24,6 +24,7 @@ import type { WorkflowRunState } from '../../../workflows/types';
 import { Agent } from '../../agent';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
 
 // ============================================================================
 // Helper Functions
@@ -921,6 +922,37 @@ describe('Observe API', () => {
 
     expect(result.runId).toBe(runId);
     result.cleanup();
+  });
+
+  it('does not let a stale observer cleanup erase a newer binding replay cache', async () => {
+    const baseAgent = new Agent({
+      id: 'observe-stale-cleanup-agent',
+      name: 'Observe Stale Cleanup Agent',
+      instructions: 'test',
+      model: createTextModel('unused') as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub: cachingPubsub });
+    const runId = 'observer-reused-run';
+    const first = await durableAgent.prepare('first', { runId });
+    const staleObserver = await durableAgent.observe(runId);
+
+    durableAgent.runRegistry.cleanupBound(runId, first.workflowInput.runtimeBindingId);
+    globalRunRegistry.delete(runId);
+    const second = await durableAgent.prepare('second', { runId });
+    const topic = `agent.stream.${runId}`;
+    await cachingPubsub.publish(topic, { type: 'second-binding-event', runId, data: { binding: 'second' } });
+
+    staleObserver.cleanup();
+
+    expect(durableAgent.runRegistry.get(runId)?.runtimeBindingId).toBe(second.workflowInput.runtimeBindingId);
+    expect(globalRunRegistry.get(runId)?.runtimeBindingId).toBe(second.workflowInput.runtimeBindingId);
+    expect(await cachingPubsub.getHistory(topic)).toEqual([
+      expect.objectContaining({ type: 'second-binding-event', data: { binding: 'second' } }),
+    ]);
+
+    durableAgent.runRegistry.cleanupBound(runId, second.workflowInput.runtimeBindingId);
+    globalRunRegistry.delete(runId);
+    await cachingPubsub.clearTopic(topic);
   });
 });
 

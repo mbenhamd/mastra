@@ -219,7 +219,8 @@ Use the returned `source` field to route execution through the owning surface, s
           {
             name: 'tools',
             type: 'ToolsInput',
-            description: "Replaces the backing agent's tools for this mode. Mutually exclusive with `additionalTools`.",
+            description:
+              "Replaces every backing-agent tool source for this mode. Harness built-ins remain available unless `harnessBuiltins` is `'exclude'`. Mutually exclusive with `additionalTools`.",
             isOptional: true,
           },
           {
@@ -227,6 +228,14 @@ Use the returned `source` field to route execution through the owning surface, s
             type: 'ToolsInput',
             description: "Tools layered on top of the backing agent's tools. Mutually exclusive with `tools`.",
             isOptional: true,
+          },
+          {
+            name: 'harnessBuiltins',
+            type: "'include' | 'exclude'",
+            description:
+              "Controls Harness-owned plan-task and subagent built-ins for this mode. Defaults to `'include'`.",
+            isOptional: true,
+            defaultValue: "'include'",
           },
           {
             name: 'agent',

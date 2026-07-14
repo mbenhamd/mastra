@@ -204,10 +204,7 @@ describe('Session — suspend capture on message()', () => {
 
     // §4.2f — durable per-signalId evidence stays `pending` until resume
     // terminalizes (the accept-time pending write is the durable barrier).
-    await waitFor(
-      () => session.getRecord().pendingResume !== undefined,
-      'pendingResume captured for suspended signal',
-    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'pendingResume captured for suspended signal');
     const lookup = await session.lookupMessageResult(handle.id);
     expect(lookup && 'status' in lookup ? lookup.status : null).toBe('pending');
   });
@@ -229,10 +226,7 @@ describe('Session — suspend capture on message()', () => {
     expect(suspended.finishReason).toBe('suspended');
 
     // Evidence is parked while suspended (companion to the test above).
-    await waitFor(
-      () => session.getRecord().pendingResume !== undefined,
-      'pendingResume captured for suspended signal',
-    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'pendingResume captured for suspended signal');
     expect((session.getRecord().pendingResume as { originSignalId?: string }).originSignalId).toBe(handle.id);
 
     // Now approve the tool → resume runs to a terminal (non-suspended) finish.
@@ -243,10 +237,7 @@ describe('Session — suspend capture on message()', () => {
     // §4.2f — the terminal resume IS this signal's answer: it settles the
     // durable per-signalId evidence and projects signal_completed (not just
     // agent_end), so a suspended owned signal does not stay pending forever.
-    await waitFor(
-      () => events.some(e => e.type === 'signal_completed'),
-      'signal_completed after terminal resume',
-    );
+    await waitFor(() => events.some(e => e.type === 'signal_completed'), 'signal_completed after terminal resume');
     const lookup = await session.lookupMessageResult(handle.id);
     expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
     expect(session.getRecord().pendingResume).toBeUndefined();
@@ -263,20 +254,14 @@ describe('Session — suspend capture on message()', () => {
 
     const handle = await session.signal({ content: 'do it' });
     await handle.result;
-    await waitFor(
-      () => session.getRecord().pendingResume !== undefined,
-      'pendingResume captured for suspended signal',
-    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'pendingResume captured for suspended signal');
 
     // No further run enqueued → resumeStream throws → terminal failure.
     const events: { type: string }[] = [];
     session.subscribe(e => events.push(e));
     await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
 
-    await waitFor(
-      () => events.some(e => e.type === 'signal_failed'),
-      'signal_failed after failed resume',
-    );
+    await waitFor(() => events.some(e => e.type === 'signal_failed'), 'signal_failed after failed resume');
     const lookup = await session.lookupMessageResult(handle.id);
     expect(lookup && 'status' in lookup ? lookup.status : null).toBe('failed');
   });
@@ -1138,10 +1123,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     const first = session.queue({ content: 'first' });
     void first.catch(() => {});
     // Yield so the drain starts the first item and it parks on the suspension.
-    await waitFor(
-      () => session.getRecord().pendingResume !== undefined,
-      'first queued turn suspended',
-    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'first queued turn suspended');
     const second = session.queue({ content: 'second' });
     void second.catch(() => {});
 

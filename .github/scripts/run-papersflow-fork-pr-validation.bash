@@ -1179,6 +1179,7 @@ changed_files="$(mktemp)"
 changed_lockfile_importers="$(mktemp)"
 changed_workspaces="$(mktemp)"
 changed_tests="$(mktemp)"
+forced_mastracode_tests="$(mktemp)"
 delegated_docs_tests="$(mktemp)"
 deleted_tests="$(mktemp)"
 fixer_test_result="$(mktemp)"
@@ -1191,7 +1192,7 @@ unsupported_mastracode_sources="$(mktemp)"
 unsupported_tests="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$forced_mastracode_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_tests" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
@@ -1384,7 +1385,8 @@ while IFS= read -r file; do
         case "$file" in
           mastracode/src/tui/components/login-dialog.test.ts | \
             mastracode/src/tui/event-dispatch.test.ts | \
-            mastracode/src/tui/notify.test.ts) ;;
+            mastracode/src/tui/notify.test.ts | \
+            mastracode/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
       fi
@@ -1401,15 +1403,26 @@ while IFS= read -r file; do
       mastracode/src/tui/notify.ts)
         required_test="mastracode/src/tui/notify.test.ts"
         ;;
+      mastracode/src/utils/signals-pubsub.ts)
+        required_test="mastracode/src/utils/__tests__/signals-pubsub.test.ts"
+        ;;
+      mastracode/src/index.ts)
+        # Composition root: no unit suite owns it; the mastracode lane's
+        # build:mastracode compiles it and the owned TUI suites exercise its
+        # wiring. Restoration-only edits are accepted under the build gate.
+        ;;
       *)
         printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
         ;;
     esac
     if [[ -n "$required_test" ]]; then
-      if ! git_regular_file_at_head "$file" ||
-        ! grep -Fxq "$required_test" "$changed_files" ||
-        ! git_regular_file_at_head "$required_test"; then
+      if ! git_regular_file_at_head "$file" || ! git_regular_file_at_head "$required_test"; then
         printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
+      elif ! grep -Fxq "$required_test" "$changed_files"; then
+        # The paired suite exists but was not edited: force it to RUN so the
+        # source change is still executed against its owned coverage instead
+        # of failing closed on parse-only or restoration commits.
+        printf '%s\n' "$required_test" >> "$forced_mastracode_tests"
       fi
     fi
   fi
@@ -1434,7 +1447,7 @@ if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_t
     cat "$deleted_tests" >&2
   fi
   if [[ -s "$unsupported_mastracode_sources" ]]; then
-    echo "These MastraCode production sources are outside the three owned source-and-test pairs:" >&2
+    echo "These MastraCode production sources are outside the owned source-and-test pairs:" >&2
     cat "$unsupported_mastracode_sources" >&2
   fi
   if [[ -s "$missing_mastracode_tests" ]]; then
@@ -1721,20 +1734,27 @@ if workspace_changed packages/server; then
     run_with_validation_budget 600 \
       pnpm --dir packages/server exec vitest run src/server/server-adapter/routes/permissions.test.ts --reporter=dot
   fi
-  run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
-  run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
-  # Compare generator output against the immutable PR head, not the mutable
-  # index or a movable HEAD: a PR-controlled generator could stage or commit
-  # its own output and pass an index-relative diff without that content being
-  # part of the reviewed head commit.
-  if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
-    echo "Validation checkout no longer matches the pull request head commit ${HEAD_SHA}." >&2
-    echo "A generator or package script moved HEAD; failing closed." >&2
+  # Anchor artifact freshness to the commit the workflow checked out. In CI
+  # that is the pull_request merge commit, whose second parent must be the PR
+  # head; local and fixture runs check out the head directly. Capturing the
+  # anchor before the generators run means a PR-controlled generator that
+  # stages or commits its own output still diffs against reviewed content.
+  server_artifact_anchor="$(git rev-parse HEAD)"
+  if [[ "$server_artifact_anchor" != "$HEAD_SHA" && \
+    "$(git rev-parse --quiet --verify 'HEAD^2' 2>/dev/null || true)" != "$HEAD_SHA" ]]; then
+    echo "Validation checkout matches neither the pull request head ${HEAD_SHA} nor a merge of it." >&2
+    echo "Failing closed instead of validating unreviewed content." >&2
     exit 1
   fi
-  if ! git cat-file -e "${HEAD_SHA}:client-sdks/client-js/src/route-types.generated.ts" 2>/dev/null || \
-    ! git cat-file -e "${HEAD_SHA}:packages/cli/src/commands/api/route-metadata.generated.ts" 2>/dev/null || \
-    ! git diff --exit-code "$HEAD_SHA" -- \
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
+  if [[ "$(git rev-parse HEAD)" != "$server_artifact_anchor" ]]; then
+    echo "A generator or package script moved HEAD during Server validation; failing closed." >&2
+    exit 1
+  fi
+  if ! git cat-file -e "${server_artifact_anchor}:client-sdks/client-js/src/route-types.generated.ts" 2>/dev/null || \
+    ! git cat-file -e "${server_artifact_anchor}:packages/cli/src/commands/api/route-metadata.generated.ts" 2>/dev/null || \
+    ! git diff --exit-code "$server_artifact_anchor" -- \
       client-sdks/client-js/src/route-types.generated.ts \
       packages/cli/src/commands/api/route-metadata.generated.ts; then
     echo "Generated Server route artifacts are stale or missing from the pull request." >&2
@@ -1778,9 +1798,12 @@ if workspace_changed stores/redis; then
 fi
 
 if workspace_changed mastracode; then
-  # MastraCode's Vitest setup mocks this workspace package, but Vite still
-  # resolves its exported dist entry before applying the mock.
+  # MastraCode's Vitest setup mocks these workspace packages, but Vite still
+  # resolves their exported dist entries before applying the mocks
+  # (settings.ts lazily imports @mastra/stagehand; the TUI imports
+  # @mastra/github-signals).
   run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
+  run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
   mapfile -t mastracode_lint_files < <(
     while IFS= read -r file; do
       if [[ -f "$file" && "$file" =~ ^mastracode/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
@@ -2094,7 +2117,14 @@ function unsupportedRuntimeReasons(file, source) {
   const computedSpecifiers = new Set();
   for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers)) {
     const reason = unsupportedModuleReason(specifier);
-    if (reason) reasons.add(`module ${reason}`);
+    // A banned specifier that already existed in this file at the trusted
+    // base commit is part of the reviewed production surface (e.g. a server
+    // handler's SSRF-guarded fetch); editing unrelated lines of that file
+    // must not retroactively reject it. Only NEWLY ADDED banned imports in
+    // the changed surface fail closed.
+    if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier))) {
+      reasons.add(`module ${reason}`);
+    }
     if (
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
@@ -2252,7 +2282,8 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif [[ "$file" == mastracode/* && \
       "$file" != mastracode/src/tui/components/login-dialog.test.ts && \
       "$file" != mastracode/src/tui/event-dispatch.test.ts && \
-      "$file" != mastracode/src/tui/notify.test.ts ]]; then
+      "$file" != mastracode/src/tui/notify.test.ts && \
+      "$file" != mastracode/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
@@ -2283,6 +2314,11 @@ if server_route_source_changed; then
     >> "$changed_tests"
 fi
 
+if [[ -s "$forced_mastracode_tests" ]]; then
+  echo "Forcing owned MastraCode suites to run for source-only changes:"
+  sort -u "$forced_mastracode_tests"
+  sort -u "$forced_mastracode_tests" >> "$changed_tests"
+fi
 sort -u -o "$changed_tests" "$changed_tests"
 
 if [[ -s "$delegated_docs_tests" ]]; then

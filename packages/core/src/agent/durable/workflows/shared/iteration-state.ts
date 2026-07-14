@@ -82,6 +82,7 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
 
   return {
     runId: currentState.runId,
+    runtimeBindingId: currentState.runtimeBindingId,
     agentId: currentState.agentId,
     agentName: currentState.agentName,
     messageListState: executionOutput.messageListState,

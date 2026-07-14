@@ -36,6 +36,50 @@ const REJECTED_RUN_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
 const MAX_REJECTED_RUN_TOMBSTONES = 1000;
 const ABORTED_RUN_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
 const MAX_ABORTED_RUN_TOMBSTONES = 1000;
+const TERMINAL_PUBLISH_TIMEOUT_MS = 10_000;
+const TERMINAL_DELIVERY_TIMEOUT_MS = 30_000;
+
+export type AgentThreadOutputDrainErrorReason =
+  | 'subscription-closed'
+  | 'stream-stopped'
+  | 'registration-publish-failed'
+  | 'terminal-publish-failed'
+  | 'terminal-delivery-timeout';
+
+/** Internal failure for the subscription barrier that makes terminal delivery observable. */
+export class AgentThreadOutputDrainError extends Error {
+  readonly name = 'AgentThreadOutputDrainError';
+
+  constructor(
+    readonly reason: AgentThreadOutputDrainErrorReason,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+  }
+}
+
+/** Teardown may wake a terminal model result without replacing that already-known result. */
+export function isAgentThreadOutputDrainTeardownError(error: unknown): boolean {
+  return (
+    error instanceof AgentThreadOutputDrainError &&
+    (error.reason === 'subscription-closed' || error.reason === 'stream-stopped')
+  );
+}
+
+async function waitWithTimeout<T>(work: Promise<T>, timeoutMs: number, timeoutError: () => Error): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError()), timeoutMs);
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /**
  * TTL for the cross-process thread lease acquired in the idle-wake path.
  * Kept short so a crashed owner process frees the thread quickly. A
@@ -243,6 +287,8 @@ function createRuntimeState(): AgentThreadRuntimeState {
 export class AgentThreadStreamRuntime {
   #id = randomUUID();
   #statesByPubSub = new WeakMap<PubSub, AgentThreadRuntimeState>();
+  #threadOutputRegistrations = new WeakMap<object, Promise<void>>();
+  #threadOutputTerminals = new WeakMap<object, Promise<void>>();
 
   #getPubSub(pubsub?: PubSub): PubSub {
     return pubsub ?? defaultAgentThreadPubSub;
@@ -533,6 +579,48 @@ export class AgentThreadStreamRuntime {
       runId: event.runId,
       data: event,
     });
+  }
+
+  async #publishRegistrationAndWait(
+    pubsub: PubSub | undefined,
+    key: string,
+    event: Extract<AgentThreadStreamRuntimeEvent, { type: 'run-registered' }>,
+  ): Promise<void> {
+    try {
+      await this.#publishAndWait(pubsub, key, event);
+    } catch (error) {
+      if (error instanceof AgentThreadOutputDrainError) throw error;
+      throw new AgentThreadOutputDrainError(
+        'registration-publish-failed',
+        `Failed to publish run-registered for agent thread run ${event.runId}`,
+        error,
+      );
+    }
+  }
+
+  async #publishTerminalAndWait(
+    pubsub: PubSub | undefined,
+    key: string,
+    event: Extract<AgentThreadStreamRuntimeEvent, { type: 'run-completed' | 'run-suspended' }>,
+  ): Promise<void> {
+    try {
+      await waitWithTimeout(
+        this.#publishAndWait(pubsub, key, event),
+        TERMINAL_PUBLISH_TIMEOUT_MS,
+        () =>
+          new AgentThreadOutputDrainError(
+            'terminal-publish-failed',
+            `Timed out publishing ${event.type} for agent thread run ${event.runId}`,
+          ),
+      );
+    } catch (error) {
+      if (error instanceof AgentThreadOutputDrainError) throw error;
+      throw new AgentThreadOutputDrainError(
+        'terminal-publish-failed',
+        `Failed to publish ${event.type} for agent thread run ${event.runId}`,
+        error,
+      );
+    }
   }
 
   #withBroadcastStream<OUTPUT>(
@@ -1400,12 +1488,21 @@ export class AgentThreadStreamRuntime {
       state.pendingOutputWaiters.delete(output.runId);
       for (const waiter of waiters) waiter.resolve(output);
     }
-    const registrationPublish = this.#publishAndWait(pubsub, key, {
+    // Registration is part of the subscriber's delivery barrier just like the
+    // terminal event. Normalize its rejection so a provider run that already
+    // executed cannot become retryable merely because PubSub rejected the
+    // segment's run-registered publication.
+    const registrationPublish = this.#publishRegistrationAndWait(pubsub, key, {
       type: 'run-registered',
       runId: output.runId,
       streamId,
       streamSeq,
     });
+    // The Harness output-drain waiter may not attach until the model has already
+    // produced FullOutput. Mark the promise observed immediately while retaining
+    // the original rejecting promise below for that later waiter.
+    void registrationPublish.catch(() => {});
+    this.#threadOutputRegistrations.set(output, registrationPublish);
     state.registrationPublishesByRunId.set(output.runId, registrationPublish);
     // Always drive the run's stream to completion, even when no caller consumes
     // the returned output (e.g. a fire-and-forget schedule wake). The broadcast
@@ -1492,71 +1589,124 @@ export class AgentThreadStreamRuntime {
     if (state.watchedThreadStreamIds.has(record.streamId)) return;
     state.watchedThreadStreamIds.add(record.streamId);
 
+    let terminalSettled = false;
+    let resolveTerminal!: () => void;
+    let rejectTerminal!: (error: AgentThreadOutputDrainError) => void;
+    const terminal = new Promise<void>((resolve, reject) => {
+      resolveTerminal = () => {
+        if (terminalSettled) return;
+        terminalSettled = true;
+        resolve();
+      };
+      rejectTerminal = error => {
+        if (terminalSettled) return;
+        terminalSettled = true;
+        reject(error);
+      };
+    });
+    this.#threadOutputTerminals.set(record.output, terminal);
+    void terminal.catch(() => {});
+
     const completion = record.output._waitUntilFinished().finally(async () => {
-      // Gate finalization on the registration publish + the stream-part
-      // broadcast settling (PR #202/#204): publishing `run-completed` off
-      // `_waitUntilFinished()` alone let remote subscribers observe completion
-      // FIRST, delete the remote run, and ignore the late parts.
-      await state.registrationPublishesByRunId.get(record.runId)?.catch(() => {});
-      state.registrationPublishesByRunId.delete(record.runId);
-      await state.broadcastsByRunId.get(record.runId)?.catch(() => {});
-      state.broadcastsByRunId.delete(record.runId);
-      state.watchedThreadStreamIds.delete(record.streamId);
-      this.#cleanupPreparedRun(state, record.runId);
-
-      // A suspended run (approval or generic tool suspension) is paused, not
-      // finished: surface run-suspended and leave its records in place so a
-      // later resume can re-attach to the same thread.
-      if (record.output.status === 'suspended' && this.#isSuspendedRun(state, record.runId)) {
-        record.lifecycle = 'suspended';
-        this.#publish(pubsub, key, { type: 'run-suspended', runId: record.runId, streamId: record.streamId });
-        return;
-      }
-
-      record.lifecycle = 'completed';
-      this.#clearSuspendedRun(state, record.runId);
-      this.#forgetCallerSignalsForRun(state, record.runId);
-      let publishError: unknown;
       try {
-        await this.#publishAndWait(pubsub, key, {
+        // Gate finalization on the registration publish + the stream-part
+        // broadcast settling (PR #202/#204): publishing `run-completed` off
+        // `_waitUntilFinished()` alone let remote subscribers observe completion
+        // FIRST, delete the remote run, and ignore the late parts.
+        await state.registrationPublishesByRunId.get(record.runId)?.catch(() => {});
+        state.registrationPublishesByRunId.delete(record.runId);
+        await state.broadcastsByRunId.get(record.runId)?.catch(() => {});
+        state.broadcastsByRunId.delete(record.runId);
+        state.watchedThreadStreamIds.delete(record.streamId);
+        this.#cleanupPreparedRun(state, record.runId);
+
+        // A suspended run (approval or generic tool suspension) is paused, not
+        // finished: surface run-suspended and leave its records in place so a
+        // later resume can re-attach to the same thread.
+        if (record.output.status === 'suspended' && this.#isSuspendedRun(state, record.runId)) {
+          record.lifecycle = 'suspended';
+          await this.#publishTerminalAndWait(pubsub, key, {
+            type: 'run-suspended',
+            runId: record.runId,
+            streamId: record.streamId,
+          });
+          resolveTerminal();
+          return;
+        }
+
+        record.lifecycle = 'completed';
+        this.#clearSuspendedRun(state, record.runId);
+        this.#forgetCallerSignalsForRun(state, record.runId);
+        await this.#publishTerminalAndWait(pubsub, key, {
           type: 'run-completed',
           runId: record.runId,
           streamId: record.streamId,
         });
-      } catch (err) {
-        publishError = err;
-      }
-      state.threadRunsByStreamId.delete(record.streamId);
-      if (
-        state.activeThreadRunIds.get(key) === record.runId &&
-        state.activeThreadStreamIds.get(key) === record.streamId
-      ) {
-        state.activeThreadRunIds.delete(key);
-        state.activeThreadStreamIds.delete(key);
-      }
-      if (state.threadKeysByRunId.get(record.runId) === key) {
-        state.threadKeysByRunId.delete(record.runId);
-      }
-      // If queued follow-up work exists, keep the cross-process lease held by
-      // handing it to the next run instead of releasing it: releasing here
-      // would briefly empty the lease key, letting a racing process win it and
-      // start a competing run on this thread. The drain runs under the
-      // transferred lease and releases it only once every queue is empty. If
-      // there's no pending work, release as usual so other processes can wake
-      // the thread.
-      try {
-        if (this.#hasPendingThreadWork(state, key)) {
-          await this.#drainPendingSignals(state, pubsub, key, record);
-        } else {
-          this.#releaseThreadLease(pubsub, key, record.runId);
+        resolveTerminal();
+        state.threadRunsByStreamId.delete(record.streamId);
+        if (
+          state.activeThreadRunIds.get(key) === record.runId &&
+          state.activeThreadStreamIds.get(key) === record.streamId
+        ) {
+          state.activeThreadRunIds.delete(key);
+          state.activeThreadStreamIds.delete(key);
         }
-      } finally {
+        if (state.threadKeysByRunId.get(record.runId) === key) {
+          state.threadKeysByRunId.delete(record.runId);
+        }
+        // If queued follow-up work exists, keep the cross-process lease held by
+        // handing it to the next run instead of releasing it: releasing here
+        // would briefly empty the lease key, letting a racing process win it and
+        // start a competing run on this thread. The drain runs under the
+        // transferred lease and releases it only once every queue is empty. If
+        // there's no pending work, release as usual so other processes can wake
+        // the thread.
+        try {
+          if (this.#hasPendingThreadWork(state, key)) {
+            await this.#drainPendingSignals(state, pubsub, key, record);
+          } else {
+            this.#releaseThreadLease(pubsub, key, record.runId);
+          }
+        } finally {
+          if (state.threadRunsById.get(record.runId) === record) {
+            state.threadRunsById.delete(record.runId);
+          }
+          this.#resolveReservationWaiters(state, record.runId);
+        }
+      } catch (error) {
+        if (terminalSettled) throw error;
+        const terminalError =
+          error instanceof AgentThreadOutputDrainError
+            ? error
+            : new AgentThreadOutputDrainError(
+                'terminal-publish-failed',
+                `Failed to finalize terminal delivery for agent thread run ${record.runId}`,
+                error,
+              );
+        rejectTerminal(terminalError);
+        this.#clearSuspendedRun(state, record.runId);
+        state.pendingSignalsByThread.delete(key);
+        state.threadRunsByStreamId.delete(record.streamId);
+        if (
+          state.activeThreadRunIds.get(key) === record.runId &&
+          state.activeThreadStreamIds.get(key) === record.streamId
+        ) {
+          state.activeThreadRunIds.delete(key);
+          state.activeThreadStreamIds.delete(key);
+        }
+        if (state.threadKeysByRunId.get(record.runId) === key) {
+          state.threadKeysByRunId.delete(record.runId);
+        }
         if (state.threadRunsById.get(record.runId) === record) {
           state.threadRunsById.delete(record.runId);
         }
+        this.#forgetCallerSignalsForRun(state, record.runId);
+        this.#releaseThreadLease(pubsub, key, record.runId);
         this.#resolveReservationWaiters(state, record.runId);
+        this.#rememberRejectedRunError(state, record.runId, terminalError);
+        void this.#drainPendingIdleSignals(state, pubsub, key).catch(() => {});
+        throw terminalError;
       }
-      if (publishError) throw publishError;
     });
     void completion.catch(() => {});
     return completion;
@@ -2001,6 +2151,13 @@ export class AgentThreadStreamRuntime {
     const seenStreamIds = new Set<string>();
     const pendingRuns: AgentThreadRunRecord<any>[] = [];
     const waiters: Array<() => void> = [];
+    const drainedOutputs = new WeakSet<object>();
+    const enqueuedOutputs = new WeakSet<object>();
+    const streamDrainedOutputs = new WeakSet<object>();
+    const terminalOutputs = new WeakSet<object>();
+    const outputsByRunId = new Map<string, MastraModelOutput<unknown>[]>();
+    const outputDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
+    const streamDrainWaiters = new Map<object, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
     const remoteRuns = new Map<
       string,
       {
@@ -2018,6 +2175,158 @@ export class AgentThreadStreamRuntime {
       while (waiters.length) waiters.shift()?.();
     };
 
+    const settleOutputDrainIfReady = (output: MastraModelOutput<unknown>) => {
+      if (!streamDrainedOutputs.has(output) || !terminalOutputs.has(output)) return;
+      drainedOutputs.add(output);
+      const pending = outputDrainWaiters.get(output);
+      outputDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.resolve();
+    };
+
+    const markOutputStreamDrained = (output: MastraModelOutput<unknown>) => {
+      streamDrainedOutputs.add(output);
+      const pending = streamDrainWaiters.get(output);
+      streamDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.resolve();
+      settleOutputDrainIfReady(output);
+    };
+
+    const removeTrackedOutput = (runId: string, output: MastraModelOutput<unknown>) => {
+      const outputs = outputsByRunId.get(runId);
+      if (!outputs) return;
+      const index = outputs.indexOf(output);
+      if (index === -1) return;
+      outputs.splice(index, 1);
+      if (outputs.length === 0) {
+        // Admission is guarded per streamId (a later approval-resume/retry
+        // segment mints a fresh streamId), so dropping the correlation queue is
+        // all that is needed to admit a legitimate later segment.
+        outputsByRunId.delete(runId);
+      }
+    };
+
+    const markRunTerminalDelivered = (runId: string) => {
+      const outputs = outputsByRunId.get(runId);
+      const output = outputs?.shift();
+      if (outputs?.length === 0) outputsByRunId.delete(runId);
+      if (!output) return;
+      terminalOutputs.add(output);
+      settleOutputDrainIfReady(output);
+    };
+
+    const rejectOutputDrain = (output: MastraModelOutput<unknown>, error: Error) => {
+      const pending = outputDrainWaiters.get(output);
+      outputDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.reject(error);
+    };
+
+    const rejectStreamDrain = (output: MastraModelOutput<unknown>, error: Error) => {
+      const pending = streamDrainWaiters.get(output);
+      streamDrainWaiters.delete(output);
+      for (const waiter of pending ?? []) waiter.reject(error);
+    };
+
+    const waitForStreamDrain = (output: MastraModelOutput<unknown>): Promise<void> => {
+      if (streamDrainedOutputs.has(output)) return Promise.resolve();
+      if (done) {
+        return Promise.reject(
+          new AgentThreadOutputDrainError(
+            'subscription-closed',
+            'Thread subscription closed before output stream drain completed',
+          ),
+        );
+      }
+      const pending = streamDrainWaiters.get(output) ?? new Set();
+      let waiter!: { resolve: () => void; reject: (error: Error) => void };
+      const drained = new Promise<void>((resolve, reject) => {
+        waiter = { resolve, reject };
+      });
+      pending.add(waiter);
+      streamDrainWaiters.set(output, pending);
+      return drained.finally(() => {
+        pending.delete(waiter);
+        if (pending.size === 0) streamDrainWaiters.delete(output);
+      });
+    };
+
+    const rejectAfterEnqueuedStreamDrain = async (
+      output: MastraModelOutput<unknown>,
+      error: unknown,
+    ): Promise<never> => {
+      // A PubSub can invoke this subscription and then reject later in the same
+      // publish. Once enqueued, the segment is observable regardless of the
+      // publication promise's outcome. Do not let its failure reach Session
+      // until every buffered part has crossed the subscription generator; turn
+      // teardown can then close all tools that actually started, with no later
+      // tool_start appearing after the failure terminal.
+      if (enqueuedOutputs.has(output) && !streamDrainedOutputs.has(output)) {
+        try {
+          await waitForStreamDrain(output);
+        } catch {
+          // Explicit subscription teardown stops the generator and is therefore
+          // also a safe boundary after which this segment cannot emit more parts.
+        }
+      }
+      removeTrackedOutput(output.runId, output);
+      throw error;
+    };
+
+    const waitForOutputDrain = (output: MastraModelOutput<unknown>): Promise<void> | undefined => {
+      const registration = this.#threadOutputRegistrations.get(output);
+      const terminal = this.#threadOutputTerminals.get(output);
+      // Duck-typed Agent overrides may return an output without registering it
+      // with the thread runtime. There is no subscription segment to drain in
+      // that case, so preserve their existing direct completion contract.
+      if (!registration) return undefined;
+      if (drainedOutputs.has(output)) return Promise.resolve();
+      if (done) {
+        return Promise.reject(
+          new AgentThreadOutputDrainError(
+            'subscription-closed',
+            'Thread subscription closed before output drain completed',
+          ),
+        );
+      }
+      const pending = outputDrainWaiters.get(output) ?? new Set();
+      let waiter!: { resolve: () => void; reject: (error: Error) => void };
+      const drained = new Promise<void>((resolve, reject) => {
+        waiter = { resolve, reject };
+      });
+      pending.add(waiter);
+      outputDrainWaiters.set(output, pending);
+      return registration
+        .then(
+          async () => {
+            if (terminal) {
+              try {
+                await terminal;
+              } catch (error) {
+                await rejectAfterEnqueuedStreamDrain(output, error);
+              }
+            }
+            try {
+              await waitWithTimeout(
+                drained,
+                TERMINAL_DELIVERY_TIMEOUT_MS,
+                () =>
+                  new AgentThreadOutputDrainError(
+                    'terminal-delivery-timeout',
+                    `Thread subscription did not observe terminal delivery for agent run ${output.runId}`,
+                  ),
+              );
+            } catch (error) {
+              await rejectAfterEnqueuedStreamDrain(output, error);
+            }
+          },
+          error => rejectAfterEnqueuedStreamDrain(output, error),
+        )
+        .catch(error => {
+          pending.delete(waiter);
+          if (pending.size === 0) outputDrainWaiters.delete(output);
+          throw error;
+        });
+    };
+
     const activeRunId = () => {
       const runId = state.activeThreadRunIds.get(key);
       if (!runId) return null;
@@ -2032,6 +2341,18 @@ export class AgentThreadStreamRuntime {
     const enqueueRun = (record: AgentThreadRunRecord<any>) => {
       if (done || seenStreamIds.has(record.streamId)) return;
       seenStreamIds.add(record.streamId);
+      enqueuedOutputs.add(record.output);
+      const outputs = outputsByRunId.get(record.runId) ?? [];
+      outputs.push(record.output);
+      outputsByRunId.set(record.runId, outputs);
+      // The per-run correlation queue exists even when no caller uses the
+      // internal output-drain waiter. A rejected terminal has no delivery event
+      // that could shift this output, so observe the runtime's terminal promise
+      // and remove this exact object on failure.
+      queueMicrotask(() => {
+        const terminal = this.#threadOutputTerminals.get(record.output);
+        void terminal?.catch(() => removeTrackedOutput(record.runId, record.output));
+      });
       pendingRuns.push(record);
       wake();
     };
@@ -2157,6 +2478,7 @@ export class AgentThreadStreamRuntime {
         return;
       }
       if (data.type === 'run-completed' || data.type === 'run-aborted' || data.type === 'run-suspended') {
+        markRunTerminalDelivered(data.runId);
         const eventStreamId = data.streamId ?? data.runId;
         if (data.type === 'run-suspended') {
           state.suspendedRunIds.add(data.runId);
@@ -2225,6 +2547,12 @@ export class AgentThreadStreamRuntime {
           void currentReader.cancel();
         } catch {}
       }
+      const error = new AgentThreadOutputDrainError(
+        'subscription-closed',
+        'Thread subscription closed before output drain completed',
+      );
+      for (const [output] of outputDrainWaiters) rejectOutputDrain(output as MastraModelOutput<unknown>, error);
+      for (const [output] of streamDrainWaiters) rejectStreamDrain(output as MastraModelOutput<unknown>, error);
       wake();
     };
 
@@ -2232,6 +2560,7 @@ export class AgentThreadStreamRuntime {
       activeRunId,
       abort: () => this.abortThread(options, resolvedPubSub),
       unsubscribe,
+      _waitForOutputDrain: waitForOutputDrain,
       stream: (async function* () {
         try {
           while (!done || pendingRuns.length > 0) {
@@ -2250,10 +2579,16 @@ export class AgentThreadStreamRuntime {
             currentReader = reader as ReadableStreamDefaultReader<any>;
             activeReaderRunId = run.runId;
             let readerReleased = false;
+            let fullyDrained = false;
             try {
               while (true) {
                 const { value: part, done: streamDone } = await reader.read();
                 if (streamDone) {
+                  // A natural close (including a reader cancelled by a
+                  // run-aborted event) means every visible part crossed this
+                  // generator; only an explicit subscription teardown leaves
+                  // the segment un-drained.
+                  fullyDrained = !done;
                   break;
                 }
                 const typedPart = part as any;
@@ -2282,6 +2617,9 @@ export class AgentThreadStreamRuntime {
                     } catch {}
                     reader.releaseLock();
                   })();
+                  // Every model-visible part has crossed the generator; the
+                  // background read above only discards non-visible trailers.
+                  fullyDrained = true;
                   break;
                 }
               }
@@ -2297,6 +2635,17 @@ export class AgentThreadStreamRuntime {
               activeReaderRunId = null;
               if (!readerReleased) {
                 reader.releaseLock();
+              }
+              if (fullyDrained) {
+                markOutputStreamDrained(run.output);
+              } else {
+                rejectOutputDrain(
+                  run.output,
+                  new AgentThreadOutputDrainError(
+                    'stream-stopped',
+                    'Thread subscription stopped before output drain completed',
+                  ),
+                );
               }
             }
           }

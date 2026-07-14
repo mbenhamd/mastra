@@ -33,20 +33,29 @@ import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { MessageList } from '../../../message-list';
 import type { MastraDBMessage } from '../../../message-list';
+import {
+  createToolSurfaceFence,
+  enforceActiveToolsFence,
+  enforceToolChoiceFence,
+  enforceToolSurfaceFence,
+} from '../../../tool-surface-fence';
 import { TripWire } from '../../../trip-wire';
 import { isSupportedLanguageModel } from '../../../utils';
 import { DurableStepIds } from '../../constants';
-import { endRunSpansWithError, globalRunRegistry } from '../../run-registry';
+import { endRunSpansWithError, getBoundRunRegistryEntry, globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent, emitStepStartEvent } from '../../stream-adapter';
 import type { DurableAgenticWorkflowInput, DurableLLMStepOutput, DurableToolCallInput } from '../../types';
 import { applyToolPayloadTransformToChunk } from '../../utils/apply-tool-payload-transform';
 import { resolveRuntimeDependencies, resolveModelFromListEntry } from '../../utils/resolve-runtime';
+import { modelListEntrySchema } from '../shared/schemas';
 
 /**
  * Input schema for the durable LLM execution step
  */
 const durableLLMInputSchema = z.object({
   runId: z.string(),
+  // Optional for workflows persisted before runtime registry bindings existed.
+  runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
   messageListState: z.any(), // SerializedMessageListState
@@ -60,22 +69,7 @@ const durableLLMInputSchema = z.object({
     providerOptions: z.record(z.string(), z.any()).optional(),
   }),
   // Model list for fallback support (when agent configured with array of models)
-  modelList: z
-    .array(
-      z.object({
-        id: z.string(),
-        config: z.object({
-          provider: z.string(),
-          modelId: z.string(),
-          specificationVersion: z.string().optional(),
-          originalConfig: z.union([z.string(), z.record(z.string(), z.any())]).optional(),
-          providerOptions: z.record(z.string(), z.any()).optional(),
-        }),
-        maxRetries: z.number(),
-        enabled: z.boolean(),
-      }),
-    )
-    .optional(),
+  modelList: z.array(modelListEntrySchema).optional(),
   options: z.any(),
   state: z.any(),
   messageId: z.string(),
@@ -309,6 +303,21 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             let currentTools = tools as unknown as ToolSet;
             let currentToolChoice = execOptions.toolChoice as ToolChoice<ToolSet> | undefined;
             let currentActiveTools = execOptions.activeTools;
+            const toolSurfaceFence = execOptions.toolSurfaceFence
+              ? createToolSurfaceFence(currentTools as unknown as Record<string, unknown>, execOptions.toolSurfaceFence)
+              : undefined;
+            if (toolSurfaceFence) {
+              currentTools = enforceToolSurfaceFence(
+                currentTools as unknown as Record<string, unknown>,
+                toolSurfaceFence,
+              ) as ToolSet;
+              currentActiveTools = enforceActiveToolsFence(
+                currentActiveTools,
+                toolSurfaceFence,
+                Object.keys(currentTools),
+              );
+              enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+            }
             let currentModelSettings: Record<string, unknown> = { ...(execOptions.modelSettings ?? {}) };
             let currentProviderOptions: SharedProviderOptions | undefined = mergeProviderOptions(
               execOptions.providerOptions,
@@ -348,7 +357,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   }
                 : undefined;
 
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
             const executionAbortSignal = registryEntry?.abortSignal ?? abortSignal;
             const baseInputProcessors = registryEntry?.inputProcessors ?? resolvedInputProcessors ?? [];
             // Output processors likewise fall back to the rebuilt list when the
@@ -427,6 +436,21 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 currentProviderOptions = merged.providerOptions;
                 currentModelSettings = merged.modelSettings ?? {};
                 structuredOutput = merged.structuredOutput;
+                // PF-1790: re-enforce the immutable replacement tool ceiling after
+                // processors may have mutated tools/activeTools/toolChoice. The
+                // fence can narrow per step but never expand or swap executables.
+                if (toolSurfaceFence) {
+                  currentTools = enforceToolSurfaceFence(
+                    currentTools as unknown as Record<string, unknown>,
+                    toolSurfaceFence,
+                  ) as ToolSet;
+                  currentActiveTools = enforceActiveToolsFence(
+                    currentActiveTools,
+                    toolSurfaceFence,
+                    Object.keys(currentTools),
+                  );
+                  enforceToolChoiceFence(currentToolChoice as any, toolSurfaceFence);
+                }
               } catch (error) {
                 // Handle TripWire from processInputStep — emit tripwire chunk and
                 // bail the step, mirroring the regular agent's buildTripWireBailResponse.
@@ -1697,7 +1721,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // Error processor retry for non-stream errors (e.g. provider
             // rejections that throw before the stream opens). Stream-level
             // errors are already handled in the inner catch above.
-            const registryEntry = globalRunRegistry.get(runId);
+            const registryEntry = getBoundRunRegistryEntry(runId, typedInput.runtimeBindingId);
             const canRetryError = maxProcessorRetries !== undefined && processorRetryCount < maxProcessorRetries;
             if (registryEntry?.errorProcessors?.length && canRetryError) {
               try {

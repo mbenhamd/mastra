@@ -45,7 +45,11 @@ import {
   runResumeDurableStreamUntilIdle,
   globalRunRegistry,
 } from '@mastra/core/agent/durable';
-import type { AgentStepFinishEventData, AgentSuspendedEventData } from '@mastra/core/agent/durable';
+import type {
+  AgentStepFinishEventData,
+  AgentSuspendedEventData,
+  RunRegistryEntry,
+} from '@mastra/core/agent/durable';
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';
@@ -904,10 +908,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           // carry the abort controller across the resumed segment. The
           // explicit flag tells resolveRuntimeDependencies to rebuild runtime
           // state from the Mastra instance instead of trusting this entry.
+          // Placeholders are exempt from runtime-binding checks (see
+          // getBoundRunRegistryEntry), so no runtimeBindingId is stamped here.
           isPlaceholder: true,
           tools: {},
           model: undefined as any,
-        };
+        } as RunRegistryEntry;
         globalRunRegistry.set(runId, existingEntry);
       }
       existingEntry.abortController = abortController;

@@ -18,6 +18,7 @@ import type { CreatedAgentSignal } from './signals';
 import type {
   AgentMemoryOption,
   ToolsetsInput,
+  ToolsetsMode,
   ToolsInput,
   StructuredOutputOptions,
   PublicStructuredOutputOptions,
@@ -527,6 +528,11 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
 
   /** Additional tool sets that can be used for this execution */
   toolsets?: ToolsetsInput;
+  /**
+   * How `toolsets` interact with the agent's other tool sources.
+   * `merge` (default) augments them; `replace` exposes only the supplied toolsets.
+   */
+  toolsetsMode?: ToolsetsMode;
   /** Client-side tools available during execution */
   clientTools?: ToolsInput;
   /** Per-execution hooks that run before and after tool calls, overriding matching agent-level hooks. */
@@ -727,6 +733,8 @@ export type InnerAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptions
   };
   /** Internal: PubSub captured by the public execution path for this run */
   _pubsub?: PubSub;
+  /** Internal: lease used to prevent stale or colliding executions from clearing another run's tool fence. */
+  _toolSurfaceFenceOwnerId?: string;
   toolCallId?: string;
 } & ([NonNullable<OUTPUT>] extends [never]
     ? { structuredOutput?: never }

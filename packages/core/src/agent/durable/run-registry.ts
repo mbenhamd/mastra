@@ -43,6 +43,49 @@ export function endRunSpansWithError(runId: string, error: Error): void {
 }
 
 /**
+ * Read a run entry only when it is the exact entry captured by the durable
+ * workflow input. A caller-reused runId must never rebind an older workflow to
+ * a newer run's tools, processors, model, memory, or request context.
+ */
+export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: string): RunRegistryEntry | undefined {
+  const entry = globalRunRegistry.get(runId);
+  if (
+    entry &&
+    // Placeholder entries are cross-process carriers (e.g. the abort
+    // controller seeded by @mastra/inngest resume()). They hold no usable
+    // runtime dependencies — consumers rebuild from the Mastra instance — so
+    // a binding check would only break legitimate cross-process resumes.
+    entry.isPlaceholder !== true &&
+    (entry.runtimeBindingId !== runtimeBindingId ||
+      // Inputs persisted before runtime bindings existed may reconstruct after
+      // a process restart, but must never attach to a newly registered run that
+      // happens to reuse the same caller-provided ID.
+      runtimeBindingId === undefined)
+  ) {
+    throw new Error(
+      `Durable run ${runId} no longer matches its registered runtime dependencies. Refusing to execute a rebound run identifier.`,
+    );
+  }
+  return entry;
+}
+
+/** Register without replacing another active run that happens to reuse the same ID. */
+export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
+  if (globalRunRegistry.has(runId)) {
+    throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
+  }
+  globalRunRegistry.set(runId, entry);
+}
+
+/** Delete only the entry owned by the caller; stale cleanup must not delete a newer binding. */
+export function deleteBoundRunRegistryEntry(runId: string, runtimeBindingId: string): boolean {
+  const entry = globalRunRegistry.get(runId);
+  if (entry?.runtimeBindingId !== runtimeBindingId) return false;
+  globalRunRegistry.delete(runId);
+  return true;
+}
+
+/**
  * Registry for per-run non-serializable state.
  *
  * During durable execution, the DurableAgent needs to store non-serializable
@@ -123,6 +166,13 @@ export class RunRegistry {
       entry.cleanup?.();
       this.#entries.delete(runId);
     }
+  }
+
+  /** Ignore cleanup callbacks retained by an older execution that reused the same runId. */
+  cleanupBound(runId: string, runtimeBindingId: string): boolean {
+    if (this.#entries.get(runId)?.runtimeBindingId !== runtimeBindingId) return false;
+    this.cleanup(runId);
+    return true;
   }
 
   /**

@@ -22,6 +22,7 @@ interface PrepareToolsStepOptions<OUTPUT = undefined> {
   agentSpan?: Span<SpanType.AGENT_RUN>;
   methodType: AgentMethodType;
   memory?: MastraMemory;
+  isResume?: boolean;
   backgroundTaskEnabled?: boolean;
   runScope: PrepareStreamRunScope<OUTPUT>;
 }
@@ -36,6 +37,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
   agentSpan,
   methodType,
   memory: _memory,
+  isResume,
   backgroundTaskEnabled,
   runScope,
 }: PrepareToolsStepOptions<OUTPUT>) {
@@ -48,6 +50,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
 
       const convertedTools = await capabilities.convertTools({
         toolsets: options?.toolsets,
+        toolsetsMode: options?.toolsetsMode,
         clientTools: options?.clientTools,
         threadId,
         resourceId,
@@ -63,6 +66,8 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         backgroundTaskEnabled,
         inputProcessors: options.inputProcessors,
         hooks: options.hooks,
+        isResume,
+        toolSurfaceFenceOwnerId: options._toolSurfaceFenceOwnerId,
       });
 
       // Update the agent span with available tool names for observability
