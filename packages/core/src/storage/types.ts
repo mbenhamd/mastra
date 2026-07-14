@@ -13,9 +13,11 @@ import type {
   WorkflowTerminalEffectKind,
   WorkflowTerminalEffectRecord,
   WorkflowTerminalDestinationReceiptRecord,
+  WorkflowTerminalSnapshotRecord,
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
+import type { WorkflowTerminalParentContinuationContract } from '../workflows/terminal-continuation';
 
 export type StoragePagination = {
   page: number;
@@ -77,6 +79,7 @@ export interface WorkflowTerminalizationCapabilities {
   journalVersion?: 1;
   producerOutboxVersion?: 1;
   destinationReceiptVersion?: 1;
+  parentApplicationVersion?: 1;
   recoveryVersion?: 1;
 }
 
@@ -267,6 +270,125 @@ export type GetWorkflowTerminalDestinationReceiptResult =
         | 'missing_receipt'
         | 'missing_effect'
         | 'missing_terminal_state'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
+    };
+
+export interface GetWorkflowTerminalParentContextInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+}
+
+export type GetWorkflowTerminalParentContextResult =
+  | {
+      status: 'found';
+      effect: Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }>;
+      retainedChild: WorkflowTerminalSnapshotRecord;
+      parentWorkflowName: string;
+      parentRunId: string;
+      revision: string;
+      snapshot: WorkflowRunState;
+    }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status:
+        | 'missing_effect'
+        | 'missing_terminal_state'
+        | 'missing_parent'
+        | 'corrupt_parent_state'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
+    };
+
+export interface GetWorkflowTerminalContinuationPlanInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+}
+
+/**
+ * @internal Immutable storage evidence for one graph-bound parent continuation.
+ * The contract contains only structural action/patch instructions; retained
+ * child output and the parent snapshot remain in their authoritative rows.
+ */
+export interface WorkflowTerminalContinuationPlanRecord {
+  version: 1;
+  planKey: string;
+  planHash: string;
+  receiptKey: string;
+  effectKey: string;
+  consumerId: 'mastra.parent-application.v1';
+  workflowName: string;
+  runId: string;
+  parentWorkflowName: string;
+  parentRunId: string;
+  parentRevision: string;
+  contract: WorkflowTerminalParentContinuationContract;
+  /** Present only when a framework action must be executed after commit. */
+  frameworkActionKey?: string;
+  createdAt: number;
+}
+
+export type GetWorkflowTerminalContinuationPlanResult =
+  | {
+      status: 'found';
+      plan: WorkflowTerminalContinuationPlanRecord;
+      applicationState: 'applied' | 'quarantined';
+      dispatchState: 'none' | 'pending' | 'destination_applied';
+    }
+  | {
+      status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status: 'missing_effect' | 'missing_receipt' | 'missing_plan' | 'missing_record' | 'missing_run' | 'unsupported';
+    };
+
+export interface ApplyWorkflowTerminalParentEffectInput extends GetWorkflowTerminalizationInput {
+  ownerId: string;
+  claimToken: string;
+  claimGeneration: number;
+  contract: WorkflowTerminalParentContinuationContract;
+}
+
+export interface WorkflowTerminalContinuationPlanObservation {
+  version: 1;
+  planKey: string;
+  planHash: string;
+  contractHash: string;
+  actionKind: WorkflowTerminalParentContinuationContract['action']['kind'];
+  actionReason: WorkflowTerminalParentContinuationContract['action']['reason'];
+  createdAt: number;
+}
+
+export type ApplyWorkflowTerminalParentEffectResult =
+  | {
+      status: 'applied' | 'already_applied' | 'quarantined' | 'already_quarantined';
+      plan: WorkflowTerminalContinuationPlanRecord;
+    }
+  | {
+      status: 'contract_conflict';
+      plan: WorkflowTerminalContinuationPlanObservation;
+    }
+  | {
+      status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
+      record: WorkflowTerminalizationObservation;
+    }
+  | {
+      status:
+        | 'parent_conflict'
+        | 'missing_effect'
+        | 'missing_child_terminal_state'
+        | 'missing_parent'
+        | 'corrupt_child_terminal_state'
+        | 'corrupt_parent_state'
+        | 'invalid_contract'
         | 'missing_record'
         | 'missing_run'
         | 'unsupported';

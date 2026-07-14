@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import {
+  createEmptyWorkflowSnapshot,
+  createWorkflowTerminalGraphFingerprint,
+  createWorkflowTerminalParentContinuationContract,
+} from '@mastra/core/storage';
+import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WorkflowsPG } from '.';
@@ -27,6 +32,9 @@ describe('WorkflowsPG terminalization journal', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`DELETE FROM mastra_workflow_terminal_continuation_plans WHERE workflow_name = $1`, [
+        workflowName,
+      ]);
       await client.query(`DELETE FROM mastra_workflow_terminal_destination_receipts WHERE workflow_name = $1`, [
         workflowName,
       ]);
@@ -34,6 +42,7 @@ describe('WorkflowsPG terminalization journal', () => {
       await client.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1`, [workflowName]);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -62,6 +71,919 @@ describe('WorkflowsPG terminalization journal', () => {
     });
     return { operation, reads: () => ({ workflowName: workflowNameReads, runId: runIdReads }) };
   }
+
+  it('validates every parent-application run identity before storage lookup', async () => {
+    const missing = {
+      workflowName: `parent-identity-${randomUUID()}`,
+      runId: 'missing',
+      ownerId: 'owner',
+      claimToken: 'token',
+      claimGeneration: 1,
+    };
+    const contract = createWorkflowTerminalParentContinuationContract({
+      version: 1,
+      terminalEffectKey: 'effect',
+      terminalEffectPayloadHash: `sha256:${'0'.repeat(64)}`,
+      executionMode: 'continuous',
+      expectedParentRevision: 'pg:v1:1',
+      graphFingerprint: createWorkflowTerminalGraphFingerprint([]),
+      childTerminalStatus: 'success',
+      observedParentStatus: 'success',
+      source: { kind: 'step', stepId: 'step', executionPath: [0] },
+      action: { kind: 'noop', reason: 'already-terminal' },
+      patch: { kind: 'none' },
+    });
+    const invalidIdentities = [
+      [
+        { workflowName: 'w'.repeat(513) },
+        'workflowName must be a well-formed non-empty string no longer than 512 characters',
+      ],
+      [
+        { runId: `run${String.fromCharCode(0xd800)}` },
+        'runId must be a well-formed non-empty string no longer than 512 characters',
+      ],
+    ] as const;
+
+    for (const [identity, message] of invalidIdentities) {
+      const operation = { ...missing, ...identity };
+      await expect(workflowsA.getWorkflowTerminalParentContext(operation)).rejects.toThrow(message);
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(operation)).rejects.toThrow(message);
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...operation, contract })).rejects.toThrow(message);
+    }
+  });
+
+  it('atomically applies and recovers the exact graph-bound parent contract', async () => {
+    const suffix = randomUUID();
+    const child = { workflowName: `parent-apply-child-${suffix}`, runId: 'child-run' };
+    const parent = { workflowName: `parent-apply-parent-${suffix}`, runId: 'parent-run' };
+    const now = Date.now();
+    const parentSnapshot: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(parent.runId),
+      status: 'running',
+      value: { stale: true },
+      context: {
+        nested: {
+          status: 'running',
+          payload: { paperId: 'p1' },
+          startedAt: now - 20,
+          metadata: { nestedRunId: child.runId },
+        },
+        __state: { stale: true },
+      } as WorkflowRunState['context'],
+      serializedStepGraph: [
+        { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+        { type: 'sleep', id: 'after-child', duration: 10 },
+      ],
+      activePaths: [0],
+      activeStepsPath: { nested: [0] },
+      requestContext: { parent: true },
+      timestamp: now - 20,
+    };
+    await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+    await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+    try {
+      const claimed = await workflowsA.claimWorkflowTerminalization({
+        ...child,
+        eventKey: 'terminal-event',
+        terminalStatus: 'success',
+        ownerId: 'worker',
+        leaseMs: 10_000,
+      });
+      if (claimed.status !== 'acquired') throw new Error('Expected child claim');
+      const fence = {
+        ...child,
+        ownerId: claimed.record.ownerId,
+        claimToken: claimed.record.claimToken,
+        claimGeneration: claimed.record.claimGeneration,
+      };
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...fence,
+          snapshot: {
+            ...createEmptyWorkflowSnapshot(child.runId),
+            status: 'success',
+            result: {
+              status: 'success',
+              output: { answer: 42 },
+              startedAt: now - 10,
+              endedAt: now,
+            },
+            value: { final: true },
+            context: { __state: { final: true } } as WorkflowRunState['context'],
+            timestamp: now,
+          },
+        }),
+      ).resolves.toMatchObject({ status: 'persisted' });
+      const prepared = await workflowsA.prepareWorkflowTerminalEffect({
+        ...fence,
+        expectedPhase: 'run_state_persisted',
+        effect: {
+          kind: 'parent-workflow-step-end',
+          parentWorkflowName: parent.workflowName,
+          parentRunId: parent.runId,
+          parentStepId: 'nested',
+          parentExecutionPath: [0],
+        },
+      });
+      if (prepared.status !== 'prepared' || prepared.effect.kind !== 'parent-workflow-step-end') {
+        throw new Error('Expected parent effect');
+      }
+      const context = await workflowsA.getWorkflowTerminalParentContext(fence);
+      if (context.status !== 'found') throw new Error('Expected parent context');
+      const alternateReceipt = await workflowsA.reserveWorkflowTerminalDestinationReceipt({
+        ...fence,
+        effectKind: 'parent-workflow-step-end',
+        consumerId: 'pf1771.corruption-probe',
+      });
+      if (alternateReceipt.status !== 'reserved') throw new Error('Expected alternate corruption-probe receipt');
+      const contract = createWorkflowTerminalParentContinuationContract({
+        version: 1,
+        terminalEffectKey: prepared.effect.effectKey,
+        terminalEffectPayloadHash: prepared.effect.payloadHash,
+        executionMode: 'continuous',
+        expectedParentRevision: context.revision,
+        graphFingerprint: createWorkflowTerminalGraphFingerprint(context.snapshot.serializedStepGraph),
+        childTerminalStatus: 'success',
+        observedParentStatus: 'running',
+        source: { kind: 'step', stepId: 'nested', executionPath: [0] },
+        action: {
+          kind: 'run-entry',
+          reason: 'next-step',
+          target: { kind: 'entry', entryType: 'sleep', entryId: 'after-child', executionPath: [1] },
+        },
+        patch: {
+          kind: 'merge-child-terminal',
+          resultWrite: 'source-coordinate',
+          resultSource: 'retained-child-terminal-envelope',
+          payloadWrite: 'preserve-parent-step-payload',
+          metadataWrite: 'merge-child-and-bind-nested-run-id',
+          stateWrite: 'replace-context-__state-from-retained-child',
+          requestContextWrite: 'merge-from-retained-child',
+          activeStepsWrite: 'derive-from-source-coordinate',
+          snapshotTimestampWrite: 'storage-clock',
+          parentRunWrite: { kind: 'preserve' },
+          loopWrite: { kind: 'preserve' },
+        },
+      });
+
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot
+         SET snapshot = jsonb_set(snapshot, '{timestamp}', to_jsonb($1::bigint))
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [Date.now() + 60_000, parent.workflowName, parent.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot
+         SET snapshot = jsonb_set(snapshot, '{serializedStepGraph}', '[null]'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
+      );
+
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        parent.workflowName,
+        parent.runId,
+      ]);
+      await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await pool.query(
+        `INSERT INTO mastra_workflow_parent_revisions (workflow_name, run_id, generation, updated_at)
+         VALUES ($1, $2, 1, $3)`,
+        [parent.workflowName, parent.runId, Date.now()],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = snapshot #- '{context,__state}'
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{context,__state}', '{"final":true}'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{result,status}', '"failed"'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = jsonb_set(snapshot, '{result,status}', '"success"'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+
+      const retainedSnapshotBackup = await pool.query<{ snapshot: unknown }>(
+        `SELECT snapshot FROM mastra_workflow_terminal_snapshots
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots
+         SET snapshot = to_jsonb('{'::text)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_child_terminal_state',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_snapshots SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(retainedSnapshotBackup.rows[0]!.snapshot), child.workflowName, child.runId],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot
+         SET snapshot = jsonb_set(snapshot, '{requestContext}', '[]'::jsonb, true)
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await pool.query(
+        `UPDATE mastra_workflow_snapshot SET snapshot = $1
+         WHERE workflow_name = $2 AND run_id = $3`,
+        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
+      );
+
+      const rollbackTrigger = `pf1771_plan_rollback_${suffix.replaceAll('-', '')}`;
+      const parentBeforeRollback = await workflowsA.loadWorkflowSnapshot(parent);
+      await pool.query(`
+        CREATE FUNCTION ${rollbackTrigger}() RETURNS trigger AS $$
+        BEGIN
+          RAISE EXCEPTION 'PF-1771 rollback probe';
+        END;
+        $$ LANGUAGE plpgsql
+      `);
+      await pool.query(`
+        CREATE TRIGGER ${rollbackTrigger}
+        BEFORE INSERT ON mastra_workflow_terminal_continuation_plans
+        FOR EACH ROW EXECUTE FUNCTION ${rollbackTrigger}()
+      `);
+      try {
+        await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).rejects.toThrow(
+          'PF-1771 rollback probe',
+        );
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS ${rollbackTrigger} ON mastra_workflow_terminal_continuation_plans`);
+        await pool.query(`DROP FUNCTION IF EXISTS ${rollbackTrigger}()`);
+      }
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBeforeRollback);
+      const contextAfterRollback = await workflowsA.getWorkflowTerminalParentContext(fence);
+      expect(contextAfterRollback).toMatchObject({ status: 'found', revision: context.revision });
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'missing_receipt',
+      });
+      await expect(workflowsA.getWorkflowTerminalization(fence)).resolves.toMatchObject({
+        status: 'found',
+        record: { phase: 'parent_outbox_pending' },
+      });
+
+      const concurrent = await Promise.all([
+        workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract }),
+        workflowsB.applyWorkflowTerminalParentEffect({ ...fence, contract }),
+      ]);
+      expect(concurrent.map(result => result.status).sort()).toEqual(['already_applied', 'applied']);
+      const applied = concurrent.find(result => result.status === 'applied');
+      expect(applied).toMatchObject({
+        plan: {
+          contract: { contractHash: contract.contractHash },
+          frameworkActionKey: expect.stringMatching(/^wta:v1:[a-f0-9]{64}$/),
+        },
+      });
+      await expect(workflowsB.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+        status: 'found',
+        applicationState: 'applied',
+        dispatchState: 'pending',
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toMatchObject({
+        status: 'running',
+        value: { final: true },
+        context: { nested: { status: 'success', output: { answer: 42 } }, __state: { final: true } },
+      });
+      const afterApply = await workflowsA.getWorkflowTerminalParentContext(fence);
+      if (afterApply.status !== 'found') throw new Error('Expected applied parent context');
+      expect(afterApply.revision).not.toBe(context.revision);
+      const patchedSnapshot = await workflowsA.loadWorkflowSnapshot(parent);
+      if (!patchedSnapshot) throw new Error('Expected patched parent snapshot');
+      await workflowsA.deleteWorkflowRunById(parent);
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: patchedSnapshot });
+      const recreated = await workflowsA.getWorkflowTerminalParentContext(fence);
+      if (recreated.status !== 'found') throw new Error('Expected recreated parent context');
+      expect(recreated.revision).not.toBe(afterApply.revision);
+      expect(recreated.revision).not.toBe(context.revision);
+      await expect(workflowsB.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toMatchObject({
+        status: 'already_applied',
+      });
+
+      const { contractHash: _contractHash, ...contractSpec } = contract;
+      const changed = createWorkflowTerminalParentContinuationContract({
+        ...contractSpec,
+        expectedParentRevision: 'pg:v1:999',
+      });
+      await expect(
+        workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract: changed }),
+      ).resolves.toMatchObject({
+        status: 'contract_conflict',
+        plan: { contractHash: contract.contractHash },
+      });
+
+      await expect(
+        pool.query(
+          `UPDATE mastra_workflow_terminal_continuation_plans
+           SET contract = contract - 'executionMode'
+           WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
+          [prepared.effect.effectKey],
+        ),
+      ).rejects.toThrow();
+      await expect(
+        pool.query(
+          `UPDATE mastra_workflow_terminal_continuation_plans
+           SET contract = jsonb_set(contract, '{expectedParentRevision}', '"pg:v1:999"'::jsonb)
+           WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
+          [prepared.effect.effectKey],
+        ),
+      ).rejects.toThrow();
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_destination_receipts
+         SET application_state = 'quarantined', dispatch_state = 'none',
+             applied_at = NULL, dispatch_pending_at = NULL, destination_applied_at = NULL,
+             quarantined_at = updated_at
+         WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
+        [prepared.effect.effectKey],
+      );
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).rejects.toThrow(
+        'Contradictory workflow terminal parent application evidence',
+      );
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_destination_receipts
+         SET application_state = 'applied', dispatch_state = 'pending',
+             applied_at = updated_at, dispatch_pending_at = updated_at,
+             destination_applied_at = NULL, quarantined_at = NULL
+         WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
+        [prepared.effect.effectKey],
+      );
+
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_continuation_plans
+         SET created_at = created_at + 1
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [child.workflowName, child.runId],
+      );
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).rejects.toThrow(
+        'Invalid workflow terminal continuation plan integrity',
+      );
+      await pool.query(
+        `UPDATE mastra_workflow_terminal_continuation_plans
+         SET created_at = created_at - 1,
+             receipt_key = $1,
+             workflow_name = 'corrupted-workflow',
+             run_id = 'corrupted-run'
+         WHERE effect_key = $2 AND consumer_id = 'mastra.parent-application.v1'`,
+        [alternateReceipt.receipt.receiptKey, prepared.effect.effectKey],
+      );
+      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).rejects.toThrow(
+        'Invalid workflow terminal continuation plan integrity',
+      );
+      await expect(
+        workflowsA.getWorkflowTerminalContinuationPlan({ ...fence, claimToken: 'stale-token' }),
+      ).rejects.toThrow('Invalid workflow terminal continuation plan integrity');
+    } finally {
+      await cleanup(child.workflowName);
+      await cleanup(parent.workflowName);
+    }
+  });
+
+  it.each([
+    ['single', 1, true],
+    ['multiple', 2, false],
+  ] as const)(
+    'round-trips %s foreach recovery payloads through JSONB without plan leakage',
+    async (_label, suspendedCount, expectsCompatibilityHoist) => {
+      const suffix = randomUUID();
+      const child = { workflowName: `foreach-child-${suffix}`, runId: 'child-run' };
+      const parent = { workflowName: `foreach-parent-${suffix}`, runId: 'parent-run' };
+      const now = Date.now();
+      const sourceIndex = suspendedCount;
+      const suspended = Array.from({ length: suspendedCount }, (_, index) => ({
+        status: 'suspended',
+        suspendPayload: {
+          __streamState: { messageList: { memoryInfo: { resourceId: `resource-${index}` } } },
+          __workflow_meta: {
+            resumeLabels: { [`resume-${index}`]: { stepId: 'each', foreachIndex: index } },
+          },
+        },
+      }));
+      const parentSnapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(parent.runId),
+        status: 'running',
+        value: { stale: true },
+        context: {
+          each: {
+            status: 'running',
+            payload: Array.from({ length: suspendedCount + 1 }, (_, index) => `input-${index}`),
+            output: [...suspended, null],
+            startedAt: now - 20,
+            metadata: { __workflow_meta: { iterationRunIds: { [String(sourceIndex)]: child.runId } } },
+          },
+          __state: { stale: true },
+        } as WorkflowRunState['context'],
+        serializedStepGraph: [
+          { type: 'foreach', step: { id: 'each', component: 'WORKFLOW' }, opts: { concurrency: 2 } },
+        ],
+        activePaths: [0, sourceIndex],
+        activeStepsPath: { each: [0, sourceIndex] },
+        timestamp: now - 20,
+      };
+
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+      await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+      try {
+        const claimed = await workflowsA.claimWorkflowTerminalization({
+          ...child,
+          eventKey: 'terminal-event',
+          terminalStatus: 'success',
+          ownerId: 'worker',
+          leaseMs: 10_000,
+        });
+        if (claimed.status !== 'acquired') throw new Error('Expected child claim');
+        const fence = {
+          ...child,
+          ownerId: claimed.record.ownerId,
+          claimToken: claimed.record.claimToken,
+          claimGeneration: claimed.record.claimGeneration,
+        };
+        await expect(
+          workflowsA.persistWorkflowTerminalState({
+            ...fence,
+            snapshot: {
+              ...createEmptyWorkflowSnapshot(child.runId),
+              status: 'success',
+              result: { status: 'success', output: { answer: 42 }, startedAt: now - 10, endedAt: now },
+              value: { final: true },
+              context: { __state: { final: true } } as WorkflowRunState['context'],
+              timestamp: now,
+            },
+          }),
+        ).resolves.toMatchObject({ status: 'persisted' });
+        const prepared = await workflowsA.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: {
+            kind: 'parent-workflow-step-end',
+            parentWorkflowName: parent.workflowName,
+            parentRunId: parent.runId,
+            parentStepId: 'each',
+            parentExecutionPath: [0, sourceIndex],
+          },
+        });
+        if (prepared.status !== 'prepared' || prepared.effect.kind !== 'parent-workflow-step-end') {
+          throw new Error('Expected parent effect');
+        }
+        const context = await workflowsA.getWorkflowTerminalParentContext(fence);
+        if (context.status !== 'found') throw new Error('Expected parent context');
+        const contract = createWorkflowTerminalParentContinuationContract({
+          version: 1,
+          terminalEffectKey: prepared.effect.effectKey,
+          terminalEffectPayloadHash: prepared.effect.payloadHash,
+          executionMode: 'continuous',
+          expectedParentRevision: context.revision,
+          graphFingerprint: createWorkflowTerminalGraphFingerprint(context.snapshot.serializedStepGraph),
+          childTerminalStatus: 'success',
+          observedParentStatus: 'running',
+          source: { kind: 'foreach-iteration', stepId: 'each', containerPath: [0], iterationIndex: sourceIndex },
+          action: {
+            kind: 'suspend-parent',
+            reason: 'foreach-suspended',
+            target: { kind: 'container', containerType: 'foreach', executionPath: [0] },
+          },
+          patch: {
+            kind: 'merge-child-terminal',
+            resultWrite: 'source-coordinate',
+            resultSource: 'retained-child-terminal-envelope',
+            payloadWrite: 'preserve-parent-step-payload',
+            metadataWrite: 'merge-child-and-bind-nested-run-id',
+            stateWrite: 'replace-context-__state-from-retained-child',
+            requestContextWrite: 'merge-from-retained-child',
+            activeStepsWrite: 'derive-from-source-coordinate',
+            snapshotTimestampWrite: 'storage-clock',
+            parentRunWrite: {
+              kind: 'set-suspended',
+              resultSource: 'aggregate-container',
+              activePathSource: 'source-coordinate',
+              suspendedPathsSource: 'aggregate-container',
+              resumeLabelsSource: 'aggregate-container',
+            },
+            loopWrite: { kind: 'preserve' },
+          },
+        });
+
+        await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toMatchObject({
+          status: 'applied',
+        });
+        const stored = await workflowsB.loadWorkflowSnapshot(parent);
+        if (!stored) throw new Error('Expected stored foreach parent');
+        const suspendPayload = (stored.context.each as any).suspendPayload;
+        for (let index = 0; index < suspendedCount; index++) {
+          expect(suspendPayload.__workflow_meta.iterationSuspendPayloads[String(index)]).toMatchObject({
+            __streamState: { messageList: { memoryInfo: { resourceId: `resource-${index}` } } },
+          });
+        }
+        expect(Boolean(suspendPayload.__streamState)).toBe(expectsCompatibilityHoist);
+        const plan = await workflowsB.getWorkflowTerminalContinuationPlan(fence);
+        expect(plan).toMatchObject({ status: 'found', applicationState: 'applied', dispatchState: 'pending' });
+        expect(JSON.stringify(plan)).not.toContain('__streamState');
+        expect(JSON.stringify(plan)).not.toContain('resource-0');
+
+        suspendPayload.__workflow_meta.iterationSuspendPayloads['0'].__streamState.messageList.memoryInfo.resourceId =
+          'caller-mutated';
+        await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toMatchObject({
+          context: {
+            each: {
+              suspendPayload: {
+                __workflow_meta: {
+                  iterationSuspendPayloads: {
+                    '0': { __streamState: { messageList: { memoryInfo: { resourceId: 'resource-0' } } } },
+                  },
+                },
+              },
+            },
+          },
+        });
+      } finally {
+        await cleanup(child.workflowName);
+        await cleanup(parent.workflowName);
+      }
+    },
+  );
+
+  it('allows only one child effect to consume a shared PostgreSQL parent revision', async () => {
+    const suffix = randomUUID();
+    const parent = { workflowName: `parent-race-${suffix}`, runId: 'parent-run' };
+    const leftChild = { workflowName: `parent-race-left-${suffix}`, runId: 'child-left' };
+    const rightChild = { workflowName: `parent-race-right-${suffix}`, runId: 'child-right' };
+    const now = Date.now();
+    const parentSnapshot: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(parent.runId),
+      status: 'running',
+      context: {
+        left: {
+          status: 'running',
+          payload: {},
+          startedAt: now - 20,
+          metadata: { nestedRunId: leftChild.runId },
+        },
+        right: {
+          status: 'running',
+          payload: {},
+          startedAt: now - 20,
+          metadata: { nestedRunId: rightChild.runId },
+        },
+      } as WorkflowRunState['context'],
+      serializedStepGraph: [
+        {
+          type: 'parallel',
+          steps: [
+            { type: 'step', step: { id: 'left', component: 'WORKFLOW' } },
+            { type: 'step', step: { id: 'right', component: 'WORKFLOW' } },
+          ],
+        },
+      ],
+      activePaths: [0, 0],
+      activeStepsPath: { left: [0, 0], right: [0, 1] },
+      timestamp: now - 20,
+    };
+    await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+    await workflowsA.persistWorkflowSnapshot({ ...leftChild, snapshot: createEmptyWorkflowSnapshot(leftChild.runId) });
+    await workflowsA.persistWorkflowSnapshot({
+      ...rightChild,
+      snapshot: createEmptyWorkflowSnapshot(rightChild.runId),
+    });
+
+    try {
+      const prepareChild = async (
+        workflows: WorkflowsPG,
+        child: typeof leftChild,
+        stepId: 'left' | 'right',
+        executionPath: [0, 0] | [0, 1],
+      ) => {
+        const claim = await workflows.claimWorkflowTerminalization({
+          ...child,
+          eventKey: `terminal-${stepId}`,
+          terminalStatus: 'success',
+          ownerId: `worker-${stepId}`,
+          leaseMs: 10_000,
+        });
+        if (claim.status !== 'acquired') throw new Error(`Expected ${stepId} child claim`);
+        const fence = {
+          ...child,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+        };
+        await workflows.persistWorkflowTerminalState({
+          ...fence,
+          snapshot: {
+            ...createEmptyWorkflowSnapshot(child.runId),
+            status: 'success',
+            result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
+            context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
+            value: { [stepId]: true },
+            timestamp: now,
+          },
+        });
+        const prepared = await workflows.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: {
+            kind: 'parent-workflow-step-end',
+            parentWorkflowName: parent.workflowName,
+            parentRunId: parent.runId,
+            parentStepId: stepId,
+            parentExecutionPath: executionPath,
+          },
+        });
+        if (prepared.status !== 'prepared' || prepared.effect.kind !== 'parent-workflow-step-end') {
+          throw new Error(`Expected ${stepId} parent effect`);
+        }
+        const context = await workflows.getWorkflowTerminalParentContext(fence);
+        if (context.status !== 'found') throw new Error(`Expected ${stepId} parent context`);
+        return { workflows, fence, effect: prepared.effect, context, stepId, executionPath };
+      };
+
+      const [left, right] = await Promise.all([
+        prepareChild(workflowsA, leftChild, 'left', [0, 0]),
+        prepareChild(workflowsB, rightChild, 'right', [0, 1]),
+      ]);
+      expect(left.context.revision).toBe(right.context.revision);
+      const contractFor = (candidate: typeof left | typeof right) =>
+        createWorkflowTerminalParentContinuationContract({
+          version: 1,
+          terminalEffectKey: candidate.effect.effectKey,
+          terminalEffectPayloadHash: candidate.effect.payloadHash,
+          executionMode: 'continuous',
+          expectedParentRevision: left.context.revision,
+          graphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+          childTerminalStatus: 'success',
+          observedParentStatus: 'running',
+          source: { kind: 'step', stepId: candidate.stepId, executionPath: candidate.executionPath },
+          action: {
+            kind: 'wait',
+            reason: 'parallel-aggregation',
+            coordinate: { kind: 'container', containerType: 'parallel', executionPath: [0] },
+          },
+          patch: {
+            kind: 'merge-child-terminal',
+            resultWrite: 'source-coordinate',
+            resultSource: 'retained-child-terminal-envelope',
+            payloadWrite: 'preserve-parent-step-payload',
+            metadataWrite: 'merge-child-and-bind-nested-run-id',
+            stateWrite: 'replace-context-__state-from-retained-child',
+            requestContextWrite: 'merge-from-retained-child',
+            activeStepsWrite: 'derive-from-source-coordinate',
+            snapshotTimestampWrite: 'storage-clock',
+            parentRunWrite: { kind: 'preserve' },
+            loopWrite: { kind: 'preserve' },
+          },
+        });
+
+      const outcomes = await Promise.all([
+        left.workflows.applyWorkflowTerminalParentEffect({ ...left.fence, contract: contractFor(left) }),
+        right.workflows.applyWorkflowTerminalParentEffect({ ...right.fence, contract: contractFor(right) }),
+      ]);
+      expect(outcomes.map(result => result.status).sort()).toEqual(['applied', 'parent_conflict']);
+      const evidence = await pool.query<{ receipt_count: string; plan_count: string }>(
+        `SELECT
+           (SELECT count(*) FROM mastra_workflow_terminal_destination_receipts
+            WHERE workflow_name = ANY($1::text[])) AS receipt_count,
+           (SELECT count(*) FROM mastra_workflow_terminal_continuation_plans
+            WHERE workflow_name = ANY($1::text[])) AS plan_count`,
+        [[leftChild.workflowName, rightChild.workflowName]],
+      );
+      expect(evidence.rows).toEqual([{ receipt_count: '1', plan_count: '1' }]);
+      const snapshot = await workflowsA.loadWorkflowSnapshot(parent);
+      expect([snapshot?.context.left?.status, snapshot?.context.right?.status].sort()).toEqual(['running', 'success']);
+    } finally {
+      await cleanup(leftChild.workflowName);
+      await cleanup(rightChild.workflowName);
+      await cleanup(parent.workflowName);
+    }
+  });
+
+  it.each(['wait', 'noop', 'quarantine'] as const)(
+    'persists the PostgreSQL %s receipt, journal, parent, and revision state family',
+    async variant => {
+      const suffix = randomUUID();
+      const parent = { workflowName: `state-family-parent-${variant}-${suffix}`, runId: 'parent-run' };
+      const child = { workflowName: `state-family-child-${variant}-${suffix}`, runId: 'child-run' };
+      const now = Date.now();
+      const sourceStepId = variant === 'wait' ? 'left' : 'nested';
+      const sourcePath = variant === 'wait' ? ([0, 0] as const) : ([0] as const);
+      const parentSnapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(parent.runId),
+        status: variant === 'noop' ? 'success' : 'running',
+        context: {
+          [sourceStepId]: {
+            status: 'running',
+            payload: {},
+            startedAt: now - 20,
+            metadata: { nestedRunId: child.runId },
+          },
+          ...(variant === 'wait' ? { right: { status: 'running', payload: {}, startedAt: now - 20 } } : {}),
+          __state: { stale: true },
+        } as WorkflowRunState['context'],
+        serializedStepGraph:
+          variant === 'wait'
+            ? [
+                {
+                  type: 'parallel',
+                  steps: [
+                    { type: 'step', step: { id: 'left', component: 'WORKFLOW' } },
+                    { type: 'step', step: { id: 'right' } },
+                  ],
+                },
+              ]
+            : [
+                { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+                { type: 'sleep', id: 'after-child', duration: 10 },
+              ],
+        activePaths: variant === 'noop' ? [] : [...sourcePath],
+        activeStepsPath:
+          variant === 'wait' ? { left: [0, 0], right: [0, 1] } : variant === 'noop' ? {} : { nested: [0] },
+        timestamp: now - 20,
+      };
+      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+      await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+      try {
+        const claim = await workflowsA.claimWorkflowTerminalization({
+          ...child,
+          eventKey: `state-family-${variant}`,
+          terminalStatus: 'success',
+          ownerId: 'state-family-worker',
+          leaseMs: 10_000,
+        });
+        if (claim.status !== 'acquired') throw new Error('Expected state-family claim');
+        const fence = {
+          ...child,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+        };
+        await workflowsA.persistWorkflowTerminalState({
+          ...fence,
+          snapshot: {
+            ...createEmptyWorkflowSnapshot(child.runId),
+            status: 'success',
+            result: { status: 'success', output: variant, startedAt: now - 10, endedAt: now },
+            context: { __state: { final: true } } as WorkflowRunState['context'],
+            value: { final: true },
+            timestamp: now,
+          },
+        });
+        const prepared = await workflowsA.prepareWorkflowTerminalEffect({
+          ...fence,
+          expectedPhase: 'run_state_persisted',
+          effect: {
+            kind: 'parent-workflow-step-end',
+            parentWorkflowName: parent.workflowName,
+            parentRunId: parent.runId,
+            parentStepId: sourceStepId,
+            parentExecutionPath: [...sourcePath],
+          },
+        });
+        if (prepared.status !== 'prepared' || prepared.effect.kind !== 'parent-workflow-step-end') {
+          throw new Error('Expected state-family parent effect');
+        }
+        const context = await workflowsA.getWorkflowTerminalParentContext(fence);
+        if (context.status !== 'found') throw new Error('Expected state-family parent context');
+        const contractBase = {
+          version: 1,
+          terminalEffectKey: prepared.effect.effectKey,
+          terminalEffectPayloadHash: prepared.effect.payloadHash,
+          executionMode: 'continuous',
+          expectedParentRevision: context.revision,
+          graphFingerprint: createWorkflowTerminalGraphFingerprint(context.snapshot.serializedStepGraph),
+          childTerminalStatus: 'success',
+          observedParentStatus: variant === 'noop' ? ('success' as const) : ('running' as const),
+          source: { kind: 'step' as const, stepId: sourceStepId, executionPath: [...sourcePath] },
+        };
+        const contract =
+          variant === 'wait'
+            ? createWorkflowTerminalParentContinuationContract({
+                ...contractBase,
+                action: {
+                  kind: 'wait',
+                  reason: 'parallel-aggregation',
+                  coordinate: { kind: 'container', containerType: 'parallel', executionPath: [0] },
+                },
+                patch: {
+                  kind: 'merge-child-terminal',
+                  resultWrite: 'source-coordinate',
+                  resultSource: 'retained-child-terminal-envelope',
+                  payloadWrite: 'preserve-parent-step-payload',
+                  metadataWrite: 'merge-child-and-bind-nested-run-id',
+                  stateWrite: 'replace-context-__state-from-retained-child',
+                  requestContextWrite: 'merge-from-retained-child',
+                  activeStepsWrite: 'derive-from-source-coordinate',
+                  snapshotTimestampWrite: 'storage-clock',
+                  parentRunWrite: { kind: 'preserve' },
+                  loopWrite: { kind: 'preserve' },
+                },
+              })
+            : variant === 'noop'
+              ? createWorkflowTerminalParentContinuationContract({
+                  ...contractBase,
+                  action: { kind: 'noop', reason: 'already-terminal' },
+                  patch: { kind: 'none' },
+                })
+              : createWorkflowTerminalParentContinuationContract({
+                  ...contractBase,
+                  action: {
+                    kind: 'quarantine',
+                    reason: 'plan-conflict',
+                    conflictDigest: `sha256:${'f'.repeat(64)}`,
+                  },
+                  patch: { kind: 'none' },
+                });
+        const before = await workflowsA.loadWorkflowSnapshot(parent);
+        const result = await workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract });
+        expect(result.status).toBe(variant === 'quarantine' ? 'quarantined' : 'applied');
+        await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
+          status: 'found',
+          applicationState: variant === 'quarantine' ? 'quarantined' : 'applied',
+          dispatchState: 'none',
+        });
+        await expect(workflowsA.getWorkflowTerminalization(fence)).resolves.toMatchObject({
+          status: 'found',
+          record: {
+            phase: variant === 'wait' || variant === 'noop' ? 'parent_effect_recorded' : 'parent_outbox_pending',
+          },
+        });
+        const after = await workflowsA.loadWorkflowSnapshot(parent);
+        if (variant === 'wait') {
+          expect(after).toMatchObject({ context: { left: { status: 'success' }, right: { status: 'running' } } });
+        } else {
+          expect(after).toEqual(before);
+        }
+        const revision = await pool.query<{ generation: string }>(
+          `SELECT generation FROM mastra_workflow_parent_revisions
+           WHERE workflow_name = $1 AND run_id = $2`,
+          [parent.workflowName, parent.runId],
+        );
+        const expectedGeneration = Number(context.revision.slice('pg:v1:'.length)) + (variant === 'wait' ? 1 : 0);
+        expect(revision.rows).toEqual([{ generation: String(expectedGeneration) }]);
+      } finally {
+        await cleanup(child.workflowName);
+        await cleanup(parent.workflowName);
+      }
+    },
+  );
 
   it('uses database time and fences concurrent adapter instances', async () => {
     const workflowName = `terminalization-${Date.now()}`;
@@ -596,6 +1518,76 @@ describe('WorkflowsPG terminalization journal', () => {
     }
   });
 
+  it('idempotently seeds revision evidence for workflow snapshots created before upgrade', async () => {
+    const workflowName = `revision-upgrade-${randomUUID()}`;
+    const runId = 'pre-upgrade-run';
+    const now = new Date();
+    await pool.query(
+      `INSERT INTO mastra_workflow_snapshot
+       (workflow_name, run_id, snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [workflowName, runId, JSON.stringify(createEmptyWorkflowSnapshot(runId)), now, now, now, now],
+    );
+    try {
+      await expect(
+        pool.query(
+          `SELECT generation FROM mastra_workflow_parent_revisions
+           WHERE workflow_name = $1 AND run_id = $2`,
+          [workflowName, runId],
+        ),
+      ).resolves.toMatchObject({ rows: [] });
+
+      await Promise.all([workflowsA.init(), workflowsB.init()]);
+      const seeded = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, runId],
+      );
+      expect(seeded.rows).toEqual([{ generation: '1' }]);
+      await workflowsA.init();
+      const repeated = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, runId],
+      );
+      expect(repeated.rows).toEqual([{ generation: '1' }]);
+      await expect(workflowsA.deleteWorkflowRunById({ workflowName, runId })).resolves.toBeUndefined();
+      const tombstone = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, runId],
+      );
+      expect(tombstone.rows).toEqual([{ generation: '2' }]);
+
+      const missingRevisionRunId = 'missing-revision-delete';
+      await pool.query(
+        `INSERT INTO mastra_workflow_snapshot
+         (workflow_name, run_id, snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          workflowName,
+          missingRevisionRunId,
+          JSON.stringify(createEmptyWorkflowSnapshot(missingRevisionRunId)),
+          now,
+          now,
+          now,
+          now,
+        ],
+      );
+      await expect(
+        workflowsA.deleteWorkflowRunById({ workflowName, runId: missingRevisionRunId }),
+      ).resolves.toBeUndefined();
+      const selfHealedTombstone = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, missingRevisionRunId],
+      );
+      expect(selfHealedTombstone.rows).toEqual([{ generation: '1' }]);
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
   it('enforces the receipt version and closed state matrix in fresh exported DDL', async () => {
     const schema = `r${randomUUID().replaceAll('-', '').slice(0, 4)}`;
     const table = `"${schema}"."mastra_workflow_terminal_destination_receipts"`;
@@ -662,6 +1654,40 @@ describe('WorkflowsPG terminalization journal', () => {
       await expect(
         pool.query(`UPDATE ${table} SET created_at = -1, updated_at = -1 WHERE effect_key = 'effect-reserved'`),
       ).rejects.toThrow();
+    } finally {
+      await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+    }
+  });
+
+  it('exports the final graph-bound contract and revision schemas without obsolete raw-event plan columns', async () => {
+    const schema = `p${randomUUID().replaceAll('-', '').slice(0, 4)}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    try {
+      const exportDDL = WorkflowsPG.getExportDDL(schema);
+      for (const fragment of [
+        'terminal_effects',
+        'terminal_destination_receipts',
+        'workflow_parent_revisions',
+        'terminal_continuation_plans',
+      ]) {
+        const ddl = exportDDL.find(statement => statement.startsWith('CREATE TABLE') && statement.includes(fragment));
+        if (!ddl) throw new Error(`${fragment} DDL missing`);
+        await pool.query(ddl);
+      }
+      const planDDL = exportDDL.find(statement => statement.includes('mastra_workflow_terminal_continuation_plans'))!;
+      expect(planDDL).toContain('"contract_hash" TEXT NOT NULL');
+      expect(planDDL).toContain('"contract" JSONB NOT NULL');
+      expect(planDDL).toContain('"framework_action_key" TEXT');
+      expect(planDDL).toContain("'continuous'");
+      expect(planDDL).not.toContain('parent_result_mode');
+      expect(planDDL).not.toContain('parent_iteration_index');
+      expect(planDDL).not.toContain('plan_kind');
+      expect(planDDL).not.toContain('targets');
+      expect(planDDL).not.toContain('per-step-pause');
+
+      const revisionDDL = exportDDL.find(statement => statement.includes('mastra_workflow_parent_revisions'))!;
+      expect(revisionDDL).toContain('PRIMARY KEY ("workflow_name", "run_id")');
+      expect(revisionDDL).toContain('"generation" BIGINT NOT NULL');
     } finally {
       await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     }

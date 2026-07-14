@@ -3,8 +3,14 @@ import type { WorkflowRunState, WorkflowTerminalEffectRecord, WorkflowTerminalSn
 import {
   materializeWorkflowTerminalForeachStates,
   validateWorkflowTerminalParentContinuationBinding,
+  validateWorkflowTerminalParentContinuationIntegrity,
 } from './contract';
-import { WORKFLOW_TERMINAL_FOREACH_STATE_KEY, WORKFLOW_TERMINAL_FOREACH_SUSPEND_PAYLOAD_KEY } from './types';
+import { createWorkflowTerminalGraphFingerprint } from './graph-fingerprint';
+import {
+  WORKFLOW_TERMINAL_FOREACH_RUN_KEY,
+  WORKFLOW_TERMINAL_FOREACH_STATE_KEY,
+  WORKFLOW_TERMINAL_FOREACH_SUSPEND_PAYLOAD_KEY,
+} from './types';
 import type {
   WorkflowTerminalChildStatus,
   WorkflowTerminalParentContinuationContract,
@@ -355,6 +361,24 @@ function optionalDataRecord(
   return value === undefined ? {} : dataRecord(value, field, budget);
 }
 
+function storedDataRecord(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${field} must be a data object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${field} must be a plain object`);
+  }
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    assertJsonString(key, `${field} key`);
+    if (!('value' in descriptor)) throw new TypeError(`${field} contains accessor fields`);
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError(`${field} contains symbol fields`);
+  }
+  return value as Record<string, unknown>;
+}
+
 /** Use only for records produced by this module's canonical normalization in the current patch call. */
 function normalizedDataRecord(value: unknown, field: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -372,13 +396,13 @@ function terminalResultFromRetained(
   parentResult: ParentStepResult,
   nestedRunId: string,
   storageTimestamp: number,
-  budget: ContinuationDataBudget,
+  childBudget: ContinuationDataBudget,
 ): ParentStepResult {
   const childSnapshot = retained.snapshot;
   const terminalResult =
     childSnapshot.result === undefined
       ? {}
-      : dataRecord(childSnapshot.result, 'retained child snapshot result', budget);
+      : dataRecord(childSnapshot.result, 'retained child snapshot result', childBudget);
   const status = retained.terminalStatus;
   if (terminalResult.status !== undefined && terminalResult.status !== status) {
     throw new TypeError('retained child result status conflicts with its terminal snapshot');
@@ -392,34 +416,49 @@ function terminalResultFromRetained(
       ? undefined
       : terminalResult.error !== undefined
         ? terminalResult.error
-        : canonicalJsonValue(rawError, 'retained child error', budget);
+        : canonicalJsonValue(rawError, 'retained child error', childBudget);
   if (status === 'failed' && error === undefined) {
     throw new TypeError('failed retained child snapshot is missing an error');
   }
-  const existingMetadata = optionalNormalizedDataRecord(parentResult.metadata, 'parent step metadata');
-  const childMetadata = optionalNormalizedDataRecord(terminalResult.metadata, 'retained child result metadata');
+  const existingMetadata = readContinuationStoredState('parent', () =>
+    optionalNormalizedDataRecord(parentResult.metadata, 'parent step metadata'),
+  );
+  const childMetadata = readContinuationStoredState('child', () =>
+    optionalNormalizedDataRecord(terminalResult.metadata, 'retained child result metadata'),
+  );
   const startedAt = parentResult.startedAt ?? terminalResult.startedAt ?? retained.createdAt;
   const endedAt = terminalResult.endedAt ?? retained.createdAt;
   if (!Number.isSafeInteger(startedAt) || (startedAt as number) < 0) {
-    throw new TypeError('parent step startedAt must be a non-negative safe integer');
+    throw new WorkflowTerminalContinuationStoredStateError(
+      parentResult.startedAt === undefined ? 'child' : 'parent',
+      'parent step startedAt must be a non-negative safe integer',
+    );
   }
   if (!Number.isSafeInteger(endedAt) || (endedAt as number) < 0) {
-    throw new TypeError('retained child endedAt must be a non-negative safe integer');
+    throw new WorkflowTerminalContinuationStoredStateError(
+      'child',
+      'retained child endedAt must be a non-negative safe integer',
+    );
   }
-  if (
-    (startedAt as number) > (endedAt as number) ||
-    (endedAt as number) > retained.createdAt ||
-    retained.createdAt > storageTimestamp
-  ) {
-    throw new TypeError('retained child result timestamps are not monotonic');
+  if ((startedAt as number) > (endedAt as number)) {
+    throw new WorkflowTerminalContinuationStoredStateError(
+      parentResult.startedAt === undefined ? 'child' : 'parent',
+      'retained child result timestamps are not monotonic',
+    );
+  }
+  if ((endedAt as number) > retained.createdAt || retained.createdAt > storageTimestamp) {
+    throw new WorkflowTerminalContinuationStoredStateError(
+      'child',
+      'retained child result timestamps are not monotonic',
+    );
   }
   delete terminalResult.__state;
   if (status !== 'failed') delete terminalResult.error;
   return {
     ...terminalResult,
     status,
-    ...(status === 'failed' ? { error: clone(error) } : {}),
-    payload: clone(parentResult.payload),
+    ...(status === 'failed' ? { error: readContinuationStoredState('child', () => clone(error)) } : {}),
+    payload: readContinuationStoredState('parent', () => clone(parentResult.payload)),
     startedAt,
     endedAt,
     metadata: { ...existingMetadata, ...childMetadata, nestedRunId },
@@ -640,6 +679,206 @@ function applyAggregateSuspension(
   snapshot.activePaths = path;
 }
 
+function validateStoredParentSnapshotForContinuation(parentSnapshot: WorkflowRunState): void {
+  if (
+    typeof parentSnapshot.runId !== 'string' ||
+    ![
+      'pending',
+      'running',
+      'suspended',
+      'success',
+      'failed',
+      'tripwire',
+      'canceled',
+      'bailed',
+      'paused',
+      'waiting',
+    ].includes(String(parentSnapshot.status)) ||
+    !Number.isSafeInteger(parentSnapshot.timestamp) ||
+    parentSnapshot.timestamp < 0
+  ) {
+    throw new TypeError('parent continuation snapshot identity or lifecycle is invalid');
+  }
+  createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph);
+  if (
+    parentSnapshot.context === null ||
+    typeof parentSnapshot.context !== 'object' ||
+    Array.isArray(parentSnapshot.context) ||
+    (Object.getPrototypeOf(parentSnapshot.context) !== Object.prototype &&
+      Object.getPrototypeOf(parentSnapshot.context) !== null)
+  ) {
+    throw new TypeError('parent continuation context is invalid');
+  }
+  if (
+    parentSnapshot.activeStepsPath === null ||
+    typeof parentSnapshot.activeStepsPath !== 'object' ||
+    Array.isArray(parentSnapshot.activeStepsPath) ||
+    (Object.getPrototypeOf(parentSnapshot.activeStepsPath) !== Object.prototype &&
+      Object.getPrototypeOf(parentSnapshot.activeStepsPath) !== null)
+  ) {
+    throw new TypeError('parent continuation active step paths are invalid');
+  }
+  const activeStepsPath = parentSnapshot.activeStepsPath as Record<string, unknown>;
+  for (const sourcePathValue of Object.values(activeStepsPath)) {
+    if (
+      !Array.isArray(sourcePathValue) ||
+      sourcePathValue.length === 0 ||
+      sourcePathValue.some(value => !Number.isSafeInteger(value) || value < 0)
+    ) {
+      throw new TypeError('parent continuation active source path is invalid');
+    }
+  }
+  for (const [stepId, value] of Object.entries(parentSnapshot.context)) {
+    if (stepId === '__state' || stepId === 'input') continue;
+    const result = storedDataRecord(value, `parent continuation context ${stepId}`);
+    if (
+      result.status !== undefined &&
+      ![
+        'pending',
+        'running',
+        'suspended',
+        'success',
+        'failed',
+        'canceled',
+        'waiting',
+        'paused',
+        'tripwire',
+        'bailed',
+        'skipped',
+      ].includes(String(result.status))
+    ) {
+      throw new TypeError(`parent continuation context ${stepId} status is invalid`);
+    }
+    const metadata =
+      result.metadata === undefined
+        ? {}
+        : storedDataRecord(result.metadata, `parent continuation context ${stepId} metadata`);
+    if (metadata.__workflow_meta === undefined) continue;
+    const workflowMetadata = storedDataRecord(
+      metadata.__workflow_meta,
+      `parent continuation context ${stepId} workflow metadata`,
+    );
+    if (workflowMetadata[WORKFLOW_TERMINAL_FOREACH_RUN_KEY] !== undefined) {
+      const iterationRuns = storedDataRecord(
+        workflowMetadata[WORKFLOW_TERMINAL_FOREACH_RUN_KEY],
+        `parent continuation context ${stepId} foreach ownership`,
+      );
+      for (const [index, runId] of Object.entries(iterationRuns)) {
+        if (!/^(0|[1-9][0-9]*)$/.test(index) || typeof runId !== 'string') {
+          throw new TypeError(`parent continuation context ${stepId} foreach ownership is invalid`);
+        }
+      }
+    }
+    if (workflowMetadata[WORKFLOW_TERMINAL_FOREACH_STATE_KEY] !== undefined) {
+      if (!Array.isArray(result.output)) {
+        throw new TypeError(`parent continuation context ${stepId} foreach output is invalid`);
+      }
+      materializeWorkflowTerminalForeachStates(
+        workflowMetadata[WORKFLOW_TERMINAL_FOREACH_STATE_KEY],
+        result.output.length,
+      );
+    }
+  }
+}
+
+function validateParentContinuationIdentityBinding(
+  contract: WorkflowTerminalParentContinuationContract,
+  context: {
+    effect: Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }>;
+    parentRevision: string;
+    parentWorkflowName: string;
+    parentSnapshot: WorkflowRunState;
+    executionMode: 'continuous';
+  },
+): void {
+  validateWorkflowTerminalParentContinuationIntegrity(contract);
+  const { effect, parentRevision, parentWorkflowName, parentSnapshot, executionMode } = context;
+  const contractSourcePath =
+    contract.source.kind === 'step'
+      ? contract.source.executionPath
+      : [...contract.source.containerPath, contract.source.iterationIndex];
+  if (
+    contract.expectedParentRevision !== parentRevision ||
+    contract.terminalEffectKey !== effect.effectKey ||
+    contract.terminalEffectPayloadHash !== effect.payloadHash ||
+    contract.executionMode !== executionMode ||
+    parentWorkflowName !== effect.parentWorkflowName ||
+    contract.graphFingerprint !== createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph) ||
+    contract.observedParentStatus !== parentSnapshot.status ||
+    contract.childTerminalStatus !== effect.terminalStatus ||
+    parentSnapshot.runId !== effect.parentRunId ||
+    contract.source.stepId !== effect.parentStepId ||
+    contractSourcePath.length !== effect.parentExecutionPath.length ||
+    contractSourcePath.some((entry, index) => entry !== effect.parentExecutionPath[index])
+  ) {
+    throw new TypeError('Workflow terminal parent continuation identity binding conflict');
+  }
+  if (
+    contract.patch.kind === 'merge-child-terminal' &&
+    contract.patch.loopWrite.kind === 'set-iteration' &&
+    contract.patch.loopWrite.stepId !== contract.source.stepId
+  ) {
+    throw new TypeError('Workflow terminal parent continuation loop step conflict');
+  }
+}
+
+function validateStoredParentSourceForContinuation(
+  contract: WorkflowTerminalParentContinuationContract,
+  effect: Extract<WorkflowTerminalEffectRecord, { kind: 'parent-workflow-step-end' }>,
+  parentSnapshot: WorkflowRunState,
+): void {
+  if (contract.patch.kind === 'none') return;
+
+  const context = parentSnapshot.context as Record<string, unknown>;
+  const source = dataRecord(context[contract.source.stepId], 'parent continuation source result');
+  if (source.status !== 'running') {
+    throw new TypeError('parent continuation source status is invalid');
+  }
+  const metadata = optionalDataRecord(source.metadata, 'parent continuation source metadata');
+  if (contract.source.kind === 'step') {
+    const executionPath = contract.source.executionPath;
+    if (
+      metadata.nestedRunId !== effect.runId ||
+      !Array.isArray(parentSnapshot.activeStepsPath[contract.source.stepId]) ||
+      parentSnapshot.activeStepsPath[contract.source.stepId]!.length !== executionPath.length ||
+      parentSnapshot.activeStepsPath[contract.source.stepId]!.some((entry, index) => entry !== executionPath[index])
+    ) {
+      throw new TypeError('parent continuation nested run ownership is invalid');
+    }
+  } else {
+    if (!Array.isArray(source.payload) || !Array.isArray(source.output)) {
+      throw new TypeError('parent continuation foreach source state is invalid');
+    }
+    const workflowMetadata = optionalDataRecord(
+      metadata.__workflow_meta,
+      'parent continuation foreach workflow metadata',
+    );
+    const iterationRuns = dataRecord(
+      workflowMetadata.iterationRunIds,
+      'parent continuation foreach iteration ownership',
+    );
+    if (
+      Object.values(iterationRuns).some(runId => typeof runId !== 'string') ||
+      iterationRuns[String(contract.source.iterationIndex)] !== effect.runId
+    ) {
+      throw new TypeError('parent continuation foreach iteration ownership is invalid');
+    }
+    const states = materializeWorkflowTerminalForeachStates(
+      workflowMetadata[WORKFLOW_TERMINAL_FOREACH_STATE_KEY],
+      source.output.length,
+    );
+    const state = states[String(contract.source.iterationIndex)];
+    if (state === 'success' || state === 'failed' || state === 'canceled') {
+      throw new TypeError('parent continuation foreach iteration is already terminal');
+    }
+  }
+
+  if (contract.patch.loopWrite.kind === 'set-iteration') {
+    const loopResult = dataRecord(context[contract.patch.loopWrite.stepId], 'parent continuation loop source result');
+    optionalDataRecord(loopResult.metadata, 'parent continuation loop metadata');
+  }
+}
+
 /**
  * @internal Pure reference semantics for the later atomic storage implementations.
  * It applies no framework action and publishes no event; it only materializes the
@@ -692,11 +931,23 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
     storageTimestamp,
     executionMode,
   } = input;
-  const inputBudget = createContinuationDataBudget();
-  assertBoundedDataOnly(contract, 'parent continuation contract', inputBudget);
-  assertBoundedDataOnly(effect, 'parent continuation effect', inputBudget);
-  assertBoundedDataOnly(parentSnapshot, 'parent continuation snapshot', inputBudget);
-  assertBoundedDataOnly(retainedChild, 'retained child terminal snapshot', inputBudget, true);
+  const contractBudget = createContinuationDataBudget();
+  assertBoundedDataOnly(contract, 'parent continuation contract', contractBudget);
+  assertBoundedDataOnly(effect, 'parent continuation effect', contractBudget);
+  readContinuationStoredState('parent', () =>
+    assertBoundedDataOnly(parentSnapshot, 'parent continuation snapshot', createContinuationDataBudget()),
+  );
+  readContinuationStoredState('child', () =>
+    assertBoundedDataOnly(retainedChild, 'retained child terminal snapshot', createContinuationDataBudget(), true),
+  );
+  readContinuationStoredState('parent', () => validateStoredParentSnapshotForContinuation(parentSnapshot));
+  validateParentContinuationIdentityBinding(contract, {
+    effect,
+    parentRevision,
+    parentWorkflowName,
+    parentSnapshot,
+    executionMode,
+  });
   validateWorkflowTerminalParentContinuationBinding(contract, {
     effect,
     parentRevision,
@@ -704,41 +955,58 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
     parentSnapshot,
     executionMode,
   });
-  if (
-    !Number.isSafeInteger(storageTimestamp) ||
-    storageTimestamp < parentSnapshot.timestamp ||
-    storageTimestamp < retainedChild.createdAt
-  ) {
+  readContinuationStoredState('parent', () =>
+    validateStoredParentSourceForContinuation(contract, effect, parentSnapshot),
+  );
+  if (!Number.isSafeInteger(storageTimestamp) || storageTimestamp < 0) {
     throw new TypeError('storageTimestamp must be a monotonic non-negative safe integer');
   }
+  if (storageTimestamp < parentSnapshot.timestamp) {
+    throw new WorkflowTerminalContinuationStoredStateError(
+      'parent',
+      'storageTimestamp is not monotonic: it precedes the parent snapshot timestamp',
+    );
+  }
+  if (storageTimestamp < retainedChild.createdAt) {
+    throw new WorkflowTerminalContinuationStoredStateError(
+      'child',
+      'storageTimestamp is not monotonic: it precedes retained child createdAt',
+    );
+  }
 
-  const next = clone(parentSnapshot);
+  const next = readContinuationStoredState('parent', () => clone(parentSnapshot));
   if (contract.patch.kind === 'none') return next;
 
-  validateRetainedBinding(retainedChild, effect, contract.childTerminalStatus);
+  readContinuationStoredState('child', () =>
+    validateRetainedBinding(retainedChild, effect, contract.childTerminalStatus),
+  );
   const retainedState = retainedChild.snapshot.context?.__state;
   if (retainedState === undefined) {
-    throw new TypeError('retained child snapshot is missing final context.__state');
+    throw new WorkflowTerminalContinuationStoredStateError(
+      'child',
+      'retained child snapshot is missing final context.__state',
+    );
   }
-  const normalizationBudget = createContinuationDataBudget();
-  const finalState = dataRecord(retainedState, 'retained child final context.__state', normalizationBudget);
-  const childRequestContext = optionalDataRecord(
-    retainedChild.snapshot.requestContext,
-    'retained child requestContext',
-    normalizationBudget,
+  const parentNormalizationBudget = createContinuationDataBudget();
+  const childNormalizationBudget = createContinuationDataBudget();
+  const finalState = readContinuationStoredState('child', () =>
+    dataRecord(retainedState, 'retained child final context.__state', childNormalizationBudget),
   );
-  const parentRequestContext = optionalDataRecord(
-    parentSnapshot.requestContext,
-    'parent requestContext',
-    normalizationBudget,
+  const childRequestContext = readContinuationStoredState('child', () =>
+    optionalDataRecord(
+      retainedChild.snapshot.requestContext,
+      'retained child requestContext',
+      childNormalizationBudget,
+    ),
   );
-  const existing = dataRecord(next.context?.[contract.source.stepId], 'parent source step result', normalizationBudget);
-  const terminalResult = terminalResultFromRetained(
-    retainedChild,
-    existing,
-    effect.runId,
-    storageTimestamp,
-    normalizationBudget,
+  const parentRequestContext = readContinuationStoredState('parent', () =>
+    optionalDataRecord(parentSnapshot.requestContext, 'parent requestContext', parentNormalizationBudget),
+  );
+  const existing = readContinuationStoredState('parent', () =>
+    dataRecord(next.context?.[contract.source.stepId], 'parent source step result', parentNormalizationBudget),
+  );
+  const terminalResult = readContinuationStoredState('child', () =>
+    terminalResultFromRetained(retainedChild, existing, effect.runId, storageTimestamp, childNormalizationBudget),
   );
 
   let sourceResult: ParentStepResult;
@@ -748,37 +1016,50 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
     delete next.activeStepsPath[contract.source.stepId];
   } else {
     sourceResult = terminalResult;
+    const source = contract.source;
     defineDataProperty(
       next.context,
       contract.source.stepId,
-      mergeForeachIteration(existing, terminalResult, contract.source) as WorkflowRunState['context'][string],
+      readContinuationStoredState('parent', () =>
+        mergeForeachIteration(existing, terminalResult, source),
+      ) as WorkflowRunState['context'][string],
     );
   }
 
-  next.context.__state = clone(finalState) as WorkflowRunState['context'][string];
-  next.value = clone(finalState) as WorkflowRunState['value'];
+  next.context.__state = readContinuationStoredState('child', () =>
+    clone(finalState),
+  ) as WorkflowRunState['context'][string];
+  next.value = readContinuationStoredState('child', () => clone(finalState)) as WorkflowRunState['value'];
   next.requestContext = { ...parentRequestContext, ...childRequestContext };
 
   if (contract.patch.loopWrite.kind === 'set-iteration') {
-    const loopResult = normalizedDataRecord(next.context[contract.patch.loopWrite.stepId], 'parent loop step result');
-    const metadata = optionalNormalizedDataRecord(loopResult.metadata, 'parent loop metadata');
-    defineDataProperty(next.context, contract.patch.loopWrite.stepId, {
-      ...loopResult,
-      metadata: { ...metadata, iterationCount: contract.patch.loopWrite.iterationCount },
-    } as unknown as WorkflowRunState['context'][string]);
-    if (contract.action.reason === 'loop-continue') {
-      defineDataProperty(next.activeStepsPath, contract.patch.loopWrite.stepId, sourcePath(contract.source));
-    }
+    const loopWrite = contract.patch.loopWrite;
+    readContinuationStoredState('parent', () => {
+      const loopResult = normalizedDataRecord(next.context[loopWrite.stepId], 'parent loop step result');
+      const metadata = optionalNormalizedDataRecord(loopResult.metadata, 'parent loop metadata');
+      defineDataProperty(next.context, loopWrite.stepId, {
+        ...loopResult,
+        metadata: { ...metadata, iterationCount: loopWrite.iterationCount },
+      } as unknown as WorkflowRunState['context'][string]);
+      if (contract.action.reason === 'loop-continue') {
+        defineDataProperty(next.activeStepsPath, loopWrite.stepId, sourcePath(contract.source));
+      }
+    });
   }
 
   if (contract.patch.parentRunWrite.kind === 'set') {
     next.status = contract.patch.parentRunWrite.status;
-    next.result = clone(sourceResult);
+    next.result = readContinuationStoredState('child', () => clone(sourceResult));
     next.activePaths = sourcePath(contract.source);
     if (contract.patch.parentRunWrite.status === 'failed') {
       const error = sourceResult.error;
-      if (error === undefined) throw new TypeError('failed parent continuation source is missing an error');
-      next.error = clone(error) as WorkflowRunState['error'];
+      if (error === undefined) {
+        throw new WorkflowTerminalContinuationStoredStateError(
+          'child',
+          'failed parent continuation source is missing an error',
+        );
+      }
+      next.error = readContinuationStoredState('child', () => clone(error)) as WorkflowRunState['error'];
     } else {
       delete next.error;
     }
@@ -791,9 +1072,30 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
       delete next.stepExecutionPath;
     }
   } else if (contract.patch.parentRunWrite.kind === 'set-suspended') {
-    applyAggregateSuspension(next, contract, storageTimestamp, normalizationBudget);
+    readContinuationStoredState('parent', () =>
+      applyAggregateSuspension(next, contract, storageTimestamp, parentNormalizationBudget),
+    );
   }
 
   next.timestamp = storageTimestamp;
   return next;
+}
+
+export class WorkflowTerminalContinuationStoredStateError extends TypeError {
+  readonly state: 'parent' | 'child';
+
+  constructor(state: 'parent' | 'child', message = `Invalid durable ${state} workflow continuation state`) {
+    super(message);
+    this.name = 'WorkflowTerminalContinuationStoredStateError';
+    this.state = state;
+  }
+}
+
+function readContinuationStoredState<T>(state: 'parent' | 'child', read: () => T): T {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof WorkflowTerminalContinuationStoredStateError) throw error;
+    throw new WorkflowTerminalContinuationStoredStateError(state, error instanceof Error ? error.message : undefined);
+  }
 }

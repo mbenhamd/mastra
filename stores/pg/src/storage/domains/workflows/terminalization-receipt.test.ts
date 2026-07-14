@@ -115,6 +115,7 @@ describe('WorkflowsPG terminal destination receipts', () => {
         journalVersion: 1,
         producerOutboxVersion: 1,
         destinationReceiptVersion: 1,
+        parentApplicationVersion: 1,
       });
       const results = await Promise.all([
         workflowsA.reserveWorkflowTerminalDestinationReceipt(input),
