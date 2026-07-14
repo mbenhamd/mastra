@@ -2114,7 +2114,14 @@ function unsupportedRuntimeReasons(file, source) {
   const computedSpecifiers = new Set();
   for (const specifier of runtimeModuleSpecifiers(file, source, computedSpecifiers)) {
     const reason = unsupportedModuleReason(specifier);
-    if (reason) reasons.add(`module ${reason}`);
+    // A banned specifier that already existed in this file at the trusted
+    // base commit is part of the reviewed production surface (e.g. a server
+    // handler's SSRF-guarded fetch); editing unrelated lines of that file
+    // must not retroactively reject it. Only NEWLY ADDED banned imports in
+    // the changed surface fail closed.
+    if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier))) {
+      reasons.add(`module ${reason}`);
+    }
     if (
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
