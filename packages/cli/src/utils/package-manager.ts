@@ -1,16 +1,23 @@
 export type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
-export function getPackageManagerAddCommand(pm: PackageManager): string {
+export function getPackageManagerAddArgs(pm: PackageManager): string[] {
   switch (pm) {
     case 'npm':
-      return 'install --audit=false --fund=false --loglevel=error --progress=false --update-notifier=false';
+      return [
+        'install',
+        '--audit=false',
+        '--fund=false',
+        '--loglevel=error',
+        '--progress=false',
+        '--update-notifier=false',
+      ];
     case 'yarn':
-      return 'add';
+      return ['add'];
     case 'pnpm':
-      return 'add --loglevel=error';
+      return ['add', '--loglevel=error'];
     case 'bun':
-      return 'add';
+      return ['add'];
     default:
-      return 'add';
+      return ['add'];
   }
 }

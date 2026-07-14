@@ -12,7 +12,7 @@ interface CreateProjectArgs {
   llm?: LLMProvider;
   llmApiKey?: string;
   example?: boolean;
-  timeout?: string | boolean;
+  timeout?: number | true;
   dir?: string;
   projectName?: string;
   mcp?: Editor;
@@ -38,7 +38,7 @@ export const createProject = async (projectNameArg: string | undefined, args: Cr
     command: 'create',
     args: { ...args, projectName },
     execution: async () => {
-      const timeout = args?.timeout ? (args?.timeout === true ? 60000 : parseInt(args?.timeout, 10)) : undefined;
+      const timeout = args.timeout === true ? 60_000 : args.timeout;
       if (args.default) {
         await create({
           components: ['agents', 'tools', 'workflows'],

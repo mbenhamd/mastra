@@ -110,3 +110,18 @@ describe('getVersionTag', () => {
     expect(tag).toBeUndefined();
   });
 });
+
+describe('parseTimeout', () => {
+  test('parses a non-negative integer timeout', async () => {
+    const { parseTimeout } = await import('./utils');
+
+    expect(parseTimeout('60000')).toBe(60_000);
+    expect(parseTimeout('0')).toBe(0);
+  });
+
+  test.each(['-1', '1.5', 'not-a-number', ''])('rejects invalid timeout %j', async value => {
+    const { parseTimeout } = await import('./utils');
+
+    expect(() => parseTimeout(value)).toThrow('Timeout must be a non-negative integer in milliseconds');
+  });
+});

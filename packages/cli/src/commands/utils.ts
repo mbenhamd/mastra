@@ -56,6 +56,14 @@ export function parseSkills(value: string) {
     .filter(Boolean);
 }
 
+export function parseTimeout(value: string): number {
+  const timeout = Number(value);
+  if (value.trim() === '' || !Number.isSafeInteger(timeout) || timeout < 0) {
+    throw new InvalidArgumentError('Timeout must be a non-negative integer in milliseconds');
+  }
+  return timeout;
+}
+
 export function parseComponents(value: string) {
   const parsedValue = value.split(',');
 

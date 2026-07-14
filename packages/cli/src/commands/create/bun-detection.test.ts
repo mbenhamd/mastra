@@ -3,6 +3,8 @@ import { getPackageManager } from '../utils';
 
 const mocks = vi.hoisted(() => {
   const mockExec = vi.fn();
+  const mockExeca = vi.fn().mockResolvedValue({ stdout: '' });
+  const mockInstallPackages = vi.fn().mockResolvedValue(undefined);
   const mockChildProcess = {
     exec: (cmd: string, opts: any, cb: any) => {
       mockExec(cmd);
@@ -21,11 +23,17 @@ const mocks = vi.hoisted(() => {
 
   return {
     mockExec,
+    mockExeca,
+    mockInstallPackages,
     mockChildProcess,
     mockRm,
     mockExistsSync,
   };
 });
+
+vi.mock('execa', () => ({
+  execa: mocks.mockExeca,
+}));
 
 vi.mock('node:child_process', () => ({
   default: mocks.mockChildProcess,
@@ -44,6 +52,7 @@ vi.mock('fs/promises', () => ({
     mkdir: vi.fn().mockResolvedValue(undefined),
     readFile: vi.fn().mockResolvedValue(JSON.stringify({ scripts: {}, engines: {} })),
     writeFile: vi.fn().mockResolvedValue(undefined),
+    appendFile: vi.fn().mockResolvedValue(undefined),
     rm: mocks.mockRm,
   },
 }));
@@ -70,6 +79,7 @@ vi.mock('@clack/prompts', () => ({
 vi.mock('../../services/service.deps.js', () => ({
   DepsService: class {
     addScriptsToPackageJson = vi.fn().mockResolvedValue(undefined);
+    installPackages = mocks.mockInstallPackages;
   },
 }));
 
@@ -90,6 +100,9 @@ describe('Bun Runtime Detection', () => {
     process.exit = mockExit;
     mocks.mockExec.mockReset();
     mocks.mockExec.mockResolvedValue({ stdout: '' });
+    mocks.mockExeca.mockReset();
+    mocks.mockExeca.mockResolvedValue({ stdout: '' });
+    mocks.mockInstallPackages.mockClear();
     mocks.mockRm.mockClear();
     mocks.mockExistsSync.mockReturnValue(false);
   });
@@ -129,10 +142,14 @@ describe('Bun Runtime Detection', () => {
     });
 
     // Check if bun init was called
-    expect(mocks.mockExec).toHaveBeenCalledWith('bun init -y');
+    expect(mocks.mockExeca).toHaveBeenCalledWith('bun', ['init', '-y'], {
+      timeout: undefined,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: 1_000,
+    });
 
     // Check if bun add was used for dependencies
-    expect(mocks.mockExec).toHaveBeenCalledWith(expect.stringContaining('bun add zod@^4'));
+    expect(mocks.mockInstallPackages).toHaveBeenCalledWith(['zod@^4'], { timeout: undefined });
   });
 
   it('should use npm init when npm is detected', async () => {
@@ -143,24 +160,25 @@ describe('Bun Runtime Detection', () => {
     await createMastraProject({
       projectName: 'test-npm-project',
       needsInteractive: false,
+      timeout: 12_345,
     });
 
     // Check if npm init was called
-    expect(mocks.mockExec).toHaveBeenCalledWith('npm init -y');
+    expect(mocks.mockExeca).toHaveBeenCalledWith('npm', ['init', '-y'], {
+      timeout: 12_345,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: 1_000,
+    });
 
     // Check if npm install was used for dependencies
-    expect(mocks.mockExec).toHaveBeenCalledWith(
-      expect.stringContaining(
-        'npm install --audit=false --fund=false --loglevel=error --progress=false --update-notifier=false zod@^4',
-      ),
-    );
+    expect(mocks.mockInstallPackages).toHaveBeenCalledWith(['zod@^4'], { timeout: 12_345 });
   });
 
   it('should clean up directory on failure', async () => {
     process.env.npm_config_user_agent = 'bun/1.0.0';
 
     // Simulate failure during init
-    mocks.mockExec.mockRejectedValueOnce(new Error('Init failed'));
+    mocks.mockExeca.mockRejectedValueOnce(new Error('Init failed'));
     mocks.mockExistsSync.mockReturnValue(true); // Directory exists for cleanup
 
     const { createMastraProject } = await import('./utils');
