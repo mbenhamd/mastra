@@ -350,6 +350,8 @@ export interface MCPToolProperties {
  * - Supports FlexibleSchema | Schema for broader AI SDK compatibility
  */
 export type CoreTool = {
+  /** Internal FGA identity chosen when this tool is converted for execution. */
+  _mastraFgaResourceId?: string;
   description?: string;
   parameters: FlexibleSchema<any> | Schema;
   outputSchema?: FlexibleSchema<any> | Schema;
@@ -408,6 +410,8 @@ export type CoreTool = {
  * The only difference: parameters must be Schema (not FlexibleSchema | Schema)
  */
 export type InternalCoreTool = {
+  /** Internal FGA identity chosen when this tool is converted for execution. */
+  _mastraFgaResourceId?: string;
   description?: string;
   parameters: Schema;
   outputSchema?: Schema;

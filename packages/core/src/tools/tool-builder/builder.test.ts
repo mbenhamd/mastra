@@ -39,6 +39,7 @@ describe('CoreToolBuilder FGA', () => {
     });
 
     const builtTool = builder.build();
+    expect(builtTool._mastraFgaResourceId).toBe('search');
     await expect(builtTool.execute!({ query: 'docs' }, { toolCallId: 'call-1', messages: [] })).resolves.toEqual({
       result: 'ok',
     });
@@ -89,6 +90,7 @@ describe('CoreToolBuilder FGA', () => {
     });
 
     const builtTool = builder.build();
+    expect(builtTool._mastraFgaResourceId).toBe('agent-1:search');
     await builtTool.execute!({ query: 'docs' }, { toolCallId: 'call-1', messages: [] });
 
     expect(fgaProvider.require).toHaveBeenCalledWith(user, {
@@ -238,6 +240,7 @@ describe('MCP Tool Tracing', () => {
     });
 
     const builtTool = builder.build();
+    expect(builtTool._mastraFgaResourceId).toBe('["filesystem-server","mcp-server_list-files"]');
     await builtTool.execute!({ path: '/tmp' }, { toolCallId: 'test-call-id', messages: [] });
 
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalledWith(
