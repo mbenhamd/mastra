@@ -875,6 +875,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let rawResponse: any;
       let activeFallbackModelIndex = inputData.fallbackModelIndex || 0;
       let executedStepModel: string | undefined;
+      let hadInterjectedSignals = false;
       const maxErrorProcessorRetries = maxProcessorRetries ?? (errorProcessors?.length ? 10 : undefined);
       const { outputStream, callBail, runState, stepTools, stepWorkspace, processAPIErrorRetry } =
         await executeStreamWithFallbackModels<{
@@ -1559,6 +1560,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             }
 
             if (interjectedSignals.length > 0) {
+              hadInterjectedSignals = true;
               messageList.markResponseMessageBoundary(currentStep.messageId);
               outputStream.messageId = rotateResponseMessageId();
               for (const signal of interjectedSignals) {
@@ -1948,7 +1950,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       // Tool calls are added to the message list inline during stream processing (case 'tool-call').
       // Tool results (including deferred provider results) are handled inline (case 'tool-result').
-      const toolCalls = (outputStream._getImmediateToolCalls() ?? []).map(chunk => {
+      const toolCalls = (hadInterjectedSignals ? [] : (outputStream._getImmediateToolCalls() ?? [])).map(chunk => {
         const tool = stepTools?.[chunk.payload.toolName] || findProviderToolByName(stepTools, chunk.payload.toolName);
         return {
           ...chunk.payload,

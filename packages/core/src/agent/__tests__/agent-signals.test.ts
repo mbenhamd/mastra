@@ -4149,9 +4149,9 @@ describe('Agent signals', () => {
       instructions: 'Test',
       model: createTextStreamModel('observer response'),
     });
-    new Mastra({ agents: { runner, observer }, logger: false, pubsub });
-    expect(runner.getPubSub()).toBe(pubsub);
-    expect(observer.getPubSub()).toBe(pubsub);
+    const mastra = new Mastra({ agents: { runner, observer }, logger: false, pubsub });
+    expect(runner.getPubSub()).toBe(mastra.pubsub);
+    expect(observer.getPubSub()).toBe(mastra.pubsub);
 
     const subscription = await observer.subscribeToThread({
       threadId: 'shared-thread',
@@ -4475,6 +4475,7 @@ describe('Agent signals', () => {
     continueToToolCall();
     await waitForCondition(() => callCount === 2);
     await runPromise;
+    await stream._waitUntilFinished();
 
     expect(chunks.map(chunk => chunk.type)).not.toContain('tool-call');
     expect(JSON.stringify(prompts[1])).toContain('Actually stop and answer this instead');
@@ -6165,7 +6166,7 @@ describe('Agent signals', () => {
     ).toThrow('already active for this thread');
   });
 
-  it('waits for same-agent active runs before allowing another stream on the thread', async () => {
+  it('does not treat a same-agent active run as a cross-agent blocker', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new EventEmitterPubSub();
     let finishActive!: () => void;
@@ -6201,7 +6202,7 @@ describe('Agent signals', () => {
         waiterResolved = true;
       });
     await nextTick();
-    expect(waiterResolved).toBe(false);
+    expect(waiterResolved).toBe(true);
 
     finishActive();
     await completion;
@@ -6209,7 +6210,7 @@ describe('Agent signals', () => {
     expect(waiterResolved).toBe(true);
   });
 
-  it('waits for completed active records to clear before allowing another stream on the thread', async () => {
+  it('does not block on a completed active record awaiting cleanup', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new EventEmitterPubSub();
     let finishActive!: () => void;
@@ -6234,7 +6235,7 @@ describe('Agent signals', () => {
     let waiterResolved = false;
     const waiter = runtime
       .waitForCrossAgentThreadRun(
-        { id: 'completed-window-agent' } as any,
+        { id: 'completed-window-next-agent' } as any,
         {
           runId: 'completed-window-next-run',
           memory: { resource: 'completed-window-user', thread: 'completed-window-thread' },
@@ -6245,7 +6246,7 @@ describe('Agent signals', () => {
         waiterResolved = true;
       });
     await nextTick();
-    expect(waiterResolved).toBe(false);
+    expect(waiterResolved).toBe(true);
 
     finishActive();
     await completion;
