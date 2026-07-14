@@ -44,10 +44,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   generated Client SDK route types, CLI API metadata, and Core permission
   interfaces are mapped narrowly to the Server validation lane. Route
   regeneration fails unless both route artifacts are tracked and unchanged
-  from the PR head, while the Server permission check owns the generated RBAC
-  interface. This allows route and permission PRs to commit canonical output
-  without granting general validation coverage to the Client SDK, CLI, or Core
-  workspaces.
+  from the PR head. Route-surface changes also run Server route consistency and
+  API-manifest tests, scoped TypeScript checks over each generated module and
+  its consumers, and focused Client SDK Harness and CLI descriptor tests. The
+  Server permission check owns the generated RBAC interface. Server package
+  manifest changes fail closed before package-owned commands run. This allows
+  route and permission PRs to commit canonical output without granting general
+  validation coverage to the Client SDK, CLI, or Core workspaces.
   The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
@@ -61,13 +64,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   allowlisted because it exercises route handlers exclusively against
   `InMemoryStore`. Both exact-path exceptions are content-conditioned: edits
   that add Playwright, environment credentials, external provider or storage
-  packages, or direct network/process primitives fail closed before the path
-  exception is considered. A TypeScript parser and module resolver follow the
-  changed and newly reachable local runtime dependency graph, including
-  `.js` specifiers that resolve to TypeScript source; helper-only changes re-run
-  the owning exact test. Every changed Server test is screened across that
-  incremental runtime surface before generic Vitest execution. Other
-  integration-named Server tests remain fail-closed.
+  packages (including scoped OpenAI SDKs), or direct network/process primitives
+  fail closed before the path exception is considered. A TypeScript parser and
+  module resolver follow the changed and newly reachable local runtime
+  dependency graph, including `.js` specifiers that resolve to TypeScript
+  source; helper-only changes re-run the owning exact test. Every changed Server
+  test is screened across that incremental runtime surface before generic Vitest
+  execution. Other integration-named Server tests remain fail-closed.
   Other Playwright files, `e2e-tests/**`, nested
   integration-test packages, integration-test filename variants, explicit
   provider E2E files, and PostgreSQL pooler/performance suites fail closed until
@@ -99,10 +102,12 @@ or command plan:
 The fixtures use an isolated temporary Git repository and mocked package
 commands. They prove Server permission and route-generation selection, map
 each generated artifact back to Server even when it is the only changed file,
-reject stale or deleted generated output, run the exact fork-safe favorites
-integration test, reject exact and ordinary Server tests when their changed or
-newly reachable local dependencies gain unsafe runtime requirements, distinguish
-real imports from comments, and keep other integration-named tests fail-closed.
+reject stale or deleted generated output, reject Server manifest changes before
+package commands run, exercise route-contract and generated-consumer checks,
+run the exact fork-safe favorites integration test, reject exact and ordinary
+Server tests when their changed or newly reachable local dependencies gain
+unsafe runtime requirements, distinguish real imports from comments, and keep
+other integration-named tests fail-closed.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`

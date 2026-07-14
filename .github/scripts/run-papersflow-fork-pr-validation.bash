@@ -139,6 +139,37 @@ run_validator_self_tests() {
   assert_contains '--filter @mastra/server check:permissions' "$command_log"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+  assert_contains '--dir packages/server exec vitest run --reporter=dot src/server/server-adapter/schema-consistency.test.ts src/server/server-adapter/api-schema-manifest.test.ts' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
+  assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec vitest run --reporter=dot src/resources/harness.test.ts' "$command_log"
+  assert_contains '--dir packages/cli exec vitest run --reporter=dot src/commands/api/descriptors.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"build:lib":"true"}}' > packages/server/package.json
+    git add .
+    git commit -q -m 'change Server package scripts'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-manifest-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Changed Server package manifest fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/package.json' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Changed Server package manifest fixture executed PR-controlled package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
 
   head_sha="$(
     cd "$fixture_repo"
@@ -224,6 +255,7 @@ run_validator_self_tests() {
   assert_contains 'packages/server' "$output"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+  assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -239,6 +271,7 @@ run_validator_self_tests() {
   assert_contains 'packages/server' "$output"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+  assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -283,6 +316,52 @@ run_validator_self_tests() {
   fi
   assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
   assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { run } from '@openai/agents';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test import scoped OpenAI agents SDK'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-openai-agents-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Scoped OpenAI agents fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'module @openai/agents' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { openai } from '@mastra/openai';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test import Mastra OpenAI provider'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-mastra-openai-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Mastra OpenAI provider fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'module @mastra/openai' "$output"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -704,6 +783,9 @@ done < "$unowned_files"
 
 grep -E '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|patches/)' "$changed_files" \
   >> "$unsupported_inputs" || true
+# Server validation invokes package-owned scripts. Reject manifest edits before
+# any PR-controlled Server command can weaken or replace those checks.
+grep -Fx 'packages/server/package.json' "$changed_files" >> "$unsupported_inputs" || true
 
 sort -u -o "$unsupported_inputs" "$unsupported_inputs"
 
@@ -770,6 +852,13 @@ if workspace_changed packages/mcp; then
 fi
 
 if workspace_changed packages/server; then
+  server_route_surface_changed=false
+  if grep -Eq \
+    '^(client-sdks/client-js/src/route-types\.generated\.ts|packages/cli/src/commands/api/route-metadata\.generated\.ts|packages/server/scripts/generate-(route-types|api-cli-route-metadata)\.ts|packages/server/src/server/(handlers|schemas|server-adapter/routes)/|packages/server/src/server/server-adapter/(api-schema-manifest|openapi-utils)\.ts)' \
+    "$changed_files"; then
+    server_route_surface_changed=true
+  fi
+
   run_with_validation_budget 900 pnpm build:server
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
   run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
@@ -785,6 +874,24 @@ if workspace_changed packages/server; then
     echo "Generated Server route artifacts are stale or missing from the pull request." >&2
     echo "Run both @mastra/server route generators and commit their output." >&2
     exit 1
+  fi
+  if [[ "$server_route_surface_changed" == true ]]; then
+    run_with_validation_budget 600 pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/server-adapter/schema-consistency.test.ts \
+      src/server/server-adapter/api-schema-manifest.test.ts
+    run_with_validation_budget 600 pnpm --dir client-sdks/client-js exec tsc-files --noEmit \
+      src/route-types.generated.ts \
+      src/types.ts \
+      src/resources/harness.ts \
+      src/resources/agent.test.ts
+    run_with_validation_budget 600 pnpm --dir packages/cli exec tsc-files --noEmit \
+      src/commands/api/route-metadata.generated.ts \
+      src/commands/api/index.ts \
+      src/commands/api/descriptors.test.ts
+    run_with_validation_budget 600 pnpm --dir client-sdks/client-js exec vitest run --reporter=dot \
+      src/resources/harness.test.ts
+    run_with_validation_budget 600 pnpm --dir packages/cli exec vitest run --reporter=dot \
+      src/commands/api/descriptors.test.ts
   fi
 fi
 
@@ -1037,8 +1144,10 @@ const bannedBuiltins = new Set([
 function unsupportedModuleReason(specifier) {
   if (specifier === '@playwright/test' || specifier === 'testcontainers') return specifier;
   if (specifier.startsWith('@ai-sdk/')) return specifier;
+  if (specifier.startsWith('@openai/')) return specifier;
   if (specifier === '@anthropic-ai/sdk' || specifier === '@google/generative-ai') return specifier;
   if (specifier === 'ollama' || specifier === 'openai') return specifier;
+  if (specifier === '@mastra/openai' || specifier.startsWith('@mastra/openai/')) return specifier;
   if (specifier.startsWith('@mastra/')) {
     const packageName = specifier.slice('@mastra/'.length).split('/')[0];
     if (bannedMastraPackages.has(packageName)) return specifier;
