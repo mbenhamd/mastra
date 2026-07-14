@@ -11,6 +11,21 @@ vi.mock('execa', () => ({
 import type { PackageManager } from '../utils/package-manager.js';
 import { DepsService } from './service.deps.js';
 
+function deferredSubprocess(pid: number) {
+  let resolve!: (value: { all: string }) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<{ all: string }>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return {
+    subprocess: Object.assign(promise, { pid, kill: vi.fn(() => true) }),
+    resolve,
+    reject,
+  };
+}
+
 describe('DepsService.installPackages', () => {
   beforeEach(() => {
     mocks.execa.mockReset();
@@ -92,39 +107,125 @@ describe('DepsService.installPackages', () => {
 
   it.runIf(process.platform !== 'win32')('terminates the install process group when timeout expires', async () => {
     vi.useFakeTimers();
-    const subprocess = Object.assign(new Promise<never>(() => {}), {
-      pid: 43_210,
-      kill: vi.fn(() => true),
-    });
-    mocks.execa.mockReturnValueOnce(subprocess);
+    const deferred = deferredSubprocess(43_210);
+    mocks.execa.mockReturnValueOnce(deferred.subprocess);
     const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
 
     try {
-      void new DepsService('npm').installPackages(['typescript'], { timeout: 500 });
+      const installation = new DepsService('npm').installPackages(['typescript'], { timeout: 500 });
       await vi.advanceTimersByTimeAsync(1_500);
 
       expect(kill).toHaveBeenCalledWith(-43_210, 'SIGTERM');
       expect(kill).toHaveBeenCalledWith(-43_210, 'SIGKILL');
+      deferred.reject(new Error('timed out'));
+      await expect(installation).rejects.toThrow('timed out');
     } finally {
       kill.mockRestore();
       vi.useRealTimers();
     }
   });
 
-  it.runIf(process.platform !== 'win32')('terminates the install process group for an already-aborted signal', () => {
-    const controller = new AbortController();
-    controller.abort();
-    const subprocess = Object.assign(new Promise<never>(() => {}), {
-      pid: 43_211,
-      kill: vi.fn(() => true),
-    });
-    mocks.execa.mockReturnValueOnce(subprocess);
+  it.runIf(process.platform !== 'win32')('treats timeout zero as no install timeout', async () => {
+    vi.useFakeTimers();
+    const deferred = deferredSubprocess(43_211);
+    mocks.execa.mockReturnValueOnce(deferred.subprocess);
     const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
 
     try {
-      void new DepsService('npm').installPackages(['typescript'], { cancelSignal: controller.signal });
-      expect(kill).toHaveBeenCalledWith(-43_211, 'SIGTERM');
+      const installation = new DepsService('npm').installPackages(['typescript'], { timeout: 0 });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(kill).not.toHaveBeenCalled();
+      deferred.resolve({ all: 'installed' });
+      await expect(installation).resolves.toEqual({ all: 'installed' });
     } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('awaits forced install-tree cleanup before rejecting', async () => {
+    vi.useFakeTimers();
+    const deferred = deferredSubprocess(43_212);
+    mocks.execa.mockReturnValueOnce(deferred.subprocess);
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+
+    try {
+      let settled = false;
+      const installation = new DepsService('npm').installPackages(['typescript'], { timeout: 500 });
+      void installation.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(500);
+      deferred.reject(new Error('timed out'));
+      await Promise.resolve();
+      expect(kill).toHaveBeenCalledWith(-43_212, 'SIGTERM');
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(installation).rejects.toThrow('timed out');
+      expect(kill).toHaveBeenCalledWith(-43_212, 'SIGKILL');
+      expect(settled).toBe(true);
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'terminates the install process group for an already-aborted signal',
+    async () => {
+      const controller = new AbortController();
+      controller.abort();
+      vi.useFakeTimers();
+      const deferred = deferredSubprocess(43_213);
+      mocks.execa.mockReturnValueOnce(deferred.subprocess);
+      const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+
+      try {
+        const installation = new DepsService('npm').installPackages(['typescript'], {
+          cancelSignal: controller.signal,
+        });
+        expect(kill).toHaveBeenCalledWith(-43_213, 'SIGTERM');
+        await vi.advanceTimersByTimeAsync(1_000);
+        deferred.reject(new Error('aborted'));
+        await expect(installation).rejects.toThrow('aborted');
+      } finally {
+        kill.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')('kills a detached install tree when the CLI exits', async () => {
+    const deferred = deferredSubprocess(43_214);
+    mocks.execa.mockReturnValueOnce(deferred.subprocess);
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const once = vi.spyOn(process, 'once');
+
+    try {
+      const installation = new DepsService('npm').installPackages(['typescript']);
+      const exitListener = once.mock.calls.find(([event]) => event === 'exit')?.[1] as
+        | ((code: number) => void)
+        | undefined;
+      expect(exitListener).toBeDefined();
+
+      exitListener?.(1);
+      expect(kill).toHaveBeenCalledWith(-43_214, 'SIGKILL');
+
+      deferred.resolve({ all: 'installed' });
+      await expect(installation).resolves.toEqual({ all: 'installed' });
+    } finally {
+      once.mockRestore();
       kill.mockRestore();
     }
   });

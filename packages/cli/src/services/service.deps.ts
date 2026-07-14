@@ -53,34 +53,55 @@ async function terminateInstallTree(subprocess: ResultPromise, signal: NodeJS.Si
 }
 
 function scheduleInstallTreeTermination(subprocess: ResultPromise, timeout?: number, cancelSignal?: AbortSignal) {
-  let terminationStarted = false;
+  let terminationPromise: Promise<void> | undefined;
   const terminate = () => {
-    if (terminationStarted) return;
-    terminationStarted = true;
+    terminationPromise ??= (async () => {
+      if (process.platform === 'win32') {
+        await terminateInstallTree(subprocess, 'SIGKILL');
+        return;
+      }
 
-    if (process.platform === 'win32') {
-      void terminateInstallTree(subprocess, 'SIGKILL').catch(() => {});
-      return;
-    }
-
-    void terminateInstallTree(subprocess, 'SIGTERM').catch(() => {});
-    const forceKillTimer = setTimeout(() => {
-      void terminateInstallTree(subprocess, 'SIGKILL').catch(() => {});
-    }, FORCE_KILL_DELAY_MS);
-    forceKillTimer.unref();
+      await terminateInstallTree(subprocess, 'SIGTERM');
+      await new Promise<void>(resolve => setTimeout(resolve, FORCE_KILL_DELAY_MS));
+      await terminateInstallTree(subprocess, 'SIGKILL');
+    })().catch(() => {});
+    return terminationPromise;
   };
 
-  const timeoutTimer = timeout === undefined ? undefined : setTimeout(terminate, timeout);
+  const terminateOnExit = () => {
+    const pid = subprocess.pid;
+    if (process.platform !== 'win32' && pid) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+        return;
+      } catch {
+        // Fall through when the detached process group has already exited.
+      }
+    }
+    try {
+      subprocess.kill('SIGKILL');
+    } catch {
+      // Best-effort cleanup during process exit cannot be awaited or retried.
+    }
+  };
+  const terminateOnAbort = () => void terminate();
+
+  const timeoutTimer = timeout === undefined || timeout <= 0 ? undefined : setTimeout(() => void terminate(), timeout);
   timeoutTimer?.unref();
   if (cancelSignal?.aborted) {
-    terminate();
+    void terminate();
   } else {
-    cancelSignal?.addEventListener('abort', terminate, { once: true });
+    cancelSignal?.addEventListener('abort', terminateOnAbort, { once: true });
   }
+  process.once('exit', terminateOnExit);
 
-  return () => {
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    cancelSignal?.removeEventListener('abort', terminate);
+  return {
+    terminate,
+    clear() {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      cancelSignal?.removeEventListener('abort', terminateOnAbort);
+      process.removeListener('exit', terminateOnExit);
+    },
   };
 }
 
@@ -146,12 +167,15 @@ export class DepsService {
       forceKillAfterDelay: FORCE_KILL_DELAY_MS,
       detached: process.platform !== 'win32',
     });
-    const clearTreeTermination = scheduleInstallTreeTermination(subprocess, options.timeout, options.cancelSignal);
+    const treeTermination = scheduleInstallTreeTermination(subprocess, options.timeout, options.cancelSignal);
 
     try {
       return await subprocess;
+    } catch (error) {
+      await treeTermination.terminate();
+      throw error;
     } finally {
-      clearTreeTermination();
+      treeTermination.clear();
     }
   }
 
