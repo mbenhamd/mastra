@@ -1382,8 +1382,10 @@ describe('createToolCallStep tool approval workflow', () => {
       makeExecuteParams({ inputData, resumeData: { approved: true }, suspendData: makeSuspendData() }),
     );
 
+    // Upstream #17836: errors are reified to serialization-safe plain objects
+    // before persisting; the approval provenance (fork PF-1703) must survive.
     expect(result).toEqual({
-      error,
+      error: { message: error.message, name: 'Error', stack: expect.any(String) },
       approval: {
         id: inputData.toolCallId,
         approved: true,
