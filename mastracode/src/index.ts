@@ -35,12 +35,7 @@ import {
 
 import { getDynamicInstructions } from './agents/instructions.js';
 import { getDynamicMemory } from './agents/memory.js';
-import {
-  createMastraCodeGateway,
-  getDynamicModel,
-  getGoalJudgeModel,
-  resolveModel,
-} from './agents/model.js';
+import { createMastraCodeGateway, getDynamicModel, getGoalJudgeModel, resolveModel } from './agents/model.js';
 // import { createMastraCodeModelCatalogProvider } from './agents/model.js';
 // import { buildMode } from './agents/modes/build.js';
 // import { fastMode } from './agents/modes/explore.js';
