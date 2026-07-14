@@ -1,3 +1,5 @@
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { posix } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
@@ -11,7 +13,53 @@ import {
   normalizeStudioBase,
   detectRuntime,
   injectStudioHtmlConfig,
+  upsertMastraDir,
 } from './utils';
+
+describe('upsertMastraDir', () => {
+  let directory: string;
+
+  beforeEach(() => {
+    directory = mkdtempSync(`${tmpdir()}/mastra-deployer-utils-`);
+  });
+
+  afterEach(() => {
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('creates a missing .gitignore with the Mastra output rule', () => {
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('.mastra\n');
+    expect(statSync(`${directory}/.mastra`).isDirectory()).toBe(true);
+  });
+
+  it('updates the supplied directory without executing a shell command', () => {
+    writeFileSync(`${directory}/.gitignore`, 'dist');
+
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('dist\n.mastra\n');
+    expect(statSync(`${directory}/.mastra`).isDirectory()).toBe(true);
+  });
+
+  it.each(['.mastra', '.mastra/', '/.mastra', '/.mastra/'])('recognizes an existing %s ignore entry', entry => {
+    writeFileSync(`${directory}/.gitignore`, `${entry}\n`);
+
+    upsertMastraDir({ dir: directory });
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe(`${entry}\n`);
+  });
+
+  it('appends a final ignore rule after a later negation', () => {
+    writeFileSync(`${directory}/.gitignore`, '.mastra\n!.mastra/\n');
+
+    upsertMastraDir({ dir: directory });
+
+    expect(readFileSync(`${directory}/.gitignore`, 'utf8')).toBe('.mastra\n!.mastra/\n.mastra\n');
+  });
+});
 
 describe('getPackageName', () => {
   it('should return the full scoped package name for scoped packages', () => {

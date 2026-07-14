@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
@@ -17,6 +16,7 @@ import { getPackageRootPath } from '../build/package-info';
 import type { BundlerOptions } from '../build/types';
 import type { BundlerPlatform } from '../build/utils';
 import { isBareModuleSpecifier, slash } from '../build/utils';
+import { createChildProcessLogger } from '../deploy/log.js';
 import { DepsService } from '../services/deps';
 import { FileService } from '../services/fs';
 import { getWorkspaceInformation } from './workspaceDependencies';
@@ -158,10 +158,16 @@ export abstract class Bundler extends MastraBundler {
         await fsExtra.move(nodeModules, nodeModulesTmp, { overwrite: true });
         movedNodeModules = true;
       }
-      execSync('npm install --package-lock-only --force', {
-        cwd: outputDir,
-        stdio: 'pipe',
+      const runProcess = createChildProcessLogger({
+        logger: this.logger,
+        root: outputDir,
         timeout: 60_000,
+        output: 'ignore',
+      });
+      await runProcess({
+        cmd: 'npm',
+        args: ['install', '--package-lock-only', '--force'],
+        env: process.env as Record<string, string>,
       });
     } catch {
       this.logger.warn('Failed to generate package-lock.json — deploy will fall back to npm install');
