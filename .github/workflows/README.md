@@ -40,7 +40,11 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   runs its package typecheck, build, lint, and changed-test coverage. Nested
   fixture manifests are not treated as workspace boundaries. Server changes run
   the package build, lint, Core-import boundary check, permission freshness
-  check, both `SERVER_ROUTES` generators, and changed-test coverage. The
+  check, both `SERVER_ROUTES` generators, and changed-test coverage. Route
+  contract changes additionally typecheck the focused Client SDK route
+  consumers and run the CLI descriptor suite. Route-source changes also run
+  the schema-consistency and API-manifest suites even when no test was edited.
+  The
   generated Client SDK route types, CLI API metadata, and Core permission
   interfaces are mapped narrowly to the Server validation lane. Route
   regeneration fails unless both route artifacts are tracked and unchanged
@@ -55,7 +59,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
   target. Root dependency graph changes also fail closed until broad workspace
-  validation is available. Non-workspace changes must match the explicit
+  validation is available. The Server package manifest also fails closed so a
+  PR cannot redefine the scripts that constitute its own gate. Non-workspace
+  changes must match the explicit
   CI-rollout or changeset-metadata allowlist; other root paths fail closed.
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
   The deterministic, in-process Core Harness real-agent E2E suite is explicitly
@@ -64,8 +70,10 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   allowlisted because it exercises route handlers exclusively against
   `InMemoryStore`. Both exact-path exceptions are content-conditioned: edits
   that add Playwright, environment credentials, external provider or storage
-  packages (including scoped OpenAI SDKs), or direct network/process primitives
-  fail closed before the path exception is considered. A TypeScript parser and
+  packages (including scoped OpenAI SDKs), or direct network/process
+  primitives fail closed before the path exception is considered. Newly added
+  external imports in the exact exceptions are limited to their reviewed
+  in-process Core, Vitest, Zod, and safe Node surfaces. A TypeScript parser and
   module resolver follow the changed and newly reachable local runtime
   dependency graph, including `.js` specifiers that resolve to TypeScript
   source; helper-only changes re-run the owning exact test. Every changed Server
@@ -104,10 +112,10 @@ commands. They prove Server permission and route-generation selection, map
 each generated artifact back to Server even when it is the only changed file,
 reject stale or deleted generated output, reject Server manifest changes before
 package commands run, exercise route-contract and generated-consumer checks,
-run the exact fork-safe favorites integration test, reject exact and ordinary
-Server tests when their changed or newly reachable local dependencies gain
-unsafe runtime requirements, distinguish real imports from comments, and keep
-other integration-named tests fail-closed.
+run route consistency coverage and the exact fork-safe favorites integration
+test, reject exact and ordinary Server tests when their changed or newly
+reachable local dependencies gain unsafe runtime requirements, distinguish real
+imports from comments, and keep other integration-named tests fail-closed.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`

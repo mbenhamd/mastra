@@ -25,7 +25,7 @@ run_validator_self_tests() {
   mock_bin="$test_root/bin"
   command_log="$test_root/pnpm.log"
   mkdir -p \
-    "$fixture_repo/client-sdks/client-js/src" \
+    "$fixture_repo/client-sdks/client-js/src/resources" \
     "$fixture_repo/packages/cli/src/commands/api" \
     "$fixture_repo/packages/core/src/auth/ee/interfaces" \
     "$fixture_repo/packages/core/src/harness/v1" \
@@ -74,6 +74,9 @@ run_validator_self_tests() {
     git config user.name 'Fork validator fixture'
     printf '%s\n' '{}' > package.json
     printf '%s\n' '{}' > client-sdks/client-js/package.json
+    printf '%s\n' \
+      '{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"strict":true}}' \
+      > client-sdks/client-js/tsconfig.json
     printf '%s\n' '{}' > packages/cli/package.json
     printf '%s\n' '{}' > packages/core/package.json
     printf '%s\n' 'export default {};' > packages/core/vitest.config.ts
@@ -82,10 +85,24 @@ run_validator_self_tests() {
     printf '%s\n' '{}' > packages/server/package.json
     printf '%s\n' 'export default {};' > packages/server/vitest.config.ts
     printf '%s\n' "export const route = 'base';" > packages/server/src/server/server-adapter/routes/index.ts
-    printf '%s\n' "export const routeTypes = 'base';" > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' 'export type RouteTypes = { source: "base" };' \
+      'export type HarnessRoute = { source: "base" };' \
+      'export type IndexOnlyRoute = { source: "base" };' \
+      > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' "import type { RouteTypes } from './route-types.generated.js';" \
+      'export type ClientRouteTypes = RouteTypes;' \
+      > client-sdks/client-js/src/types.ts
+    printf '%s\n' "import type { HarnessRoute } from '../route-types.generated.js';" \
+      'export type ClientHarnessRoute = HarnessRoute;' \
+      > client-sdks/client-js/src/resources/harness.ts
+    printf '%s\n' "export type { IndexOnlyRoute } from './route-types.generated.js';" \
+      > client-sdks/client-js/src/index.ts
     printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
     printf '%s\n' 'export const favoriteFixture = true;' \
       > packages/server/src/server/handlers/favorites-helper.ts
+    printf '%s\n' "import { Hono } from 'hono';" \
+      'export const dormantExternalFixture = Hono;' \
+      > packages/server/src/server/handlers/dormant-external-helper.ts
     printf '%s\n' "import { it } from 'vitest';" "import { favoriteFixture } from './favorites-helper';" \
       "it('favorites', () => favoriteFixture);" \
       > packages/server/src/server/handlers/favorites.integration.test.ts
@@ -124,10 +141,20 @@ run_validator_self_tests() {
     fi
   }
 
+  assert_route_consumer_commands() {
+    assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
+    assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
+    assert_contains '--dir client-sdks/client-js exec vitest run src/resources/harness.test.ts --reporter=dot' "$command_log"
+    assert_contains '--dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot' "$command_log"
+  }
+
   head_sha="$(
     cd "$fixture_repo"
     printf '%s\n' "export const route = 'head';" > packages/server/src/server/server-adapter/routes/index.ts
-    printf '%s\n' "export const routeTypes = 'head';" > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' 'export type RouteTypes = { source: "head" };' \
+      'export type HarnessRoute = { source: "head" };' \
+      'export type IndexOnlyRoute = { source: "head" };' \
+      > client-sdks/client-js/src/route-types.generated.ts
     printf '%s\n' "export const routeMetadata = 'head';" > packages/cli/src/commands/api/route-metadata.generated.ts
     git add .
     git commit -q -m 'server route change'
@@ -139,11 +166,10 @@ run_validator_self_tests() {
   assert_contains '--filter @mastra/server check:permissions' "$command_log"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
-  assert_contains '--dir packages/server exec vitest run --reporter=dot src/server/server-adapter/schema-consistency.test.ts src/server/server-adapter/api-schema-manifest.test.ts' "$command_log"
-  assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
-  assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
-  assert_contains '--dir client-sdks/client-js exec vitest run --reporter=dot src/resources/harness.test.ts' "$command_log"
-  assert_contains '--dir packages/cli exec vitest run --reporter=dot src/commands/api/descriptors.test.ts' "$command_log"
+  assert_contains 'Client SDK route consumers accept generated route types.' "$output"
+  assert_route_consumer_commands
+  assert_contains 'src/server/server-adapter/schema-consistency.test.ts' "$command_log"
+  assert_contains 'src/server/server-adapter/api-schema-manifest.test.ts' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -154,17 +180,18 @@ run_validator_self_tests() {
     git rev-parse HEAD
   )"
   : > "$command_log"
-  output="$test_root/server-manifest-failure.log"
+  output="$test_root/server-package-manifest-failure.log"
   set +e
   run_fixture "$head_sha" "$output"
   status=$?
   set -e
   if (( status == 0 )); then
-    echo 'Changed Server package manifest fixture unexpectedly passed.' >&2
+    echo 'Changed Server package manifest unexpectedly passed.' >&2
     cat "$output" >&2
     exit 1
   fi
   assert_contains 'packages/server/package.json' "$output"
+  assert_contains 'require dedicated validation' "$output"
   if [[ -s "$command_log" ]]; then
     echo 'Changed Server package manifest fixture executed PR-controlled package commands.' >&2
     cat "$command_log" >&2
@@ -244,7 +271,10 @@ run_validator_self_tests() {
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' "export const routeTypes = 'head';" > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' 'export type RouteTypes = { source: "head" };' \
+      'export type HarnessRoute = { source: "head" };' \
+      'export type IndexOnlyRoute = { source: "head" };' \
+      > client-sdks/client-js/src/route-types.generated.ts
     git add .
     git commit -q -m 'generated route types only'
     git rev-parse HEAD
@@ -255,7 +285,31 @@ run_validator_self_tests() {
   assert_contains 'packages/server' "$output"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
-  assert_contains '--dir client-sdks/client-js exec tsc-files --noEmit src/route-types.generated.ts src/types.ts src/resources/harness.ts src/resources/agent.test.ts' "$command_log"
+  assert_contains 'Client SDK route consumers accept generated route types.' "$output"
+  assert_route_consumer_commands
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export type RouteTypes = { source: "head" };' \
+      'export type HarnessRoute = { source: "head" };' \
+      > client-sdks/client-js/src/route-types.generated.ts
+    git add .
+    git commit -q -m 'drop an index-only generated route export'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/generated-index-export-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Missing public generated route export unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Client SDK index references missing generated exports: IndexOnlyRoute' "$output"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -271,7 +325,8 @@ run_validator_self_tests() {
   assert_contains 'packages/server' "$output"
   assert_contains '--filter @mastra/server generate:route-types' "$command_log"
   assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
-  assert_contains '--dir packages/cli exec tsc-files --noEmit src/commands/api/route-metadata.generated.ts src/commands/api/index.ts src/commands/api/descriptors.test.ts' "$command_log"
+  assert_contains 'Client SDK route consumers accept generated route types.' "$output"
+  assert_route_consumer_commands
 
   head_sha="$(
     cd "$fixture_repo"
@@ -320,6 +375,43 @@ run_validator_self_tests() {
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    printf '%s\n' "import { z } from 'zod';" 'void z;' \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test use an approved external module'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-approved-external-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { createOpenAI } from '@ai-sdk/openai';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test import AI SDK provider'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-ai-sdk-provider-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'AI SDK provider fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'module @ai-sdk/openai' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     printf '%s\n' "import { run } from '@openai/agents';" \
       >> packages/server/src/server/handlers/favorites.integration.test.ts
     git add .
@@ -362,6 +454,52 @@ run_validator_self_tests() {
   fi
   assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
   assert_contains 'module @mastra/openai' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { dormantExternalFixture } from './dormant-external-helper';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make a dormant external helper newly reachable'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-dormant-external-helper-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Newly reachable dormant external helper unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { OpenAIVoice } from '@mastra/voice-openai';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'make favorites test require a voice provider'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-voice-provider-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Voice-provider favorites fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -781,7 +919,7 @@ while IFS= read -r file; do
   esac
 done < "$unowned_files"
 
-grep -E '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|patches/)' "$changed_files" \
+grep -E '^(package\.json|packages/server/package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|patches/)' "$changed_files" \
   >> "$unsupported_inputs" || true
 # Server validation invokes package-owned scripts. Reject manifest edits before
 # any PR-controlled Server command can weaken or replace those checks.
@@ -804,6 +942,121 @@ fi
 
 workspace_changed() {
   grep -Fxq "$1" "$changed_workspaces"
+}
+
+server_route_source_changed() {
+  grep -Eq \
+    '^(packages/server/scripts/generate-(route-types|api-cli-route-metadata)\.ts|packages/server/src/server/(handlers|schemas|server-adapter/routes)/|packages/server/src/server/server-adapter/(api-schema-manifest|openapi-utils)\.ts)' \
+    "$changed_files"
+}
+
+server_route_contract_changed() {
+  server_route_source_changed ||
+    grep -Eq \
+      '^(client-sdks/client-js/src/route-types\.generated\.ts|packages/cli/src/commands/api/route-metadata\.generated\.ts)$' \
+      "$changed_files"
+}
+
+check_client_route_consumers() {
+  local timeout_seconds
+  if ! timeout_seconds="$(remaining_validation_seconds 600)"; then
+    echo 'Validation budget exhausted before Client SDK route-consumer typecheck.' >&2
+    return 124
+  fi
+
+  timeout --kill-after=30s "${timeout_seconds}s" node - "$TYPESCRIPT_MODULE_PATH" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const ts = require(process.argv[2]);
+const formatHost = {
+  getCanonicalFileName: file => file,
+  getCurrentDirectory: () => process.cwd(),
+  getNewLine: () => '\n',
+};
+const configPath = 'client-sdks/client-js/tsconfig.json';
+const config = ts.readConfigFile(configPath, ts.sys.readFile);
+if (config.error) {
+  console.error(ts.formatDiagnosticsWithColorAndContext([config.error], formatHost));
+  process.exit(1);
+}
+
+const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath));
+if (parsed.errors.length > 0) {
+  console.error(ts.formatDiagnosticsWithColorAndContext(parsed.errors, formatHost));
+  process.exit(1);
+}
+
+const rootNames = [
+  'client-sdks/client-js/src/route-types.generated.ts',
+  'client-sdks/client-js/src/types.ts',
+  'client-sdks/client-js/src/resources/harness.ts',
+].map(file => path.resolve(file));
+const program = ts.createProgram({
+  rootNames,
+  options: {
+    ...parsed.options,
+    incremental: false,
+    noEmit: true,
+    tsBuildInfoFile: undefined,
+  },
+});
+const diagnostics = ts.getPreEmitDiagnostics(program);
+if (diagnostics.length > 0) {
+  console.error(ts.formatDiagnosticsWithColorAndContext(diagnostics, formatHost));
+  process.exit(1);
+}
+
+const generatedSource = program.getSourceFile(rootNames[0]);
+const generatedModule = generatedSource && program.getTypeChecker().getSymbolAtLocation(generatedSource);
+if (!generatedSource || !generatedModule) {
+  console.error('Could not resolve the generated Client SDK route-type module.');
+  process.exit(1);
+}
+const generatedExports = new Set(
+  program
+    .getTypeChecker()
+    .getExportsOfModule(generatedModule)
+    .map(symbol => symbol.getName()),
+);
+const indexPath = 'client-sdks/client-js/src/index.ts';
+const indexSource = ts.createSourceFile(
+  indexPath,
+  fs.readFileSync(indexPath, 'utf8'),
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TS,
+);
+if (indexSource.parseDiagnostics.length > 0) {
+  console.error(ts.formatDiagnosticsWithColorAndContext(indexSource.parseDiagnostics, formatHost));
+  process.exit(1);
+}
+const publicRouteExports = [];
+for (const statement of indexSource.statements) {
+  if (
+    ts.isExportDeclaration(statement) &&
+    statement.moduleSpecifier &&
+    ts.isStringLiteralLike(statement.moduleSpecifier) &&
+    statement.moduleSpecifier.text === './route-types.generated.js' &&
+    statement.exportClause &&
+    ts.isNamedExports(statement.exportClause)
+  ) {
+    for (const element of statement.exportClause.elements) {
+      publicRouteExports.push(element.propertyName?.text ?? element.name.text);
+    }
+  }
+}
+if (publicRouteExports.length === 0) {
+  console.error('Client SDK index has no explicit generated route-type re-export contract.');
+  process.exit(1);
+}
+const missingPublicExports = publicRouteExports.filter(name => !generatedExports.has(name));
+if (missingPublicExports.length > 0) {
+  console.error(`Client SDK index references missing generated exports: ${missingPublicExports.join(', ')}`);
+  process.exit(1);
+}
+console.log('Client SDK route consumers accept generated route types.');
+NODE
 }
 
 mapfile -t prettier_files < <(
@@ -852,13 +1105,6 @@ if workspace_changed packages/mcp; then
 fi
 
 if workspace_changed packages/server; then
-  server_route_surface_changed=false
-  if grep -Eq \
-    '^(client-sdks/client-js/src/route-types\.generated\.ts|packages/cli/src/commands/api/route-metadata\.generated\.ts|packages/server/scripts/generate-(route-types|api-cli-route-metadata)\.ts|packages/server/src/server/(handlers|schemas|server-adapter/routes)/|packages/server/src/server/server-adapter/(api-schema-manifest|openapi-utils)\.ts)' \
-    "$changed_files"; then
-    server_route_surface_changed=true
-  fi
-
   run_with_validation_budget 900 pnpm build:server
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
   run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
@@ -875,10 +1121,11 @@ if workspace_changed packages/server; then
     echo "Run both @mastra/server route generators and commit their output." >&2
     exit 1
   fi
-  if [[ "$server_route_surface_changed" == true ]]; then
-    run_with_validation_budget 600 pnpm --dir packages/server exec vitest run --reporter=dot \
-      src/server/server-adapter/schema-consistency.test.ts \
-      src/server/server-adapter/api-schema-manifest.test.ts
+  if server_route_contract_changed; then
+    # Byte-clean generated output is not sufficient if either native consumer
+    # rejects it. Keep this scoped to the direct Client SDK and CLI type/test
+    # consumers so unrelated package baselines cannot mask route compatibility.
+    check_client_route_consumers
     run_with_validation_budget 600 pnpm --dir client-sdks/client-js exec tsc-files --noEmit \
       src/route-types.generated.ts \
       src/types.ts \
@@ -888,10 +1135,10 @@ if workspace_changed packages/server; then
       src/commands/api/route-metadata.generated.ts \
       src/commands/api/index.ts \
       src/commands/api/descriptors.test.ts
-    run_with_validation_budget 600 pnpm --dir client-sdks/client-js exec vitest run --reporter=dot \
-      src/resources/harness.test.ts
-    run_with_validation_budget 600 pnpm --dir packages/cli exec vitest run --reporter=dot \
-      src/commands/api/descriptors.test.ts
+    run_with_validation_budget 600 \
+      pnpm --dir client-sdks/client-js exec vitest run src/resources/harness.test.ts --reporter=dot
+    run_with_validation_budget 600 \
+      pnpm --dir packages/cli exec vitest run src/commands/api/descriptors.test.ts --reporter=dot
   fi
 fi
 
@@ -935,6 +1182,7 @@ analyze_test_runtime_surface() {
     "$TYPESCRIPT_MODULE_PATH" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const { builtinModules } = require('node:module');
 const path = require('node:path');
 
 const [mode, baseSha, entryFile, changedFilesPath, typescriptModulePath] = process.argv.slice(2);
@@ -1117,6 +1365,7 @@ const bannedMastraPackages = new Set([
   'mongodb',
   'mssql',
   'mysql',
+  'openai',
   'opensearch',
   'pg',
   'pinecone',
@@ -1140,6 +1389,11 @@ const bannedBuiltins = new Set([
   'tls',
   'worker_threads',
 ]);
+const nodeBuiltins = new Set(builtinModules.map(specifier => specifier.replace(/^node:/, '').split('/')[0]));
+const exactTestEntries = new Set([
+  'packages/core/src/harness/v1/session.real-agent.e2e.test.ts',
+  'packages/server/src/server/handlers/favorites.integration.test.ts',
+]);
 
 function unsupportedModuleReason(specifier) {
   if (specifier === '@playwright/test' || specifier === 'testcontainers') return specifier;
@@ -1148,6 +1402,7 @@ function unsupportedModuleReason(specifier) {
   if (specifier === '@anthropic-ai/sdk' || specifier === '@google/generative-ai') return specifier;
   if (specifier === 'ollama' || specifier === 'openai') return specifier;
   if (specifier === '@mastra/openai' || specifier.startsWith('@mastra/openai/')) return specifier;
+  if (specifier.startsWith('@mastra/voice-')) return specifier;
   if (specifier.startsWith('@mastra/')) {
     const packageName = specifier.slice('@mastra/'.length).split('/')[0];
     if (bannedMastraPackages.has(packageName)) return specifier;
@@ -1155,6 +1410,18 @@ function unsupportedModuleReason(specifier) {
   const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
   if (bannedBuiltins.has(bareSpecifier.split('/')[0])) return specifier;
   return undefined;
+}
+
+function approvedExactExternalSpecifier(specifier) {
+  const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
+  return (
+    specifier === 'vitest' ||
+    specifier === 'zod' ||
+    specifier.startsWith('zod/') ||
+    specifier === '@mastra/core' ||
+    specifier.startsWith('@mastra/core/') ||
+    nodeBuiltins.has(bareSpecifier.split('/')[0])
+  );
 }
 
 function propertyName(node) {
@@ -1167,9 +1434,20 @@ function propertyName(node) {
 
 function unsupportedRuntimeReasons(file, source) {
   const reasons = new Set();
+  const wasReachableFromExactTest = baseGraph.has(repositoryPath(file));
+  const baseSource = readBaseSource(file);
+  const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
   for (const specifier of runtimeModuleSpecifiers(file, source)) {
     const reason = unsupportedModuleReason(specifier);
     if (reason) reasons.add(`module ${reason}`);
+    if (
+      exactTestEntries.has(entryFile) &&
+      !specifier.startsWith('.') &&
+      (!wasReachableFromExactTest || !baseSpecifiers.has(specifier)) &&
+      !approvedExactExternalSpecifier(specifier)
+    ) {
+      reasons.add(`unreviewed external module ${specifier}`);
+    }
   }
   const parsed = sourceFile(file, source);
   const visit = node => {
@@ -1304,6 +1582,18 @@ if (( ${#detected_tests[@]} > 0 )); then
     fi
   done
 fi
+
+if server_route_source_changed; then
+  # Route generators prove artifact freshness; these canonical suites prove
+  # the serving tuple remains collision-free and the public manifest remains
+  # derivable from it even when the PR does not edit a test file.
+  printf '%s\n' \
+    'packages/server/src/server/server-adapter/schema-consistency.test.ts' \
+    'packages/server/src/server/server-adapter/api-schema-manifest.test.ts' \
+    >> "$changed_tests"
+fi
+
+sort -u -o "$changed_tests" "$changed_tests"
 
 if [[ -s "$delegated_docs_tests" ]]; then
   echo "Delegating docs Playwright files to the fork-enabled Docs E2E workflow:"
