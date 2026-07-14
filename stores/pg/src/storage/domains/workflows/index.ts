@@ -2049,28 +2049,28 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!retained) return { status: 'missing_terminal_state' };
         validateWorkflowTerminalSnapshotJournalLink(retained, context.record, operation.workflowName, operation.runId);
         validateWorkflowTerminalEffectRecoveryLink(result.effect, retained);
-        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(
-          t,
-          result.effect.parentWorkflowName,
-          result.effect.parentRunId,
-        );
+        const parentWorkflowName = result.effect.parentWorkflowName;
+        const parentRunId = result.effect.parentRunId;
+        const revisionLock = await this.lockWorkflowParentRevisionWithPresence(t, parentWorkflowName, parentRunId);
+        const deleteProvisionalRevision = async (): Promise<void> => {
+          await t.none(
+            `DELETE FROM ${this.workflowParentRevisionTableName()}
+             WHERE workflow_name = $1 AND run_id = $2 AND generation = 0 AND terminal_status IS NULL`,
+            [parentWorkflowName, parentRunId],
+          );
+        };
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
            WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
-          [result.effect.parentWorkflowName, result.effect.parentRunId],
+          [parentWorkflowName, parentRunId],
         );
         if (!row) {
-          if (revisionLock.created) {
-            await t.none(
-              `DELETE FROM ${this.workflowParentRevisionTableName()}
-               WHERE workflow_name = $1 AND run_id = $2`,
-              [result.effect.parentWorkflowName, result.effect.parentRunId],
-            );
-          }
+          await deleteProvisionalRevision();
           return { status: 'missing_parent' };
         }
         let generation = revisionLock.generation;
         if (!Number.isSafeInteger(generation) || generation < 1) {
+          await deleteProvisionalRevision();
           return { status: 'corrupt_parent_state' };
         }
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
