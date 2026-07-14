@@ -461,9 +461,35 @@ describe('WorkflowsPG terminalization journal', () => {
       await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({
         status: 'corrupt_parent_state',
       });
+      const revisionAfterContextRead = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(revisionAfterContextRead.rowCount).toBe(0);
+      await pool.query(
+        `INSERT INTO mastra_workflow_parent_revisions (workflow_name, run_id, generation, updated_at)
+         VALUES ($1, $2, 0, $3)`,
+        [parent.workflowName, parent.runId, Date.now()],
+      );
+      await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
+      const revisionAfterStaleContextRead = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(revisionAfterStaleContextRead.rowCount).toBe(0);
       await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
         status: 'corrupt_parent_state',
       });
+      const revisionAfterRejectedApply = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(revisionAfterRejectedApply.rowCount).toBe(0);
       await pool.query(
         `INSERT INTO mastra_workflow_parent_revisions (workflow_name, run_id, generation, updated_at)
          VALUES ($1, $2, 1, $3)`,
