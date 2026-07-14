@@ -1246,11 +1246,11 @@ export class Agent<
     }
 
     const committedWorkflow = workflow.commit() as T;
-    // Register the parent Mastra instance on this internal processor workflow so that its
-    // createRun() -> getWorkflowRunById() can read configured storage instead of logging
-    // "Cannot get workflow run. Mastra storage is not initialized" on every run (then falling
-    // back to in-memory). Combined with shouldPersistSnapshot:()=>false above, this does not
-    // write any processor-workflow rows to storage. Mirrors the execution-workflow fix in #17344.
+    // Register the parent Mastra instance so this internal workflow receives
+    // the configured ID generator and runtime context. Fresh built-in run IDs
+    // skip the guaranteed-miss storage lookup; explicit or custom-generated
+    // IDs still use the registered storage for collision/status checks. With
+    // shouldPersistSnapshot:()=>false above, processor runs are never written.
     if (this.#mastra && isProcessorWorkflow(committedWorkflow)) {
       committedWorkflow.__registerMastra(this.#mastra);
     }

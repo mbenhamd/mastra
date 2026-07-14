@@ -1594,7 +1594,16 @@ export class EventedWorkflow<
       throw new Error('Uncommitted step flow changes detected. Call .commit() to register the steps.');
     }
 
-    const runIdToUse = options?.runId || randomUUID();
+    const usesCustomGeneratedRunId = !options?.runId && Boolean(this.mastra?.getIdGenerator());
+    const runIdToUse =
+      options?.runId ||
+      this.mastra?.generateId({
+        idType: 'run',
+        source: 'workflow',
+        entityId: this.id,
+        resourceId: options?.resourceId,
+      }) ||
+      randomUUID();
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
 
@@ -1639,9 +1648,14 @@ export class EventedWorkflow<
       stepResults: {},
     });
 
-    const existingRun = await this.getWorkflowRunById(runIdToUse, {
-      withNestedWorkflows: false,
-    });
+    // A generated run for a workflow that never persists snapshots cannot
+    // already exist in storage. Avoid the guaranteed-miss round trip while
+    // retaining collision/status checks for persistent runs and caller-owned
+    // run IDs.
+    const existingRun =
+      shouldPersistSnapshot || options?.runId || usesCustomGeneratedRunId
+        ? await this.getWorkflowRunById(runIdToUse, { withNestedWorkflows: false })
+        : undefined;
 
     // Check if run exists in persistent storage (not just in-memory)
     const existsInStorage = existingRun && !existingRun.isFromInMemory;
