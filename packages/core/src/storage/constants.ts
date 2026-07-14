@@ -69,6 +69,9 @@ export const TABLE_TOOL_PROVIDER_CONNECTIONS = 'mastra_tool_provider_connections
 // Notifications
 export const TABLE_NOTIFICATIONS = 'mastra_notifications';
 
+// Thread state (per-thread, per-type durable state; e.g. the task list)
+export const TABLE_THREAD_STATE = 'mastra_thread_state';
+
 /** Union of all core table name constants. */
 export type TABLE_NAMES =
   | typeof TABLE_WORKFLOW_SNAPSHOT
@@ -122,7 +125,8 @@ export type TABLE_NAMES =
   | typeof TABLE_HARNESS_PLAN_TASKS
   | typeof TABLE_HARNESS_RUN_SUMMARIES
   | typeof TABLE_TOOL_PROVIDER_CONNECTIONS
-  | typeof TABLE_NOTIFICATIONS;
+  | typeof TABLE_NOTIFICATIONS
+  | typeof TABLE_THREAD_STATE;
 
 export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
@@ -581,6 +585,14 @@ export const EXPERIMENT_RESULTS_SCHEMA: Record<string, StorageColumn> = {
   status: { type: 'text', nullable: true },
   tags: { type: 'jsonb', nullable: true },
   createdAt: { type: 'timestamp', nullable: false },
+};
+
+export const THREAD_STATE_SCHEMA: Record<string, StorageColumn> = {
+  threadId: { type: 'text', nullable: false },
+  type: { type: 'text', nullable: false },
+  value: { type: 'jsonb', nullable: false },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
 };
 
 /**
@@ -1148,6 +1160,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
   },
   [TABLE_TOOL_PROVIDER_CONNECTIONS]: TOOL_PROVIDER_CONNECTIONS_SCHEMA,
   [TABLE_NOTIFICATIONS]: NOTIFICATIONS_SCHEMA,
+  [TABLE_THREAD_STATE]: THREAD_STATE_SCHEMA,
 };
 
 /**
@@ -1221,6 +1234,7 @@ export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
     compositePrimaryKey: ['authorId', 'providerId', 'connectionId'],
   },
   [TABLE_NOTIFICATIONS]: { columns: NOTIFICATIONS_SCHEMA, compositePrimaryKey: ['threadId', 'id'] },
+  [TABLE_THREAD_STATE]: { columns: THREAD_STATE_SCHEMA, compositePrimaryKey: ['threadId', 'type'] },
 };
 
 /**
