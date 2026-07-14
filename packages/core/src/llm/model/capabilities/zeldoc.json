@@ -1,3 +1,5 @@
 {
-  "attachment": ["z-code"]
+  "temperature": [
+    "z-code"
+  ]
 }

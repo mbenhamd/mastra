@@ -29,6 +29,7 @@ vi.mock('../../../../workflows', () => ({
 
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
+  rebuildRunToolsFromMastra: vi.fn().mockResolvedValue({ tools: {} }),
   toolApprovalRequirement: vi.fn().mockResolvedValue({ required: true, reasons: ['tool-config'] }),
 }));
 
@@ -429,7 +430,7 @@ describe('issue #17218 (durable engine): mapping step round-trips approvals on r
 
     expect(stored).toBeDefined();
     expect(stored?.state).toBe('result');
-    expect(stored?.result).toBe(JSON.stringify(TOOL_RESULT));
+    expect(stored?.result).toEqual(TOOL_RESULT);
     expect(stored?.approval).toMatchObject({ approved: true });
 
     expect(v6).toBeDefined();

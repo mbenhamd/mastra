@@ -8,7 +8,7 @@ import type { AgentExecutionOptions, AgentExecutionOptionsBase } from './agent.t
 import type { MessageListInput } from './message-list';
 import type { StructuredOutputOptions } from './types';
 
-export const supportedLanguageModelSpecifications = ['v2', 'v3'];
+export const supportedLanguageModelSpecifications = ['v2', 'v3', 'v4'];
 export const isSupportedLanguageModel = (
   model: MastraLanguageModel | MastraLegacyLanguageModel,
 ): model is MastraLanguageModel => {
@@ -55,12 +55,32 @@ export async function tryGenerateWithJsonFallback<OUTPUT>(
   }
 
   try {
-    return await agent.generate(prompt, options);
+    const result = await agent.generate(prompt, options);
+    // Some models resolve without throwing but produce no parseable structured
+    // object (empty/malformed JSON). Treat that the same as a thrown error so the
+    // caller still gets the json-prompt-injection retry instead of a downstream
+    // crash when it reads `result.object`. Mirrors tryStreamWithJsonFallback.
+    if (result.object === undefined) {
+      throw new MastraError({
+        id: 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: 'structuredOutput object is undefined',
+      });
+    }
+    return result;
   } catch (error) {
     console.warn('Error in tryGenerateWithJsonFallback. Attempting fallback.', error);
     return await agent.generate(prompt, {
       ...options,
-      structuredOutput: { ...options.structuredOutput, jsonPromptInjection: true },
+      structuredOutput: {
+        ...options.structuredOutput,
+        jsonPromptInjection:
+          options.structuredOutput.jsonPromptInjection === 'inline' ||
+          options.structuredOutput.jsonPromptInjection === 'system'
+            ? options.structuredOutput.jsonPromptInjection
+            : true,
+      },
     });
   }
 }
@@ -101,7 +121,14 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
     console.warn('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
     const result = await agent.stream(prompt, {
       ...streamOptions,
-      structuredOutput: { ...streamOptions.structuredOutput, jsonPromptInjection: true },
+      structuredOutput: {
+        ...streamOptions.structuredOutput,
+        jsonPromptInjection:
+          streamOptions.structuredOutput.jsonPromptInjection === 'inline' ||
+          streamOptions.structuredOutput.jsonPromptInjection === 'system'
+            ? streamOptions.structuredOutput.jsonPromptInjection
+            : true,
+      },
     });
     notifyStreamObserver(onStream, result as unknown as Awaited<ReturnType<Agent['stream']>>);
     return result;

@@ -2063,7 +2063,8 @@ export class Harness<TState = {}> {
             threadId: this.currentThreadId,
             runId: directStreamRunId,
           });
-          return { accepted: result.accepted, runId: result.runId };
+          await result.accepted;
+          return { accepted: true as const, runId: result.runId! };
         }
       }
 
@@ -2080,7 +2081,8 @@ export class Harness<TState = {}> {
             resourceId: this.resourceId,
             threadId: this.currentThreadId,
           });
-          return { accepted: result.accepted, runId: result.runId };
+          await result.accepted;
+          return { accepted: true as const, runId: result.runId! };
         }
       }
 
@@ -2089,7 +2091,8 @@ export class Harness<TState = {}> {
           resourceId: this.resourceId,
           threadId: this.currentThreadId,
         });
-        return { accepted: result.accepted, runId: result.runId };
+        await result.accepted;
+        return { accepted: true as const, runId: result.runId! };
       }
 
       const streamOptions = await this.buildAgentMessageStreamOptions({
@@ -2104,7 +2107,8 @@ export class Harness<TState = {}> {
         threadId: this.currentThreadId,
         ifIdle: { streamOptions: streamOptions as any },
       });
-      return { accepted: result.accepted, runId: result.runId };
+      await result.accepted;
+      return { accepted: true as const, runId: result.runId! };
     });
 
     return { id: signal.id, type: signal.type, accepted };

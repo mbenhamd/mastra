@@ -523,6 +523,17 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     await mastra.shutdown();
   });
 
+  it('tags scheduler-spawned background workflow events as localOnly', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+
+    const schedRunId = 'sched___mastra_notification_dispatch_1781099940000';
+    await mastra.pubsub.publish('workflows', makeStartEvent('__mastra_notification_dispatcher', schedRunId, false));
+
+    expect(pubsub.calls[0]!.localOnly).toBe(true);
+    await mastra.shutdown();
+  });
+
   it('keeps real scheduled public workflow starts portable', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
     const storage = new MockStore();

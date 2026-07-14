@@ -222,13 +222,9 @@ const useMastraSpeechToText = ({
   };
 
   const stop = () => {
-    const recorder = recorderRef.current;
+    sessionRef.current += 1;
     startInFlightRef.current = false;
-    if (recorder) {
-      recorder.stop();
-    } else {
-      sessionRef.current += 1;
-    }
+    recorderRef.current?.stop();
     recorderRef.current = null;
     setState(prev => ({ ...prev, isListening: false }));
   };

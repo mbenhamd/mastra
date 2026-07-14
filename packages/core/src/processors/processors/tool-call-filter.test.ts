@@ -1,6 +1,6 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
 import { convertArrayToReadableStream, mockValues, mockId } from '@internal/ai-sdk-v5/test';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod/v4';
 
 import { Mastra } from '../..';
@@ -12,7 +12,6 @@ import type { MastraDBMessage } from '../../memory/types';
 import { toolCallFilterProvider } from '../../processor-provider/providers';
 import { InMemoryStore } from '../../storage';
 import type { ProcessInputStepArgs } from '../index';
-import { filterToolCallMessages } from '../tool-call-filter-utils';
 
 import { ToolCallFilter } from './tool-call-filter';
 
@@ -39,37 +38,6 @@ describe('ToolCallFilter', () => {
   }) as (reason?: string) => never;
 
   describe('exclude all tool calls (default)', () => {
-    it('keeps runtime compatibility when null options are supplied', () => {
-      expect(() => new ToolCallFilter(null as any)).not.toThrow();
-    });
-
-    it.each(['weather', false, {}, ['weather', 42]])('rejects malformed runtime exclude input: %j', exclude => {
-      expect(() => new ToolCallFilter({ exclude } as any)).toThrow(
-        'Tool call filter options.exclude must be an array of strings when provided',
-      );
-    });
-
-    it('rejects malformed runtime exclude input in the shared filter utility', () => {
-      expect(() => filterToolCallMessages([], { exclude: ['weather', 42] } as any)).toThrow(
-        'Tool call filter options.exclude must be an array of strings when provided',
-      );
-    });
-
-    it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '64'])(
-      'rejects malformed runtime maxModelOutputBytes input: %j',
-      maxModelOutputBytes => {
-        expect(() => new ToolCallFilter({ maxModelOutputBytes } as any)).toThrow(
-          'Tool call filter options.maxModelOutputBytes must be a finite non-negative number when provided',
-        );
-      },
-    );
-
-    it('rejects malformed runtime maxModelOutputBytes input in the shared filter utility', () => {
-      expect(() => filterToolCallMessages([], { maxModelOutputBytes: -1 })).toThrow(
-        'Tool call filter options.maxModelOutputBytes must be a finite non-negative number when provided',
-      );
-    });
-
     it('should exclude all tool calls and tool results', async () => {
       const filter = new ToolCallFilter();
 
@@ -212,10 +180,6 @@ describe('ToolCallFilter', () => {
           content: {
             format: 2,
             content: 'I found three relevant papers.',
-            providerMetadata: {
-              openai: { itemId: 'KEEP_FILTERED_MESSAGE_ITEM' },
-              mastra: { channels: { slack: { messageId: 'channel-message' } } },
-            },
             parts: [
               {
                 type: 'tool-invocation' as const,
@@ -251,10 +215,6 @@ describe('ToolCallFilter', () => {
       }
       expect(resultContent.content).toBe('I found three relevant papers.');
       expect(resultContent.parts).toEqual([]);
-      expect(resultContent.providerMetadata).toEqual({
-        openai: { itemId: 'KEEP_FILTERED_MESSAGE_ITEM' },
-        mastra: { channels: { slack: { messageId: 'channel-message' } } },
-      });
     });
 
     it('should handle empty messages array', async () => {
@@ -408,39 +368,6 @@ describe('ToolCallFilter', () => {
   });
 
   describe('exclude specific tool calls', () => {
-    it('preserves unmatched tool messages and their provider metadata', async () => {
-      const filter = new ToolCallFilter({ exclude: ['weather'] });
-      const message: MastraDBMessage = {
-        id: 'unmatched-calculator',
-        role: 'assistant',
-        content: {
-          format: 2,
-          content: '',
-          providerMetadata: { openai: { itemId: 'KEEP_PROVIDER_ITEM' } },
-          parts: [
-            {
-              type: 'tool-invocation',
-              toolInvocation: {
-                state: 'result',
-                toolCallId: 'calculator-call',
-                toolName: 'calculator',
-                args: { expression: '2+2' },
-                result: 4,
-              },
-            },
-          ],
-        },
-        createdAt: new Date(),
-      };
-      const messageList = new MessageList().add(message, 'input');
-
-      const result = await filter.processInput({ messages: [message], messageList, abort: mockAbort });
-
-      const resultMessages = Array.isArray(result) ? result : result.get.all.db();
-      expect(resultMessages).toEqual([message]);
-      expect(JSON.stringify(resultMessages)).toContain('KEEP_PROVIDER_ITEM');
-    });
-
     it('should exclude only specified tool calls', async () => {
       const filter = new ToolCallFilter({ exclude: ['weather'] });
 
@@ -1407,466 +1334,6 @@ describe('ToolCallFilter', () => {
       expect(serialized).not.toContain('CIRCULAR_RAW');
     });
 
-    it('preserves serializable JSON output with shared sibling references', async () => {
-      const shared = { safe: true };
-      const filter = new ToolCallFilter({ preserveModelOutput: true });
-      const message: MastraDBMessage = {
-        id: 'msg-shared-json-output',
-        role: 'assistant',
-        content: {
-          format: 2,
-          content: '',
-          parts: [
-            {
-              type: 'tool-invocation',
-              toolInvocation: {
-                state: 'result',
-                toolCallId: 'call-shared-json',
-                toolName: 'sharedJsonTool',
-                args: { secret: 'SHARED_JSON_ARGS' },
-                result: 'SHARED_JSON_RAW',
-              },
-              providerMetadata: {
-                mastra: {
-                  modelOutput: { type: 'json', value: { left: shared, right: shared } },
-                },
-              },
-            },
-          ],
-        },
-        createdAt: new Date(),
-      };
-
-      const result = await filter.processInput({
-        messages: [message],
-        messageList: createMessageList([message]),
-        abort: mockAbort,
-      });
-
-      const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
-      expect(serialized).toContain(
-        'sharedJsonTool result:\\n{\\"left\\":{\\"safe\\":true},\\"right\\":{\\"safe\\":true}}',
-      );
-      expect(serialized).not.toContain('SHARED_JSON_ARGS');
-      expect(serialized).not.toContain('SHARED_JSON_RAW');
-    });
-
-    it('does not invoke accessor-backed model-output fields or array elements', () => {
-      const accessor = vi.fn();
-      const messages: MastraDBMessage[] = [];
-
-      const addMessage = (id: string, mastraMetadata: Record<string, unknown>) => {
-        messages.push({
-          id,
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: '',
-            parts: [
-              {
-                type: 'tool-invocation',
-                toolInvocation: {
-                  state: 'result',
-                  toolCallId: `call-${id}`,
-                  toolName: `tool-${id}`,
-                  args: { secret: 'ACCESSOR_ARGS' },
-                  result: 'ACCESSOR_RAW',
-                },
-                providerMetadata: { mastra: mastraMetadata },
-              },
-            ],
-          },
-          createdAt: new Date(),
-        });
-      };
-
-      const metadataAccessor: Record<string, unknown> = {};
-      Object.defineProperty(metadataAccessor, 'modelOutput', {
-        enumerable: true,
-        get() {
-          accessor('modelOutput');
-          return 'METADATA_ACCESSOR_TEXT';
-        },
-      });
-      addMessage('metadata-accessor', metadataAccessor);
-
-      const typeAccessor = { value: 'TYPE_ACCESSOR_TEXT' } as Record<string, unknown>;
-      Object.defineProperty(typeAccessor, 'type', {
-        enumerable: true,
-        get() {
-          accessor('type');
-          return 'text';
-        },
-      });
-      addMessage('type-accessor', { modelOutput: typeAccessor });
-
-      const valueAccessor = { type: 'text' } as Record<string, unknown>;
-      Object.defineProperty(valueAccessor, 'value', {
-        enumerable: true,
-        get() {
-          accessor('value');
-          return 'VALUE_ACCESSOR_TEXT';
-        },
-      });
-      addMessage('value-accessor', { modelOutput: valueAccessor });
-
-      const indexAccessor: unknown[] = [];
-      Object.defineProperty(indexAccessor, '0', {
-        enumerable: true,
-        get() {
-          accessor('array index');
-          return 'INDEX_ACCESSOR_TEXT';
-        },
-      });
-      addMessage('index-accessor', { modelOutput: indexAccessor });
-
-      const iteratorAccessor = ['ITERATOR_ACCESSOR_TEXT'];
-      Object.defineProperty(iteratorAccessor, Symbol.iterator, {
-        get() {
-          accessor('array iterator');
-          return Array.prototype[Symbol.iterator];
-        },
-      });
-      addMessage('iterator-accessor', { modelOutput: iteratorAccessor });
-
-      const contentPart = { type: 'text' } as Record<string, unknown>;
-      Object.defineProperty(contentPart, 'text', {
-        enumerable: true,
-        get() {
-          accessor('content text');
-          return 'CONTENT_ACCESSOR_TEXT';
-        },
-      });
-      addMessage('content-accessor', { modelOutput: { type: 'content', value: [contentPart] } });
-
-      const result = filterToolCallMessages(messages, { preserveModelOutput: true });
-
-      expect(result).toHaveLength(1);
-      expect(JSON.stringify(result)).toContain('tool-iterator-accessor result:\\nITERATOR_ACCESSOR_TEXT');
-      expect(accessor).not.toHaveBeenCalled();
-    });
-
-    it.each([
-      [
-        'model output with throwing accessors',
-        () => {
-          const output = {} as Record<string, unknown>;
-          Object.defineProperty(output, 'type', {
-            enumerable: true,
-            get() {
-              throw new Error('hostile model output');
-            },
-          });
-          return output;
-        },
-      ],
-      ['non-JSON values with inherited toJSON', () => ({ type: 'json', value: new Date('2024-01-01T00:00:00Z') })],
-    ] as const)('omits %s', async (_label, createOutput) => {
-      const filter = new ToolCallFilter({ preserveModelOutput: true });
-      const message: MastraDBMessage = {
-        id: 'msg-hostile-output',
-        role: 'assistant',
-        content: {
-          format: 2,
-          content: '',
-          parts: [
-            {
-              type: 'tool-invocation',
-              toolInvocation: {
-                state: 'result',
-                toolCallId: 'call-hostile',
-                toolName: 'hostileTool',
-                args: { secret: 'HOSTILE_ARGS' },
-                result: 'HOSTILE_RAW',
-              },
-              providerMetadata: { mastra: { modelOutput: createOutput() } },
-            },
-          ],
-        },
-        createdAt: new Date(),
-      };
-
-      const result = await filter.processInput({
-        messages: [message],
-        messageList: createMessageList([message]),
-        abort: mockAbort,
-      });
-
-      expect(Array.isArray(result) ? result : result.get.all.db()).toEqual([]);
-    });
-
-    it.each([
-      ['legacy array', () => Array.from({ length: 10_001 }, () => 'BUDGET_VALUE')],
-      [
-        'content array',
-        () => ({
-          type: 'content',
-          value: Array.from({ length: 10_001 }, () => ({ type: 'text', text: 'BUDGET_VALUE' })),
-        }),
-      ],
-      ['JSON array', () => ({ type: 'json', value: Array.from({ length: 10_001 }, () => 'BUDGET_VALUE') })],
-    ] as const)('omits %s model output that exceeds the traversal node budget', async (_label, createOutput) => {
-      const filter = new ToolCallFilter({ preserveModelOutput: true });
-      const messages: MastraDBMessage[] = [
-        toolMessages[0]!,
-        {
-          id: 'msg-over-budget-output',
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: '',
-            parts: [
-              {
-                type: 'tool-invocation',
-                toolInvocation: {
-                  state: 'result',
-                  toolCallId: 'call-over-budget',
-                  toolName: 'budgetTool',
-                  args: { secret: 'BUDGET_ARGS' },
-                  result: 'BUDGET_RAW',
-                },
-                providerMetadata: { mastra: { modelOutput: createOutput() } },
-              },
-            ],
-          },
-          createdAt: new Date(),
-        },
-      ];
-
-      const result = await filter.processInput({
-        messages,
-        messageList: createMessageList(messages),
-        abort: mockAbort,
-      });
-
-      const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
-      expect(serialized).not.toContain('budgetTool result');
-      expect(serialized).not.toContain('BUDGET_ARGS');
-      expect(serialized).not.toContain('BUDGET_RAW');
-    });
-
-    it('preserves text content while dropping media from model output', async () => {
-      const filter = new ToolCallFilter({ preserveModelOutput: true });
-      const messages: MastraDBMessage[] = [
-        toolMessages[0]!,
-        {
-          id: 'msg-media-output',
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: '',
-            parts: [
-              {
-                type: 'tool-invocation' as const,
-                toolInvocation: {
-                  state: 'result' as const,
-                  toolCallId: 'call-media',
-                  toolName: 'mediaTool',
-                  args: { secret: 'MEDIA_ARGS' },
-                  result: { raw: 'MEDIA_RAW' },
-                },
-                providerMetadata: {
-                  mastra: {
-                    modelOutput: {
-                      type: 'content',
-                      value: [
-                        { type: 'text', text: 'Safe caption' },
-                        { type: 'media', data: 'BASE64_SENTINEL', mediaType: 'image/png' },
-                      ],
-                    },
-                  },
-                },
-              },
-            ],
-          },
-          createdAt: new Date(),
-        },
-      ];
-
-      const result = await filter.processInput({
-        messages,
-        messageList: createMessageList(messages),
-        abort: mockAbort,
-      });
-
-      const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
-      expect(serialized).toContain('mediaTool result:\\nSafe caption');
-      expect(serialized).not.toContain('BASE64_SENTINEL');
-      expect(serialized).not.toContain('MEDIA_ARGS');
-      expect(serialized).not.toContain('MEDIA_RAW');
-    });
-
-    it('bounds preserved model output by UTF-8 bytes', async () => {
-      const filter = new ToolCallFilter({ preserveModelOutput: true, maxModelOutputBytes: 18 });
-      const messages: MastraDBMessage[] = [
-        toolMessages[0]!,
-        {
-          id: 'msg-bounded-output',
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: '',
-            parts: [
-              {
-                type: 'tool-invocation' as const,
-                toolInvocation: {
-                  state: 'result' as const,
-                  toolCallId: 'call-bounded',
-                  toolName: 'boundedTool',
-                  args: {},
-                  result: 'raw',
-                },
-                providerMetadata: {
-                  mastra: { modelOutput: { type: 'text', value: 'éééééééééééééééé' } },
-                },
-              },
-            ],
-          },
-          createdAt: new Date(),
-        },
-      ];
-
-      const result = await filter.processInput({
-        messages,
-        messageList: createMessageList(messages),
-        abort: mockAbort,
-      });
-      const resultMessages = Array.isArray(result) ? result : result.get.all.db();
-      const text = resultMessages[1]!.content.parts.find((part: any) => part.type === 'text') as {
-        text: string;
-      };
-      const preservedOutput = text.text.replace('boundedTool result:\n', '');
-
-      expect(new TextEncoder().encode(preservedOutput).byteLength).toBeLessThanOrEqual(18);
-      expect(preservedOutput.endsWith('\n[truncated]')).toBe(true);
-      expect(preservedOutput).not.toContain('�');
-    });
-
-    it('serializes bounded JSON without materializing the complete JSON string', async () => {
-      const jsonValue = { payload: 'x'.repeat(1024 * 1024) };
-      const filter = new ToolCallFilter({ preserveModelOutput: true, maxModelOutputBytes: 64 });
-      const message: MastraDBMessage = {
-        id: 'msg-bounded-json-output',
-        role: 'assistant',
-        content: {
-          format: 2,
-          content: '',
-          parts: [
-            {
-              type: 'tool-invocation',
-              toolInvocation: {
-                state: 'result',
-                toolCallId: 'call-bounded-json',
-                toolName: 'boundedJsonTool',
-                args: {},
-                result: 'raw',
-              },
-              providerMetadata: { mastra: { modelOutput: { type: 'json', value: jsonValue } } },
-            },
-          ],
-        },
-        createdAt: new Date(),
-      };
-
-      const stringifySpy = vi.spyOn(JSON, 'stringify');
-      let result: MessageList | MastraDBMessage[];
-      let serializedWholeJsonValue: boolean;
-      try {
-        result = await filter.processInput({
-          messages: [message],
-          messageList: createMessageList([message]),
-          abort: mockAbort,
-        });
-        serializedWholeJsonValue = stringifySpy.mock.calls.some(([value]) => value === jsonValue);
-      } finally {
-        stringifySpy.mockRestore();
-      }
-
-      const resultMessages = Array.isArray(result!) ? result! : result!.get.all.db();
-      const text = resultMessages[0]!.content.parts.find(part => part.type === 'text');
-      expect(serializedWholeJsonValue!).toBe(false);
-      expect(text?.type === 'text' ? text.text : '').toContain('[truncated]');
-    });
-
-    it('omits bigint model output when a byte bound is configured', async () => {
-      const filter = new ToolCallFilter({ preserveModelOutput: true, maxModelOutputBytes: 64 });
-      const message: MastraDBMessage = {
-        id: 'msg-bounded-bigint-output',
-        role: 'assistant',
-        content: {
-          format: 2,
-          content: '',
-          parts: [
-            {
-              type: 'tool-invocation',
-              toolInvocation: {
-                state: 'result',
-                toolCallId: 'call-bounded-bigint',
-                toolName: 'boundedBigintTool',
-                args: {},
-                result: 'raw',
-              },
-              providerMetadata: { mastra: { modelOutput: 1n << 100_000n } },
-            },
-          ],
-        },
-        createdAt: new Date(),
-      };
-
-      const result = await filter.processInput({
-        messages: [message],
-        messageList: createMessageList([message]),
-        abort: mockAbort,
-      });
-
-      expect(Array.isArray(result) ? result : result.get.all.db()).toEqual([]);
-    });
-
-    it.each(['call', 'partial-call', 'approval-requested', 'approval-responded', 'output-error', 'output-denied'])(
-      'does not preserve model output for %s tool state',
-      async state => {
-        const filter = new ToolCallFilter({ preserveModelOutput: true });
-        const messages: MastraDBMessage[] = [
-          toolMessages[0]!,
-          {
-            id: `msg-${state}`,
-            role: 'assistant',
-            content: {
-              format: 2,
-              content: '',
-              parts: [
-                {
-                  type: 'tool-invocation',
-                  toolInvocation: {
-                    state,
-                    toolCallId: `call-${state}`,
-                    toolName: 'stateTool',
-                    args: { secret: 'STATE_ARGS' },
-                    result: 'STATE_RAW',
-                  },
-                  providerMetadata: {
-                    mastra: { modelOutput: { type: 'text', value: 'STATE_MODEL_OUTPUT' } },
-                  },
-                } as any,
-              ],
-            },
-            createdAt: new Date(),
-          },
-        ];
-
-        const result = await filter.processInput({
-          messages,
-          messageList: createMessageList(messages),
-          abort: mockAbort,
-        });
-        const serialized = JSON.stringify(Array.isArray(result) ? result : result.get.all.db());
-
-        expect(serialized).not.toContain('STATE_MODEL_OUTPUT');
-        expect(serialized).not.toContain('STATE_ARGS');
-        expect(serialized).not.toContain('STATE_RAW');
-      },
-    );
-
     it('does not transform messages when exclude is empty', async () => {
       const filter = new ToolCallFilter({ exclude: [], preserveModelOutput: true });
       const messageList = createMessageList(toolMessages);
@@ -1885,56 +1352,10 @@ describe('ToolCallFilter', () => {
       expect(serialized).not.toContain('search result:\\nCompact search summary');
     });
 
-    it('filters matching legacy content.toolInvocations when no tool parts exist', async () => {
-      const filter = new ToolCallFilter({ exclude: ['search'] });
-      const messages: MastraDBMessage[] = [
-        {
-          id: 'legacy-top-level-tools',
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: 'Tool summary',
-            parts: [{ type: 'text', text: 'Tool summary' }],
-            toolInvocations: [
-              {
-                state: 'result',
-                toolCallId: 'legacy-search',
-                toolName: 'search',
-                args: { query: 'LEGACY_SEARCH_ARGS' },
-                result: 'LEGACY_SEARCH_RESULT',
-              },
-              {
-                state: 'result',
-                toolCallId: 'legacy-calculator',
-                toolName: 'calculator',
-                args: { expression: '2+2' },
-                result: 4,
-              },
-            ],
-          },
-          createdAt: new Date(),
-        },
-      ];
-
-      const result = await filter.processInput({
-        messages,
-        messageList: createMessageList(messages),
-        abort: mockAbort,
-      });
-
-      const resultMessages = Array.isArray(result) ? result : result.get.all.db();
-      const serialized = JSON.stringify(resultMessages);
-      expect(serialized).not.toContain('LEGACY_SEARCH_ARGS');
-      expect(serialized).not.toContain('LEGACY_SEARCH_RESULT');
-      expect(serialized).toContain('legacy-calculator');
-      expect(resultMessages[0]!.content.toolInvocations).toHaveLength(1);
-    });
-
     it('exposes filterAfterToolSteps and preserveModelOutput through the processor provider config', async () => {
       const parsedConfig = toolCallFilterProvider.configSchema.parse({
         filterAfterToolSteps: 0,
         preserveModelOutput: true,
-        maxModelOutputBytes: 256,
       });
       const processor = toolCallFilterProvider.createProcessor(parsedConfig);
       const messageList = createMessageList(toolMessages);
@@ -1961,13 +1382,6 @@ describe('ToolCallFilter', () => {
 
       const resultMessages = Array.isArray(result) ? result : result?.get.all.db();
       expect(JSON.stringify(resultMessages)).toContain('Compact search summary');
-    });
-
-    it('rejects non-finite model output byte limits in provider configuration', () => {
-      expect(() =>
-        toolCallFilterProvider.configSchema.parse({ maxModelOutputBytes: Number.POSITIVE_INFINITY }),
-      ).toThrow();
-      expect(() => toolCallFilterProvider.configSchema.parse({ maxModelOutputBytes: -1 })).toThrow();
     });
   });
 
@@ -2024,66 +1438,6 @@ describe('ToolCallFilter', () => {
       const result = await filter.processInputStep(mockStepArgs(messageList));
 
       expect(result.messages).toBeUndefined();
-    });
-
-    it('does not crash on legacy response messages with string content', async () => {
-      const filter = new ToolCallFilter({ filterAfterToolSteps: 1 });
-      const messages = [
-        {
-          id: 'legacy-string-response',
-          role: 'assistant',
-          content: 'Legacy assistant text',
-          createdAt: new Date(),
-        } as unknown as MastraDBMessage,
-      ];
-      const messageList = {
-        get: {
-          all: { db: () => messages },
-          response: { db: () => messages },
-        },
-      } as unknown as MessageList;
-
-      const result = await filter.processInputStep(mockStepArgs(messageList));
-
-      expect(result.messages).toEqual(messages);
-    });
-
-    it('preserves recent legacy content.toolInvocations', async () => {
-      const filter = new ToolCallFilter({ filterAfterToolSteps: 1 });
-      const messages: MastraDBMessage[] = [
-        {
-          id: 'legacy-top-level-response',
-          role: 'assistant',
-          content: {
-            format: 2,
-            content: '',
-            providerMetadata: { openai: { itemId: 'RECENT_PROVIDER_ITEM' } },
-            parts: [],
-            toolInvocations: [
-              {
-                state: 'result',
-                toolCallId: 'recent-legacy-tool',
-                toolName: 'search',
-                args: { query: 'RECENT_LEGACY_ARGS' },
-                result: 'RECENT_LEGACY_RESULT',
-              },
-            ],
-          },
-          createdAt: new Date(),
-        },
-      ];
-      const messageList = {
-        get: {
-          all: { db: () => messages },
-          response: { db: () => messages },
-        },
-      } as unknown as MessageList;
-
-      const result = await filter.processInputStep(mockStepArgs(messageList));
-
-      expect(JSON.stringify(result.messages)).toContain('RECENT_LEGACY_ARGS');
-      expect(JSON.stringify(result.messages)).toContain('RECENT_LEGACY_RESULT');
-      expect(JSON.stringify(result.messages)).toContain('RECENT_PROVIDER_ITEM');
     });
 
     it('should filter tool calls from tool steps older than filterAfterToolSteps', async () => {

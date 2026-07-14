@@ -51,6 +51,7 @@ function createCredentialsHeaders(): HeadersInit {
   return { 'Content-Type': 'application/json' };
 }
 
+
 /**
  * Response shape from Neon Auth session endpoint.
  */

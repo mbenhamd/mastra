@@ -923,6 +923,7 @@ describe('MastraLLM', () => {
         tracingContext: { currentSpan: mockCurrentSpan },
       };
 
+      // Use fake timers so the 10s delay completes instantly
       vi.useFakeTimers();
       try {
         const textPromise = llm.__text({
@@ -931,6 +932,7 @@ describe('MastraLLM', () => {
           ...tracingCtx,
         });
 
+        // Advance past the 10s delay
         await vi.advanceTimersByTimeAsync(11_000);
         await textPromise;
       } finally {

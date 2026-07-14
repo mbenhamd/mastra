@@ -5,6 +5,8 @@ export { getChatModule } from './chat-lazy';
 export { MastraStateAdapter } from './state-adapter';
 export { defaultTypingStatus } from './typing-status';
 export type { TypingStatusContext, TypingStatusFn, TypingStatusReturn } from './typing-status';
+export { resolveWaitUntil } from './wait-until';
+export type { WaitUntilFn, WaitUntilResolver } from './wait-until';
 export type {
   ChannelAdapterBaseConfig,
   ChannelAdapterConfig,

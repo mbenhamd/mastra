@@ -11,6 +11,10 @@
   "devDependencies": {
     "@types/node": "22.19.21",
     "tsx": "^4.22.4",
+<<<<<<<< HEAD:scripts/pr-complexity/package.json
     "typescript": "^5.9.3"
+========
+    "typescript": "^6.0.3"
+>>>>>>>> upstream/main:scripts/release-issue-notification/package.json
   }
 }
