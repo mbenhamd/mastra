@@ -3,6 +3,7 @@ import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import type { ResultPromise } from 'execa';
+import { onExit } from 'signal-exit';
 import { getPackageManagerAddArgs } from '../utils/package-manager';
 import type { PackageManager } from '../utils/package-manager';
 
@@ -93,14 +94,17 @@ function scheduleInstallTreeTermination(subprocess: ResultPromise, timeout?: num
   } else {
     cancelSignal?.addEventListener('abort', terminateOnAbort, { once: true });
   }
-  process.once('exit', terminateOnExit);
+  // signal-exit runs the callback exactly once for normal exits and for fatal
+  // signals such as SIGINT/SIGTERM (which never emit Node's `exit` event),
+  // then re-raises the signal so the CLI dies with the conventional code.
+  const removeExitCleanup = onExit(terminateOnExit);
 
   return {
     terminate,
     clear() {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       cancelSignal?.removeEventListener('abort', terminateOnAbort);
-      process.removeListener('exit', terminateOnExit);
+      removeExitCleanup();
     },
   };
 }

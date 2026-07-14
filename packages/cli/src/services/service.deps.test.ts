@@ -2,10 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   execa: vi.fn(),
+  onExit: vi.fn(),
 }));
 
 vi.mock('execa', () => ({
   execa: mocks.execa,
+}));
+
+vi.mock('signal-exit', () => ({
+  onExit: mocks.onExit,
 }));
 
 import type { PackageManager } from '../utils/package-manager.js';
@@ -30,6 +35,8 @@ describe('DepsService.installPackages', () => {
   beforeEach(() => {
     mocks.execa.mockReset();
     mocks.execa.mockResolvedValue({ all: 'installed' });
+    mocks.onExit.mockReset();
+    mocks.onExit.mockReturnValue(vi.fn());
   });
 
   it.each([
@@ -206,27 +213,44 @@ describe('DepsService.installPackages', () => {
     },
   );
 
-  it.runIf(process.platform !== 'win32')('kills a detached install tree when the CLI exits', async () => {
-    const deferred = deferredSubprocess(43_214);
-    mocks.execa.mockReturnValueOnce(deferred.subprocess);
-    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
-    const once = vi.spyOn(process, 'once');
+  it.runIf(process.platform !== 'win32')(
+    'registers signal-aware cleanup that kills a detached install tree when the CLI dies',
+    async () => {
+      const deferred = deferredSubprocess(43_214);
+      mocks.execa.mockReturnValueOnce(deferred.subprocess);
+      const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+      const removeExitCleanup = vi.fn();
+      let exitCleanup!: () => void;
+      mocks.onExit.mockImplementationOnce(callback => {
+        exitCleanup = callback;
+        return removeExitCleanup;
+      });
 
-    try {
-      const installation = new DepsService('npm').installPackages(['typescript']);
-      const exitListener = once.mock.calls.find(([event]) => event === 'exit')?.[1] as
-        | ((code: number) => void)
-        | undefined;
-      expect(exitListener).toBeDefined();
+      try {
+        const installation = new DepsService('npm').installPackages(['typescript']);
+        // signal-exit invokes the callback on the normal `exit` event and on
+        // fatal signals such as SIGINT/SIGTERM, which never emit `exit`.
+        expect(mocks.onExit).toHaveBeenCalledOnce();
 
-      exitListener?.(1);
-      expect(kill).toHaveBeenCalledWith(-43_214, 'SIGKILL');
+        exitCleanup();
+        expect(kill).toHaveBeenCalledWith(-43_214, 'SIGKILL');
 
-      deferred.resolve({ all: 'installed' });
-      await expect(installation).resolves.toEqual({ all: 'installed' });
-    } finally {
-      once.mockRestore();
-      kill.mockRestore();
-    }
+        deferred.resolve({ all: 'installed' });
+        await expect(installation).resolves.toEqual({ all: 'installed' });
+        expect(removeExitCleanup).toHaveBeenCalledOnce();
+      } finally {
+        kill.mockRestore();
+      }
+    },
+  );
+
+  it('unregisters the signal-exit cleanup after a completed install', async () => {
+    const removeExitCleanup = vi.fn();
+    mocks.onExit.mockReturnValueOnce(removeExitCleanup);
+
+    await expect(new DepsService('npm').installPackages(['typescript'])).resolves.toEqual({ all: 'installed' });
+
+    expect(mocks.onExit).toHaveBeenCalledOnce();
+    expect(removeExitCleanup).toHaveBeenCalledOnce();
   });
 });
