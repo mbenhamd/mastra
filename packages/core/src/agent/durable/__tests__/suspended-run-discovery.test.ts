@@ -1322,6 +1322,12 @@ describe('DurableAgent suspended-run discovery', () => {
       expect.objectContaining({
         resource: { type: 'tool', id: 'public-durable-id:protectedTool' },
         permission: 'tools:execute',
+        context: expect.objectContaining({
+          metadata: expect.objectContaining({
+            agentId: 'public-durable-id',
+            agentName: 'Public durable name',
+          }),
+        }),
       }),
     );
     expect(fgaProvider.require).not.toHaveBeenCalledWith(
