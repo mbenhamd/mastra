@@ -1798,9 +1798,12 @@ if workspace_changed stores/redis; then
 fi
 
 if workspace_changed mastracode; then
-  # MastraCode's Vitest setup mocks this workspace package, but Vite still
-  # resolves its exported dist entry before applying the mock.
+  # MastraCode's Vitest setup mocks these workspace packages, but Vite still
+  # resolves their exported dist entries before applying the mocks
+  # (settings.ts lazily imports @mastra/stagehand; the TUI imports
+  # @mastra/github-signals).
   run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
+  run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
   mapfile -t mastracode_lint_files < <(
     while IFS= read -r file; do
       if [[ -f "$file" && "$file" =~ ^mastracode/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then
