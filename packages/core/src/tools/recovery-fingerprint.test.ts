@@ -37,6 +37,18 @@ describe('createToolRecoveryFingerprint', () => {
     expect(createToolRecoveryFingerprint(notANumberPosition)).not.toBe(createToolRecoveryFingerprint(infinitePosition));
   });
 
+  it('rejects regular-expression subclasses whose prototype behavior cannot be fingerprinted', () => {
+    class InternalPolicy extends RegExp {
+      override test(value: string): boolean {
+        return value.startsWith('internal:') && super.test(value);
+      }
+    }
+
+    expect(() => createToolRecoveryFingerprint({ policy: new InternalPolicy('reports', 'u') })).toThrow(
+      'Cannot create a durable recovery fingerprint for RegExp subclass at "$tool.policy"',
+    );
+  });
+
   it('keeps special-value sentinels distinct from ordinary objects', () => {
     expect(createToolRecoveryFingerprint(/reports/iu)).not.toBe(
       createToolRecoveryFingerprint({ $regexp: 'reports', $flags: 'iu' }),

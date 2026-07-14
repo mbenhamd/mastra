@@ -15,6 +15,9 @@ function normalizeRecoveryValue(value: unknown, seen: Map<object, string>, path:
   seen.set(value, path);
 
   if (value instanceof Date) return { $date: value.toISOString() };
+  if (value instanceof RegExp && Object.getPrototypeOf(value) !== RegExp.prototype) {
+    throw new TypeError(`Cannot create a durable recovery fingerprint for RegExp subclass at "${path}"`);
+  }
   if (value instanceof RegExp) {
     const properties: Record<string, unknown> = {};
     for (const key of Object.keys(value).sort()) {
