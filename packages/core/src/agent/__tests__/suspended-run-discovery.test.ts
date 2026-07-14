@@ -1000,7 +1000,11 @@ describe.each([
   describe('agent resume fail-closed boundaries', () => {
     it('waits for an in-flight pending snapshot to become suspended', async () => {
       const storage = new InMemoryStore();
-      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-pending', 'resource-pending');
+      const suspended = await suspendRun(
+        createSuspendedSetup({ storage }).agent,
+        'thread-in-flight',
+        'resource-in-flight',
+      );
       const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
       const workflows = (await storage.getStore('workflows'))!;
       const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
@@ -1014,11 +1018,35 @@ describe.each([
         {
           runId: suspended.runId,
           toolCallId: suspended.toolCallId,
-          memory: { thread: 'thread-pending', resource: 'resource-pending' },
+          memory: { thread: 'thread-in-flight', resource: 'resource-in-flight' },
         },
       );
       await output.consumeStream();
       await vi.waitFor(() => expect(mockFindUser).toHaveBeenCalledOnce());
+    });
+
+    it('rejects a running snapshot instead of applying approval to a later suspension', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-running', 'resource-running');
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const workflows = (await storage.getStore('workflows'))!;
+      const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockResolvedValueOnce({
+        ...persisted!,
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'running' },
+      });
+
+      await expect(
+        restarted.agent.resumeStream(
+          { approved: true },
+          {
+            runId: suspended.runId,
+            toolCallId: suspended.toolCallId,
+            memory: { thread: 'thread-running', resource: 'resource-running' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_RUN_NOT_SUSPENDED' });
+      expect(mockFindUser).not.toHaveBeenCalled();
     });
 
     it('rejects terminal snapshots even when suspended-looking context remains', async () => {
@@ -1314,6 +1342,21 @@ describe.each([
           resumeData: { name: 'Dero Israel' },
         }),
       ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_CONFLICTING_CONTINUATION_INPUT' });
+    });
+
+    it('rejects messages when declining a tool call', async () => {
+      const { agent } = createSuspendedSetup();
+      for (const messages of [[{ role: 'user' as const, content: 'decline this request' }], '']) {
+        await expect(
+          agent.sendToolApproval({
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+            toolCallId: 'call-1',
+            approved: false,
+            messages,
+          }),
+        ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_APPROVAL' });
+      }
     });
 
     it('approves a suspended run after a simulated restart (in-memory state lost)', async () => {

@@ -459,6 +459,87 @@ describe('DurableAgent suspended-run discovery', () => {
     globalRunRegistry.delete(runId);
   });
 
+  it('binds regular-expression source and flags exactly', async () => {
+    const setup = createSetup({ storage: new InMemoryStore(), model: textModel() });
+    const equivalentRunId = 'prepared-equivalent-regexp-binding';
+    const equivalentPrepared = await setup.agent.prepare('prepared message', {
+      runId: equivalentRunId,
+      requestContext: new RequestContext([['policy', /reports/iu]]),
+    });
+
+    const equivalent = await setup.agent.stream('prepared message', {
+      runId: equivalentRunId,
+      requestContext: new RequestContext([['policy', /reports/iu]]),
+    });
+    await equivalent.output.consumeStream();
+    equivalent.cleanup();
+    equivalentPrepared.cleanup();
+
+    const differentFlagsRunId = 'prepared-different-regexp-flags';
+    await setup.agent.prepare('prepared message', {
+      runId: differentFlagsRunId,
+      requestContext: new RequestContext([['policy', /reports/iu]]),
+    });
+
+    try {
+      await expect(
+        setup.agent.stream('prepared message', {
+          runId: differentFlagsRunId,
+          requestContext: new RequestContext([['policy', /reports/gu]]),
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
+    } finally {
+      globalRunRegistry.delete(differentFlagsRunId);
+    }
+
+    const preparedRegExp = /reports/gu;
+    preparedRegExp.lastIndex = 2;
+    const resumedRegExp = /reports/gu;
+    resumedRegExp.lastIndex = 4;
+    const differentPositionRunId = 'prepared-different-regexp-position';
+    await setup.agent.prepare('prepared message', {
+      runId: differentPositionRunId,
+      requestContext: new RequestContext([['policy', preparedRegExp]]),
+    });
+
+    try {
+      await expect(
+        setup.agent.stream('prepared message', {
+          runId: differentPositionRunId,
+          requestContext: new RequestContext([['policy', resumedRegExp]]),
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
+    } finally {
+      globalRunRegistry.delete(differentPositionRunId);
+    }
+  });
+
+  it('binds regular-expression subclasses by identity', async () => {
+    class PolicyRegExp extends RegExp {
+      override test(value: string): boolean {
+        return value.startsWith('report:') && super.test(value);
+      }
+    }
+
+    const setup = createSetup({ storage: new InMemoryStore(), model: textModel() });
+    const runId = 'prepared-regexp-subclass-identity';
+    await setup.agent.prepare('prepared message', {
+      runId,
+      requestContext: new RequestContext([['policy', new PolicyRegExp('reports', 'u')]]),
+    });
+
+    try {
+      await expect(
+        setup.agent.stream('prepared message', {
+          runId,
+          requestContext: new RequestContext([['policy', new PolicyRegExp('reports', 'u')]]),
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
+    } finally {
+      globalRunRegistry.delete(runId);
+    }
+  });
+
   it('binds undefined, sparse arrays, and Date aliasing exactly', async () => {
     const setup = createSetup({ storage: new InMemoryStore(), model: textModel() });
     const sharedDate = new Date('2026-01-01T00:00:00.000Z');

@@ -15,6 +15,22 @@ function normalizeRecoveryValue(value: unknown, seen: Map<object, string>, path:
   seen.set(value, path);
 
   if (value instanceof Date) return { $date: value.toISOString() };
+  if (value instanceof RegExp) {
+    const properties: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      properties[key] = normalizeRecoveryValue(
+        (value as unknown as Record<string, unknown>)[key],
+        seen,
+        `${path}.${key}`,
+      );
+    }
+    return {
+      $regexp: value.source,
+      $flags: value.flags,
+      $lastIndex: normalizeRecoveryValue(value.lastIndex, seen, `${path}.lastIndex`),
+      $properties: properties,
+    };
+  }
   if (Array.isArray(value)) {
     return value.map((item, index) => normalizeRecoveryValue(item, seen, `${path}[${index}]`));
   }
@@ -34,7 +50,7 @@ function normalizeRecoveryValue(value: unknown, seen: Map<object, string>, path:
   for (const key of Object.keys(value).sort()) {
     normalized[key] = normalizeRecoveryValue((value as Record<string, unknown>)[key], seen, `${path}.${key}`);
   }
-  return normalized;
+  return { $object: normalized };
 }
 
 function canonicalizeRecoverySchema(value: unknown, key?: string): unknown {

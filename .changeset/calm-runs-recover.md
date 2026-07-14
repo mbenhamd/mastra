@@ -4,6 +4,7 @@
 
 - Added `listSuspendedRuns()` for discovering and resuming suspended standard or durable agent runs after a process restart.
 - Durable recovery now validates the persisted run owner and runtime version before continuing.
+- Prepared and recovered runtime bindings now compare regular-expression source, flags, execution position, and custom properties without accepting identity-changing subclasses.
 - Built-in `Run.startAsync()` results now expose an optional `execution` promise for observing background execution failures.
 
 **Breaking change:** `DurableAgent.prepare()` no longer returns `registryEntry`.

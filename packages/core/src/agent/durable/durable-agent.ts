@@ -708,6 +708,14 @@ export class DurableAgent<
         $properties: properties(),
       };
     }
+    if (value instanceof RegExp && Object.getPrototypeOf(value) === RegExp.prototype) {
+      return {
+        $id: reference,
+        $regexp: value.source,
+        $flags: value.flags,
+        $properties: properties(),
+      };
+    }
     if (value instanceof Map) {
       return {
         $id: reference,

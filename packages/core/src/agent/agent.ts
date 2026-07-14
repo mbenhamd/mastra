@@ -8923,13 +8923,24 @@ export class Agent<
     },
   ): Promise<{ accepted: true; runId: string; toolCallId?: string }> {
     const { threadId, resourceId, approved, resumeData, messages, streamOptions, ...executionOptions } = options;
+    const hasMessages = messages !== undefined;
 
-    if (messages && resumeData !== undefined) {
+    if (hasMessages && resumeData !== undefined) {
       throw new MastraError({
         id: 'AGENT_SEND_TOOL_APPROVAL_CONFLICTING_CONTINUATION_INPUT',
         domain: ErrorDomain.AGENT,
         category: ErrorCategory.USER,
         text: `Agent "${this.name}" sendToolApproval() accepts messages or resumeData, not both.`,
+        details: { threadId, resourceId, agentName: this.name },
+      });
+    }
+
+    if (hasMessages && !approved) {
+      throw new MastraError({
+        id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_APPROVAL',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" sendToolApproval() only accepts messages when approved is true.`,
         details: { threadId, resourceId, agentName: this.name },
       });
     }
@@ -8944,7 +8955,7 @@ export class Agent<
       });
     }
 
-    if (messages && approved) {
+    if (hasMessages && approved) {
       const continuation = agentThreadStreamRuntime.continueWithMessages(
         this as Agent<any, any, any, any>,
         messages,
