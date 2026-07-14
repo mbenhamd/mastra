@@ -447,26 +447,26 @@ export const createRestartExecutionParams = ({
     }
   }
 
-  let nestedWorkflowActiveStepsPath: Record<string, number[]> = {};
+  const nestedWorkflowActiveStepsPath: Record<string, number[]> = {};
+  const addNestedWorkflowActiveStep = (stepId: string) => {
+    Object.defineProperty(nestedWorkflowActiveStepsPath, stepId, {
+      value: [0],
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  };
 
   const firstEntry = graph.steps[0]!;
 
   if (firstEntry.type === 'step' || firstEntry.type === 'foreach' || firstEntry.type === 'loop') {
-    nestedWorkflowActiveStepsPath = {
-      [firstEntry.step.id]: [0],
-    };
+    addNestedWorkflowActiveStep(firstEntry.step.id);
   } else if (firstEntry.type === 'sleep' || firstEntry.type === 'sleepUntil') {
-    nestedWorkflowActiveStepsPath = {
-      [firstEntry.id]: [0],
-    };
+    addNestedWorkflowActiveStep(firstEntry.id);
   } else if (firstEntry.type === 'conditional' || firstEntry.type === 'parallel') {
-    nestedWorkflowActiveStepsPath = firstEntry.steps.reduce(
-      (acc, step) => {
-        acc[step.step.id] = [0];
-        return acc;
-      },
-      {} as Record<string, number[]>,
-    );
+    for (const step of firstEntry.steps) {
+      addNestedWorkflowActiveStep(step.step.id);
+    }
   }
   const restartData: RestartExecutionParams = {
     activePaths: nestedWorkflowPending ? [0] : snapshot.activePaths,
