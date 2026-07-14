@@ -65,11 +65,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # pnpm install executes lifecycle scripts resolved from PR-controlled
-          # manifests. Reject the same dependency-graph surface the validator
-          # rejects BEFORE any install runs, not after.
+          # manifests. Reject manifest and patch changes BEFORE any install
+          # runs, not after. pnpm-lock.yaml stays with the post-install trusted
+          # validator: pnpm 11 ignores dependency build scripts without an
+          # onlyBuiltDependencies allowlist, so a lockfile diff alone cannot
+          # execute code at install time.
           mapfile -t manifest_changes < <(
             git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
-              package.json pnpm-lock.yaml pnpm-workspace.yaml patches \
+              package.json pnpm-workspace.yaml patches \
               packages/server/package.json
           )
           if (( ${#manifest_changes[@]} > 0 )); then
