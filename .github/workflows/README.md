@@ -26,7 +26,7 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   GitHub-hosted `ubuntu-24.04` runners.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Internal Core, Deployer,
-  MCP, Memory, AI SDK, shared Storage Test Utils, PostgreSQL, and Redis, and
+  MCP, Memory, Server, AI SDK, shared Storage Test Utils, PostgreSQL, and Redis, and
   executes each supported changed Vitest file in full. Storage Test Utils
   changes must include a changed Vitest file in that workspace so shared
   conformance helpers cannot pass without execution. Okta Auth runs its package
@@ -35,7 +35,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   its package typecheck, build, lint, and changed-test coverage. This avoids the
   unrelated package failures in Deployer's broad Turbo dependency closure. MCP
   runs its package typecheck, build, lint, and changed-test coverage. Nested
-  fixture manifests are not treated as workspace boundaries. The validator discovers
+  fixture manifests are not treated as workspace boundaries. Server changes run
+  the package build, lint, Core-import boundary check, and changed-test coverage.
+  The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
   target. Root dependency graph changes also fail closed until broad workspace
