@@ -613,6 +613,21 @@ describe('evented workflow terminal loop decision evaluator', () => {
     expect(condition).toHaveBeenCalledTimes(1);
   });
 
+  it('does not admit an already-aborted attempt into same-key coalescing', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const condition = vi.fn(async () => true);
+    const evaluator = new EventedWorkflowTerminalLoopDecisionEvaluator();
+
+    const aborted = evaluator.evaluate({ ...evaluation(condition), abortSignal: controller.signal });
+    const retry = evaluator.evaluate(evaluation(condition));
+
+    await expect(aborted).resolves.toMatchObject({ status: 'aborted' });
+    await expect(retry).resolves.toMatchObject({ status: 'evaluated' });
+    expect(condition).toHaveBeenCalledTimes(1);
+    expect(evaluator.getStats()).toMatchObject({ capacityExceeded: 0 });
+  });
+
   it('retains the key after a post-start external abort until the callback settles', async () => {
     let started!: () => void;
     const didStart = new Promise<void>(resolve => (started = resolve));

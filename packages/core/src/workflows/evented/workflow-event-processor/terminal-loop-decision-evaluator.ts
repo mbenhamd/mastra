@@ -468,6 +468,9 @@ export class EventedWorkflowTerminalLoopDecisionEvaluator {
         return existing.promise.then(copyEvaluationResult);
       }
     }
+    if (safeInput.abortSignal && isSignalAborted(safeInput.abortSignal)) {
+      return Promise.resolve(copyEvaluationResult({ status: 'aborted', request: frame.request }));
+    }
     this.#evictCompleted();
     if (this.#evaluations.size >= MAX_PROCESS_LOCAL_LOOP_DECISIONS) {
       this.#capacityExceeded++;
