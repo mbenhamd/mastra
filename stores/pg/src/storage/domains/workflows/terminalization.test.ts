@@ -263,6 +263,9 @@ describe('WorkflowsPG terminalization journal', () => {
         parent.workflowName,
         parent.runId,
       ]);
+      await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({
+        status: 'corrupt_parent_state',
+      });
       await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
         status: 'corrupt_parent_state',
       });

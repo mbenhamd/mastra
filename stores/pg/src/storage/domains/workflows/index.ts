@@ -781,7 +781,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     receipt: WorkflowTerminalDestinationReceiptRecord,
     now: number,
   ): Promise<WorkflowTerminalContinuationPlanRecord | undefined> {
-    const row = await t.oneOrNone<Record<string, unknown>>(
+    const rows = await t.manyOrNone<Record<string, unknown>>(
       `SELECT * FROM ${this.terminalContinuationPlanTableName()}
        WHERE receipt_key = $1
           OR (effect_key = $2 AND consumer_id = $5)
@@ -795,7 +795,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         WORKFLOW_TERMINAL_PARENT_APPLICATION_CONSUMER_ID,
       ],
     );
-    return row ? this.decodeTerminalContinuationPlanRow(row, effect, receipt, now) : undefined;
+    if (rows.length > 1) {
+      throw new TypeError('Conflicting workflow terminal continuation plan storage');
+    }
+    return rows[0] ? this.decodeTerminalContinuationPlanRow(rows[0], effect, receipt, now) : undefined;
   }
 
   private async insertTerminalContinuationPlanRecord(
@@ -1514,7 +1517,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!row) return { status: 'missing_parent' };
         const generation = typeof row.generation === 'string' ? Number(row.generation) : row.generation;
         if (!Number.isSafeInteger(generation) || (generation as number) < 1) {
-          throw new TypeError('Workflow parent snapshot is missing revision evidence');
+          return { status: 'corrupt_parent_state' };
         }
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         return {

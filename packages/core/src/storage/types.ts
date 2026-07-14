@@ -300,6 +300,7 @@ export type GetWorkflowTerminalParentContextResult =
         | 'missing_effect'
         | 'missing_terminal_state'
         | 'missing_parent'
+        | 'corrupt_parent_state'
         | 'missing_record'
         | 'missing_run'
         | 'unsupported';
