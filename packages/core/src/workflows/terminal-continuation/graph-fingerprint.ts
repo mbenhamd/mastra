@@ -12,6 +12,10 @@ export const MAX_TERMINAL_ID_LENGTH = 512;
 export const MAX_TERMINAL_REVISION_LENGTH = 256;
 export const MAX_TERMINAL_LOOP_ITERATIONS = Number.MAX_SAFE_INTEGER - 1;
 
+export function isWorkflowTerminalNativeFunctionSource(source: string): boolean {
+  return /^function(?:\s+[^()]*)?\s*\([^)]*\)\s*\{\s*\[native code\]\s*\}$/.test(source);
+}
+
 function isWellFormed(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
@@ -94,11 +98,33 @@ function hashFramedParts(domain: string, parts: readonly string[]): string {
   return hash.digest('hex');
 }
 
-function hashSource(domain: string, value: unknown, field: string, state: GraphState): string {
+function hashBoundedSource(
+  domain: string,
+  value: unknown,
+  field: string,
+  state: GraphState,
+  validateSource?: (source: string) => void,
+): string {
   const source = validateWorkflowTerminalStructuralString(value, field, MAX_TERMINAL_GRAPH_BYTES, true);
+  validateSource?.(source);
   state.bytes += Buffer.byteLength(source, 'utf8');
   if (state.bytes > MAX_TERMINAL_GRAPH_BYTES) throw new TypeError('serialized workflow graph exceeds byte limit');
   return hashFramedParts(domain, [source]);
+}
+
+function hashSource(domain: string, value: unknown, field: string, state: GraphState): string {
+  return hashBoundedSource(domain, value, field, state);
+}
+
+function hashExecutableSource(domain: string, value: unknown, field: string, state: GraphState): string {
+  return hashBoundedSource(domain, value, field, state, source => {
+    if (source.length === 0) {
+      throw new TypeError(`${field} must not be empty`);
+    }
+    if (isWorkflowTerminalNativeFunctionSource(source)) {
+      throw new TypeError(`${field} must not contain native or bound callback source`);
+    }
+  });
 }
 
 interface GraphState {
@@ -173,7 +199,7 @@ function normalizeCondition(value: unknown, parts: string[], state: GraphState, 
     state,
     parts,
     id,
-    hashSource(
+    hashExecutableSource(
       'mastra.workflow-terminal-parent-graph.condition-source.v1',
       descriptors.fn!.value,
       `${field}.fn`,
@@ -243,9 +269,9 @@ function normalizeGraph(
         }
       }
       const fn =
-        descriptors.fn === undefined
+        descriptors.fn?.value === undefined
           ? ''
-          : hashSource(
+          : hashExecutableSource(
               'mastra.workflow-terminal-parent-graph.sleep-source.v1',
               descriptors.fn.value,
               `${entryField}.fn`,
@@ -378,6 +404,9 @@ export function resolveWorkflowTerminalGraphCoordinate(
     const branch = steps[path[1] as number];
     if (!branch) throw new TypeError('executionPath branch does not exist');
     const branchDescriptors = getDataDescriptors(branch, `${entryField}.steps[${path[1]}]`);
+    if (branchDescriptors.type?.value !== 'step') {
+      throw new TypeError(`${entryField} branch must be a step`);
+    }
     return {
       kind: 'branch',
       containerType: type,
