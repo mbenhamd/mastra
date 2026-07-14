@@ -1086,11 +1086,9 @@ export class WorkflowEventProcessor extends EventProcessor {
       data: { ...args, workflow: undefined, state: finalState },
     });
 
-    // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
-    // now that all events for this run have been processed.
-    if (this.mastra.__hasInternalWorkflow(args.workflowId, runId)) {
-      this.mastra.__unregisterInternalWorkflow(args.workflowId, runId);
-    }
+    // Suspension is non-terminal. Keep run-scoped ownership registered so
+    // workflow events remain local to this Mastra instance until a resumed run
+    // reaches success or failure (cross-process workflow ownership, PF-1723).
   }
 
   protected async processWorkflowFail(args: ProcessorArgs) {
