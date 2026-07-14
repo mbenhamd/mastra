@@ -62,23 +62,29 @@ describe('DepsService.installPackages', () => {
     expect(mocks.execa).not.toHaveBeenCalled();
   });
 
-  it('threads dev mode, timeout, and cancellation into the owned subprocess', async () => {
-    const service = new DepsService('pnpm');
-    const controller = new AbortController();
+  it.each([
+    { packageManager: 'pnpm', installArgs: ['add', '--loglevel=error', '-D', 'typescript'] },
+    { packageManager: 'bun', installArgs: ['add', '-d', 'typescript'] },
+  ] satisfies Array<{ packageManager: PackageManager; installArgs: string[] }>)(
+    'threads the $packageManager dev flag, timeout, and cancellation into the owned subprocess',
+    async ({ packageManager, installArgs }) => {
+      const service = new DepsService(packageManager);
+      const controller = new AbortController();
 
-    await service.installPackages(['typescript'], {
-      dev: true,
-      timeout: 5_000,
-      cancelSignal: controller.signal,
-    });
+      await service.installPackages(['typescript'], {
+        dev: true,
+        timeout: 5_000,
+        cancelSignal: controller.signal,
+      });
 
-    expect(mocks.execa).toHaveBeenCalledWith('pnpm', ['add', '--loglevel=error', '-D', 'typescript'], {
-      all: true,
-      stdio: 'pipe',
-      timeout: 5_000,
-      cancelSignal: controller.signal,
-      killSignal: 'SIGTERM',
-      forceKillAfterDelay: 1_000,
-    });
-  });
+      expect(mocks.execa).toHaveBeenCalledWith(packageManager, installArgs, {
+        all: true,
+        stdio: 'pipe',
+        timeout: 5_000,
+        cancelSignal: controller.signal,
+        killSignal: 'SIGTERM',
+        forceKillAfterDelay: 1_000,
+      });
+    },
+  );
 });

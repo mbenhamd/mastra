@@ -10,6 +10,11 @@ debug.enable('codemod:*');
 
 const program = new Command();
 const collectJscodeshiftOption = (value: string, previous: string[] = []) => [...previous, value];
+const jscodeshiftOptionArgs: [string, string, typeof collectJscodeshiftOption] = [
+  '-j, --jscodeshift <option>',
+  'Pass one argument directly to jscodeshift (repeat for multiple arguments)',
+  collectJscodeshiftOption,
+];
 
 program
   .name('codemod')
@@ -19,12 +24,7 @@ program
   .option('-d, --dry', 'Dry run (no changes are made to files)')
   .option('-p, --print', 'Print transformed files to stdout')
   .option('--verbose', 'Show more information about the transform process')
-  .option(
-    '-j, --jscodeshift <option>',
-    'Pass one argument directly to jscodeshift (repeat for multiple arguments)',
-    collectJscodeshiftOption,
-    [],
-  )
+  .option(...jscodeshiftOptionArgs, [])
   .action(async (codemod, source, options) => {
     try {
       await transform(codemod, source, options);
@@ -40,12 +40,7 @@ program
   .option('-d, --dry', 'Dry run (no changes are made to files)')
   .option('-p, --print', 'Print transformed files to stdout')
   .option('--verbose', 'Show more information about the transform process')
-  .option(
-    '-j, --jscodeshift <option>',
-    'Pass one argument directly to jscodeshift (repeat for multiple arguments)',
-    collectJscodeshiftOption,
-    [],
-  )
+  .option(...jscodeshiftOptionArgs, [])
   .action(async options => {
     try {
       await upgradeV1(options);

@@ -92,6 +92,12 @@ npx @mastra/codemod <command> [options]
 - `--print` - Print transformed code to stdout
 - `--verbose` - Show detailed transformation logs
 
+### Execution timeout
+
+Each codemod invocation has a five-minute execution limit. When that limit is
+reached, the CLI terminates the codemod process tree and exits with a timeout
+error instead of leaving jscodeshift workers running in the background.
+
 ### Examples
 
 ```sh

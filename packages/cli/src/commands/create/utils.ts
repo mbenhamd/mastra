@@ -12,18 +12,7 @@ import type { LLMProvider } from '../init/utils.js';
 import { getPackageManager, isGitInitialized } from '../utils.js';
 
 function getInitArgs(pm: PackageManager): string[] {
-  switch (pm) {
-    case 'npm':
-      return ['init', '-y'];
-    case 'pnpm':
-      return ['init'];
-    case 'yarn':
-      return ['init', '-y'];
-    case 'bun':
-      return ['init', '-y'];
-    default:
-      return ['init', '-y'];
-  }
+  return pm === 'pnpm' ? ['init'] : ['init', '-y'];
 }
 
 async function initializePackageJson(pm: PackageManager, timeout?: number): Promise<void> {

@@ -61,7 +61,7 @@ export class DepsService {
     // Keep package specs as discrete arguments so neither a shell nor the
     // package manager can reinterpret them as command-line options.
     if (options.dev) {
-      installArgs.push('-D');
+      installArgs.push(pm === 'bun' ? '-d' : '-D');
     }
 
     return execa(pm, [...installArgs, ...packages], {
