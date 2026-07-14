@@ -2583,8 +2583,8 @@ export class WorkflowEventProcessor extends EventProcessor {
    * - `ok: false, retry: true` — transient failure, the transport should
    *   nack/redeliver (or, for HTTP push, return 5xx so the broker retries).
    * - `ok: false, retry: false` — terminal/poison failure, the transport
-  *   should drop the event (or return 4xx for HTTP push).
-  */
+   *   should drop the event (or return 4xx for HTTP push).
+   */
   async handle(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
     const data = event.data as { workflowId?: unknown; runId?: unknown } | undefined;
     const workflowId = typeof data?.workflowId === 'string' ? data.workflowId : undefined;
