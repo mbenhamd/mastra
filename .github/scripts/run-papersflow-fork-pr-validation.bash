@@ -2,6 +2,202 @@
 
 set -euo pipefail
 
+run_validator_self_tests() {
+  local validator_path
+  local test_root
+  local fixture_repo
+  local mock_bin
+  local command_log
+  local base_sha
+  local head_sha
+  local output
+  local status
+
+  validator_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  validator_self_test_root="$test_root"
+  trap 'rm -rf -- "${validator_self_test_root:?}"' EXIT
+  fixture_repo="$test_root/repo"
+  mock_bin="$test_root/bin"
+  command_log="$test_root/pnpm.log"
+  mkdir -p \
+    "$fixture_repo/client-sdks/client-js/src" \
+    "$fixture_repo/packages/cli/src/commands/api" \
+    "$fixture_repo/packages/server/src/server/handlers" \
+    "$fixture_repo/packages/server/src/server/server-adapter/routes" \
+    "$mock_bin"
+
+  # The single-quoted lines are intentionally emitted into the mock pnpm
+  # executable and expand only when that fixture command runs.
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' > "$mock_bin/pnpm"
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    'printf '\''%s\n'\'' "$*" >> "${MOCK_PNPM_LOG:?}"' \
+    'if [[ " $* " == *" check:permissions "* && "${MOCK_FAIL_PERMISSIONS:-0}" == 1 ]]; then exit 17; fi' \
+    'if [[ " $* " == *" generate:route-types "* && "${MOCK_STALE_ROUTE_TYPES:-0}" == 1 ]]; then' \
+    '  printf '\''%s\n'\'' "// regenerated" >> client-sdks/client-js/src/route-types.generated.ts' \
+    'fi' \
+    'if [[ " $* " == *" generate:api-cli-route-metadata "* && "${MOCK_STALE_CLI_METADATA:-0}" == 1 ]]; then' \
+    '  printf '\''%s\n'\'' "// regenerated" >> packages/cli/src/commands/api/route-metadata.generated.ts' \
+    'fi' \
+    'for argument in "$@"; do' \
+    '  case "$argument" in' \
+    '    --outputFile.json=*) printf '\''%s\n'\'' '\''{"numPassedTests":1}'\'' > "${argument#*=}" ;;' \
+    '  esac' \
+    'done' \
+    >> "$mock_bin/pnpm"
+  chmod +x "$mock_bin/pnpm"
+
+  (
+    cd "$fixture_repo"
+    git init -q -b main
+    git config user.email validator@example.test
+    git config user.name 'Fork validator fixture'
+    printf '%s\n' '{}' > package.json
+    printf '%s\n' '{}' > packages/server/package.json
+    printf '%s\n' 'export default {};' > packages/server/vitest.config.ts
+    printf '%s\n' "export const route = 'base';" > packages/server/src/server/server-adapter/routes/index.ts
+    printf '%s\n' "export const routeTypes = 'base';" > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' "export const routeMetadata = 'base';" > packages/cli/src/commands/api/route-metadata.generated.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('favorites', () => {});" \
+      > packages/server/src/server/handlers/favorites.integration.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('external', () => {});" \
+      > packages/server/src/server/handlers/external.integration.test.ts
+    git add .
+    git commit -q -m base
+  )
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  run_fixture() {
+    local fixture_head="$1"
+    local fixture_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env \
+        PATH="$mock_bin:$PATH" \
+        MOCK_PNPM_LOG="$command_log" \
+        BASE_SHA="$base_sha" \
+        HEAD_SHA="$fixture_head" \
+        "$@" \
+        bash "$validator_path"
+    ) > "$fixture_output" 2>&1
+  }
+
+  assert_contains() {
+    local expected="$1"
+    local file="$2"
+    if ! grep -Fq -- "$expected" "$file"; then
+      echo "Expected fixture output to contain: $expected" >&2
+      cat "$file" >&2
+      exit 1
+    fi
+  }
+
+  head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' "export const route = 'head';" > packages/server/src/server/server-adapter/routes/index.ts
+    printf '%s\n' "export const routeTypes = 'head';" > client-sdks/client-js/src/route-types.generated.ts
+    printf '%s\n' "export const routeMetadata = 'head';" > packages/cli/src/commands/api/route-metadata.generated.ts
+    git add .
+    git commit -q -m 'server route change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/server-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains '--filter @mastra/server check:permissions' "$command_log"
+  assert_contains '--filter @mastra/server generate:route-types' "$command_log"
+  assert_contains '--filter @mastra/server generate:api-cli-route-metadata' "$command_log"
+
+  : > "$command_log"
+  output="$test_root/permission-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_FAIL_PERMISSIONS=1
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Permission freshness fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '--filter @mastra/server check:permissions' "$command_log"
+
+  : > "$command_log"
+  output="$test_root/generated-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_STALE_ROUTE_TYPES=1
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Stale generated route artifact fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Generated Server route artifacts are stale or missing from the pull request.' "$output"
+
+  git -C "$fixture_repo" reset -q --hard "$head_sha"
+  : > "$command_log"
+  output="$test_root/cli-generated-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" MOCK_STALE_CLI_METADATA=1
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Stale generated CLI route metadata fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Generated Server route artifacts are stale or missing from the pull request.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('favorites update', () => {});" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'favorites integration change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/favorites-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains \
+    'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' \
+    "$output"
+  assert_contains 'src/server/handlers/favorites.integration.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('external update', () => {});" \
+      >> packages/server/src/server/handlers/external.integration.test.ts
+    git add .
+    git commit -q -m 'unsupported integration change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/integration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Non-allowlisted integration fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/server/src/server/handlers/external.integration.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+
+  echo 'PapersFlow fork validator fixtures passed.'
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  run_validator_self_tests
+  exit 0
+fi
+
 : "${BASE_SHA:?BASE_SHA is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 
@@ -52,7 +248,23 @@ git diff --name-only --diff-filter=ACMRTD "${BASE_SHA}...${HEAD_SHA}" | sort > "
 echo "Changed files:"
 cat "$changed_files"
 
+is_server_generated_artifact() {
+  case "$1" in
+    client-sdks/client-js/src/route-types.generated.ts | \
+      packages/cli/src/commands/api/route-metadata.generated.ts) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 while IFS= read -r file; do
+  if is_server_generated_artifact "$file"; then
+    # These exact generated consumers are owned by SERVER_ROUTES. Route changes
+    # must be able to commit their regenerated output without granting general
+    # fork-validation coverage to the Client SDK or CLI workspaces.
+    printf '%s\n' "packages/server" >> "$workspace_candidates"
+    continue
+  fi
+
   workspace_found=false
   search_dir="$(dirname "$file")"
   while [[ "$search_dir" != "." && "$search_dir" != "/" ]]; do
@@ -173,6 +385,19 @@ if workspace_changed packages/server; then
   run_with_validation_budget 900 pnpm build:server
   run_with_validation_budget 600 pnpm --filter @mastra/server lint
   run_with_validation_budget 600 pnpm --filter @mastra/server check:core-imports
+  run_with_validation_budget 300 pnpm --filter @mastra/server check:permissions
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:route-types
+  run_with_validation_budget 300 pnpm --filter @mastra/server generate:api-cli-route-metadata
+  if ! git diff --exit-code -- \
+    client-sdks/client-js/src/route-types.generated.ts \
+    packages/cli/src/commands/api/route-metadata.generated.ts || \
+    ! git ls-files --error-unmatch -- \
+      client-sdks/client-js/src/route-types.generated.ts \
+      packages/cli/src/commands/api/route-metadata.generated.ts >/dev/null; then
+    echo "Generated Server route artifacts are stale or missing from the pull request." >&2
+    echo "Run both @mastra/server route generators and commit their output." >&2
+    exit 1
+  fi
 fi
 
 if workspace_changed client-sdks/ai-sdk; then
@@ -213,6 +438,11 @@ if (( ${#detected_tests[@]} > 0 )); then
       # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
       # language model and InMemoryStore and requires no provider credentials or
       # external service beyond the standard Core test environment.
+      printf '%s\n' "$file" >> "$changed_tests"
+    elif [[ "$file" == packages/server/src/server/handlers/favorites.integration.test.ts ]]; then
+      # This exact cross-layer Server suite is deterministic and fork-safe: it
+      # exercises real route handlers against InMemoryStore without credentials,
+      # provider calls, containers, or other external infrastructure.
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
       "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$ ]] || \

@@ -39,7 +39,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   unrelated package failures in Deployer's broad Turbo dependency closure. MCP
   runs its package typecheck, build, lint, and changed-test coverage. Nested
   fixture manifests are not treated as workspace boundaries. Server changes run
-  the package build, lint, Core-import boundary check, and changed-test coverage.
+  the package build, lint, Core-import boundary check, permission freshness
+  check, both `SERVER_ROUTES` generators, and changed-test coverage. The
+  generated Client SDK route types and CLI API metadata are mapped narrowly to
+  the Server validation lane; after regeneration, the validator fails unless
+  both exact artifacts are tracked and unchanged from the PR head. This allows
+  route PRs to commit canonical generated output without granting general
+  validation coverage to the Client SDK or CLI workspaces.
   The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
@@ -49,7 +55,10 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
   The deterministic, in-process Core Harness real-agent E2E suite is explicitly
   allowlisted and runs through Vitest because it uses a mock language model and
-  `InMemoryStore`. Other Playwright files, `e2e-tests/**`, nested
+  `InMemoryStore`. The exact Server favorites integration suite is also
+  allowlisted because it exercises route handlers exclusively against
+  `InMemoryStore`; other integration-named Server tests remain fail-closed.
+  Other Playwright files, `e2e-tests/**`, nested
   integration-test packages, integration-test filename variants, explicit
   provider E2E files, and PostgreSQL pooler/performance suites fail closed until
   a dedicated fork-safe workflow provides their required setup.
@@ -69,6 +78,18 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   when they check out trusted default-branch automation rather than PR code.
 - Starsling remains available only to same-repository branches in the canonical
   repository; external pull-request heads use GitHub-hosted runners there too.
+
+Run the validator's focused policy fixtures locally after changing its routing
+or command plan:
+
+```bash
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test
+```
+
+The fixtures use an isolated temporary Git repository and mocked package
+commands. They prove Server permission and route-generation selection, reject
+stale generated output, run the exact fork-safe favorites integration test, and
+keep other integration-named tests fail-closed.
 
 Do not register a self-hosted runner for public PR code. Keep canonical
 release, secret, cloud, and scheduled workflows gated to `mastra-ai/mastra`
