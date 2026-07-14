@@ -157,3 +157,9 @@ const snapshot = await workflowsStorage.loadWorkflowSnapshot({
   runId: 'run-123',
 });
 ```
+
+## Durable workflow terminalization
+
+Workflow runtimes that consume terminal events from a replayable broker need storage coordination beyond the replaceable workflow snapshot. The terminalization journal and producer outbox provide that coordination for adapters that advertise the corresponding protocol versions.
+
+See [workflow-terminalization.md](./workflow-terminalization.md) for the capability contract, phase ownership, security boundary, and adapter test requirements.
