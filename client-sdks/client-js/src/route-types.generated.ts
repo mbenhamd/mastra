@@ -5763,14 +5763,14 @@ export type PostAgentsAgentIdSendMessage_PathParams = {
   agentId: string;
 };
 
-type PostAgentsAgentIdSendMessage_Body_Auxiliary_7 =
+type PostAgentsAgentIdSendMessage_Body_Auxiliary_3 =
   | string
   | number
   | boolean
   | null
-  | PostAgentsAgentIdSendMessage_Body_Auxiliary_7[]
+  | PostAgentsAgentIdSendMessage_Body_Auxiliary_3[]
   | {
-      [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_7;
+      [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
     };
 
 export type PostAgentsAgentIdSendMessage_Body =
@@ -5792,30 +5792,60 @@ export type PostAgentsAgentIdSendMessage_Body =
       message:
         | (
             | string
-            | {
-                role: string;
-                [x: string]: unknown;
-              }
             | (
-                | string
                 | {
-                    role: string;
-                    [x: string]: unknown;
+                    type: 'text';
+                    text: string;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
+                  }
+                | {
+                    type: 'file';
+                    data: string;
+                    mediaType: string;
+                    filename?: string | undefined;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
                   }
               )[]
           )
         | {
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
             attributes?:
@@ -5825,13 +5855,13 @@ export type PostAgentsAgentIdSendMessage_Body =
               | undefined;
             metadata?:
               | {
-                  [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_7;
+                  [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
                 }
               | undefined;
             providerOptions?:
               | {
                   [key: string]: {
-                    [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_7;
+                    [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
                   };
                 }
               | undefined;
@@ -6010,30 +6040,60 @@ export type PostAgentsAgentIdSendMessage_Body =
       message:
         | (
             | string
-            | {
-                role: string;
-                [x: string]: unknown;
-              }
             | (
-                | string
                 | {
-                    role: string;
-                    [x: string]: unknown;
+                    type: 'text';
+                    text: string;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
+                  }
+                | {
+                    type: 'file';
+                    data: string;
+                    mediaType: string;
+                    filename?: string | undefined;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
                   }
               )[]
           )
         | {
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
             attributes?:
@@ -6043,13 +6103,13 @@ export type PostAgentsAgentIdSendMessage_Body =
               | undefined;
             metadata?:
               | {
-                  [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_7;
+                  [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
                 }
               | undefined;
             providerOptions?:
               | {
                   [key: string]: {
-                    [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_7;
+                    [key: string]: PostAgentsAgentIdSendMessage_Body_Auxiliary_3;
                   };
                 }
               | undefined;
@@ -6089,14 +6149,14 @@ export type PostAgentsAgentIdQueueMessage_PathParams = {
   agentId: string;
 };
 
-type PostAgentsAgentIdQueueMessage_Body_Auxiliary_7 =
+type PostAgentsAgentIdQueueMessage_Body_Auxiliary_3 =
   | string
   | number
   | boolean
   | null
-  | PostAgentsAgentIdQueueMessage_Body_Auxiliary_7[]
+  | PostAgentsAgentIdQueueMessage_Body_Auxiliary_3[]
   | {
-      [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_7;
+      [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
     };
 
 export type PostAgentsAgentIdQueueMessage_Body =
@@ -6118,30 +6178,60 @@ export type PostAgentsAgentIdQueueMessage_Body =
       message:
         | (
             | string
-            | {
-                role: string;
-                [x: string]: unknown;
-              }
             | (
-                | string
                 | {
-                    role: string;
-                    [x: string]: unknown;
+                    type: 'text';
+                    text: string;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
+                  }
+                | {
+                    type: 'file';
+                    data: string;
+                    mediaType: string;
+                    filename?: string | undefined;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
                   }
               )[]
           )
         | {
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
             attributes?:
@@ -6151,13 +6241,13 @@ export type PostAgentsAgentIdQueueMessage_Body =
               | undefined;
             metadata?:
               | {
-                  [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_7;
+                  [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
                 }
               | undefined;
             providerOptions?:
               | {
                   [key: string]: {
-                    [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_7;
+                    [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
                   };
                 }
               | undefined;
@@ -6336,30 +6426,60 @@ export type PostAgentsAgentIdQueueMessage_Body =
       message:
         | (
             | string
-            | {
-                role: string;
-                [x: string]: unknown;
-              }
             | (
-                | string
                 | {
-                    role: string;
-                    [x: string]: unknown;
+                    type: 'text';
+                    text: string;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
+                  }
+                | {
+                    type: 'file';
+                    data: string;
+                    mediaType: string;
+                    filename?: string | undefined;
+                    providerOptions?:
+                      | {
+                          [key: string]: {
+                            [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                          };
+                        }
+                      | undefined;
                   }
               )[]
           )
         | {
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
             attributes?:
@@ -6369,13 +6489,13 @@ export type PostAgentsAgentIdQueueMessage_Body =
               | undefined;
             metadata?:
               | {
-                  [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_7;
+                  [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
                 }
               | undefined;
             providerOptions?:
               | {
                   [key: string]: {
-                    [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_7;
+                    [key: string]: PostAgentsAgentIdQueueMessage_Body_Auxiliary_3;
                   };
                 }
               | undefined;
@@ -6455,20 +6575,43 @@ export type PostAgentsAgentIdSignals_Body =
                   [key: string]: string | number | boolean | null | undefined;
                 }
               | undefined;
-            type: 'user-message';
+            type: 'user' | 'user-message';
+            tagName?: string | undefined;
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
+            providerOptions?:
+              | {
+                  [key: string]: {
+                    [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                  };
+                }
+              | undefined;
           }
         | {
             id?: string | undefined;
@@ -6483,8 +6626,16 @@ export type PostAgentsAgentIdSignals_Body =
                   [key: string]: string | number | boolean | null | undefined;
                 }
               | undefined;
-            type: string;
+            type: 'state' | 'reactive' | 'notification' | 'system-reminder';
+            tagName?: string | undefined;
             contents: string;
+            providerOptions?:
+              | {
+                  [key: string]: {
+                    [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                  };
+                }
+              | undefined;
           };
     }
   | {
@@ -6671,20 +6822,43 @@ export type PostAgentsAgentIdSignals_Body =
                   [key: string]: string | number | boolean | null | undefined;
                 }
               | undefined;
-            type: 'user-message';
+            type: 'user' | 'user-message';
+            tagName?: string | undefined;
             contents:
               | string
-              | {
-                  role: string;
-                  [x: string]: unknown;
-                }
               | (
-                  | string
                   | {
-                      role: string;
-                      [x: string]: unknown;
+                      type: 'text';
+                      text: string;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
+                    }
+                  | {
+                      type: 'file';
+                      data: string;
+                      mediaType: string;
+                      filename?: string | undefined;
+                      providerOptions?:
+                        | {
+                            [key: string]: {
+                              [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                            };
+                          }
+                        | undefined;
                     }
                 )[];
+            providerOptions?:
+              | {
+                  [key: string]: {
+                    [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                  };
+                }
+              | undefined;
           }
         | {
             id?: string | undefined;
@@ -6699,8 +6873,16 @@ export type PostAgentsAgentIdSignals_Body =
                   [key: string]: string | number | boolean | null | undefined;
                 }
               | undefined;
-            type: string;
+            type: 'state' | 'reactive' | 'notification' | 'system-reminder';
+            tagName?: string | undefined;
             contents: string;
+            providerOptions?:
+              | {
+                  [key: string]: {
+                    [key: string]: PostAgentsAgentIdSignals_Body_Auxiliary_3;
+                  };
+                }
+              | undefined;
           };
     };
 
@@ -21777,6 +21959,25 @@ export type PostHarnessNameSessions_Response = {
               startedAt: number;
             };
           };
+          assistantDrafts: {
+            [key: string]: {
+              runId: string;
+              sessionId: string;
+              resourceId: string;
+              threadId: string;
+              signalId?: string | undefined;
+              queuedItemId?: string | undefined;
+              messageId?: string | undefined;
+              text: string;
+              reasoningText?: string | undefined;
+              status: 'streaming' | 'interrupted' | 'completed' | 'failed';
+              startedAt: number;
+              updatedAt: number;
+              terminalAt?: number | undefined;
+              finishReason?: ('complete' | 'aborted' | 'error') | undefined;
+              truncated?: boolean | undefined;
+            };
+          };
           tokenUsage: {
             promptTokens: number;
             completionTokens: number;
@@ -21980,6 +22181,25 @@ export type GetHarnessNameSessionsSessionId_Response = {
             task: string;
             parentToolCallId: string;
             startedAt: number;
+          };
+        };
+        assistantDrafts: {
+          [key: string]: {
+            runId: string;
+            sessionId: string;
+            resourceId: string;
+            threadId: string;
+            signalId?: string | undefined;
+            queuedItemId?: string | undefined;
+            messageId?: string | undefined;
+            text: string;
+            reasoningText?: string | undefined;
+            status: 'streaming' | 'interrupted' | 'completed' | 'failed';
+            startedAt: number;
+            updatedAt: number;
+            terminalAt?: number | undefined;
+            finishReason?: ('complete' | 'aborted' | 'error') | undefined;
+            truncated?: boolean | undefined;
           };
         };
         tokenUsage: {
