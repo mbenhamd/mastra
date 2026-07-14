@@ -32,7 +32,12 @@ describe('Processor-returned tools receive requestContext', () => {
             callCount === 1
               ? [
                   { type: 'stream-start', warnings: [] },
-                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'response-metadata',
+                    id: 'id-0',
+                    modelId: '__GATEWAY_OPENAI_MODEL__',
+                    timestamp: new Date(0),
+                  },
                   {
                     type: 'tool-call',
                     toolCallId: 'call-1',
@@ -47,7 +52,12 @@ describe('Processor-returned tools receive requestContext', () => {
                 ]
               : [
                   { type: 'stream-start', warnings: [] },
-                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'response-metadata',
+                    id: 'id-1',
+                    modelId: '__GATEWAY_OPENAI_MODEL__',
+                    timestamp: new Date(0),
+                  },
                   { type: 'text-start', id: 'text-1' },
                   { type: 'text-delta', id: 'text-1', delta: 'Done.' },
                   { type: 'text-end', id: 'text-1' },
@@ -433,10 +443,7 @@ describe('Processor-returned tools receive requestContext', () => {
     const toolAuthorizations = fgaProvider.require.mock.calls
       .map(([, authorization]) => authorization.resource)
       .filter(resource => resource.type === 'tool');
-    expect(toolAuthorizations).toEqual([
-      { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
-      { type: 'tool', id: 'processor-fga-agent:authorized-context-tool' },
-    ]);
+    expect(toolAuthorizations).toEqual([{ type: 'tool', id: 'processor-fga-agent:authorized-context-tool' }]);
   });
 
   it('keeps optional context absent for processor-added tools', async () => {

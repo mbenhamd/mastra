@@ -2,6 +2,7 @@ import { anthropic } from '@ai-sdk/anthropic-v5';
 import { openai } from '@ai-sdk/openai-v6';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { getBuiltToolFGAResourceId } from '../../auth/ee/fga-check';
 import { SpanType } from '../../observability';
 import type { AnySpan } from '../../observability';
 import { RequestContext } from '../../request-context';
@@ -39,7 +40,8 @@ describe('CoreToolBuilder FGA', () => {
     });
 
     const builtTool = builder.build();
-    expect(builtTool._mastraFgaResourceId).toBe('search');
+    expect(getBuiltToolFGAResourceId(builtTool)).toBe('search');
+    expect(builtTool).not.toHaveProperty('_mastraFgaResourceId');
     await expect(builtTool.execute!({ query: 'docs' }, { toolCallId: 'call-1', messages: [] })).resolves.toEqual({
       result: 'ok',
     });
@@ -90,7 +92,8 @@ describe('CoreToolBuilder FGA', () => {
     });
 
     const builtTool = builder.build();
-    expect(builtTool._mastraFgaResourceId).toBe('agent-1:search');
+    expect(getBuiltToolFGAResourceId(builtTool)).toBe('agent-1:search');
+    expect(builtTool).not.toHaveProperty('_mastraFgaResourceId');
     await builtTool.execute!({ query: 'docs' }, { toolCallId: 'call-1', messages: [] });
 
     expect(fgaProvider.require).toHaveBeenCalledWith(user, {
@@ -110,6 +113,25 @@ describe('CoreToolBuilder FGA', () => {
       }),
     });
     expect(execute).toHaveBeenCalled();
+  });
+
+  it('binds provenance to the final buildV5 object and not to arbitrary clones', () => {
+    const testTool = createTool({
+      id: 'search',
+      description: 'Search',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async () => ({ result: 'ok' }),
+    });
+    const builder = new CoreToolBuilder({
+      originalTool: testTool,
+      options: { name: 'search', agentId: 'agent-1' },
+    });
+
+    const builtTool = builder.buildV5();
+
+    expect(getBuiltToolFGAResourceId(builtTool)).toBe('agent-1:search');
+    expect(builtTool).not.toHaveProperty('_mastraFgaResourceId');
+    expect(getBuiltToolFGAResourceId({ ...builtTool })).toBeUndefined();
   });
 
   it('fails closed when FGA is configured and a tool executes without a user', async () => {
@@ -240,7 +262,8 @@ describe('MCP Tool Tracing', () => {
     });
 
     const builtTool = builder.build();
-    expect(builtTool._mastraFgaResourceId).toBe('["filesystem-server","mcp-server_list-files"]');
+    expect(getBuiltToolFGAResourceId(builtTool)).toBe('["filesystem-server","mcp-server_list-files"]');
+    expect(builtTool).not.toHaveProperty('_mastraFgaResourceId');
     await builtTool.execute!({ path: '/tmp' }, { toolCallId: 'test-call-id', messages: [] });
 
     expect(mockAgentSpan.createChildSpan).toHaveBeenCalledWith(
@@ -511,6 +534,30 @@ describe('MCP Tool Tracing', () => {
 });
 
 describe('Provider-defined Tool Handling', () => {
+  it('binds the selected identity to build and buildV5 provider-tool objects', () => {
+    const providerTool = {
+      type: 'provider-defined' as const,
+      id: 'provider.search' as const,
+      description: 'Provider search',
+      inputSchema: z.object({ query: z.string() }),
+      execute: vi.fn().mockResolvedValue({ result: 'ok' }),
+    };
+    const createBuilder = () =>
+      new CoreToolBuilder({
+        originalTool: providerTool as any,
+        options: { name: 'search', agentId: 'agent-1' },
+      });
+
+    const builtTool = createBuilder().build();
+    const builtV5Tool = createBuilder().buildV5();
+
+    expect(builtTool.execute).toEqual(expect.any(Function));
+    expect(getBuiltToolFGAResourceId(builtTool)).toBe('agent-1:search');
+    expect(getBuiltToolFGAResourceId(builtV5Tool)).toBe('agent-1:search');
+    expect(builtTool).not.toHaveProperty('_mastraFgaResourceId');
+    expect(builtV5Tool).not.toHaveProperty('_mastraFgaResourceId');
+  });
+
   it('should not crash when autoResumeSuspendedTools is enabled with openai.tools.webSearch()', () => {
     const webSearchTool = openai.tools.webSearch({});
 
@@ -650,10 +697,9 @@ describe('CoreToolBuilder background task schema injection', () => {
 });
 
 describe('CoreToolBuilder requestContext merge', () => {
-  it('preserves non-serializable closure requestContext values when exec RC is also present', async () => {
-    // Simulates what happens when the evented workflow engine deserialises requestContext:
-    // the 'harness' key (containing functions) is lost because JSON.stringify drops functions
-    // and may throw on objects with circular references.
+  it('preserves live infrastructure values while execution application keys override', async () => {
+    // Simulate an evented workflow wire round trip: the harness slot survives,
+    // but JSON serialization strips its live callbacks.
     const harnessCtx = {
       harnessId: 'h-1',
       getState: () => ({ tasks: [] }),
@@ -665,10 +711,12 @@ describe('CoreToolBuilder requestContext merge', () => {
     closureRC.set('harness', harnessCtx);
     closureRC.set('serializable-key', 'from-closure');
 
-    // The evented engine's RC — reconstructed from toJSON(), missing 'harness'
-    const execRC = new RequestContext();
+    const wireProjection = JSON.parse(JSON.stringify(closureRC.toJSON())) as Record<string, unknown>;
+    const execRC = new RequestContext(Object.entries(wireProjection));
     execRC.set('serializable-key', 'from-exec');
     execRC.set('workflow-only-key', 42);
+    expect((execRC.get('harness') as any).harnessId).toBe('h-1');
+    expect((execRC.get('harness') as any).updateState).toBeUndefined();
 
     const receivedCtx: { requestContext?: RequestContext } = {};
     const execute = vi.fn().mockImplementation((_args: unknown, ctx: any) => {
@@ -696,13 +744,41 @@ describe('CoreToolBuilder requestContext merge', () => {
     await builtTool.execute!({ tasks: ['a'] }, { toolCallId: 'call-1', messages: [], requestContext: execRC });
 
     const merged = receivedCtx.requestContext!;
-    // Non-serializable key from closure is preserved
+    // Live infrastructure value from the closure is preserved.
     expect(merged.get('harness')).toBe(harnessCtx);
     expect((merged.get('harness') as any).updateState).toBe(harnessCtx.updateState);
-    // Closure value wins for shared keys
-    expect(merged.get('serializable-key')).toBe('from-closure');
+    // Execution-time values retain the documented per-call precedence.
+    expect(merged.get('serializable-key')).toBe('from-exec');
     // Exec-only key is preserved
     expect(merged.get('workflow-only-key')).toBe(42);
+  });
+
+  it('accepts an execution-time infrastructure value when the build context has no owner', async () => {
+    const closureRC = new RequestContext();
+    closureRC.set('tenantId', 'build-tenant');
+    const execRC = new RequestContext();
+    const user = { id: 'exec-user' };
+    execRC.set('user', user);
+
+    let receivedRequestContext: RequestContext | undefined;
+    const testTool = createTool({
+      id: 'read-user',
+      description: 'Read user',
+      inputSchema: z.object({}),
+      execute: async (_args, context) => {
+        receivedRequestContext = context.requestContext;
+        return { result: 'ok' };
+      },
+    });
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool,
+      options: { name: 'read-user', requestContext: closureRC },
+    }).build();
+
+    await builtTool.execute!({}, { toolCallId: 'call-1', messages: [], requestContext: execRC });
+
+    expect(receivedRequestContext?.get('user')).toBe(user);
+    expect(receivedRequestContext?.get('tenantId')).toBe('build-tenant');
   });
 
   it('falls back to closure RC when exec RC is empty', async () => {

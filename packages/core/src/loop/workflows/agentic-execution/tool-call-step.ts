@@ -109,6 +109,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   logger,
   agentId,
   mastra,
+  actor,
 }: OuterLLMRun<Tools, OUTPUT>) {
   return createStep({
     id: 'toolCallStep',
@@ -931,6 +932,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           workspace: _internal?.stepWorkspace,
           // Forward requestContext so tools receive values set by the workflow step
           requestContext: toolRequestContext,
+          actor,
           // Let tools that read thread history mid-stream (e.g. forked subagents
           // cloning the parent thread) drain the save queue so the store reflects
           // the latest user/assistant messages before they read.
@@ -1149,24 +1151,26 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const toolFgaProvider = mastra?.getServer?.()?.fga;
         if (toolFgaProvider) {
           const fgaUser = requestContext?.get('user');
-          const { checkFGA, FGADeniedError, getStandaloneToolFGAResourceId } =
+          const { builtToolEnforcesFGAProvider, checkFGA, getBuiltToolFGAResourceId, getStandaloneToolFGAResourceId } =
             await import('../../../auth/ee/fga-check');
-          const builtResourceId = (tool as { _mastraFgaResourceId?: unknown })._mastraFgaResourceId;
-          const toolResourceId =
-            typeof builtResourceId === 'string' ? builtResourceId : getStandaloneToolFGAResourceId(inputData.toolName);
-          if (!fgaUser) {
-            throw new FGADeniedError(
-              { id: 'unknown' },
-              { type: 'tool', id: toolResourceId },
-              MastraFGAPermissions.TOOLS_EXECUTE,
-            );
+          const builtResourceId = getBuiltToolFGAResourceId(tool);
+          // CoreToolBuilder owns the check only when it will use this exact
+          // provider. Converted tools without a builder provider (for example,
+          // browser tools) retain their canonical identity but are authorized
+          // here; raw tools fail closed to the standalone identity.
+          if (!builtToolEnforcesFGAProvider(tool, toolFgaProvider)) {
+            await checkFGA({
+              fgaProvider: toolFgaProvider,
+              user: fgaUser,
+              resource: {
+                type: 'tool',
+                id: builtResourceId ?? getStandaloneToolFGAResourceId(inputData.toolName),
+              },
+              permission: MastraFGAPermissions.TOOLS_EXECUTE,
+              actor,
+              requestContext: toolRequestContext,
+            });
           }
-          await checkFGA({
-            fgaProvider: toolFgaProvider,
-            user: fgaUser,
-            resource: { type: 'tool', id: toolResourceId },
-            permission: MastraFGAPermissions.TOOLS_EXECUTE,
-          });
         }
 
         const llmBgOverrides =

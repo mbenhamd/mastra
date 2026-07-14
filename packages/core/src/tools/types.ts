@@ -12,6 +12,7 @@ import type { ElicitRequest, ElicitResult } from '@modelcontextprotocol/sdk/type
 
 import type { MastraPrimitives, MastraUnion } from '../action';
 export type { MastraPrimitives, MastraUnion };
+import type { ActorSignal } from '../auth/ee';
 import type { ToolBackgroundConfig } from '../background-tasks';
 import type { MastraBrowser } from '../browser/browser';
 import type { Mastra } from '../mastra';
@@ -228,11 +229,14 @@ export type MastraToolInvocationOptions = ToolInvocationOptions &
      */
     workspace?: Workspace;
     /**
-     * Request context for tool execution. When provided at execution time, this overrides
-     * any requestContext configured at tool build time. Allows workflow steps to forward
-     * their requestContext (e.g., authenticated API clients, feature flags) to tools.
+     * Request context for tool execution. Execution-time application keys override
+     * build-time values, while existing infrastructure-owned build values remain
+     * authoritative. Infrastructure keys absent at build time can still be supplied
+     * by the execution context.
      */
     requestContext?: RequestContext;
+    /** Trusted server-side actor used by native FGA checks for this invocation. */
+    actor?: ActorSignal;
     /**
      * Flushes the parent stream's pending messages to persistent storage.
      *
@@ -350,8 +354,6 @@ export interface MCPToolProperties {
  * - Supports FlexibleSchema | Schema for broader AI SDK compatibility
  */
 export type CoreTool = {
-  /** Internal FGA identity chosen when this tool is converted for execution. */
-  _mastraFgaResourceId?: string;
   description?: string;
   parameters: FlexibleSchema<any> | Schema;
   outputSchema?: FlexibleSchema<any> | Schema;
@@ -410,8 +412,6 @@ export type CoreTool = {
  * The only difference: parameters must be Schema (not FlexibleSchema | Schema)
  */
 export type InternalCoreTool = {
-  /** Internal FGA identity chosen when this tool is converted for execution. */
-  _mastraFgaResourceId?: string;
   description?: string;
   parameters: Schema;
   outputSchema?: Schema;

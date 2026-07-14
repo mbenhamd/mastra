@@ -19,7 +19,7 @@ import {
   getStandaloneToolFGAResourceId,
   MastraFGAPermissions,
 } from '../../auth/ee';
-import type { ActorSignal } from '../../auth/ee';
+import { bindBuiltToolFGAResourceId } from '../../auth/ee/fga-check';
 import { backgroundOverrideJsonSchema, backgroundOverrideZodSchema } from '../../background-tasks';
 import { MastraBase } from '../../base';
 import { ErrorCategory, MastraError, ErrorDomain } from '../../error';
@@ -27,7 +27,7 @@ import type { Mastra } from '../../mastra';
 import { SpanType, wrapMastra, EntityType, getOrCreateSpan, createObservabilityContext } from '../../observability';
 import type { AnySpan } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
-import { RequestContext } from '../../request-context';
+import { isInfrastructureRequestContextKey, RequestContext } from '../../request-context';
 import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { StandardSchemaWithJSON } from '../../schema';
 import { getNeedsApprovalFn, isVercelTool, isProviderDefinedTool } from '../../tools/toolchecks';
@@ -209,6 +209,14 @@ export class CoreToolBuilder extends MastraBase {
   private originalTool: ToolToConvert;
   private options: ToolOptions;
   private logType?: LogType;
+
+  private bindFGAResourceId<T extends object>(tool: T): T {
+    return bindBuiltToolFGAResourceId(
+      tool,
+      resolveToolFGAResourceId(this.originalTool, this.options),
+      () => (this.options.mastra as any)?.getServer?.()?.fga,
+    );
+  }
 
   constructor(input: {
     originalTool: ToolToConvert;
@@ -466,7 +474,7 @@ export class CoreToolBuilder extends MastraBase {
         }
       }
 
-      return {
+      const providerTool = {
         ...(processedOutputSchema ? { outputSchema: processedOutputSchema } : {}),
         type: 'provider-defined' as const,
         id: tool.id as `${string}.${string}`,
@@ -488,7 +496,8 @@ export class CoreToolBuilder extends MastraBase {
         toModelOutput: 'toModelOutput' in this.originalTool ? this.originalTool.toModelOutput : undefined,
         transform: 'transform' in this.originalTool ? this.originalTool.transform : undefined,
         inputExamples: 'inputExamples' in this.originalTool ? this.originalTool.inputExamples : undefined,
-      } as unknown as (CoreTool & { id: `${string}.${string}` }) | undefined;
+      } as unknown as CoreTool & { id: `${string}.${string}` };
+      return this.bindFGAResourceId(providerTool);
     }
 
     return undefined;
@@ -575,7 +584,7 @@ export class CoreToolBuilder extends MastraBase {
             memory: options.memory,
             runId: options.runId,
             requestContext: execOptions.requestContext ?? options.requestContext ?? new RequestContext(),
-            actor: (execOptions as MastraToolInvocationOptions & { actor?: ActorSignal }).actor,
+            actor: execOptions.actor,
             // Workspace for file operations and command execution
             // Execution-time workspace (from prepareStep/processInputStep) takes precedence over build-time workspace
             workspace: execOptions.workspace ?? options.workspace,
@@ -721,7 +730,7 @@ export class CoreToolBuilder extends MastraBase {
 
     return async (args: unknown, execOptions?: MastraToolInvocationOptions) => {
       let logger = options.logger || this.logger;
-      const actor = (execOptions as (MastraToolInvocationOptions & { actor?: ActorSignal }) | undefined)?.actor;
+      const actor = execOptions?.actor;
 
       // Create tool span early so validation failures are always observable.
       // Prefer execution-time tracingContext (passed at runtime for VNext methods)
@@ -731,8 +740,10 @@ export class CoreToolBuilder extends MastraBase {
       const toolRequestContext =
         executionRequestContext && options.requestContext && executionRequestContext !== options.requestContext
           ? new RequestContext<unknown>([
-              ...Array.from(executionRequestContext.entries() as IterableIterator<[string, unknown]>),
               ...Array.from(options.requestContext.entries() as IterableIterator<[string, unknown]>),
+              ...Array.from(executionRequestContext.entries() as IterableIterator<[string, unknown]>).filter(
+                ([key]) => !isInfrastructureRequestContextKey(key) || !options.requestContext?.has(key),
+              ),
             ])
           : (executionRequestContext ?? options.requestContext);
       const toolSpan = getOrCreateSpan({
@@ -863,16 +874,16 @@ export class CoreToolBuilder extends MastraBase {
         ('name' in builtTool && typeof builtTool.name === 'string' ? builtTool.name : null) ||
         builtTool.id.split('.')[1] ||
         builtTool.id;
-      return {
+      return this.bindFGAResourceId({
         ...rest,
         type: builtTool.type,
         id: builtTool.id,
         name,
         args: builtTool.args,
-      } as VercelToolV5;
+      } as VercelToolV5);
     }
 
-    return base as VercelToolV5;
+    return this.bindFGAResourceId(base as VercelToolV5);
   }
 
   build(): CoreTool {
@@ -1015,7 +1026,6 @@ export class CoreToolBuilder extends MastraBase {
     }
 
     const definition = {
-      _mastraFgaResourceId: resolveToolFGAResourceId(this.originalTool, this.options),
       type: 'function' as const,
       description: this.originalTool.description,
       requireApproval,
@@ -1030,7 +1040,7 @@ export class CoreToolBuilder extends MastraBase {
         : undefined,
     };
 
-    return {
+    return this.bindFGAResourceId({
       ...definition,
       id: 'id' in this.originalTool ? this.originalTool.id : undefined,
       parameters: processedInputSchema ?? z.object({}),
@@ -1048,6 +1058,6 @@ export class CoreToolBuilder extends MastraBase {
       // Preserve tool-level background config so the agentic loop can pick it up
       // from the converted CoreTool at dispatch time.
       backgroundConfig: this.options.backgroundConfig,
-    } as unknown as CoreTool;
+    } as unknown as CoreTool);
   }
 }
