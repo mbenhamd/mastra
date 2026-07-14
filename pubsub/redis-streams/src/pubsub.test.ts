@@ -21,17 +21,17 @@ function makeEvent(overrides: Partial<Omit<Event, 'id' | 'createdAt'>> = {}): Om
  * Throws if the timeout is hit.
  */
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   opts: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 5000;
   const intervalMs = opts.intervalMs ?? 25;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise(r => setTimeout(r, intervalMs));
   }
-  if (!predicate()) {
+  if (!(await predicate())) {
     throw new Error(`waitFor timed out after ${timeoutMs}ms`);
   }
 }
@@ -336,15 +336,22 @@ describe('RedisStreamsPubSub', () => {
       expect(types).not.toContain('event-1');
     });
 
-    it('XAUTOCLAIM reassigns idle pending messages to a sibling consumer', async () => {
-      const ps = new RedisStreamsPubSub({
+    it('XAUTOCLAIM advances the durable attempt before a sibling consumer receives it', async () => {
+      const consumerA = new RedisStreamsPubSub({
         url: REDIS_URL,
         blockMs: 200,
         // Aggressive reclaim settings so the test doesn't have to wait 30s.
         reclaimIntervalMs: 250,
         reclaimIdleMs: 500,
       });
-      pubsubs.push(ps);
+      const consumerB = new RedisStreamsPubSub({
+        url: REDIS_URL,
+        blockMs: 200,
+        reclaimIntervalMs: 250,
+        reclaimIdleMs: 500,
+      });
+      const settledGroupConsumer = new RedisStreamsPubSub({ url: REDIS_URL, blockMs: 200 });
+      pubsubs.push(consumerA, consumerB, settledGroupConsumer);
 
       const topic = `t-${randomUUID()}`;
       const groupName = `claim-${randomUUID()}`;
@@ -355,11 +362,27 @@ describe('RedisStreamsPubSub', () => {
         seenA.push(event);
         // intentionally never ack/nack
       };
-      await ps.subscribe(topic, cbA, { group: groupName });
+      await consumerA.subscribe(topic, cbA, { group: groupName });
+
+      // A separate group settles the original delivery. Reclaim in the crash
+      // group must not broadcast a replacement entry back to this group.
+      const settledGroupEvents: Event[] = [];
+      await settledGroupConsumer.subscribe(
+        topic,
+        (event, ack) => {
+          settledGroupEvents.push(event);
+          void ack?.();
+        },
+        { group: `settled-${randomUUID()}` },
+      );
 
       // Publish; subscriber A reads but never acks.
-      await ps.publish(topic, makeEvent({ type: 'sticky' }));
-      await waitFor(() => seenA.length === 1, { timeoutMs: 5000 });
+      await consumerA.publish(topic, makeEvent({ type: 'sticky' }));
+      await waitFor(() => seenA.length === 1 && settledGroupEvents.length === 1, { timeoutMs: 5000 });
+      expect(seenA[0]!.deliveryAttempt).toBe(1);
+
+      // Simulate the first worker disappearing with the message still pending.
+      await consumerA.unsubscribe(topic, cbA);
 
       // Subscriber B joins the same group. It can only see entries that A
       // has not acked once XAUTOCLAIM moves them over.
@@ -368,11 +391,126 @@ describe('RedisStreamsPubSub', () => {
         seenB.push(event);
         void ack?.();
       };
-      await ps.subscribe(topic, cbB, { group: groupName });
+      await consumerB.subscribe(topic, cbB, { group: groupName });
 
       // Wait for autoclaim to fire (idleMs=500, intervalMs=250 + a margin).
       await waitFor(() => seenB.length >= 1, { timeoutMs: 6000 });
       expect(seenB[0]!.type).toBe('sticky');
+      expect(seenB[0]!.id).toBe(seenA[0]!.id);
+      expect(seenB[0]!.deliveryAttempt).toBe(2);
+      await new Promise(r => setTimeout(r, 300));
+      expect(settledGroupEvents).toHaveLength(1);
+    });
+
+    it('counts repeated crash reclaims and drops the entry after the delivery cap', async () => {
+      const warnings: Array<{ message: string; metadata: unknown }> = [];
+      const makeConsumer = (captureWarnings = false) =>
+        new RedisStreamsPubSub({
+          url: REDIS_URL,
+          blockMs: 100,
+          reclaimIntervalMs: 50,
+          reclaimIdleMs: 100,
+          maxDeliveryAttempts: 3,
+          logger: captureWarnings
+            ? {
+                warn: (message, metadata) => warnings.push({ message: String(message), metadata }),
+              }
+            : undefined,
+        });
+      const consumers = [makeConsumer(), makeConsumer(), makeConsumer(), makeConsumer(true)];
+      pubsubs.push(...consumers);
+
+      const topic = `t-reclaim-cap-${randomUUID()}`;
+      const streamKey = `mastra:topic:${topic}`;
+      const groupName = `claim-cap-${randomUUID()}`;
+      const seenAttempts: number[][] = [[], [], [], []];
+
+      for (let index = 0; index < 3; index++) {
+        const cb: EventCallback = event => {
+          seenAttempts[index]!.push(event.deliveryAttempt ?? 0);
+          // Simulate a worker crash: leave the entry pending.
+        };
+        await consumers[index]!.subscribe(topic, cb, { group: groupName });
+        if (index === 0) {
+          await consumers[index]!.publish(topic, makeEvent({ type: 'reclaim-cap' }));
+        }
+        await waitFor(() => seenAttempts[index]!.length === 1, { timeoutMs: 5000 });
+        await consumers[index]!.unsubscribe(topic, cb);
+      }
+
+      const finalCb: EventCallback = event => {
+        seenAttempts[3]!.push(event.deliveryAttempt ?? 0);
+      };
+      await consumers[3]!.subscribe(topic, finalCb, { group: groupName });
+      await waitFor(() => warnings.some(entry => entry.message.includes('dropping crash-reclaimed event')), {
+        timeoutMs: 5000,
+      });
+
+      expect(seenAttempts).toEqual([[1], [2], [3], []]);
+      expect(warnings).toContainEqual({
+        message: 'redis-streams: dropping crash-reclaimed event after max delivery attempts',
+        metadata: expect.objectContaining({ attempt: 4, max: 3 }),
+      });
+
+      const inspector = createClient({ url: REDIS_URL }) as RedisClientType;
+      await inspector.connect();
+      try {
+        await waitFor(async () => (await inspector.xPending(streamKey, groupName)).pending === 0, { timeoutMs: 5000 });
+      } finally {
+        await inspector.quit();
+      }
+    });
+
+    it.each([
+      ['null', 'null'],
+      ['array', '[]'],
+      ['string', '"invalid"'],
+      ['number', '42'],
+      ['boolean', 'true'],
+    ])('acknowledges a reclaimed %s JSON payload without invoking the subscriber', async (_label, payload) => {
+      const topic = `t-invalid-${randomUUID()}`;
+      const streamKey = `mastra:topic:${topic}`;
+      const groupName = `claim-invalid-${randomUUID()}`;
+      const direct = createClient({ url: REDIS_URL }) as RedisClientType;
+      await direct.connect();
+      try {
+        await direct.xGroupCreate(streamKey, groupName, '0', { MKSTREAM: true });
+        await direct.xAdd(streamKey, '*', { event: payload });
+        await direct.xReadGroup(groupName, 'abandoned-consumer', [{ key: streamKey, id: '>' }], { COUNT: 1 });
+      } finally {
+        await direct.quit();
+      }
+
+      const debugMessages: string[] = [];
+      const consumer = new RedisStreamsPubSub({
+        url: REDIS_URL,
+        blockMs: 200,
+        reclaimIntervalMs: 100,
+        reclaimIdleMs: 200,
+        logger: {
+          debug: message => debugMessages.push(String(message)),
+        },
+      });
+      pubsubs.push(consumer);
+      let callbackCount = 0;
+      await consumer.subscribe(
+        topic,
+        () => {
+          callbackCount++;
+        },
+        { group: groupName },
+      );
+
+      await waitFor(() => debugMessages.some(message => message.includes('malformed payload')), { timeoutMs: 5000 });
+      expect(callbackCount).toBe(0);
+
+      const inspector = createClient({ url: REDIS_URL }) as RedisClientType;
+      await inspector.connect();
+      try {
+        await expect(inspector.xPending(streamKey, groupName)).resolves.toMatchObject({ pending: 0 });
+      } finally {
+        await inspector.quit();
+      }
     });
   });
 

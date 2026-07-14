@@ -89,4 +89,6 @@ await pubsub.destroy('workflow.events')
 
 ## Acknowledgment
 
-Each delivered event includes `ack` and `nack` functions. Call `ack` after successful processing to remove the event from the subscription. When neither is called, Google Cloud redelivers the event after its acknowledgment deadline expires.
+Each delivered event includes `ack` and `nack` functions. Call `ack` after successful processing to remove the event from the subscription. When neither is called, Google Cloud redelivers the event after its acknowledgment deadline expires. Mastra forwards Google Cloud's message ID and `deliveryAttempt`.
+
+Google Cloud reports a positive delivery attempt only when the subscription has a correctly configured dead-letter policy and the required IAM permissions. Without that policy it reports `0`, which Mastra treats as an untracked first delivery. Configure dead lettering on the shared workflow subscription when the retry budget must survive worker rotation or process restart; Google documents the count as approximate and notes that it can reset.

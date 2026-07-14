@@ -95,7 +95,7 @@ export const mastra = new Mastra({
     name: 'maxDeliveryAttempts',
     type: 'number',
     description:
-      'Maximum times an event is redelivered through `nack` before it is dropped. Pass `Infinity` to disable the cap.',
+      'Maximum times an event is delivered across explicit `nack` redelivery and crash reclamation before it is dropped. Pass `Infinity` to disable the cap.',
     isOptional: true,
     defaultValue: '5',
   },
@@ -152,4 +152,4 @@ await pubsub.close()
 
 ## Redelivery and reclaim
 
-When a subscriber calls `nack`, the event is republished with an incremented `deliveryAttempt` and the original is acknowledged. Once an event reaches `maxDeliveryAttempts`, it's dropped instead of redelivered. Separately, each subscription periodically reclaims events that an earlier consumer in the group read but never acknowledged, controlled by `reclaimIntervalMs` and `reclaimIdleMs`.
+When a subscriber calls `nack`, the event is republished with the same logical event ID, an incremented `deliveryAttempt`, and then the original is acknowledged. Republishing first ensures a Redis write failure leaves the original pending for reclaim. Once an event reaches `maxDeliveryAttempts`, it's dropped instead of redelivered. Configure that transport cap strictly above Mastra's workflow source-event retry budget so at least one later delivery remains available if terminal-failure publication must be retried. Separately, each subscription periodically reclaims events that an earlier consumer in the group read but never acknowledged, controlled by `reclaimIntervalMs` and `reclaimIdleMs`. Redis atomically advances the affected consumer group's pending-entry delivery counter during reclaim; Mastra combines that durable counter with `deliveryAttempt`, so repeated worker crashes consume the transport budget without broadcasting duplicate retries to unrelated groups.

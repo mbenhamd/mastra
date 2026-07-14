@@ -40,9 +40,9 @@ export interface RedisStreamsPubSubConfig {
    */
   reclaimIdleMs?: number;
   /**
-   * Maximum number of times a single event will be redelivered via nack
-   * before it is dropped (acked without republish). Defaults to 5. Set to
-   * `Infinity` to disable the cap (events redeliver forever on every nack).
+   * Maximum number of times a single event will be delivered across explicit
+   * nacks and crash reclamation before it is dropped (acked without
+   * republish). Defaults to 5. Set to `Infinity` to disable the cap.
    *
    * `0` is treated as `Infinity` with a one-time warn for back-compat;
    * prefer `Infinity` to disable the cap explicitly.
@@ -235,7 +235,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
         for (const entry of messages) {
           if (sub.stopped || this.#closed) return;
           if (!entry) continue;
-          await this.#deliverMessage(sub, entry.id, entry.message);
+          await this.#advanceReclaimedMessage(sub, entry.id, entry.message);
         }
       } catch (err) {
         this.#logger?.debug?.('redis-streams: XAUTOCLAIM failed', {
@@ -249,6 +249,68 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
     };
 
     sub.reclaimTimer = setTimeout(tick, this.#reclaimIntervalMs);
+  }
+
+  /**
+   * Deliver a crash-reclaimed entry with its group-local durable attempt.
+   * XAUTOCLAIM atomically changes ownership and increments the pending-entry
+   * delivery counter. Reading that counter avoids publishing a new stream-wide
+   * entry, which would incorrectly redeliver the event to unrelated groups.
+   */
+  async #advanceReclaimedMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
+    let event: Event;
+    try {
+      event = this.#parseEvent(fields);
+    } catch {
+      // Reuse the normal malformed-payload path, which logs and acknowledges
+      // the poison entry without invoking user code.
+      await this.#deliverMessage(sub, streamId, fields);
+      return;
+    }
+
+    const payloadAttempt =
+      typeof event.deliveryAttempt === 'number' &&
+      Number.isSafeInteger(event.deliveryAttempt) &&
+      event.deliveryAttempt >= 1
+        ? event.deliveryAttempt
+        : 1;
+
+    const pending = await this.#writeClient.xPendingRange(sub.streamKey, sub.group, streamId, streamId, 1);
+    const groupDeliveryCount = pending[0]?.deliveriesCounter ?? 2;
+    const attempt = payloadAttempt + Math.max(groupDeliveryCount - 1, 1);
+    if (attempt > this.#maxDeliveryAttempts) {
+      this.#logger?.warn?.('redis-streams: dropping crash-reclaimed event after max delivery attempts', {
+        topic: sub.topic,
+        eventType: event.type,
+        eventId: event.id,
+        attempt,
+        max: this.#maxDeliveryAttempts,
+      });
+      await this.#writeClient.xAck(sub.streamKey, sub.group, streamId);
+      return;
+    }
+
+    const reclaimedFields = {
+      ...fields,
+      event: JSON.stringify({
+        ...event,
+        deliveryAttempt: attempt,
+      } satisfies Event),
+    };
+    await this.#deliverMessage(sub, streamId, reclaimedFields);
+  }
+
+  #parseEvent(fields: Record<string, string>): Event {
+    const parsed: unknown = JSON.parse(fields.event ?? '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('event payload must be an object');
+    }
+
+    const event = parsed as Event;
+    if (typeof event.createdAt === 'string') {
+      event.createdAt = new Date(event.createdAt);
+    }
+    return event;
   }
 
   async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
@@ -476,11 +538,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async #deliverMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
     let event: Event;
     try {
-      event = JSON.parse(fields.event ?? '{}') as Event;
-      // createdAt is serialized as a string; rehydrate.
-      if (typeof event.createdAt === 'string') {
-        event.createdAt = new Date(event.createdAt);
-      }
+      event = this.#parseEvent(fields);
     } catch (err) {
       this.#logger?.debug?.('redis-streams: malformed payload, dropping', {
         topic: sub.topic,
