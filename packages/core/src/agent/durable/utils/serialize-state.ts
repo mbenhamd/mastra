@@ -172,6 +172,7 @@ export function serializeDurableOptions(options: {
   maxSteps?: number;
   toolChoice?: any;
   activeTools?: string[];
+  toolSurfaceFence?: string[];
   temperature?: number;
   requireToolApproval?: boolean;
   toolCallConcurrency?: number;
@@ -203,6 +204,7 @@ export function serializeDurableOptions(options: {
     maxSteps: options.maxSteps,
     toolChoice: serializedToolChoice,
     activeTools: options.activeTools,
+    toolSurfaceFence: options.toolSurfaceFence,
     temperature: options.temperature,
     requireToolApproval: options.requireToolApproval,
     toolCallConcurrency: options.toolCallConcurrency,
@@ -222,6 +224,7 @@ export function serializeDurableOptions(options: {
  */
 export function createWorkflowInput(params: {
   runId: string;
+  runtimeBindingId: string;
   agentId: string;
   agentName?: string;
   messageList: MessageList;
@@ -236,6 +239,7 @@ export function createWorkflowInput(params: {
   return {
     __workflowKind: 'durable-agent',
     runId: params.runId,
+    runtimeBindingId: params.runtimeBindingId,
     agentId: params.agentId,
     agentName: params.agentName,
     messageListState: params.messageList.serialize(),

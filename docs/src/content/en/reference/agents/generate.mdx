@@ -757,6 +757,14 @@ const response = await agent.generate('Help me organize my day', {
             description: 'Additional tool sets that can be used for this execution.',
           },
           {
+            name: 'toolsetsMode',
+            type: "'merge' | 'replace'",
+            isOptional: true,
+            defaultValue: "'merge'",
+            description:
+              "Controls whether `toolsets` augment the agent's tool sources or replace all of them for this execution.",
+          },
+          {
             name: 'clientTools',
             type: 'ToolsInput',
             isOptional: true,

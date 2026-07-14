@@ -9,14 +9,13 @@
  * on the same turn. These tests drive Agent.convertTools() directly with a
  * crafted channel-bound RequestContext.
  */
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
-import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-
+import type { AgentChannels } from '../channels/agent-channels';
 import { RequestContext } from '../request-context';
 import { createTool } from '../tools';
-import type { AgentChannels } from '../channels/agent-channels';
 
 import { Agent } from './agent';
 import {
@@ -137,6 +136,35 @@ describe('Agent §14.7 channel tool strip', () => {
     expect(tools.safe_tool).toBeDefined();
   });
 
+  it('keeps reserved channel names fenced when toolsets replace every backing source', async () => {
+    const agent = makeAgent();
+    injectChannels(agent, ['add_reaction']);
+    const context = channelBoundContext();
+    const tools = await convert(agent, context, {
+      toolsetsMode: 'replace',
+      toolsets: {
+        replacement: {
+          add_reaction: createTool({
+            id: 'add_reaction',
+            description: 'replacement tool spoofing the direct-provider channel name',
+            inputSchema: z.object({}),
+            execute: async () => ({ ok: true }),
+          }),
+          safe_tool: createTool({
+            id: 'safe_tool',
+            description: 'unrelated replacement tool',
+            inputSchema: z.object({}),
+            execute: async () => ({ ok: true }),
+          }),
+        },
+      },
+    });
+
+    expect(tools.add_reaction).toBeUndefined();
+    expect(tools.safe_tool).toBeDefined();
+    expect([...(readChannelToolFence(context) ?? [])]).toEqual(['add_reaction']);
+  });
+
   it('does not strip the reserved names on a non-channel turn (toolset tool survives)', async () => {
     const agent = makeAgent();
     injectChannels(agent, ['add_reaction', 'remove_reaction']);
@@ -180,9 +208,14 @@ describe('Agent §14.7 channel tool strip', () => {
 
 describe('§14.7 channel-tool-fence helpers (INC-1b)', () => {
   it('isHarnessChannelBoundTurn requires BOTH harness and channel slots', () => {
-    expect(isHarnessChannelBoundTurn(new RequestContext([['harness', {}], ['channel', { origin: 'inbound' }]]))).toBe(
-      true,
-    );
+    expect(
+      isHarnessChannelBoundTurn(
+        new RequestContext([
+          ['harness', {}],
+          ['channel', { origin: 'inbound' }],
+        ]),
+      ),
+    ).toBe(true);
     expect(isHarnessChannelBoundTurn(new RequestContext([['harness', {}]]))).toBe(false);
     expect(isHarnessChannelBoundTurn(new RequestContext([['channel', { origin: 'inbound' }]]))).toBe(false);
     expect(isHarnessChannelBoundTurn(new RequestContext([]))).toBe(false);

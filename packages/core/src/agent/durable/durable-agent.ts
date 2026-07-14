@@ -15,7 +15,13 @@ import type { ToolsInput } from '../types';
 import { AGENT_STREAM_TOPIC } from './constants';
 import { runDurableStreamUntilIdle } from './durable-stream-until-idle';
 import { prepareForDurableExecution } from './preparation';
-import { ExtendedRunRegistry, globalRunRegistry } from './run-registry';
+import {
+  deleteBoundRunRegistryEntry,
+  ExtendedRunRegistry,
+  getBoundRunRegistryEntry,
+  globalRunRegistry,
+  registerGlobalRunRegistryEntry,
+} from './run-registry';
 import { createDurableAgentStream, emitErrorEvent } from './stream-adapter';
 import type {
   AgentFinishEventData,
@@ -43,6 +49,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   maxSteps?: number;
   /** Additional tool sets that can be used for this execution */
   toolsets?: AgentExecutionOptions<OUTPUT>['toolsets'];
+  /** Whether toolsets augment (default) or replace every other agent tool source */
+  toolsetsMode?: AgentExecutionOptions<OUTPUT>['toolsetsMode'];
   /** Client-side tools available during execution */
   clientTools?: AgentExecutionOptions<OUTPUT>['clientTools'];
   /** Tool selection strategy */
@@ -399,7 +407,7 @@ export class DurableAgent<
    */
   protected async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     const workflow = this.getWorkflow();
-    const requestContext = globalRunRegistry.get(runId)?.requestContext;
+    const requestContext = getBoundRunRegistryEntry(runId, workflowInput.runtimeBindingId)?.requestContext;
 
     const run = await workflow.createRun({ runId, pubsub: this.pubsub });
     const result = await run.start({ inputData: workflowInput, requestContext });
@@ -439,6 +447,25 @@ export class DurableAgent<
     await emitErrorEvent(this.pubsub, runId, error);
   }
 
+  /** Preserve caller IDs exactly, but retry the vanishingly rare generated-ID collision. */
+  #allocateRunId(requestedRunId?: string): string {
+    if (requestedRunId !== undefined) {
+      if (this.#runRegistry.has(requestedRunId) || globalRunRegistry.has(requestedRunId)) {
+        throw new Error(
+          `Durable run ${requestedRunId} is already active. Refusing to replace its runtime dependencies.`,
+        );
+      }
+      return requestedRunId;
+    }
+
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const candidate = crypto.randomUUID();
+      if (!this.#runRegistry.has(candidate) && !globalRunRegistry.has(candidate)) return candidate;
+    }
+
+    throw new Error('Unable to allocate a unique durable run identifier after 32 attempts.');
+  }
+
   // ===========================================================================
   // Public API
   // ===========================================================================
@@ -451,12 +478,13 @@ export class DurableAgent<
     messages: MessageListInput,
     options?: DurableAgentStreamOptions<TOutput>,
   ): Promise<DurableAgentStreamResult<TOutput>> {
+    const allocatedRunId = this.#allocateRunId(options?.runId);
     // 1. Prepare for durable execution (non-durable phase)
     const preparation = await prepareForDurableExecution<TOutput>({
       agent: this.#wrappedAgent as Agent<string, any, TOutput>,
       messages,
       options: options as AgentExecutionOptions<TOutput>,
-      runId: options?.runId,
+      runId: allocatedRunId,
       requestContext: options?.requestContext,
       logger: this.logger,
       mastra: this.#mastra,
@@ -465,8 +493,12 @@ export class DurableAgent<
     const { runId, messageId, workflowInput, registryEntry, messageList, threadId, resourceId } = preparation;
 
     // 2. Register non-serializable state (both local and global registries)
+    if (this.#runRegistry.has(runId)) {
+      throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
+    }
+    registerGlobalRunRegistryEntry(runId, { ...registryEntry, messageList });
     this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
-    globalRunRegistry.set(runId, { ...registryEntry, messageList });
+    const runtimeBindingId = registryEntry.runtimeBindingId;
 
     // Track cleanup state to avoid double cleanup
     let cleanedUp = false;
@@ -477,9 +509,7 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#runRegistry.cleanup(runId);
-          globalRunRegistry.delete(runId);
-          this.#clearPubsubTopic(runId);
+          this.#cleanupBoundRun(runId, runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
@@ -530,9 +560,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#runRegistry.cleanup(runId);
-        globalRunRegistry.delete(runId);
-        this.#clearPubsubTopic(runId);
+        this.#cleanupBoundRun(runId, runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -578,15 +606,13 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#runRegistry.cleanup(runId);
-          globalRunRegistry.delete(runId);
-          this.#clearPubsubTopic(runId);
+          this.#cleanupBoundRun(runId, entry.runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
     };
 
-    const globalEntry = globalRunRegistry.get(runId);
+    const globalEntry = getBoundRunRegistryEntry(runId, entry.runtimeBindingId);
     const resumeModel = globalEntry?.model as any;
 
     const {
@@ -619,7 +645,7 @@ export class DurableAgent<
 
     // Wait for subscription to be ready, then resume workflow
     const workflow = this.getWorkflow();
-    const requestContext = globalRunRegistry.get(runId)?.requestContext;
+    const requestContext = getBoundRunRegistryEntry(runId, entry.runtimeBindingId)?.requestContext;
     ready
       .then(async () => {
         const run = await workflow.createRun({ runId, pubsub: this.pubsub });
@@ -640,9 +666,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#runRegistry.cleanup(runId);
-        globalRunRegistry.delete(runId);
-        this.#clearPubsubTopic(runId);
+        this.#cleanupBoundRun(runId, entry.runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -681,6 +705,7 @@ export class DurableAgent<
     },
   ): Promise<Omit<DurableAgentStreamResult<TOutput>, 'runId'> & { runId: string }> {
     const memoryInfo = this.#runRegistry.getMemoryInfo(runId);
+    const runtimeBindingId = this.#runRegistry.get(runId)?.runtimeBindingId;
 
     // Track cleanup state to avoid double cleanup
     let cleanedUp = false;
@@ -690,9 +715,7 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#runRegistry.cleanup(runId);
-          globalRunRegistry.delete(runId);
-          this.#clearPubsubTopic(runId);
+          if (runtimeBindingId) this.#cleanupBoundRun(runId, runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
@@ -737,9 +760,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#runRegistry.cleanup(runId);
-        globalRunRegistry.delete(runId);
-        this.#clearPubsubTopic(runId);
+        if (runtimeBindingId) this.#cleanupBoundRun(runId, runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -765,6 +786,13 @@ export class DurableAgent<
     if ('clearTopic' in pubsub && typeof (pubsub as any).clearTopic === 'function') {
       void (pubsub as any).clearTopic(AGENT_STREAM_TOPIC(runId));
     }
+  }
+
+  /** Clear replay state only while this binding still owns the reused run ID. */
+  #cleanupBoundRun(runId: string, runtimeBindingId: string): void {
+    const cleanedLocal = this.#runRegistry.cleanupBound(runId, runtimeBindingId);
+    const cleanedGlobal = deleteBoundRunRegistryEntry(runId, runtimeBindingId);
+    if (cleanedLocal || cleanedGlobal) this.#clearPubsubTopic(runId);
   }
 
   /**
@@ -814,22 +842,29 @@ export class DurableAgent<
    * Prepare for durable execution without starting it.
    */
   async prepare(messages: MessageListInput, options?: AgentExecutionOptions<TOutput>) {
+    const allocatedRunId = this.#allocateRunId(options?.runId);
     const preparation = await prepareForDurableExecution<TOutput>({
       agent: this.#wrappedAgent as Agent<string, any, TOutput>,
       messages,
       options,
+      runId: allocatedRunId,
       requestContext: options?.requestContext,
       logger: this.logger,
       mastra: this.#mastra,
     });
 
+    if (this.#runRegistry.has(preparation.runId)) {
+      throw new Error(
+        `Durable run ${preparation.runId} is already active. Refusing to replace its runtime dependencies.`,
+      );
+    }
+    registerGlobalRunRegistryEntry(preparation.runId, {
+      ...preparation.registryEntry,
+      messageList: preparation.messageList,
+    });
     this.#runRegistry.registerWithMessageList(preparation.runId, preparation.registryEntry, preparation.messageList, {
       threadId: preparation.threadId,
       resourceId: preparation.resourceId,
-    });
-    globalRunRegistry.set(preparation.runId, {
-      ...preparation.registryEntry,
-      messageList: preparation.messageList,
     });
 
     return {

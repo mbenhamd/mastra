@@ -198,6 +198,11 @@ export interface PendingResume {
    */
   requestContext?: PersistedRequestContextInput;
   /**
+   * Immutable model-visible tool-name ceiling captured from a replacement
+   * toolset turn. Reapplied on resume so processors cannot expand the surface.
+   */
+  toolSurfaceFence?: string[];
+  /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
    * "wrote resumedAt" and "cleared pendingResume" does not double-resume.

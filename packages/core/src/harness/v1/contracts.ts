@@ -144,7 +144,12 @@ export type HarnessEvidence =
  */
 export type PendingInteraction = Omit<
   PendingResume,
-  'runtimeDependencies' | 'requestContext' | 'resumedAt' | 'approvedTransitionModeId' | 'modeTransitionAppliedAt'
+  | 'runtimeDependencies'
+  | 'requestContext'
+  | 'toolSurfaceFence'
+  | 'resumedAt'
+  | 'approvedTransitionModeId'
+  | 'modeTransitionAppliedAt'
 >;
 
 /**

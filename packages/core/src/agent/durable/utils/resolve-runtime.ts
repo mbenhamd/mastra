@@ -11,7 +11,8 @@ import type { CoreTool } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
 import { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
-import { globalRunRegistry } from '../run-registry';
+import { createToolSurfaceFence } from '../../tool-surface-fence';
+import { getBoundRunRegistryEntry } from '../run-registry';
 import type {
   SerializableDurableState,
   SerializableModelConfig,
@@ -84,7 +85,12 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
 
   // 2. Check global registry first (for local/test execution)
   // This is necessary because workflow steps don't have direct access to DurableAgent's registry
-  const globalEntry = globalRunRegistry.get(runId);
+  const globalEntry = getBoundRunRegistryEntry(runId, input.runtimeBindingId);
+  if (globalEntry && input.options?.toolSurfaceFence !== undefined) {
+    // This also rejects stale persisted name ceilings whose concrete tool was
+    // omitted or replaced with an accessor/undefined registry value.
+    createToolSurfaceFence(globalEntry.tools, input.options.toolSurfaceFence);
+  }
   let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
   let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
@@ -94,6 +100,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // If we found the entry in global registry, we already have model and tools
   if (globalEntry) {
     logger?.debug?.(`[DurableAgent:${agentId}] Using model and tools from global registry for run ${runId}`);
+  } else if ((input.options?.toolSurfaceFence?.length ?? 0) > 0) {
+    throw new Error(
+      `[DurableAgent:${agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
+    );
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
@@ -103,6 +113,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // Future: restore serialized version overrides from workflow input here
 
       tools = await agent.getToolsForExecution({
+        ...(input.options?.toolSurfaceFence ? { toolsets: {}, toolsetsMode: 'replace' as const } : {}),
         runId,
         threadId: input.state.threadId,
         resourceId: input.state.resourceId,

@@ -425,6 +425,7 @@ describe('DurableAgent', () => {
       const runId = 'test-dispose-' + crypto.randomUUID();
 
       globalRunRegistry.set(runId, {
+        runtimeBindingId: `binding-${runId}`,
         tools: {},
         model: { provider: 'test', modelId: 'test' } as any,
         cleanup: cleanupSpy,
@@ -803,6 +804,7 @@ describe('RunRegistry', () => {
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
     registry.register(runId, {
+      runtimeBindingId: `binding-${runId}`,
       tools,
       saveQueueManager: undefined as any,
       model: mockModel,
@@ -820,9 +822,24 @@ describe('RunRegistry', () => {
     const registry = new RunRegistry();
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
-    registry.register('run-1', { tools: { a: {} } as any, saveQueueManager: undefined as any, model: mockModel });
-    registry.register('run-2', { tools: { b: {} } as any, saveQueueManager: undefined as any, model: mockModel });
-    registry.register('run-3', { tools: { c: {} } as any, saveQueueManager: undefined as any, model: mockModel });
+    registry.register('run-1', {
+      runtimeBindingId: 'binding-run-1',
+      tools: { a: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
+    registry.register('run-2', {
+      runtimeBindingId: 'binding-run-2',
+      tools: { b: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
+    registry.register('run-3', {
+      runtimeBindingId: 'binding-run-3',
+      tools: { c: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
 
     expect(registry.size).toBe(3);
     expect(registry.runIds).toContain('run-1');
@@ -841,12 +858,27 @@ describe('RunRegistry', () => {
     const tools1 = { tool1: { description: 'First' } } as any;
     const tools2 = { tool2: { description: 'Second' } } as any;
 
-    registry.register(runId, { tools: tools1, saveQueueManager: undefined as any, model: mockModel });
+    registry.register(runId, {
+      runtimeBindingId: `binding-${runId}-1`,
+      tools: tools1,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.getTools(runId)).toBe(tools1);
 
-    registry.register(runId, { tools: tools2, saveQueueManager: undefined as any, model: mockModel });
+    registry.register(runId, {
+      runtimeBindingId: `binding-${runId}-2`,
+      tools: tools2,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.getTools(runId)).toBe(tools2);
     expect(registry.size).toBe(1);
+
+    registry.cleanupBound(runId, `binding-${runId}-1`);
+    expect(registry.getTools(runId)).toBe(tools2);
+    registry.cleanupBound(runId, `binding-${runId}-2`);
+    expect(registry.has(runId)).toBe(false);
   });
 });
 
@@ -863,7 +895,7 @@ describe('ExtendedRunRegistry', () => {
 
     registry.registerWithMessageList(
       runId,
-      { tools: {}, saveQueueManager: undefined as any, model: mockModel },
+      { runtimeBindingId: `binding-${runId}`, tools: {}, saveQueueManager: undefined as any, model: mockModel },
       messageList,
       {
         threadId: 'thread-1',
@@ -887,7 +919,12 @@ describe('ExtendedRunRegistry', () => {
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
     // Can use basic register
-    registry.register('basic-run', { tools: { t: {} } as any, saveQueueManager: undefined as any, model: mockModel });
+    registry.register('basic-run', {
+      runtimeBindingId: 'binding-basic-run',
+      tools: { t: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.has('basic-run')).toBe(true);
     expect(registry.getTools('basic-run')).toBeDefined();
 
@@ -895,7 +932,12 @@ describe('ExtendedRunRegistry', () => {
     const messageList = new MessageList({});
     registry.registerWithMessageList(
       'extended-run',
-      { tools: {}, saveQueueManager: undefined as any, model: mockModel },
+      {
+        runtimeBindingId: 'binding-extended-run',
+        tools: {},
+        saveQueueManager: undefined as any,
+        model: mockModel,
+      },
       messageList,
       { threadId: 't1' },
     );
@@ -1092,6 +1134,7 @@ describe('DurableAgent resume model metadata', () => {
 
     const mockModel = { modelId: 'gpt-4', provider: 'openai' };
     globalRunRegistry.set(runId, {
+      runtimeBindingId: `binding-${runId}`,
       tools: {},
       model: mockModel as any,
       cleanup: () => {},
@@ -1116,6 +1159,7 @@ describe('DurableAgent resume model metadata', () => {
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, cache: false });
 
     durableAgent.runRegistry.register(runId, {
+      runtimeBindingId: `binding-${runId}`,
       tools: {},
       model: mockModel as any,
       cleanup: () => {},

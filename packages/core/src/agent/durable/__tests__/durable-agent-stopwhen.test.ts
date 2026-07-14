@@ -320,7 +320,9 @@ describe('DurableAgent stopWhen callback', () => {
         const trackException = vi.fn();
         const doStream = vi.fn();
         const runId = `direct-workflow-max-steps-${String(maxSteps)}`;
+        const runtimeBindingId = `binding-${String(maxSteps)}`;
         globalRunRegistry.set(runId, {
+          runtimeBindingId,
           tools: {},
           model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
         });
@@ -332,6 +334,7 @@ describe('DurableAgent stopWhen callback', () => {
             inputData: {
               __workflowKind: 'durable-agent',
               runId,
+              runtimeBindingId,
               agentId: 'direct-workflow-agent',
               messageListState: {},
               toolsMetadata: [],

@@ -39,11 +39,30 @@ describe('Session.injectSystemReminder()', () => {
     const messages = agent.streamCalls[0]!.messages as {
       __isCreatedSignal?: boolean;
       type?: string;
+      tagName?: string;
       contents?: unknown;
     };
     expect(messages.__isCreatedSignal).toBe(true);
-    expect(messages.type).toBe('system-reminder');
+    expect(messages.type).toBe('reactive');
+    expect(messages.tagName).toBe('system-reminder');
     expect(messages.contents).toBe('remember X');
+  });
+
+  it('threads replacement mode semantics through an idle reminder wake', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      modes: [{ id: 'default', agentId: 'default', tools: { reminderTool: {} as any } }],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    await session.injectSystemReminder('remember replacement boundary');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(agent.streamCalls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.streamCalls[0]!.options.toolsets['mode:default']).toHaveProperty('reminderTool');
+    await session.close();
   });
 
   it('drains into an active run (willInterleave: true)', async () => {
@@ -76,7 +95,8 @@ describe('Session.injectSystemReminder()', () => {
       metadata: { goalId: 'g1' },
     });
 
-    expect(handle.signal.type).toBe('system-reminder');
+    expect(handle.signal.type).toBe('reactive');
+    expect(handle.signal.tagName).toBe('system-reminder');
     expect(handle.signal.attributes).toEqual({ type: 'goal-judge' });
     expect(handle.signal.metadata).toEqual({ goalId: 'g1' });
 

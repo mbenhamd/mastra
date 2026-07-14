@@ -1,5 +1,6 @@
 import type { ModelMessage, ToolChoice } from '@internal/ai-sdk-v5';
 import type { MastraScorer, MastraScorers, ScoringSamplingConfig } from '../evals';
+import type { PubSub } from '../events/pubsub';
 import type { SystemMessage } from '../llm';
 import type { ProviderOptions } from '../llm/model/provider-options';
 import type { MastraLanguageModel } from '../llm/model/shared.types';
@@ -8,7 +9,6 @@ import type { LoopConfig, LoopOptions, PrepareStepFunction } from '../loop/types
 import type { VersionOverrides } from '../mastra/types';
 import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
-import type { PubSub } from '../events/pubsub';
 import type { RequestContext } from '../request-context';
 import type { RequireToolApproval, ToolPayloadTransformPolicy } from '../tools';
 import type { OutputWriter, WorkflowRunState } from '../workflows/types';
@@ -17,6 +17,7 @@ import type { CreatedAgentSignal } from './signals';
 import type {
   AgentMemoryOption,
   ToolsetsInput,
+  ToolsetsMode,
   ToolsInput,
   StructuredOutputOptions,
   PublicStructuredOutputOptions,
@@ -523,6 +524,11 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
 
   /** Additional tool sets that can be used for this execution */
   toolsets?: ToolsetsInput;
+  /**
+   * How `toolsets` interact with the agent's other tool sources.
+   * `merge` (default) augments them; `replace` exposes only the supplied toolsets.
+   */
+  toolsetsMode?: ToolsetsMode;
   /** Client-side tools available during execution */
   clientTools?: ToolsInput;
   /** Tool selection strategy: 'auto', 'none', 'required', or specific tools */
@@ -721,6 +727,8 @@ export type InnerAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptions
   };
   /** Internal: PubSub captured by the public execution path for this run */
   _pubsub?: PubSub;
+  /** Internal: lease used to prevent stale or colliding executions from clearing another run's tool fence. */
+  _toolSurfaceFenceOwnerId?: string;
   toolCallId?: string;
 } & ([NonNullable<OUTPUT>] extends [never]
     ? { structuredOutput?: never }

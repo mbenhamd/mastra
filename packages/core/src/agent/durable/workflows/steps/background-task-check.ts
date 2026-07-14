@@ -4,7 +4,7 @@ import { ChunkFrom } from '../../../../stream/types';
 import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 
 const BG_CHECK_STEP_ID = `${DurableStepIds.AGENTIC_EXECUTION}-bg-task-check`;
@@ -39,13 +39,14 @@ export function createDurableBackgroundTaskCheckStep() {
 
       const initData = getInitData<{
         runId: string;
+        runtimeBindingId?: string;
         agentId: string;
         options?: { skipBgTaskWait?: boolean };
         state?: { threadId?: string; resourceId?: string };
       }>();
-      const { runId, agentId } = initData;
+      const { runId, runtimeBindingId, agentId } = initData;
 
-      const registryEntry = globalRunRegistry.get(runId);
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       const bgManager = registryEntry?.backgroundTaskManager;
 
       if (!bgManager) {

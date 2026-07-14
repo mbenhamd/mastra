@@ -76,10 +76,10 @@ const harness = new Harness({
 
 ### Mode tool overrides
 
-Modes support two strategies for tool configuration. Use `tools` to replace the backing agent's tools entirely, or `additionalTools` to layer extra tools on top:
+Modes support two strategies for tool configuration. Use `tools` to replace every backing-agent tool source, or `additionalTools` to layer extra tools on top:
 
 ```typescript
-// Replace — agent sees only these tools in plan mode
+// Replace the agent's assigned, memory, workspace, skill, MCP, and other tools
 const planMode = { id: 'plan', tools: { planTool } }
 
 // Augment — agent keeps its own tools plus these
@@ -87,6 +87,30 @@ const buildMode = { id: 'build', additionalTools: { deployTool } }
 ```
 
 You can't set both `tools` and `additionalTools` on the same mode.
+
+Harness-owned built-ins remain available by default. These include the plan-task tools and `spawn_subagent` when subagents are configured. Set `harnessBuiltins: 'exclude'` to remove them:
+
+```typescript
+const restrictedMode = {
+  id: 'restricted',
+  tools: { approvedTool },
+  harnessBuiltins: 'exclude',
+}
+```
+
+Use an empty replacement with excluded built-ins for a tool-free mode:
+
+```typescript
+const toolFreeMode = {
+  id: 'tool-free',
+  tools: {},
+  harnessBuiltins: 'exclude',
+}
+```
+
+Replacement is enforced on every agent-loop step and across suspend and resume while the same live Harness instance retains the canonical tool snapshot. After each input-processor pass Mastra materializes a fresh trusted tool map, so processors can remove an allowed tool for a step but can't add a tool outside the replacement surface, replace an allowed implementation, or mutate the configuration used by later model or execution calls.
+
+Harness persists the allowed tool names, but executable tool objects are process-local. After `harness.shutdown()`, process loss, or session rehydration in another Harness instance, a pending replacement run fails closed before it is marked resumed—even when the new Harness has same-named static mode tools—because Mastra can't prove implementation identity from names alone.
 
 ### Mode transitions
 

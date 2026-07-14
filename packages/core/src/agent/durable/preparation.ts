@@ -16,6 +16,12 @@ import type { AgentExecutionOptions } from '../agent.types';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
+import {
+  clearToolSurfaceFence,
+  createToolSurfaceFence,
+  materializeToolSurfaceFence,
+  readToolSurfaceFence,
+} from '../tool-surface-fence';
 import type { AgentInstructions, AgentModelManagerConfig, ToolsetsInput, ToolsInput } from '../types';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import { createWorkflowInput } from './utils/serialize-state';
@@ -27,6 +33,7 @@ import { createWorkflowInput } from './utils/serialize-state';
 interface DurablePreparationAgent {
   id: string;
   name?: string;
+  getDefaultOptions(opts: { requestContext: RequestContext }): AgentExecutionOptions | Promise<AgentExecutionOptions>;
   getInstructions(opts: { requestContext: RequestContext }): AgentInstructions | Promise<AgentInstructions>;
   getModel(opts: { requestContext: RequestContext }): MastraLanguageModel | Promise<MastraLanguageModel>;
   getModelList(requestContext: RequestContext): Promise<AgentModelManagerConfig[] | null>;
@@ -37,6 +44,7 @@ interface DurablePreparationAgent {
   }): Promise<Record<string, { scorer: unknown; sampling?: unknown }> | undefined>;
   getToolsForExecution(opts: {
     toolsets?: ToolsetsInput;
+    toolsetsMode?: AgentExecutionOptions['toolsetsMode'];
     clientTools?: ToolsInput;
     threadId?: string;
     resourceId?: string;
@@ -44,6 +52,7 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext;
     memoryConfig?: MemoryConfig;
     autoResumeSuspendedTools?: boolean;
+    _toolSurfaceFenceOwnerId?: string;
   }): Promise<Record<string, CoreTool>>;
   listInputProcessors(requestContext?: RequestContext): Promise<InputProcessorOrWorkflow[]>;
   listOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
@@ -126,6 +135,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 1. Generate IDs
   const runId = providedRunId ?? crypto.randomUUID();
   const messageId = crypto.randomUUID();
+  const runtimeBindingId = crypto.randomUUID();
 
   // 2. Get request context
   const requestContext = providedRequestContext ?? new RequestContext();
@@ -147,6 +157,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const resourceId = execOptions?.memory?.resource;
   let threadObject: StorageThreadType | undefined;
   let threadExists = false;
+  let processorMemory: MastraMemory | undefined;
+  let createdThreadDuringPreparation = false;
 
   // 5. Create MessageList
   const messageList = new MessageList({
@@ -213,20 +225,23 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   if (inputProcessors.length > 0) {
     try {
       // Set MastraMemory context so processors that need it (OM, message history) can access it
-      const memory = await typedAgent.getMemory({ requestContext });
+      processorMemory = await typedAgent.getMemory({ requestContext });
       const memoryConfig = execOptions?.memory?.options;
-      if (memory && threadId && resourceId) {
-        const existingThread = await memory.getThreadById({ threadId });
-        threadObject =
-          existingThread ??
-          (await memory.createThread({
+      if (processorMemory && threadId && resourceId) {
+        const existingThread = await processorMemory.getThreadById({ threadId });
+        if (existingThread) {
+          threadObject = existingThread;
+        } else {
+          threadObject = await processorMemory.createThread({
             threadId,
             metadata: thread?.metadata,
             title: thread?.title,
             memoryConfig,
             resourceId,
             saveThread: true,
-          }));
+          });
+          createdThreadDuringPreparation = true;
+        }
         threadExists = true;
         requestContext.set('MastraMemory', { thread: threadObject, resourceId, memoryConfig });
       }
@@ -245,12 +260,13 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       logger?.warn?.(`[DurableAgent] Error running input processors: ${error}`);
     }
   }
-
   // 7. Convert tools to CoreTool format for execution
   let tools: Record<string, CoreTool> = {};
+  const toolSurfaceFenceOwnerId = crypto.randomUUID();
   try {
     tools = await typedAgent.getToolsForExecution({
       toolsets: execOptions?.toolsets,
+      toolsetsMode: execOptions?.toolsetsMode,
       clientTools: execOptions?.clientTools,
       threadId,
       resourceId,
@@ -258,10 +274,31 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext,
       memoryConfig: execOptions?.memory?.options,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      _toolSurfaceFenceOwnerId: toolSurfaceFenceOwnerId,
     });
   } catch (error) {
     logger?.warn?.(`[DurableAgent] Error converting tools: ${error}`);
+    // getToolsForExecution merges agent defaults internally. Re-resolve only
+    // on this exceptional path so an inherited replacement mode cannot be
+    // mistaken for append mode and silently continue with an empty surface.
+    const defaultOptions = await typedAgent.getDefaultOptions({ requestContext });
+    if ((execOptions?.toolsetsMode ?? defaultOptions.toolsetsMode) === 'replace') {
+      clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId);
+      if (createdThreadDuringPreparation && processorMemory && threadId) {
+        try {
+          await processorMemory.deleteThread(threadId);
+        } catch (rollbackError) {
+          logger?.warn?.(`[DurableAgent] Error rolling back preparation thread: ${rollbackError}`);
+        }
+      }
+      throw error;
+    }
   }
+  const replacementFence = readToolSurfaceFence(requestContext, runId);
+  const ownsReplacementFence = replacementFence
+    ? clearToolSurfaceFence(requestContext, runId, toolSurfaceFenceOwnerId)
+    : false;
+  const toolSurfaceFence = ownsReplacementFence ? [...replacementFence!.allowedNames] : undefined;
 
   // 8. Get model (and model list if configured)
   const model = await typedAgent.getModel({ requestContext });
@@ -328,6 +365,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 13. Create serialized workflow input
   const workflowInput = createWorkflowInput({
     runId,
+    runtimeBindingId,
     agentId: agent.id,
     agentName: agent.name,
     messageList,
@@ -338,7 +376,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     options: {
       maxSteps: execOptions?.maxSteps,
       toolChoice: execOptions?.toolChoice as any,
-      activeTools: execOptions?.activeTools,
+      activeTools: execOptions?.activeTools?.filter((name): name is string => typeof name === 'string'),
+      toolSurfaceFence,
       temperature: execOptions?.modelSettings?.temperature,
       // Durable runs serialize their options, so a function-valued global approval policy
       // can't be persisted. Degrade safely by requiring approval for every tool call.
@@ -365,9 +404,22 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     messageId,
   });
 
-  // 14. Create registry entry for non-serializable state
+  // 14. Create registry entry for non-serializable state.
+  // For a replacement run, capture an immutable surface bound to the ORIGINAL
+  // fenced implementations now, before any per-step input processor can mutate
+  // the shared `tools` map in place. The tool-call step dispatches from this
+  // instead of re-snapshotting the mutable registry object.
+  const replacementToolSurface =
+    toolSurfaceFence !== undefined
+      ? (Object.freeze(materializeToolSurfaceFence(createToolSurfaceFence(tools, toolSurfaceFence))) as Record<
+          string,
+          CoreTool
+        >)
+      : undefined;
   const registryEntry: RunRegistryEntry = {
+    runtimeBindingId,
     tools,
+    replacementToolSurface,
     saveQueueManager,
     memory,
     model,
@@ -387,7 +439,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     processorStates,
     backgroundTaskManager,
     backgroundTasksConfig,
-    cleanup: () => {},
   };
 
   return {

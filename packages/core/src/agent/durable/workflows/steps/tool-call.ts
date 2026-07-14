@@ -7,6 +7,7 @@ import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
 import type { MemoryConfig } from '../../../../memory/types';
 import { ChunkFrom } from '../../../../stream/types';
+import type { CoreTool } from '../../../../tools/types';
 import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { SuspendOptions } from '../../../../workflows/step';
@@ -17,8 +18,9 @@ import {
   parseToolApprovalDecision,
   parseToolApprovalGrant,
 } from '../../../tool-call-identity';
+import { createToolSurfaceFence, materializeToolSurfaceFence } from '../../../tool-surface-fence';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type { DurableToolCallInput, SerializableDurableOptions, AgentSuspendedEventData } from '../../types';
 import { resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
@@ -144,6 +146,7 @@ export function createDurableToolCallStep() {
       // Get context from init data (the parent workflow input)
       const initData = getInitData<{
         runId: string;
+        runtimeBindingId?: string;
         agentId: string;
         options: SerializableDurableOptions;
         state: {
@@ -154,7 +157,7 @@ export function createDurableToolCallStep() {
         };
       }>();
 
-      const { runId, options: agentOptions, state } = initData;
+      const { runId, runtimeBindingId, options: agentOptions, state } = initData;
       const logger = (mastra as any)?.getLogger?.();
       const identityDigest = createToolCallIdentityDigest({ toolCallId, toolName, args });
 
@@ -167,22 +170,56 @@ export function createDurableToolCallStep() {
       }
 
       // 1. Resolve the tool from global registry first, then Mastra
-      const registryEntry = globalRunRegistry.get(runId);
-      let tool = registryEntry?.tools?.[toolName];
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      if (!registryEntry && agentOptions.toolSurfaceFence !== undefined) {
+        throw new Error(
+          `[DurableAgent:${initData.agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
+        );
+      }
+      const replacementToolNames =
+        agentOptions.toolSurfaceFence !== undefined ? new Set(agentOptions.toolSurfaceFence) : undefined;
+      // For a replacement run, never dispatch from the mutable registry object.
+      // Select from the immutable surface bound to the fenced originals captured at
+      // preparation; fall back to re-materializing the fence when that surface is
+      // unavailable. Either way an in-place processor mutation of `registryEntry.tools`
+      // cannot swap the executable the model was shown a fenced original for.
+      let toolSourceMap: Record<string, CoreTool> | undefined = registryEntry?.tools;
+      if (registryEntry && replacementToolNames) {
+        // Revalidate at the side-effect boundary. A crash/restart can resume
+        // directly at this step after the LLM step's earlier validation, and this
+        // rebuild also fails closed on a partial registry.
+        toolSourceMap =
+          registryEntry.replacementToolSurface ??
+          (materializeToolSurfaceFence(createToolSurfaceFence(registryEntry.tools, replacementToolNames)) as Record<
+            string,
+            CoreTool
+          >);
+      }
+      let tool = replacementToolNames?.has(toolName) === false ? undefined : toolSourceMap?.[toolName];
 
-      if (!tool) {
+      if (!tool && replacementToolNames === undefined) {
         tool = resolveTool(toolName, mastra as Mastra);
       }
 
-      const toolKey = registryEntry?.tools?.[toolName]
+      const toolKey = toolSourceMap?.[toolName]
         ? toolName
-        : Object.entries(registryEntry?.tools ?? {}).find(([, registeredTool]) => registeredTool === tool)?.[0];
+        : Object.entries(toolSourceMap ?? {}).find(([, registeredTool]) => registeredTool === tool)?.[0];
       const effectiveActiveTools = activeTools === null ? undefined : (activeTools ?? agentOptions.activeTools);
       const activeToolKey = toolKey ?? toolName;
       const isHiddenByActiveTools = effectiveActiveTools !== undefined && !effectiveActiveTools.includes(activeToolKey);
 
       if (!tool || isHiddenByActiveTools) {
-        const availableToolNames = effectiveActiveTools ?? Object.keys(registryEntry?.tools ?? {});
+        const registeredToolNames = Object.keys(toolSourceMap ?? {});
+        const fenceScopedToolNames =
+          replacementToolNames === undefined
+            ? registeredToolNames
+            : registeredToolNames.filter(name => replacementToolNames.has(name));
+        const availableToolNames =
+          effectiveActiveTools === undefined
+            ? fenceScopedToolNames
+            : replacementToolNames === undefined
+              ? effectiveActiveTools
+              : effectiveActiveTools.filter(name => replacementToolNames.has(name));
         const availableToolsStr =
           availableToolNames.length > 0 ? ` Available tools: ${availableToolNames.join(', ')}` : '';
         const error = {
@@ -213,9 +250,9 @@ export function createDurableToolCallStep() {
       // Note: In foreach mode, the message list from the registry may be available
       // but for durability, we access what's available through the registry
       let messageList: MessageList | undefined;
-      // For local execution, the globalRunRegistry might have an ExtendedRunRegistry entry
-      // that stores the messageList. We cast and check safely.
-      const extendedEntry = globalRunRegistry.get(runId) as any;
+      // For local execution, the bound global entry may be an ExtendedRunRegistry entry
+      // that stores the MessageList. Reuse the already binding-checked value.
+      const extendedEntry = registryEntry as any;
       if (extendedEntry?.messageList) {
         messageList = extendedEntry.messageList;
       }

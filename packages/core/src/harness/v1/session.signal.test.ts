@@ -65,10 +65,32 @@ describe('Session.signal()', () => {
     const call = agent.streamCalls[0]!;
     expect((call.options as { runId: string }).runId).toBe(handle.runId);
 
-    const messages = call.messages as { __isCreatedSignal?: boolean; type?: string; contents?: unknown };
+    const messages = call.messages as {
+      __isCreatedSignal?: boolean;
+      type?: string;
+      tagName?: string;
+      contents?: unknown;
+    };
     expect(messages.__isCreatedSignal).toBe(true);
-    expect(messages.type).toBe('user-message');
+    expect(messages.type).toBe('user');
+    expect(messages.tagName).toBe('user');
     expect(messages.contents).toBe('hi');
+  });
+
+  it('threads replacement mode semantics through an idle signal wake', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      modes: [{ id: 'default', agentId: 'default', tools: { signalTool: {} as any } }],
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    const handle = await session.signal({ content: 'hi' });
+    await handle.result;
+
+    expect(agent.streamCalls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.streamCalls[0]!.options.toolsets['mode:default']).toHaveProperty('signalTool');
+    await session.close();
   });
 
   it('active-delivery dispatch returns willInterleave: true and reuses the in-flight runId', async () => {

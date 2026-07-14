@@ -269,7 +269,8 @@ The `cleanup()` returned by `observe()` destroys the run's registry entries and 
     name: 'runId',
     type: 'string',
     isOptional: true,
-    description: 'Unique identifier for this run. Use it later with `resume()` or `observe()`.',
+    description:
+      'Unique identifier for this run. Use it later with `resume()` or `observe()`. A caller-supplied ID remains reserved until the run is cleaned up; starting or preparing another active run with the same ID fails instead of replacing its runtime dependencies.',
   },
   {
     name: 'instructions',
@@ -307,6 +308,14 @@ The `cleanup()` returned by `observe()` destroys the run's registry entries and 
     type: 'object',
     isOptional: true,
     description: 'Additional tool sets available for this run.',
+  },
+  {
+    name: 'toolsetsMode',
+    type: "'merge' | 'replace'",
+    isOptional: true,
+    defaultValue: "'merge'",
+    description:
+      "Controls whether `toolsets` augment the agent's tool sources or replace all of them for this durable run. A non-empty replacement run fails closed after process or registry loss because Mastra can't safely reconstruct the original tool implementations by name alone. An empty replacement remains reconstructable as tool-free.",
   },
   {
     name: 'clientTools',
