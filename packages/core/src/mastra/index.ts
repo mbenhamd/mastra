@@ -83,6 +83,13 @@ type PendingWorkerStart = {
   ignoreShutdownError?: boolean;
 };
 
+type InternalWorkflowOwnershipState = {
+  latestGeneration: number;
+  ownedGenerations: Set<number>;
+  activeEventsByGeneration: Map<number, number>;
+  pendingReleaseGenerations: Set<number>;
+};
+
 /**
  * Creates an error for when a null/undefined value is passed to an add* method.
  * This commonly occurs when config is spread ({ ...config }) and the original
@@ -703,10 +710,11 @@ export class Mastra<
   #events: {
     [topic: string]: ((event: Event, cb?: () => Promise<void>) => Promise<void>)[];
   } = {};
-  #internalMastraWorkflows: Record<string, AnyWorkflow> = {};
+  #internalMastraWorkflows = new Map<string, AnyWorkflow>();
   #runScopedInternalWorkflows = new Map<string, Map<string, AnyWorkflow>>();
-  #runScopedWorkflowTimestamps = new Map<string, Map<string, number>>();
-  static readonly INTERNAL_WORKFLOW_TTL_MS = 30 * 60 * 1000;
+  #internalWorkflowOwnershipByRunId = new Map<string, Map<string, InternalWorkflowOwnershipState>>();
+  #internalWorkflowRegistrationGenerationByRunId = new Map<string, Map<string, number>>();
+  #nextInternalWorkflowOwnershipGeneration = 0;
   // Server cache for temporary persistence and durable agent resumable streams
   #serverCache: MastraServerCache;
   // Cache for stored agents to allow in-memory modifications (like model changes) to persist across requests
@@ -739,12 +747,14 @@ export class Mastra<
                 const workflowId = data?.workflowId as string | undefined;
                 const runId = data?.runId as string | undefined;
                 const isOwnedHere =
-                  (workflowId !== undefined &&
-                    runId !== undefined &&
-                    self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow)) ||
-                  runId?.startsWith('sched_') === true;
+                  workflowId !== undefined &&
+                  runId !== undefined &&
+                  self.#ownsInternalWorkflow(workflowId, runId, data?.parentWorkflow);
 
                 if (isOwnedHere) {
+                  if (topic === 'workflows') {
+                    self.#ensureInternalWorkflowRunOwned(workflowId, runId);
+                  }
                   return target.publish(
                     topic,
                     { ...event, data: { ...data, __mastraInternalWorkflow: true } },
@@ -752,7 +762,10 @@ export class Mastra<
                   );
                 }
               } else if (topic.startsWith('workflow.events.v2.')) {
-                return target.publish(topic, event, { ...options, localOnly: true });
+                const runId = event.runId;
+                if (typeof runId === 'string' && self.#internalWorkflowOwnershipByRunId.has(runId)) {
+                  return target.publish(topic, event, { ...options, localOnly: true });
+                }
               }
 
               // Preserve caller-supplied transport options for portable and unrelated events.
@@ -2994,7 +3007,7 @@ export class Mastra<
     return this.#lifecycleState === 'ready' && this.#harnesses[name] !== undefined;
   }
 
-  __registerInternalWorkflow(workflow: AnyWorkflow, runId?: string) {
+  __registerInternalWorkflow(workflow: AnyWorkflow, runId?: string): number | undefined {
     workflow.__registerMastra(this);
     workflow.__registerPrimitives({
       logger: this.getLogger(),
@@ -3006,39 +3019,49 @@ export class Mastra<
         this.#runScopedInternalWorkflows.set(workflow.id, runs);
       }
       runs.set(runId, workflow);
-
-      let timestamps = this.#runScopedWorkflowTimestamps.get(workflow.id);
-      if (!timestamps) {
-        timestamps = new Map();
-        this.#runScopedWorkflowTimestamps.set(workflow.id, timestamps);
+      const generation = ++this.#nextInternalWorkflowOwnershipGeneration;
+      let registrationGenerations = this.#internalWorkflowRegistrationGenerationByRunId.get(runId);
+      if (!registrationGenerations) {
+        registrationGenerations = new Map();
+        this.#internalWorkflowRegistrationGenerationByRunId.set(runId, registrationGenerations);
       }
-      timestamps.set(runId, Date.now());
-      this.#sweepStaleRunScopedWorkflows();
+      const previousGeneration = registrationGenerations.get(workflow.id);
+      if (previousGeneration !== undefined) {
+        this.#requestInternalWorkflowRunOwnershipRelease(workflow.id, runId, previousGeneration);
+      }
+      registrationGenerations.set(workflow.id, generation);
+      this.#acquireInternalWorkflowRunOwnership(workflow.id, runId, generation);
+      return generation;
     } else {
-      this.#internalMastraWorkflows[workflow.id] = workflow;
+      this.#internalMastraWorkflows.set(workflow.id, workflow);
     }
   }
 
-  __unregisterInternalWorkflow(id: string, runId: string) {
-    const runs = this.#runScopedInternalWorkflows.get(id);
-    runs?.delete(runId);
-    if (runs?.size === 0) this.#runScopedInternalWorkflows.delete(id);
+  __unregisterInternalWorkflow(id: string, runId: string, registrationGeneration?: number) {
+    const registrationGenerations = this.#internalWorkflowRegistrationGenerationByRunId.get(runId);
+    const currentGeneration = registrationGenerations?.get(id);
+    if (registrationGeneration !== undefined && currentGeneration !== registrationGeneration) return;
 
-    const timestamps = this.#runScopedWorkflowTimestamps.get(id);
-    timestamps?.delete(runId);
-    if (timestamps?.size === 0) this.#runScopedWorkflowTimestamps.delete(id);
+    const runs = this.#runScopedInternalWorkflows.get(id);
+    const removed = runs?.delete(runId) ?? false;
+    if (runs?.size === 0) this.#runScopedInternalWorkflows.delete(id);
+    registrationGenerations?.delete(id);
+    if (registrationGenerations?.size === 0) {
+      this.#internalWorkflowRegistrationGenerationByRunId.delete(runId);
+    }
+    if (removed) this.#requestInternalWorkflowRunOwnershipRelease(id, runId, currentGeneration);
   }
 
   __hasInternalWorkflow(id: string, runId?: string): boolean {
     return runId
-      ? !!this.#runScopedInternalWorkflows.get(id)?.has(runId) || !!this.#internalMastraWorkflows[id]
-      : !!this.#internalMastraWorkflows[id];
+      ? !!this.#runScopedInternalWorkflows.get(id)?.has(runId) || this.#internalMastraWorkflows.has(id)
+      : this.#internalMastraWorkflows.has(id);
   }
 
   __getInternalWorkflow(id: string, runId?: string): AnyWorkflow {
     const workflow = runId
-      ? (this.#runScopedInternalWorkflows.get(id)?.get(runId) ?? this.#internalMastraWorkflows[id])
-      : this.#internalMastraWorkflows[id];
+      ? (this.#runScopedInternalWorkflows.get(id)?.get(runId) ?? this.#internalMastraWorkflows.get(id))
+      : this.#internalMastraWorkflows.get(id);
     if (!workflow) {
       throw new MastraError({
         id: 'MASTRA_GET_INTERNAL_WORKFLOW_BY_ID_NOT_FOUND',
@@ -3055,18 +3078,98 @@ export class Mastra<
     return workflow;
   }
 
-  #sweepStaleRunScopedWorkflows() {
-    const now = Date.now();
-    for (const [workflowId, timestamps] of this.#runScopedWorkflowTimestamps) {
-      for (const [runId, registeredAt] of timestamps) {
-        if (now - registeredAt > Mastra.INTERNAL_WORKFLOW_TTL_MS) {
-          this.__unregisterInternalWorkflow(workflowId, runId);
-        }
-      }
+  /** @internal Holds routing ownership while a workflow event handler is active. */
+  __beginInternalWorkflowEvent(workflowId: string, runId: string): number | undefined {
+    const ownership = this.#internalWorkflowOwnershipByRunId.get(runId)?.get(workflowId);
+    if (!ownership) return undefined;
+
+    const generation = ownership.latestGeneration;
+    ownership.activeEventsByGeneration.set(generation, (ownership.activeEventsByGeneration.get(generation) ?? 0) + 1);
+    return generation;
+  }
+
+  /** @internal Defers terminal ownership release until concurrent handlers drain. */
+  __endInternalWorkflowEvent(workflowId: string, runId: string, generation: number, terminalEventHandled: boolean) {
+    const ownership = this.#internalWorkflowOwnershipByRunId.get(runId)?.get(workflowId);
+    if (!ownership) return;
+    const activeCount = ownership.activeEventsByGeneration.get(generation);
+    if (activeCount === undefined) return;
+
+    if (terminalEventHandled) {
+      ownership.pendingReleaseGenerations.add(generation);
+    }
+
+    if (activeCount > 1) {
+      ownership.activeEventsByGeneration.set(generation, activeCount - 1);
+      return;
+    }
+
+    ownership.activeEventsByGeneration.delete(generation);
+    if (ownership.pendingReleaseGenerations.has(generation)) {
+      this.#releaseInternalWorkflowRunOwnership(workflowId, runId, generation);
+    }
+  }
+
+  #ensureInternalWorkflowRunOwned(workflowId: string, runId: string) {
+    const existing = this.#internalWorkflowOwnershipByRunId.get(runId)?.get(workflowId);
+    if (existing) return existing.latestGeneration;
+    const generation = ++this.#nextInternalWorkflowOwnershipGeneration;
+    this.#acquireInternalWorkflowRunOwnership(workflowId, runId, generation);
+    return generation;
+  }
+
+  #acquireInternalWorkflowRunOwnership(workflowId: string, runId: string, generation: number) {
+    let ownershipByWorkflowId = this.#internalWorkflowOwnershipByRunId.get(runId);
+    if (!ownershipByWorkflowId) {
+      ownershipByWorkflowId = new Map();
+      this.#internalWorkflowOwnershipByRunId.set(runId, ownershipByWorkflowId);
+    }
+    const existing = ownershipByWorkflowId.get(workflowId);
+    if (existing) {
+      existing.latestGeneration = generation;
+      existing.ownedGenerations.add(generation);
+      return;
+    }
+    ownershipByWorkflowId.set(workflowId, {
+      latestGeneration: generation,
+      ownedGenerations: new Set([generation]),
+      activeEventsByGeneration: new Map(),
+      pendingReleaseGenerations: new Set(),
+    });
+  }
+
+  #requestInternalWorkflowRunOwnershipRelease(workflowId: string, runId: string, generation?: number) {
+    const ownership = this.#internalWorkflowOwnershipByRunId.get(runId)?.get(workflowId);
+    if (!ownership) return;
+    const releaseGeneration = generation ?? ownership.latestGeneration;
+    if ((ownership.activeEventsByGeneration.get(releaseGeneration) ?? 0) > 0) {
+      ownership.pendingReleaseGenerations.add(releaseGeneration);
+      return;
+    }
+    this.#releaseInternalWorkflowRunOwnership(workflowId, runId, releaseGeneration);
+  }
+
+  #releaseInternalWorkflowRunOwnership(workflowId: string, runId: string, generation: number) {
+    const ownershipByWorkflowId = this.#internalWorkflowOwnershipByRunId.get(runId);
+    const ownership = ownershipByWorkflowId?.get(workflowId);
+    if (!ownership) return;
+
+    ownership.pendingReleaseGenerations.delete(generation);
+    ownership.activeEventsByGeneration.delete(generation);
+    ownership.ownedGenerations.delete(generation);
+    if (ownership.ownedGenerations.size > 0) {
+      ownership.latestGeneration = Math.max(...ownership.ownedGenerations);
+      return;
+    }
+
+    ownershipByWorkflowId!.delete(workflowId);
+    if (ownershipByWorkflowId!.size === 0) {
+      this.#internalWorkflowOwnershipByRunId.delete(runId);
     }
   }
 
   #ownsInternalWorkflow(workflowId: string, runId: string, parentWorkflow: unknown): boolean {
+    if (this.#internalWorkflowOwnershipByRunId.get(runId)?.has(workflowId)) return true;
     if (this.__hasInternalWorkflow(workflowId, runId)) return true;
 
     let parent = parentWorkflow as { workflowId?: string; runId?: string; parentWorkflow?: unknown } | undefined;
@@ -3074,8 +3177,13 @@ export class Mastra<
     let depth = 0;
     while (parent && depth < 16 && !seen.has(parent)) {
       seen.add(parent);
-      if (parent.workflowId && parent.runId && this.__hasInternalWorkflow(parent.workflowId, parent.runId)) {
-        return true;
+      if (parent.workflowId && parent.runId) {
+        if (
+          this.#internalWorkflowOwnershipByRunId.get(parent.runId)?.has(parent.workflowId) ||
+          this.__hasInternalWorkflow(parent.workflowId, parent.runId)
+        ) {
+          return true;
+        }
       }
       parent = parent.parentWorkflow as typeof parent;
       depth += 1;
@@ -4738,7 +4846,6 @@ export class Mastra<
     if (data?.__mastraInternalWorkflow !== true) return true;
     const workflowId = data.workflowId;
     const runId = data.runId;
-    if (typeof runId === 'string' && runId.startsWith('sched_')) return true;
     return (
       typeof workflowId === 'string' &&
       typeof runId === 'string' &&

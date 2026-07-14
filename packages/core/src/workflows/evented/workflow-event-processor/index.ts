@@ -2367,8 +2367,16 @@ export class WorkflowEventProcessor extends EventProcessor {
    *   should drop the event (or return 4xx for HTTP push).
    */
   async handle(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
+    const data = event.data as { workflowId?: unknown; runId?: unknown } | undefined;
+    const workflowId = typeof data?.workflowId === 'string' ? data.workflowId : undefined;
+    const runId = typeof data?.runId === 'string' ? data.runId : undefined;
+    const internalEventGeneration =
+      workflowId !== undefined && runId !== undefined
+        ? this.mastra.__beginInternalWorkflowEvent(workflowId, runId)
+        : undefined;
+    let terminalEventHandled = false;
     try {
-      await this.#dispatch(event);
+      terminalEventHandled = await this.#dispatch(event);
       return { ok: true };
     } catch (err) {
       this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: error processing event', {
@@ -2377,6 +2385,10 @@ export class WorkflowEventProcessor extends EventProcessor {
         error: err,
       });
       return { ok: false, retry: true };
+    } finally {
+      if (internalEventGeneration !== undefined) {
+        this.mastra.__endInternalWorkflowEvent(workflowId!, runId!, internalEventGeneration, terminalEventHandled);
+      }
     }
   }
 
@@ -2396,7 +2408,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
   }
 
-  async #dispatch(event: Event) {
+  async #dispatch(event: Event): Promise<boolean> {
     const { type, data } = event;
 
     const workflowData = data as Omit<ProcessorArgs, 'workflow'>;
@@ -2407,7 +2419,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     });
 
     if (currentState?.status === 'canceled' && type !== 'workflow.end' && type !== 'workflow.cancel') {
-      return;
+      return false;
     }
 
     if (type.startsWith('workflow.user-event.')) {
@@ -2416,7 +2428,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         // Workflow no longer registered (e.g. deleted from code). Treat as a
         // terminal failure rather than throwing — otherwise the transport
         // would redeliver this event indefinitely.
-        return this.errorWorkflow(
+        await this.errorWorkflow(
           workflowData,
           new MastraError({
             id: 'MASTRA_WORKFLOW',
@@ -2425,6 +2437,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             category: ErrorCategory.SYSTEM,
           }),
         );
+        return false;
       }
       await processWorkflowWaitForEvent(
         {
@@ -2437,7 +2450,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           currentState: currentState!,
         },
       );
-      return;
+      return false;
     }
 
     let workflow;
@@ -2459,7 +2472,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (type === 'workflow.fail' || type === 'workflow.end' || type === 'workflow.cancel') {
         // fall through to switch below with workflow=undefined
       } else {
-        return this.errorWorkflow(
+        await this.errorWorkflow(
           workflowData,
           new MastraError({
             id: 'MASTRA_WORKFLOW',
@@ -2468,6 +2481,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             category: ErrorCategory.SYSTEM,
           }),
         );
+        return false;
       }
     }
 
@@ -2545,5 +2559,6 @@ export class WorkflowEventProcessor extends EventProcessor {
       default:
         break;
     }
+    return type === 'workflow.end' || type === 'workflow.fail';
   }
 }

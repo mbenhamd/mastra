@@ -127,6 +127,11 @@ export class CachingPubSub extends PubSub {
     event: Omit<Event, 'id' | 'createdAt' | 'index'>,
     options?: { localOnly?: boolean },
   ): Promise<void> {
+    if (options?.localOnly) {
+      await this.inner.publish(topic, event, options);
+      return;
+    }
+
     const cacheKey = this.getCacheKey(topic);
     const counterKey = this.getCounterKey(topic);
 

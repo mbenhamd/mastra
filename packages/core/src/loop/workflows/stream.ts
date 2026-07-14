@@ -200,9 +200,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         ...rest,
       });
 
-      if (rest.mastra) {
-        rest.mastra.__registerInternalWorkflow(agenticLoopWorkflow, runId);
-      }
+      const agenticLoopWorkflowRegistration = rest.mastra?.__registerInternalWorkflow(agenticLoopWorkflow, runId);
 
       const initialData = {
         messageId: messageId!,
@@ -272,7 +270,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         keepRegisteredForResume = executionResult.status === 'suspended';
       } finally {
         if (!keepRegisteredForResume) {
-          rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId);
+          rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId, agenticLoopWorkflowRegistration);
         }
       }
 
