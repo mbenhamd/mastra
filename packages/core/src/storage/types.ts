@@ -6,6 +6,7 @@ import type { MastraDBMessage, StorageThreadType, SerializedMemoryConfig } from 
 import type { ProcessorPhase } from '../processor-provider';
 import { getZodInnerType, getZodTypeName } from '../utils/zod-utils';
 import type {
+  StepResult,
   WorkflowRunState,
   WorkflowRunStatus,
   WorkflowTerminalStatus,
@@ -18,6 +19,10 @@ import type {
   WorkflowTerminalizationRecord,
 } from '../workflows';
 import type { WorkflowTerminalParentContinuationContract } from '../workflows/terminal-continuation';
+import type {
+  WorkflowTerminalRecoveryAncestryV1,
+  WorkflowTerminalRecoveryEnvelopeInputV1,
+} from '../workflows/terminal-recovery';
 
 export type StoragePagination = {
   page: number;
@@ -109,6 +114,20 @@ export type GetWorkflowTerminalizationResult =
   | { status: 'found'; record: WorkflowTerminalizationObservation }
   | { status: 'missing_record' | 'missing_run' | 'unsupported' };
 
+export interface GetWorkflowRunTerminalStatusInput {
+  workflowName: string;
+  runId: string;
+}
+
+export type DurableWorkflowRunTerminalStatus = Extract<
+  WorkflowRunStatus,
+  'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed'
+>;
+
+export type GetWorkflowRunTerminalStatusResult =
+  | { status: 'terminal'; terminalStatus: DurableWorkflowRunTerminalStatus }
+  | { status: 'nonterminal' | 'missing_run' | 'unsupported' };
+
 export interface AdvanceWorkflowTerminalizationInput extends GetWorkflowTerminalizationInput {
   ownerId: string;
   claimToken: string;
@@ -155,6 +174,8 @@ export interface PersistWorkflowTerminalStateInput extends GetWorkflowTerminaliz
   claimToken: string;
   claimGeneration: number;
   snapshot: WorkflowRunState;
+  /** Canonicalized exactly once at the adapter's authorized persistence boundary. */
+  recoveryEnvelope: WorkflowTerminalRecoveryEnvelopeInputV1;
   resourceId?: string;
   leaseMs?: number;
 }
@@ -165,7 +186,90 @@ export type PersistWorkflowTerminalStateResult =
       status: 'phase_conflict' | 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
       record: WorkflowTerminalizationObservation;
     }
-  | { status: 'invalid_snapshot' | 'missing_record' | 'missing_run' | 'unsupported' };
+  | {
+      status:
+        | 'invalid_snapshot'
+        | 'invalid_recovery_envelope'
+        | 'missing_recovery_ancestry'
+        | 'missing_record'
+        | 'missing_run'
+        | 'unsupported';
+    };
+
+/** @internal Immutable child-to-root ancestry captured before nested execution starts. */
+export interface WorkflowTerminalRecoveryAncestryRecord {
+  version: 1;
+  workflowName: string;
+  runId: string;
+  ancestryHash: `sha256:${string}`;
+  ancestry: WorkflowTerminalRecoveryAncestryV1;
+  createdAt: number;
+}
+
+export interface PersistWorkflowTerminalRecoveryAncestryInput extends GetWorkflowTerminalizationInput {
+  ancestry: WorkflowTerminalRecoveryAncestryV1;
+}
+
+export type PersistWorkflowTerminalRecoveryAncestryResult =
+  | { status: 'persisted' | 'already_persisted'; record: WorkflowTerminalRecoveryAncestryRecord }
+  | { status: 'ancestry_conflict' | 'missing_run' | 'unsupported' };
+
+export type GetWorkflowTerminalRecoveryAncestryResult =
+  | { status: 'found'; record: WorkflowTerminalRecoveryAncestryRecord }
+  | { status: 'missing_ancestry' | 'missing_run' | 'unsupported' };
+
+/** Atomically binds one nested child run to its scalar step or foreach iteration. */
+export interface BindWorkflowNestedRunOwnershipInput {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  nestedRunId: string;
+  forEachIndex?: number;
+  result: StepResult<any, any, any, any>;
+  requestContext: Record<string, any>;
+}
+
+export type BindWorkflowNestedRunOwnershipResult =
+  | {
+      status: 'bound' | 'already_bound';
+      stepResults: Record<string, StepResult<any, any, any, any>>;
+    }
+  | { status: 'ownership_conflict' | 'missing_run' | 'unsupported' };
+
+/**
+ * Atomically admits a nested child by binding its parent slot and retaining
+ * its immutable child-to-root recovery ancestry in the same storage section.
+ */
+export interface AdmitWorkflowNestedRunInput extends BindWorkflowNestedRunOwnershipInput {
+  nestedWorkflowName: string;
+  recoveryAncestry: WorkflowTerminalRecoveryAncestryV1;
+  /** Canonical graph identity expected for retained or newly initialized child state. */
+  expectedChildGraphFingerprint: string;
+  /** Initial child state created only when the durable child row is absent. */
+  initialChildSnapshot?: {
+    snapshot: WorkflowRunState;
+    resourceId?: string;
+  };
+}
+
+export type AdmitWorkflowNestedRunResult =
+  | {
+      status: 'admitted' | 'already_admitted';
+      stepResults: Record<string, StepResult<any, any, any, any>>;
+      recovery: WorkflowTerminalRecoveryAncestryRecord;
+      childSnapshotState: 'initialized' | 'retained' | 'not_requested';
+    }
+  | {
+      status:
+        | 'ownership_conflict'
+        | 'ancestry_conflict'
+        | 'parent_snapshot_conflict'
+        | 'parent_terminal'
+        | 'child_terminal'
+        | 'child_snapshot_conflict'
+        | 'missing_run'
+        | 'unsupported';
+    };
 
 export type WorkflowTerminalEffectDescriptor =
   | {
@@ -220,7 +324,7 @@ export interface GetWorkflowTerminalEffectForDispatchInput extends GetWorkflowTe
 }
 
 export type GetWorkflowTerminalEffectForDispatchResult =
-  | { status: 'found'; effect: WorkflowTerminalEffectRecord; snapshot: WorkflowRunState; resourceId?: string }
+  | { status: 'found'; effect: WorkflowTerminalEffectRecord; recovery: WorkflowTerminalSnapshotRecord }
   | {
       status: 'not_owner' | 'fence_conflict' | 'lease_expired' | 'complete';
       record: WorkflowTerminalizationObservation;
@@ -301,6 +405,7 @@ export type GetWorkflowTerminalParentContextResult =
         | 'missing_terminal_state'
         | 'missing_parent'
         | 'corrupt_parent_state'
+        | 'parent_conflict'
         | 'missing_record'
         | 'missing_run'
         | 'unsupported';
@@ -2518,6 +2623,12 @@ export interface UpdateWorkflowStateOptions {
   resumeLabels?: Record<string, { stepId: string; foreachIndex?: number }>;
   activePaths?: Array<number>;
   activeStepsPath?: Record<string, number[]>;
+  /**
+   * Exact event-local workflow state at a terminal boundary. Storage adapters
+   * atomically replace both persisted state views (`context.__state` and
+   * `value`) and advance the snapshot timestamp from their storage clock.
+   */
+  finalState?: Record<string, unknown>;
   /**
    * Tracing context for span continuity during suspend/resume.
    * Persisted when workflow suspends to enable linking resumed spans

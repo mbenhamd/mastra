@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import {
+  InMemoryDB,
+  WorkflowsInMemory,
   createEmptyWorkflowSnapshot,
   createWorkflowTerminalGraphFingerprint,
   createWorkflowTerminalParentContinuationContract,
 } from '@mastra/core/storage';
-import type { WorkflowRunState } from '@mastra/core/workflows';
+import type { WorkflowRunState, WorkflowTerminalRecoveryAncestryV1 } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 import { WorkflowsPG } from '.';
 
 describe('WorkflowsPG terminalization journal', () => {
@@ -32,14 +35,17 @@ describe('WorkflowsPG terminalization journal', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`DELETE FROM mastra_workflow_terminal_continuation_plans WHERE workflow_name = $1`, [
+      await client.query(`DELETE FROM mastra_workflow_terminal_continuation_plans_v2 WHERE workflow_name = $1`, [
         workflowName,
       ]);
-      await client.query(`DELETE FROM mastra_workflow_terminal_destination_receipts WHERE workflow_name = $1`, [
+      await client.query(`DELETE FROM mastra_workflow_terminal_destination_receipts_v2 WHERE workflow_name = $1`, [
         workflowName,
       ]);
-      await client.query(`DELETE FROM mastra_workflow_terminal_effects WHERE workflow_name = $1`, [workflowName]);
-      await client.query(`DELETE FROM mastra_workflow_terminal_snapshots WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminal_effects_v2 WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminal_snapshots_v2 WHERE workflow_name = $1`, [workflowName]);
+      await client.query(`DELETE FROM mastra_workflow_terminal_recovery_ancestries WHERE workflow_name = $1`, [
+        workflowName,
+      ]);
       await client.query(`DELETE FROM mastra_workflow_terminalizations WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1`, [workflowName]);
       await client.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1`, [workflowName]);
@@ -112,6 +118,204 @@ describe('WorkflowsPG terminalization journal', () => {
     }
   });
 
+  function recoveryEnvelope(
+    snapshot: WorkflowRunState,
+    identity: { workflowName: string; runId: string },
+    terminalStatus: 'success' | 'failed' | 'canceled',
+    ancestry: WorkflowTerminalRecoveryAncestryV1 = [],
+    terminalResult?: unknown,
+  ) {
+    return createTerminalRecoveryEnvelope({
+      ...identity,
+      snapshot,
+      terminalStatus,
+      ancestry,
+      terminalResult,
+    });
+  }
+
+  function nestedAncestry({
+    child,
+    parent,
+    parentSnapshot,
+    source,
+  }: {
+    child: { workflowName: string; runId: string };
+    parent: { workflowName: string; runId: string };
+    parentSnapshot: WorkflowRunState;
+    source:
+      | { kind: 'step'; stepId: string; executionPath: number[] }
+      | { kind: 'foreach-iteration'; stepId: string; containerPath: number[]; iterationIndex: number };
+  }): WorkflowTerminalRecoveryAncestryV1 {
+    return [
+      {
+        version: 1,
+        childWorkflowName: child.workflowName,
+        childRunId: child.runId,
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+        parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+        source,
+        inputPointer: { kind: 'parent-source-payload', stepId: source.stepId },
+        resultPointer: { kind: 'retained-terminal-result', workflowName: child.workflowName, runId: child.runId },
+        resumeMetadata: { wasResume: false, resumeSteps: [] },
+      },
+    ];
+  }
+
+  it('fences a stale child plan across adapters when the parent terminal claim wins', async () => {
+    const suffix = randomUUID();
+    const child = { workflowName: `claim-race-child-${suffix}`, runId: 'child-run' };
+    const parent = { workflowName: `claim-race-parent-${suffix}`, runId: 'parent-run' };
+    const now = Date.now();
+    const parentSnapshot: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(parent.runId),
+      status: 'running',
+      context: {
+        nested: {
+          status: 'running',
+          payload: {},
+          startedAt: now - 10,
+          metadata: { nestedRunId: child.runId },
+        },
+      } as WorkflowRunState['context'],
+      serializedStepGraph: [
+        { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+        { type: 'sleep', id: 'after-child', duration: 1 },
+      ],
+      activePaths: [0],
+      activeStepsPath: { nested: [0] },
+      timestamp: now - 10,
+    };
+    await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+    await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
+    try {
+      const childClaim = await workflowsA.claimWorkflowTerminalization({
+        ...child,
+        eventKey: 'child-terminal',
+        terminalStatus: 'success',
+        ownerId: 'child-owner',
+        leaseMs: 10_000,
+      });
+      if (childClaim.status !== 'acquired') throw new Error(`Expected acquired, received ${childClaim.status}`);
+      const fence = {
+        ...child,
+        ownerId: childClaim.record.ownerId,
+        claimToken: childClaim.record.claimToken,
+        claimGeneration: childClaim.record.claimGeneration,
+      };
+      const childSnapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(child.runId),
+        status: 'success',
+        result: { status: 'success', startedAt: now - 5, endedAt: now },
+        timestamp: now,
+      };
+      const ancestry = nestedAncestry({
+        child,
+        parent,
+        parentSnapshot,
+        source: { kind: 'step', stepId: 'nested', executionPath: [0] },
+      });
+      await workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...fence,
+          snapshot: childSnapshot,
+          recoveryEnvelope: recoveryEnvelope(childSnapshot, child, 'success', ancestry, childSnapshot.result),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted' });
+      const prepared = await workflowsA.prepareWorkflowTerminalEffect({
+        ...fence,
+        expectedPhase: 'run_state_persisted',
+        effect: {
+          kind: 'parent-workflow-step-end',
+          parentWorkflowName: parent.workflowName,
+          parentRunId: parent.runId,
+          parentStepId: 'nested',
+          parentExecutionPath: [0],
+        },
+      });
+      if (prepared.status !== 'prepared' || prepared.effect.kind !== 'parent-workflow-step-end') {
+        throw new Error('Expected parent effect');
+      }
+      const context = await workflowsA.getWorkflowTerminalParentContext(fence);
+      if (context.status !== 'found') throw new Error(`Expected found, received ${context.status}`);
+      const contract = createWorkflowTerminalParentContinuationContract({
+        version: 1,
+        terminalEffectKey: prepared.effect.effectKey,
+        terminalEffectPayloadHash: prepared.effect.payloadHash,
+        executionMode: 'continuous',
+        expectedParentRevision: context.revision,
+        graphFingerprint: createWorkflowTerminalGraphFingerprint(context.snapshot.serializedStepGraph),
+        childTerminalStatus: 'success',
+        observedParentStatus: 'running',
+        source: { kind: 'step', stepId: 'nested', executionPath: [0] },
+        action: {
+          kind: 'run-entry',
+          reason: 'next-step',
+          target: { kind: 'entry', entryType: 'sleep', entryId: 'after-child', executionPath: [1] },
+        },
+        patch: {
+          kind: 'merge-child-terminal',
+          resultWrite: 'source-coordinate',
+          resultSource: 'retained-child-terminal-envelope',
+          payloadWrite: 'preserve-parent-step-payload',
+          metadataWrite: 'merge-child-and-bind-nested-run-id',
+          stateWrite: 'replace-context-__state-from-retained-child',
+          requestContextWrite: 'merge-from-retained-child',
+          activeStepsWrite: 'derive-from-source-coordinate',
+          snapshotTimestampWrite: 'storage-clock',
+          parentRunWrite: { kind: 'preserve' },
+          loopWrite: { kind: 'preserve' },
+        },
+      });
+      const before = await workflowsA.loadWorkflowSnapshot(parent);
+      const beforeRevision = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      const parentClaim = await workflowsB.claimWorkflowTerminalization({
+        ...parent,
+        eventKey: 'parent-terminal',
+        terminalStatus: 'failed',
+        ownerId: 'parent-owner',
+        leaseMs: 10_000,
+      });
+      if (parentClaim.status !== 'acquired') throw new Error(`Expected acquired, received ${parentClaim.status}`);
+      const afterClaimRevision = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(Number(afterClaimRevision.rows[0]!.generation)).toBe(Number(beforeRevision.rows[0]!.generation) + 1);
+
+      await expect(workflowsA.getWorkflowTerminalParentContext(fence)).resolves.toEqual({ status: 'parent_conflict' });
+      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
+        status: 'parent_conflict',
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(before);
+
+      await expect(
+        workflowsB.claimWorkflowTerminalization({
+          ...parent,
+          eventKey: 'parent-terminal',
+          terminalStatus: 'failed',
+          ownerId: parentClaim.record.ownerId,
+          claimToken: parentClaim.record.claimToken,
+          claimGeneration: parentClaim.record.claimGeneration,
+          leaseMs: 10_000,
+        }),
+      ).resolves.toMatchObject({ status: 'renewed' });
+      const afterRenewRevision = await pool.query<{ generation: string }>(
+        `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
+        [parent.workflowName, parent.runId],
+      );
+      expect(afterRenewRevision.rows[0]!.generation).toBe(afterClaimRevision.rows[0]!.generation);
+    } finally {
+      await cleanup(child.workflowName);
+      await cleanup(parent.workflowName);
+    }
+  });
+
   it('atomically applies and recovers the exact graph-bound parent contract', async () => {
     const suffix = randomUUID();
     const child = { workflowName: `parent-apply-child-${suffix}`, runId: 'child-run' };
@@ -156,22 +360,31 @@ describe('WorkflowsPG terminalization journal', () => {
         claimToken: claimed.record.claimToken,
         claimGeneration: claimed.record.claimGeneration,
       };
+      const childSnapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(child.runId),
+        status: 'success',
+        result: {
+          status: 'success',
+          output: { answer: 42 },
+          startedAt: now - 10,
+          endedAt: now,
+        },
+        value: { final: true },
+        context: { __state: { final: true } } as WorkflowRunState['context'],
+        timestamp: now,
+      };
+      const ancestry = nestedAncestry({
+        child,
+        parent,
+        parentSnapshot,
+        source: { kind: 'step', stepId: 'nested', executionPath: [0] },
+      });
+      await workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
       await expect(
         workflowsA.persistWorkflowTerminalState({
           ...fence,
-          snapshot: {
-            ...createEmptyWorkflowSnapshot(child.runId),
-            status: 'success',
-            result: {
-              status: 'success',
-              output: { answer: 42 },
-              startedAt: now - 10,
-              endedAt: now,
-            },
-            value: { final: true },
-            context: { __state: { final: true } } as WorkflowRunState['context'],
-            timestamp: now,
-          },
+          snapshot: childSnapshot,
+          recoveryEnvelope: recoveryEnvelope(childSnapshot, child, 'success', ancestry, childSnapshot.result),
         }),
       ).resolves.toMatchObject({ status: 'persisted' });
       const prepared = await workflowsA.prepareWorkflowTerminalEffect({
@@ -228,24 +441,6 @@ describe('WorkflowsPG terminalization journal', () => {
 
       await pool.query(
         `UPDATE mastra_workflow_snapshot
-         SET snapshot = jsonb_set(snapshot, '{timestamp}', to_jsonb($1::bigint))
-         WHERE workflow_name = $2 AND run_id = $3`,
-        [Date.now() + 60_000, parent.workflowName, parent.runId],
-      );
-      await expect(workflowsA.applyWorkflowTerminalParentEffect({ ...fence, contract })).resolves.toEqual({
-        status: 'corrupt_parent_state',
-      });
-      await expect(workflowsA.getWorkflowTerminalContinuationPlan(fence)).resolves.toMatchObject({
-        status: 'missing_receipt',
-      });
-      await pool.query(
-        `UPDATE mastra_workflow_snapshot SET snapshot = $1
-         WHERE workflow_name = $2 AND run_id = $3`,
-        [JSON.stringify(parentSnapshot), parent.workflowName, parent.runId],
-      );
-
-      await pool.query(
-        `UPDATE mastra_workflow_snapshot
          SET snapshot = jsonb_set(snapshot, '{serializedStepGraph}', '[null]'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [parent.workflowName, parent.runId],
@@ -276,8 +471,8 @@ describe('WorkflowsPG terminalization journal', () => {
       );
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = snapshot #- '{context,__state}'
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = envelope #- '{finalState}'
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -288,15 +483,15 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'missing_receipt',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{context,__state}', '{"final":true}'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{finalState}', '{"final":true}'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{result,status}', '"failed"'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{terminalResult,status}', '"failed"'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -307,20 +502,20 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'missing_receipt',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = jsonb_set(snapshot, '{result,status}', '"success"'::jsonb, true)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = jsonb_set(envelope, '{terminalResult,status}', '"success"'::jsonb, true)
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
 
-      const retainedSnapshotBackup = await pool.query<{ snapshot: unknown }>(
-        `SELECT snapshot FROM mastra_workflow_terminal_snapshots
+      const retainedSnapshotBackup = await pool.query<{ envelope: unknown }>(
+        `SELECT envelope FROM mastra_workflow_terminal_snapshots_v2
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots
-         SET snapshot = to_jsonb('{'::text)
+        `UPDATE mastra_workflow_terminal_snapshots_v2
+         SET envelope = '{}'::jsonb
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
       );
@@ -328,9 +523,9 @@ describe('WorkflowsPG terminalization journal', () => {
         status: 'corrupt_child_terminal_state',
       });
       await pool.query(
-        `UPDATE mastra_workflow_terminal_snapshots SET snapshot = $1
+        `UPDATE mastra_workflow_terminal_snapshots_v2 SET envelope = $1
          WHERE workflow_name = $2 AND run_id = $3`,
-        [JSON.stringify(retainedSnapshotBackup.rows[0]!.snapshot), child.workflowName, child.runId],
+        [JSON.stringify(retainedSnapshotBackup.rows[0]!.envelope), child.workflowName, child.runId],
       );
 
       await pool.query(
@@ -362,7 +557,7 @@ describe('WorkflowsPG terminalization journal', () => {
       `);
       await pool.query(`
         CREATE TRIGGER ${rollbackTrigger}
-        BEFORE INSERT ON mastra_workflow_terminal_continuation_plans
+        BEFORE INSERT ON mastra_workflow_terminal_continuation_plans_v2
         FOR EACH ROW EXECUTE FUNCTION ${rollbackTrigger}()
       `);
       try {
@@ -370,7 +565,7 @@ describe('WorkflowsPG terminalization journal', () => {
           'PF-1771 rollback probe',
         );
       } finally {
-        await pool.query(`DROP TRIGGER IF EXISTS ${rollbackTrigger} ON mastra_workflow_terminal_continuation_plans`);
+        await pool.query(`DROP TRIGGER IF EXISTS ${rollbackTrigger} ON mastra_workflow_terminal_continuation_plans_v2`);
         await pool.query(`DROP FUNCTION IF EXISTS ${rollbackTrigger}()`);
       }
       await expect(workflowsA.loadWorkflowSnapshot(parent)).resolves.toEqual(parentBeforeRollback);
@@ -435,7 +630,7 @@ describe('WorkflowsPG terminalization journal', () => {
 
       await expect(
         pool.query(
-          `UPDATE mastra_workflow_terminal_continuation_plans
+          `UPDATE mastra_workflow_terminal_continuation_plans_v2
            SET contract = contract - 'executionMode'
            WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
           [prepared.effect.effectKey],
@@ -443,7 +638,7 @@ describe('WorkflowsPG terminalization journal', () => {
       ).rejects.toThrow();
       await expect(
         pool.query(
-          `UPDATE mastra_workflow_terminal_continuation_plans
+          `UPDATE mastra_workflow_terminal_continuation_plans_v2
            SET contract = jsonb_set(contract, '{expectedParentRevision}', '"pg:v1:999"'::jsonb)
            WHERE effect_key = $1 AND consumer_id = 'mastra.parent-application.v1'`,
           [prepared.effect.effectKey],
@@ -451,7 +646,7 @@ describe('WorkflowsPG terminalization journal', () => {
       ).rejects.toThrow();
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_destination_receipts
+        `UPDATE mastra_workflow_terminal_destination_receipts_v2
          SET application_state = 'quarantined', dispatch_state = 'none',
              applied_at = NULL, dispatch_pending_at = NULL, destination_applied_at = NULL,
              quarantined_at = updated_at
@@ -462,7 +657,7 @@ describe('WorkflowsPG terminalization journal', () => {
         'Contradictory workflow terminal parent application evidence',
       );
       await pool.query(
-        `UPDATE mastra_workflow_terminal_destination_receipts
+        `UPDATE mastra_workflow_terminal_destination_receipts_v2
          SET application_state = 'applied', dispatch_state = 'pending',
              applied_at = updated_at, dispatch_pending_at = updated_at,
              destination_applied_at = NULL, quarantined_at = NULL
@@ -471,7 +666,7 @@ describe('WorkflowsPG terminalization journal', () => {
       );
 
       await pool.query(
-        `UPDATE mastra_workflow_terminal_continuation_plans
+        `UPDATE mastra_workflow_terminal_continuation_plans_v2
          SET created_at = created_at + 1
          WHERE workflow_name = $1 AND run_id = $2`,
         [child.workflowName, child.runId],
@@ -480,7 +675,7 @@ describe('WorkflowsPG terminalization journal', () => {
         'Invalid workflow terminal continuation plan integrity',
       );
       await pool.query(
-        `UPDATE mastra_workflow_terminal_continuation_plans
+        `UPDATE mastra_workflow_terminal_continuation_plans_v2
          SET created_at = created_at - 1,
              receipt_key = $1,
              workflow_name = 'corrupted-workflow',
@@ -559,17 +754,26 @@ describe('WorkflowsPG terminalization journal', () => {
           claimToken: claimed.record.claimToken,
           claimGeneration: claimed.record.claimGeneration,
         };
+        const childSnapshot: WorkflowRunState = {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'success',
+          result: { status: 'success', output: { answer: 42 }, startedAt: now - 10, endedAt: now },
+          value: { final: true },
+          context: { __state: { final: true } } as WorkflowRunState['context'],
+          timestamp: now,
+        };
+        const ancestry = nestedAncestry({
+          child,
+          parent,
+          parentSnapshot,
+          source: { kind: 'foreach-iteration', stepId: 'each', containerPath: [0], iterationIndex: sourceIndex },
+        });
+        await workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
         await expect(
           workflowsA.persistWorkflowTerminalState({
             ...fence,
-            snapshot: {
-              ...createEmptyWorkflowSnapshot(child.runId),
-              status: 'success',
-              result: { status: 'success', output: { answer: 42 }, startedAt: now - 10, endedAt: now },
-              value: { final: true },
-              context: { __state: { final: true } } as WorkflowRunState['context'],
-              timestamp: now,
-            },
+            snapshot: childSnapshot,
+            recoveryEnvelope: recoveryEnvelope(childSnapshot, child, 'success', ancestry, childSnapshot.result),
           }),
         ).resolves.toMatchObject({ status: 'persisted' });
         const prepared = await workflowsA.prepareWorkflowTerminalEffect({
@@ -727,16 +931,25 @@ describe('WorkflowsPG terminalization journal', () => {
           claimToken: claim.record.claimToken,
           claimGeneration: claim.record.claimGeneration,
         };
+        const snapshot: WorkflowRunState = {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'success',
+          result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
+          context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
+          value: { [stepId]: true },
+          timestamp: now,
+        };
+        const ancestry = nestedAncestry({
+          child,
+          parent,
+          parentSnapshot,
+          source: { kind: 'step', stepId, executionPath },
+        });
+        await workflows.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
         await workflows.persistWorkflowTerminalState({
           ...fence,
-          snapshot: {
-            ...createEmptyWorkflowSnapshot(child.runId),
-            status: 'success',
-            result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
-            context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
-            value: { [stepId]: true },
-            timestamp: now,
-          },
+          snapshot,
+          recoveryEnvelope: recoveryEnvelope(snapshot, child, 'success', ancestry, snapshot.result),
         });
         const prepared = await workflows.prepareWorkflowTerminalEffect({
           ...fence,
@@ -800,9 +1013,9 @@ describe('WorkflowsPG terminalization journal', () => {
       expect(outcomes.map(result => result.status).sort()).toEqual(['applied', 'parent_conflict']);
       const evidence = await pool.query<{ receipt_count: string; plan_count: string }>(
         `SELECT
-           (SELECT count(*) FROM mastra_workflow_terminal_destination_receipts
+           (SELECT count(*) FROM mastra_workflow_terminal_destination_receipts_v2
             WHERE workflow_name = ANY($1::text[])) AS receipt_count,
-           (SELECT count(*) FROM mastra_workflow_terminal_continuation_plans
+           (SELECT count(*) FROM mastra_workflow_terminal_continuation_plans_v2
             WHERE workflow_name = ANY($1::text[])) AS plan_count`,
         [[leftChild.workflowName, rightChild.workflowName]],
       );
@@ -856,9 +1069,12 @@ describe('WorkflowsPG terminalization journal', () => {
         activePaths: variant === 'noop' ? [] : [...sourcePath],
         activeStepsPath:
           variant === 'wait' ? { left: [0, 0], right: [0, 1] } : variant === 'noop' ? {} : { nested: [0] },
-        timestamp: now - 20,
+        timestamp: now + 60_000,
       };
-      await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+      await workflowsA.persistWorkflowSnapshot({
+        ...parent,
+        snapshot: variant === 'noop' ? { ...parentSnapshot, status: 'running' } : parentSnapshot,
+      });
       await workflowsA.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
       try {
         const claim = await workflowsA.claimWorkflowTerminalization({
@@ -875,16 +1091,26 @@ describe('WorkflowsPG terminalization journal', () => {
           claimToken: claim.record.claimToken,
           claimGeneration: claim.record.claimGeneration,
         };
+        const childSnapshot: WorkflowRunState = {
+          ...createEmptyWorkflowSnapshot(child.runId),
+          status: 'success',
+          result: { status: 'success', output: variant, startedAt: now - 10, endedAt: now },
+          context: { __state: { final: true } } as WorkflowRunState['context'],
+          value: { final: true },
+          timestamp: now,
+        };
+        const ancestry = nestedAncestry({
+          child,
+          parent,
+          parentSnapshot,
+          source: { kind: 'step', stepId: sourceStepId, executionPath: [...sourcePath] },
+        });
+        await workflowsA.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
+        if (variant === 'noop') await workflowsA.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
         await workflowsA.persistWorkflowTerminalState({
           ...fence,
-          snapshot: {
-            ...createEmptyWorkflowSnapshot(child.runId),
-            status: 'success',
-            result: { status: 'success', output: variant, startedAt: now - 10, endedAt: now },
-            context: { __state: { final: true } } as WorkflowRunState['context'],
-            value: { final: true },
-            timestamp: now,
-          },
+          snapshot: childSnapshot,
+          recoveryEnvelope: recoveryEnvelope(childSnapshot, child, 'success', ancestry, childSnapshot.result),
         });
         const prepared = await workflowsA.prepareWorkflowTerminalEffect({
           ...fence,
@@ -967,7 +1193,20 @@ describe('WorkflowsPG terminalization journal', () => {
         });
         const after = await workflowsA.loadWorkflowSnapshot(parent);
         if (variant === 'wait') {
-          expect(after).toMatchObject({ context: { left: { status: 'success' }, right: { status: 'running' } } });
+          expect(after).toMatchObject({
+            timestamp: parentSnapshot.timestamp,
+            context: { left: { status: 'success' }, right: { status: 'running' } },
+          });
+          const evidenceClocks = await pool.query<{ applied_at: string; journal_updated_at: string }>(
+            `SELECT receipt.applied_at, journal.updated_at AS journal_updated_at
+             FROM mastra_workflow_terminal_destination_receipts_v2 AS receipt
+             JOIN mastra_workflow_terminalizations AS journal
+               ON journal.workflow_name = receipt.workflow_name AND journal.run_id = receipt.run_id
+             WHERE receipt.workflow_name = $1 AND receipt.run_id = $2`,
+            [child.workflowName, child.runId],
+          );
+          expect(Number(evidenceClocks.rows[0]!.applied_at)).toBeLessThan(parentSnapshot.timestamp);
+          expect(Number(evidenceClocks.rows[0]!.journal_updated_at)).toBeLessThan(parentSnapshot.timestamp);
         } else {
           expect(after).toEqual(before);
         }
@@ -1052,6 +1291,8 @@ describe('WorkflowsPG terminalization journal', () => {
         record: { claimGeneration: acquired.record.claimGeneration + 1 },
       });
       if (takeover.status !== 'acquired') throw new Error('takeover failed');
+      const terminalSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+      const terminalRecovery = recoveryEnvelope(terminalSnapshot, run, 'failed');
 
       await expect(
         workflowsA.persistWorkflowTerminalState({
@@ -1059,7 +1300,8 @@ describe('WorkflowsPG terminalization journal', () => {
           ownerId: acquired.record.ownerId!,
           claimToken: acquired.record.claimToken!,
           claimGeneration: acquired.record.claimGeneration,
-          snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+          snapshot: terminalSnapshot,
+          recoveryEnvelope: terminalRecovery,
         }),
       ).resolves.toMatchObject({ status: 'not_owner' });
       await expect(
@@ -1078,7 +1320,8 @@ describe('WorkflowsPG terminalization journal', () => {
           ownerId: takeover.record.ownerId!,
           claimToken: takeover.record.claimToken!,
           claimGeneration: takeover.record.claimGeneration,
-          snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+          snapshot: terminalSnapshot,
+          recoveryEnvelope: terminalRecovery,
         }),
       ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
       await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'failed' });
@@ -1136,6 +1379,12 @@ describe('WorkflowsPG terminalization journal', () => {
         leaseMs: 10_000,
       });
       if (claim.status !== 'acquired') throw new Error('claim failed');
+      const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+      const validRecovery = recoveryEnvelope(validSnapshot, run, 'failed');
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        run.workflowName,
+        run.runId,
+      ]);
       await expect(
         workflowsA.persistWorkflowTerminalState({
           ...run,
@@ -1143,6 +1392,7 @@ describe('WorkflowsPG terminalization journal', () => {
           claimToken: claim.record.claimToken,
           claimGeneration: claim.record.claimGeneration,
           snapshot: undefined as never,
+          recoveryEnvelope: validRecovery,
         }),
       ).resolves.toEqual({ status: 'invalid_snapshot' });
       await expect(
@@ -1156,13 +1406,140 @@ describe('WorkflowsPG terminalization journal', () => {
             status: 'failed',
             value: { unserializable: 1n },
           } as never,
+          recoveryEnvelope: validRecovery,
         }),
-      ).rejects.toThrow('BigInt');
+      ).resolves.toEqual({ status: 'invalid_snapshot' });
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot: { runId, status: 'failed', serializedStepGraph: [] } as unknown as WorkflowRunState,
+          recoveryEnvelope: validRecovery,
+        }),
+      ).resolves.toEqual({ status: 'invalid_snapshot' });
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot: validSnapshot,
+          recoveryEnvelope: undefined as never,
+        }),
+      ).resolves.toEqual({ status: 'invalid_recovery_envelope' });
       await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
         status: 'found',
         record: { phase: 'terminalization_pending' },
       });
       await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
+      const retained = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM mastra_workflow_terminal_snapshots_v2
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(retained.rows[0]?.count).toBe('0');
+      const revision = await pool.query(
+        `SELECT generation FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(revision.rowCount).toBe(0);
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('seeds a missing parent revision when terminal persistence succeeds', async () => {
+    const workflowName = `terminalization-revision-seed-${randomUUID()}`;
+    const runId = 'run';
+    const run = { workflowName, runId };
+    await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(runId) });
+
+    try {
+      const claim = await workflowsA.claimWorkflowTerminalization({
+        ...run,
+        eventKey: 'terminal-event',
+        terminalStatus: 'failed',
+        ownerId: 'worker',
+        leaseMs: 10_000,
+      });
+      if (claim.status !== 'acquired') throw new Error('claim failed');
+      await pool.query(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        run.workflowName,
+        run.runId,
+      ]);
+      const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot,
+          recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
+      const revision = await pool.query<{ generation: string; terminal_status: string | null }>(
+        `SELECT generation::text, terminal_status FROM mastra_workflow_parent_revisions
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [run.workflowName, run.runId],
+      );
+      expect(revision.rows).toEqual([{ generation: '1', terminal_status: 'failed' }]);
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it.each([
+    { label: 'explicit', existingResourceId: undefined, requestedResourceId: 'invalid\0resource' },
+    { label: 'existing-row fallback', existingResourceId: '', requestedResourceId: undefined },
+  ])('rejects an invalid $label resourceId before any terminal state write', async options => {
+    const workflowName = `terminalization-invalid-resource-${options.label}-${randomUUID()}`;
+    const runId = 'run';
+    const run = { workflowName, runId };
+    await workflowsA.persistWorkflowSnapshot({
+      ...run,
+      resourceId: options.existingResourceId,
+      snapshot: createEmptyWorkflowSnapshot(runId),
+    });
+
+    try {
+      const claim = await workflowsA.claimWorkflowTerminalization({
+        ...run,
+        eventKey: 'terminal-event',
+        terminalStatus: 'failed',
+        ownerId: 'worker',
+        leaseMs: 10_000,
+      });
+      if (claim.status !== 'acquired') throw new Error('claim failed');
+      const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot,
+          recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
+          resourceId: options.requestedResourceId,
+        }),
+      ).rejects.toThrow(/resourceId must be a well-formed non-empty string/);
+
+      await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
+        status: 'found',
+        record: { phase: 'terminalization_pending' },
+      });
+      await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
+      const retained = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM mastra_workflow_terminal_snapshots_v2
+         WHERE workflow_name = $1 AND run_id = $2`,
+        [workflowName, runId],
+      );
+      expect(retained.rows[0]?.count).toBe('0');
     } finally {
       await cleanup(workflowName);
     }
@@ -1198,6 +1575,7 @@ describe('WorkflowsPG terminalization journal', () => {
           claimToken: claim.record.claimToken,
           claimGeneration: claim.record.claimGeneration,
           snapshot,
+          recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
         }),
       ).resolves.toEqual({ status: 'invalid_snapshot' });
       await expect(workflowsA.getWorkflowTerminalization(run)).resolves.toMatchObject({
@@ -1205,6 +1583,130 @@ describe('WorkflowsPG terminalization journal', () => {
         record: { phase: 'terminalization_pending' },
       });
       await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('serializes an authorized terminal snapshot once with ordinary PG JSON semantics', async () => {
+    const workflowName = `terminalization-capture-${randomUUID()}`;
+    const run = { workflowName, runId: 'run' };
+    await workflowsA.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+    try {
+      const claim = await workflowsA.claimWorkflowTerminalization({
+        ...run,
+        eventKey: 'terminal-event',
+        terminalStatus: 'failed',
+        ownerId: 'worker',
+        leaseMs: 10_000,
+      });
+      if (claim.status !== 'acquired') throw new Error('claim failed');
+      const canonicalSnapshot = {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'failed' as const,
+        context: { __state: { captured: true } } as WorkflowRunState['context'],
+        value: { captured: true },
+      };
+      let toJSONCalls = 0;
+      const snapshot = {
+        ...canonicalSnapshot,
+        toJSON() {
+          toJSONCalls += 1;
+          return canonicalSnapshot;
+        },
+      };
+      await expect(
+        workflowsA.persistWorkflowTerminalState({
+          ...run,
+          ownerId: claim.record.ownerId,
+          claimToken: claim.record.claimToken,
+          claimGeneration: claim.record.claimGeneration,
+          snapshot,
+          recoveryEnvelope: recoveryEnvelope(canonicalSnapshot, run, 'failed'),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted' });
+      expect(toJSONCalls).toBe(1);
+      await expect(workflowsA.loadWorkflowSnapshot(run)).resolves.toMatchObject({
+        status: 'failed',
+        context: { __state: { captured: true } },
+        value: { captured: true },
+      });
+    } finally {
+      await cleanup(workflowName);
+    }
+  });
+
+  it('preserves fence-first precedence without executing hostile stale snapshot serialization', async () => {
+    const workflowName = `terminalization-precedence-${randomUUID()}`;
+    const run = { workflowName, runId: 'run' };
+    const memory = new WorkflowsInMemory({ db: new InMemoryDB() });
+    const stores = [memory, workflowsA] as const;
+    try {
+      for (const store of stores) {
+        await store.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+      }
+      const claims = await Promise.all(
+        stores.map(store =>
+          store.claimWorkflowTerminalization({
+            ...run,
+            eventKey: 'terminal-event',
+            terminalStatus: 'failed',
+            ownerId: 'owner-a',
+            leaseMs: 10_000,
+          }),
+        ),
+      );
+      const results = await Promise.all(
+        stores.map((store, index) => {
+          const claim = claims[index]!;
+          if (claim.status !== 'acquired') throw new Error(`Expected acquired, received ${claim.status}`);
+          return store.persistWorkflowTerminalState({
+            ...run,
+            ownerId: 'owner-b',
+            claimToken: claim.record.claimToken,
+            claimGeneration: claim.record.claimGeneration,
+            snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
+            recoveryEnvelope: {} as never,
+          });
+        }),
+      );
+      expect(results.map(result => result.status)).toEqual(['not_owner', 'not_owner']);
+
+      const validSnapshot = { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' as const };
+      const validRecovery = recoveryEnvelope(validSnapshot, run, 'failed');
+      let toJSONCalls = 0;
+      for (const [index, store] of stores.entries()) {
+        await expect(
+          store.persistWorkflowTerminalState({
+            ...run,
+            ownerId: 'owner-b',
+            claimToken: claims[index]!.record.claimToken,
+            claimGeneration: claims[index]!.record.claimGeneration,
+            snapshot: {
+              ...validSnapshot,
+              value: { unserializable: 1n },
+            } as never,
+            recoveryEnvelope: validRecovery,
+          }),
+        ).resolves.toMatchObject({ status: 'not_owner' });
+        await expect(
+          store.persistWorkflowTerminalState({
+            ...run,
+            ownerId: 'owner-b',
+            claimToken: claims[index]!.record.claimToken,
+            claimGeneration: claims[index]!.record.claimGeneration,
+            snapshot: {
+              ...validSnapshot,
+              toJSON() {
+                toJSONCalls += 1;
+                throw new Error('must not execute before authorization');
+              },
+            },
+            recoveryEnvelope: validRecovery,
+          }),
+        ).resolves.toMatchObject({ status: 'not_owner' });
+      }
+      expect(toJSONCalls).toBe(0);
     } finally {
       await cleanup(workflowName);
     }
@@ -1233,12 +1735,14 @@ describe('WorkflowsPG terminalization journal', () => {
         leaseMs: 10_000,
       });
       if (claim.status !== 'acquired') throw new Error('claim failed');
+      const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
       const operation = {
         ...run,
         ownerId: claim.record.ownerId,
         claimToken: claim.record.claimToken,
         claimGeneration: claim.record.claimGeneration,
-        snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const },
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot, run, 'failed'),
       };
       let workflowNameReads = 0;
       let runIdReads = 0;
@@ -1444,6 +1948,11 @@ describe('WorkflowsPG terminalization journal', () => {
       workflowsA.persistWorkflowTerminalState({
         ...invalidFence,
         snapshot: { ...createEmptyWorkflowSnapshot(missing.runId), status: 'failed' },
+        recoveryEnvelope: recoveryEnvelope(
+          { ...createEmptyWorkflowSnapshot(missing.runId), status: 'failed' },
+          missing,
+          'failed',
+        ),
       }),
     ).rejects.toThrow(TypeError);
   });
@@ -1485,7 +1994,7 @@ describe('WorkflowsPG terminalization journal', () => {
     expect(ddl).toContain('PRIMARY KEY ("workflow_name", "run_id")');
     expect(ddl).toContain('mastra_workflow_terminalizations_phase_lease_idx');
     expect(ddl).toContain('mastra_workflow_terminalizations_completed_idx');
-    expect(ddl).toContain('mastra_workflow_terminal_destination_receipts_lookup_idx');
+    expect(ddl).toContain('mastra_workflow_terminal_destination_receipts_v2_lookup_idx');
 
     const schemaName = 'tenant_identifier';
     const customSchemaDDL = WorkflowsPG.getExportDDL(schemaName).join('\n');
@@ -1590,13 +2099,19 @@ describe('WorkflowsPG terminalization journal', () => {
 
   it('enforces the receipt version and closed state matrix in fresh exported DDL', async () => {
     const schema = `r${randomUUID().replaceAll('-', '').slice(0, 4)}`;
-    const table = `"${schema}"."mastra_workflow_terminal_destination_receipts"`;
+    const table = `"${schema}"."mastra_workflow_terminal_destination_receipts_v2"`;
+    const effectTable = `"${schema}"."mastra_workflow_terminal_effects_v2"`;
     await pool.query(`CREATE SCHEMA "${schema}"`);
     try {
       const ddl = WorkflowsPG.getExportDDL(schema).find(
         statement => statement.startsWith('CREATE TABLE') && statement.includes('terminal_destination_receipts'),
       );
       if (!ddl) throw new Error('receipt DDL missing');
+      const effectDDL = WorkflowsPG.getExportDDL(schema).find(
+        statement => statement.startsWith('CREATE TABLE') && statement.includes('terminal_effects_v2'),
+      );
+      if (!effectDDL) throw new Error('effect DDL missing');
+      await pool.query(effectDDL);
       await pool.query(ddl);
       const insert = async (
         suffix: string,
@@ -1608,17 +2123,28 @@ describe('WorkflowsPG terminalization journal', () => {
         destinationAppliedAt: number | null,
         quarantinedAt: number | null,
         version = 1,
-      ) =>
-        pool.query(
+      ) => {
+        const effectKey = `effect-${suffix}`;
+        const runId = `run-${suffix}`;
+        const hash = `sha256:${'0'.repeat(64)}`;
+        await pool.query(
+          `INSERT INTO ${effectTable}
+            (workflow_name, run_id, effect_kind, version, effect_key, source_event_key, terminal_status,
+            recovery_envelope_hash, retained_record_hash, payload_hash, created_at)
+           VALUES ('workflow', $1, 'workflow-finish', 1, $2, $3, 'failed', $4, $4, $4, 100)`,
+          [runId, effectKey, `event-${suffix}`, hash],
+        );
+        return pool.query(
           `INSERT INTO ${table}
            (version, workflow_name, run_id, effect_key, consumer_id, receipt_key, effect_kind,
             producer_payload_hash, destination_hash, application_state, dispatch_state, created_at, updated_at,
             applied_at, dispatch_pending_at, destination_applied_at, quarantined_at)
-           VALUES ($1, 'workflow', 'run', $2, $3, $4, 'workflow-finish', 'payload', 'destination',
-             $5, $6, 100, $7, $8, $9, $10, $11)`,
+           VALUES ($1, 'workflow', $2, $3, $4, $5, 'workflow-finish', 'payload', 'destination',
+             $6, $7, 100, $8, $9, $10, $11, $12)`,
           [
             version,
-            `effect-${suffix}`,
+            runId,
+            effectKey,
             `consumer-${suffix}`,
             `receipt-${suffix}`,
             applicationState,
@@ -1630,6 +2156,7 @@ describe('WorkflowsPG terminalization journal', () => {
             quarantinedAt,
           ],
         );
+      };
 
       await insert('reserved', 'reserved', 'none', 100, null, null, null, null);
       await insert('applied', 'applied', 'none', 110, 110, null, null, null);
@@ -1674,7 +2201,9 @@ describe('WorkflowsPG terminalization journal', () => {
         if (!ddl) throw new Error(`${fragment} DDL missing`);
         await pool.query(ddl);
       }
-      const planDDL = exportDDL.find(statement => statement.includes('mastra_workflow_terminal_continuation_plans'))!;
+      const planDDL = exportDDL.find(statement =>
+        statement.includes('mastra_workflow_terminal_continuation_plans_v2'),
+      )!;
       expect(planDDL).toContain('"contract_hash" TEXT NOT NULL');
       expect(planDDL).toContain('"contract" JSONB NOT NULL');
       expect(planDDL).toContain('"framework_action_key" TEXT');
@@ -1688,6 +2217,8 @@ describe('WorkflowsPG terminalization journal', () => {
       const revisionDDL = exportDDL.find(statement => statement.includes('mastra_workflow_parent_revisions'))!;
       expect(revisionDDL).toContain('PRIMARY KEY ("workflow_name", "run_id")');
       expect(revisionDDL).toContain('"generation" BIGINT NOT NULL');
+      expect(revisionDDL).toContain('"terminal_status" TEXT');
+      expect(revisionDDL).toContain("'tripwire', 'bailed'");
     } finally {
       await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     }

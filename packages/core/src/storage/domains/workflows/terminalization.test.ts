@@ -4,14 +4,119 @@ import {
   applyWorkflowTerminalParentContinuationPatch,
   createWorkflowTerminalGraphFingerprint,
   createWorkflowTerminalParentContinuationContract,
+  MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES,
 } from '../../../workflows/terminal-continuation';
 import { InMemoryStore } from '../../mock';
+import type { AdmitWorkflowNestedRunInput } from '../../types';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
 import { InMemoryDB } from '../inmemory-db';
 import type { WorkflowsStorage } from './base';
 import { WorkflowsStorage as WorkflowsStorageBase } from './base';
 import { WorkflowsInMemory } from './inmemory';
-import { claimWorkflowTerminalizationRecord } from './terminalization';
+import {
+  captureWorkflowNestedRunAdmissionInput,
+  claimWorkflowTerminalizationRecord,
+  validateWorkflowNestedRunInitialSnapshot,
+} from './terminalization';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
+
+describe('Nested workflow admission materialization', () => {
+  const expectedChildGraphFingerprint = createWorkflowTerminalGraphFingerprint([]);
+  const input = (): AdmitWorkflowNestedRunInput => ({
+    workflowName: 'parent',
+    runId: 'parent-run',
+    stepId: 'nested',
+    nestedWorkflowName: 'child',
+    nestedRunId: 'child-run',
+    expectedChildGraphFingerprint,
+    result: { status: 'running' },
+    requestContext: {},
+    recoveryAncestry: [],
+  });
+
+  it('rejects an accessor admission identity without executing or alternating it', () => {
+    const admission = input();
+    let reads = 0;
+    Object.defineProperty(admission, 'nestedRunId', {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? 'child-a' : 'child-b';
+      },
+    });
+
+    expect(() => captureWorkflowNestedRunAdmissionInput(admission)).toThrow(
+      'Nested workflow admission nestedRunId must be own data',
+    );
+    expect(reads).toBe(0);
+  });
+
+  it('rejects inherited and accessor initial snapshot fields without executing them', () => {
+    const snapshot = { ...createEmptyWorkflowSnapshot('child-run'), status: 'running' as const };
+    const inherited = Object.create({ snapshot });
+    expect(() =>
+      validateWorkflowNestedRunInitialSnapshot(inherited, 'child-run', expectedChildGraphFingerprint),
+    ).toThrow('Initial nested workflow snapshot must be an own-data payload');
+
+    let reads = 0;
+    const accessor = {} as AdmitWorkflowNestedRunInput['initialChildSnapshot'];
+    Object.defineProperty(accessor, 'snapshot', {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return snapshot;
+      },
+    });
+    expect(() =>
+      validateWorkflowNestedRunInitialSnapshot(accessor, 'child-run', expectedChildGraphFingerprint),
+    ).toThrow('Initial nested workflow snapshot must be an own-data payload');
+    expect(reads).toBe(0);
+  });
+
+  it.each(['own', 'inherited'] as const)('rejects a %s top-level toJSON hook without executing it', placement => {
+    let calls = 0;
+    const toJSON = () => {
+      calls += 1;
+      return { runId: 'forged-run' };
+    };
+    const snapshot = { ...createEmptyWorkflowSnapshot('child-run'), status: 'running' as const };
+    if (placement === 'own') {
+      Object.defineProperty(snapshot, 'toJSON', { configurable: true, value: toJSON });
+    } else {
+      Object.setPrototypeOf(snapshot, { toJSON });
+    }
+
+    expect(() =>
+      validateWorkflowNestedRunInitialSnapshot({ snapshot }, 'child-run', expectedChildGraphFingerprint),
+    ).toThrow('Invalid workflow terminal recovery data at initialChildSnapshot.snapshot');
+    expect(calls).toBe(0);
+  });
+
+  it.each(['own', 'inherited'] as const)('rejects a nested %s toJSON hook without executing it', placement => {
+    let calls = 0;
+    const toJSON = () => {
+      calls += 1;
+      return { forged: true };
+    };
+    const payload = {};
+    if (placement === 'own') {
+      Object.defineProperty(payload, 'toJSON', { configurable: true, value: toJSON });
+    } else {
+      Object.setPrototypeOf(payload, { toJSON });
+    }
+    const snapshot = {
+      ...createEmptyWorkflowSnapshot('child-run'),
+      status: 'running' as const,
+      context: { nested: { status: 'success', output: payload } },
+      value: { payload },
+    };
+
+    expect(() =>
+      validateWorkflowNestedRunInitialSnapshot({ snapshot }, 'child-run', expectedChildGraphFingerprint),
+    ).toThrow('Invalid workflow terminal recovery data at initialChildSnapshot.snapshot');
+    expect(calls).toBe(0);
+  });
+});
 
 describe('WorkflowsStorage terminalization defaults', () => {
   it('reports unsupported explicitly when an adapter has not implemented the capability', async () => {
@@ -29,6 +134,20 @@ describe('WorkflowsStorage terminalization defaults', () => {
       }),
     ).resolves.toEqual({ status: 'unsupported' });
     await expect(workflows.getWorkflowTerminalization(run)).resolves.toEqual({ status: 'unsupported' });
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'unsupported' });
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry: [] })).resolves.toEqual({
+      status: 'unsupported',
+    });
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(run)).resolves.toEqual({ status: 'unsupported' });
+    await expect(
+      workflows.bindWorkflowNestedRunOwnership({
+        ...run,
+        stepId: 'nested',
+        nestedRunId: 'child-run',
+        result: { status: 'running' },
+        requestContext: {},
+      }),
+    ).resolves.toEqual({ status: 'unsupported' });
     await expect(
       workflows.advanceWorkflowTerminalization({
         ...run,
@@ -57,6 +176,11 @@ describe('WorkflowsStorage terminalization defaults', () => {
         claimToken: 'token',
         claimGeneration: 1,
         snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'failed' },
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...run,
+          snapshot: createEmptyWorkflowSnapshot(run.runId),
+          terminalStatus: 'failed',
+        }),
       }),
     ).resolves.toEqual({ status: 'unsupported' });
     await expect(
@@ -162,6 +286,14 @@ describe('WorkflowsInMemory terminalization journal', () => {
     };
   }
 
+  function recoveryEnvelope(
+    snapshot: WorkflowRunState,
+    identity: { workflowName: string; runId: string } = run,
+    terminalStatus: 'success' | 'failed' | 'canceled' = 'failed',
+  ) {
+    return createTerminalRecoveryEnvelope({ ...identity, snapshot, terminalStatus });
+  }
+
   function withStatefulIdentity<T extends { workflowName: string; runId: string }>(
     operation: T,
     alternate: { workflowName: string; runId: string },
@@ -183,9 +315,11 @@ describe('WorkflowsInMemory terminalization journal', () => {
   }
 
   async function persistFailedState(workflows: WorkflowsStorage, claim: Awaited<ReturnType<typeof acquire>>) {
+    const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
     return workflows.persistWorkflowTerminalState({
       ...fence(claim),
-      snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+      snapshot,
+      recoveryEnvelope: recoveryEnvelope(snapshot),
     });
   }
 
@@ -317,7 +451,10 @@ describe('WorkflowsInMemory terminalization journal', () => {
       requestContext: { parent: true, shared: 'parent' },
       timestamp: now - 20,
     };
-    await workflows.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: mode === 'noop' ? { ...parentSnapshot, status: 'running' } : parentSnapshot,
+    });
     await workflows.persistWorkflowSnapshot({ ...child, snapshot: createEmptyWorkflowSnapshot(child.runId) });
     const claimed = await workflows.claimWorkflowTerminalization({
       ...child,
@@ -354,12 +491,48 @@ describe('WorkflowsInMemory terminalization journal', () => {
       requestContext: { child: true, shared: 'child' },
       timestamp: now,
     };
+    const ancestry = [
+      {
+        version: 1 as const,
+        childWorkflowName: child.workflowName,
+        childRunId: child.runId,
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+        parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+        source:
+          foreachSuspendedCount === undefined
+            ? ({ kind: 'step', stepId: sourceStepId, executionPath: sourcePath } as const)
+            : ({
+                kind: 'foreach-iteration',
+                stepId: sourceStepId,
+                containerPath: [0],
+                iterationIndex: foreachSuspendedCount,
+              } as const),
+        inputPointer: { kind: 'parent-source-payload' as const, stepId: sourceStepId },
+        resultPointer: {
+          kind: 'retained-terminal-result' as const,
+          workflowName: child.workflowName,
+          runId: child.runId,
+        },
+        resumeMetadata: { wasResume: false, resumeSteps: [] },
+      },
+    ];
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry })).resolves.toMatchObject({
+      status: 'persisted',
+    });
     await workflows.persistWorkflowTerminalState({
       ...child,
       ownerId: claimed.record.ownerId,
       claimToken: claimed.record.claimToken,
       claimGeneration: claimed.record.claimGeneration,
       snapshot: childSnapshot,
+      recoveryEnvelope: createTerminalRecoveryEnvelope({
+        ...child,
+        snapshot: childSnapshot,
+        terminalStatus,
+        ancestry,
+        terminalResult,
+      }),
     });
     const prepared = await workflows.prepareWorkflowTerminalEffect({
       ...child,
@@ -384,6 +557,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       claimToken: claimed.record.claimToken,
       claimGeneration: claimed.record.claimGeneration,
     };
+    if (mode === 'noop') await workflows.persistWorkflowSnapshot({ ...parent, snapshot: parentSnapshot });
     const context = await workflows.getWorkflowTerminalParentContext(fence);
     if (context.status !== 'found') throw new Error('Expected parent context');
     const contractSource =
@@ -550,6 +724,44 @@ describe('WorkflowsInMemory terminalization journal', () => {
     expect(unrelatedGetter).not.toHaveBeenCalled();
   });
 
+  it('invalidates a pre-claim parent plan exactly once when the parent terminal claim wins', async () => {
+    const fixture = await setupGraphBoundParentApplication();
+    const before = await fixture.workflows.loadWorkflowSnapshot(fixture.parent);
+    const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
+    const revisionBefore = fixture.db.workflowTerminalParentRevisions.get(parentKey)?.generation;
+    const parentClaim = await fixture.workflows.claimWorkflowTerminalization({
+      ...fixture.parent,
+      eventKey: 'parent-terminal',
+      terminalStatus: 'failed',
+      ownerId: 'parent-terminal-owner',
+      leaseMs: 10_000,
+    });
+    if (parentClaim.status !== 'acquired') throw new Error(`Expected acquired, received ${parentClaim.status}`);
+    const revisionAfterClaim = fixture.db.workflowTerminalParentRevisions.get(parentKey)?.generation;
+    expect(revisionAfterClaim).toBe((revisionBefore ?? 0) + 1);
+
+    await expect(fixture.workflows.getWorkflowTerminalParentContext(fixture.fence)).resolves.toEqual({
+      status: 'parent_conflict',
+    });
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'parent_conflict' });
+    await expect(fixture.workflows.loadWorkflowSnapshot(fixture.parent)).resolves.toEqual(before);
+
+    await expect(
+      fixture.workflows.claimWorkflowTerminalization({
+        ...fixture.parent,
+        eventKey: 'parent-terminal',
+        terminalStatus: 'failed',
+        ownerId: parentClaim.record.ownerId,
+        claimToken: parentClaim.record.claimToken,
+        claimGeneration: parentClaim.record.claimGeneration,
+        leaseMs: 10_000,
+      }),
+    ).resolves.toMatchObject({ status: 'renewed' });
+    expect(fixture.db.workflowTerminalParentRevisions.get(parentKey)?.generation).toBe(revisionAfterClaim);
+  });
+
   it('atomically applies the exact PF-1781 patch and stores a pending framework action', async () => {
     const fixture = await setupGraphBoundParentApplication();
     const expected = applyWorkflowTerminalParentContinuationPatch({
@@ -653,7 +865,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
   });
 
-  it('records an already-terminal noop without rewriting or revising the parent', async () => {
+  it('durably records an exact-revision terminal parent noop without rewriting or revising it', async () => {
     const fixture = await setupGraphBoundParentApplication('success', 'noop');
     const before = await fixture.workflows.loadWorkflowSnapshot(fixture.parent);
     const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
@@ -664,10 +876,8 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
     expect(result).toMatchObject({
       status: 'applied',
-      plan: { contract: { action: { kind: 'noop', reason: 'already-terminal' } } },
+      plan: { contract: { action: { kind: 'noop' }, patch: { kind: 'none' } } },
     });
-    if (result.status !== 'applied') throw new Error('Expected applied noop');
-    expect(result.plan.frameworkActionKey).toBeUndefined();
     await expect(fixture.workflows.loadWorkflowSnapshot(fixture.parent)).resolves.toEqual(before);
     expect(fixture.db.workflowTerminalParentRevisions.get(parentKey)).toBe(revisionBefore);
     await expect(fixture.workflows.getWorkflowTerminalContinuationPlan(fixture.fence)).resolves.toMatchObject({
@@ -675,6 +885,48 @@ describe('WorkflowsInMemory terminalization journal', () => {
       applicationState: 'applied',
       dispatchState: 'none',
     });
+    await expect(fixture.workflows.getWorkflowTerminalization(fixture.fence)).resolves.toMatchObject({
+      status: 'found',
+      record: { phase: 'parent_effect_recorded' },
+    });
+  });
+
+  it('rejects a stale terminal-parent noop revision without creating application evidence', async () => {
+    const fixture = await setupGraphBoundParentApplication('success', 'noop');
+    const before = await fixture.workflows.loadWorkflowSnapshot(fixture.parent);
+    if (!before) throw new Error('Expected terminal parent snapshot');
+    await fixture.workflows.persistWorkflowSnapshot({ ...fixture.parent, snapshot: before });
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
+    ).resolves.toEqual({ status: 'parent_conflict' });
+    await expect(fixture.workflows.getWorkflowTerminalContinuationPlan(fixture.fence)).resolves.toEqual({
+      status: 'missing_receipt',
+    });
+  });
+
+  it('rejects a mutating contract against matching terminal parent evidence', async () => {
+    const fixture = await setupGraphBoundParentApplication('success', 'noop');
+    const { contractHash: _contractHash, ...noopSpec } = fixture.contract;
+    const mutating = createWorkflowTerminalParentContinuationContract({
+      ...noopSpec,
+      observedParentStatus: 'running',
+      action: {
+        kind: 'run-entry',
+        reason: 'next-step',
+        target: { kind: 'entry', entryType: 'sleep', entryId: 'after-child', executionPath: [1] },
+      },
+      patch: mergePatch,
+    });
+    const before = await fixture.workflows.loadWorkflowSnapshot(fixture.parent);
+    const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
+    const revisionBefore = fixture.db.workflowTerminalParentRevisions.get(parentKey);
+
+    await expect(
+      fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: mutating }),
+    ).resolves.toEqual({ status: 'parent_conflict' });
+    await expect(fixture.workflows.loadWorkflowSnapshot(fixture.parent)).resolves.toEqual(before);
+    expect(fixture.db.workflowTerminalParentRevisions.get(parentKey)).toBe(revisionBefore);
   });
 
   it.each([
@@ -814,18 +1066,22 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
   });
 
-  it('rejects future parent timestamps instead of fabricating a storage clock', async () => {
+  it('preserves an application parent timestamp ahead of the storage clock', async () => {
     const fixture = await setupGraphBoundParentApplication();
     const parentKey = JSON.stringify([fixture.parent.workflowName, fixture.parent.runId]);
     const parent = fixture.db.workflows.get(parentKey);
     if (!parent?.snapshot || typeof parent.snapshot === 'string') throw new Error('Expected in-memory parent snapshot');
-    parent.snapshot.timestamp = Date.now() + 60_000;
+    const applicationTimestamp = Date.now() + 60_000;
+    parent.snapshot.timestamp = applicationTimestamp;
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
-    ).resolves.toEqual({ status: 'corrupt_parent_state' });
-    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(0);
-    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(0);
+    ).resolves.toMatchObject({ status: 'applied' });
+    await expect(fixture.workflows.loadWorkflowSnapshot(fixture.parent)).resolves.toMatchObject({
+      timestamp: applicationTimestamp,
+    });
+    expect(fixture.db.workflowTerminalDestinationReceipts).toHaveLength(1);
+    expect(fixture.db.workflowTerminalContinuationPlans).toHaveLength(1);
   });
 
   it('classifies corrupt retained child evidence separately from caller contracts', async () => {
@@ -833,7 +1089,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
     const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
     const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
     if (!retained) throw new Error('Expected retained child snapshot');
-    delete retained.snapshot.context.__state;
+    delete (retained.envelope as Partial<typeof retained.envelope>).finalState;
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
@@ -847,7 +1103,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
     const journalKey = JSON.stringify([fixture.fence.workflowName, fixture.fence.runId]);
     const retained = fixture.db.workflowTerminalSnapshots.get(journalKey);
     if (!retained) throw new Error('Expected retained child snapshot');
-    retained.snapshot.result = { status: 'failed' } as never;
+    retained.envelope.terminalResult = { status: 'failed' } as never;
 
     await expect(
       fixture.workflows.applyWorkflowTerminalParentEffect({ ...fixture.fence, contract: fixture.contract }),
@@ -1070,16 +1326,43 @@ describe('WorkflowsInMemory terminalization journal', () => {
         claimToken: claim.record.claimToken,
         claimGeneration: claim.record.claimGeneration,
       };
+      const snapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'success',
+        result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
+        context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
+        value: { [stepId]: true },
+        timestamp: now,
+      };
+      const ancestry = [
+        {
+          version: 1 as const,
+          childWorkflowName: child.workflowName,
+          childRunId: child.runId,
+          parentWorkflowName: parent.workflowName,
+          parentRunId: parent.runId,
+          parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentSnapshot.serializedStepGraph),
+          source: { kind: 'step' as const, stepId, executionPath: path },
+          inputPointer: { kind: 'parent-source-payload' as const, stepId },
+          resultPointer: {
+            kind: 'retained-terminal-result' as const,
+            workflowName: child.workflowName,
+            runId: child.runId,
+          },
+          resumeMetadata: { wasResume: false, resumeSteps: [] },
+        },
+      ];
+      await workflows.persistWorkflowTerminalRecoveryAncestry({ ...child, ancestry });
       await workflows.persistWorkflowTerminalState({
         ...childFence,
-        snapshot: {
-          ...createEmptyWorkflowSnapshot(runId),
-          status: 'success',
-          result: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
-          context: { __state: { [stepId]: true } } as WorkflowRunState['context'],
-          value: { [stepId]: true },
-          timestamp: now,
-        },
+        snapshot,
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...child,
+          snapshot,
+          terminalStatus: 'success',
+          ancestry,
+          terminalResult: { status: 'success', output: stepId, startedAt: now - 10, endedAt: now },
+        }),
       });
       const effect = await workflows.prepareWorkflowTerminalEffect({
         ...childFence,
@@ -1215,6 +1498,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       claimToken: claim.claimToken!,
       claimGeneration: claim.claimGeneration,
     };
+    const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
 
     await expect(
       workflows.advanceWorkflowTerminalization({
@@ -1242,7 +1526,8 @@ describe('WorkflowsInMemory terminalization journal', () => {
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
-        snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot),
       }),
     ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
     await expect(
@@ -1255,31 +1540,48 @@ describe('WorkflowsInMemory terminalization journal', () => {
   });
 
   it('atomically persists an isolated terminal snapshot before certifying the journal phase', async () => {
-    const workflows = await setup();
+    const { db, workflows } = await setupWithDb();
     const claim = await acquire(workflows);
     const fenced = fence(claim);
+    const validSnapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+    const validRecoveryEnvelope = recoveryEnvelope(validSnapshot);
 
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
         snapshot: { ...createEmptyWorkflowSnapshot('other-run'), status: 'failed' },
+        recoveryEnvelope: validRecoveryEnvelope,
       }),
     ).resolves.toEqual({ status: 'invalid_snapshot' });
     await expect(
       workflows.persistWorkflowTerminalState({
         ...fenced,
         snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'paused' } as never,
+        recoveryEnvelope: validRecoveryEnvelope,
       }),
     ).resolves.toEqual({ status: 'invalid_snapshot' });
     for (const snapshot of [null, undefined, 'invalid', 1, []]) {
-      await expect(workflows.persistWorkflowTerminalState({ ...fenced, snapshot: snapshot as never })).resolves.toEqual(
-        { status: 'invalid_snapshot' },
-      );
+      await expect(
+        workflows.persistWorkflowTerminalState({
+          ...fenced,
+          snapshot: snapshot as never,
+          recoveryEnvelope: validRecoveryEnvelope,
+        }),
+      ).resolves.toEqual({ status: 'invalid_snapshot' });
     }
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...fenced,
+        snapshot: { runId, status: 'failed', serializedStepGraph: [] } as unknown as WorkflowRunState,
+        recoveryEnvelope: validRecoveryEnvelope,
+      }),
+    ).resolves.toEqual({ status: 'invalid_snapshot' });
     await expect(workflows.getWorkflowTerminalization(run)).resolves.toMatchObject({
       status: 'found',
       record: { phase: 'terminalization_pending' },
     });
+    expect(db.workflowTerminalSnapshots.size).toBe(0);
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
 
     const terminalSnapshot = {
       ...createEmptyWorkflowSnapshot(runId),
@@ -1287,7 +1589,11 @@ describe('WorkflowsInMemory terminalization journal', () => {
       context: { marker: { status: 'success' as const, output: { value: 'retained' } } },
     };
     await expect(
-      workflows.persistWorkflowTerminalState({ ...fenced, snapshot: terminalSnapshot }),
+      workflows.persistWorkflowTerminalState({
+        ...fenced,
+        snapshot: terminalSnapshot,
+        recoveryEnvelope: recoveryEnvelope(terminalSnapshot),
+      }),
     ).resolves.toMatchObject({ status: 'persisted', record: { phase: 'run_state_persisted' } });
 
     terminalSnapshot.context.marker.output.value = 'caller-mutated';
@@ -1305,6 +1611,269 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
   });
 
+  it('commits large root evidence but rejects nested evidence that native parent continuation cannot consume', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parentGraph: WorkflowRunState['serializedStepGraph'] = [
+      { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+    ];
+    const oversizedState = {
+      values: Array.from({ length: MAX_WORKFLOW_TERMINAL_CONTINUATION_DATA_NODES }, () => null),
+    };
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: 'parent-run',
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('parent-run'),
+        serializedStepGraph: parentGraph,
+      },
+    });
+
+    const persist = async (identity: { workflowName: string; runId: string }, nested: boolean) => {
+      const initial = createEmptyWorkflowSnapshot(identity.runId);
+      await workflows.persistWorkflowSnapshot({ ...identity, snapshot: initial });
+      const claim = await workflows.claimWorkflowTerminalization({
+        ...identity,
+        eventKey: `${identity.runId}-terminal`,
+        terminalStatus: 'failed',
+        ownerId,
+        leaseMs: 10_000,
+      });
+      if (claim.status !== 'acquired') throw new Error(`Expected acquired, received ${claim.status}`);
+      const ancestry = nested
+        ? [
+            {
+              version: 1 as const,
+              childWorkflowName: identity.workflowName,
+              childRunId: identity.runId,
+              parentWorkflowName: 'parent',
+              parentRunId: 'parent-run',
+              parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentGraph),
+              source: { kind: 'step' as const, stepId: 'nested', executionPath: [0] },
+              inputPointer: { kind: 'parent-source-payload' as const, stepId: 'nested' },
+              resultPointer: {
+                kind: 'retained-terminal-result' as const,
+                workflowName: identity.workflowName,
+                runId: identity.runId,
+              },
+              resumeMetadata: { wasResume: false, resumeSteps: [] },
+            },
+          ]
+        : [];
+      if (nested) {
+        await expect(
+          workflows.persistWorkflowTerminalRecoveryAncestry({ ...identity, ancestry }),
+        ).resolves.toMatchObject({ status: 'persisted' });
+      }
+      const snapshot: WorkflowRunState = {
+        ...initial,
+        status: 'failed',
+        context: { __state: oversizedState } as WorkflowRunState['context'],
+        value: oversizedState,
+      };
+      return workflows.persistWorkflowTerminalState({
+        ...identity,
+        ownerId: claim.record.ownerId,
+        claimToken: claim.record.claimToken,
+        claimGeneration: claim.record.claimGeneration,
+        snapshot,
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...identity,
+          snapshot,
+          terminalStatus: 'failed',
+          ancestry,
+        }),
+      });
+    };
+
+    const rootIdentity = { workflowName: 'large-root', runId: 'root-run' };
+    await expect(persist(rootIdentity, false)).resolves.toMatchObject({ status: 'persisted' });
+
+    const nestedIdentity = { workflowName: 'large-nested', runId: 'nested-run' };
+    await expect(persist(nestedIdentity, true)).resolves.toEqual({ status: 'invalid_recovery_envelope' });
+    await expect(workflows.getWorkflowTerminalization(nestedIdentity)).resolves.toMatchObject({
+      status: 'found',
+      record: { phase: 'terminalization_pending' },
+    });
+    expect(db.workflowTerminalSnapshots.has(JSON.stringify([nestedIdentity.workflowName, nestedIdentity.runId]))).toBe(
+      false,
+    );
+  });
+
+  it('rejects nested terminal fields that native parent continuation cannot consume', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const identity = { workflowName: 'nested-projection-parity', runId: 'child-run' };
+    const parentGraph: WorkflowRunState['serializedStepGraph'] = [
+      { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
+    ];
+    const snapshot: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(identity.runId),
+      status: 'success',
+      result: { status: 'success' },
+    };
+    const ancestry = [
+      {
+        version: 1 as const,
+        childWorkflowName: identity.workflowName,
+        childRunId: identity.runId,
+        parentWorkflowName: 'parent',
+        parentRunId: 'parent-run',
+        parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentGraph),
+        source: { kind: 'step' as const, stepId: 'nested', executionPath: [0] },
+        inputPointer: { kind: 'parent-source-payload' as const, stepId: 'nested' },
+        resultPointer: {
+          kind: 'retained-terminal-result' as const,
+          workflowName: identity.workflowName,
+          runId: identity.runId,
+        },
+        resumeMetadata: { wasResume: false, resumeSteps: [] },
+      },
+    ];
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: 'parent-run',
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('parent-run'),
+        serializedStepGraph: parentGraph,
+      },
+    });
+    await workflows.persistWorkflowSnapshot({ ...identity, snapshot: createEmptyWorkflowSnapshot(identity.runId) });
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...identity, ancestry })).resolves.toMatchObject({
+      status: 'persisted',
+    });
+    const claim = await workflows.claimWorkflowTerminalization({
+      ...identity,
+      eventKey: 'terminal-event',
+      terminalStatus: 'success',
+      ownerId,
+      leaseMs: 10_000,
+    });
+    if (claim.status !== 'acquired') throw new Error(`Expected acquired, received ${claim.status}`);
+    const operation = {
+      ...identity,
+      ownerId: claim.record.ownerId,
+      claimToken: claim.record.claimToken,
+      claimGeneration: claim.record.claimGeneration,
+      snapshot,
+    };
+
+    for (const terminalResult of [
+      { status: 'success', metadata: 'invalid' },
+      { status: 'success', startedAt: Date.now() + 2, endedAt: Date.now() + 1 },
+    ]) {
+      await expect(
+        workflows.persistWorkflowTerminalState({
+          ...operation,
+          recoveryEnvelope: createTerminalRecoveryEnvelope({
+            ...identity,
+            snapshot,
+            terminalStatus: 'success',
+            ancestry,
+            terminalResult,
+          }),
+        }),
+      ).resolves.toEqual({ status: 'invalid_recovery_envelope' });
+    }
+    await expect(workflows.getWorkflowTerminalization(identity)).resolves.toMatchObject({
+      status: 'found',
+      record: { phase: 'terminalization_pending' },
+    });
+    expect(db.workflowTerminalSnapshots.has(JSON.stringify([identity.workflowName, identity.runId]))).toBe(false);
+
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...operation,
+        recoveryEnvelope: createTerminalRecoveryEnvelope({
+          ...identity,
+          snapshot,
+          terminalStatus: 'success',
+          ancestry,
+          terminalResult: { status: 'success', startedAt: Date.now() + 1_000, endedAt: Date.now() + 1_001 },
+        }),
+      }),
+    ).resolves.toMatchObject({ status: 'persisted' });
+  });
+
+  it.each([
+    { label: 'explicit', existingResourceId: undefined, requestedResourceId: 'invalid\0resource' },
+    { label: 'existing-row fallback', existingResourceId: '', requestedResourceId: undefined },
+  ])('rejects an invalid $label resourceId before any terminal state write', async options => {
+    const { db, workflows } = await setupWithDb();
+    if (options.existingResourceId !== undefined) {
+      await workflows.persistWorkflowSnapshot({
+        ...run,
+        resourceId: options.existingResourceId,
+        snapshot: createEmptyWorkflowSnapshot(runId),
+      });
+    }
+    const claim = await acquire(workflows);
+    const snapshot = { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const };
+
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...fence(claim),
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot),
+        resourceId: options.requestedResourceId,
+      }),
+    ).rejects.toThrow(/resourceId must be a well-formed non-empty string/);
+
+    await expect(workflows.getWorkflowTerminalization(run)).resolves.toMatchObject({
+      status: 'found',
+      record: { phase: 'terminalization_pending' },
+    });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
+    expect(db.workflowTerminalSnapshots.size).toBe(0);
+  });
+
+  it.each([
+    {
+      terminalStatus: 'failed' as const,
+      terminalResult: { status: 'failed', error: { name: 'Error', message: 'authenticated failure' } },
+      expectedError: { name: 'Error', message: 'authenticated failure' },
+    },
+    {
+      terminalStatus: 'success' as const,
+      terminalResult: { status: 'success', output: { done: true } },
+      expectedError: undefined,
+    },
+    {
+      terminalStatus: 'canceled' as const,
+      terminalResult: { status: 'canceled' },
+      expectedError: undefined,
+    },
+  ])(
+    'projects authenticated $terminalStatus error truth into the replaceable workflow row',
+    async ({ terminalStatus, terminalResult, expectedError }) => {
+      const workflows = await setup();
+      const claim = await acquire(workflows, { terminalStatus });
+      const snapshot: WorkflowRunState = {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: terminalStatus,
+        error: { name: 'Error', message: 'stale caller error' },
+      };
+
+      await expect(
+        workflows.persistWorkflowTerminalState({
+          ...fence(claim),
+          snapshot,
+          recoveryEnvelope: createTerminalRecoveryEnvelope({
+            ...run,
+            snapshot,
+            terminalStatus,
+            terminalResult,
+          }),
+        }),
+      ).resolves.toMatchObject({ status: 'persisted' });
+
+      const persisted = await workflows.loadWorkflowSnapshot(run);
+      expect(persisted?.result).toEqual(terminalResult);
+      expect(persisted?.error).toEqual(expectedError);
+      expect(Object.hasOwn(persisted ?? {}, 'error')).toBe(expectedError !== undefined);
+    },
+  );
+
   it('normalizes inherited stateful identity fields before validating and storing a snapshot', async () => {
     const workflows = await setup();
     const claim = await acquire(workflows);
@@ -1319,7 +1888,13 @@ describe('WorkflowsInMemory terminalization journal', () => {
     });
     Object.setPrototypeOf(snapshot, prototype);
 
-    await expect(workflows.persistWorkflowTerminalState({ ...fence(claim), snapshot })).resolves.toMatchObject({
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...fence(claim),
+        snapshot,
+        recoveryEnvelope: recoveryEnvelope(snapshot as WorkflowRunState),
+      }),
+    ).resolves.toMatchObject({
       status: 'persisted',
       record: { phase: 'run_state_persisted' },
     });
@@ -1339,6 +1914,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
       ...fence(claim),
       snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' as const },
     };
+    Object.assign(operation, { recoveryEnvelope: recoveryEnvelope(operation.snapshot) });
     let workflowNameReads = 0;
     let runIdReads = 0;
     Object.defineProperties(operation, {
@@ -1617,6 +2193,7 @@ describe('WorkflowsInMemory terminalization journal', () => {
         claimToken: originalToken!,
         claimGeneration: originalGeneration,
         snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'failed' },
+        recoveryEnvelope: recoveryEnvelope({ ...createEmptyWorkflowSnapshot(runId), status: 'failed' }),
       }),
     ).resolves.toMatchObject({ status: 'persisted' });
   });

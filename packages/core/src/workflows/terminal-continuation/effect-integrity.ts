@@ -16,7 +16,7 @@ function dataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
     allowNullPrototype: true,
     typeError: 'workflow terminal effect must be a plain data object',
     fieldsError: 'workflow terminal effect contains symbol or accessor fields',
-    maxKeys: 13,
+    maxKeys: 16,
     maxKeysError: 'workflow terminal effect contains unknown, missing, symbol, or accessor fields',
   });
 }
@@ -50,6 +50,9 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
     'runId',
     'sourceEventKey',
     'terminalStatus',
+    'recoveryEnvelopeHash',
+    'retainedRecordHash',
+    'resourceId',
     'payloadHash',
     'createdAt',
     ...(parent ? ['parentWorkflowName', 'parentRunId', 'parentStepId', 'parentExecutionPath'] : []),
@@ -61,6 +64,8 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
     'runId',
     'sourceEventKey',
     'terminalStatus',
+    'recoveryEnvelopeHash',
+    'retainedRecordHash',
     ...(parent ? ['parentWorkflowName', 'parentRunId', 'parentStepId', 'parentExecutionPath'] : []),
   ];
   if (
@@ -88,7 +93,32 @@ function materializeIntegrityInput(value: unknown): IntegrityInput {
       1_024,
     ),
     terminalStatus,
+    recoveryEnvelopeHash: validateWorkflowTerminalStructuralString(
+      descriptors.recoveryEnvelopeHash!.value,
+      'workflow terminal effect recoveryEnvelopeHash',
+      256,
+    ) as `sha256:${string}`,
+    retainedRecordHash: validateWorkflowTerminalStructuralString(
+      descriptors.retainedRecordHash!.value,
+      'workflow terminal effect retainedRecordHash',
+      256,
+    ) as `sha256:${string}`,
+    ...(Object.prototype.hasOwnProperty.call(descriptors, 'resourceId')
+      ? {
+          resourceId: validateWorkflowTerminalStructuralString(
+            descriptors.resourceId!.value,
+            'workflow terminal effect resourceId',
+            512,
+          ),
+        }
+      : {}),
   };
+  if (!/^sha256:[a-f0-9]{64}$/.test(common.recoveryEnvelopeHash)) {
+    throw new TypeError('workflow terminal effect recovery envelope hash is invalid');
+  }
+  if (!/^sha256:[a-f0-9]{64}$/.test(common.retainedRecordHash)) {
+    throw new TypeError('workflow terminal effect retained record hash is invalid');
+  }
   if (!parent) return common as IntegrityInput;
   return {
     ...common,
@@ -142,7 +172,15 @@ export function getWorkflowTerminalEffectIntegrity(input: unknown): { effectKey:
     effect.kind,
     ...destinationParts,
   ];
-  const payloadParts = [...identityParts, effect.terminalStatus];
+  const resourceParts =
+    effect.resourceId === undefined ? ['resource-id-absent'] : ['resource-id-present', effect.resourceId];
+  const payloadParts = [
+    ...identityParts,
+    effect.terminalStatus,
+    effect.recoveryEnvelopeHash,
+    effect.retainedRecordHash,
+    ...resourceParts,
+  ];
   return {
     effectKey: `wte:v1:${hashFramedParts('mastra.workflow-terminal-effect.identity.v1', identityParts)}`,
     payloadHash: `sha256:${hashFramedParts('mastra.workflow-terminal-effect.payload.v1', payloadParts)}`,

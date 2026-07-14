@@ -1,4 +1,6 @@
 import { isProxy } from 'node:util/types';
+import { isInfrastructureRequestContextKey } from '../../request-context';
+import type { WorkflowTerminalRecoveryEnvelopeV1 } from '../terminal-recovery/types';
 import type { WorkflowRunState, WorkflowTerminalEffectRecord, WorkflowTerminalSnapshotRecord } from '../types';
 import {
   materializeWorkflowTerminalForeachStates,
@@ -361,6 +363,47 @@ function optionalDataRecord(
   return value === undefined ? {} : dataRecord(value, field, budget);
 }
 
+export interface WorkflowTerminalParentContinuationChildProjection {
+  finalState: Record<string, unknown>;
+  requestContextPatch: Record<string, unknown>;
+  terminalResult: Record<string, unknown>;
+}
+
+/**
+ * @internal Applies the exact aggregate child-data budget consumed by parent
+ * continuation. Callers may use this before committing a nested envelope so a
+ * durable outbox can never contain child data that the native patch rejects.
+ */
+export function materializeWorkflowTerminalParentContinuationChildProjection(
+  envelope: Pick<WorkflowTerminalRecoveryEnvelopeV1, 'finalState' | 'requestContextPatch' | 'terminalResult'>,
+  retainedCreatedAt: number,
+): WorkflowTerminalParentContinuationChildProjection {
+  if (!Number.isSafeInteger(retainedCreatedAt) || retainedCreatedAt < 0) {
+    throw new TypeError('retained child createdAt must be a non-negative safe integer');
+  }
+  const budget = createContinuationDataBudget();
+  const projection = {
+    finalState: dataRecord(envelope.finalState, 'retained child final context.__state', budget),
+    requestContextPatch: optionalDataRecord(envelope.requestContextPatch, 'retained child requestContext', budget),
+    terminalResult: dataRecord(envelope.terminalResult, 'retained child terminal result', budget),
+  };
+  if (projection.terminalResult.metadata !== undefined) {
+    normalizedDataRecord(projection.terminalResult.metadata, 'retained child result metadata');
+  }
+  const startedAt = projection.terminalResult.startedAt;
+  const endedAt = projection.terminalResult.endedAt;
+  if (startedAt !== undefined && (!Number.isSafeInteger(startedAt) || (startedAt as number) < 0)) {
+    throw new TypeError('retained child startedAt must be a non-negative safe integer');
+  }
+  if (endedAt !== undefined && (!Number.isSafeInteger(endedAt) || (endedAt as number) < 0)) {
+    throw new TypeError('retained child endedAt must be a non-negative safe integer');
+  }
+  if (startedAt !== undefined && endedAt !== undefined && (startedAt as number) > (endedAt as number)) {
+    throw new TypeError('retained child result timestamps must be monotonic');
+  }
+  return projection;
+}
+
 function storedDataRecord(value: unknown, field: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError(`${field} must be a data object`);
@@ -393,16 +436,12 @@ function optionalNormalizedDataRecord(value: unknown, field: string): Record<str
 
 function terminalResultFromRetained(
   retained: WorkflowTerminalSnapshotRecord,
+  retainedTerminalResult: Record<string, unknown>,
   parentResult: ParentStepResult,
   nestedRunId: string,
   storageTimestamp: number,
-  childBudget: ContinuationDataBudget,
 ): ParentStepResult {
-  const childSnapshot = retained.snapshot;
-  const terminalResult =
-    childSnapshot.result === undefined
-      ? {}
-      : dataRecord(childSnapshot.result, 'retained child snapshot result', childBudget);
+  const terminalResult = retainedTerminalResult;
   const status = retained.terminalStatus;
   if (terminalResult.status !== undefined && terminalResult.status !== status) {
     throw new TypeError('retained child result status conflicts with its terminal snapshot');
@@ -410,13 +449,7 @@ function terminalResultFromRetained(
   if (status === 'success' && terminalResult.status !== 'success') {
     throw new TypeError('successful retained child snapshot is missing a successful result');
   }
-  const rawError = terminalResult.error ?? childSnapshot.error;
-  const error =
-    rawError === undefined
-      ? undefined
-      : terminalResult.error !== undefined
-        ? terminalResult.error
-        : canonicalJsonValue(rawError, 'retained child error', childBudget);
+  const error = terminalResult.error;
   if (status === 'failed' && error === undefined) {
     throw new TypeError('failed retained child snapshot is missing an error');
   }
@@ -446,7 +479,7 @@ function terminalResultFromRetained(
       'retained child result timestamps are not monotonic',
     );
   }
-  if ((endedAt as number) > retained.createdAt || retained.createdAt > storageTimestamp) {
+  if (retained.createdAt > storageTimestamp) {
     throw new WorkflowTerminalContinuationStoredStateError(
       'child',
       'retained child result timestamps are not monotonic',
@@ -517,8 +550,12 @@ function validateRetainedBinding(
     retained.runId !== effect.runId ||
     retained.terminalStatus !== childStatus ||
     retained.terminalStatus !== effect.terminalStatus ||
-    retained.snapshot.runId !== effect.runId ||
-    retained.snapshot.status !== retained.terminalStatus ||
+    retained.envelope.workflowName !== effect.workflowName ||
+    retained.envelope.runId !== effect.runId ||
+    retained.envelope.terminalStatus !== retained.terminalStatus ||
+    retained.envelopeHash !== effect.recoveryEnvelopeHash ||
+    retained.recordHash !== effect.retainedRecordHash ||
+    retained.resourceId !== effect.resourceId ||
     !Number.isSafeInteger(retained.createdAt) ||
     retained.createdAt < 0
   ) {
@@ -937,9 +974,6 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
   readContinuationStoredState('parent', () =>
     assertBoundedDataOnly(parentSnapshot, 'parent continuation snapshot', createContinuationDataBudget()),
   );
-  readContinuationStoredState('child', () =>
-    assertBoundedDataOnly(retainedChild, 'retained child terminal snapshot', createContinuationDataBudget(), true),
-  );
   readContinuationStoredState('parent', () => validateStoredParentSnapshotForContinuation(parentSnapshot));
   validateParentContinuationIdentityBinding(contract, {
     effect,
@@ -980,24 +1014,9 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
   readContinuationStoredState('child', () =>
     validateRetainedBinding(retainedChild, effect, contract.childTerminalStatus),
   );
-  const retainedState = retainedChild.snapshot.context?.__state;
-  if (retainedState === undefined) {
-    throw new WorkflowTerminalContinuationStoredStateError(
-      'child',
-      'retained child snapshot is missing final context.__state',
-    );
-  }
   const parentNormalizationBudget = createContinuationDataBudget();
-  const childNormalizationBudget = createContinuationDataBudget();
-  const finalState = readContinuationStoredState('child', () =>
-    dataRecord(retainedState, 'retained child final context.__state', childNormalizationBudget),
-  );
-  const childRequestContext = readContinuationStoredState('child', () =>
-    optionalDataRecord(
-      retainedChild.snapshot.requestContext,
-      'retained child requestContext',
-      childNormalizationBudget,
-    ),
+  const childProjection = readContinuationStoredState('child', () =>
+    materializeWorkflowTerminalParentContinuationChildProjection(retainedChild.envelope, retainedChild.createdAt),
   );
   const parentRequestContext = readContinuationStoredState('parent', () =>
     optionalDataRecord(parentSnapshot.requestContext, 'parent requestContext', parentNormalizationBudget),
@@ -1006,7 +1025,7 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
     dataRecord(next.context?.[contract.source.stepId], 'parent source step result', parentNormalizationBudget),
   );
   const terminalResult = readContinuationStoredState('child', () =>
-    terminalResultFromRetained(retainedChild, existing, effect.runId, storageTimestamp, childNormalizationBudget),
+    terminalResultFromRetained(retainedChild, childProjection.terminalResult, existing, effect.runId, storageTimestamp),
   );
 
   let sourceResult: ParentStepResult;
@@ -1027,10 +1046,16 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
   }
 
   next.context.__state = readContinuationStoredState('child', () =>
-    clone(finalState),
+    clone(childProjection.finalState),
   ) as WorkflowRunState['context'][string];
-  next.value = readContinuationStoredState('child', () => clone(finalState)) as WorkflowRunState['value'];
-  next.requestContext = { ...parentRequestContext, ...childRequestContext };
+  next.value = readContinuationStoredState('child', () =>
+    clone(childProjection.finalState),
+  ) as WorkflowRunState['value'];
+  const applicationChildRequestContext: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(childProjection.requestContextPatch)) {
+    if (!isInfrastructureRequestContextKey(key)) defineDataProperty(applicationChildRequestContext, key, value);
+  }
+  next.requestContext = { ...parentRequestContext, ...applicationChildRequestContext };
 
   if (contract.patch.loopWrite.kind === 'set-iteration') {
     const loopWrite = contract.patch.loopWrite;

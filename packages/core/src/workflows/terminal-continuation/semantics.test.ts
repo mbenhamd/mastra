@@ -12,6 +12,9 @@ import {
   WORKFLOW_TERMINAL_FOREACH_STATE_KEY,
 } from './semantics';
 
+const RECOVERY_ENVELOPE_HASH = `sha256:${'e'.repeat(64)}` as const;
+const RETAINED_RECORD_HASH = `sha256:${'f'.repeat(64)}` as const;
+
 const mergePatch = {
   kind: 'merge-child-terminal',
   resultWrite: 'source-coordinate',
@@ -90,6 +93,8 @@ function effect(
     runId: 'child-run',
     sourceEventKey: 'event',
     terminalStatus,
+    recoveryEnvelopeHash: RECOVERY_ENVELOPE_HASH,
+    retainedRecordHash: RETAINED_RECORD_HASH,
     payloadHash: `sha256:${'d'.repeat(64)}`,
     createdAt: 20,
     parentWorkflowName: 'parent',
@@ -115,21 +120,19 @@ function retained(
     runId: 'child-run',
     terminalStatus,
     createdAt: 20,
-    snapshot: {
+    envelopeHash: RECOVERY_ENVELOPE_HASH,
+    recordHash: RETAINED_RECORD_HASH,
+    envelope: {
+      version: 1,
+      workflowName: 'child',
       runId: 'child-run',
-      status: terminalStatus,
-      result,
-      ...(terminalStatus === 'failed' ? { error: { message: 'boom', name: 'Error' } } : {}),
-      value: {},
-      context: { __state: { final: true } } as WorkflowRunState['context'],
-      serializedStepGraph: [],
-      activePaths: [],
-      activeStepsPath: {},
-      suspendedPaths: {},
-      resumeLabels: {},
-      waitingPaths: {},
-      requestContext: { child: true, shared: 'child' },
-      timestamp: 20,
+      terminalStatus,
+      executionMode: 'continuous',
+      terminalResult: result as never,
+      finalState: { final: true },
+      requestContextPatch: { child: true, shared: 'child' },
+      childGraphFingerprint: createWorkflowTerminalGraphFingerprint([]),
+      ancestry: [],
     },
   };
 }
@@ -156,6 +159,68 @@ function contractFor(snapshot: WorkflowRunState, overrides: Record<string, unkno
 }
 
 describe('workflow terminal parent patch semantics', () => {
+  it('applies one aggregate child-projection budget at the exact node boundary', () => {
+    const finalState = { values: Array.from({ length: 2_045 }, () => null) };
+    const terminalResult = { status: 'success' };
+    const applyAt = (requestContextLength: number) => {
+      const parent = parentSnapshot();
+      const child = retained('success', terminalResult);
+      child.envelope.finalState = finalState;
+      child.envelope.requestContextPatch = {
+        values: Array.from({ length: requestContextLength }, () => null),
+      };
+      return applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(parent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: parent,
+        retainedChild: child,
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      });
+    };
+
+    expect(() => applyAt(2_048)).not.toThrow();
+    expect(() => applyAt(2_049)).toThrow(/node limit/);
+  });
+
+  it.each([
+    ['non-object metadata', { status: 'success', metadata: 'invalid' }, /metadata must be a normalized data object/],
+    ['non-monotonic timestamps', { status: 'success', startedAt: 21, endedAt: 20 }, /must be monotonic/],
+  ])('rejects producer-invalid %s through the actual parent patch', (_label, result, message) => {
+    const parent = parentSnapshot();
+    expect(() =>
+      applyWorkflowTerminalParentContinuationPatch({
+        contract: contractFor(parent),
+        effect: effect(),
+        parentRevision: 'revision-1',
+        parentWorkflowName: 'parent',
+        parentSnapshot: parent,
+        retainedChild: retained('success', result),
+        storageTimestamp: 30,
+        executionMode: 'continuous',
+      }),
+    ).toThrow(message);
+  });
+
+  it('accepts an application result clock ahead of retained database evidence', () => {
+    const parent = parentSnapshot();
+    parent.timestamp = 50;
+    const next = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(parent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: parent,
+      retainedChild: retained('success', { status: 'success', startedAt: 30, endedAt: 31 }),
+      storageTimestamp: 50,
+      executionMode: 'continuous',
+    });
+
+    expect(next).toMatchObject({ timestamp: 50, context: { nested: { startedAt: 10, endedAt: 31 } } });
+  });
+
   it('applies scalar success without mutating either snapshot', () => {
     const parent = parentSnapshot();
     const child = retained();
@@ -443,7 +508,7 @@ describe('workflow terminal parent patch semantics', () => {
   it('fails closed when exact retained final state is unavailable', () => {
     const parent = parentSnapshot();
     const child = retained();
-    delete child.snapshot.context.__state;
+    delete (child.envelope as { finalState?: unknown }).finalState;
     expect(() =>
       applyWorkflowTerminalParentContinuationPatch({
         contract: contractFor(parent),
@@ -455,18 +520,18 @@ describe('workflow terminal parent patch semantics', () => {
         storageTimestamp: 30,
         executionMode: 'continuous',
       }),
-    ).toThrow(/missing final context.__state/);
+    ).toThrow(/final context.__state must be a data object/);
   });
 
   it('normalizes touched data to JSON semantics before merging request context and state', () => {
     const parent = parentSnapshot();
     parent.requestContext = { tenantId: 'tenant-a', parent: true };
     const child = retained();
-    child.snapshot.requestContext = {
+    child.envelope.requestContextPatch = {
       tenantId: undefined,
       observedAt: new Date('2026-01-01T00:00:00.000Z'),
     };
-    child.snapshot.context.__state = {
+    child.envelope.finalState = {
       nested: { missing: undefined, observedAt: new Date('2026-01-01T00:00:00.000Z') },
     } as WorkflowRunState['context'][string];
     const next = applyWorkflowTerminalParentContinuationPatch({
@@ -487,6 +552,55 @@ describe('workflow terminal parent patch semantics', () => {
     expect(next.value).toEqual({ nested: { observedAt: '2026-01-01T00:00:00.000Z' } });
   });
 
+  it('preserves parent infrastructure context and applies only application-owned child keys', () => {
+    const parent = parentSnapshot();
+    parent.requestContext = {
+      mastra__resourceId: 'trusted-resource',
+      mastra__threadId: 'trusted-thread',
+      mastra__versions: { defaultStatus: 'published' },
+      __mastraInternal: 'trusted-internal',
+      user: { id: 'trusted-user' },
+      shared: 'parent',
+    };
+    const child = retained();
+    child.envelope.requestContextPatch = {
+      mastra__resourceId: 'untrusted-resource',
+      mastra__threadId: 'untrusted-thread',
+      mastra__versions: { defaultStatus: 'draft' },
+      mastra__future: 'untrusted-future-slot',
+      'mastra:tasks': 'untrusted-tasks',
+      __mastraInternal: 'untrusted-internal',
+      __harnessChannelReservedTools: ['untrusted-tool'],
+      user: { id: 'untrusted-user' },
+      shared: 'child',
+      custom: true,
+    };
+
+    const next = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(parent),
+      effect: effect(),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: parent,
+      retainedChild: child,
+      storageTimestamp: 30,
+      executionMode: 'continuous',
+    });
+
+    expect(next.requestContext).toEqual({
+      mastra__resourceId: 'trusted-resource',
+      mastra__threadId: 'trusted-thread',
+      mastra__versions: { defaultStatus: 'published' },
+      __mastraInternal: 'trusted-internal',
+      user: { id: 'trusted-user' },
+      shared: 'child',
+      custom: true,
+    });
+    expect(next.requestContext).not.toHaveProperty('mastra__future');
+    expect(next.requestContext).not.toHaveProperty('mastra:tasks');
+    expect(next.requestContext).not.toHaveProperty('__harnessChannelReservedTools');
+  });
+
   it('canonicalizes existing parent request context before applying the child overlay', () => {
     const parent = parentSnapshot();
     const parentRequestContext = Object.create(null) as Record<string, unknown>;
@@ -500,7 +614,7 @@ describe('workflow terminal parent patch semantics', () => {
     });
     parent.requestContext = parentRequestContext;
     const child = retained();
-    child.snapshot.requestContext = { child: true };
+    child.envelope.requestContextPatch = { child: true };
 
     const next = applyWorkflowTerminalParentContinuationPatch({
       contract: contractFor(parent),
@@ -644,12 +758,34 @@ describe('workflow terminal parent patch semantics', () => {
       }),
     ).toThrow(/byte limit/);
 
+    const boundedError = { message: 'x'.repeat(600_000) };
+    const boundedFailure = applyWorkflowTerminalParentContinuationPatch({
+      contract: contractFor(failedParent, {
+        childTerminalStatus: 'failed',
+        action: { kind: 'fail-parent', reason: 'parent-fail' },
+        patch: failedPatch,
+      }),
+      effect: effect('failed'),
+      parentRevision: 'revision-1',
+      parentWorkflowName: 'parent',
+      parentSnapshot: failedParent,
+      retainedChild: retained('failed', {
+        status: 'failed',
+        error: boundedError,
+        startedAt: 11,
+        endedAt: 20,
+      }),
+      storageTimestamp: 30,
+      executionMode: 'continuous',
+    });
+    expect(boundedFailure.error).toEqual(boundedError);
+
     const aggregateParent = parentSnapshot();
     aggregateParent.requestContext = {
       parentError: inheritedErrorWithMessage('p'.repeat(600_000)),
     };
     const aggregateChild = retained();
-    aggregateChild.snapshot.requestContext = {
+    aggregateChild.envelope.requestContextPatch = {
       childError: inheritedErrorWithMessage('c'.repeat(600_000)),
     };
     expect(
@@ -787,7 +923,7 @@ describe('workflow terminal parent patch semantics', () => {
   it('rejects a non-record retained final state', () => {
     const parent = parentSnapshot();
     const child = retained();
-    child.snapshot.context.__state = [] as unknown as WorkflowRunState['context'][string];
+    child.envelope.finalState = [] as never;
     expect(() =>
       applyWorkflowTerminalParentContinuationPatch({
         contract: contractFor(parent),
@@ -806,7 +942,7 @@ describe('workflow terminal parent patch semantics', () => {
     const parent = parentSnapshot();
     for (const requestContext of [{ value: 'a\0b' }, { ['key\0collision']: true }, { value: '\ud800' }]) {
       const child = retained();
-      child.snapshot.requestContext = requestContext;
+      child.envelope.requestContextPatch = requestContext as never;
       expect(() =>
         applyWorkflowTerminalParentContinuationPatch({
           contract: contractFor(parent),

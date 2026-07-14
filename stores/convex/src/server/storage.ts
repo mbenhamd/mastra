@@ -850,12 +850,16 @@ export async function handleTypedOperation(
         return { ok: false, error: `Snapshot for runId ${request.runId} is missing or has invalid context` };
       }
 
-      const parsedResult = parseWorkflowJson(request.result, 'result', request.runId);
+      const parsedResult = parseWorkflowJson<Record<string, any>>(request.result, 'result', request.runId);
       if (!parsedResult.ok) {
         return { ok: false, error: parsedResult.error };
       }
 
-      const parsedRequestContext = parseWorkflowJson(request.requestContext, 'requestContext', request.runId);
+      const parsedRequestContext = parseWorkflowJson<Record<string, any>>(
+        request.requestContext,
+        'requestContext',
+        request.runId,
+      );
       if (!parsedRequestContext.ok) {
         return { ok: false, error: parsedRequestContext.error };
       }
@@ -900,7 +904,7 @@ export async function handleTypedOperation(
         return { ok: false, error: `Snapshot for runId ${request.runId} is missing or has invalid context` };
       }
 
-      const parsedOpts = parseWorkflowJson(request.opts, 'opts', request.runId);
+      const parsedOpts = parseWorkflowJson<Record<string, any>>(request.opts, 'opts', request.runId);
       if (!parsedOpts.ok) {
         return { ok: false, error: parsedOpts.error };
       }

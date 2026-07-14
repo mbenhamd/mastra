@@ -17,6 +17,7 @@ import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
+import type { WorkflowTerminalRecoveryEnvelopeV1 } from './terminal-recovery/types';
 
 export type OutputWriter<TChunk = any> = (chunk: TChunk, options?: { messageId?: string }) => Promise<void>;
 
@@ -410,6 +411,12 @@ interface WorkflowTerminalEffectRecordBase {
   runId: string;
   sourceEventKey: string;
   terminalStatus: WorkflowTerminalStatus;
+  /** Hash of the canonical retained recovery envelope authorized by this effect. */
+  recoveryEnvelopeHash: `sha256:${string}`;
+  /** Hash of the complete retained terminal record, including resource presence. */
+  retainedRecordHash: `sha256:${string}`;
+  /** Optional canonical finish-delivery resource identity bound into payloadHash. */
+  resourceId?: string;
   payloadHash: string;
   createdAt: number;
 }
@@ -432,14 +439,17 @@ export interface WorkflowTerminalFinishEffectRecord extends WorkflowTerminalEffe
 /** @internal Durable producer intent. It intentionally contains no workflow result or request context. */
 export type WorkflowTerminalEffectRecord = WorkflowTerminalParentEffectRecord | WorkflowTerminalFinishEffectRecord;
 
-/** @internal Immutable terminal state retained independently from the replaceable workflow run row. */
+/** @internal Authenticated terminal recovery evidence retained independently from the replaceable workflow run row. */
 export interface WorkflowTerminalSnapshotRecord {
   version: 1;
   workflowName: string;
   runId: string;
   resourceId?: string;
   terminalStatus: WorkflowTerminalStatus;
-  snapshot: WorkflowRunState;
+  envelopeHash: `sha256:${string}`;
+  /** Authenticates the envelope binding and explicit present/absent resource identity. */
+  recordHash: `sha256:${string}`;
+  envelope: WorkflowTerminalRecoveryEnvelopeV1;
   createdAt: number;
 }
 

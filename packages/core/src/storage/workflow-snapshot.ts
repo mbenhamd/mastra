@@ -54,6 +54,14 @@ export function createEmptyWorkflowSnapshot(runId: string): WorkflowRunState {
   } as WorkflowRunState;
 }
 
+/** @internal Preserves a valid logical workflow clock across a storage-clock final-state write. */
+export function validateWorkflowSnapshotTimestampForFinalState(timestamp: unknown, now: number): number {
+  if (!Number.isSafeInteger(timestamp) || (timestamp as number) < 0 || !Number.isSafeInteger(now) || now < 0) {
+    throw new TypeError('Workflow snapshot and storage timestamps must be non-negative safe integers');
+  }
+  return Math.max(timestamp as number, now);
+}
+
 export function mergeWorkflowStepResult({
   snapshot,
   stepId,
@@ -69,9 +77,13 @@ export function mergeWorkflowStepResult({
     throw new Error(`Snapshot context not found for runId ${snapshot?.runId}`);
   }
 
-  const existingResult = snapshot.context[stepId];
+  const existingDescriptor = Object.getOwnPropertyDescriptor(snapshot.context, stepId);
+  const existingResult =
+    existingDescriptor?.enumerable && 'value' in existingDescriptor ? existingDescriptor.value : undefined;
+  let nextResult: StepResult<any, any, any, any>;
   if (
     existingResult &&
+    typeof existingResult === 'object' &&
     'output' in existingResult &&
     Array.isArray(existingResult.output) &&
     result &&
@@ -97,7 +109,7 @@ export function mergeWorkflowStepResult({
         }
       }
     }
-    snapshot.context[stepId] = {
+    nextResult = {
       ...existingResult,
       // Pending-marker writes are reset commands built from an earlier snapshot,
       // so keep existing step-level fields and ignore sibling values they carry.
@@ -105,8 +117,14 @@ export function mergeWorkflowStepResult({
       output: mergedOutput,
     };
   } else {
-    snapshot.context[stepId] = result;
+    nextResult = result;
   }
+  Object.defineProperty(snapshot.context, stepId, {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: nextResult,
+  });
 
   snapshot.requestContext = { ...snapshot.requestContext, ...requestContext };
   try {

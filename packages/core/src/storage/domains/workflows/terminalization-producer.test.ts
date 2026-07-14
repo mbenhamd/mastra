@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { WorkflowTerminalEffectRecord } from '../../../workflows';
+import type {
+  WorkflowRunState,
+  WorkflowTerminalEffectRecord,
+  WorkflowTerminalRecoveryAncestryV1,
+} from '../../../workflows';
+import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
 import { InMemoryDB } from '../inmemory-db';
 import type { WorkflowsStorage } from './base';
@@ -7,8 +12,10 @@ import { WorkflowsInMemory } from './inmemory';
 import {
   MAX_WORKFLOW_TERMINAL_PARENT_EXECUTION_PATH_LENGTH,
   createWorkflowTerminalEffectRecord,
+  getWorkflowTerminalSnapshotRecordHash,
   validateWorkflowTerminalEffectIntegrity,
 } from './terminalization';
+import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 
 describe('WorkflowsInMemory terminal producer outbox', () => {
   const now = new Date('2026-01-01T00:00:00.000Z');
@@ -30,12 +37,35 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     return JSON.stringify([run.workflowName, run.runId]);
   }
 
+  function parentGraph(stepId = 'nested', executionPath = [0]): WorkflowRunState['serializedStepGraph'] {
+    return Array.from({ length: executionPath[0]! + 1 }, (_, rootIndex) =>
+      rootIndex === executionPath[0]
+        ? executionPath.length === 1
+          ? { type: 'step' as const, step: { id: stepId, component: 'WORKFLOW' } }
+          : {
+              type: 'parallel' as const,
+              steps: Array.from({ length: executionPath[1]! + 1 }, (_, branchIndex) => ({
+                type: 'step' as const,
+                step: {
+                  id: branchIndex === executionPath[1] ? stepId : `filler-${rootIndex}-${branchIndex}`,
+                  component: branchIndex === executionPath[1] ? 'WORKFLOW' : 'STEP',
+                },
+              })),
+            }
+        : { type: 'sleep' as const, id: `filler-${rootIndex}`, duration: 1 },
+    );
+  }
+
   async function createTerminalRun(
     workflows: WorkflowsStorage,
     run: { workflowName: string; runId: string; resourceId?: string },
     eventKey = `${run.runId}-event`,
+    ancestry: WorkflowTerminalRecoveryAncestryV1 = [],
   ) {
-    await workflows.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), serializedStepGraph: parentGraph() },
+    });
     const claim = await workflows.claimWorkflowTerminalization({
       ...run,
       eventKey,
@@ -52,14 +82,55 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     };
     const snapshot = {
       ...createEmptyWorkflowSnapshot(run.runId),
+      serializedStepGraph: parentGraph(),
       status: 'failed' as const,
-      context: { marker: { status: 'success' as const, output: { retained: true } } },
+      context: {
+        __state: { retained: true },
+        marker: { status: 'success' as const, output: { retained: true } },
+      },
     };
-    await expect(workflows.persistWorkflowTerminalState({ ...fence, snapshot })).resolves.toMatchObject({
+    if (ancestry.length > 0) {
+      await workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry });
+    }
+    const recoveryEnvelope = createTerminalRecoveryEnvelope({
+      ...run,
+      snapshot,
+      terminalStatus: 'failed',
+      ancestry,
+    });
+    await expect(
+      workflows.persistWorkflowTerminalState({ ...fence, snapshot, recoveryEnvelope }),
+    ).resolves.toMatchObject({
       status: 'persisted',
       record: { phase: 'run_state_persisted' },
     });
     return { claim: claim.record, fence, snapshot };
+  }
+
+  function nestedAncestry(
+    child: { workflowName: string; runId: string },
+    parent: { workflowName: string; runId: string },
+    stepId = 'nested',
+    executionPath = [0],
+  ): WorkflowTerminalRecoveryAncestryV1 {
+    return [
+      {
+        version: 1,
+        childWorkflowName: child.workflowName,
+        childRunId: child.runId,
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+        parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(parentGraph(stepId, executionPath)),
+        source: { kind: 'step', stepId, executionPath },
+        inputPointer: { kind: 'parent-source-payload', stepId },
+        resultPointer: {
+          kind: 'retained-terminal-result',
+          workflowName: child.workflowName,
+          runId: child.runId,
+        },
+        resumeMetadata: { wasResume: false, resumeSteps: [] },
+      },
+    ];
   }
 
   function withStatefulIdentity<T extends { workflowName: string; runId: string }>(
@@ -93,6 +164,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       producerOutboxVersion: 1,
       destinationReceiptVersion: 1,
       parentApplicationVersion: 1,
+      recoveryVersion: 1,
     });
     const canonical = db.workflows.get(runKey(run))?.snapshot;
     const retained = db.workflowTerminalSnapshots.get(runKey(run));
@@ -102,20 +174,22 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       runId: run.runId,
       resourceId: run.resourceId,
       terminalStatus: 'failed',
-      snapshot: { status: 'failed', context: { marker: { output: { retained: true } } } },
+      envelopeHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      recordHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      envelope: { terminalStatus: 'failed', finalState: { retained: true } },
     });
-    expect(retained?.snapshot).not.toBe(canonical);
+    expect(retained?.envelope).not.toBe(canonical);
 
     snapshot.context.marker.output.retained = false;
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({
       context: { marker: { output: { retained: true } } },
     });
-    expect(retained?.snapshot).toMatchObject({ context: { marker: { output: { retained: true } } } });
+    expect(retained?.envelope).toMatchObject({ finalState: { retained: true } });
 
     await workflows.persistWorkflowSnapshot({ ...run, snapshot: createEmptyWorkflowSnapshot(run.runId) });
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'pending' });
     expect(db.workflowTerminalSnapshots.get(runKey(run))).toMatchObject({
-      snapshot: { status: 'failed', context: { marker: { output: { retained: true } } } },
+      envelope: { terminalStatus: 'failed', finalState: { retained: true } },
     });
   });
 
@@ -130,6 +204,14 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       effect: { kind: 'workflow-finish' as const },
     };
 
+    const retainedBeforePrepare = db.workflowTerminalSnapshots.get(runKey(run));
+    if (!retainedBeforePrepare) throw new Error('Expected retained terminal state');
+    retainedBeforePrepare.resourceId = 'redirected-before-prepare';
+    await expect(workflows.prepareWorkflowTerminalEffect(prepare)).rejects.toThrow(
+      'Invalid workflow terminal snapshot record integrity',
+    );
+    retainedBeforePrepare.resourceId = run.resourceId;
+
     const prepared = await workflows.prepareWorkflowTerminalEffect(prepare);
     expect(prepared).toMatchObject({
       status: 'prepared',
@@ -138,6 +220,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     if (prepared.status !== 'prepared') throw new Error('Expected prepared effect');
     expect(prepared.effect.effectKey).toMatch(/^wte:v1:[a-f0-9]{64}$/);
     expect(prepared.effect.payloadHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(prepared.effect.resourceId).toBe(run.resourceId);
     vi.advanceTimersByTime(9_000);
     await expect(workflows.prepareWorkflowTerminalEffect({ ...prepare, leaseMs: 10_000 })).resolves.toMatchObject({
       status: 'already_prepared',
@@ -149,24 +232,36 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
       workflows.getWorkflowTerminalEffectForDispatch({ ...fence, claimToken: 'wrong-token', kind: 'workflow-finish' }),
     ).resolves.toMatchObject({ status: 'fence_conflict' });
 
+    const retained = db.workflowTerminalSnapshots.get(runKey(run));
+    if (!retained) throw new Error('Expected retained terminal state');
+    retained.resourceId = 'redirected-resource';
+    await expect(workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' })).rejects.toThrow(
+      'Invalid workflow terminal snapshot record integrity',
+    );
+    retained.resourceId = run.resourceId;
+
     await workflows.deleteWorkflowRunById(run);
     const dispatch = await workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' });
     expect(dispatch).toMatchObject({
       status: 'found',
       effect: { effectKey: prepared.effect.effectKey },
-      snapshot: { status: 'failed', context: { marker: { output: { retained: true } } } },
-      resourceId: run.resourceId,
+      recovery: {
+        resourceId: run.resourceId,
+        envelope: { terminalStatus: 'failed', finalState: { retained: true } },
+      },
     });
     if (dispatch.status !== 'found') throw new Error('Expected dispatch evidence');
     dispatch.effect.effectKey = 'caller-mutated';
-    dispatch.snapshot.status = 'success';
+    dispatch.recovery.envelope.finalState.retained = false;
     await expect(
       workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' }),
     ).resolves.toMatchObject({
       status: 'found',
       effect: { effectKey: prepared.effect.effectKey },
-      snapshot: { status: 'failed' },
-      resourceId: run.resourceId,
+      recovery: {
+        resourceId: run.resourceId,
+        envelope: { terminalStatus: 'failed', finalState: { retained: true } },
+      },
     });
   });
 
@@ -200,7 +295,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     const dispatch = withStatefulIdentity({ ...intendedState.fence, kind: 'workflow-finish' as const }, alternate);
     await expect(workflows.getWorkflowTerminalEffectForDispatch(dispatch.operation)).resolves.toMatchObject({
       status: 'found',
-      snapshot: { runId: intended.runId },
+      recovery: { envelope: { runId: intended.runId } },
     });
     expect(dispatch.reads()).toEqual({ workflowName: 1, runId: 1 });
   });
@@ -295,7 +390,11 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     const originalRetained = db.workflowTerminalSnapshots.get(retainedKey);
     if (!originalRetained) throw new Error('Expected retained terminal state');
     vi.advanceTimersByTime(1_000);
-    db.workflowTerminalSnapshots.set(retainedKey, { ...originalRetained, createdAt: originalRetained.createdAt + 500 });
+    const forgedRetained = { ...originalRetained, createdAt: originalRetained.createdAt + 500 };
+    db.workflowTerminalSnapshots.set(retainedKey, {
+      ...forgedRetained,
+      recordHash: getWorkflowTerminalSnapshotRecordHash(forgedRetained),
+    });
     await expect(
       workflows.prepareWorkflowTerminalEffect({
         ...fence,
@@ -340,7 +439,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     if (!retained) throw new Error('Expected retained terminal state');
     db.workflowTerminalSnapshots.set(retainedKey, { ...retained, terminalStatus: 'success' });
     await expect(workflows.getWorkflowTerminalEffectForDispatch({ ...fence, kind: 'workflow-finish' })).rejects.toThrow(
-      'Invalid workflow terminal snapshot journal link',
+      'Invalid workflow terminal snapshot record integrity',
     );
   });
 
@@ -348,7 +447,20 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     const db = new InMemoryDB();
     const workflows = new WorkflowsInMemory({ db });
     const run = { workflowName: 'parent-workflow', runId: 'parent-run' };
-    const { claim, fence } = await createTerminalRun(workflows, run);
+    const parent = { workflowName: 'root', runId: 'root-run' };
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(parent.runId),
+        serializedStepGraph: parentGraph('nested', [0, 2]),
+      },
+    });
+    const { claim, fence } = await createTerminalRun(
+      workflows,
+      run,
+      `${run.runId}-event`,
+      nestedAncestry(run, parent, 'nested', [0, 2]),
+    );
     const base = {
       ...fence,
       expectedPhase: 'run_state_persisted' as const,
@@ -360,9 +472,12 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
         parentExecutionPath: [0, 2],
       },
     };
-    const first = createWorkflowTerminalEffectRecord(claim, base, Date.now());
+    const retained = db.workflowTerminalSnapshots.get(runKey(run));
+    if (!retained) throw new Error('Expected retained recovery envelope');
+    const first = createWorkflowTerminalEffectRecord(claim, retained, base, Date.now());
     const reordered = createWorkflowTerminalEffectRecord(
       claim,
+      retained,
       {
         ...fence,
         expectedPhase: 'run_state_persisted',
@@ -378,6 +493,7 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     );
     const changedPath = createWorkflowTerminalEffectRecord(
       claim,
+      retained,
       { ...base, effect: { ...base.effect, parentExecutionPath: [0, 3] } },
       Date.now() + 2,
     );
@@ -479,5 +595,116 @@ describe('WorkflowsInMemory terminal producer outbox', () => {
     expect(db.workflowTerminalizations.has(runKey(run))).toBe(false);
     expect(db.workflowTerminalEffects.has(effectKey(run, 'workflow-finish'))).toBe(false);
     expect(db.workflowTerminalSnapshots.has(runKey(run))).toBe(false);
+  });
+
+  it('retains a completed ancestor while a recursively linked child remains pending', async () => {
+    const db = new InMemoryDB();
+    const workflows = new WorkflowsInMemory({ db });
+    const parent = { workflowName: 'cleanup-parent', runId: 'parent-run' };
+    const child = { workflowName: 'cleanup-child', runId: 'child-run' };
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      snapshot: { ...createEmptyWorkflowSnapshot(parent.runId), serializedStepGraph: parentGraph() },
+    });
+    const childState = await createTerminalRun(workflows, child, `${child.runId}-event`, nestedAncestry(child, parent));
+    const parentState = await createTerminalRun(workflows, parent);
+
+    await workflows.prepareWorkflowTerminalEffect({
+      ...parentState.fence,
+      expectedPhase: 'run_state_persisted',
+      effect: { kind: 'workflow-finish' },
+    });
+    await workflows.prepareWorkflowTerminalEffect({
+      ...childState.fence,
+      expectedPhase: 'run_state_persisted',
+      effect: {
+        kind: 'parent-workflow-step-end',
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+        parentStepId: 'nested',
+        parentExecutionPath: [0],
+      },
+    });
+    const parentJournal = db.workflowTerminalizations.get(runKey(parent));
+    const childJournal = db.workflowTerminalizations.get(runKey(child));
+    if (!parentJournal || !childJournal) throw new Error('Expected cleanup journals');
+    db.workflowTerminalizations.set(runKey(parent), {
+      ...parentJournal,
+      phase: 'complete',
+      completedAt: Date.now(),
+    });
+    vi.advanceTimersByTime(1);
+
+    await expect(
+      workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date() }),
+    ).resolves.toEqual({ status: 'deleted', count: 0 });
+    db.workflowTerminalizations.set(runKey(child), {
+      ...childJournal,
+      phase: 'complete',
+      completedAt: Date.now(),
+    });
+    vi.advanceTimersByTime(1);
+    await expect(
+      workflows.deleteCompletedWorkflowTerminalizations({ ...parent, olderThan: new Date() }),
+    ).resolves.toEqual({ status: 'deleted', count: 1 });
+  });
+
+  it('traverses wide and deep dependency graphs once, isolates unrelated trees, and fails closed at 100k', () => {
+    const completedJournal = { phase: 'complete' } as never;
+    const addEdge = (
+      db: InMemoryDB,
+      parent: { workflowName: string; runId: string },
+      child: { workflowName: string; runId: string },
+    ) => {
+      db.workflowTerminalEffects.set(JSON.stringify([child.workflowName, child.runId, 'parent-workflow-step-end']), {
+        kind: 'parent-workflow-step-end',
+        workflowName: child.workflowName,
+        runId: child.runId,
+        parentWorkflowName: parent.workflowName,
+        parentRunId: parent.runId,
+      } as never);
+    };
+    const hasPending = (workflows: WorkflowsInMemory, root: { workflowName: string; runId: string }) =>
+      (workflows as any).hasPendingTerminalDependents(root.workflowName, root.runId) as boolean;
+
+    const wideDb = new InMemoryDB();
+    const wide = new WorkflowsInMemory({ db: wideDb });
+    const wideRoot = { workflowName: 'wide-root', runId: 'root' };
+    for (let index = 0; index < 5_000; index++) {
+      const child = { workflowName: 'wide-child', runId: String(index) };
+      addEdge(wideDb, wideRoot, child);
+      wideDb.workflowTerminalizations.set(runKey(child), completedJournal);
+    }
+    addEdge(
+      wideDb,
+      { workflowName: 'unrelated-root', runId: 'root' },
+      {
+        workflowName: 'unrelated-pending',
+        runId: 'child',
+      },
+    );
+    expect(hasPending(wide, wideRoot)).toBe(false);
+
+    const deepDb = new InMemoryDB();
+    const deep = new WorkflowsInMemory({ db: deepDb });
+    const deepRoot = { workflowName: 'deep', runId: '0' };
+    let parent = deepRoot;
+    for (let index = 1; index <= 5_000; index++) {
+      const child = { workflowName: 'deep', runId: String(index) };
+      addEdge(deepDb, parent, child);
+      if (index < 5_000) deepDb.workflowTerminalizations.set(runKey(child), completedJournal);
+      parent = child;
+    }
+    expect(hasPending(deep, deepRoot)).toBe(true);
+    deepDb.workflowTerminalizations.set(runKey(parent), completedJournal);
+    expect(hasPending(deep, deepRoot)).toBe(false);
+
+    const boundedDb = new InMemoryDB();
+    const bounded = new WorkflowsInMemory({ db: boundedDb });
+    const boundedRoot = { workflowName: 'bounded-root', runId: 'root' };
+    for (let index = 0; index < 100_000; index++) {
+      addEdge(boundedDb, boundedRoot, { workflowName: 'bounded-child', runId: String(index) });
+    }
+    expect(hasPending(bounded, boundedRoot)).toBe(true);
   });
 });
