@@ -3763,6 +3763,7 @@ export class Run<
    */
   resumeStream<TResume>({
     step,
+    label,
     resumeData,
     requestContext,
     tracingOptions,
@@ -3772,6 +3773,7 @@ export class Run<
     ...rest
   }: {
     resumeData?: TResume;
+    label?: string;
     step?:
       | Step<string, any, any, any, TResume, any, TEngineType, any>
       | [
@@ -3836,6 +3838,7 @@ export class Run<
         const executionResultsPromise = self._resume({
           resumeData,
           step,
+          label,
           requestContext,
           ...observabilityContext,
           tracingOptions,

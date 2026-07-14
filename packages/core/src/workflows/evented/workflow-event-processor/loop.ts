@@ -3,6 +3,7 @@ import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { Mastra } from '../../../mastra';
 import { resolveCurrentState } from '../helpers';
+import { createEventedResumeLabels, mergeEventedResumeLabels } from '../resume-label';
 import type { StepExecutor } from '../step-executor';
 import { createPendingMarker } from '../types';
 import type { ProcessorArgs } from '.';
@@ -135,6 +136,7 @@ export async function processWorkflowForEach(
     timeTravel,
     restart,
     resumeData,
+    resumeLabel,
     parentWorkflow,
     requestContext,
     perStep,
@@ -216,6 +218,7 @@ export async function processWorkflowForEach(
           stepResults,
           prevResult: iterationPrevResult,
           resumeData,
+          resumeLabel,
           activeStepsPath,
           requestContext,
           perStep,
@@ -232,12 +235,40 @@ export async function processWorkflowForEach(
     const pendingIterations = currentResult.output.filter((r: any) => r === null || r?.status === 'suspended');
     if (pendingIterations.length > 0) {
       // Collect resumeLabels from all suspended iterations
-      const collectedResumeLabels: Record<string, { stepId: string; foreachIndex?: number }> = {};
-      for (let i = 0; i < currentResult.output.length; i++) {
-        const iterResult = currentResult.output[i];
-        if (iterResult?.status === 'suspended' && iterResult.suspendPayload?.__workflow_meta?.resumeLabels) {
-          Object.assign(collectedResumeLabels, iterResult.suspendPayload.__workflow_meta.resumeLabels);
+      let collectedResumeLabels = createEventedResumeLabels();
+      try {
+        for (let i = 0; i < currentResult.output.length; i++) {
+          const iterResult = currentResult.output[i];
+          if (iterResult?.status === 'suspended') {
+            collectedResumeLabels = mergeEventedResumeLabels(
+              collectedResumeLabels,
+              iterResult.suspendPayload?.__workflow_meta?.resumeLabels,
+              target => ({ ...target, foreachIndex: i }),
+            );
+          }
         }
+      } catch (error) {
+        await pubsub.publish('workflows', {
+          type: 'workflow.fail',
+          runId,
+          data: {
+            parentWorkflow,
+            workflowId,
+            runId,
+            executionPath,
+            resumeSteps,
+            stepResults,
+            prevResult: {
+              status: 'failed',
+              error: error instanceof Error ? error : new Error('Invalid workflow resume label metadata'),
+            },
+            activeStepsPath,
+            requestContext,
+            state: currentState,
+            outputOptions,
+          },
+        });
+        return;
       }
 
       // Build the suspend metadata with all collected resumeLabels
