@@ -2,12 +2,58 @@
  * Login dialog component - handles OAuth login flow UI
  */
 
-import { exec } from 'node:child_process';
-import { Box, Container, getKeybindings, Spacer, Text } from '@earendil-works/pi-tui';
+import { spawn } from 'node:child_process';
+import { win32 } from 'node:path';
+import { Box, Container, getKeybindings, hyperlink, Spacer, Text } from '@earendil-works/pi-tui';
 import type { Focusable, TUI } from '@earendil-works/pi-tui';
 import { getOAuthProviders } from '../../auth/index.js';
 import { theme } from '../theme.js';
 import { MaskedInput } from './masked-input.js';
+
+/**
+ * Open a URL in the default browser without going through a shell.
+ * Only well-formed http(s) URLs are opened; anything else is ignored
+ * (the URL is still displayed for the user to open manually).
+ */
+function parseBrowserUrl(url: string): URL | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed;
+    }
+  } catch {
+    // Ignore malformed URLs.
+  }
+  return undefined;
+}
+
+function sanitizeTerminalText(value: string): string {
+  return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, '\uFFFD');
+}
+
+function openUrlInBrowser(parsed: URL): void {
+  const url = parsed.href;
+  const configuredWindowsRoot = process.env.SystemRoot || process.env.WINDIR;
+  const windowsRoot =
+    configuredWindowsRoot && win32.isAbsolute(configuredWindowsRoot) ? configuredWindowsRoot : String.raw`C:\Windows`;
+  const windowsLauncher = win32.join(windowsRoot, 'System32', 'rundll32.exe');
+
+  const [cmd, args]: [string, string[]] =
+    process.platform === 'darwin'
+      ? ['open', [url]]
+      : process.platform === 'win32'
+        ? [windowsLauncher, ['url.dll,FileProtocolHandler', url]]
+        : ['xdg-open', [url]];
+
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    // Opening the browser is best-effort — the URL is shown in the dialog.
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // Ignore synchronous argument/spawn failures too.
+  }
+}
 
 export class LoginDialogComponent extends Box implements Focusable {
   private contentContainer: Container;
@@ -83,20 +129,28 @@ export class LoginDialogComponent extends Box implements Focusable {
   showAuth(url: string, instructions?: string): void {
     this.contentContainer.clear();
 
-    this.contentContainer.addChild(new Text(theme.fg('accent', url)));
+    const parsedUrl = parseBrowserUrl(url);
+    const displayUrl = parsedUrl?.href ?? sanitizeTerminalText(url);
+    this.contentContainer.addChild(new Text(theme.fg('accent', displayUrl)));
 
-    const clickHint = process.platform === 'darwin' ? 'Cmd+click to open' : 'Ctrl+click to open';
-    const hyperlink = `\x1b]8;;${url}\x07${clickHint}\x1b]8;;\x07`;
-    this.contentContainer.addChild(new Text(theme.fg('muted', hyperlink)));
+    if (parsedUrl) {
+      const clickHint = process.platform === 'darwin' ? 'Cmd+click to open' : 'Ctrl+click to open';
+      const link = hyperlink(clickHint, parsedUrl.href);
+      this.contentContainer.addChild(new Text(theme.fg('muted', link)));
+    }
 
     if (instructions) {
       this.contentContainer.addChild(new Spacer(1));
-      this.contentContainer.addChild(new Text(theme.fg('warning', instructions)));
+      this.contentContainer.addChild(new Text(theme.fg('warning', sanitizeTerminalText(instructions))));
     }
 
-    // Try to open browser
-    const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-    exec(`${openCmd} "${url}"`);
+    // Try to open browser. The URL comes from the auth provider, so treat it
+    // as untrusted: only open well-formed http(s) URLs, and spawn without a
+    // shell so it can't be used for command injection (CodeQL
+    // js/shell-command-constructed-from-input).
+    if (parsedUrl) {
+      openUrlInBrowser(parsedUrl);
+    }
 
     this.tui.requestRender();
   }
@@ -106,9 +160,9 @@ export class LoginDialogComponent extends Box implements Focusable {
    */
   showPrompt(message: string, placeholder?: string): Promise<string> {
     this.contentContainer.addChild(new Spacer(1));
-    this.contentContainer.addChild(new Text(theme.fg('text', message)));
+    this.contentContainer.addChild(new Text(theme.fg('text', sanitizeTerminalText(message))));
     if (placeholder) {
-      this.contentContainer.addChild(new Text(theme.fg('muted', `e.g., ${placeholder}`)));
+      this.contentContainer.addChild(new Text(theme.fg('muted', `e.g., ${sanitizeTerminalText(placeholder)}`)));
     }
     this.contentContainer.addChild(this.input);
     this.contentContainer.addChild(new Text(theme.fg('muted', '(Escape to cancel, Enter to submit)')));
@@ -126,7 +180,7 @@ export class LoginDialogComponent extends Box implements Focusable {
    * Show progress message
    */
   showProgress(message: string): void {
-    this.contentContainer.addChild(new Text(theme.fg('muted', message)));
+    this.contentContainer.addChild(new Text(theme.fg('muted', sanitizeTerminalText(message))));
     this.tui.requestRender();
   }
 
