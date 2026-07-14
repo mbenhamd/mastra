@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { isProxy } from 'node:util/types';
+import { isDate, isProxy } from 'node:util/types';
 import type { SerializedStep, SerializedStepFlowEntry } from '../types';
+import { getDenseDataArray, getPlainDataDescriptors } from './data-shape';
 import type { WorkflowTerminalSha256 } from './types';
 
 export const MAX_TERMINAL_PATH_LENGTH = 256;
@@ -44,18 +45,15 @@ export function validateWorkflowTerminalStructuralString(
 }
 
 function getDataDescriptors(value: unknown, field: string): Record<PropertyKey, PropertyDescriptor> {
-  if (isProxy(value)) throw new TypeError(`${field} must not be a proxy`);
-  if (value === null || typeof value !== 'object') throw new TypeError(`${field} must be a data object`);
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${field} must be a plain object`);
-  const descriptors = Object.getOwnPropertyDescriptors(value) as Record<PropertyKey, PropertyDescriptor>;
-  Object.setPrototypeOf(descriptors, null);
-  for (const key of Reflect.ownKeys(descriptors)) {
-    if (typeof key !== 'string' || !('value' in descriptors[key]!) || descriptors[key]!.enumerable !== true) {
-      throw new TypeError(`${field} contains symbol, accessor, or non-enumerable fields`);
-    }
-  }
-  return descriptors;
+  return getPlainDataDescriptors(value, {
+    allowNullPrototype: true,
+    typeError: `${field} must be a data object`,
+    proxyError: `${field} must not be a proxy`,
+    prototypeError: `${field} must be a plain object`,
+    fieldsError: `${field} contains symbol, accessor, or non-enumerable fields`,
+    maxKeys: 7,
+    maxKeysError: `${field} contains too many fields`,
+  });
 }
 
 function validateKeys(
@@ -74,26 +72,13 @@ function validateKeys(
 }
 
 function getDenseArray(value: unknown, field: string, maxLength = MAX_TERMINAL_GRAPH_NODES): unknown[] {
-  if (isProxy(value)) throw new TypeError(`${field} must not be a proxy`);
-  if (!Array.isArray(value)) throw new TypeError(`${field} must be a dense array`);
-  const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<PropertyKey, PropertyDescriptor>;
-  const length = descriptors.length?.value;
-  if (!Number.isSafeInteger(length) || length < 0 || length > maxLength) {
-    throw new TypeError(`${field} has an invalid length`);
-  }
-  const out = Array.from({ length }, (_, index) => {
-    const descriptor = descriptors[String(index)];
-    if (!descriptor || !('value' in descriptor)) throw new TypeError(`${field} must be a dense data-only array`);
-    return descriptor.value;
+  return getDenseDataArray(value, {
+    typeError: `${field} must be a dense array`,
+    proxyError: `${field} must not be a proxy`,
+    lengthError: `${field} has an invalid length`,
+    dataError: `${field} must be a dense data-only array`,
+    maxLength,
   });
-  if (
-    Reflect.ownKeys(descriptors).some(
-      key => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= length),
-    )
-  ) {
-    throw new TypeError(`${field} must be a dense data-only array`);
-  }
-  return out;
 }
 
 function hashFramedParts(domain: string, parts: readonly string[]): string {
@@ -212,7 +197,10 @@ function normalizeGraph(
     const entryField = `${field}[${index}]`;
     const descriptors = getDataDescriptors(entries[index], entryField);
     const type = descriptors.type?.value;
-    append(state, parts, 'entry', String(index), String(type));
+    if (!['step', 'sleep', 'sleepUntil', 'parallel', 'conditional', 'loop', 'foreach'].includes(type as string)) {
+      throw new TypeError(`${entryField}.type is invalid`);
+    }
+    append(state, parts, 'entry', String(index), type as string);
     if (type === 'step') {
       validateKeys(descriptors, ['type', 'step'], ['type', 'step'], entryField);
       normalizeStep(descriptors.step!.value, parts, state, scopeStepIds, depth, `${entryField}.step`);
@@ -243,10 +231,10 @@ function normalizeGraph(
         }
         if (date !== undefined) {
           if (isProxy(date)) throw new TypeError(`${entryField}.date must not be a proxy`);
-          if (!(date instanceof Date) && typeof date !== 'string') {
+          if (!isDate(date) && typeof date !== 'string') {
             throw new TypeError(`${entryField}.date must be a Date or string`);
           }
-          const epoch = date instanceof Date ? Date.prototype.getTime.call(date) : Date.parse(date);
+          const epoch = isDate(date) ? Date.prototype.getTime.call(date) : Date.parse(date);
           if (!Number.isFinite(epoch)) throw new TypeError(`${entryField}.date must be valid`);
           if (typeof date === 'string' && new Date(epoch).toISOString() !== date) {
             throw new TypeError(`${entryField}.date must be a canonical ISO timestamp`);
