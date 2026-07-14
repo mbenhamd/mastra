@@ -1,6 +1,7 @@
 import { ReadableStream } from 'node:stream/web';
 import type { ToolSet } from '@internal/ai-sdk-v5';
 import type { MastraDBMessage } from '../../agent/message-list';
+import { readToolSurfaceFence } from '../../agent/tool-surface-fence';
 import { getErrorFromUnknown } from '../../error';
 import { ConsoleLogger } from '../../logger';
 import { createObservabilityContext } from '../../observability';
@@ -202,6 +203,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
       const agenticLoopWorkflowRegistration = rest.mastra?.__registerInternalWorkflow(agenticLoopWorkflow, runId);
 
+      const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
       const initialData = {
         messageId: messageId!,
         messages: {
@@ -220,6 +222,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           isContinued: true,
           totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
         },
+        ...(toolSurfaceFence ? { toolSurfaceFence: [...toolSurfaceFence.allowedNames] } : {}),
       };
 
       if (!resumeContext) {

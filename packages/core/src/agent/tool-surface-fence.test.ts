@@ -10,6 +10,7 @@ import {
   consumeToolSurfaceFenceRestore,
   createToolSurfaceFence,
   enforceActiveToolsFence,
+  enforceToolChoiceFence,
   enforceToolSurfaceFence,
   readToolSurfaceFence,
   stageToolSurfaceFenceRestore,
@@ -44,6 +45,14 @@ describe('replacement tool surface fence', () => {
 
     expect(enforceActiveToolsFence(undefined, allowed)).toEqual(['modeTool', 'builtin']);
     expect(enforceActiveToolsFence(['modeTool', 'hidden'], allowed)).toEqual(['modeTool']);
+  });
+
+  it('rejects shorthand forced choices outside the replacement ceiling', () => {
+    const fence = createToolSurfaceFence({ modeTool: {} });
+
+    expect(() => enforceToolChoiceFence({ toolName: 'hiddenTool' }, fence)).toThrow(
+      /outside the execution's replacement tool surface/,
+    );
   });
 
   it('clears a prior execution fence when the RequestContext is reused', () => {

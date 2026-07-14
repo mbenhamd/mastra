@@ -353,6 +353,41 @@ describe('Agent replacement toolsets', () => {
     expect(readToolSurfaceFence(requestContext, runId)).toBeUndefined();
   });
 
+  it.each(['caller', 'processor'] as const)(
+    'rejects a shorthand %s-forced tool outside the replacement surface before provider invocation',
+    async source => {
+      const doGenerate = vi.fn();
+      const requestContext = new RequestContext();
+      const agent = new Agent({
+        id: 'shorthand-forced-choice-agent',
+        name: 'shorthand-forced-choice-agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doGenerate }),
+        ...(source === 'processor'
+          ? {
+              inputProcessors: [
+                {
+                  id: 'force-hidden-tool-shorthand',
+                  processInputStep: () => ({ toolChoice: { toolName: 'hiddenTool' } as any }),
+                },
+              ],
+            }
+          : {}),
+      });
+
+      await expect(
+        agent.generate('test', {
+          runId: `shorthand-${source}-run`,
+          requestContext,
+          toolsetsMode: 'replace',
+          toolsets: { mode: { modeTool: testTool('modeTool') } },
+          ...(source === 'caller' ? { toolChoice: { toolName: 'hiddenTool' } as any } : {}),
+        }),
+      ).rejects.toThrow(/outside the execution's replacement tool surface/);
+      expect(doGenerate).not.toHaveBeenCalled();
+    },
+  );
+
   it('applies replacement to stream defaults and cleans terminal run fences', async () => {
     const visibleToolNames: string[][] = [];
     const model = new MockLanguageModelV2({
@@ -393,6 +428,31 @@ describe('Agent replacement toolsets', () => {
 
     expect(visibleToolNames).toEqual([['modeTool']]);
     expect(readToolSurfaceFence(requestContext, 'stream-run')).toBeUndefined();
+  });
+
+  it('does not eagerly consume an ordinary stream without a replacement fence', async () => {
+    let pulled = false;
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: new ReadableStream({
+          pull(controller) {
+            pulled = true;
+            controller.enqueue({ type: 'finish', finishReason: 'stop', usage });
+            controller.close();
+          },
+        }),
+      }),
+    });
+    const agent = new Agent({ id: 'lazy-stream-agent', name: 'lazy-stream-agent', instructions: 'test', model });
+
+    const output = await agent.stream('test');
+    await Promise.resolve();
+    expect(pulled).toBe(false);
+
+    await output.getFullOutput();
+    expect(pulled).toBe(true);
   });
 
   it('isolates concurrent replacement runs sharing one RequestContext', async () => {
@@ -593,4 +653,104 @@ describe('Agent replacement toolsets', () => {
       expect(readToolSurfaceFence(requestContext, initial.runId)).toBeUndefined();
     },
   );
+
+  it(
+    'fails closed when a replacement stream resumes with a fresh context and no reconstruction inputs',
+    { timeout: 30_000 },
+    async () => {
+      const visibleToolNames: string[][] = [];
+      const model = new MockLanguageModelV2({
+        doStream: async options => {
+          visibleToolNames.push((options.tools ?? []).map(tool => tool.name));
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'response-metadata', id: 'initial', modelId: 'mock', timestamp: new Date(0) },
+              {
+                type: 'tool-call',
+                toolCallId: 'approval-call',
+                toolName: 'approvalTool',
+                input: '{}',
+                providerExecuted: false,
+              },
+              { type: 'finish', finishReason: 'tool-calls', usage },
+            ]),
+          };
+        },
+      });
+      const agent = new Agent({
+        id: 'fresh-context-resume-agent',
+        name: 'fresh-context-resume-agent',
+        instructions: 'test',
+        model,
+      });
+      new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+      const initialContext = new RequestContext();
+      const approvalTool = createTool({
+        id: 'approvalTool',
+        description: 'approvalTool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: vi.fn(),
+      });
+      const initial = await agent.stream('start', {
+        runId: 'fresh-context-replacement-run',
+        requestContext: initialContext,
+        toolsetsMode: 'replace',
+        toolsets: { approval: { approvalTool } },
+      });
+      const suspended = await initial.getFullOutput();
+      expect(suspended.finishReason).toBe('suspended');
+
+      await expect(
+        agent.resumeStream({ approved: true }, { runId: initial.runId, toolCallId: 'approval-call' }),
+      ).rejects.toThrow(/without toolsetsMode "replace"/);
+      expect(visibleToolNames).toEqual([['approvalTool']]);
+    },
+  );
+
+  it('fails closed when replacement generate resumes with a fresh context and no reconstruction inputs', async () => {
+    const doGenerate = vi.fn(async options => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      finishReason: 'tool-calls' as const,
+      usage,
+      content: [
+        {
+          type: 'tool-call' as const,
+          toolCallId: 'approval-call',
+          toolName: (options.tools ?? [])[0]!.name,
+          input: '{}',
+        },
+      ],
+      warnings: [],
+    }));
+    const agent = new Agent({
+      id: 'fresh-context-generate-agent',
+      name: 'fresh-context-generate-agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({ doGenerate }),
+    });
+    new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+    const approvalTool = createTool({
+      id: 'approvalTool',
+      description: 'approvalTool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: vi.fn(),
+    });
+    const initial = await agent.generate('start', {
+      runId: 'fresh-context-generate-run',
+      requestContext: new RequestContext(),
+      toolsetsMode: 'replace',
+      toolsets: { approval: { approvalTool } },
+    });
+    expect(initial.finishReason).toBe('suspended');
+
+    await expect(
+      agent.resumeGenerate({ approved: true }, { runId: initial.runId, toolCallId: 'approval-call' }),
+    ).rejects.toThrow(/without toolsetsMode "replace"/);
+    expect(doGenerate).toHaveBeenCalledOnce();
+  });
 });

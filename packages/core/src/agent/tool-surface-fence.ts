@@ -742,7 +742,6 @@ export function enforceToolChoiceFence(
   if (
     toolChoice &&
     typeof toolChoice === 'object' &&
-    toolChoice.type === 'tool' &&
     typeof toolChoice.toolName === 'string' &&
     !fence.allowedNames.includes(toolChoice.toolName)
   ) {

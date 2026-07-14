@@ -131,6 +131,7 @@ import {
   enforceToolSurfaceFence,
   materializeToolSurfaceFence,
   readToolSurfaceFence,
+  stageToolSurfaceFenceRestore,
   stampToolSurfaceFence,
   suspendToolSurfaceFence,
 } from './tool-surface-fence';
@@ -6032,6 +6033,19 @@ export class Agent<
     return undefined;
   }
 
+  #getAgenticLoopSnapshotToolSurfaceFence(existingSnapshot: any): readonly string[] | undefined {
+    for (const key in existingSnapshot?.context) {
+      const step = existingSnapshot?.context[key];
+      for (const candidate of [step?.payload, step?.output]) {
+        const allowedNames = candidate?.toolSurfaceFence;
+        if (Array.isArray(allowedNames) && allowedNames.every(name => typeof name === 'string')) {
+          return Object.freeze([...allowedNames]);
+        }
+      }
+    }
+    return undefined;
+  }
+
   #withSnapshotThreadTarget<T extends { memory?: AgentExecutionOptionsBase<any>['memory'] }>(
     options: T | undefined,
     snapshotMemoryInfo: { threadId?: string; resourceId?: string } | undefined,
@@ -7769,23 +7783,22 @@ export class Agent<
       }
 
       const output = result.result as MastraModelOutput<OUTPUT>;
+      const outputFenceRequestContext = mergedOptions.requestContext;
 
-      void output.getFullOutput().then(
-        full => {
-          if (mergedOptions.requestContext) {
+      if (outputFenceRequestContext && readToolSurfaceFence(outputFenceRequestContext, output.runId)) {
+        void output.getFullOutput().then(
+          full => {
             if (full.finishReason === 'suspended') {
-              suspendToolSurfaceFence(mergedOptions.requestContext, output.runId, toolSurfaceFenceOwnerId);
+              suspendToolSurfaceFence(outputFenceRequestContext, output.runId, toolSurfaceFenceOwnerId);
             } else {
-              clearToolSurfaceFence(mergedOptions.requestContext, output.runId, toolSurfaceFenceOwnerId);
+              clearToolSurfaceFence(outputFenceRequestContext, output.runId, toolSurfaceFenceOwnerId);
             }
-          }
-        },
-        () => {
-          if (mergedOptions.requestContext) {
-            clearToolSurfaceFence(mergedOptions.requestContext, output.runId, toolSurfaceFenceOwnerId);
-          }
-        },
-      );
+          },
+          () => {
+            clearToolSurfaceFence(outputFenceRequestContext, output.runId, toolSurfaceFenceOwnerId);
+          },
+        );
+      }
 
       const completion = agentThreadStreamRuntime.registerRun(
         this as Agent<any, any, any, any>,
@@ -8114,6 +8127,7 @@ export class Agent<
       runId,
       method: 'resumeStream',
     });
+    const persistedToolSurfaceFence = this.#getAgenticLoopSnapshotToolSurfaceFence(existingSnapshot);
     defaultOptions ??= (await this.getDefaultOptions({
       requestContext: requestContextToUse,
     })) as AgentExecutionOptions<TOutput>;
@@ -8121,6 +8135,7 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (streamOptionsWithPubSub ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    ownershipOptions.requestContext ??= new RequestContext();
     if (ownershipOptions.toolsetsMode === 'replace') {
       if (streamOptionsWithPubSub?.toolsetsMode === 'replace') {
         ownershipOptions.toolsets = streamOptionsWithPubSub.toolsets ?? {};
@@ -8177,6 +8192,7 @@ export class Agent<
     }
     let preparedOptionsWithPubSub: (AgentExecutionOptionsBase<any> & { runId?: string; _pubsub: PubSub }) | undefined;
     let fenceRequestContext = ownershipOptions.requestContext;
+    let stagedToolSurfaceFenceRestore = false;
 
     try {
       let mergedStreamOptions = deepMerge(
@@ -8193,6 +8209,7 @@ export class Agent<
       if (requestContextToUse) {
         mergedStreamOptions.requestContext = requestContextToUse;
       }
+      mergedStreamOptions.requestContext ??= ownershipOptions.requestContext;
       fenceRequestContext = mergedStreamOptions.requestContext;
 
       if (ownsReservation && reservedThreadTarget) {
@@ -8363,6 +8380,11 @@ export class Agent<
         ...this.#getThreadTarget(preparedOptionsWithPubSub),
       };
 
+      if (persistedToolSurfaceFence && fenceRequestContext) {
+        stageToolSurfaceFenceRestore(fenceRequestContext, runId, persistedToolSurfaceFence);
+        stagedToolSurfaceFenceRestore = true;
+      }
+
       const result = await this.#execute({
         ...preparedOptionsWithPubSub,
         structuredOutput: mergedStreamOptions.structuredOutput
@@ -8418,23 +8440,26 @@ export class Agent<
       );
 
       const output = result.result as unknown as MastraModelOutput<OUTPUT>;
-      void output.getFullOutput().then(
-        full => {
-          if (fenceRequestContext) {
+      if (fenceRequestContext && readToolSurfaceFence(fenceRequestContext, runId)) {
+        void output.getFullOutput().then(
+          full => {
             if (full.finishReason === 'suspended') {
               suspendToolSurfaceFence(fenceRequestContext, runId, toolSurfaceFenceOwnerId);
             } else {
               clearToolSurfaceFence(fenceRequestContext, runId, toolSurfaceFenceOwnerId);
             }
-          }
-        },
-        () => {
-          if (fenceRequestContext) clearToolSurfaceFence(fenceRequestContext, runId, toolSurfaceFenceOwnerId);
-        },
-      );
+          },
+          () => {
+            clearToolSurfaceFence(fenceRequestContext, runId, toolSurfaceFenceOwnerId);
+          },
+        );
+      }
 
       return output;
     } catch (error) {
+      if (stagedToolSurfaceFenceRestore && fenceRequestContext) {
+        consumeToolSurfaceFenceRestore(fenceRequestContext, runId);
+      }
       if (fenceRequestContext) clearToolSurfaceFence(fenceRequestContext, runId, toolSurfaceFenceOwnerId);
       if (preparedOptionsWithPubSub) {
         this.#forgetThreadStreamPubSub(preparedOptionsWithPubSub);
@@ -8516,6 +8541,7 @@ export class Agent<
       runId,
       method: 'resumeGenerate',
     });
+    const persistedToolSurfaceFence = this.#getAgenticLoopSnapshotToolSurfaceFence(existingSnapshot);
 
     defaultOptions ??= (await this.getDefaultOptions({
       requestContext: requestContextToUse,
@@ -8525,6 +8551,7 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    mergedOptions.requestContext ??= new RequestContext();
     if (mergedOptions.toolsetsMode === 'replace') {
       if (options?.toolsetsMode === 'replace') {
         mergedOptions.toolsets = options.toolsets ?? {};
@@ -8579,7 +8606,12 @@ export class Agent<
     }
 
     let result;
+    let stagedToolSurfaceFenceRestore = false;
     try {
+      if (persistedToolSurfaceFence) {
+        stageToolSurfaceFenceRestore(mergedOptions.requestContext, runId, persistedToolSurfaceFence);
+        stagedToolSurfaceFenceRestore = true;
+      }
       result = await this.#execute({
         ...mergedOptions,
         structuredOutput: mergedOptions.structuredOutput
@@ -8599,6 +8631,9 @@ export class Agent<
         maxProcessorRetries: mergedOptions.maxProcessorRetries ?? this.#maxProcessorRetries,
       } as unknown as InnerAgentExecutionOptions<OUTPUT> & { _threadStreamPubSub?: PubSub });
     } catch (error) {
+      if (stagedToolSurfaceFenceRestore) {
+        consumeToolSurfaceFenceRestore(mergedOptions.requestContext, runId);
+      }
       if (mergedOptions.requestContext) {
         clearToolSurfaceFence(mergedOptions.requestContext, runId, toolSurfaceFenceOwnerId);
       }
