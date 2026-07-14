@@ -196,7 +196,17 @@ export function createDurableToolCallStep() {
       const isHiddenByActiveTools = effectiveActiveTools !== undefined && !effectiveActiveTools.includes(activeToolKey);
 
       if (!tool || isHiddenByActiveTools) {
-        const availableToolNames = effectiveActiveTools ?? Object.keys(registryEntry?.tools ?? {});
+        const registeredToolNames = Object.keys(registryEntry?.tools ?? {});
+        const fenceScopedToolNames =
+          replacementToolNames === undefined
+            ? registeredToolNames
+            : registeredToolNames.filter(name => replacementToolNames.has(name));
+        const availableToolNames =
+          effectiveActiveTools === undefined
+            ? fenceScopedToolNames
+            : replacementToolNames === undefined
+              ? effectiveActiveTools
+              : effectiveActiveTools.filter(name => replacementToolNames.has(name));
         const availableToolsStr =
           availableToolNames.length > 0 ? ` Available tools: ${availableToolNames.join(', ')}` : '';
         const error = {

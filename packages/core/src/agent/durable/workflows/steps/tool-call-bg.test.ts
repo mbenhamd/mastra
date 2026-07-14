@@ -166,9 +166,40 @@ describe('durable tool-call background task dispatch', () => {
     );
 
     expect(result.error).toEqual(expect.objectContaining({ name: 'ToolNotFoundError' }));
+    expect(result.error.message).toContain('Available tools: allowedTool.');
+    expect(result.error.message).not.toContain('Available tools: allowedTool, hiddenTool');
     expect(allowedExecute).not.toHaveBeenCalled();
     expect(hiddenExecute).not.toHaveBeenCalled();
     expect(backingExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not advertise fenced-out tools retained in activeTools', async () => {
+    setupRegistry({
+      tools: {
+        allowedTool: { execute: vi.fn().mockResolvedValue('allowed') },
+        hiddenTool: { execute: vi.fn().mockResolvedValue('hidden') },
+      },
+    });
+
+    const result = await executeStep(
+      mockPubsub(),
+      makeInitData({
+        options: {
+          requireToolApproval: false,
+          toolSurfaceFence: ['allowedTool'],
+          activeTools: ['allowedTool', 'hiddenTool'],
+        },
+      }),
+      { ...baseInput(), toolName: 'hiddenTool' },
+    );
+
+    expect(result.error).toEqual(
+      expect.objectContaining({
+        name: 'ToolNotFoundError',
+        message: expect.stringContaining('Available tools: allowedTool.'),
+      }),
+    );
+    expect(result.error.message).not.toContain('Available tools: allowedTool, hiddenTool');
   });
 
   it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {

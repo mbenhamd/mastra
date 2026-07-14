@@ -7531,7 +7531,7 @@ export class Session {
       : undefined;
     const existing = this._record.pendingResume;
     if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
-      this._retainCurrentReplacementToolSurface(full.runId);
+      if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
       await this._flushUpdate(prev => prev, { tokenUsageDelta: opts.tokenUsageDelta });
       if (this._currentAgentRequestContext && suspendedFenceLease) {
         clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
