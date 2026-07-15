@@ -40,6 +40,17 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   React, MastraCode, Slack, Vercel, Harness, AgentController, and evented
   workflow build/test surface. The exception is intentionally not reusable by
   another PR or branch.
+- PF-2009 PR `#277` has a second base-owned upstream-sync lane for the next
+  reviewed official-main merge. Admission is bound to its exact repository,
+  PR number, branch, base, both preserved two-parent merge commits, the two
+  changed root dependency manifests, SHA-256 hashes for the root manifest,
+  Server manifest, workspace policy, and lockfile, plus one digest covering
+  every tracked package manifest, pnpm lockfile, pnpm hook, workspace file, and
+  patch. The lane reuses the same explicit Harness, AgentController, workflow,
+  Server, SDK, MastraCode, Slack, and Vercel validation surface without making
+  the PF-558 exception reusable. Exact same-repository policy PR `#278`, its
+  branch, and its `main` base may bootstrap the new validator once; every later
+  PR loads it from protected base.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
@@ -145,6 +156,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   when they check out trusted default-branch automation rather than PR code.
 - Starsling remains available only to same-repository branches in the canonical
   repository; external pull-request heads use GitHub-hosted runners there too.
+  Canonical-only workflows, including the initial Prebuild change detector,
+  must guard every Starsling job so fork PRs skip rather than wait forever for
+  a runner the fork cannot access.
 
 Run the validator's focused policy fixtures locally after changing its routing
 or command plan:
@@ -152,6 +166,7 @@ or command plan:
 ```bash
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf558-upstream-sync
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf2009-upstream-sync
 ```
 
 The fixtures use an isolated temporary Git repository and mocked package
