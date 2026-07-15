@@ -125,7 +125,17 @@ run_pf558_admission_self_tests() (
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
   fixture_repo="$test_root/repo"
-  trap 'rm -rf -- "$test_root"' EXIT
+  pf558_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-558 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf558_fixture_cleanup EXIT
   mkdir -p "$fixture_repo/packages/server"
 
   git -C "$fixture_repo" init -q -b main
@@ -1431,8 +1441,11 @@ docs/src/content/en/docs/harness/overview.mdx
 EOF
 
   echo 'Building and typechecking the preserved and adopted runtime boundaries.'
-  run_with_validation_budget 900 pnpm --filter @mastra/core --fail-if-no-match check
+  # Turbo builds the core package's internal workspace dependencies. A fresh
+  # runner has no dist artifacts, so typechecking before this build produces
+  # cascading false missing-module errors from @internal/* and schema-compat.
   run_with_validation_budget 900 pnpm run build:core
+  run_with_validation_budget 900 pnpm --filter @mastra/core --fail-if-no-match check
   run_with_validation_budget 900 pnpm run build:server
   run_with_validation_budget 900 pnpm --filter @mastra/client-js --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match build:js
@@ -1482,6 +1495,7 @@ EOF
   if [[ -f scripts/affected-tests.test.ts ]]; then
     run_with_validation_budget 600 pnpm exec vitest run --reporter=dot scripts/affected-tests.test.ts
   fi
+  run_with_validation_budget 60 node scripts/affected-tests.mjs --self-test-symbol-exports
 
   echo 'PF-558 dedicated upstream-sync validation passed.'
 }
