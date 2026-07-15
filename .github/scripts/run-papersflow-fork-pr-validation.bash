@@ -1470,9 +1470,13 @@ EOF
   run_with_validation_budget 900 pnpm run build:server
   run_with_validation_budget 900 pnpm --filter @mastra/client-js --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match build:js
+  # The split SDK imports workspace packages through their built exports.
+  # Build the complete SDK/TUI dependency graph before either tsc invocation;
+  # otherwise a clean runner has no dist declarations for packages such as
+  # MCP, LibSQL, observability, DuckDB, and FastEmbed.
+  run_with_validation_budget 900 pnpm run build:mastracode
   run_with_validation_budget 600 pnpm --filter @mastra/code-sdk --fail-if-no-match check
   run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match check
-  run_with_validation_budget 900 pnpm run build:mastracode
   run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter @mastra/core --fail-if-no-match lint
