@@ -5,6 +5,34 @@ import { createStep } from './workflow';
 
 describe('Workflow schema type inference', () => {
   describe('schemas with .optional().default()', () => {
+    it('accepts raw workflow input while steps receive parsed defaults', async () => {
+      const schema = z.object({
+        requiredField: z.string(),
+        optionalWithDefault: z.number().default(10),
+      });
+      const step = createStep({
+        id: 'raw-input-step',
+        inputSchema: schema,
+        outputSchema: z.object({ result: z.number() }),
+        execute: async ({ inputData }) => {
+          expectTypeOf(inputData).toEqualTypeOf<{ requiredField: string; optionalWithDefault: number }>();
+          return { result: inputData.optionalWithDefault };
+        },
+      });
+      const workflow = createWorkflow({
+        id: 'raw-input-workflow',
+        inputSchema: schema,
+        outputSchema: z.object({ result: z.number() }),
+      })
+        .then(step)
+        .commit();
+
+      const run = await workflow.createRun();
+      await run.start({ inputData: { requiredField: 'value' } });
+      // @ts-expect-error - raw input remains schema checked
+      await run.start({ inputData: { requiredField: 42 } });
+    });
+
     it('should allow chaining a step whose inputSchema matches the workflow inputSchema with optional defaults', () => {
       const schema = z.object({
         requiredField: z.string(),

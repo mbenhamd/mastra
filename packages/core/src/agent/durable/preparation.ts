@@ -277,7 +277,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     agent,
     messages,
     options: rawExecOptions,
-    runId: providedRunId,
     requestContext: providedRequestContext,
     logger,
     mastra,

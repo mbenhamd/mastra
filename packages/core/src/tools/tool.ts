@@ -2,7 +2,7 @@ import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
-import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
+import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
 import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
 import type {
@@ -577,6 +577,26 @@ export class Tool<
  */
 type SchemaLike = PublicSchema<any> | undefined;
 type InferSchema<T extends SchemaLike> = T extends PublicSchema<any> ? InferPublicSchema<T> : unknown;
+type InferSchemaInput<T extends SchemaLike> = T extends PublicSchema<any> ? InferPublicSchemaInput<T> : unknown;
+
+type ToolWithRawInput<
+  TSchemaIn,
+  TSchemaOut,
+  TSuspendSchema,
+  TResumeSchema,
+  TContext extends ToolExecutionContext<TSuspendSchema, TResumeSchema, any>,
+  TId extends string,
+  TRequestContext,
+  TRawInput,
+> = Tool<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext> & {
+  /** Raw schema input is validated and transformed before the configured callback runs. */
+  execute?: (
+    inputData: TRawInput,
+    context?: TContext,
+  ) => ReturnType<
+    NonNullable<Tool<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['execute']>
+  >;
+};
 
 type CreateToolOpts<
   TId extends string,
@@ -614,14 +634,24 @@ export function createTool<
     ToolExecutionContext<InferSchema<TSuspendSchema>, InferSchema<TResumeSchema>, TRequestContext>,
 >(
   opts: CreateToolOpts<TId, TInputSchema, TOutputSchema, TSuspendSchema, TResumeSchema, TRequestContext, TContext>,
-): Tool<
+): ToolWithRawInput<
   InferSchema<TInputSchema>,
   InferSchema<TOutputSchema>,
   InferSchema<TSuspendSchema>,
   InferSchema<TResumeSchema>,
   TContext,
   TId,
-  TRequestContext
+  TRequestContext,
+  InferSchemaInput<TInputSchema>
 > {
-  return new Tool(opts);
+  return new Tool(opts) as ToolWithRawInput<
+    InferSchema<TInputSchema>,
+    InferSchema<TOutputSchema>,
+    InferSchema<TSuspendSchema>,
+    InferSchema<TResumeSchema>,
+    TContext,
+    TId,
+    TRequestContext,
+    InferSchemaInput<TInputSchema>
+  >;
 }

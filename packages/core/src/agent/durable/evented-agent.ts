@@ -10,8 +10,8 @@
  * 3. Events are streamed via pubsub as the workflow executes
  */
 
-import type { WorkflowFinishCallbackResult } from '../../workflows/types';
 import { createObservabilityContext } from '../../observability';
+import type { WorkflowFinishCallbackResult } from '../../workflows/types';
 import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';

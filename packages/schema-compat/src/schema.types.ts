@@ -37,3 +37,20 @@ export type InferPublicSchema<T extends PublicSchema> = T extends { _output: inf
       : T extends PublicSchema<infer Output>
         ? Output
         : never;
+
+/**
+ * Infers the value accepted by a schema before validation and transforms.
+ *
+ * This differs from {@link InferPublicSchema} for schemas with defaults or
+ * transforms. Runtime entrypoints accept this raw input, then pass the parsed
+ * output to user callbacks.
+ */
+export type InferPublicSchemaInput<T extends PublicSchema> = T extends { _input: infer Input }
+  ? Input
+  : T extends { '~standard': { types: { input: infer I } } }
+    ? I
+    : T extends { _type: infer Output }
+      ? Output
+      : T extends PublicSchema<any, infer Input>
+        ? Input
+        : never;

@@ -42,7 +42,13 @@ import {
 } from '../../processors/span-payload';
 import type { ProcessorStepOutput } from '../../processors/step-schema';
 import { toStandardSchema } from '../../schema';
-import type { InferPublicSchema, InferStandardSchemaOutput, PublicSchema, StandardSchemaWithJSON } from '../../schema';
+import type {
+  InferPublicSchema,
+  InferPublicSchemaInput,
+  InferStandardSchemaOutput,
+  PublicSchema,
+  StandardSchemaWithJSON,
+} from '../../schema';
 
 import { WorkflowRunOutput } from '../../stream/RunOutput';
 import type { ChunkType, LanguageModelUsage, ProviderMetadata } from '../../stream/types';
@@ -74,7 +80,7 @@ import type { WorkflowScheduleConfig } from '../scheduler/types';
 import { forwardAgentStreamChunk } from '../stream-utils';
 import type { StreamChunkWriter } from '../stream-utils';
 import { Workflow, Run } from '../workflow';
-import type { AgentStepOptions } from '../workflow';
+import type { AgentStepOptions, RunWithRawInput } from '../workflow';
 import { EventedExecutionEngine } from './execution-engine';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
 import type { TripwireChunk } from './helpers';
@@ -98,18 +104,20 @@ export function cloneWorkflow<
     EventedEngineType
   >[],
   TPrevSchema = TInput,
+  TRawInput = TInput,
 >(
-  workflow: Workflow<EventedEngineType, TSteps, string, TState, TInput, TOutput, TPrevSchema>,
+  workflow: Workflow<EventedEngineType, TSteps, string, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput>,
   opts: { id: TWorkflowId },
-): Workflow<EventedEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
-  const wf: Workflow<EventedEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> = new Workflow({
-    id: opts.id,
-    inputSchema: workflow.inputSchema,
-    outputSchema: workflow.outputSchema,
-    steps: workflow.stepDefs,
-    mastra: workflow.mastra,
-    options: workflow.options,
-  });
+): Workflow<EventedEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput> {
+  const wf: Workflow<EventedEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput> =
+    new Workflow({
+      id: opts.id,
+      inputSchema: workflow.inputSchema,
+      outputSchema: workflow.outputSchema,
+      steps: workflow.stepDefs,
+      mastra: workflow.mastra,
+      options: workflow.options,
+    });
 
   wf.setStepFlow(workflow.stepGraph);
   wf.commit();
@@ -1561,7 +1569,8 @@ export function createWorkflow<
     InferSchemaOutput<TStateSchema>,
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
-    InferPublicSchema<TInputSchema>
+    InferPublicSchema<TInputSchema>,
+    InferPublicSchemaInput<TInputSchema>
   >({
     ...(params as any),
     executionEngine,
@@ -1576,7 +1585,8 @@ export class EventedWorkflow<
   TInput = unknown,
   TOutput = unknown,
   TPrevSchema = TInput,
-> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
+  TRawInput = TInput,
+> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput> {
   #schedules: WorkflowScheduleConfig[];
 
   constructor(params: WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>) {
@@ -1609,7 +1619,7 @@ export class EventedWorkflow<
     runId?: string;
     resourceId?: string;
     disableScorers?: boolean;
-  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput>> {
+  }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, unknown, TRawInput>> {
     if (this.stepFlow.length === 0) {
       throw new Error(
         'Execution flow of workflow is not defined. Add steps to the workflow via .then(), .branch(), etc.',
@@ -1717,7 +1727,7 @@ export class EventedWorkflow<
       });
     }
 
-    return run;
+    return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, unknown, TRawInput>;
   }
 }
 
