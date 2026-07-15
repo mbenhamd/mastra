@@ -604,11 +604,6 @@ export interface Config<
    *
    * Look up a registered harness with `mastra.getHarness('name')`.
    *
-   * `AgentController` entries are also accepted under this key as the
-   * deprecated upstream alias of {@link MastraConfig.agentControllers}; they
-   * are routed to the AgentController registry, with `agentControllers`
-   * taking precedence on key collisions.
-   *
    * @example
    * ```typescript
    * new Mastra({
@@ -622,7 +617,7 @@ export interface Config<
    * });
    * ```
    */
-  harnesses?: Record<string, HarnessV1 | AgentController<any> | undefined>;
+  harnesses?: Record<string, HarnessV1 | undefined>;
   /**
    * Optional central transform policy for tool payloads before they are
    * serialized into display streams or user-visible transcripts.
@@ -1349,27 +1344,7 @@ export class Mastra<
       TChannels
     >,
   ) {
-    // `config.harnesses` accepts both Harness v1 instances (the fork surface)
-    // and AgentControllers (the deprecated upstream alias of
-    // `config.agentControllers`). Split them here: Harness v1 entries flow
-    // through the harness registration path below; AgentController entries are
-    // merged into the AgentController registry, with `agentControllers`
-    // winning on key collisions.
-    const isHarnessV1 = (entry: HarnessV1 | AgentController<any>): entry is HarnessV1 =>
-      typeof (entry as Partial<HarnessV1>)._listRunnableAgentIds === 'function';
-    const configuredHarnesses: Record<string, HarnessV1 | undefined> = {};
-    const aliasedAgentControllers: Record<string, AgentController<any>> = {};
-    for (const [key, entry] of Object.entries(config?.harnesses ?? {})) {
-      if (entry == null) {
-        configuredHarnesses[key] = entry ?? undefined;
-        continue;
-      }
-      if (isHarnessV1(entry)) {
-        configuredHarnesses[key] = entry;
-      } else {
-        aliasedAgentControllers[key] = entry;
-      }
-    }
+    const configuredHarnesses = config?.harnesses ? { ...config.harnesses } : {};
     if (config?.harness != null) {
       if (configuredHarnesses.default != null) {
         const error = new MastraError({
@@ -1808,14 +1783,10 @@ export class Mastra<
       this.#ensureHarnessChannelOutboxWorker();
     }
 
-    // AgentControllers hosted on this Mastra. `harnesses` entries that are
-    // AgentControllers (the deprecated alias) were split into
-    // `aliasedAgentControllers` above; `agentControllers` wins on collisions.
-    const agentControllerEntries = {
-      ...aliasedAgentControllers,
-      ...(config?.agentControllers ?? {}),
-    };
-    for (const [key, agentController] of Object.entries(agentControllerEntries)) {
+    // AgentControllers use their own registry and accessors. Keeping that
+    // boundary distinct prevents the public Harness v1 surface from widening
+    // to a union with a controller that has a different session contract.
+    for (const [key, agentController] of Object.entries(config?.agentControllers ?? {})) {
       this.#agentControllers[key] = agentController;
       agentController.__registerMastra(this);
     }
@@ -2661,25 +2632,6 @@ export class Mastra<
    */
   public listAgentControllers(): Record<string, AgentController<any>> {
     return this.#agentControllers;
-  }
-
-  /**
-   * Get an AgentController hosted on this Mastra instance by its unique `id`.
-   *
-   * @deprecated Use {@link Mastra.getAgentControllerById} instead.
-   */
-  public getHarnessById(id: string): AgentController<any> | undefined {
-    return this.getAgentControllerById(id);
-  }
-
-  /**
-   * List all AgentControllers hosted on this Mastra instance, keyed by their
-   * registration key.
-   *
-   * @deprecated Use {@link Mastra.listAgentControllers} instead.
-   */
-  public listHarnesses(): Record<string, AgentController<any>> {
-    return this.listAgentControllers();
   }
 
   /**
@@ -3538,11 +3490,6 @@ export class Mastra<
   /**
    * Look up a Harness v1 instance registered on this Mastra.
    *
-   * Falls back to the AgentController registry when no Harness v1 is
-   * registered under the name, covering the deprecated upstream alias where
-   * AgentControllers were registered via `config.harnesses` and resolved via
-   * `getHarness()`.
-   *
    * @param name - The key the harness was registered under in the
    *   `harnesses` config map. Defaults to `default` for `config.harness`
    *   single-harness sugar.
@@ -3555,8 +3502,8 @@ export class Mastra<
    * const session = await code.session({ threadId, resourceId });
    * ```
    */
-  public getHarness(name = 'default'): HarnessV1 | AgentController<any> {
-    const harness = this.#harnesses[name] ?? this.#agentControllers[name];
+  public getHarness(name = 'default'): HarnessV1 {
+    const harness = this.#harnesses[name];
     if (!harness) {
       const error = new MastraError({
         id: 'MASTRA_GET_HARNESS_BY_NAME_NOT_FOUND',
