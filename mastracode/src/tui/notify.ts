@@ -3,7 +3,7 @@
  * Sends a terminal bell and optionally a native OS notification.
  */
 
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import type { HookManager } from '../hooks/manager.js';
 
 export type NotificationMode = 'bell' | 'system' | 'both' | 'off';
@@ -49,9 +49,25 @@ export function sendNotification(
 function sendSystemNotification(reason: NotificationReason, message?: string): void {
   if (process.platform === 'darwin') {
     const title = 'Mastra Code';
-    const body = message || reasonToMessage(reason);
-    const escaped = body.replace(/"/g, '\\"');
-    exec(`osascript -e 'display notification "${escaped}" with title "${title}"'`);
+    const body = (message || reasonToMessage(reason)).replaceAll('\0', '\uFFFD');
+    // Keep the AppleScript static and pass notification content through argv.
+    // Feeding the script on stdin via the documented `-` program-file marker
+    // makes every later value data, even when model or tool output starts with
+    // an osascript option such as `-e`.
+    const script = 'on run argv\n' + 'display notification (item 1 of argv) with title (item 2 of argv)\n' + 'end run';
+    try {
+      const child = spawn('/usr/bin/osascript', ['-', body, title], { stdio: ['pipe', 'ignore', 'ignore'] });
+      child.on('error', () => {
+        // Best-effort: ignore asynchronous notification failures.
+      });
+      child.stdin.on('error', () => {
+        // The child can exit before stdin is written when osascript is unavailable.
+      });
+      child.stdin.end(script);
+      child.unref();
+    } catch {
+      // Best-effort: ignore synchronous argument/spawn failures
+    }
   }
   // Linux/Windows: could add notify-send / powershell in the future
 }

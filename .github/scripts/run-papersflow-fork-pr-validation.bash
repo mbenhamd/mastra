@@ -1804,6 +1804,7 @@ if workspace_changed mastracode; then
   # @mastra/github-signals).
   run_with_validation_budget 900 pnpm --filter ./signals/github --fail-if-no-match build:lib
   run_with_validation_budget 900 pnpm --filter ./browser/stagehand --fail-if-no-match build
+  run_with_validation_budget 900 pnpm --filter ./browser/agent-browser --fail-if-no-match build
   mapfile -t mastracode_lint_files < <(
     while IFS= read -r file; do
       if [[ -f "$file" && "$file" =~ ^mastracode/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]]; then

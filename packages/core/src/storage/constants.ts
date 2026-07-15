@@ -642,6 +642,14 @@ export const EXPERIMENT_RESULTS_SCHEMA: Record<string, StorageColumn> = {
   createdAt: { type: 'timestamp', nullable: false },
 };
 
+export const THREAD_STATE_SCHEMA: Record<string, StorageColumn> = {
+  threadId: { type: 'text', nullable: false },
+  type: { type: 'text', nullable: false },
+  value: { type: 'jsonb', nullable: false },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
 /**
  * Schema definitions for all core tables.
  */

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { PubSub, UnixSocketPubSub } from '@mastra/core/events';
 import type { PubSubDeliveryMode, Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
 
+const THREAD_STREAM_PREFIX = 'agent.thread-stream.';
+
 function safeSocketPathComponent(value: string): string {
   const safe = value.replace(/[^a-zA-Z0-9_-]/g, '_');
   if (!safe) return '_';
@@ -85,7 +87,7 @@ class SignalsPubSub extends PubSub {
     // Deduplicate concurrent callers so only one socket is created per topic.
     let inflight = this.#pending.get(key);
     if (!inflight) {
-      inflight = this.#initSocket(topic, key);
+      inflight = this.#initSocket(key);
       this.#pending.set(key, inflight);
     }
     const socket = await inflight;
@@ -93,9 +95,9 @@ class SignalsPubSub extends PubSub {
     return socket;
   }
 
-  async #initSocket(topic: string, key: string): Promise<UnixSocketPubSub> {
+  async #initSocket(key: string): Promise<UnixSocketPubSub> {
     try {
-      const socketPath = await this.#socketPath(topic);
+      const socketPath = await this.#socketPath(key);
       if (this.#closed) throw new Error('SignalsPubSub is closed');
       const socket = new UnixSocketPubSub(socketPath);
       this.#sockets.set(key, socket);
@@ -105,19 +107,17 @@ class SignalsPubSub extends PubSub {
     }
   }
 
-  async #socketPath(topic: string): Promise<string> {
-    // Extract threadId from the topic. Topics follow the format:
-    // agent.thread-stream.<encoded key> where key = resourceId\0threadId
-    const threadId = safeSocketPathComponent(this.#extractThreadId(topic));
+  async #socketPath(key: string): Promise<string> {
     const dir = join('/tmp/mc', safeSocketPathComponent(this.#resourceId));
     await mkdir(dir, { recursive: true });
-    const candidate = join(dir, `${key}.sock`);
+    let fileKey = key.replace(/[^a-zA-Z0-9_-]/g, '_') || '_';
+    const candidate = join(dir, `${fileKey}.sock`);
     // macOS sun_path limit is 104 bytes; Linux is 108. Use 104 as the
     // conservative bound. When the path is too long, replace the key with
     // a short hash so the socket can still be created.
     if (Buffer.byteLength(candidate) > 104) {
-      key = createHash('sha256').update(key).digest('hex').slice(0, 16);
-      return join(dir, `${key}.sock`);
+      fileKey = createHash('sha256').update(key).digest('hex').slice(0, 16);
+      return join(dir, `${fileKey}.sock`);
     }
     return candidate;
   }
@@ -133,7 +133,7 @@ class SignalsPubSub extends PubSub {
         const decoded = decodeURIComponent(encoded);
         const separatorIdx = decoded.indexOf('\0');
         if (separatorIdx !== -1) {
-          return decoded.slice(separatorIdx + 1);
+          return safeSocketPathComponent(decoded.slice(separatorIdx + 1));
         }
       } catch {
         // Malformed URI — fall through to sanitized fallback.
