@@ -17,6 +17,15 @@ import { vi } from 'vitest';
 
 type AnyRecord = Record<string, any>;
 
+type MockSession = AnyRecord;
+type MockAgentController = AgentController<Record<string, unknown>> & {
+  session: MockSession;
+};
+type MockTuiState = AnyRecord & {
+  controller: MockAgentController;
+  session: MockSession;
+};
+
 function deepMerge<T extends AnyRecord>(base: T, overrides?: AnyRecord): T {
   if (!overrides) return base;
   const result: AnyRecord = { ...base };
@@ -55,7 +64,7 @@ export interface MockAgentControllerOptions {
  * suspensions, model, mode, state, displayState, the event bus, and the
  * run-control methods (sendSignal, sendMessage, respondToToolSuspension, …).
  */
-export function createMockSession(opts: MockAgentControllerOptions = {}) {
+export function createMockSession(opts: MockAgentControllerOptions = {}): MockSession {
   const resourceId = opts.resourceId ?? opts.id ?? 'test-controller';
   let currentThreadId: string | null = opts.threadId ?? null;
 
@@ -146,7 +155,7 @@ export function createMockSession(opts: MockAgentControllerOptions = {}) {
  * catalog, resource ids). Returns the controller; read `controller.session` for the
  * shared session instance.
  */
-export function createMockAgentController(opts: MockAgentControllerOptions = {}) {
+export function createMockAgentController(opts: MockAgentControllerOptions = {}): MockAgentController {
   const session = createMockSession(opts);
 
   const base = {
@@ -166,9 +175,7 @@ export function createMockAgentController(opts: MockAgentControllerOptions = {})
     getObservationalMemoryRecord: vi.fn(async () => null),
   };
 
-  return deepMerge(base, opts.controller) as unknown as AgentController<Record<string, unknown>> & {
-    session: ReturnType<typeof createMockSession>;
-  };
+  return deepMerge(base, opts.controller) as unknown as MockAgentController;
 }
 
 /**
@@ -176,12 +183,12 @@ export function createMockAgentController(opts: MockAgentControllerOptions = {})
  * `controller.session` — matching production wiring. Spread extra fields via
  * `extra`. Cast the result to your context type at the call site.
  */
-export function createMockState(opts: MockAgentControllerOptions & { extra?: AnyRecord } = {}) {
+export function createMockState(opts: MockAgentControllerOptions & { extra?: AnyRecord } = {}): MockTuiState {
   const { extra, ...agentControllerOpts } = opts;
   const controller = createMockAgentController(agentControllerOpts);
   return {
     controller,
     session: controller.session,
     ...extra,
-  };
+  } as MockTuiState;
 }
