@@ -78,6 +78,26 @@ function resolveToolFGAResourceId(tool: ToolToConvert, options: ToolOptions): st
       : getStandaloneToolFGAResourceId(options.name);
 }
 
+function cloneInvocationOptionsWithRequestContext(
+  execOptions: MastraToolInvocationOptions,
+  requestContext: RequestContext | undefined,
+): MastraToolInvocationOptions {
+  // Preserve accessors without evaluating them. MCP intentionally exposes
+  // deprecated top-level context fields as throwing getters, so object spread
+  // would fail before the tool can use the canonical nested `mcp` context.
+  const invocationOptions: MastraToolInvocationOptions = Object.create(
+    Object.getPrototypeOf(execOptions),
+    Object.getOwnPropertyDescriptors(execOptions),
+  );
+  Object.defineProperty(invocationOptions, 'requestContext', {
+    configurable: true,
+    enumerable: true,
+    value: requestContext,
+    writable: true,
+  });
+  return invocationOptions;
+}
+
 /**
  * Detect Zod v4 schemas. Zod v3 stores the type name as `_def.typeName`
  * (e.g. "ZodObject"); Zod v4 stores it as `_def.type` (e.g. "object"). We
@@ -830,11 +850,8 @@ export class CoreToolBuilder extends MastraBase {
         return await new Promise((resolve, reject) => {
           setImmediate(async () => {
             try {
-              const result = await execFunction(
-                args,
-                { ...execOptions!, requestContext: toolRequestContext },
-                toolSpan,
-              );
+              const invocationOptions = cloneInvocationOptionsWithRequestContext(execOptions!, toolRequestContext);
+              const result = await execFunction(args, invocationOptions, toolSpan);
               resolve(result);
             } catch (err) {
               reject(err);

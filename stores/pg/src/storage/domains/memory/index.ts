@@ -35,6 +35,13 @@ const SAFE_NETWORK_ERROR_CODES = new Set([
   'ENOTFOUND',
   'ETIMEDOUT',
 ]);
+const SAFE_PAGINATION_ERROR_MESSAGES = new Set([
+  'page must be >= 0',
+  'page must be 0 when perPage is false',
+  'page value too large',
+  'perPage must be >= 0',
+  'perPage must be false or a safe integer',
+]);
 
 /**
  * Columns added to the OM table after its initial release.
@@ -527,12 +534,12 @@ export class MemoryPG extends MemoryStorage {
       // Validate pagination input before normalization
       // This ensures page === 0 when perPageInput === false
       this.validatePaginationInput(page, perPageInput === undefined ? 100 : perPageInput);
-    } catch {
+    } catch (error) {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_THREADS', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Invalid pagination parameters',
+        text: this.getSafePaginationErrorText(error),
         details: this.getSafePaginationDetails(page, perPageInput),
       });
     }
@@ -1002,6 +1009,21 @@ export class MemoryPG extends MemoryStorage {
     };
   }
 
+  private getSafePaginationErrorText(error: unknown): string {
+    try {
+      if ((typeof error !== 'object' && typeof error !== 'function') || error === null) {
+        return 'Invalid pagination parameters';
+      }
+      const message = (error as { message?: unknown }).message;
+      return typeof message === 'string' && SAFE_PAGINATION_ERROR_MESSAGES.has(message)
+        ? message
+        : 'Invalid pagination parameters';
+    } catch {
+      // Error-like values may expose throwing accessors. Never reflect them.
+      return 'Invalid pagination parameters';
+    }
+  }
+
   public async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messageIds.length === 0) return { messages: [] };
     const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
@@ -1054,12 +1076,12 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
-    } catch {
+    } catch (error) {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Invalid pagination parameters',
+        text: this.getSafePaginationErrorText(error),
         details: {
           hasThreadId: true,
           threadIdCount: threadIds.length,
@@ -1213,12 +1235,12 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       this.validatePaginationInput(page, perPageInput === undefined ? 40 : perPageInput);
-    } catch {
+    } catch (error) {
       throw new MastraError({
         id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.USER,
-        text: 'Invalid pagination parameters',
+        text: this.getSafePaginationErrorText(error),
         details: {
           hasResourceId,
           ...this.getSafePaginationDetails(page, perPageInput),

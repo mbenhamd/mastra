@@ -3,8 +3,9 @@
  *
  * Exported as `@mastra/core/harness/v1`. See HARNESS_V1_SPEC.md.
  *
- * The legacy Harness lives at `@mastra/core/harness` and remains the
- * default through v1.0. See §11 for the migration story.
+ * Upstream's deprecated `@mastra/core/harness` entry aliases the canonical
+ * AgentController API. The fork's durable Harness v1 runtime is intentionally
+ * available only from this explicit subpath.
  */
 
 export { Harness, createHarnessOperatorThreadController } from './harness';
@@ -154,16 +155,16 @@ export type {
 } from './contracts';
 
 /**
- * `HarnessMessage` and `HarnessMessageContent` are stable cross-version
- * interfaces (spec §11.1). They are re-exported from v1 and back the same
- * underlying definitions used by the legacy `Harness`, so renderers can
- * import from either entry point and consume the same shape.
+ * `HarnessMessage` and `HarnessMessageContent` are stable cross-runtime
+ * interfaces (spec §11.1). Harness v1 aliases AgentController's canonical
+ * message definitions so renderers can consume either runtime without a
+ * duplicated type contract.
  */
 export type {
-  HarnessMessage,
-  HarnessMessageContent,
-  HarnessMessageContent as HarnessMessageContentPart,
-} from '../types';
+  AgentControllerMessage as HarnessMessage,
+  AgentControllerMessageContent as HarnessMessageContent,
+  AgentControllerMessageContent as HarnessMessageContentPart,
+} from '../../agent-controller/types';
 
 /**
  * Goal-loop primitive types (§4.7). `GoalState` lives in `SessionRecord.goal`

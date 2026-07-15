@@ -2,6 +2,7 @@
  * @license Mastra Enterprise License - see ee/LICENSE
  */
 import { FGADeniedError, MastraFGAPermissions } from '@mastra/core/auth/ee';
+import { RequestContext } from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -34,17 +35,11 @@ describe('MCP Server FGA checks', () => {
   let mcpServer: MCPServer;
 
   const createRequestContext = (user?: { id: string }) => {
-    const values = new Map<string, unknown>();
+    const requestContext = new RequestContext();
     if (user) {
-      values.set('user', user);
+      requestContext.set('user', user);
     }
-
-    return {
-      get: (key: string) => values.get(key),
-      set: (key: string, value: unknown) => {
-        values.set(key, value);
-      },
-    };
+    return requestContext;
   };
 
   const testTool = createTool({

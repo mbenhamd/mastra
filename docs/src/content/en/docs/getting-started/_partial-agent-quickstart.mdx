@@ -22,7 +22,7 @@ Create a tsconfig.json file:
 }
 ```
 
-If you need to add a tool to the agent, create a new file and use `import { createTool } from "@mastra/core/tools"`. Plain object tool definitions silently fail to execute; tools MUST be defined via `createTool()` with `id`, `description`, `inputSchema` (zod), `execute()`. `execute()` receives two parameters: the validated input data based on inputSchema (first parameter) and an optional execution context object (second parameter) containing `requestContext`, `tracingContext`, `abortSignal`, and other execution metadata.
+If you need to add a tool to the agent, create a new file and use `import { createTool } from "@mastra/core/tools"`. Plain object tool definitions silently fail to execute; tools MUST be defined via `createTool()` with `id`, `description`, `inputSchema` (Zod), `execute()`. `execute()` receives two parameters: the validated input data based on inputSchema (first parameter) and an optional execution context object (second parameter) containing `requestContext`, `tracingContext`, `abortSignal`, and other execution metadata.
 
 Example:
 

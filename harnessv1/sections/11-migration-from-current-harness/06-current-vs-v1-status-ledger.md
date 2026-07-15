@@ -29,14 +29,18 @@ records (§5.1, §5.2) stay with their owning sections and are not re-exported
 through the runtime entry; clients reach them via the §13.3 wire surface or
 §5.2 `HarnessStorageDomain` instead.
 
-#### Current main source snapshot
+#### Historical pre-AgentController source snapshot
 
-This ledger still classifies spec names against pre-v1 Mastra collision risk. It
-is not a compatibility promise and it must not claim that target v1 surfaces are
-already shipped on `main`. Entity vocabulary and cutover order:
-[§0 Mental model](../../00-mental-model.md). Duplicate traps: §11.6e.
+This ledger classifies spec names against the pre-v1, pre-AgentController Mastra
+snapshot captured by the upstream-sync branch's first parent. Its
+`Current code:` labels and source paths are historical migration evidence, not a
+description of the merged tree and not a compatibility promise. The merged
+tree uses `@mastra/core/agent-controller` as the canonical controller API and
+exports the fork's durable runtime explicitly from `@mastra/core/harness/v1`.
+Entity vocabulary and cutover order: [§0 Mental model](../../00-mental-model.md).
+Duplicate traps: §11.6e.
 
-Current-source surfaces present on Mastra `main`:
+Historical surfaces present in that pre-v1 snapshot:
 
 - Current `Harness` exists at `packages/core/src/harness/harness.ts:211` and is
   a singleton, thread-first runtime. Its live state includes
@@ -95,7 +99,7 @@ Current-source surfaces present on Mastra `main`:
   accepted signal id with text/echo matching as fallback UI cleanup, and
   resource switching all operate through current Harness thread APIs.
 
-Target v1 surfaces not present on current `main`:
+Target v1 surfaces absent from that historical snapshot:
 
 - Harness `Session` class and `RemoteSession` / `RemoteSafeSession` SDK surface.
 - Session resolver, `SessionRecord`, session lease/CAS storage primitives,
@@ -110,9 +114,10 @@ Target v1 surfaces not present on current `main`:
 - Harness channel durable inbox/action/outbox rows, wakeup workers tied to
   session ownership, and session-scoped channel diagnostics.
 
-The implementation direction is therefore a clean replacement at the v1 cutover:
-current signal mechanics are implementation input for the agent boundary, but the
-session-first API, storage, route, SDK, and recovery contracts remain v1 work.
+The implementation direction was therefore a clean replacement at the v1
+cutover: historical signal mechanics were implementation input for the agent
+boundary, while the session-first API, storage, route, SDK, and recovery
+contracts belonged to Harness v1.
 
 #### Implementation composition checklist
 
@@ -152,13 +157,13 @@ subsystem:
   legacy `display_state_changed` as durability or keep raw component/runtime
   handles in storage.
 
-#### Migration-sensitive current MastraCode surfaces
+#### Historical migration-sensitive MastraCode surfaces
 
-The following current MastraCode surfaces need explicit rewrite before the v1
-cutover. This subsection owns the migration-sensitive behavior inventory; §15.2
-turns these rules into focused tests and should not restate alternate product
-semantics. They are listed here because they are easy to miss when reading only
-the core Harness files:
+The following MastraCode surfaces in the historical snapshot required explicit
+rewrite before the v1 cutover. This subsection owns the migration-sensitive
+behavior inventory; §15.2 turns these rules into focused tests and should not
+restate alternate product semantics. They are listed here because they are easy
+to miss when reading only the historical core Harness files:
 
 - `createMastraCode(...)` must stop treating the constructed Harness as one
   mutable current-thread singleton. Startup must create/open a v1 `Session`, pass
@@ -709,14 +714,14 @@ durable row.
 
 Maintenance rule: when a new top-level `class`, `interface`, or `type` is
 added to a non-example `sections/` file, add it to the appropriate §11.6c
-section bucket; when a current-code shape is renamed, removed, or gains a
-matching v1 export, update §11.6a or §11.6b; when a v1 family is materially
-informed by current-code scaffolding under a different identifier, add or
-update a §11.6d precursor row. When referencing a child section, use the
+section bucket; when the historical baseline classification changes, update
+§11.6a or §11.6b; when a v1 family is materially informed by historical
+scaffolding under a different identifier, add or update a §11.6d precursor
+row. When referencing a child section, use the
 heading-letter form (e.g. `§5.1b.2`, `§13.3d`), not the file-ordinal form
 (`§5.1.6`, `§13.3.4`). File ordinals are filesystem state, not section
-identity. Every `Current code:` line anchor must be re-verified against
-`../packages/**/src` on each spec pass; cross-package anchors
+identity. Every `Current code:` line anchor must be re-verified against the
+documented historical snapshot on each spec pass; cross-package anchors
 (`../packages/memory`, `../packages/core/src/background-tasks`,
 `../packages/core/src/tools`, `../packages/core/src/storage/domains/**`) drift
 silently when the spec author edits only the harness file, so a grep pass

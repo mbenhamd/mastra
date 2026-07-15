@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { HarnessMessage } from '../types';
+import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 
 import { ACTIVITY_TIMELINE_DEFAULT_LIMIT, buildActivityTimeline } from './activity-timeline';
 import type { ActivityTimelineSessionInput, BuildActivityTimelineInput } from './activity-timeline';

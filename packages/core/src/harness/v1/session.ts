@@ -45,6 +45,7 @@ import {
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
+import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -82,9 +83,6 @@ import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
 import type { Workspace } from '../../workspace';
-import { convertStoredMessageToHarnessMessage } from '../_shared/message-conversion';
-import type { StoredMessageRow } from '../_shared/message-conversion';
-import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
@@ -157,6 +155,8 @@ import type {
   SubagentToolStartEvent,
 } from './events';
 import type { Harness } from './harness';
+import type { StoredMessageRow } from './message-conversion';
+import { convertStoredMessageToHarnessMessage } from './message-conversion';
 import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import type {
   AddTaskInput,
@@ -13724,7 +13724,15 @@ export class Session {
   }
 
   /** @internal — used by the Harness after descendants are terminalized. */
-  _flushClosedMarker(closedAt: number): Promise<SessionRecord> {
+  async _flushClosedMarker(closedAt: number): Promise<SessionRecord> {
+    // Close can begin before the debounced assistant-draft write fires. Drain
+    // that write while the session is still in the writable `closing` state;
+    // `_markClosed()` intentionally rejects every later `_flushUpdate`.
+    // There can be no new draft deltas after the close drain reaches idle, so
+    // this also cancels the timer and makes the post-close event flush a no-op
+    // for assistant drafts.
+    await this._flushAssistantDraftsNow();
+
     const run = async (): Promise<SessionRecord> => {
       if (this._record.closedAt !== undefined) {
         return this._record;

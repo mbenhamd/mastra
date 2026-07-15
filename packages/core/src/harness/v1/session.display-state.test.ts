@@ -426,6 +426,35 @@ describe('Session.getDisplayState — shape', () => {
     });
   });
 
+  it('flushes a debounced assistant draft before persisting the closed marker', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const internals = session as unknown as {
+      _recordAssistantDraftDelta: (opts: {
+        runId: string;
+        kind: 'text' | 'reasoning';
+        delta: string;
+        messageId?: string;
+      }) => void;
+    };
+
+    internals._recordAssistantDraftDelta({
+      runId: 'run-close-flush',
+      kind: 'text',
+      delta: 'persist before close',
+      messageId: 'message-close-flush',
+    });
+    await session.close();
+
+    const stored = await storage.loadSession({ sessionId: session.id });
+    expect(stored?.closedAt).toBeTypeOf('number');
+    expect(stored?.assistantDrafts?.['run-close-flush']).toMatchObject({
+      text: 'persist before close',
+      status: 'streaming',
+      messageId: 'message-close-flush',
+    });
+  });
+
   it('terminalizes an aborted in-flight assistant draft as interrupted', async () => {
     const { harness, agent, storage } = setupHarness();
     let release!: () => void;

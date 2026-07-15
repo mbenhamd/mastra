@@ -609,12 +609,13 @@ The mapping is a total function from `HarnessRowErrorCode` onto
    `details.reason`); namespacing rows would not eliminate the projection
    surface, only its visibility.
 
-Current Mastra emits `HarnessEvent` shapes that do not yet honor this
-contract. The §11.6a current-to-v1 projector for current `HarnessEvent`
-(`packages/core/src/harness/types.ts:725-902`) is the v1 boundary: current bare
-codes enter the projector, the projector applies the §13.3f.1 mapping, and
-v1 SDK consumers observe only namespaced envelopes. Unknown current strings are
-projection bugs: the projector must reject them before serialization, tests must
-add an explicit mapping before the value becomes public, and `harness.internal`
-remains reserved for true unhandled server exceptions rather than a fallback
-vocabulary for current-code drift.
+The historical pre-AgentController Mastra snapshot emitted `HarnessEvent`
+shapes that did not yet honor this contract. The §11.6a current-to-v1 projector
+for that snapshot's `HarnessEvent` (`packages/core/src/harness/types.ts:725-902`)
+was the v1 boundary: historical bare codes entered the projector, the projector
+applied the §13.3f.1 mapping, and v1 SDK consumers observed only namespaced
+envelopes. Unknown historical strings were projection bugs: the projector had
+to reject them before serialization, tests had to add an explicit mapping
+before the value became public, and `harness.internal` remained reserved for
+true unhandled server exceptions rather than a fallback vocabulary for source
+drift.

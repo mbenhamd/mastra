@@ -113,7 +113,7 @@ Workers deployments must bind KV namespaces for the following runtime tables:
 - `mastra_scorers`: Stores scorer/evaluation rows
 - `mastra_background_tasks`: Stores background task rows
 
-These bindings support the current Cloudflare KV memory, workflow, scoring, and background task domains. `CloudflareKVStorage` does not currently implement the Harness attachment storage domain or R2 byte storage. Harness attachment primitives/elements are separate from the memory `mastra_resources` namespace; a Harness attachment storage implementation should keep metadata in its attachment table family and use an R2-compatible object store for attachment bytes when object-backed attachments are enabled.
+These bindings support the current Cloudflare KV memory, workflow, scoring, and background task domains. `CloudflareKVStorage` doesn't currently implement the Harness attachment storage domain or R2 byte storage. Harness attachment primitives/elements are separate from the memory `mastra_resources` namespace; a Harness attachment storage implementation should keep metadata in its attachment table family and use an R2-compatible object store for attachment bytes when object-backed attachments are enabled.
 
 ### Consistency & Propagation
 

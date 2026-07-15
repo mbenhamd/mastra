@@ -698,6 +698,42 @@ describe('CoreToolBuilder background task schema injection', () => {
 });
 
 describe('CoreToolBuilder requestContext merge', () => {
+  it('preserves invocation option accessors without evaluating compatibility getters', async () => {
+    const legacyGetter = vi.fn(() => {
+      throw new Error('deprecated compatibility getter was evaluated');
+    });
+    const mcpContext = { serverName: 'test-server' };
+    let receivedInvocationOptions: Record<string, unknown> | undefined;
+
+    const testTool = {
+      description: 'Read canonical MCP context',
+      inputSchema: z.object({}),
+      execute: async (_args: unknown, invocationOptions: Record<string, unknown>) => {
+        receivedInvocationOptions = invocationOptions;
+        return { result: 'ok' };
+      },
+    };
+    const builtTool = new CoreToolBuilder({
+      originalTool: testTool as any,
+      options: { name: 'mcp_context_tool', requestContext: new RequestContext() },
+    }).build();
+    const invocationOptions = {
+      toolCallId: 'call-1',
+      messages: [],
+      mcp: mcpContext,
+    } as any;
+    Object.defineProperty(invocationOptions, 'elicitation', {
+      enumerable: true,
+      get: legacyGetter,
+    });
+
+    await expect(builtTool.execute!({}, invocationOptions)).resolves.toEqual({ result: 'ok' });
+
+    expect(legacyGetter).not.toHaveBeenCalled();
+    expect(receivedInvocationOptions?.mcp).toBe(mcpContext);
+    expect(Object.getOwnPropertyDescriptor(receivedInvocationOptions, 'elicitation')?.get).toBe(legacyGetter);
+  });
+
   it('preserves requestContext identity when closure and exec contexts are the same instance', async () => {
     const sharedRC = new RequestContext();
     sharedRC.set('initial-key', 'initial-value');

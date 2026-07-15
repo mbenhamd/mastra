@@ -17,7 +17,7 @@
  * projection); the entry/source kind enums already reserve them.
  */
 
-import type { HarnessMessage } from '../types';
+import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 
 import { HarnessValidationError } from './errors';
 import type { ActivityTimelineEntry, ActivityTimelineOptions, SessionActivityTimeline } from './types';

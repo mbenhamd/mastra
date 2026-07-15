@@ -180,8 +180,9 @@ Mastra surfaces and projects only the subset that has a v1 public-event home:
    are implementation inputs; §10.4 in-epoch ordering, §10.5 in-memory
    replay buffer, and §13.3d SSE envelope are the v1 surfaces and do not
    expose pubsub-level identifiers.
-4. **Current `HarnessEvent`.** Current Mastra's `HarnessEvent` union at
-   `../packages/core/src/harness/types.ts:725` is `changed-v1` per §11.6a.
+4. **Historical `HarnessEvent`.** The pre-AgentController Mastra snapshot's
+   `HarnessEvent` union at `../packages/core/src/harness/types.ts:725` is
+   `changed-v1` per §11.6a.
    The current-to-v1 projector is the migration boundary that translates
    current bare codes into v1 namespaced envelopes (§13.3f.1) and excludes
    current display notifications like `display_state_changed`.
