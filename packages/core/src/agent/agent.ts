@@ -1077,7 +1077,7 @@ export class Agent<
     objective: string,
     options: {
       threadId: string;
-      resourceId?: string;
+      resourceId: string;
       judgeModelId?: string;
       maxRuns?: number;
       prompt?: string;
@@ -1085,7 +1085,7 @@ export class Agent<
     },
   ): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
-    if (!store || !options.threadId) return undefined;
+    if (!store || !options.resourceId || !options.threadId) return undefined;
 
     const now = Date.now();
     const record: GoalObjectiveRecord = {
@@ -1099,7 +1099,7 @@ export class Agent<
       ...(options.judgeModelId !== undefined ? { judgeModelId: options.judgeModelId } : {}),
       ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
     };
-    await writeObjective(store, options.threadId, record);
+    await writeObjective(store, options.resourceId, options.threadId, record);
     return record;
   }
 
@@ -1107,17 +1107,17 @@ export class Agent<
    * Read the current objective record for a thread, or `undefined` when none is
    * set (or the agent has no storage).
    */
-  async getObjective(options: { threadId: string }): Promise<GoalObjectiveRecord | undefined> {
+  async getObjective(options: { resourceId: string; threadId: string }): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
-    return readObjective(store, options.threadId);
+    return readObjective(store, options.resourceId, options.threadId);
   }
 
   /**
    * Drop the objective for a thread.
    */
-  async clearObjective(options: { threadId: string }): Promise<void> {
+  async clearObjective(options: { resourceId: string; threadId: string }): Promise<void> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
-    await clearObjective(store, options.threadId);
+    await clearObjective(store, options.resourceId, options.threadId);
   }
 
   /**
@@ -1126,6 +1126,7 @@ export class Agent<
    * remembered in thread state). No-ops when no objective is set.
    */
   async updateObjectiveOptions(options: {
+    resourceId: string;
     threadId: string;
     judgeModelId?: string;
     maxRuns?: number;
@@ -1133,7 +1134,7 @@ export class Agent<
     status?: GoalObjectiveRecord['status'];
   }): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
-    const existing = await readObjective(store, options.threadId);
+    const existing = await readObjective(store, options.resourceId, options.threadId);
     if (!store || !existing) return undefined;
 
     const updated: GoalObjectiveRecord = {
@@ -1144,7 +1145,7 @@ export class Agent<
       ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
       ...(options.status !== undefined ? { status: options.status } : {}),
     };
-    await writeObjective(store, options.threadId, updated);
+    await writeObjective(store, options.resourceId, options.threadId, updated);
     return updated;
   }
 

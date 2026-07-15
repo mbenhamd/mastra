@@ -122,8 +122,9 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
       }
 
       const threadId = _internal?.threadId;
+      const resourceId = _internal?.resourceId;
       const store = (await resolveGoalStore(mastra as any)) as ResolvedGoalStore | undefined;
-      const record = await readObjective(store, threadId);
+      const record = await readObjective(store, resourceId, threadId);
 
       // No active objective → no gating, no chunk.
       if (!record || record.status !== 'active' || !store || !threadId) {
@@ -435,7 +436,7 @@ export function createGoalStep<Tools extends ToolSet = ToolSet, OUTPUT = undefin
         pausedReason: status === 'paused' ? pausedReason : undefined,
         updatedAt: Date.now(),
       };
-      await writeObjective(store, threadId, updated, requestContext);
+      await writeObjective(store, resourceId, threadId, updated, requestContext);
 
       // The goal gate makes the final continuation decision: complete, parked,
       // waiting for user input, or budget reached → stop; otherwise force

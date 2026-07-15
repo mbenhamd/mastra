@@ -55,7 +55,7 @@ describeForAllEngines(
         status: 'done',
       });
 
-      const record = await agent.getObjective({ threadId: THREAD });
+      const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
       expect(record?.status).toBe('done');
       expect(record?.runsUsed).toBe(1);
     });

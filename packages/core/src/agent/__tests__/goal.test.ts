@@ -132,7 +132,7 @@ describe('Agent objective methods', () => {
   it('set / get / clear round-trip via thread state', async () => {
     const agent = makeAgent();
 
-    expect(await agent.getObjective({ threadId: THREAD })).toBeUndefined();
+    expect(await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE })).toBeUndefined();
 
     await agent.setObjective('Ship the feature', {
       id: 'goal-1',
@@ -141,7 +141,7 @@ describe('Agent objective methods', () => {
       judgeModelId: 'judge-1',
       maxRuns: 5,
     });
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record).toMatchObject({
       id: 'goal-1',
       objective: 'Ship the feature',
@@ -153,26 +153,39 @@ describe('Agent objective methods', () => {
     // Unprovided optional fields are left unset so they fall back to agent config.
     expect(record?.prompt).toBeUndefined();
 
-    await agent.clearObjective({ threadId: THREAD });
-    expect(await agent.getObjective({ threadId: THREAD })).toBeUndefined();
+    await agent.clearObjective({ threadId: THREAD, resourceId: RESOURCE });
+    expect(await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE })).toBeUndefined();
+  });
+
+  it('isolates objectives for the same thread id across resources', async () => {
+    const agent = makeAgent();
+
+    await agent.setObjective('Resource one goal', { threadId: THREAD, resourceId: RESOURCE });
+    await agent.setObjective('Resource two goal', { threadId: THREAD, resourceId: 'resource-2' });
+
+    await expect(agent.getObjective({ threadId: THREAD, resourceId: RESOURCE })).resolves.toMatchObject({
+      objective: 'Resource one goal',
+    });
+    await expect(agent.getObjective({ threadId: THREAD, resourceId: 'resource-2' })).resolves.toMatchObject({
+      objective: 'Resource two goal',
+    });
   });
 
   it('updateObjectiveOptions persists provided values and no-ops without an objective', async () => {
     const agent = makeAgent();
 
-    expect(await agent.updateObjectiveOptions({ threadId: THREAD, judgeModelId: 'j' })).toBeUndefined();
+    expect(
+      await agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, judgeModelId: 'j' }),
+    ).toBeUndefined();
 
     await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
     const updated = await agent.updateObjectiveOptions({
       threadId: THREAD,
+      resourceId: RESOURCE,
       judgeModelId: 'new-judge',
       maxRuns: 12,
     });
-    expect(updated).toMatchObject({
-      judgeModelId: 'new-judge',
-      maxRuns: 12,
-      objective: 'Goal',
-    });
+    expect(updated).toMatchObject({ judgeModelId: 'new-judge', maxRuns: 12, objective: 'Goal' });
   });
 
   it('no-ops without storage', async () => {
@@ -185,8 +198,8 @@ describe('Agent objective methods', () => {
       goal: {},
     });
     // No Mastra/storage registered.
-    expect(await agent.setObjective('x', { threadId: THREAD })).toBeUndefined();
-    expect(await agent.getObjective({ threadId: THREAD })).toBeUndefined();
+    expect(await agent.setObjective('x', { threadId: THREAD, resourceId: RESOURCE })).toBeUndefined();
+    expect(await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE })).toBeUndefined();
   });
 });
 
@@ -211,7 +224,7 @@ describe('in-loop goal scoring', () => {
 
     expect(goalChunks).toHaveLength(0);
     // runsUsed never incremented.
-    expect((await agent.getObjective({ threadId: THREAD }))?.runsUsed).toBe(0);
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.runsUsed).toBe(0);
   });
 
   it('scores and completes the goal when a judge model + scorer resolve', async () => {
@@ -249,7 +262,7 @@ describe('in-loop goal scoring', () => {
     expect(Array.isArray(resultChunks[0].payload.results)).toBe(true);
     expect(typeof resultChunks[0].payload.duration).toBe('number');
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('done');
     expect(record?.runsUsed).toBe(1);
   });
@@ -283,7 +296,7 @@ describe('in-loop goal scoring', () => {
       maxRunsReached: false,
     });
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('done');
     expect(record?.runsUsed).toBe(2);
   });
@@ -363,7 +376,7 @@ describe('in-loop goal scoring', () => {
       reason: 'waiting for your review',
     });
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('active');
     expect(record?.runsUsed).toBe(1);
   });
@@ -399,7 +412,7 @@ describe('in-loop goal scoring', () => {
     expect(resultChunks).toHaveLength(2);
     expect(resultChunks[resultChunks.length - 1].payload.maxRunsReached).toBe(true);
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.runsUsed).toBe(2);
     // Exhausting the budget without completing parks the goal as `paused`.
     expect(record?.status).toBe('paused');
@@ -444,7 +457,7 @@ describe('in-loop goal scoring', () => {
     expect(last.status).toBe('paused');
     expect(last.pausedReason).toContain('budget');
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('paused');
     expect(record?.pausedReason).toContain('budget');
     expect(record?.runsUsed).toBe(2);
@@ -468,8 +481,8 @@ describe('in-loop goal scoring', () => {
       void _;
     }
     expect(scorer.run).toHaveBeenCalledTimes(2);
-    expect((await agent.getObjective({ threadId: THREAD }))?.status).toBe('paused');
-    expect((await agent.getObjective({ threadId: THREAD }))?.runsUsed).toBe(2);
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.status).toBe('paused');
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.runsUsed).toBe(2);
 
     // Second run on the same thread: a paused goal is gated out before scoring.
     const goalChunks: any[] = [];
@@ -486,7 +499,7 @@ describe('in-loop goal scoring', () => {
     expect(scorer.run).toHaveBeenCalledTimes(2);
     expect(goalChunks.length).toBe(0);
 
-    const record = await agent.getObjective({ threadId: THREAD });
+    const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.runsUsed).toBe(2);
     expect(record?.status).toBe('paused');
   });
@@ -507,11 +520,11 @@ describe('in-loop goal scoring', () => {
       void _;
     }
     expect(scorer.run).toHaveBeenCalledTimes(1);
-    expect((await agent.getObjective({ threadId: THREAD }))?.status).toBe('paused');
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.status).toBe('paused');
 
     // Resume: raise the budget and reactivate. The stale pause reason is cleared
     // on the next scoring write.
-    await agent.updateObjectiveOptions({ threadId: THREAD, maxRuns: 3, status: 'active' });
+    await agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, maxRuns: 3, status: 'active' });
 
     const goalChunks: any[] = [];
     const secondStream = await agent.stream('again', {
@@ -525,7 +538,7 @@ describe('in-loop goal scoring', () => {
     // The resumed goal re-scores (more scorer calls) and a goal chunk is emitted.
     expect(scorer.run.mock.calls.length).toBeGreaterThan(1);
     expect(goalChunks.length).toBeGreaterThan(0);
-    expect((await agent.getObjective({ threadId: THREAD }))?.runsUsed).toBeGreaterThan(1);
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.runsUsed).toBeGreaterThan(1);
   });
 
   it('invokes a model-resolver function for goal.judge and scores when it resolves a model', async () => {
@@ -570,6 +583,6 @@ describe('in-loop goal scoring', () => {
     expect(judge).toHaveBeenCalled();
     expect(scorer.run).not.toHaveBeenCalled();
     expect(goalChunks).toHaveLength(0);
-    expect((await agent.getObjective({ threadId: THREAD }))?.runsUsed).toBe(0);
+    expect((await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE }))?.runsUsed).toBe(0);
   });
 });

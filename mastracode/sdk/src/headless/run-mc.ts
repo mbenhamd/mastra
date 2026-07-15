@@ -508,7 +508,10 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         if (!objective) return fail('Failed to set goal.');
 
         const agent = controller.getCurrentAgent(session);
-        const persisted = await agent.getObjective({ threadId: session.thread.getId()! });
+        const persisted = await agent.getObjective({
+          resourceId: session.identity.getResourceId(),
+          threadId: session.thread.getId()!,
+        });
         if (settled) return;
         if (!persisted || persisted.id !== objective.id) {
           return fail('Failed to persist goal objective before sending goal signal.');

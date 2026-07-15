@@ -317,8 +317,18 @@ function formatAvailableTaskIds(tasks: TaskItemSnapshot[]): string {
 // the build at the read/write call sites below, rather than silently passing
 // the duck-typed `isThreadStateStore` guard.
 type ResolvedThreadStateStore = {
-  getState<T = unknown>(args: { threadId: string; type: string }): Promise<T | undefined>;
-  setState(args: { threadId: string; type: string; value: TaskRecord[] }): Promise<void>;
+  getState<T = unknown>(args: { resourceId: string; threadId: string; type: string }): Promise<T | undefined>;
+  mutateState<T = unknown, TResult = void>(args: {
+    resourceId: string;
+    threadId: string;
+    type: string;
+    mutate: (
+      current: T | undefined,
+    ) =>
+      | { operation: 'set'; value: T; result: TResult }
+      | { operation: 'delete'; result: TResult }
+      | { operation: 'keep'; result: TResult };
+  }): Promise<TResult>;
 };
 
 interface TaskToolAgentContext {
@@ -342,7 +352,7 @@ function isThreadStateStore(value: unknown): value is ResolvedThreadStateStore {
   return (
     !!value &&
     typeof (value as ResolvedThreadStateStore).getState === 'function' &&
-    typeof (value as ResolvedThreadStateStore).setState === 'function'
+    typeof (value as ResolvedThreadStateStore).mutateState === 'function'
   );
 }
 
@@ -395,11 +405,12 @@ function noMemoryCheckResult(): TaskCheckResult {
 }
 
 /** Read the current task list for the thread from the store. */
-async function readTaskStore(context: TaskToolContext): Promise<TaskItemSnapshot[]> {
+async function readTaskStore(context: TaskToolContext): Promise<TaskItemSnapshot[] | undefined> {
   const store = await resolveTaskStore(context);
   const threadId = context.agent?.threadId;
-  if (!store || !threadId) return [];
-  const tasks = await store.getState<TaskRecord[]>({ threadId, type: TASK_STATE_TYPE });
+  const resourceId = context.agent?.resourceId;
+  if (!store || !threadId || !resourceId) return undefined;
+  const tasks = await store.getState<TaskRecord[]>({ resourceId, threadId, type: TASK_STATE_TYPE });
   return Array.isArray(tasks) ? tasks : [];
 }
 
@@ -414,12 +425,20 @@ async function applyTaskMutation(
 ): Promise<TaskToolResult> {
   const store = await resolveTaskStore(context);
   const threadId = context.agent?.threadId;
-  if (!store || !threadId) return noMemoryResult();
+  const resourceId = context.agent?.resourceId;
+  if (!store || !threadId || !resourceId) return noMemoryResult();
 
-  const currentTasks = await readTaskStore(context);
-  const result = mutation(currentTasks);
+  const result = await store.mutateState<TaskRecord[], TaskToolResult>({
+    resourceId,
+    threadId,
+    type: TASK_STATE_TYPE,
+    mutate: stored => {
+      const currentTasks = Array.isArray(stored) ? stored : [];
+      const result = mutation(currentTasks);
+      return result.isError ? { operation: 'keep', result } : { operation: 'set', value: result.tasks, result };
+    },
+  });
   if (!result.isError) {
-    await store.setState({ threadId, type: TASK_STATE_TYPE, value: result.tasks });
     // Surface the new list to the task state processor for this step's snapshot.
     context.requestContext?.set(TASKS_REQUEST_CONTEXT_KEY, result.tasks);
     emitTaskDisplayUpdate(context.requestContext, result.tasks);
@@ -628,6 +647,7 @@ summary.allCompleted is true only when at least one tracked task exists and ever
       if (!isMemoryBacked(context?.agent)) return noMemoryCheckResult();
 
       const tasks = await readTaskStore(context);
+      if (!tasks) return noMemoryCheckResult();
       const taskCheck = summarizeTaskCheck(tasks);
 
       return {

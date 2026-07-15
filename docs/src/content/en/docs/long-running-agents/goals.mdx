@@ -99,18 +99,18 @@ Each evaluation emits a typed `goal` stream chunk (`GoalEvaluationPayload`: `obj
 
 ## Managing the objective
 
-Control the objective for a thread with `Agent` methods. All of them no-op when the run isn't memory-backed (they require storage and a `threadId`):
+Control the objective for a resource-owned thread with `Agent` methods. All of them no-op when the run isn't memory-backed. They require storage plus both `resourceId` and `threadId` values:
 
 ```typescript title="src/mastra/objective.ts"
 // Read the current objective record.
-const record = await worker.getObjective({ threadId })
+const record = await worker.getObjective({ resourceId, threadId })
 
 // Update options on the active objective (only provided fields are written;
 // unset fields fall back to the agent's `goal` config).
-await worker.updateObjectiveOptions({ threadId, maxRuns: 100 })
+await worker.updateObjectiveOptions({ resourceId, threadId, maxRuns: 100 })
 
 // Drop the objective.
-await worker.clearObjective({ threadId })
+await worker.clearObjective({ resourceId, threadId })
 ```
 
 Per-objective values written by `setObjective` / `updateObjectiveOptions` take precedence over the agent's `goal` config, and that precedence is remembered in thread state. See the [`GoalEvaluationPayload` in the ChunkType reference](/reference/streaming/ChunkType) for the full goal chunk shape.

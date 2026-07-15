@@ -170,9 +170,11 @@ export class GoalManager {
   ): Promise<GoalState | null> {
     if (!this.record) return null;
     const threadId = state.session.thread.getId();
+    const resourceId = state.session.identity.getResourceId();
     const agent = this.getAgent(state);
     if (agent && threadId) {
       const updated = await agent.updateObjectiveOptions({
+        resourceId,
         threadId,
         ...(judgeModelId ? { judgeModelId } : {}),
         maxRuns: maxTurns,
@@ -241,6 +243,7 @@ export class GoalManager {
    */
   async saveToThread(state: GoalManagerState): Promise<void> {
     const threadId = state.session.thread.getId();
+    const resourceId = state.session.identity.getResourceId();
     const agent = this.getAgent(state);
     try {
       if (agent && threadId) {
@@ -248,6 +251,7 @@ export class GoalManager {
           // Push the current status/options into the existing record. If no
           // record is persisted yet (e.g. first save), create one.
           const updated = await agent.updateObjectiveOptions({
+            resourceId,
             threadId,
             status: this.record.status,
             ...(this.record.pausedReason ? { pausedReason: this.record.pausedReason } : {}),
@@ -263,12 +267,13 @@ export class GoalManager {
             await agent.setObjective(this.record.objective, {
               id: this.record.id,
               threadId,
-              resourceId: state.session.identity.getResourceId(),
+              resourceId,
               ...(this.record.judgeModelId ? { judgeModelId: this.record.judgeModelId } : {}),
               ...(this.record.maxRuns !== undefined ? { maxRuns: this.record.maxRuns } : {}),
             });
             if (desiredStatus !== 'active') {
               await agent.updateObjectiveOptions({
+                resourceId,
                 threadId,
                 status: desiredStatus,
                 ...(this.record.pausedReason ? { pausedReason: this.record.pausedReason } : {}),
@@ -276,7 +281,7 @@ export class GoalManager {
             }
           }
         } else {
-          await agent.clearObjective({ threadId });
+          await agent.clearObjective({ resourceId, threadId });
         }
       }
       // Clear any legacy thread-metadata goal so it can't shadow the record.
@@ -296,10 +301,11 @@ export class GoalManager {
     this.activeDurationMs = 0;
 
     const threadId = state.session.thread.getId();
+    const resourceId = state.session.identity.getResourceId();
     const agent = this.getAgent(state);
     if (agent && threadId) {
       try {
-        const record = await agent.getObjective({ threadId });
+        const record = await agent.getObjective({ resourceId, threadId });
         if (record) {
           this.record = { ...record, id: record.id ?? randomUUID() };
           return;

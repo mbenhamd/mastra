@@ -114,9 +114,9 @@ export function resolveEffectiveGoalSettings(
  * silently passing the duck-typed `isThreadStateStore` guard.
  */
 export type ResolvedGoalStore = {
-  getState<T = unknown>(args: { threadId: string; type: string }): Promise<T | undefined>;
-  setState(args: { threadId: string; type: string; value: GoalObjectiveRecord }): Promise<void>;
-  deleteState(args: { threadId: string; type: string }): Promise<void>;
+  getState<T = unknown>(args: { resourceId: string; threadId: string; type: string }): Promise<T | undefined>;
+  setState(args: { resourceId: string; threadId: string; type: string; value: GoalObjectiveRecord }): Promise<void>;
+  deleteState(args: { resourceId: string; threadId: string; type: string }): Promise<void>;
 };
 
 function isThreadStateStore(value: unknown): value is ResolvedGoalStore {
@@ -141,10 +141,11 @@ export async function resolveGoalStore(mastra: MastraUnion | undefined): Promise
 /** Read the current objective record for a thread from the store. */
 export async function readObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
 ): Promise<GoalObjectiveRecord | undefined> {
-  if (!store || !threadId) return undefined;
-  return store.getState<GoalObjectiveRecord>({ threadId, type: GOAL_STATE_TYPE });
+  if (!store || !resourceId || !threadId) return undefined;
+  return store.getState<GoalObjectiveRecord>({ resourceId, threadId, type: GOAL_STATE_TYPE });
 }
 
 /**
@@ -153,23 +154,25 @@ export async function readObjective(
  */
 export async function writeObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
   record: GoalObjectiveRecord,
   requestContext?: RequestContext,
 ): Promise<void> {
-  if (!store || !threadId) return;
-  await store.setState({ threadId, type: GOAL_STATE_TYPE, value: record });
+  if (!store || !resourceId || !threadId) return;
+  await store.setState({ resourceId, threadId, type: GOAL_STATE_TYPE, value: record });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, record);
 }
 
 /** Drop the objective for a thread. */
 export async function clearObjective(
   store: ResolvedGoalStore | undefined,
+  resourceId: string | undefined,
   threadId: string | undefined,
   requestContext?: RequestContext,
 ): Promise<void> {
-  if (!store || !threadId) return;
-  await store.deleteState({ threadId, type: GOAL_STATE_TYPE });
+  if (!store || !resourceId || !threadId) return;
+  await store.deleteState({ resourceId, threadId, type: GOAL_STATE_TYPE });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, undefined);
 }
 

@@ -67,7 +67,7 @@ describeForAllEngines(
       });
 
       // Verify objective is marked as paused (not done).
-      const record = await agent.getObjective({ threadId: THREAD });
+      const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
       expect(record?.status).toBe('paused');
       expect(record?.runsUsed).toBe(2); // Should match maxRuns
     });

@@ -40,7 +40,7 @@ function stableObjectiveCacheKey(record: GoalObjectiveRecord, maxRuns: number): 
 }
 
 type ResolvedThreadStateStore = {
-  getState<T = unknown>(args: { threadId: string; type: string }): Promise<T | undefined>;
+  getState<T = unknown>(args: { resourceId: string; threadId: string; type: string }): Promise<T | undefined>;
 };
 
 /**
@@ -82,7 +82,11 @@ export class GoalStateProcessor {
     } else {
       const store = await this.resolveStore();
       current = store
-        ? await store.getState<GoalObjectiveRecord>({ threadId: args.threadId, type: GOAL_STATE_TYPE })
+        ? await store.getState<GoalObjectiveRecord>({
+            resourceId: args.resourceId,
+            threadId: args.threadId,
+            type: GOAL_STATE_TYPE,
+          })
         : undefined;
     }
 

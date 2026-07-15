@@ -14,7 +14,7 @@ import type { TaskItemSnapshot } from './task-tools';
 // `TaskItemSnapshot`, so this assignment enforces that the two shapes stay
 // structurally identical.
 type ResolvedThreadStateStore = {
-  getState<T = unknown>(args: { threadId: string; type: string }): Promise<T | undefined>;
+  getState<T = unknown>(args: { resourceId: string; threadId: string; type: string }): Promise<T | undefined>;
 };
 
 function isThreadStateStore(value: unknown): value is ResolvedThreadStateStore {
@@ -229,7 +229,11 @@ export class TaskStateProcessor {
     } else {
       const store = await this.resolveTaskStore();
       const stored = store
-        ? await store.getState<TaskRecord[]>({ threadId: args.threadId, type: TASK_STATE_TYPE })
+        ? await store.getState<TaskRecord[]>({
+            resourceId: args.resourceId,
+            threadId: args.threadId,
+            type: TASK_STATE_TYPE,
+          })
         : undefined;
       currentTasks = Array.isArray(stored) ? stored : priorTasks;
     }

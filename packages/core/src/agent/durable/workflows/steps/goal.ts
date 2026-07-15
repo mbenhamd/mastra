@@ -166,6 +166,7 @@ export function createDurableGoalStep() {
       }
 
       const threadId = initData.state?.threadId;
+      const resourceId = initData.state?.resourceId;
 
       // Reconstruct requestContext from serialized entries for resolvers.
       const requestContext = new RequestContext();
@@ -176,7 +177,7 @@ export function createDurableGoalStep() {
       }
 
       const store = (await resolveGoalStore(mastra as any)) as ResolvedGoalStore | undefined;
-      const record = await readObjective(store, threadId);
+      const record = await readObjective(store, resourceId, threadId);
 
       // No active objective → no gating, no chunk.
       if (!record || record.status !== 'active' || !store || !threadId) {
@@ -439,7 +440,7 @@ export function createDurableGoalStep() {
         pausedReason: status === 'paused' ? pausedReason : undefined,
         updatedAt: Date.now(),
       };
-      await writeObjective(store, threadId, updated, requestContext);
+      await writeObjective(store, resourceId, threadId, updated, requestContext);
 
       // Continuation decision.
       const shouldContinue = !result.complete && !waiting && !judgeFailed && !maxRunsReached;

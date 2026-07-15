@@ -121,7 +121,12 @@ describe('GoalManager adapter', () => {
     const goal = await manager.updateJudgeDefaults(state, 'anthropic/claude-sonnet-4-5', 25);
 
     expect(agent.updateObjectiveOptions).toHaveBeenCalledWith(
-      expect.objectContaining({ threadId: 'parent-thread', judgeModelId: 'anthropic/claude-sonnet-4-5', maxRuns: 25 }),
+      expect.objectContaining({
+        resourceId: 'resource-1',
+        threadId: 'parent-thread',
+        judgeModelId: 'anthropic/claude-sonnet-4-5',
+        maxRuns: 25,
+      }),
     );
     expect(goal).toMatchObject({ judgeModelId: 'anthropic/claude-sonnet-4-5', maxTurns: 25, turnsUsed: 3 });
   });
@@ -154,7 +159,7 @@ describe('GoalManager adapter', () => {
 
     await manager.loadFromThread(state);
 
-    expect(agent.getObjective).toHaveBeenCalledWith({ threadId: 'parent-thread' });
+    expect(agent.getObjective).toHaveBeenCalledWith({ resourceId: 'resource-1', threadId: 'parent-thread' });
     expect(manager.getGoal()).toMatchObject({ objective: 'persisted goal', turnsUsed: 4, status: 'paused' });
   });
 
@@ -227,6 +232,7 @@ describe('GoalManager adapter', () => {
 
     expect(agent.updateObjectiveOptions).toHaveBeenCalledWith(
       expect.objectContaining({
+        resourceId: 'resource-1',
         threadId: 'parent-thread',
         status: 'paused',
         pausedReason: 'Judge evaluation was interrupted.',

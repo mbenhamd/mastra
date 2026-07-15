@@ -7,19 +7,35 @@ import { createMockModel } from '../../../test-utils/llm-mock';
 import { createGoalStep } from './goal-step';
 
 const THREAD_ID = 'thread-1';
+const RESOURCE_ID = 'resource-1';
+
+function stateKey(resourceId: string, threadId: string, type: string): string {
+  return `${resourceId}:${threadId}:${type}`;
+}
 
 /** Minimal in-memory thread-state store matching ResolvedGoalStore. */
 function createStore(initial?: GoalObjectiveRecord) {
   const states = new Map<string, GoalObjectiveRecord>();
-  if (initial) states.set(`${THREAD_ID}:${GOAL_STATE_TYPE}`, initial);
+  if (initial) states.set(stateKey(RESOURCE_ID, THREAD_ID, GOAL_STATE_TYPE), initial);
   return {
     states,
-    getState: async ({ threadId, type }: { threadId: string; type: string }) => states.get(`${threadId}:${type}`),
-    setState: async ({ threadId, type, value }: { threadId: string; type: string; value: GoalObjectiveRecord }) => {
-      states.set(`${threadId}:${type}`, value);
+    getState: async ({ resourceId, threadId, type }: { resourceId: string; threadId: string; type: string }) =>
+      states.get(stateKey(resourceId, threadId, type)),
+    setState: async ({
+      resourceId,
+      threadId,
+      type,
+      value,
+    }: {
+      resourceId: string;
+      threadId: string;
+      type: string;
+      value: GoalObjectiveRecord;
+    }) => {
+      states.set(stateKey(resourceId, threadId, type), value);
     },
-    deleteState: async ({ threadId, type }: { threadId: string; type: string }) => {
-      states.delete(`${threadId}:${type}`);
+    deleteState: async ({ resourceId, threadId, type }: { resourceId: string; threadId: string; type: string }) => {
+      states.delete(stateKey(resourceId, threadId, type));
     },
   };
 }
@@ -146,7 +162,7 @@ async function runGoalStep(
     _internal: {
       generateId: () => 'response-2',
       threadId: THREAD_ID,
-      resourceId: 'resource-1',
+      resourceId: RESOURCE_ID,
       ...(opts?.useMemory ? { memory: { id: 'memory' } } : {}),
     },
     agentId: 'agent',
@@ -164,7 +180,7 @@ async function runGoalStep(
     chunk: resultChunk,
     pendingChunk: goalChunks.find(c => c.payload.pending),
     goalChunks,
-    record: store.states.get(`${THREAD_ID}:${GOAL_STATE_TYPE}`)!,
+    record: store.states.get(stateKey(RESOURCE_ID, THREAD_ID, GOAL_STATE_TYPE))!,
     stepResult,
     messages,
     dataParts,
