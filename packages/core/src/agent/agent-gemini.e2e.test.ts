@@ -1,6 +1,8 @@
-import { getLLMTestMode } from '@internal/llm-recorder';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { getLLMRecordingsDir, defaultNameGenerator, getLLMTestMode } from '@internal/llm-recorder';
 import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '..';
 import { MockMemory } from '../memory/mock';
@@ -13,134 +15,98 @@ import { Agent } from './index';
 
 setupDummyApiKeys(getLLMTestMode(), ['google']);
 
-const mock = createGatewayMock({
-  transformRequest: ({ url, body }) => {
-    let serialized = JSON.stringify(body);
-    // Normalize UUIDs (runId, suspendedToolRunId)
-    serialized = serialized.replace(
-      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
-      '00000000-0000-0000-0000-000000000000',
-    );
-    // Normalize toolCallId (AI SDK generated, alphanumeric ~16 chars).
-    serialized = serialized.replace(/"toolCallId":"[a-zA-Z0-9]+"/g, '"toolCallId":"NORMALIZED"');
-    serialized = serialized.replace(/\\"toolCallId\\":\\"[a-zA-Z0-9]+\\"/g, '\\"toolCallId\\":\\"NORMALIZED\\"');
-    // Normalize workflow timestamps embedded in multi-level stringified results.
-    // They can appear at various escape depths (\"startedAt\", \\\"startedAt\\\", etc.)
-    serialized = serialized.replace(/(\\*"startedAt\\*":\s*)\d{10,}/g, '$10');
-    serialized = serialized.replace(/(\\*"completedAt\\*":\s*)\d{10,}/g, '$10');
-    serialized = serialized.replace(/(\\*"endedAt\\*":\s*)\d{10,}/g, '$10');
+let memory: MockMemory;
+let requestContext: RequestContext;
+let mockStorage: InMemoryStore;
 
-    const parsed = JSON.parse(serialized);
+let mockGateway: any;
 
-    // Gemini message conversion produces different content structures between runs:
-    // adjacent entries may be split/merged differently, text parts may be combined
-    // or separated, and previous assistant text may be prepended or dropped.
-    // Normalize by flattening all parts into a sequence of (role, content) pairs,
-    // then rebuilding a canonical contents array.
-    if (parsed.contents) {
-      // Flatten: collect all parts as (role, part) tuples
-      type Part = Record<string, any>;
-      const flat: { role: string; part: Part }[] = [];
-      for (const entry of parsed.contents) {
-        for (const part of entry.parts) {
-          flat.push({ role: entry.role, part });
+beforeEach(async c => {
+  memory = new MockMemory();
+  requestContext = new RequestContext();
+  mockStorage = new InMemoryStore();
+  mockGateway = createGatewayMock({
+    maxChunkDelay: 1000,
+    replayWithTiming: true,
+    name: `test-${Buffer.from(
+      // use stable 8-char hash from c.task.name
+      createHash('sha256').update(c.task.name).digest('hex').slice(0, 8),
+    )}`,
+    exactMatch: true,
+    recordingsDir: join(getLLMRecordingsDir(c.task.file.filepath), defaultNameGenerator(c.task.file.filepath)),
+    transformRequest: ({ url, body }) => {
+      let serialized = JSON.stringify(body);
+      // Normalize UUIDs (runId, suspendedToolRunId)
+      // serialized = serialized.replace(
+      //   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+      //   '00000000-0000-0000-0000-000000000000',
+      // );
+      // Normalize toolCallId (AI SDK generated, alphanumeric ~16 chars).
+      serialized = serialized.replace(/"toolCallId":"[a-zA-Z0-9]+"/g, '"toolCallId":"NORMALIZED"');
+      serialized = serialized.replace(/\\"toolCallId\\":\\"[a-zA-Z0-9]+\\"/g, '\\"toolCallId\\":\\"NORMALIZED\\"');
+      // Normalize workflow run IDs that depend on UUID counter state.
+      serialized = serialized.replace(/"runId":"[^"]+"/g, '"runId":"NORMALIZED"');
+      serialized = serialized.replace(/\\"runId\\":\\"[^\\"]+\\"/g, '\\"runId\\":\\"NORMALIZED\\"');
+      serialized = serialized.replace(/"originRunId":"[^"]+"/g, '"originRunId":"NORMALIZED"');
+      serialized = serialized.replace(/\\"originRunId\\":\\"[^\\"]+\\"/g, '\\"originRunId\\":\\"NORMALIZED\\"');
+      serialized = serialized.replace(/"(identityDigest|resumeIdentityDigest)":"[^"]+"/g, '"$1":"NORMALIZED"');
+      serialized = serialized.replace(
+        /\\"(identityDigest|resumeIdentityDigest)\\":\\"[^\\"]+\\"/g,
+        '\\"$1\\":\\"NORMALIZED\\"',
+      );
+      serialized = serialized.replace(/"suspendedToolRunId":"[^"]+"/g, '"suspendedToolRunId":"NORMALIZED"');
+      serialized = serialized.replace(
+        /\\"suspendedToolRunId\\":\\"[^\\"]+\\"/g,
+        '\\"suspendedToolRunId\\":\\"NORMALIZED\\"',
+      );
+      // Normalize workflow timestamps embedded in multi-level stringified results.
+      // They can appear at various escape depths (\"startedAt\", \\\"startedAt\\\", etc.)
+      serialized = serialized.replace(/(\\*"startedAt\\*":\s*)\d{10,}/g, '$10');
+      serialized = serialized.replace(/(\\*"completedAt\\*":\s*)\d{10,}/g, '$10');
+      serialized = serialized.replace(/(\\*"endedAt\\*":\s*)\d{10,}/g, '$10');
+      // Normalize wall-clock durations embedded in network completion-check feedback
+      // (e.g. "Duration: 3649ms") — replay is much faster than the recorded run.
+      serialized = serialized.replace(/Duration: \d+ms/g, 'Duration: NORMALIZEDms');
+
+      const parsed = JSON.parse(serialized);
+
+      // Normalize client-generated tool call ids echoed back in Gemini
+      // functionCall/functionResponse parts — the AI SDK generates a fresh
+      // random id per run, so they can never match the recorded request.
+      const normalizeFunctionCallIds = (value: unknown): void => {
+        if (Array.isArray(value)) {
+          for (const item of value) normalizeFunctionCallIds(item);
+          return;
         }
-      }
-
-      // Filter out trivial text parts (".", "", whitespace-only)
-      const significant = flat.filter(({ part }) => {
-        if ('text' in part && Object.keys(part).length === 1) {
-          return part.text.trim().length > 1;
-        }
-        return true;
-      });
-
-      // Normalize network routing text: the Gemini converter may place
-      // the routing instruction at different positions in the contents array,
-      // with variable prefix/suffix text from previous assistant responses,
-      // and under either 'model' or 'user' role.
-      // Strategy: extract the routing instruction, remove it and all non-routing
-      // model text from the contents, then append the routing instruction as a
-      // canonical entry at the end. This makes the hash position-independent.
-      const ROUTING_START = 'You will be calling just *one* primitive';
-      const ROUTING_END = 'were not picked.';
-      let routingInstruction: string | null = null;
-      const withoutRouting: { role: string; part: Part }[] = [];
-      for (const item of significant) {
-        if ('text' in item.part && typeof item.part.text === 'string') {
-          const startIdx = item.part.text.indexOf(ROUTING_START);
-          if (startIdx >= 0) {
-            // Extract and store the normalized routing instruction
-            let routingText = item.part.text.substring(startIdx);
-            const endIdx = routingText.indexOf(ROUTING_END);
-            if (endIdx >= 0) {
-              routingText = routingText.substring(0, endIdx + ROUTING_END.length);
+        if (value && typeof value === 'object') {
+          const obj = value as Record<string, unknown>;
+          for (const [key, child] of Object.entries(obj)) {
+            if (
+              (key === 'functionCall' || key === 'functionResponse') &&
+              child &&
+              typeof child === 'object' &&
+              'id' in (child as Record<string, unknown>)
+            ) {
+              (child as Record<string, unknown>).id = 'NORMALIZED';
             }
-            routingInstruction = routingText;
-            continue; // Remove from contents
+            normalizeFunctionCallIds(child);
           }
         }
-        withoutRouting.push(item);
-      }
-      // For network requests, also drop non-routing model text parts (previous
-      // assistant responses that appear non-deterministically)
-      const cleaned = routingInstruction
-        ? withoutRouting.filter(item => {
-            if (item.role === 'model' && 'text' in item.part && Object.keys(item.part).length === 1) {
-              return false; // Drop all model text parts for network requests
-            }
-            return true;
-          })
-        : withoutRouting;
-      // Append the routing instruction as a canonical entry at the end
-      if (routingInstruction) {
-        cleaned.push({ role: 'model', part: { text: routingInstruction } });
-      }
+      };
+      normalizeFunctionCallIds(parsed);
 
-      // Rebuild canonical contents: group consecutive same-role parts,
-      // merge adjacent text-only parts within each group
-      const rebuilt: { role: string; parts: Part[] }[] = [];
-      for (const { role, part } of cleaned) {
-        const prev = rebuilt[rebuilt.length - 1];
-        if (prev && prev.role === role) {
-          const last = prev.parts[prev.parts.length - 1];
-          if (
-            'text' in part &&
-            last &&
-            'text' in last &&
-            Object.keys(last).length === 1 &&
-            Object.keys(part).length === 1
-          ) {
-            last.text += part.text;
-          } else {
-            prev.parts.push(part);
-          }
-        } else {
-          rebuilt.push({ role, parts: [part] });
-        }
-      }
-      parsed.contents = rebuilt;
-    }
-
-    return { url, body: parsed };
-  },
+      return { url, body: parsed };
+    },
+  });
+  await mockGateway.start();
 });
-beforeAll(() => mock.start());
-afterAll(() => mock.saveAndStop());
+afterEach(() => mockGateway.saveAndStop());
 
 describe('Gemini Model Compatibility Tests', () => {
-  let memory: MockMemory;
-  let requestContext: RequestContext;
-  let mockStorage: InMemoryStore;
-
-  beforeEach(() => {
-    memory = new MockMemory();
-    requestContext = new RequestContext();
-    mockStorage = new InMemoryStore();
-  });
-
-  const MODEL = 'google/gemini-2.0-flash';
-  const GEMINI_3_PRO = 'google/gemini-3-pro-preview';
+  // gemini-2.0-flash was shut down 2026-06-01 and gemini-3-pro-preview was shut
+  // down 2026-03-09, so recordings can no longer be refreshed against them.
+  const MODEL = 'google/gemini-2.5-flash';
+  const GEMINI_3_PRO = 'google/gemini-3.1-pro-preview';
 
   describe('Direct generate() method - Gemini basic functionality', () => {
     it('should handle basic generation with Gemini', async () => {

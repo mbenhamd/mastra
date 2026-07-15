@@ -1,3 +1,5 @@
+import { JSONParseError, NoObjectGeneratedError, TypeValidationError } from '@internal/ai-sdk-v5';
+
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { MastraLegacyLanguageModel, MastraLanguageModel } from '../llm/model/shared.types';
 import type { StorageThreadType } from '../memory';
@@ -29,6 +31,15 @@ export function notifyStreamObserver(
   } catch (error) {
     console.warn('Error in stream observer callback.', error);
   }
+}
+
+function isStructuredOutputFormatError(error: unknown): boolean {
+  return (
+    JSONParseError.isInstance(error) ||
+    NoObjectGeneratedError.isInstance(error) ||
+    TypeValidationError.isInstance(error) ||
+    (error instanceof MastraError && error.id === 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED')
+  );
 }
 
 export async function tryGenerateWithJsonFallback<
@@ -70,6 +81,8 @@ export async function tryGenerateWithJsonFallback<OUTPUT>(
     }
     return result;
   } catch (error) {
+    if (!isStructuredOutputFormatError(error)) throw error;
+
     console.warn('Error in tryGenerateWithJsonFallback. Attempting fallback.', error);
     return await agent.generate(prompt, {
       ...options,
@@ -118,6 +131,8 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
     }
     return result;
   } catch (error) {
+    if (!isStructuredOutputFormatError(error)) throw error;
+
     console.warn('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
     const result = await agent.stream(prompt, {
       ...streamOptions,

@@ -403,6 +403,44 @@ describe.each([
       ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
     }, 30000);
 
+    it('rejects a foreign run before polling for a requested tool call', async () => {
+      const storage = new InMemoryStore();
+      const agentA = new Agent({
+        id: 'agent-a',
+        name: 'Agent A',
+        instructions: 'You find users.',
+        model: createMockModel(),
+        tools: { findUserTool: createFindUserTool() },
+      });
+      const agentB = new Agent({
+        id: 'agent-b',
+        name: 'Agent B',
+        instructions: 'You find users.',
+        model: createMockModel({ toolCallOnFirstCall: false }),
+        tools: { findUserTool: createFindUserTool() },
+      });
+      new Mastra({ agents: { agentA, agentB }, logger: false, storage });
+
+      const { runId } = await suspendRun(agentA, 'thread-a', 'shared-resource');
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const loadWorkflowSnapshot = vi.spyOn(workflowsStore, 'loadWorkflowSnapshot');
+      const options = {
+        runId,
+        toolCallId: 'guessed-tool-call',
+        memory: { thread: 'thread-a', resource: 'shared-resource' },
+      };
+
+      await expect(agentB.resumeStream({ approved: true }, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_AGENT_MISMATCH',
+      });
+      expect(loadWorkflowSnapshot).not.toHaveBeenCalled();
+
+      await expect(agentB.resumeGenerate({ approved: true }, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_AGENT_MISMATCH',
+      });
+      expect(loadWorkflowSnapshot).not.toHaveBeenCalled();
+    }, 30000);
+
     it('hides snapshots without an owning agent id from every agent (default-deny)', async () => {
       const storage = new InMemoryStore();
       const agentA = new Agent({

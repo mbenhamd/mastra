@@ -635,11 +635,19 @@ function findRecording(
   url: string,
   body: unknown,
   usedHashes?: Set<string>,
+  exactReplayCounts?: Map<string, number>,
 ): ReplayRecording | undefined {
-  // 1. Exact hash match (fast path)
-  const exact = recordings.find(r => isExactRecordingMatch(r, hash));
-  if (exact) {
-    return exact;
+  // 1. Exact hash match (fast path). Multiple recordings can share a hash when
+  //    the same request produced different responses (retries, colliding test
+  //    variants) — consume them in record order, then keep serving the last one.
+  const exactMatches = recordings.filter(r => isExactRecordingMatch(r, hash));
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+  if (exactMatches.length > 1) {
+    const served = exactReplayCounts?.get(hash) ?? 0;
+    exactReplayCounts?.set(hash, served + 1);
+    return exactMatches[Math.min(served, exactMatches.length - 1)];
   }
 
   if (recordings.length === 0) {
@@ -857,6 +865,10 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
   const recordings: LLMRecording[] = [];
   const isRecordMode = mode === 'record';
   const fuzzyUsedHashes = new Set<string>();
+  // Tracks how many exact matches have been served per hash and per test so
+  // divergent responses replay in record order without leaking ordinals across
+  // split per-test fixtures that happen to contain the same request hash.
+  const exactReplayCountsByTest = new Map<string | undefined, Map<string, number>>();
   let saved = false;
 
   // Create handlers for each LLM API host (or a filtered subset)
@@ -1016,7 +1028,12 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
           currentTestName && hasTestScopedRecordings
             ? savedRecordings.filter(recording => recording.testName === currentTestName)
             : savedRecordings;
-        const recording = findRecording(replayRecordings, hash, url, body, fuzzyUsedHashes);
+        let exactReplayCounts = exactReplayCountsByTest.get(currentTestName);
+        if (!exactReplayCounts) {
+          exactReplayCounts = new Map<string, number>();
+          exactReplayCountsByTest.set(currentTestName, exactReplayCounts);
+        }
+        const recording = findRecording(replayRecordings, hash, url, body, fuzzyUsedHashes, exactReplayCounts);
 
         if (!recording) {
           console.error(`[llm-recorder] No recording found for: ${url}${model ? ` (model: ${model})` : ''}`);
@@ -1143,11 +1160,22 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         ...(existingMeta?.createdAt ? { updatedAt: now } : {}),
       };
 
-      // Deduplicate recordings by hash — identical requests across tests share one entry
-      const seen = new Set<string>();
+      // Deduplicate recordings by hash — identical requests across tests share one entry,
+      // but ONLY when their responses are also identical. When the same request produced
+      // different responses (e.g. a retry after a malformed response, or two test variants
+      // whose normalized requests collide but got different model outputs), every entry is
+      // kept in record order and replay consumes them sequentially, so each recorded
+      // request/response chain replays exactly as it happened.
+      const seenResponsesByHash = new Map<string, Set<string>>();
       const dedupedRecordings = recordings.filter(r => {
-        if (seen.has(r.hash)) return false;
-        seen.add(r.hash);
+        const responseKey = JSON.stringify(r.response);
+        let seen = seenResponsesByHash.get(r.hash);
+        if (!seen) {
+          seen = new Set();
+          seenResponsesByHash.set(r.hash, seen);
+        }
+        if (seen.has(responseKey)) return false;
+        seen.add(responseKey);
         return true;
       });
 

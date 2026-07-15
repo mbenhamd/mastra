@@ -460,6 +460,13 @@ export class BackgroundTaskManager {
       throw new Error(`Concurrency limit reached, cannot resume task "${taskId}" — retry once a slot is available`);
     }
 
+    // Resume publishes directly (not via dispatch()), so it needs its own
+    // lazy worker start for the library-mode process-restart case.
+    await this.#ensureExecutionWorkersStarted();
+    if (this.shuttingDown) {
+      throw new Error('BackgroundTaskManager is shutting down, cannot resume tasks');
+    }
+
     // Hand off to the worker subscriber. `task.resume` rides the same
     // `TOPIC_DISPATCH` + `WORKER_GROUP` exactly-once channel as
     // `task.dispatch`, so any worker (including a different process from
@@ -819,7 +826,31 @@ export class BackgroundTaskManager {
 
   // --- Internal ---
 
+  /**
+   * Lazily start Mastra's execution workers before publishing. In "library
+   * mode" nothing ever calls `mastra.startWorkers()`, so the evented
+   * `__background-task` workflow started by `handleDispatch` would publish
+   * to the `workflows` topic with no consumer and the task would sit at
+   * `running` forever (#19339). A no-op once workers are running; honors the
+   * `workers: false` / `MASTRA_WORKERS` opt-outs.
+   *
+   * Startup failures are logged but don't abort the publish — in distributed
+   * topologies a remote worker on the shared broker can still pick the task
+   * up, and throwing here would also abort `drainPending()` /
+   * `recoverStaleTasks()` loops.
+   */
+  async #ensureExecutionWorkersStarted(): Promise<void> {
+    if (!this.#mastra) return;
+    try {
+      await this.#mastra.__ensureExecutionWorkersStarted();
+    } catch (err) {
+      this.#mastra.getLogger?.()?.error('Failed to start execution workers for background task', err as any);
+    }
+  }
+
   private async dispatch(task: BackgroundTask, isRestart?: boolean): Promise<boolean> {
+    if (this.shuttingDown) return false;
+    await this.#ensureExecutionWorkersStarted();
     if (this.shuttingDown) return false;
     // Publish `task.dispatch` on `TOPIC_DISPATCH` with `WORKER_GROUP`, so
     // exactly one worker handles the task. `handleDispatch` flips the

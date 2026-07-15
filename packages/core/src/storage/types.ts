@@ -2922,6 +2922,8 @@ export interface DatasetItem {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  /** Caller-defined, dataset-local logical identity. Immutable after insertion. */
+  externalId?: string | null;
   /** Inherited from the parent dataset at insert time. */
   organizationId?: string | null;
   /** Inherited from the parent dataset at insert time. */
@@ -2941,6 +2943,8 @@ export interface DatasetItemRow {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  /** Caller-defined, dataset-local logical identity. Immutable across SCD-2 history. */
+  externalId?: string | null;
   /** Inherited from the parent dataset at insert time. */
   organizationId?: string | null;
   /** Inherited from the parent dataset at insert time. */
@@ -2968,6 +2972,11 @@ export interface DatasetVersion {
 // Dataset CRUD Input/Output Types
 
 export interface CreateDatasetInput {
+  /**
+   * Optional caller-defined durable identity. When provided, storage adapters atomically create
+   * the dataset or return the compatible dataset that already owns this ID.
+   */
+  id?: string;
   name: string;
   description?: string;
   metadata?: Record<string, unknown>;
@@ -3053,6 +3062,11 @@ export interface UpdateDatasetInput {
  * {@link UpdateDatasetItemInput}.
  */
 export interface DatasetItemPayload {
+  /**
+   * Optional caller-defined identity scoped to this dataset. Reusing an identity
+   * with the originally accepted payload is idempotent; incompatible reuse fails.
+   */
+  externalId?: string;
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
@@ -3079,10 +3093,17 @@ export interface AddDatasetItemInput extends DatasetItemPayload {
  * The optional `filters` field is a tenancy read-scope for the parent dataset;
  * see {@link AddDatasetItemInput.filters}.
  */
-export interface UpdateDatasetItemInput extends Partial<DatasetItemPayload> {
+export interface UpdateDatasetItemInput extends Partial<Omit<DatasetItemPayload, 'externalId'>> {
   id: string;
   datasetId: string;
   filters?: DatasetTenancyFilters;
+}
+
+export interface DatasetItemIdentityConflictDetail {
+  index: number;
+  externalId: string;
+  existingItemId: string;
+  reason: 'payload_mismatch' | 'deleted';
 }
 
 /**
