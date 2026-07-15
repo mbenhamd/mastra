@@ -547,7 +547,7 @@ describe('DurableAgent workflow state serialization', () => {
       stopSequences: ['<end>', '<stop>'],
       seed: 7,
     });
-    expect(result.registryEntry.callTimeHeaders).toEqual({ 'x-trace-id': 'abc-123' });
+    expect(durableAgent.runRegistry.get(result.runId)?.callTimeHeaders).toEqual({ 'x-trace-id': 'abc-123' });
   });
 
   it('should drop non-serializable values from modelSettings and strip headers', async () => {
@@ -577,7 +577,7 @@ describe('DurableAgent workflow state serialization', () => {
     });
 
     // String-valued headers are preserved on the in-process registry entry
-    expect(result.registryEntry.callTimeHeaders).toEqual({ ok: 'yes' });
+    expect(durableAgent.runRegistry.get(result.runId)?.callTimeHeaders).toEqual({ ok: 'yes' });
   });
 
   it('should serialize misc options (disableBackgroundTasks, tracingOptions, actor, instructions, system)', async () => {

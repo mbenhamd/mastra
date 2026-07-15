@@ -192,7 +192,7 @@ if (output.finishReason === 'suspended') {
 | Result | Stream to iterate | Full output object |
 
 :::note
-`toolCallId` is optional on all four methods. Pass it when multiple tool calls may be pending at the same time (common in supervisor agents). When omitted, the agent resumes the most recent suspended tool call.
+Pass `toolCallId` to target the exact suspended call. Some direct approval methods retain an optional `toolCallId` for compatibility with a uniquely labeled snapshot, but omission is rejected when the stored resume label is missing or ambiguous. Runs returned by [`listSuspendedRuns()`](/reference/agents/listSuspendedRuns) always include the exact label to pass.
 :::
 
 ## Tool-level approval

@@ -16,6 +16,7 @@ import {
   stageToolSurfaceFenceRestore,
   stampToolSurfaceFence,
   suspendToolSurfaceFence,
+  transferSuspendedToolSurfaceFence,
 } from './tool-surface-fence';
 
 describe('replacement tool surface fence', () => {
@@ -362,5 +363,18 @@ describe('replacement tool surface fence', () => {
     expect(readToolSurfaceFence(requestContext, 'shared-run')).toBe(fence);
     const currentLease = captureSuspendedToolSurfaceFenceLease(requestContext, 'shared-run')!;
     expect(clearSuspendedToolSurfaceFence(requestContext, 'shared-run', currentLease)).toBe(true);
+  });
+
+  it('moves the exact suspended fence to a defensively snapshotted request context', () => {
+    const sourceContext = new RequestContext();
+    const targetContext = new RequestContext();
+    const fence = stampToolSurfaceFence(sourceContext, 'shared-run', { modeTool: {} }, 'suspend-owner');
+    suspendToolSurfaceFence(sourceContext, 'shared-run', 'suspend-owner');
+    const lease = captureSuspendedToolSurfaceFenceLease(sourceContext, 'shared-run')!;
+
+    expect(transferSuspendedToolSurfaceFence(sourceContext, targetContext, 'shared-run', lease)).toBe(true);
+    expect(readToolSurfaceFence(sourceContext, 'shared-run')).toBeUndefined();
+    expect(claimToolSurfaceFence(targetContext, 'shared-run', 'resume-owner')).toBe(fence);
+    expect(transferSuspendedToolSurfaceFence(sourceContext, targetContext, 'shared-run', lease)).toBe(false);
   });
 });

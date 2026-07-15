@@ -65,11 +65,16 @@ export const durableAgenticOutputSchema = z.object({
  * Implementations can extend this with additional fields.
  */
 export const baseDurableAgenticInputSchema = z.object({
+  __workflowKind: z.literal('durable-agent'),
   runId: z.string(),
   // Optional for workflows persisted before runtime registry bindings existed.
   runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
+  versions: z.any().optional(),
+  hasProcessors: z.boolean().optional(),
+  runtimeBindings: z.any().optional(),
+  runtimeResolution: z.literal('registry-required').optional(),
   messageListState: z.any(),
   toolsMetadata: z.array(z.any()),
   modelConfig: modelConfigSchema,
@@ -84,11 +89,16 @@ export const baseDurableAgenticInputSchema = z.object({
  */
 export const baseIterationStateSchema = z.object({
   // Original input fields
+  __workflowKind: z.literal('durable-agent'),
   runId: z.string(),
   // Optional for workflows persisted before runtime registry bindings existed.
   runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
+  versions: z.any().optional(),
+  hasProcessors: z.boolean().optional(),
+  runtimeBindings: z.any().optional(),
+  runtimeResolution: z.literal('registry-required').optional(),
   messageListState: z.any(),
   toolsMetadata: z.array(z.any()),
   modelConfig: z.any(),

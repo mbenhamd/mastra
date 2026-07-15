@@ -618,6 +618,39 @@ export function captureSuspendedToolSurfaceFenceLease(
   return registered?.state === 'suspended' ? (registered as unknown as SuspendedToolSurfaceFenceLease) : undefined;
 }
 
+/** Move one exact suspended ceiling when a public RequestContext is defensively snapshotted. */
+export function transferSuspendedToolSurfaceFence(
+  sourceContext: RequestContext,
+  targetContext: RequestContext,
+  runId: string | undefined,
+  lease: SuspendedToolSurfaceFenceLease,
+): boolean {
+  const sourceRegistry = toolSurfaceFenceRegistries.get(sourceContext);
+  const key = runKey(runId);
+  const registered = sourceRegistry?.get(key);
+  if (registered !== (lease as unknown as RegisteredToolSurfaceFence) || registered.state !== 'suspended') {
+    return false;
+  }
+  if (sourceContext === targetContext) return true;
+
+  const targetRegistry = getOrCreateRegistry(toolSurfaceFenceRegistries, targetContext);
+  if (targetRegistry.has(key)) {
+    throw new Error(
+      `Cannot transfer replacement tool surface for run ${runId ?? '<unknown>'}: the snapshotted RequestContext already retains that run.`,
+    );
+  }
+  if (targetRegistry.size >= MAX_RETAINED_FENCES_PER_CONTEXT) {
+    throw new Error(
+      `Cannot transfer replacement tool surface to the snapshotted RequestContext: ${MAX_RETAINED_FENCES_PER_CONTEXT} active or suspended runs are already retained.`,
+    );
+  }
+
+  targetRegistry.set(key, registered);
+  sourceRegistry!.delete(key);
+  if (sourceRegistry!.size === 0) toolSurfaceFenceRegistries.delete(sourceContext);
+  return true;
+}
+
 /** Clear a parked ceiling only if it is still the exact captured suspension. */
 export function clearSuspendedToolSurfaceFence(
   requestContext: RequestContext,

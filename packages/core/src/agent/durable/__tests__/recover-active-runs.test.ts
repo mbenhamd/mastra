@@ -16,9 +16,11 @@ import { Mastra } from '../../../mastra';
 import { InMemoryStore } from '../../../storage';
 import type { WorkflowRunState, WorkflowRunStatus } from '../../../workflows/types';
 import { Agent } from '../../agent';
+import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
+import { serializeModelConfig } from '../utils/serialize-state';
 
 function makeSnapshot(
   runId: string,
@@ -33,11 +35,24 @@ function makeSnapshot(
       input: {
         __workflowKind: 'durable-agent',
         runId,
+        runtimeBindingId: `binding-${runId}`,
+        runtimeResolution: 'registry-required',
         agentId: input.agentId,
-        messageListState: {
-          memoryInfo:
-            input.threadId || input.resourceId ? { threadId: input.threadId, resourceId: input.resourceId } : null,
-        },
+        agentName: input.agentId,
+        messageListState: new MessageList(
+          input.threadId
+            ? {
+                threadId: input.threadId,
+                resourceId: input.resourceId,
+              }
+            : {},
+        ).serialize(),
+        toolsMetadata: [],
+        modelConfig: serializeModelConfig(makeMockModel() as any),
+        runtimeBindings: {},
+        options: {},
+        state: { threadId: input.threadId, resourceId: input.resourceId },
+        messageId: `message-${runId}`,
       } as any,
     },
     activePaths: [],
@@ -100,12 +115,14 @@ function stubWorkflow(agent: DurableAgent, behavior: { failFor?: Set<string> } =
   const restartedRunIds: string[] = [];
   const failFor = behavior.failFor ?? new Set<string>();
   const fakeWorkflow = {
+    deleteWorkflowRunById: vi.fn(async () => {}),
     createRun: vi.fn(async ({ runId }: { runId: string }) => ({
       restart: vi.fn(async () => {
         restartedRunIds.push(runId);
         if (failFor.has(runId)) {
           throw new Error(`boom-${runId}`);
         }
+        await (agent as any).onDurableWorkflowFinish({ runId, status: 'success' });
         return { status: 'success' };
       }),
     })),

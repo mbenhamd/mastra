@@ -22,9 +22,11 @@ import { InMemoryStore } from '../../../storage';
 import { createTool } from '../../../tools';
 import type { WorkflowRunState } from '../../../workflows/types';
 import { Agent } from '../../agent';
+import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
+import { serializeModelConfig } from '../utils/serialize-state';
 
 // ============================================================================
 // Helper Functions
@@ -91,33 +93,44 @@ async function seedSuspendedRun(
   status: WorkflowRunState['status'] = 'suspended',
 ) {
   const workflows = (await store.getStore('workflows'))!;
-  await workflows.persistWorkflowSnapshot({
-    workflowName: DurableStepIds.AGENTIC_LOOP,
+  const snapshot = {
     runId,
-    resourceId: memory.resourceId,
-    snapshot: {
-      runId,
-      status,
-      value: {},
-      context: {
-        input: {
-          __workflowKind: 'durable-agent',
-          runId,
-          agentId,
-          messageListState: { memoryInfo: memory },
-          requestContextEntries: { tenantId: 'tenant-1' },
-          state: memory,
-        },
+    status,
+    value: {},
+    context: {
+      input: {
+        __workflowKind: 'durable-agent',
+        runId,
+        runtimeBindingId: `binding-${runId}`,
+        runtimeResolution: 'registry-required',
+        agentId,
+        agentName: agentId,
+        messageListState: new MessageList(memory).serialize(),
+        toolsMetadata: [],
+        modelConfig: serializeModelConfig(createTextModel('Unused') as any),
+        runtimeBindings: {},
+        options: {},
+        requestContextEntries: { tenantId: 'tenant-1' },
+        state: memory,
+        messageId: `message-${runId}`,
       },
-      activePaths: [],
-      activeStepsPath: {},
-      suspendedPaths: {},
-      resumeLabels: {},
-      serializedStepGraph: [],
-      waitingPaths: {},
-      timestamp: Date.now(),
-    } as WorkflowRunState,
-  });
+    },
+    activePaths: [],
+    activeStepsPath: {},
+    suspendedPaths: {},
+    resumeLabels: {},
+    serializedStepGraph: [],
+    waitingPaths: {},
+    timestamp: Date.now(),
+  } as WorkflowRunState;
+  for (const workflowName of [DurableStepIds.AGENTIC_LOOP, DurableStepIds.AGENTIC_EXECUTION]) {
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      resourceId: memory.resourceId,
+      snapshot,
+    });
+  }
 }
 
 // ============================================================================
@@ -222,19 +235,17 @@ describe('Resume API', () => {
       });
       const prepareSpy = vi.spyOn(durableAgent, 'prepare');
 
-      const result = await durableAgent.resume(runId, { approved: true });
-
-      expect(prepareSpy).toHaveBeenCalledOnce();
-      expect(prepareSpy).toHaveBeenCalledWith(
-        [],
-        expect.objectContaining({
-          runId,
+      const result = await durableAgent.resume(
+        runId,
+        { approved: true },
+        {
           memory: { thread: 'cold-thread', resource: 'cold-resource' },
-          requestContext: expect.anything(),
-        }),
+        },
       );
-      expect(prepareSpy.mock.calls[0]?.[1]?.requestContext?.get('tenantId')).toBe('tenant-1');
+
+      expect(prepareSpy).not.toHaveBeenCalled();
       expect(durableAgent.runRegistry.has(runId)).toBe(true);
+      expect(durableAgent.runRegistry.get(runId)?.requestContext?.get('tenantId')).toBe('tenant-1');
       expect(result.runId).toBe(runId);
       expect(result.threadId).toBe('cold-thread');
       expect(result.resourceId).toBe('cold-resource');
@@ -261,9 +272,15 @@ describe('Resume API', () => {
       );
       const prepareSpy = vi.spyOn(durableAgent, 'prepare');
 
-      await expect(durableAgent.resume(runId, { approved: true })).rejects.toThrow(
-        'This workflow run was not suspended',
-      );
+      await expect(
+        durableAgent.resume(
+          runId,
+          { approved: true },
+          {
+            memory: { thread: 'completed-thread', resource: 'completed-resource' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_RUN_NOT_SUSPENDED' });
       expect(prepareSpy).not.toHaveBeenCalled();
       expect(durableAgent.runRegistry.has(runId)).toBe(false);
     });
@@ -282,9 +299,9 @@ describe('Resume API', () => {
         logger: false,
       });
 
-      await expect(durableAgent.resume('missing-cold-run', { approved: true })).rejects.toThrow(
-        'No registry entry found for run missing-cold-run. Cannot resume.',
-      );
+      await expect(durableAgent.resume('missing-cold-run', { approved: true })).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_RESUME_SNAPSHOT_NOT_FOUND',
+      });
     });
 
     it('does not rehydrate a persisted run owned by another agent', async () => {
@@ -303,9 +320,15 @@ describe('Resume API', () => {
         resourceId: 'foreign-resource',
       });
 
-      await expect(durableAgent.resume(runId, { approved: true })).rejects.toThrow(
-        `persisted run belongs to agent "different-agent", not "${durableAgent.id}"`,
-      );
+      await expect(
+        durableAgent.resume(
+          runId,
+          { approved: true },
+          {
+            memory: { thread: 'foreign-thread', resource: 'foreign-resource' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_AGENT_MISMATCH' });
       expect(durableAgent.runRegistry.has(runId)).toBe(false);
     });
 
@@ -990,13 +1013,14 @@ describe('per-call tool injection survives in-process resume', () => {
       execute: async ({ context }) => `client:${context.q}`,
     });
 
-    const { runId } = await durableAgent.prepare('Start', {
+    const { runId, cleanup } = await durableAgent.prepare('Start', {
       clientTools: { perCallClientTool },
     });
 
     const tools = durableAgent.runRegistry.getTools(runId);
     expect(tools).toBeDefined();
     expect(tools?.perCallClientTool).toBeDefined();
+    cleanup();
   });
 
   it('preserves per-call toolsets on the run registry after prepare', async () => {
@@ -1018,7 +1042,7 @@ describe('per-call tool injection survives in-process resume', () => {
       execute: async ({ context }) => `toolset:${context.q}`,
     });
 
-    const { runId } = await durableAgent.prepare('Start', {
+    const { runId, cleanup } = await durableAgent.prepare('Start', {
       toolsets: {
         perCallToolset: { perCallToolsetTool },
       },
@@ -1027,5 +1051,6 @@ describe('per-call tool injection survives in-process resume', () => {
     const tools = durableAgent.runRegistry.getTools(runId);
     expect(tools).toBeDefined();
     expect(tools?.perCallToolsetTool).toBeDefined();
+    cleanup();
   });
 });

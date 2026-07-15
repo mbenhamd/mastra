@@ -77,6 +77,8 @@ export {
 export {
   DurableAgent,
   type DurableAgentConfig,
+  type DurableAgentPreparationResult,
+  type DurableAgentResumeOptions,
   type DurableAgentStreamOptions,
   type DurableAgentStreamResult,
 } from './durable-agent';

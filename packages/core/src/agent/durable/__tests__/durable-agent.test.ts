@@ -1134,12 +1134,6 @@ describe('DurableAgent resume model metadata', () => {
     const runId = 'test-resume-model';
 
     const mockModel = { modelId: 'gpt-4', provider: 'openai' };
-    globalRunRegistry.set(runId, {
-      runtimeBindingId: `binding-${runId}`,
-      tools: {},
-      model: mockModel as any,
-      cleanup: () => {},
-    });
 
     const mockLM = new MockLanguageModelV2({
       doStream: async () => ({
@@ -1159,12 +1153,17 @@ describe('DurableAgent resume model metadata', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, cache: false });
 
-    durableAgent.runRegistry.register(runId, {
+    const messageList = new MessageList({});
+    const registryEntry = {
       runtimeBindingId: `binding-${runId}`,
+      agentId: durableAgent.id,
       tools: {},
       model: mockModel as any,
+      messageList,
       cleanup: () => {},
-    });
+    };
+    globalRunRegistry.set(runId, registryEntry);
+    durableAgent.runRegistry.registerWithMessageList(runId, registryEntry, messageList);
 
     const result = await durableAgent.resume(runId, { approved: true });
 

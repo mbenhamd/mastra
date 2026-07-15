@@ -36,6 +36,11 @@ import { safeStringify } from '../../utils';
 import { isZodObject, safeExtendZodObject } from '../../utils/zod-utils';
 
 import type { SuspendOptions } from '../../workflows';
+import {
+  createToolRecoveryFingerprint as hashToolRecoveryFingerprint,
+  normalizeToolRecoverySchema,
+  normalizeToolRecoverySchemaIdentity,
+} from '../recovery-fingerprint';
 import { ToolStream } from '../stream';
 import type {
   CoreTool,
@@ -66,6 +71,52 @@ interface LogMessageOptions {
   start: string;
   error: string;
   logData: Record<string, unknown>;
+}
+
+function createToolRecoveryFingerprint(
+  tool: ToolToConvert,
+  schemas: { input?: unknown; output?: unknown; suspend?: unknown; resume?: unknown },
+  options: { backgroundConfig?: unknown; requireApproval?: unknown },
+): string {
+  const candidate = tool as unknown as Record<string, unknown>;
+  const originalFingerprint =
+    typeof candidate.recoveryFingerprint === 'string' ? candidate.recoveryFingerprint : undefined;
+  return hashToolRecoveryFingerprint({
+    id: candidate.id,
+    name: candidate.name,
+    type: candidate.type,
+    args: candidate.args,
+    originalFingerprint,
+    description: candidate.description,
+    schemas: {
+      input: normalizeToolRecoverySchema(schemas.input),
+      output: normalizeToolRecoverySchema(schemas.output),
+      suspend: normalizeToolRecoverySchema(schemas.suspend),
+      resume: normalizeToolRecoverySchema(schemas.resume),
+    },
+    originalSchemaIdentity: normalizeToolRecoverySchemaIdentity(
+      candidate.inputSchema ?? candidate.parameters ?? candidate.schema,
+    ),
+    requestContextSchema: normalizeToolRecoverySchemaIdentity(candidate.requestContextSchema),
+    execute: candidate.execute,
+    requireApproval: candidate.requireApproval,
+    builderRequireApproval: options.requireApproval,
+    needsApproval: candidate.needsApproval,
+    needsApprovalFn: candidate.needsApprovalFn,
+    strict: candidate.strict,
+    providerOptions: candidate.providerOptions,
+    toModelOutput: candidate.toModelOutput,
+    transform: candidate.transform,
+    inputExamples: candidate.inputExamples,
+    mcp: candidate.mcp,
+    mcpMetadata: candidate.mcpMetadata,
+    background: candidate.background,
+    backgroundConfig: options.backgroundConfig,
+    onInputStart: candidate.onInputStart,
+    onInputDelta: candidate.onInputDelta,
+    onInputAvailable: candidate.onInputAvailable,
+    onOutput: candidate.onOutput,
+  });
 }
 
 function resolveToolFGAResourceId(tool: ToolToConvert, options: ToolOptions): string {
@@ -1061,6 +1112,19 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       hasSuspendSchema: !!this.getSuspendSchema(),
+      recoveryFingerprint: createToolRecoveryFingerprint(
+        this.originalTool,
+        {
+          input: processedInputSchema,
+          output: processedOutputSchema,
+          suspend: this.getSuspendSchema(),
+          resume: this.getResumeSchema(),
+        },
+        {
+          backgroundConfig: this.options.backgroundConfig,
+          requireApproval: this.options.requireApproval,
+        },
+      ),
       execute: this.originalTool.execute
         ? this.createExecute(
             this.originalTool,

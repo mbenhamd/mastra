@@ -85,7 +85,8 @@ describe('DurableAgent goal step', () => {
       storage: new InMemoryStore(),
     });
 
-    const { registryEntry } = await durableAgent.prepare('hello');
+    const prepared = await durableAgent.prepare('hello');
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     expect(registryEntry.goal).toBeDefined();
     expect(registryEntry.goal?.scorer).toBe(passingScorer);

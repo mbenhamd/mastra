@@ -9,11 +9,14 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
 import { Mastra } from '../../mastra';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import type { WorkflowRunState } from '../../workflows/types';
 import { Agent } from '../agent';
+import { agentThreadStreamRuntime } from '../thread-stream-runtime';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from './mock-model';
 
 const mockFindUser = vi.fn().mockImplementation(async (data: { name: string }) => {
@@ -178,22 +181,40 @@ function createSuspendedSetup({
   storage = new InMemoryStore(),
   toolCallOnFirstCall = true,
   toolCallId,
-}: { storage?: InMemoryStore; toolCallOnFirstCall?: boolean; toolCallId?: string } = {}) {
+  fgaProvider,
+  requestContextSchema,
+}: {
+  storage?: InMemoryStore;
+  toolCallOnFirstCall?: boolean;
+  toolCallId?: string;
+  fgaProvider?: IFGAProvider;
+  requestContextSchema?: any;
+} = {}) {
   const agent = new Agent({
     id: 'user-agent',
     name: 'User Agent',
     instructions: 'You find users.',
     model: createMockModel({ toolCallOnFirstCall, toolCallId }),
     tools: { findUserTool: createFindUserTool() },
+    requestContextSchema,
   });
 
   const mastra = new Mastra({
     agents: { agent },
     logger: false,
     storage,
+    server: fgaProvider ? ({ fga: fgaProvider } as any) : undefined,
   });
 
   return { agent, mastra, storage };
+}
+
+function createFGAProvider(): IFGAProvider {
+  return {
+    check: vi.fn().mockResolvedValue(true),
+    require: vi.fn().mockResolvedValue(undefined),
+    filterAccessible: vi.fn(),
+  };
 }
 
 async function suspendRun(agent: Agent, threadId: string, resourceId: string) {
@@ -210,6 +231,42 @@ async function suspendRun(agent: Agent, threadId: string, resourceId: string) {
   }
   expect(toolCallId).toBeTruthy();
   return { runId: stream.runId, toolCallId };
+}
+
+async function persistConflictingSuspendedStepOwnership(
+  storage: InMemoryStore,
+  runId: string,
+  conflicting: { threadId: string; resourceId: string },
+) {
+  const workflowsStore = (await storage.getStore('workflows'))!;
+  const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: 'agentic-loop' });
+  expect(run).not.toBeNull();
+  const snapshot = run!.snapshot as WorkflowRunState;
+  const suspendedStep = Object.values(snapshot.context).find(step => step?.status === 'suspended');
+  expect(suspendedStep?.suspendPayload?.__streamState).toBeDefined();
+  const streamState = suspendedStep!.suspendPayload!.__streamState;
+  snapshot.context['conflicting-ownership-step'] = {
+    ...suspendedStep,
+    suspendPayload: {
+      ...suspendedStep!.suspendPayload,
+      __streamState: {
+        ...streamState,
+        messageList: {
+          ...streamState.messageList,
+          memoryInfo: {
+            ...streamState.messageList.memoryInfo,
+            ...conflicting,
+          },
+        },
+      },
+    },
+  } as any;
+  await workflowsStore.persistWorkflowSnapshot({
+    workflowName: 'agentic-loop',
+    runId,
+    resourceId: run!.resourceId,
+    snapshot,
+  });
 }
 
 afterEach(() => {
@@ -242,6 +299,7 @@ describe.each([
       expect(runs[0]).toEqual({
         runId,
         status: 'suspended',
+        workflowName: 'agentic-loop',
         threadId: 'thread-1',
         resourceId: 'resource-1',
         suspendedAt: expect.any(Date),
@@ -278,6 +336,8 @@ describe.each([
       await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-2', 'resource-1');
       const { agent } = createSuspendedSetup({ storage });
       await suspendRun(agent, 'thread-3', 'resource-1');
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const listWorkflowRuns = vi.spyOn(workflowsStore, 'listWorkflowRuns');
 
       const pageOne = await agent.listSuspendedRuns({ resourceId: 'resource-1', perPage: 2, page: 0 });
       expect(pageOne.total).toBe(3);
@@ -293,6 +353,9 @@ describe.each([
 
       // Without both perPage and page, all matching runs are returned.
       expect((await agent.listSuspendedRuns({ resourceId: 'resource-1', perPage: 2 })).runs).toHaveLength(3);
+      expect(listWorkflowRuns).toHaveBeenCalledWith(
+        expect.objectContaining({ perPage: false, resourceId: 'resource-1' }),
+      );
     }, 30000);
 
     it('only returns runs owned by the listing agent', async () => {
@@ -325,6 +388,19 @@ describe.each([
       const listedByB = await agentB.listSuspendedRuns({ resourceId: 'shared-resource' });
       expect(listedByB.runs.map(run => run.runId)).toEqual([runB]);
       expect(listedByB.total).toBe(1);
+
+      await expect(
+        agentB.approveToolCall({
+          runId: runA,
+          memory: { thread: 'thread-a', resource: 'shared-resource' },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_AGENT_MISMATCH' });
+      await expect(
+        agentA.approveToolCall({
+          runId: runA,
+          memory: { thread: 'thread-a', resource: 'other-resource' },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
     }, 30000);
 
     it('hides snapshots without an owning agent id from every agent (default-deny)', async () => {
@@ -369,6 +445,114 @@ describe.each([
       // A snapshot with no owning agent id must not leak to any agent.
       expect((await agentA.listSuspendedRuns({ resourceId: 'shared-resource' })).total).toBe(0);
       expect((await agentB.listSuspendedRuns({ resourceId: 'shared-resource' })).total).toBe(0);
+
+      await expect(
+        agentA.approveToolCall({
+          runId,
+          memory: { thread: 'thread-a', resource: 'shared-resource' },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_AGENT_MISMATCH' });
+    }, 30000);
+
+    it('fails closed when suspended steps disagree on thread or resource ownership', async () => {
+      const { agent, storage } = createSuspendedSetup();
+      const { runId } = await suspendRun(agent, 'thread-a', 'resource-a');
+      await persistConflictingSuspendedStepOwnership(storage, runId, {
+        threadId: 'thread-b',
+        resourceId: 'resource-b',
+      });
+
+      expect((await agent.listSuspendedRuns()).runs).toHaveLength(0);
+      const options = {
+        runId,
+        memory: { thread: 'thread-a', resource: 'resource-a' },
+      };
+      await expect(agent.resumeStream({}, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+      });
+      await expect(agent.resumeGenerate({}, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+      });
+    }, 30000);
+
+    it('fails closed when one of several suspended tool steps is missing ownership metadata', async () => {
+      const { agent, storage } = createSuspendedSetup();
+      const { runId } = await suspendRun(agent, 'thread-a', 'resource-a');
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: 'agentic-loop' });
+      const snapshot = run!.snapshot as WorkflowRunState;
+      const [stepId, suspendedStep] = Object.entries(snapshot.context).find(
+        ([, step]) => step?.status === 'suspended',
+      )!;
+      const unownedStepId = `${stepId}-unowned`;
+      snapshot.context[unownedStepId] = structuredClone(suspendedStep) as any;
+      const unownedPayload = snapshot.context[unownedStepId]!.suspendPayload as any;
+      delete unownedPayload.__agentId;
+      unownedPayload.requireToolApproval.toolCallId = 'unowned-call';
+      snapshot.resumeLabels!['unowned-call'] = { stepId: unownedStepId } as any;
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: 'agentic-loop',
+        runId,
+        resourceId: 'resource-a',
+        snapshot,
+      });
+
+      expect((await agent.listSuspendedRuns({ resourceId: 'resource-a' })).total).toBe(0);
+      await expect(
+        agent.resumeStream(
+          { approved: true },
+          { runId, toolCallId: 'unowned-call', memory: { thread: 'thread-a', resource: 'resource-a' } },
+        ),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_AGENT_MISMATCH' });
+    }, 30000);
+
+    it('rejects a persisted payload toolCallId that disagrees with its resume label', async () => {
+      const { agent, storage } = createSuspendedSetup();
+      const { runId } = await suspendRun(agent, 'thread-a', 'resource-a');
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: 'agentic-loop' });
+      const snapshot = run!.snapshot as WorkflowRunState;
+      const suspendedStep = Object.values(snapshot.context).find(step => step?.status === 'suspended')!;
+      (suspendedStep.suspendPayload as any).requireToolApproval.toolCallId = 'tampered-call';
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: 'agentic-loop',
+        runId,
+        resourceId: 'resource-a',
+        snapshot,
+      });
+
+      expect((await agent.listSuspendedRuns({ resourceId: 'resource-a' })).total).toBe(0);
+      await expect(
+        agent.resumeStream(
+          { approved: true },
+          { runId, toolCallId: 'tampered-call', memory: { thread: 'thread-a', resource: 'resource-a' } },
+        ),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_LABEL_CONFLICT' });
+    }, 30000);
+
+    it('fails closed when the workflow row and embedded snapshot disagree on resource ownership', async () => {
+      const { agent, storage } = createSuspendedSetup();
+      const { runId } = await suspendRun(agent, 'thread-a', 'resource-a');
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: 'agentic-loop' });
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: 'agentic-loop',
+        runId,
+        resourceId: 'conflicting-resource',
+        snapshot: run!.snapshot,
+      });
+
+      expect((await agent.listSuspendedRuns()).runs).toHaveLength(0);
+      const options = {
+        runId,
+        memory: { thread: 'thread-a', resource: 'resource-a' },
+      };
+      await expect(agent.resumeStream({}, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+      });
+      await expect(agent.resumeGenerate({}, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+      });
     }, 30000);
 
     it('rejects invalid pagination inputs', async () => {
@@ -754,9 +938,6 @@ describe.each([
     }, 30000);
 
     it('returns an empty list for a standalone agent (ephemeral in-memory storage)', async () => {
-      // Mastra falls back to an in-memory store when no storage is configured
-      // (and warns about it), so discovery never throws — it just finds nothing
-      // durable. Suspended runs only survive restarts with persistent storage.
       const agent = new Agent({
         id: 'no-storage-agent',
         name: 'No Storage Agent',
@@ -767,9 +948,421 @@ describe.each([
 
       expect((await agent.listSuspendedRuns()).runs).toEqual([]);
     }, 30000);
+
+    it('validates a required request context before scanning storage', async () => {
+      const storage = new InMemoryStore();
+      const { agent } = createSuspendedSetup({
+        storage,
+        requestContextSchema: z.object({ principal: z.string() }),
+      });
+      const workflows = (await storage.getStore('workflows'))!;
+      const listWorkflowRuns = vi.spyOn(workflows, 'listWorkflowRuns');
+
+      await expect(agent.listSuspendedRuns()).rejects.toMatchObject({
+        id: 'AGENT_REQUEST_CONTEXT_VALIDATION_FAILED',
+      });
+      expect(listWorkflowRuns).not.toHaveBeenCalled();
+    });
+
+    it.each(['', '   '])('rejects an empty FGA resource scope before scanning storage (%j)', async resourceId => {
+      const storage = new InMemoryStore();
+      const fgaProvider = createFGAProvider();
+      const { agent } = createSuspendedSetup({ storage, fgaProvider });
+      const workflows = (await storage.getStore('workflows'))!;
+      const listWorkflowRuns = vi.spyOn(workflows, 'listWorkflowRuns');
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, resourceId],
+      ]);
+
+      await expect(agent.listSuspendedRuns({ requestContext })).rejects.toMatchObject({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_UNVERIFIED',
+      });
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+      expect(listWorkflowRuns).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('agent resume fail-closed boundaries', () => {
+    it('waits for an in-flight pending snapshot to become suspended', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(
+        createSuspendedSetup({ storage }).agent,
+        'thread-in-flight',
+        'resource-in-flight',
+      );
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const workflows = (await storage.getStore('workflows'))!;
+      const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockResolvedValueOnce({
+        ...persisted!,
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'pending' },
+      });
+
+      const output = await restarted.agent.resumeStream(
+        { approved: true },
+        {
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          memory: { thread: 'thread-in-flight', resource: 'resource-in-flight' },
+        },
+      );
+      await output.consumeStream();
+      await vi.waitFor(() => expect(mockFindUser).toHaveBeenCalledOnce());
+    });
+
+    it('rejects a running snapshot instead of applying approval to a later suspension', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-running', 'resource-running');
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const workflows = (await storage.getStore('workflows'))!;
+      const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockResolvedValueOnce({
+        ...persisted!,
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'running' },
+      });
+
+      await expect(
+        restarted.agent.resumeStream(
+          { approved: true },
+          {
+            runId: suspended.runId,
+            toolCallId: suspended.toolCallId,
+            memory: { thread: 'thread-running', resource: 'resource-running' },
+          },
+        ),
+      ).rejects.toMatchObject({ id: 'AGENT_RESUME_RUN_NOT_SUSPENDED' });
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
+
+    it('rejects terminal snapshots even when suspended-looking context remains', async () => {
+      const { agent, storage } = createSuspendedSetup();
+      const { runId } = await suspendRun(agent, 'thread-terminal', 'resource-terminal');
+      const workflows = (await storage.getStore('workflows'))!;
+      const run = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
+      const snapshot = run!.snapshot as WorkflowRunState;
+      snapshot.status = 'success';
+      await workflows.persistWorkflowSnapshot({
+        workflowName: 'agentic-loop',
+        runId,
+        resourceId: 'resource-terminal',
+        snapshot,
+      });
+      const options = {
+        runId,
+        memory: { thread: 'thread-terminal', resource: 'resource-terminal' },
+      };
+
+      await expect(agent.resumeStream({ approved: true }, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_RUN_NOT_SUSPENDED',
+      });
+      await expect(agent.resumeGenerate({ approved: true }, options)).rejects.toMatchObject({
+        id: 'AGENT_RESUME_RUN_NOT_SUSPENDED',
+      });
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
+
+    it('snapshots explicit resume identity before awaiting workflow storage', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-owner-b', 'resource-owner-b');
+      const fgaProvider = createFGAProvider();
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const workflows = (await storage.getStore('workflows'))!;
+      const getWorkflowRunById = workflows.getWorkflowRunById.bind(workflows);
+      let releaseStorage!: () => void;
+      const storageGate = new Promise<void>(resolve => {
+        releaseStorage = resolve;
+      });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockImplementationOnce(async args => {
+        await storageGate;
+        return getWorkflowRunById(args);
+      });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-a' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-owner-a'],
+        [MASTRA_THREAD_ID_KEY, 'thread-owner-a'],
+      ]);
+      const memory = { thread: 'thread-owner-a', resource: 'resource-owner-a' };
+      const options = {
+        runId: suspended.runId,
+        toolCallId: suspended.toolCallId,
+        get requestContext() {
+          return requestContext;
+        },
+        get memory() {
+          return memory;
+        },
+      };
+
+      const resuming = restarted.agent.resumeStream({ approved: true }, options);
+      const rejection = expect(resuming).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
+      await vi.waitFor(() => expect(fgaProvider.require).toHaveBeenCalledTimes(1));
+      requestContext.set('user', { id: 'user-b' });
+      requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-owner-b');
+      requestContext.set(MASTRA_THREAD_ID_KEY, 'thread-owner-b');
+      memory.resource = 'resource-owner-b';
+      memory.thread = 'thread-owner-b';
+      releaseStorage();
+
+      await rejection;
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
+
+    it('snapshots a class-instance resume options bag before awaiting workflow storage', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-owner-b', 'resource-owner-b');
+      const fgaProvider = createFGAProvider();
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const workflows = (await storage.getStore('workflows'))!;
+      const getWorkflowRunById = workflows.getWorkflowRunById.bind(workflows);
+      let releaseStorage!: () => void;
+      const storageGate = new Promise<void>(resolve => {
+        releaseStorage = resolve;
+      });
+      vi.spyOn(workflows, 'getWorkflowRunById').mockImplementationOnce(async args => {
+        await storageGate;
+        return getWorkflowRunById(args);
+      });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-a' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-owner-a'],
+        [MASTRA_THREAD_ID_KEY, 'thread-owner-a'],
+      ]);
+      const memory = { thread: 'thread-owner-a', resource: 'resource-owner-a' };
+      class ResumeOptions {
+        constructor(
+          readonly runId: string,
+          readonly toolCallId: string,
+        ) {}
+
+        get requestContext() {
+          return requestContext;
+        }
+
+        get memory() {
+          return memory;
+        }
+      }
+      const options = new ResumeOptions(suspended.runId, suspended.toolCallId);
+
+      const resuming = restarted.agent.resumeStream({ approved: true }, options);
+      const rejection = expect(resuming).rejects.toMatchObject({ id: 'AGENT_RESUME_OWNER_MISMATCH' });
+      await vi.waitFor(() => expect(fgaProvider.require).toHaveBeenCalledTimes(1));
+      requestContext.set('user', { id: 'user-b' });
+      requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-owner-b');
+      requestContext.set(MASTRA_THREAD_ID_KEY, 'thread-owner-b');
+      memory.resource = 'resource-owner-b';
+      memory.thread = 'thread-owner-b';
+      releaseStorage();
+
+      await rejection;
+      expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
+
+    it('reauthorizes the exact resume owner immediately before stream execution', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-revoked', 'resource-revoked');
+      const fgaProvider = createFGAProvider();
+      const revoked = new Error('resume authorization revoked');
+      vi.mocked(fgaProvider.require).mockResolvedValueOnce(undefined).mockRejectedValueOnce(revoked);
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-revoked'],
+        [MASTRA_THREAD_ID_KEY, 'thread-revoked'],
+      ]);
+
+      await expect(
+        restarted.agent.resumeStream(
+          { approved: true },
+          {
+            runId: suspended.runId,
+            toolCallId: suspended.toolCallId,
+            requestContext,
+            memory: { thread: 'thread-revoked', resource: 'resource-revoked' },
+          },
+        ),
+      ).rejects.toBe(revoked);
+      expect(fgaProvider.require).toHaveBeenCalledTimes(2);
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
+
+    it('reauthorizes after waiting for another agent to release the resume thread', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-wait', 'resource-wait');
+      const fgaProvider = createFGAProvider();
+      const revoked = new Error('resume authorization revoked while waiting');
+      vi.mocked(fgaProvider.require).mockResolvedValueOnce(undefined).mockRejectedValueOnce(revoked);
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const blocker = new Agent({
+        id: 'resume-thread-blocker',
+        name: 'Resume thread blocker',
+        instructions: 'Hold the thread while the suspended run waits.',
+        model: createMockModel({ toolCallOnFirstCall: false }),
+      });
+      let releaseBlocker!: () => void;
+      const blockerFinished = new Promise<void>(resolve => {
+        releaseBlocker = resolve;
+      });
+      const blockerRunId = `resume-thread-blocker-run-${evented ? 'evented' : 'default'}`;
+      const blockerCompletion = agentThreadStreamRuntime.registerRun(
+        blocker as any,
+        {
+          runId: blockerRunId,
+          status: 'running',
+          fullStream: (async function* () {})(),
+          _waitUntilFinished: () => blockerFinished,
+        } as any,
+        {
+          runId: blockerRunId,
+          memory: { thread: 'thread-wait', resource: 'resource-wait' },
+        } as any,
+        restarted.agent.getPubSub(),
+      );
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-wait'],
+        [MASTRA_THREAD_ID_KEY, 'thread-wait'],
+      ]);
+
+      const resuming = restarted.agent.resumeStream(
+        { approved: true },
+        {
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          requestContext,
+          memory: { thread: 'thread-wait', resource: 'resource-wait' },
+        },
+      );
+      const rejectedWith = resuming.then(
+        () => new Error('Expected the parked resume to be rejected'),
+        error => error,
+      );
+      let blockerReleased = false;
+      try {
+        await vi.waitFor(() => expect(fgaProvider.require).toHaveBeenCalledTimes(1));
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(fgaProvider.require).toHaveBeenCalledTimes(1);
+        expect(mockFindUser).not.toHaveBeenCalled();
+
+        releaseBlocker();
+        blockerReleased = true;
+        await blockerCompletion;
+        expect(await rejectedWith).toBe(revoked);
+        expect(fgaProvider.require).toHaveBeenCalledTimes(2);
+        expect(mockFindUser).not.toHaveBeenCalled();
+      } finally {
+        if (!blockerReleased) releaseBlocker();
+        await blockerCompletion;
+      }
+    });
+
+    it('reauthorizes the exact resume owner immediately before generate execution', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(
+        createSuspendedSetup({ storage }).agent,
+        'thread-generate',
+        'resource-generate',
+      );
+      const fgaProvider = createFGAProvider();
+      const revoked = new Error('resume authorization revoked');
+      vi.mocked(fgaProvider.require).mockResolvedValueOnce(undefined).mockRejectedValueOnce(revoked);
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-generate'],
+        [MASTRA_THREAD_ID_KEY, 'thread-generate'],
+      ]);
+
+      await expect(
+        restarted.agent.resumeGenerate(
+          { approved: true },
+          {
+            runId: suspended.runId,
+            toolCallId: suspended.toolCallId,
+            requestContext,
+            memory: { thread: 'thread-generate', resource: 'resource-generate' },
+          },
+        ),
+      ).rejects.toBe(revoked);
+      expect(fgaProvider.require).toHaveBeenCalledTimes(2);
+      expect(mockFindUser).not.toHaveBeenCalled();
+    });
   });
 
   describe('agent.sendToolApproval() storage fallback', () => {
+    it('passes authenticated request context through cold FGA discovery and resume', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-1', 'resource-1');
+      const fgaProvider = createFGAProvider();
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+      const requestContext = new RequestContext([
+        ['user', { id: 'user-1' }],
+        [MASTRA_RESOURCE_ID_KEY, 'resource-1'],
+        [MASTRA_THREAD_ID_KEY, 'thread-1'],
+      ]);
+
+      await expect(
+        restarted.agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          toolCallId: suspended.toolCallId,
+          approved: false,
+          requestContext,
+        }),
+      ).resolves.toEqual({ accepted: true, runId: suspended.runId, toolCallId: suspended.toolCallId });
+      expect(fgaProvider.require).toHaveBeenCalled();
+    });
+
+    it('rejects conflicting message and resume-data continuation modes', async () => {
+      const { agent } = createSuspendedSetup();
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          toolCallId: 'call-1',
+          approved: true,
+          messages: [{ role: 'user', content: 'continue' }],
+          resumeData: { name: 'Dero Israel' },
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_CONFLICTING_CONTINUATION_INPUT' });
+    });
+
+    it('rejects messages when declining a tool call', async () => {
+      const { agent } = createSuspendedSetup();
+      for (const messages of [[{ role: 'user' as const, content: 'decline this request' }], '']) {
+        await expect(
+          agent.sendToolApproval({
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+            toolCallId: 'call-1',
+            approved: false,
+            messages,
+          }),
+        ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_APPROVAL' });
+      }
+    });
+
+    it('rejects message continuation when only a persisted suspended run owns the thread', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(createSuspendedSetup({ storage }).agent, 'thread-1', 'resource-1');
+      const { agent: restartedAgent } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+
+      await expect(
+        restartedAgent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          approved: true,
+          messages: [{ role: 'user', content: 'continue' }],
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_MESSAGES_REQUIRE_ACTIVE_RUN' });
+      expect((await restartedAgent.listSuspendedRuns({ resourceId: 'resource-1' })).runs).toHaveLength(1);
+    }, 30000);
+
     it('approves a suspended run after a simulated restart (in-memory state lost)', async () => {
       const storage = new InMemoryStore();
       const { agent } = createSuspendedSetup({ storage });
@@ -914,7 +1507,7 @@ describe.each([
           approved: true,
         }),
       ).rejects.toMatchObject({
-        id: 'AGENT_SEND_TOOL_APPROVAL_AMBIGUOUS_SUSPENDED_RUNS',
+        id: 'AGENT_SEND_TOOL_APPROVAL_AMBIGUOUS_SUSPENDED_CALLS',
       });
 
       // Passing the toolCallId narrows the match to a single run.
@@ -925,6 +1518,43 @@ describe.each([
         approved: true,
       });
       expect(result).toEqual({ accepted: true, runId: second.runId, toolCallId: second.toolCallId });
+    }, 30000);
+
+    it('rejects an exact cold call while another run owns the same thread', async () => {
+      const storage = new InMemoryStore();
+      const cold = await suspendRun(
+        createSuspendedSetup({ storage, toolCallId: 'cold-call' }).agent,
+        'thread-1',
+        'resource-1',
+      );
+      const restarted = createSuspendedSetup({ storage, toolCallId: 'warm-call' });
+      const warm = await suspendRun(restarted.agent, 'thread-1', 'resource-1');
+      expect(restarted.agent.getActiveThreadRunId({ threadId: 'thread-1', resourceId: 'resource-1' })).toBe(warm.runId);
+
+      await expect(
+        restarted.agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          toolCallId: cold.toolCallId,
+          approved: false,
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_ACTIVE_RUN_CONFLICT' });
+    }, 30000);
+
+    it('rejects duplicate exact ids across warm and cold runs', async () => {
+      const storage = new InMemoryStore();
+      await suspendRun(createSuspendedSetup({ storage, toolCallId: 'duplicate-call' }).agent, 'thread-1', 'resource-1');
+      const restarted = createSuspendedSetup({ storage, toolCallId: 'duplicate-call' });
+      await suspendRun(restarted.agent, 'thread-1', 'resource-1');
+
+      await expect(
+        restarted.agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          toolCallId: 'duplicate-call',
+          approved: true,
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_AMBIGUOUS_SUSPENDED_CALLS' });
     }, 30000);
 
     it('throws when no active or suspended run exists for the thread', async () => {

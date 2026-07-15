@@ -424,7 +424,7 @@ describe('DurableAgent streaming execution', () => {
             },
           },
         }),
-      ).rejects.toThrow(/already active.*Refusing to replace/);
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
 
       expect(globalRunRegistry.get(first.runId)?.runtimeBindingId).toBe(first.workflowInput.runtimeBindingId);
       expect(Object.keys(globalRunRegistry.get(first.runId)?.tools ?? {})).toEqual(['firstTool']);
@@ -459,7 +459,7 @@ describe('DurableAgent streaming execution', () => {
       globalRunRegistry.delete(prepared.runId);
     });
 
-    it('should reconstruct a pre-binding durable input after registry loss without attaching it to a new run', async () => {
+    it('should keep a pre-binding-shaped registry-required input fail-closed after registry loss', async () => {
       const backingTool = createTool({
         id: 'legacyBackingTool',
         description: 'reconstructed backing tool',
@@ -487,14 +487,14 @@ describe('DurableAgent streaming execution', () => {
       ).rejects.toThrow(/no longer matches its registered runtime dependencies/);
 
       globalRunRegistry.delete(prepared.runId);
-      const resolved = await resolveRuntimeDependencies({
-        runId: prepared.runId,
-        agentId: baseAgent.id,
-        input: legacyWorkflowInput,
-        mastra: { getAgentById: () => baseAgent } as any,
-      });
-
-      expect(Object.keys(resolved.tools)).toEqual(['backingTool']);
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: legacyWorkflowInput,
+          mastra: { getAgentById: () => baseAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
       durableAgent.runRegistry.cleanup(prepared.runId);
     });
 
@@ -574,10 +574,10 @@ describe('DurableAgent streaming execution', () => {
           agentId: baseAgent.id,
           input: prepared.workflowInput,
         }),
-      ).rejects.toThrow(/Cannot reconstruct replacement tool implementations/);
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
     });
 
-    it('should reconstruct an empty replacement surface as tool-free after registry loss', async () => {
+    it('should keep an empty replacement surface fail-closed after registry loss', async () => {
       const model = createTextStreamModel('unused');
       const baseAgent = new Agent({
         id: 'durable-empty-replacement-agent',
@@ -601,15 +601,15 @@ describe('DurableAgent streaming execution', () => {
       });
       globalRunRegistry.delete('empty-registry-loss-run');
 
-      const resolved = await resolveRuntimeDependencies({
-        runId: 'empty-registry-loss-run',
-        agentId: baseAgent.id,
-        input: prepared.workflowInput,
-        mastra: { getAgentById: () => baseAgent } as any,
-      });
-
       expect(prepared.workflowInput.options.toolSurfaceFence).toEqual([]);
-      expect(resolved.tools).toEqual({});
+      await expect(
+        resolveRuntimeDependencies({
+          runId: 'empty-registry-loss-run',
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+          mastra: { getAgentById: () => baseAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
     });
 
     it('should abort durable preparation when a replacement tool surface cannot be converted', async () => {

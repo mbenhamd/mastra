@@ -214,6 +214,16 @@ describe('ExtendedRunRegistry', () => {
     expect(registry.getMessageList('run-1')).toBe(fakeMessageList);
   });
 
+  it('tracks the live MessageList published by durable workflow steps', () => {
+    const entry = makeEntry();
+    const updatedMessageList = { messages: ['updated'] } as any;
+    registry.registerWithMessageList('run-1', entry, fakeMessageList);
+
+    entry.messageList = updatedMessageList;
+
+    expect(registry.getMessageList('run-1')).toBe(updatedMessageList);
+  });
+
   it('returns undefined MessageList for unknown runId', () => {
     expect(registry.getMessageList('unknown')).toBeUndefined();
   });

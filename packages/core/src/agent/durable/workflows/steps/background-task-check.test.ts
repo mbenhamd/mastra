@@ -71,6 +71,22 @@ afterEach(() => {
 });
 
 describe('createDurableBackgroundTaskCheckStep', () => {
+  it('fails closed when a built-in durable run loses its runtime registry entry', async () => {
+    const step = createDurableBackgroundTaskCheckStep();
+
+    await expect(
+      (step as any).execute({
+        inputData: baseInput(),
+        retryCount: 0,
+        getInitData: () => ({
+          runId: 'missing-runtime',
+          agentId: 'a1',
+          runtimeResolution: 'registry-required',
+        }),
+      }),
+    ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+  });
+
   it('passes through unchanged when no manager is configured', async () => {
     const runId = 'run-no-mgr';
     const runtimeBindingId = 'binding-no-mgr';

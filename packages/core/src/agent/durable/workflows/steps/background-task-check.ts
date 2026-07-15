@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
 import { ChunkFrom } from '../../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
@@ -43,12 +44,22 @@ export function createDurableBackgroundTaskCheckStep() {
         runId: string;
         runtimeBindingId?: string;
         agentId: string;
+        runtimeResolution?: 'registry-required';
         options?: { skipBgTaskWait?: boolean };
         state?: { threadId?: string; resourceId?: string };
       }>();
       const { runId, runtimeBindingId, agentId } = initData;
 
       const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      if (!registryEntry && initData.runtimeResolution === 'registry-required') {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+          details: { agentId, runId },
+        });
+      }
       const bgManager = registryEntry?.backgroundTaskManager;
 
       if (!bgManager) {

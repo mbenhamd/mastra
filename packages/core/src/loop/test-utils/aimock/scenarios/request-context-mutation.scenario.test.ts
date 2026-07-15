@@ -5,10 +5,12 @@
  * tool executions within the same agent run.
  *
  * Behavior varies by engine:
- * - normal, durable, fs: Tools share the same RequestContext reference,
+ * - normal, durable, fs: Tools share one internal RequestContext during a run,
  *   so mutations persist between tool calls.
  * - evented: RequestContext is serialized/deserialized between workflow
  *   steps, so each step receives a fresh copy and mutations are isolated.
+ * - durable snapshots public execution input first, so its internal mutations
+ *   never flow back into the caller-owned RequestContext.
  *
  * Asserts:
  * - Mutation visibility is engine-dependent
@@ -28,6 +30,7 @@ describeForAllEngines('AIMock loop scenario: requestContext mutation behavior', 
   // The evented engine serializes requestContext between steps,
   // so mutations are isolated. All other engines share the reference.
   const mutationsPersist = engine !== 'evented';
+  const callerObservesMutations = mutationsPersist && engine !== 'durable';
 
   it('tool mutations are visible to subsequent tool calls based on engine semantics', async () => {
     const step1Values: string[] = [];
@@ -87,12 +90,11 @@ describeForAllEngines('AIMock loop scenario: requestContext mutation behavior', 
     if (mutationsPersist) {
       // normal/durable/fs: shared reference — read tool sees the mutated value
       expect(step2Values).toEqual(['step1-value']);
-      expect(requestContext.get('counter')).toBe('step1-value');
     } else {
       // evented: serialized between steps — read tool sees the original value
       expect(step2Values).toEqual(['initial']);
-      expect(requestContext.get('counter')).toBe('initial');
     }
+    expect(requestContext.get('counter')).toBe(callerObservesMutations ? 'step1-value' : 'initial');
 
     expect(requests).toHaveLength(3);
   });
@@ -144,11 +146,10 @@ describeForAllEngines('AIMock loop scenario: requestContext mutation behavior', 
     if (mutationsPersist) {
       // normal/durable/fs: mutations accumulate (shared reference)
       expect(mutations).toEqual(['saw:0,set:1', 'saw:1,set:2', 'saw:2,set:3']);
-      expect(requestContext.get('count')).toBe('3');
     } else {
       // evented: each call starts fresh (serialized between steps)
       expect(mutations).toEqual(['saw:0,set:1', 'saw:0,set:1', 'saw:0,set:1']);
-      expect(requestContext.get('count')).toBe('0');
     }
+    expect(requestContext.get('count')).toBe(callerObservesMutations ? '3' : '0');
   });
 });

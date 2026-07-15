@@ -142,7 +142,9 @@ describe('DurableAgent prepareStep', () => {
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
     const prepareStep = vi.fn();
-    const { workflowInput, registryEntry } = await durableAgent.prepare('hello', { prepareStep });
+    const prepared = await durableAgent.prepare('hello', { prepareStep });
+    const { workflowInput } = prepared;
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     expect((workflowInput.options as any).prepareStep).toBeUndefined();
     expect(registryEntry.prepareStep).toBe(prepareStep);

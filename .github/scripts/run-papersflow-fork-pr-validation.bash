@@ -294,6 +294,7 @@ run_validator_self_tests() {
     "$fixture_repo/client-sdks/client-js/src/resources" \
     "$fixture_repo/packages/cli/src/commands/api" \
     "$fixture_repo/packages/core/src/auth/ee/interfaces" \
+    "$fixture_repo/packages/core/src/agent/durable/__tests__" \
     "$fixture_repo/packages/core/src/harness/v1" \
     "$fixture_repo/packages/server/src/server/handlers" \
     "$fixture_repo/packages/server/src/server/server-adapter/routes" \
@@ -372,8 +373,14 @@ run_validator_self_tests() {
     printf '%s\n' "import { it } from 'vitest';" "import { favoriteFixture } from './favorites-helper';" \
       "it('favorites', () => favoriteFixture);" \
       > packages/server/src/server/handlers/favorites.integration.test.ts
-    printf '%s\n' "import { it } from 'vitest';" "it('harness', () => {});" \
+    printf '%s\n' 'export const eventedExecution = process.env.MASTRA_EVENTED_EXECUTION;' \
+      > packages/core/src/harness/v1/agent-helper.ts
+    printf '%s\n' "import { it } from 'vitest';" \
+      "import { eventedExecution } from './agent-helper';" \
+      "it('harness', () => eventedExecution);" \
       > packages/core/src/harness/v1/session.real-agent.e2e.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('durable background tasks', () => {});" \
+      > packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts
     printf '%s\n' "import { it } from 'vitest';" "it('external', () => {});" \
       > packages/server/src/server/handlers/external.integration.test.ts
     git add .
@@ -982,10 +989,10 @@ run_validator_self_tests() {
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' "it('harness update', () => {});" \
-      >> packages/core/src/harness/v1/session.real-agent.e2e.test.ts
+    printf '%s\n' 'export const helperUpdate = true;' \
+      >> packages/core/src/harness/v1/agent-helper.ts
     git add .
-    git commit -q -m 'safe Harness E2E change'
+    git commit -q -m 'safe Harness runtime dependency change'
     git rev-parse HEAD
   )"
   : > "$command_log"
@@ -995,6 +1002,46 @@ run_validator_self_tests() {
     'Running changed test file in full: packages/core/src/harness/v1/session.real-agent.e2e.test.ts' \
     "$output"
   assert_contains 'src/harness/v1/session.real-agent.e2e.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('durable background update', () => {});" \
+      >> packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts
+    git add .
+    git commit -q -m 'safe durable background E2E change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/durable-background-success.log"
+  run_fixture "$head_sha" "$output"
+  assert_contains \
+    'Running changed test file in full: packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts' \
+    "$output"
+  assert_contains 'src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'const providerApiKey = process.env.PROVIDER_API_KEY;' \
+      >> packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts
+    git add .
+    git commit -q -m 'make durable background E2E require provider credentials'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/durable-background-provider-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Provider-dependent durable background fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts' "$output"
+  assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -2197,6 +2244,7 @@ fi
 
 is_explicit_fork_safe_test() {
   case "$1" in
+    packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts | \
     packages/core/src/harness/v1/session.real-agent.e2e.test.ts | \
       packages/server/src/server/handlers/favorites.integration.test.ts) return 0 ;;
     *) return 1 ;;
@@ -2428,6 +2476,7 @@ const bannedBuiltins = new Set([
 ]);
 const nodeBuiltins = new Set(builtinModules.map(specifier => specifier.replace(/^node:/, '').split('/')[0]));
 const exactTestEntries = new Set([
+  'packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts',
   'packages/core/src/harness/v1/session.real-agent.e2e.test.ts',
   'packages/server/src/server/handlers/favorites.integration.test.ts',
 ]);
@@ -2455,6 +2504,7 @@ function approvedExactExternalSpecifier(specifier) {
     specifier === 'vitest' ||
     specifier === 'zod' ||
     specifier.startsWith('zod/') ||
+    specifier === '@internal/ai-sdk-v5/test' ||
     specifier === '@mastra/core' ||
     specifier.startsWith('@mastra/core/') ||
     nodeBuiltins.has(bareSpecifier.split('/')[0])
@@ -2488,6 +2538,75 @@ function isDeclaredNamePosition(node) {
 // Aliasing any of these globals (const request = fetch, const { env } = process,
 // const load = require) strips the name this literal scanner keys on, so every
 // value-position reference outside the directly supported shapes fails closed.
+function runtimeGlobalFindings(file, source) {
+  const parsed = sourceFile(file, source);
+  const findings = [];
+  const addFinding = (reason, node, name) => {
+    let expression = node;
+    const parent = node.parent;
+    if (name === 'process' && reason === 'process.env' && parent) {
+      expression = parent;
+      const envConsumer = parent.parent;
+      if (
+        envConsumer &&
+        (ts.isPropertyAccessExpression(envConsumer) || ts.isElementAccessExpression(envConsumer)) &&
+        envConsumer.expression === parent
+      ) {
+        expression = envConsumer;
+      }
+    } else if (
+      parent &&
+      (ts.isCallExpression(parent) || ts.isNewExpression(parent)) &&
+      parent.expression === node
+    ) {
+      expression = parent;
+    }
+    findings.push({ reason, fingerprint: `${reason}\u0000${expression.getText(parsed)}` });
+  };
+  const flagGlobalReference = (node, name) => {
+    if (isDeclaredNamePosition(node) || isTypePosition(node)) return;
+    const parent = node.parent;
+    if (name === 'process') {
+      const isMemberReceiver =
+        parent &&
+        (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+        parent.expression === node;
+      if (isMemberReceiver) {
+        if (propertyName(parent) === 'env') addFinding('process.env', node, name);
+        return;
+      }
+      addFinding('process alias', node, name);
+      return;
+    }
+    if (name === 'require') {
+      if (parent && ts.isCallExpression(parent) && parent.expression === node) return;
+      addFinding('require alias', node, name);
+      return;
+    }
+    if (name === 'createRequire') {
+      addFinding('createRequire()', node, name);
+      return;
+    }
+    const isDirectCall =
+      parent && (ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === node;
+    addFinding(isDirectCall ? `${name}()` : `${name} alias`, node, name);
+  };
+  const visit = node => {
+    if (ts.isIdentifier(node) && ['process', 'require', 'createRequire', 'fetch', 'WebSocket'].includes(node.text)) {
+      flagGlobalReference(node, node.text);
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const accessedName = propertyName(node);
+      if (['process', 'fetch', 'WebSocket'].includes(accessedName)) {
+        // globalThis.process / globalThis['fetch'] and deeper receiver chains.
+        flagGlobalReference(node, accessedName);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return findings;
+}
+
 function unsupportedRuntimeReasons(file, source) {
   const reasons = new Set();
   const wasReachableFromExactTest = baseGraph.has(repositoryPath(file));
@@ -2516,48 +2635,24 @@ function unsupportedRuntimeReasons(file, source) {
   for (const occurrence of computedSpecifiers) {
     reasons.add(`computed module specifier ${occurrence}`);
   }
-  const parsed = sourceFile(file, source);
-  const flagGlobalReference = (node, name) => {
-    if (isDeclaredNamePosition(node) || isTypePosition(node)) return;
-    const parent = node.parent;
-    if (name === 'process') {
-      const isMemberReceiver =
-        parent &&
-        (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
-        parent.expression === node;
-      if (isMemberReceiver) {
-        if (propertyName(parent) === 'env') reasons.add('process.env');
-        return;
-      }
-      reasons.add('process alias');
-      return;
+
+  // Exact-path tests re-run when a reviewed runtime dependency changes. Keep
+  // pre-existing global accesses trusted by fingerprint and count, while any
+  // newly added or changed process/network access still fails closed.
+  const baseGlobalCounts = new Map();
+  if (wasReachableFromExactTest && baseSource !== undefined) {
+    for (const finding of runtimeGlobalFindings(file, baseSource)) {
+      baseGlobalCounts.set(finding.fingerprint, (baseGlobalCounts.get(finding.fingerprint) ?? 0) + 1);
     }
-    if (name === 'require') {
-      if (parent && ts.isCallExpression(parent) && parent.expression === node) return;
-      reasons.add('require alias');
-      return;
+  }
+  for (const finding of runtimeGlobalFindings(file, source)) {
+    const trustedCount = baseGlobalCounts.get(finding.fingerprint) ?? 0;
+    if (trustedCount > 0) {
+      baseGlobalCounts.set(finding.fingerprint, trustedCount - 1);
+    } else {
+      reasons.add(finding.reason);
     }
-    if (name === 'createRequire') {
-      reasons.add('createRequire()');
-      return;
-    }
-    const isDirectCall =
-      parent && (ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === node;
-    reasons.add(isDirectCall ? `${name}()` : `${name} alias`);
-  };
-  const visit = node => {
-    if (ts.isIdentifier(node) && ['process', 'require', 'createRequire', 'fetch', 'WebSocket'].includes(node.text)) {
-      flagGlobalReference(node, node.text);
-    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const accessedName = propertyName(node);
-      if (['process', 'fetch', 'WebSocket'].includes(accessedName)) {
-        // globalThis.process / globalThis['fetch'] and deeper receiver chains.
-        flagGlobalReference(node, accessedName);
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(parsed);
+  }
   return reasons;
 }
 
@@ -2612,6 +2707,7 @@ mapfile -t detected_tests < <(
 # A changed or newly reachable local dependency of an exact-path exception
 # changes the runtime contract of that test even when the test file is untouched.
 for explicit_test in \
+  packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts \
   packages/core/src/harness/v1/session.real-agent.e2e.test.ts \
   packages/server/src/server/handlers/favorites.integration.test.ts; do
   [[ -f "$explicit_test" ]] || continue
@@ -2645,6 +2741,11 @@ if (( ${#detected_tests[@]} > 0 )); then
       # This is a deterministic, in-process Vitest suite. It uses Mastra's mock
       # language model and InMemoryStore and requires no provider credentials or
       # external service beyond the standard Core test environment.
+      printf '%s\n' "$file" >> "$changed_tests"
+    elif [[ "$file" == packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts ]]; then
+      # This Core E2E suite provisions its own local recorder gateway and uses
+      # committed replay fixtures; the cross-turn case uses the reviewed
+      # deterministic AI SDK mock. It needs no provider credentials or service.
       printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == packages/server/src/server/handlers/favorites.integration.test.ts ]]; then
       # This exact cross-layer Server suite is deterministic and fork-safe: it

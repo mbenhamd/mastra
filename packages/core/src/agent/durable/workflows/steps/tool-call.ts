@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { createBackgroundTask } from '../../../../background-tasks/create';
 import { resolveBackgroundConfig } from '../../../../background-tasks/resolve-config';
 import type { ToolBackgroundConfig } from '../../../../background-tasks/types';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
 import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
@@ -76,6 +77,7 @@ const durableToolCallOutputSchema = durableToolCallInputSchema.extend({
       reason: z.string().optional(),
     })
     .optional(),
+  delegationBailed: z.boolean().optional(),
 });
 
 /**
@@ -284,6 +286,7 @@ export function createDurableToolCallStep() {
         runId: string;
         runtimeBindingId?: string;
         agentId: string;
+        runtimeResolution?: 'registry-required';
         options: SerializableDurableOptions;
         state: {
           threadId?: string;
@@ -342,14 +345,25 @@ export function createDurableToolCallStep() {
         };
       }
 
-      // 1. Resolve the tool from global registry first, then by provider-tool
+      // 1. Resolve the tool from the binding-checked registry first. Built-in
+      // durable runs fail closed if that exact runtime entry was lost.
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      if (!registryEntry && initData.runtimeResolution === 'registry-required') {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+          details: { agentId: initData.agentId, runId },
+        });
+      }
+      // Resolve by provider-tool
       // model-facing name (e.g. `web_search` resolves to `webSearch` when the
       // provider tool advertises the snake-case name), then by id, then fall
       // back to the Mastra-wide tool registry (exact name, provider-tool
       // name, then by id). Mirrors the non-durable tool-call step.
       // Replacement (fenced) runs skip every fallback stage: they dispatch only
       // from the immutable surface captured at preparation.
-      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       if (!registryEntry && agentOptions.toolSurfaceFence !== undefined) {
         throw new Error(
           `[DurableAgent:${initData.agentId}] Cannot reconstruct replacement tool implementations for run ${runId} after the run registry was lost. Refusing to substitute backing-agent tools by name.`,
@@ -394,11 +408,11 @@ export function createDurableToolCallStep() {
         ) as typeof tool;
       }
 
-      if (!tool && replacementToolNames === undefined) {
+      if (!tool && replacementToolNames === undefined && initData.runtimeResolution !== 'registry-required') {
         tool = resolveTool(toolName, mastra as Mastra);
       }
 
-      if (!tool && mastra && replacementToolNames === undefined) {
+      if (!tool && mastra && replacementToolNames === undefined && initData.runtimeResolution !== 'registry-required') {
         mastraTools = (mastra as Mastra).listTools?.() as Record<string, any> | undefined;
         if (mastraTools) {
           tool = findProviderToolByName(mastraTools as any, toolName) as typeof tool;
@@ -419,7 +433,7 @@ export function createDurableToolCallStep() {
       // for `ToolNotFoundError` on skill/mastra_workspace_* tools cross-process.
       // Replacement (fenced) runs never rebuild: caller-supplied replacement
       // implementations cannot be reconstructed from the backing agent.
-      if (!tool && mastra && replacementToolNames === undefined) {
+      if (!tool && mastra && replacementToolNames === undefined && initData.runtimeResolution !== 'registry-required') {
         const rebuilt = await rebuildRunToolsFromMastra({
           mastra: mastra as Mastra,
           runId,
@@ -1346,6 +1360,9 @@ export function createDurableToolCallStep() {
 
       try {
         const result = await tool.execute(cleanedArgs, toolOptions);
+        const delegationBailed =
+          requestContext?.get('__mastra_delegationBailed') === true ||
+          registryEntry?.requestContext?.get('__mastra_delegationBailed') === true;
 
         // Fire onOutput lifecycle hook after successful execution (matches non-durable path).
         if (tool && 'onOutput' in tool && typeof (tool as any).onOutput === 'function') {
@@ -1404,10 +1421,14 @@ export function createDurableToolCallStep() {
           args,
           ...resumeTarget,
           result,
+          ...(delegationBailed ? { delegationBailed: true } : {}),
           ...(approvalGrant ?? {}),
         };
       } catch (error) {
         const toolError = serializeError(error);
+        const delegationBailed =
+          requestContext?.get('__mastra_delegationBailed') === true ||
+          registryEntry?.requestContext?.get('__mastra_delegationBailed') === true;
 
         // Emit tool-error chunk (non-fatal — error result is returned regardless)
         if (pubsub && !wasSuspended) {
@@ -1448,6 +1469,7 @@ export function createDurableToolCallStep() {
           args,
           ...resumeTarget,
           error: toolError,
+          ...(delegationBailed ? { delegationBailed: true } : {}),
           ...(approvalGrant ?? {}),
         };
       }

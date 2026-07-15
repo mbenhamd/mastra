@@ -19,10 +19,12 @@ import { Mastra } from '../../../mastra';
 import { InMemoryStore } from '../../../storage';
 import type { WorkflowRunState, WorkflowRunStatus } from '../../../workflows/types';
 import { Agent } from '../../agent';
+import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
 import { globalRunRegistry } from '../run-registry';
+import { serializeModelConfig } from '../utils/serialize-state';
 
 function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string): WorkflowRunState {
   return {
@@ -33,11 +35,18 @@ function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string)
       input: {
         __workflowKind: 'durable-agent',
         runId,
+        runtimeBindingId: `binding-${runId}`,
+        runtimeResolution: 'registry-required',
         agentId,
-        messageListState: { memoryInfo: { threadId: 't', resourceId: 'r' } },
+        agentName: agentId,
+        messageListState: new MessageList({ threadId: 't', resourceId: 'r' }).serialize(),
+        toolsMetadata: [],
+        modelConfig: serializeModelConfig(makeMockModel() as any),
+        runtimeBindings: {},
+        options: {},
         requestContextEntries: { userId: 'u-1' },
-        modelConfig: { provider: 'mock', modelId: 'mock-v1' },
         state: { threadId: 't', resourceId: 'r' },
+        messageId: `message-${runId}`,
       } as any,
     },
     activePaths: [],
@@ -101,8 +110,15 @@ async function seed(store: InMemoryStore, runId: string, status: WorkflowRunStat
  */
 function stubWorkflow(agent: DurableAgent, terminalStatus: WorkflowRunStatus) {
   const deleteWorkflowRunById = vi.fn(async () => {});
-  const restart = vi.fn(async () => ({ status: terminalStatus }));
-  const createRun = vi.fn(async ({ runId }: { runId: string }) => ({ restart, runId }));
+  let activeRunId = '';
+  const restart = vi.fn(async () => {
+    await (agent as any).onDurableWorkflowFinish({ runId: activeRunId, status: terminalStatus });
+    return { status: terminalStatus };
+  });
+  const createRun = vi.fn(async ({ runId }: { runId: string }) => {
+    activeRunId = runId;
+    return { restart, runId };
+  });
   const fakeWorkflow = { createRun, restart, deleteWorkflowRunById };
   vi.spyOn(agent, 'getWorkflow').mockReturnValue(fakeWorkflow as any);
   return { deleteWorkflowRunById, createRun, restart };

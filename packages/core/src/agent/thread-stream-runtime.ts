@@ -1047,6 +1047,15 @@ export class AgentThreadStreamRuntime {
     return { runId: options.runId, toolCallId: options.toolCallId ?? suspension?.toolCallId };
   }
 
+  /** Whether the live run registry has already advanced to this exact suspended tool call. */
+  isSuspendedToolCall(runId: string, toolCallId: string, pubsub?: PubSub): boolean {
+    const state = this.#getState(pubsub);
+    if (!this.#isSuspendedRun(state, runId)) return false;
+    const record = state.threadRunsById.get(runId);
+    const suspension = record?.suspension ?? state.suspensionMetadataByRunId.get(runId);
+    return suspension?.toolCallId === toolCallId;
+  }
+
   abortThread(options: AgentSubscribeToThreadOptions, pubsub?: PubSub): boolean {
     const activeRunId = this.getActiveThreadRunId(options, pubsub);
     if (!activeRunId) return false;

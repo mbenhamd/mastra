@@ -247,7 +247,8 @@ describe('DurableAgent defaultOptions (#17790)', () => {
 
       const durableAgent = createDurableAgent({ agent: base });
 
-      const { registryEntry } = await durableAgent.prepare('Hello');
+      const prepared = await durableAgent.prepare('Hello');
+      const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
       const versions = registryEntry.requestContext?.get(MASTRA_VERSIONS_KEY) as any;
       expect(versions?.agents?.['sub-agent']).toEqual({ versionId: 'from-defaults' });
     });
@@ -265,9 +266,10 @@ describe('DurableAgent defaultOptions (#17790)', () => {
 
       const durableAgent = createDurableAgent({ agent: base });
 
-      const { registryEntry } = await durableAgent.prepare('Hello', {
+      const prepared = await durableAgent.prepare('Hello', {
         versions: { agents: { 'sub-agent': { versionId: 'from-request' } } },
       } as any);
+      const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
       const versions = registryEntry.requestContext?.get(MASTRA_VERSIONS_KEY) as any;
       expect(versions?.agents?.['sub-agent']).toEqual({ versionId: 'from-request' });
     });

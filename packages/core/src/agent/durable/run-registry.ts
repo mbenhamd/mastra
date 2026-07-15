@@ -5,6 +5,8 @@ import type { MessageList } from '../message-list';
 import type { SaveQueueManager } from '../save-queue';
 import type { RunRegistryEntry } from './types';
 
+const pinnedRunRegistry = new Map<string, { entry: RunRegistryEntry; count: number }>();
+
 /**
  * Global registry for accessing run entries from workflow steps.
  * This is necessary because workflow steps don't have direct access to
@@ -20,11 +22,57 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
   max: 1000,
   ttl: 10 * 60 * 1000,
   updateAgeOnGet: true,
-  dispose: entry => {
-    entry?.cleanup?.();
+  dispose: (entry, runId) => {
+    // TTLCache can call dispose with an undefined value after a missing get()
+    // refreshes expiration metadata. Terminal workflow cleanup and the public
+    // cleanup handle may legitimately race, so disposal must remain idempotent.
+    if (!pinnedRunRegistry.has(runId)) entry?.cleanup?.();
   },
   noDisposeOnSet: true,
 });
+
+/** Resolve a runtime entry, including one pinned for an active workflow segment. */
+export function getGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
+  return pinnedRunRegistry.get(runId)?.entry ?? globalRunRegistry.get(runId);
+}
+
+/** Keep an active workflow segment immune to TTL/capacity eviction. */
+export function pinGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
+  const pinned = pinnedRunRegistry.get(runId);
+  if (pinned) {
+    pinned.count += 1;
+    return pinned.entry;
+  }
+  const entry = globalRunRegistry.get(runId);
+  if (entry) pinnedRunRegistry.set(runId, { entry, count: 1 });
+  return entry;
+}
+
+/** Release an active segment and restore its TTL entry when it remains resumable. */
+export function unpinGlobalRunRegistryEntry(runId: string): void {
+  const pinned = pinnedRunRegistry.get(runId);
+  if (!pinned) return;
+  pinned.count -= 1;
+  if (pinned.count > 0) return;
+  pinnedRunRegistry.delete(runId);
+  if (!globalRunRegistry.has(runId)) globalRunRegistry.set(runId, pinned.entry);
+}
+
+/** Remove a pin during explicit terminal/consumer cleanup. */
+export function clearPinnedRunRegistryEntry(runId: string): void {
+  pinnedRunRegistry.delete(runId);
+}
+
+/** Reset every global runtime binding, including entries pinned by an unfinished segment. */
+export function clearGlobalRunRegistry(): void {
+  const cachedEntries = new Set(globalRunRegistry.values());
+  const pinnedOnlyEntries = new Set(
+    [...pinnedRunRegistry.values()].map(({ entry }) => entry).filter(entry => !cachedEntries.has(entry)),
+  );
+  pinnedRunRegistry.clear();
+  globalRunRegistry.clear();
+  for (const entry of pinnedOnlyEntries) entry.cleanup?.();
+}
 
 /**
  * End a run's root spans (MODEL_GENERATION then AGENT_RUN) with an error so the trace
@@ -48,7 +96,7 @@ export function endRunSpansWithError(runId: string, error: Error): void {
  * a newer run's tools, processors, model, memory, or request context.
  */
 export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: string): RunRegistryEntry | undefined {
-  const entry = globalRunRegistry.get(runId);
+  const entry = getGlobalRunRegistryEntry(runId);
   if (
     entry &&
     // Placeholder entries are cross-process carriers (e.g. the abort
@@ -230,6 +278,11 @@ export class ExtendedRunRegistry extends RunRegistry {
     messageList: MessageList,
     memoryInfo?: { threadId?: string; resourceId?: string },
   ): void {
+    // Durable workflow steps deserialize a fresh MessageList and publish it
+    // through the shared registry entry. Keep that entry as the live source
+    // of truth so resume observers never read the stale list captured when
+    // the run was first registered.
+    entry.messageList = messageList;
     this.register(runId, entry);
     this.#messageLists.set(runId, messageList);
     if (memoryInfo) {
@@ -241,7 +294,7 @@ export class ExtendedRunRegistry extends RunRegistry {
    * Get MessageList for a specific run
    */
   getMessageList(runId: string): MessageList | undefined {
-    return this.#messageLists.get(runId);
+    return this.get(runId)?.messageList ?? this.#messageLists.get(runId);
   }
 
   /**

@@ -8,7 +8,13 @@ import type { MemoryConfig, MemoryConfig as _MemoryConfig, StorageThreadType } f
 import { EntityType, SpanType, createObservabilityContext, getOrCreateSpan } from '../../observability';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
-import { RequestContext, MASTRA_VERSIONS_KEY, mergeVersionOverrides } from '../../request-context';
+import {
+  RequestContext,
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+  MASTRA_VERSIONS_KEY,
+  mergeVersionOverrides,
+} from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
 import { toStandardSchema } from '../../schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
@@ -38,7 +44,7 @@ import type {
   ToolsInput,
 } from '../types';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
-import { createWorkflowInput } from './utils/serialize-state';
+import { createRuntimeDependencyFingerprint, createWorkflowInput } from './utils/serialize-state';
 
 /**
  * JSON-safe snapshot of `requestContext.entries()` so durable steps (e.g.
@@ -121,6 +127,8 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext;
     memoryConfig?: MemoryConfig;
     autoResumeSuspendedTools?: boolean;
+    agentId?: string;
+    agentName?: string;
     hooks?: ToolHooks;
     delegation?: DelegationConfig;
     methodType?: AgentMethodType;
@@ -130,6 +138,13 @@ interface DurablePreparationAgent {
   listOutputProcessors(requestContext?: RequestContext): Promise<OutputProcessorOrWorkflow[]>;
   listErrorProcessors(requestContext?: RequestContext): Promise<ErrorProcessorOrWorkflow[]>;
   getBackgroundTasksConfig(): AgentBackgroundConfig | undefined;
+  __assertAgentResumePreflight(options: {
+    requestContext?: RequestContext;
+    memory?: AgentExecutionOptions<any>['memory'];
+    runId: string;
+    agentId?: string;
+    agentName?: string;
+  }): Promise<void>;
   getToolPayloadTransform?(): ToolPayloadTransformPolicy | undefined;
   __getDrainPendingSignals(): (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
   __getGoalConfig(): GoalConfig | undefined;
@@ -190,6 +205,56 @@ export interface PreparationOptions<OUTPUT = undefined> {
   durableAgentName?: string;
 }
 
+/** Completed authorization/version boundary for the preparation phase. */
+interface PreparationPreflightResult {
+  runId: string;
+  requestContext: RequestContext;
+  mergedVersions?: VersionOverrides;
+}
+
+/** @internal Runs the durable request-context/FGA boundary without resolving runtime dependencies. */
+async function preflightDurableExecution<OUTPUT = undefined>(
+  options: PreparationOptions<OUTPUT>,
+): Promise<PreparationPreflightResult> {
+  const {
+    agent,
+    options: execOptions,
+    runId: providedRunId,
+    requestContext: providedRequestContext,
+    durableAgentId,
+    durableAgentName,
+    logger,
+    mastra,
+  } = options;
+
+  validateMaxSteps(execOptions?.maxSteps, logger);
+  if (providedRunId !== undefined && providedRunId.trim().length === 0) {
+    throw new Error('DurableAgent runId must be a non-empty string.');
+  }
+  const runId = providedRunId ?? crypto.randomUUID();
+  const requestContext = providedRequestContext ?? new RequestContext();
+  const requestVersions = requestContext.get(MASTRA_VERSIONS_KEY) as VersionOverrides | undefined;
+  let effectiveVersions = mergeVersionOverrides(mastra?.getVersionOverrides?.(), requestVersions);
+  if ((execOptions as any)?.versions) {
+    effectiveVersions = mergeVersionOverrides(effectiveVersions, (execOptions as any).versions);
+  }
+  const mergedVersions = effectiveVersions ? structuredClone(effectiveVersions) : undefined;
+  if (mergedVersions) {
+    requestContext.set(MASTRA_VERSIONS_KEY, structuredClone(mergedVersions));
+  }
+
+  const typedAgent = agent as unknown as DurablePreparationAgent;
+  await typedAgent.__assertAgentResumePreflight({
+    requestContext,
+    memory: execOptions?.memory,
+    runId,
+    agentId: durableAgentId ?? agent.id,
+    agentName: durableAgentName ?? agent.name,
+  });
+
+  return { runId, requestContext, mergedVersions };
+}
+
 /**
  * Prepare for durable agent execution.
  *
@@ -228,12 +293,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const publicAgentName = durableAgentName ?? agent.name ?? agent.id;
 
   const typedAgent = agent as unknown as DurablePreparationAgent;
-
-  // 1. Generate IDs
-  const runId = providedRunId ?? crypto.randomUUID();
-  const messageId = crypto.randomUUID();
-  const runtimeBindingId = crypto.randomUUID();
-
   // 2. Get request context
   const requestContext = providedRequestContext ?? new RequestContext();
 
@@ -252,24 +311,36 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     (defaultOptions ?? {}) as Record<string, unknown>,
     (rawExecOptions ?? {}) as Record<string, unknown>,
   ) as AgentExecutionOptions<OUTPUT>;
-
-  validateMaxSteps(execOptions?.maxSteps, logger);
-
-  // 3. Merge version overrides (Mastra defaults < requestContext < call-site)
-  const requestVersions = requestContext.get(MASTRA_VERSIONS_KEY) as VersionOverrides | undefined;
-  let mergedVersions = mergeVersionOverrides(mastra?.getVersionOverrides?.(), requestVersions);
-  if ((execOptions as any)?.versions) {
-    mergedVersions = mergeVersionOverrides(mergedVersions, (execOptions as any).versions);
-  }
-  if (mergedVersions) {
-    requestContext.set(MASTRA_VERSIONS_KEY, mergedVersions);
-  }
+  const preflight = await preflightDurableExecution({
+    ...options,
+    options: execOptions,
+    requestContext,
+    durableAgentId: publicAgentId,
+    durableAgentName: publicAgentName,
+  });
+  const { runId, mergedVersions } = preflight;
+  const messageId = crypto.randomUUID();
+  const runtimeBindingId = crypto.randomUUID();
 
   // 4. Resolve thread/memory context
-  const thread =
+  const requestedThread =
     typeof execOptions?.memory?.thread === 'string' ? { id: execOptions.memory.thread } : execOptions?.memory?.thread;
-  const threadId = thread?.id;
-  const resourceId = execOptions?.memory?.resource;
+  const contextThreadId = requestContext.get(MASTRA_THREAD_ID_KEY);
+  const contextResourceId = requestContext.get(MASTRA_RESOURCE_ID_KEY);
+  const hasFga = Boolean(mastra?.getServer()?.fga);
+  if (hasFga && requestedThread?.id && typeof contextThreadId !== 'string') {
+    throw new Error('DurableAgent requires a verified request-context thread id when FGA is enabled.');
+  }
+  const threadId = typeof contextThreadId === 'string' ? contextThreadId : requestedThread?.id;
+  const resourceId = typeof contextResourceId === 'string' ? contextResourceId : execOptions?.memory?.resource;
+  const thread = requestedThread
+    ? {
+        ...requestedThread,
+        id: threadId ?? requestedThread.id,
+      }
+    : threadId
+      ? { id: threadId }
+      : undefined;
   let threadObject: StorageThreadType | undefined;
   let threadExists = false;
   let processorMemory: MastraMemory | undefined;
@@ -388,20 +459,16 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   let outputProcessors: OutputProcessorOrWorkflow[] = [];
   let errorProcessors: ErrorProcessorOrWorkflow[] = [];
 
-  try {
-    inputProcessors = await typedAgent.listInputProcessors(requestContext);
-    // Uncombined processors for processLLMRequest — combined (workflow-wrapped)
-    // processors are skipped by ProcessorRunner.runProcessLLMRequest.
-    llmRequestInputProcessors = await typedAgent.__listLLMRequestProcessors(requestContext);
-    // Call-time outputProcessors replace constructor-level ones (parity with
-    // Agent.listResolvedOutputProcessors which uses overrides-first semantics).
-    outputProcessors = execOptions?.outputProcessors
-      ? execOptions.outputProcessors
-      : await typedAgent.listOutputProcessors(requestContext);
-    errorProcessors = await typedAgent.listErrorProcessors(requestContext);
-  } catch (error) {
-    logger?.warn?.(`[DurableAgent] Error resolving processors: ${error}`);
-  }
+  inputProcessors = await typedAgent.listInputProcessors(requestContext);
+  // Uncombined processors for processLLMRequest — combined (workflow-wrapped)
+  // processors are skipped by ProcessorRunner.runProcessLLMRequest.
+  llmRequestInputProcessors = await typedAgent.__listLLMRequestProcessors(requestContext);
+  // Call-time outputProcessors replace constructor-level ones (parity with
+  // Agent.listResolvedOutputProcessors which uses overrides-first semantics).
+  outputProcessors = execOptions?.outputProcessors
+    ? execOptions.outputProcessors
+    : await typedAgent.listOutputProcessors(requestContext);
+  errorProcessors = await typedAgent.listErrorProcessors(requestContext);
 
   // Open AGENT_RUN here so processor_run spans (and their MEMORY_OPERATION
   // children) parent to it. MODEL_GENERATION is opened later under it.
@@ -495,6 +562,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext,
       memoryConfig: execOptions?.memory?.options,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      agentId: publicAgentId,
+      agentName: publicAgentName,
       hooks: execOptions?.hooks,
       delegation: execOptions?.delegation,
       methodType,
@@ -621,6 +690,12 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     runtimeBindingId,
     agentId: publicAgentId,
     agentName: publicAgentName,
+    versions: mergedVersions,
+    hasProcessors: inputProcessors.length > 0 || outputProcessors.length > 0 || errorProcessors.length > 0,
+    runtimeBindings: {
+      memory: createRuntimeDependencyFingerprint(memory),
+      workspace: createRuntimeDependencyFingerprint(workspace),
+    },
     messageList,
     tools,
     model,
@@ -693,6 +768,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       : undefined;
   const registryEntry: RunRegistryEntry = {
     runtimeBindingId,
+    agentId: publicAgentId,
+    threadId,
+    resourceId,
     tools,
     replacementToolSurface,
     saveQueueManager,
@@ -709,6 +787,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       : undefined,
     workspace,
     requestContext,
+    versions: mergedVersions ? structuredClone(mergedVersions) : undefined,
     inputProcessors,
     llmRequestInputProcessors,
     outputProcessors,

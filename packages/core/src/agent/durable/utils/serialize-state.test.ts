@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { CoreTool } from '../../../tools/types';
 import {
+  createRuntimeDependencyFingerprint,
   deserializeDate,
   serializeDate,
   serializeDurableOptions,
@@ -381,21 +382,34 @@ describe('serializeToolMetadata', () => {
     expect(result.description).toBe('A test tool');
   });
 
-  it('defaults inputSchema to { type: "object" } when no parameters', () => {
+  it('normalizes the default input schema for durable recovery', () => {
     const result = serializeToolMetadata('myTool', baseTool);
-    expect(result.inputSchema).toEqual({ type: 'object' });
+    expect(result.inputSchema).toEqual({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+    });
   });
 
-  it('uses parameters directly when they already look like JSON Schema', () => {
+  it('normalizes parameters that already look like JSON Schema', () => {
     const tool = { ...baseTool, parameters: { type: 'object', properties: { q: { type: 'string' } } } };
     const result = serializeToolMetadata('myTool', tool as any);
-    expect(result.inputSchema).toEqual({ type: 'object', properties: { q: { type: 'string' } } });
+    expect(result.inputSchema).toEqual({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      additionalProperties: false,
+      type: 'object',
+      properties: { q: { type: 'string' } },
+    });
   });
 
-  it('uses jsonSchema property when present (zod-converted schema)', () => {
+  it('normalizes the jsonSchema property when present', () => {
     const tool = { ...baseTool, parameters: { jsonSchema: { type: 'object', properties: {} } } };
     const result = serializeToolMetadata('myTool', tool as any);
-    expect(result.inputSchema).toEqual({ type: 'object', properties: {} });
+    expect(result.inputSchema).toEqual({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      additionalProperties: false,
+      type: 'object',
+      properties: {},
+    });
   });
 });
 
@@ -498,6 +512,25 @@ describe('serializeToolMetadata approval metadata', () => {
     } as ApprovalMetadataToolFixture);
 
     expect(metadata.requireApproval).toBe(true);
+  });
+});
+
+describe('createRuntimeDependencyFingerprint', () => {
+  it('distinguishes backing service configuration for otherwise identical services', () => {
+    class RuntimeService {
+      readonly id = 'shared-service';
+      constructor(
+        readonly storage: { root: string },
+        readonly createdAt = new Date(),
+      ) {}
+    }
+
+    expect(createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' }))).not.toBe(
+      createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-b' })),
+    );
+    expect(createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' }))).toBe(
+      createRuntimeDependencyFingerprint(new RuntimeService({ root: '/tenant-a' })),
+    );
   });
 });
 

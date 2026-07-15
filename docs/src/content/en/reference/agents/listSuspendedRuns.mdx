@@ -7,11 +7,9 @@ packages:
 
 # Agent.listSuspendedRuns()
 
-**Added in:** `@mastra/core@1.43.0`
+The `.listSuspendedRuns()` method lists suspended `Agent` or `DurableAgent` runs from workflow snapshot storage. It returns runs waiting on a tool call requiring [approval](/docs/agents/agent-approval), or on a tool that called `suspend()`. Storage-backed discovery works after a server restart. Multiple instances can discover the same rows, but this API doesn't provide a distributed claim for consuming an approval.
 
-The `.listSuspendedRuns()` method lists suspended agent runs from workflow snapshot storage: runs waiting on a tool call requiring [approval](/docs/agents/agent-approval), or on a tool that called `suspend()`. Because discovery is backed by storage rather than in-memory state, it works after a server restart and across multiple server instances.
-
-Pass the returned `runId` to [`resumeStream()`](/docs/agents/agent-approval#runtime-suspension-with-suspend), `approveToolCall()`, or `declineToolCall()` to continue the run.
+Pass the returned `runId` and matching `toolCallId` to [`resumeStream()`](/docs/agents/agent-approval#runtime-suspension-with-suspend), `approveToolCall()`, or `declineToolCall()` to continue the suspended call.
 
 The filter contract mirrors the workflow run listing APIs (`listWorkflowRuns`), plus the agent-level `threadId` filter.
 
@@ -20,19 +18,72 @@ The filter contract mirrors the workflow run listing APIs (`listWorkflowRuns`), 
 Discover the pending run for a conversation and continue it. Check `requiresApproval` to pick the right continuation — `approveToolCall()` / `declineToolCall()` for approval suspensions, `resumeStream()` with resume data for `suspend()`-based suspensions:
 
 ```typescript
+const threadId = 'thread-123'
+const resourceId = 'user-456'
+const expectedRunId = 'run-123'
+const expectedToolCallId = 'call-123'
+
 const { runs } = await agent.listSuspendedRuns({
-  threadId: 'thread-123',
-  resourceId: 'user-456',
+  threadId,
+  resourceId,
 })
 
-const run = runs[0]
-const toolCall = run?.toolCalls[0]
+const run = runs.find(candidate => candidate.runId === expectedRunId)
+const toolCall = run?.toolCalls.find(candidate => candidate.toolCallId === expectedToolCallId)
 
-if (run && toolCall) {
-  const stream = toolCall.requiresApproval
-    ? await agent.approveToolCall({ runId: run.runId, toolCallId: toolCall.toolCallId })
-    : await agent.resumeStream({ name: 'San Francisco' }, { runId: run.runId })
+if (!run || !toolCall) {
+  throw new Error('Expected suspended tool call was not found')
 }
+
+const stream = toolCall.requiresApproval
+  ? await agent.approveToolCall({
+      runId: run.runId,
+      toolCallId: toolCall.toolCallId,
+      memory: { thread: threadId, resource: resourceId },
+    })
+  : await agent.resumeStream(
+      { name: 'San Francisco' },
+      {
+        runId: run.runId,
+        toolCallId: toolCall.toolCallId,
+        memory: { thread: threadId, resource: resourceId },
+      },
+    )
+```
+
+`DurableAgent` uses the same method and result types. Its results have `workflowName: 'durable-agentic-loop'`. When `sendToolApproval()` finds a durable run after process loss, it re-resolves the live agent's tools, model, memory, and workspace with the caller's request context. Recovery rejects changed version selectors and structural drift that Mastra can observe in tool, model, memory, and workspace metadata. Function-source fingerprints can't identify closed-over values, private service configuration, provider accounts, or endpoints; deploy immutable versioned dependencies and don't treat this check as a security boundary.
+
+```typescript
+const approval = await durableAgent.sendToolApproval({
+  threadId: 'thread-123',
+  resourceId: 'user-456',
+  toolCallId: 'call-123',
+  approved: true,
+})
+```
+
+For an explicit durable `approveToolCall()`, `declineToolCall()`, or `resumeStream()` after restart, pass the matching memory target. With FGA, pass an authenticated request context containing both reserved resource and thread IDs:
+
+```typescript
+import {
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+  RequestContext,
+} from '@mastra/core/request-context'
+
+const requestContext = new RequestContext()
+requestContext.set(MASTRA_RESOURCE_ID_KEY, 'user-456')
+requestContext.set(MASTRA_THREAD_ID_KEY, 'thread-123')
+
+await durableAgent.approveToolCall({
+  runId: 'run-123',
+  toolCallId: 'call-123',
+  requestContext,
+  memory: {
+    thread: 'thread-123',
+    resource: 'user-456',
+  },
+})
 ```
 
 ## Parameters
@@ -60,6 +111,13 @@ if (run && toolCall) {
             type: 'string',
             isOptional: true,
             description: 'Only return runs that belong to this memory resource.',
+          },
+          {
+            name: 'requestContext',
+            type: 'RequestContext',
+            isOptional: true,
+            description:
+              'Authenticated request context. Required with FGA and used to enforce the canonical resource and thread filters.',
           },
           {
             name: 'fromDate',
@@ -116,6 +174,8 @@ interface AgentRun {
   /** Run ID accepted by resumeStream(), approveToolCall(), and declineToolCall() */
   runId: string
   status: 'suspended'
+  /** Workflow storage lane used by this run */
+  workflowName: 'agentic-loop' | 'durable-agentic-loop'
   threadId?: string
   resourceId?: string
   /** When the run suspended */
@@ -125,7 +185,8 @@ interface AgentRun {
 }
 
 interface AgentRunToolCall {
-  toolCallId?: string
+  /** Exact workflow resume label required to continue this call */
+  toolCallId: string
   toolName?: string
   /** Arguments the model supplied (approval suspensions only) */
   args?: unknown
@@ -138,9 +199,21 @@ interface AgentRunToolCall {
 
 ## Discovery scope
 
-Results are scoped to runs started by the agent you call `listSuspendedRuns()` on: snapshots persist the owning agent's id, so runs started by other agents on the same Mastra instance aren't returned. In [supervisor setups](/docs/agents/agent-approval#tool-approval-supervisor-agents) the supervisor sees its outer run — the one to resume — while a subagent's inner run is only visible from the subagent itself. Filter by `threadId` and `resourceId` to scope results to one conversation.
+Results are scoped to runs started by the agent you call `listSuspendedRuns()` on. Snapshots without a matching agent ID aren't returned. In [supervisor setups](/docs/agents/agent-approval#tool-approval-supervisor-agents), the supervisor sees its outer run while a subagent's inner run is only visible from the subagent itself. Filter by both `threadId` and `resourceId` before presenting approval controls.
 
-Run snapshots are only persisted while a run is waiting on input and are deleted when it finishes, so suspended runs are the only runs discoverable from storage. Suspended runs only survive restarts when the Mastra instance has a persistent [storage provider](/docs/storage/overview) configured. With the default in-memory store, snapshots are lost on restart.
+Cold durable recovery requires the caller's resource and thread to match the persisted ownership tuple. The run isn't resumed when ownership can't be verified. If more than one approval matches a conversation, `sendToolApproval()` requires an exact `toolCallId`.
+
+Caller-supplied durable run IDs are checked against active registries and persisted durable workflow rows in the current process. Except when `stream()` consumes the exact one-time result of a preceding `prepare()` call in that process, starting or preparing another run with an occupied ID throws `DURABLE_AGENT_RUN_ID_CONFLICT`. Prepared handoffs are request-bound, authorization is checked again at consumption time, and registry eviction invalidates the handoff. The high-level `DurableAgent.prepare()` result exposes IDs, serialized workflow input, and an idempotent `cleanup()` function for abandoning the preparation—not the live tool, model, memory, or processor registry bindings retained for that one-time handoff. Calling that cleanup after `stream()` has consumed the handoff doesn't interrupt the active run. This read-before-write check isn't a distributed lock: applications must not concurrently create the same caller-supplied ID on multiple workers. If a different standard run in the same process currently owns the same thread, `sendToolApproval()` rejects a cold call for that thread instead of routing the decision to either run.
+
+Request-local processor state isn't serializable today. A durable run configured with input, output, or error processors can resume while its original runtime registry is warm, but cold recovery after process loss fails with `DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE`. This prevents a restarted process from silently replacing stateful guardrails with empty state.
+
+The built-in durable runtime keeps validated tool, model, memory, workspace, processor, and request-context bindings in a private registry. It snapshots caller-owned message, option, resume-data, and supported request-context values before asynchronous authorization or execution, and pins the validated registry entry while an active workflow segment reads it. A missing or replaced entry fails closed instead of falling back to the current agent configuration. Integration-owned durable engines keep their documented reconstruction contract and don't use this built-in registry requirement.
+
+When function-level authorization (FGA) is configured, pass an authenticated `requestContext`. Discovery requires a non-empty reserved resource ID, rejects conflicting resource or thread filters, validates the agent request context, and checks `AGENTS_EXECUTE` before scanning workflow storage. Durable resume requires non-empty reserved resource and thread IDs and preflights the restored owner before dependency resolution. Standard resume snapshots supported caller-owned inputs before awaiting authorization or storage, rejects any persisted status other than `suspended`, and rechecks execution authorization against the verified owner immediately before execution. An agent `requestContextSchema` is always validated before discovery, including when FGA isn't configured.
+
+Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable; monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/storage/overview). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
+
+This core method doesn't add an HTTP server route or client SDK method. It also doesn't atomically claim a suspended checkpoint across workers, and `(runId, toolCallId)` isn't a one-time approval token. Until an application adds a storage-backed claim/lease and checkpoint token, route approvals through a single serialized consumer that authenticates the caller and supplies verified resource and thread IDs.
 
 ## Related
 

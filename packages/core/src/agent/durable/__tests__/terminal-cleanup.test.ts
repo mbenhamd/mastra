@@ -19,9 +19,11 @@ import { Mastra } from '../../../mastra';
 import { InMemoryStore } from '../../../storage';
 import type { WorkflowRunState, WorkflowRunStatus } from '../../../workflows/types';
 import { Agent } from '../../agent';
+import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
+import { serializeModelConfig } from '../utils/serialize-state';
 
 function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string): WorkflowRunState {
   return {
@@ -32,8 +34,17 @@ function makeSnapshot(runId: string, status: WorkflowRunStatus, agentId: string)
       input: {
         __workflowKind: 'durable-agent',
         runId,
+        runtimeBindingId: `binding-${runId}`,
+        runtimeResolution: 'registry-required',
         agentId,
-        messageListState: { memoryInfo: { threadId: 't', resourceId: 'r' } },
+        agentName: agentId,
+        messageListState: new MessageList({ threadId: 't', resourceId: 'r' }).serialize(),
+        toolsMetadata: [],
+        modelConfig: serializeModelConfig(makeMockModel() as any),
+        runtimeBindings: {},
+        options: {},
+        state: { threadId: 't', resourceId: 'r' },
+        messageId: `message-${runId}`,
       } as any,
     },
     activePaths: [],
@@ -102,8 +113,11 @@ async function seedRunning(store: InMemoryStore, runId: string, agentId: string)
 function stubWorkflow(agent: DurableAgent, terminalStatus: WorkflowRunStatus) {
   const deleteWorkflowRunById = vi.fn(async () => {});
   const fakeWorkflow = {
-    createRun: vi.fn(async () => ({
-      restart: vi.fn(async () => ({ status: terminalStatus })),
+    createRun: vi.fn(async ({ runId }: { runId: string }) => ({
+      restart: vi.fn(async () => {
+        await (agent as any).onDurableWorkflowFinish({ runId, status: terminalStatus });
+        return { status: terminalStatus };
+      }),
     })),
     deleteWorkflowRunById,
   };
@@ -182,8 +196,11 @@ describe('DurableAgent terminal snapshot cleanup', () => {
     it('swallows snapshot delete failures without failing the recovered run', async () => {
       await seedRunning(store, 'run-delete-boom', 'agent-A');
       const fakeWorkflow = {
-        createRun: vi.fn(async () => ({
-          restart: vi.fn(async () => ({ status: 'success' })),
+        createRun: vi.fn(async ({ runId }: { runId: string }) => ({
+          restart: vi.fn(async () => {
+            await (agent as any).onDurableWorkflowFinish({ runId, status: 'success' });
+            return { status: 'success' };
+          }),
         })),
         // Simulate storage rejecting the delete — recovery should still count
         // as succeeded because the stale row is preferable to a broken exit.

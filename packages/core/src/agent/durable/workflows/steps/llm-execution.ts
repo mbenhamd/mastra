@@ -59,6 +59,10 @@ const durableLLMInputSchema = z.object({
   runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
+  versions: z.any().optional(),
+  hasProcessors: z.boolean().optional(),
+  runtimeBindings: z.any().optional(),
+  runtimeResolution: z.literal('registry-required').optional(),
   messageListState: z.any(), // SerializedMessageListState
   toolsMetadata: z.array(z.any()),
   modelConfig: z.object({

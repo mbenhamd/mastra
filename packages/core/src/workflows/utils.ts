@@ -608,12 +608,13 @@ export async function waitForSuspendedSnapshot(
     | undefined,
   workflowName: string,
   runId: string,
+  isReady: (snapshot: WorkflowRunState) => boolean = () => true,
 ): Promise<WorkflowRunState | null> {
   if (!workflowsStore) return null;
 
   const deadline = Date.now() + RESUME_SNAPSHOT_POLL_TIMEOUT_MS;
   let snapshot = (await workflowsStore.loadWorkflowSnapshot({ workflowName, runId })) ?? null;
-  while ((!snapshot || snapshot.status !== 'suspended') && Date.now() < deadline) {
+  while ((!snapshot || snapshot.status !== 'suspended' || !isReady(snapshot)) && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, RESUME_SNAPSHOT_POLL_INTERVAL_MS));
     snapshot = (await workflowsStore.loadWorkflowSnapshot({ workflowName, runId })) ?? null;
   }

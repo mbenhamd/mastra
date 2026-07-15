@@ -3371,7 +3371,7 @@ export class Run<
    * Returns immediately with the runId. The workflow executes in the background.
    * Use this when you don't need to wait for the result or want to avoid polling failures.
    * @param args The input data and configuration for the workflow
-   * @returns A promise that resolves immediately with the runId
+   * @returns A promise that resolves immediately with the runId and an observable execution promise
    */
   async startAsync(
     args: (TInput extends unknown
@@ -3390,12 +3390,13 @@ export class Run<
           }) & {
         requestContext?: RequestContext<TRequestContext>;
       } & WorkflowRunStartOptions,
-  ): Promise<{ runId: string }> {
+  ): Promise<{ runId: string; execution?: Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> }> {
     // Fire execution in background, don't await completion
-    this._start(args).catch(err => {
+    const execution = this._start(args);
+    execution.catch(err => {
       this.mastra?.getLogger()?.error(`[Workflow ${this.workflowId}] Background execution failed:`, err);
     });
-    return { runId: this.runId };
+    return { runId: this.runId, execution };
   }
 
   /**

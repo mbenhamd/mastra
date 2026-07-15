@@ -111,7 +111,7 @@ describe('DurableAgent isTaskComplete', () => {
     const scorer = passingScorer();
     const onComplete = vi.fn();
 
-    const { workflowInput, registryEntry } = await durableAgent.prepare('hello', {
+    const prepared = await durableAgent.prepare('hello', {
       isTaskComplete: {
         scorers: [scorer as any],
         strategy: 'all',
@@ -121,9 +121,12 @@ describe('DurableAgent isTaskComplete', () => {
         onComplete,
       } as any,
     });
+    const { workflowInput } = prepared;
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     // Closures and class instances stay on the registry.
-    expect(registryEntry.isTaskComplete?.scorers?.[0]).toBe(scorer);
+    expect(registryEntry.isTaskComplete?.scorers?.[0]).toStrictEqual(scorer);
+    expect((registryEntry.isTaskComplete?.scorers?.[0] as any)?.run).toBe(scorer.run);
     expect((registryEntry.isTaskComplete as any)?.onComplete).toBe(onComplete);
 
     // The workflowInput carries only the JSON-safe sub-keys.
@@ -149,7 +152,9 @@ describe('DurableAgent isTaskComplete', () => {
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { workflowInput, registryEntry } = await durableAgent.prepare('hi');
+    const prepared = await durableAgent.prepare('hi');
+    const { workflowInput } = prepared;
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     expect((workflowInput.options as any).isTaskComplete).toBeUndefined();
     expect(registryEntry.isTaskComplete).toBeUndefined();

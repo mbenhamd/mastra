@@ -1,4 +1,5 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import { resolveModelConfig } from '../../../llm/model/resolve-model';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import type { StreamInternal } from '../../../loop/types';
@@ -119,14 +120,9 @@ export class DurableProcessorRebuildError extends Error {
 /**
  * Resolve all runtime dependencies needed for durable step execution.
  *
- * This function reconstructs the non-serializable state needed to execute
- * agent steps from:
- * 1. The Mastra instance (for agent lookup, tools, model)
- * 2. The serialized workflow input (for MessageList, state)
- *
- * Unlike the registry-based approach, this reconstructs tools and model
- * from the agent registered with Mastra, making it truly durable across
- * process restarts.
+ * Built-in DurableAgent runs require runtime dependencies registered by
+ * stream() or guarded cold recovery. Other durable engines, such as Inngest,
+ * retain their established Mastra reconstruction contract.
  */
 export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions): Promise<ResolvedRuntimeDependencies> {
   const { mastra, runId, agentId, input, logger } = options;
@@ -162,6 +158,15 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     // omitted or replaced with an accessor/undefined registry value.
     createToolSurfaceFence(globalEntry.tools, input.options.toolSurfaceFence);
   }
+  if (!hasHydratedEntry && input.runtimeResolution === 'registry-required') {
+    throw new MastraError({
+      id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.SYSTEM,
+      text: `DurableAgent runtime dependencies are unavailable for run "${runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+      details: { agentId, runId },
+    });
+  }
 
   // 2. Deserialize MessageList
   // Reuse the existing MessageList from the registry if available so that
@@ -177,10 +182,11 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       }).deserialize(input.messageListState);
 
   let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
-  let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
+  let model = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
   let workspace: Workspace | undefined = globalEntry?.workspace;
   let memory: MastraMemory | undefined = globalEntry?.memory;
+  let saveQueueManager = globalEntry?.saveQueueManager;
   let inputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.inputProcessors;
   let llmRequestInputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.llmRequestInputProcessors;
   let outputProcessors: OutputProcessorOrWorkflow[] | undefined = globalEntry?.outputProcessors;
@@ -200,7 +206,6 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
-
       // Restore the caller's request context from the JSON-safe snapshot on
       // the workflow input (mirrors durable-agent.ts resume handling), so
       // request-scoped tools / workspace / memory / processors resolve with
@@ -216,11 +221,9 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         memoryConfig: input.state.memoryConfig,
         autoResumeSuspendedTools: input.options?.autoResumeSuspendedTools,
       });
-
       model =
         (await (agent as any).getModel?.({ requestContext: resolveRequestContext })) ??
         resolveModel(input.modelConfig, mastra);
-
       const rawModelList = await (agent as any).getModelList?.(resolveRequestContext);
       if (rawModelList && Array.isArray(rawModelList)) {
         modelList = rawModelList.map((entry: any) => ({
@@ -231,7 +234,6 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
           headers: entry.headers,
         }));
       }
-
       memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
       workspace = await (agent as any).getWorkspace?.({ requestContext: resolveRequestContext });
 
@@ -271,6 +273,8 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     logger?.debug?.(`[DurableAgent:${agentId}] No tools resolved for run ${runId}`);
   }
 
+  saveQueueManager ??= makeSaveQueueManager(memory, mastra);
+
   // Write the rebuilt state back into the per-process registry so sibling
   // durable steps in THIS process (e.g. the tool-call step that runs after the
   // LLM step on the same worker) reuse it instead of rebuilding per call. Only
@@ -290,6 +294,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       modelList,
       workspace,
       memory,
+      saveQueueManager,
       inputProcessors,
       llmRequestInputProcessors,
       outputProcessors,
@@ -302,9 +307,6 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       globalRunRegistry.set(runId, rebuilt as RunRegistryEntry);
     }
   }
-
-  // 3. Get or create SaveQueueManager
-  const saveQueueManager = makeSaveQueueManager(memory, mastra);
 
   // 4. Reconstruct _internal for compatibility with existing code
   const _internal = resolveInternalState({

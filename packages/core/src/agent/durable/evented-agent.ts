@@ -10,12 +10,13 @@
  * 3. Events are streamed via pubsub as the workflow executes
  */
 
+import type { WorkflowFinishCallbackResult } from '../../workflows/types';
 import { createObservabilityContext } from '../../observability';
 import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';
 import type { DurableAgentConfig } from './durable-agent';
-import { globalRunRegistry } from './run-registry';
+import { pinGlobalRunRegistryEntry, unpinGlobalRunRegistryEntry } from './run-registry';
 import type { DurableAgenticWorkflowInput } from './types';
 
 /**
@@ -82,21 +83,43 @@ export class EventedAgent<
   protected override async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     try {
       const workflow = this.getWorkflow();
+      const entry = pinGlobalRunRegistryEntry(runId);
       const run = await workflow.createRun({
         runId,
+        resourceId: workflowInput.state?.resourceId,
         pubsub: this.pubsubInternal,
       });
-      // Fire and forget - use startAsync for non-blocking execution.
-      // Pass the caller's requestContext (so config selectors pick the same observability
-      // instance the root spans were created with) and parent the run under the AGENT_RUN span.
-      const entry = globalRunRegistry.get(runId);
-      await run.startAsync({
+      // The caller already runs executeWorkflow() in the background. Keep this
+      // promise pending until the current workflow segment settles so resume()
+      // can wait for its suspended snapshot to finish persisting.
+      // Preserve the caller's request context and parent the workflow segment
+      // under the AGENT_RUN span created during durable preparation.
+      const { execution } = await run.startAsync({
         inputData: workflowInput,
         requestContext: entry?.requestContext,
         ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
       });
+      if (execution) {
+        await execution
+          .catch(async error => {
+            unpinGlobalRunRegistryEntry(runId);
+            await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
+          })
+          .catch(error => {
+            this.logger.error(`[EventedAgent] Failed to report background execution error for run ${runId}`, error);
+          });
+      }
     } catch (error) {
+      unpinGlobalRunRegistryEntry(runId);
       await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  protected override async onDurableWorkflowFinish(result: WorkflowFinishCallbackResult): Promise<void> {
+    try {
+      await super.onDurableWorkflowFinish(result);
+    } finally {
+      unpinGlobalRunRegistryEntry(result.runId);
     }
   }
 }

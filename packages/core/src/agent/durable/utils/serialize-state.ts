@@ -1,6 +1,8 @@
 import type { JSONSchema7 } from 'json-schema';
 import type { MastraLanguageModel } from '../../../llm/model/shared.types';
 import type { MemoryConfig } from '../../../memory/types';
+import type { VersionOverrides } from '../../../request-context';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchema } from '../../../tools/recovery-fingerprint';
 import type { CoreTool } from '../../../tools/types';
 import type { MessageList } from '../../message-list';
 import type { AgentModelManagerConfig } from '../../types';
@@ -22,6 +24,43 @@ type SerializableApprovalTool = CoreTool & {
   needsApprovalFn?: (args: any, ctx?: any) => boolean | Promise<boolean>;
   hasSuspendSchema?: boolean;
 };
+
+export function createRuntimeDependencyFingerprint(value: unknown): string | undefined {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return undefined;
+  const record = value as Record<string, unknown>;
+  const scalarIdentity = Object.fromEntries(
+    ['id', 'name', 'version', 'type']
+      .filter(key => ['string', 'number', 'boolean'].includes(typeof record[key]))
+      .map(key => [key, record[key]]),
+  );
+  const constructorSource =
+    typeof record.constructor === 'function' ? Function.prototype.toString.call(record.constructor) : undefined;
+  const volatileKeys = new Set([
+    'createdAt',
+    'lastAccessedAt',
+    '_status',
+    '_destroyPromise',
+    '_filesystemRequestCache',
+    '_sandboxRequestCache',
+    '_sandboxKeyCache',
+    '_skills',
+    '_lsp',
+    '_logger',
+    'logger',
+  ]);
+  const configurationIdentity = Object.fromEntries(
+    Object.keys(record)
+      .filter(key => !Object.prototype.hasOwnProperty.call(scalarIdentity, key) && !volatileKeys.has(key))
+      .sort()
+      .map(key => [key, record[key]]),
+  );
+  return createToolRecoveryFingerprint({
+    constructorName: (value as any).constructor?.name,
+    constructorSource,
+    scalarIdentity,
+    configurationIdentity,
+  });
+}
 
 /**
  * Extract serializable metadata from a CoreTool
@@ -48,6 +87,7 @@ export function serializeToolMetadata(name: string, tool: CoreTool): Serializabl
       inputSchema = { type: 'object' };
     }
   }
+  inputSchema = normalizeToolRecoverySchema(inputSchema) as JSONSchema7;
 
   return {
     id: 'id' in tool && typeof tool.id === 'string' ? tool.id : name,
@@ -58,6 +98,7 @@ export function serializeToolMetadata(name: string, tool: CoreTool): Serializabl
       approvalTool.requireApproval || approvalTool.needsApproval || approvalTool.needsApprovalFn,
     ),
     hasSuspendSchema: approvalTool.hasSuspendSchema,
+    recoveryFingerprint: approvalTool.recoveryFingerprint,
   };
 }
 
@@ -65,7 +106,9 @@ export function serializeToolMetadata(name: string, tool: CoreTool): Serializabl
  * Extract serializable metadata from all tools
  */
 export function serializeToolsMetadata(tools: Record<string, CoreTool>): SerializableToolMetadata[] {
-  return Object.entries(tools).map(([name, tool]) => serializeToolMetadata(name, tool));
+  return Object.entries(tools)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, tool]) => serializeToolMetadata(name, tool));
 }
 
 /**
@@ -286,6 +329,9 @@ export function createWorkflowInput(params: {
   runtimeBindingId: string;
   agentId: string;
   agentName?: string;
+  versions?: VersionOverrides;
+  hasProcessors?: boolean;
+  runtimeBindings?: { memory?: string; workspace?: string };
   messageList: MessageList;
   tools: Record<string, CoreTool>;
   model: MastraLanguageModel;
@@ -304,6 +350,9 @@ export function createWorkflowInput(params: {
     runtimeBindingId: params.runtimeBindingId,
     agentId: params.agentId,
     agentName: params.agentName,
+    versions: params.versions,
+    hasProcessors: params.hasProcessors,
+    runtimeBindings: params.runtimeBindings,
     messageListState: params.messageList.serialize(),
     toolsMetadata: serializeToolsMetadata(params.tools),
     modelConfig: serializeModelConfig(params.model),

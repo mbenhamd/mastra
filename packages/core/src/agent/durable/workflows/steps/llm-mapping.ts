@@ -323,7 +323,7 @@ export function createDurableLLMMappingStep() {
       // communicated via requestContext because Zod output validation strips
       // unknown fields from the tool result. We read it here and propagate
       // it on the serializable output so the dowhile predicate can stop.
-      let delegationBailed = false;
+      let delegationBailed = toolResults.some(toolResult => toolResult.delegationBailed === true);
       if (requestContext?.get('__mastra_delegationBailed')) {
         delegationBailed = true;
         requestContext.set('__mastra_delegationBailed', false);

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import type { MastraScorer, MastraScorerEntry } from '../../../evals/base';
 import { runScorer } from '../../../evals/hooks';
 import type { PubSub } from '../../../events/pubsub';
@@ -10,6 +11,7 @@ import { createObservabilityContext, InternalSpans } from '../../../observabilit
 import type { AIModelGenerationSpan, ExportedSpan, SpanType } from '../../../observability';
 import { RequestContext } from '../../../request-context';
 import { PUBSUB_SYMBOL } from '../../../workflows/constants';
+import type { WorkflowOptions } from '../../../workflows/types';
 import { createWorkflow } from '../../../workflows/create';
 import { MessageList } from '../../message-list';
 import { DurableStepIds, DurableAgentDefaults } from '../constants';
@@ -23,6 +25,7 @@ import type {
   DurableToolCallOutput,
   SerializableScorersConfig,
 } from '../types';
+import { mapDurableIterationToLLMInput } from './map-llm-input';
 import {
   modelConfigSchema,
   modelListEntrySchema,
@@ -47,6 +50,8 @@ import {
 export interface DurableAgenticWorkflowOptions {
   /** Maximum number of agentic loop iterations */
   maxSteps?: number;
+  /** Server-side lifecycle callback for the outer durable-agent workflow. */
+  onFinish?: WorkflowOptions['onFinish'];
 }
 
 /**
@@ -60,6 +65,10 @@ const durableAgenticInputSchema = z.object({
   runtimeBindingId: z.string().optional(),
   agentId: z.string(),
   agentName: z.string().optional(),
+  versions: z.any().optional(),
+  hasProcessors: z.boolean().optional(),
+  runtimeBindings: z.any().optional(),
+  runtimeResolution: z.literal('registry-required').optional(),
   messageListState: z.any(),
   toolsMetadata: z.array(z.any()),
   modelConfig: modelConfigSchema,
@@ -180,22 +189,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
     .map(
       async ({ inputData }) => {
         const state = inputData as IterationState;
-        return {
-          runId: state.runId,
-          runtimeBindingId: state.runtimeBindingId,
-          agentId: state.agentId,
-          agentName: state.agentName,
-          messageListState: state.messageListState,
-          toolsMetadata: state.toolsMetadata,
-          modelConfig: state.modelConfig,
-          modelList: state.modelList,
-          options: state.options,
-          state: state.state,
-          messageId: state.messageId,
-          stepIndex: state.iterationCount,
-          agentSpanData: state.agentSpanData,
-          modelSpanData: state.modelSpanData,
-        };
+        return mapDurableIterationToLLMInput(state);
       },
       { id: 'map-to-llm-input' },
     )
@@ -311,6 +305,7 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
         // resume never reads before persisting.
         pruneSnapshot: pruneAgentLoopSnapshot,
         validateInputs: false,
+        onFinish: options?.onFinish,
         // Internal durable-agent execution plumbing — see singleIterationWorkflow.
         tracingPolicy: {
           internal: InternalSpans.WORKFLOW,
@@ -637,6 +632,15 @@ export function createDurableAgenticWorkflow(options?: DurableAgenticWorkflowOpt
 
           // Run output processors (processOutputResult) if available
           const registryEntry = getBoundRunRegistryEntry(state.runId, state.runtimeBindingId);
+          if (!registryEntry && state.runtimeResolution === 'registry-required') {
+            throw new MastraError({
+              id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
+              domain: ErrorDomain.AGENT,
+              category: ErrorCategory.SYSTEM,
+              text: `DurableAgent runtime dependencies are unavailable for run "${state.runId}". Resume the run through DurableAgent so recovery checks can restore them.`,
+              details: { agentId: state.agentId, runId: state.runId },
+            });
+          }
           if (registryEntry?.outputProcessors?.length) {
             try {
               const { ProcessorRunner } = await import('../../../processors/runner');

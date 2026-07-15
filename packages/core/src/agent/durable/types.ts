@@ -19,7 +19,7 @@ import type { MemoryConfig } from '../../memory/types';
 import type { AIModelGenerationSpan, Span, SpanType, TracingContext, TracingOptions } from '../../observability';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
-import type { RequestContext } from '../../request-context';
+import type { RequestContext, VersionOverrides } from '../../request-context';
 import type { ChunkType } from '../../stream/types';
 import type {
   CoreTool,
@@ -51,6 +51,8 @@ export interface SerializableToolMetadata {
   requireApproval?: boolean;
   /** Whether the tool has a suspend schema for custom suspension */
   hasSuspendSchema?: boolean;
+  /** Opaque binding to the resolved implementation and recovery-relevant schemas. */
+  recoveryFingerprint?: string;
 }
 
 /**
@@ -255,6 +257,14 @@ export interface DurableAgenticWorkflowInput {
   agentId: string;
   /** Agent name for logging/tracing */
   agentName?: string;
+  /** Exact effective version selectors used to resolve runtime dependencies. */
+  versions?: VersionOverrides;
+  /** Cold recovery cannot safely reconstruct request-local processor state. */
+  hasProcessors?: boolean;
+  /** Opaque identities for request-resolved runtime services. */
+  runtimeBindings?: { memory?: string; workspace?: string };
+  /** Built-in DurableAgent runs require guarded in-process runtime registration. */
+  runtimeResolution?: 'registry-required';
   /** Serialized MessageList state */
   messageListState: SerializedMessageListState;
   /** Tool metadata (without execute functions) */
@@ -385,6 +395,8 @@ export interface DurableToolCallOutput extends DurableToolCallInput {
     approved: boolean;
     reason?: string;
   };
+  /** A delegation completion hook called bail() while this tool executed. */
+  delegationBailed?: boolean;
 }
 
 /**
@@ -560,6 +572,10 @@ export interface RegistryModelListEntry {
  * Registry entry for a single run's non-serializable state
  */
 export interface RunRegistryEntry {
+  /** Durable owner tuple used to reject cross-agent/run-id registry collisions. */
+  agentId?: string;
+  threadId?: string;
+  resourceId?: string;
   /** Must match the durable workflow input before any retained runtime dependency is used */
   runtimeBindingId: string;
   /**
@@ -592,6 +608,8 @@ export interface RunRegistryEntry {
   workspace?: Workspace;
   /** Request context for forwarding auth data, feature flags, etc. to tools */
   requestContext?: RequestContext;
+  /** Immutable snapshot of the version selectors accepted when the run started. */
+  versions?: VersionOverrides;
   /** Cleanup function to call when run completes */
   cleanup?: () => void;
   /** MessageList for tracking conversation messages (non-serializable) */

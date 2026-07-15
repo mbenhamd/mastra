@@ -15,6 +15,7 @@ import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '..
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
 
 // ============================================================================
 // Helper Functions
@@ -86,6 +87,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       });
 
       expect(result.runId).toBeDefined();
+      result.cleanup();
     });
 
     it('should accept requestContext option in stream', async () => {
@@ -107,6 +109,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       });
 
       expect(runId).toBeDefined();
+      await globalRunRegistry.get(runId)?.workflowExecution;
       cleanup();
     });
   });
@@ -134,6 +137,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
 
       expect(result.runId).toBeDefined();
       // The requestContext is passed through for runtime use
+      result.cleanup();
     });
 
     it('should handle RequestContext with memory options', async () => {
@@ -159,16 +163,28 @@ describe('DurableAgent RequestContext reserved keys', () => {
         },
       });
 
-      // Memory options from body are used for preparation
-      // RequestContext reserved keys take precedence at runtime
-      expect(result.threadId).toBe('body-thread');
-      expect(result.resourceId).toBe('body-resource');
+      // Reserved middleware identity is canonical during preparation as well as runtime.
+      expect(result.threadId).toBe('middleware-thread');
+      expect(result.resourceId).toBe('middleware-user');
+      expect(result.workflowInput.state).toMatchObject({
+        threadId: 'middleware-thread',
+        resourceId: 'middleware-user',
+      });
+      expect(result.workflowInput.messageListState.memoryInfo).toEqual({
+        threadId: 'middleware-thread',
+        resourceId: 'middleware-user',
+      });
+      result.cleanup();
     });
   });
 
   describe('RequestContext with tools', () => {
     it('should pass requestContext to tool execute', async () => {
       let receivedRequestContext: unknown = undefined;
+      let releaseFirstCall!: () => void;
+      const firstCallGate = new Promise<void>(resolve => {
+        releaseFirstCall = resolve;
+      });
 
       // Model that calls a tool on first invocation, then returns text
       let callCount = 0;
@@ -176,6 +192,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
         doStream: async () => {
           callCount++;
           if (callCount === 1) {
+            await firstCallGate;
             return {
               stream: convertArrayToReadableStream([
                 { type: 'stream-start', warnings: [] },
@@ -238,12 +255,17 @@ describe('DurableAgent RequestContext reserved keys', () => {
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
       const requestContext = new RequestContext();
+      const policy = { role: 'admin' };
       requestContext.set('userId', 'user-123');
+      requestContext.set('policy', policy);
 
       // Stream to actually execute the tool
       const { cleanup } = await durableAgent.stream('Use the tool', {
         requestContext,
       });
+      policy.role = 'user';
+      requestContext.set('userId', 'substituted-user');
+      releaseFirstCall();
 
       // Wait for execution to complete
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -252,6 +274,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       // Verify requestContext was passed through to tool.execute()
       expect(receivedRequestContext).toBeDefined();
       expect((receivedRequestContext as RequestContext).get('userId')).toBe('user-123');
+      expect((receivedRequestContext as RequestContext).get('policy')).toEqual({ role: 'admin' });
     });
   });
 
@@ -288,6 +311,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
         .requestContextEntries;
       expect(entries).toEqual({ userId: 'user-123' });
+      result.cleanup();
     });
   });
 });
@@ -322,6 +346,7 @@ describe('DurableAgent RequestContext edge cases', () => {
     });
 
     expect(result.runId).toBeDefined();
+    result.cleanup();
   });
 
   it('should handle RequestContext with complex values', async () => {
@@ -350,6 +375,7 @@ describe('DurableAgent RequestContext edge cases', () => {
     });
 
     expect(result.runId).toBeDefined();
+    result.cleanup();
   });
 
   it('should handle undefined requestContext', async () => {
@@ -368,6 +394,7 @@ describe('DurableAgent RequestContext edge cases', () => {
     });
 
     expect(result.runId).toBeDefined();
+    result.cleanup();
   });
 
   it('should handle RequestContext with special characters in keys', async () => {
@@ -391,5 +418,6 @@ describe('DurableAgent RequestContext edge cases', () => {
     });
 
     expect(result.runId).toBeDefined();
+    result.cleanup();
   });
 });

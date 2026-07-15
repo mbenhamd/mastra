@@ -225,18 +225,29 @@ Returns: [`Promise<DurableAgentStreamResult>`](#durableagentstreamresult)
 
 #### `resume(runId, resumeData, options?)`
 
-Resumes a suspended run, for example after a tool approval. Pass the `runId` from the original stream and the data the run was waiting on. Throws if no registry entry exists for the run.
+Resumes a suspended run, for example after a tool approval. Pass the `runId` from the original stream and the exact `toolCallId` the run was waiting on. If the in-memory registry was lost, a configured persistent workflow store can rehydrate the run after verifying its owner tuple and observable runtime bindings. See [`listSuspendedRuns()`](/reference/agents/listSuspendedRuns) for discovery, recovery requirements, and distributed-consumption limitations.
 
 ```typescript
-const { output, cleanup } = await durableAgent.resume(runId, {
-  approved: true,
-})
+const { output, cleanup } = await durableAgent.resume(
+  runId,
+  { approved: true },
+  {
+    toolCallId: 'call-123',
+    memory: { thread: 'thread-123', resource: 'resource-123' },
+  },
+)
 
 await output.text
 cleanup()
 ```
 
 Returns: [`Promise<DurableAgentStreamResult>`](#durableagentstreamresult)
+
+#### `listSuspendedRuns(options?)`
+
+Lists this agent's suspended runs from workflow storage, including the exact `runId` and `toolCallId` needed to continue each call. The method works after process loss when persistent storage is configured. See the [full `listSuspendedRuns()` reference](/reference/agents/listSuspendedRuns) for filters, ownership checks, and distributed-consumption limitations.
+
+Returns: `Promise<AgentListSuspendedRunsResult>`
 
 #### `observe(runId, options?)`
 
@@ -531,7 +542,7 @@ interface PrepareResult {
 ]}
 />
 
-`resume()` and `observe()` accept the same lifecycle callbacks (`onChunk`, `onStepFinish`, `onFinish`, `onError`, `onSuspended`). `observe()` also accepts an `offset` to control where replay starts.
+`resume()` and `observe()` accept the same lifecycle callbacks (`onChunk`, `onStepFinish`, `onFinish`, `onError`, `onSuspended`). Durable `resume()` also accepts `toolCallId`, `memory`, `requestContext`, and `versions`; cold recovery verifies these values against the persisted run before execution. `observe()` also accepts an `offset` to control where replay starts.
 
 ## DurableAgentStreamResult
 
@@ -596,5 +607,6 @@ interface DurableAgentStreamResult<OUTPUT = undefined> {
 
 - [`createInngestAgent()`](/reference/agents/inngest-agent)
 - [Agent class](/reference/agents/agent)
+- [`Agent.listSuspendedRuns()`](/reference/agents/listSuspendedRuns)
 - [PubSub](/docs/server/pubsub)
 - [`.getMemory()`](/reference/agents/getMemory)

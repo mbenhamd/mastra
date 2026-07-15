@@ -5,34 +5,62 @@ import { CachingPubSub } from '../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { PubSub } from '../../events/pubsub';
 import { validateMaxSteps } from '../../llm/model/max-steps';
+import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { Mastra } from '../../mastra';
 import { createObservabilityContext, getOrCreateSpan, SpanType, EntityType } from '../../observability';
-import { RequestContext } from '../../request-context';
+import {
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+  MASTRA_VERSIONS_KEY,
+  RequestContext,
+  mergeVersionOverrides,
+} from '../../request-context';
+import type { VersionOverrides } from '../../request-context';
 import type { FullOutput, MastraModelOutput } from '../../stream/base/output';
 import type { ChunkType, MastraOnFinishCallback } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
-import type { WorkflowRunState, WorkflowRunStatus } from '../../workflows/types';
+import type { WorkflowFinishCallbackResult, WorkflowRunState, WorkflowRunStatus } from '../../workflows/types';
 import { Agent } from '../agent';
-import type { AgentExecutionOptions } from '../agent.types';
+import type { AgentListSuspendedRunsOptions, AgentListSuspendedRunsResult, AgentRunToolCall } from '../agent';
+import type { AgentExecutionOptions, AgentExecutionOptionsBase } from '../agent.types';
+import { snapshotAgentExecutionOptions, snapshotAgentExecutionValue } from '../execution-snapshot';
 import { MessageList } from '../message-list';
 import type { MessageListInput } from '../message-list';
+import { stableStringify } from '../message-list/cache/stable-stringify';
 import { SaveQueueManager } from '../save-queue';
 import { agentThreadStreamRuntime } from '../thread-stream-runtime';
-import type { ToolsInput } from '../types';
+import type { AgentMemoryOption, ToolsInput } from '../types';
+import { isSupportedLanguageModel } from '../utils';
 
 import { AGENT_STREAM_TOPIC, DurableStepIds } from './constants';
 import { runDurableStreamUntilIdle, runResumeDurableStreamUntilIdle } from './durable-stream-until-idle';
 import { prepareForDurableExecution } from './preparation';
+import type { PreparationResult } from './preparation';
 import {
+  clearPinnedRunRegistryEntry,
   deleteBoundRunRegistryEntry,
   endRunSpansWithError,
   ExtendedRunRegistry,
   getBoundRunRegistryEntry,
+  getGlobalRunRegistryEntry,
   globalRunRegistry,
+  pinGlobalRunRegistryEntry,
   registerGlobalRunRegistryEntry,
+  unpinGlobalRunRegistryEntry,
 } from './run-registry';
 import { createDurableAgentStream, emitChunkEvent, emitErrorEvent } from './stream-adapter';
-import type { AgentStepFinishEventData, AgentSuspendedEventData, DurableAgenticWorkflowInput } from './types';
+import type {
+  AgentStepFinishEventData,
+  AgentSuspendedEventData,
+  DurableAgenticWorkflowInput,
+  RunRegistryEntry,
+} from './types';
+import {
+  createRuntimeDependencyFingerprint,
+  serializeModelConfig,
+  serializeModelList,
+  serializeToolsMetadata,
+} from './utils/serialize-state';
 import { createDurableAgenticWorkflow } from './workflows';
 
 /**
@@ -42,6 +70,7 @@ import { createDurableAgenticWorkflow } from './workflows';
  * Not part of the public `DurableAgentStreamOptions` surface.
  */
 const CLOSE_ON_SUSPEND = Symbol('mastra.durable.closeOnSuspend');
+const pendingDurableRunIds = new Set<string>();
 
 /**
  * Options for DurableAgent.stream()
@@ -176,6 +205,12 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   abortSignal?: AbortSignal;
 }
 
+/** Runtime callbacks plus caller identity used to resume a durable segment. */
+export interface DurableAgentResumeOptions<OUTPUT = undefined> extends DurableAgentStreamOptions<OUTPUT> {
+  /** Exact workflow resume label for the suspended tool call. */
+  toolCallId?: string;
+}
+
 /**
  * Result from DurableAgent.stream()
  */
@@ -201,6 +236,17 @@ export interface DurableAgentStreamResult<OUTPUT = undefined> {
    * case.
    */
   abort: (reason?: unknown) => void;
+}
+
+/** Public, capability-safe result from DurableAgent.prepare(). */
+export interface DurableAgentPreparationResult {
+  runId: string;
+  messageId: string;
+  workflowInput: DurableAgenticWorkflowInput;
+  threadId?: string;
+  resourceId?: string;
+  /** Releases an abandoned one-time handoff without exposing its runtime bindings. */
+  cleanup: () => void;
 }
 
 /**
@@ -449,6 +495,21 @@ export class DurableAgent<
 
   /** Active streamUntilIdle wrappers keyed by scope (threadId|resourceId) */
   #activeStreamUntilIdle = new Map<string, () => void>();
+
+  /** Stable identities for non-plain request values used in prepared handoffs. */
+  #preparedRequestObjectIds = new WeakMap<object, number>();
+
+  #nextPreparedRequestObjectId = 1;
+
+  #preparedRequestSymbolIds = new Map<symbol, number>();
+
+  #nextPreparedRequestSymbolId = 1;
+
+  /** One-time prepare() results, kept private so callers cannot rewrite the handoff. */
+  #preparedExecutions = new Map<
+    string,
+    { requestFingerprint: string; integrityFingerprint: string; preparation: PreparationResult<TOutput> }
+  >();
 
   /** Timeout for auto-cleanup after stream finishes (0 = disabled) */
   readonly #cleanupTimeoutMs: number;
@@ -926,25 +987,44 @@ export class DurableAgent<
   protected async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     const workflow = this.getWorkflow();
     const entry = getBoundRunRegistryEntry(runId, workflowInput.runtimeBindingId);
+    const pinnedEntry = pinGlobalRunRegistryEntry(runId);
+    if (pinnedEntry !== entry) this.#throwRunIdConflict(runId);
     const requestContext = entry?.requestContext;
 
-    const run = await workflow.createRun({ runId, pubsub: this.pubsub });
-    // Parent the workflow run under the AGENT_RUN span so the trace exports under it.
-    const result = await run.start({
-      inputData: workflowInput,
-      requestContext,
-      ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
-    });
-    if (result?.status === 'failed') {
-      const error = new Error((result as any).error?.message || 'Workflow execution failed');
-      await this.emitError(runId, error);
+    try {
+      const run = await workflow.createRun({
+        runId,
+        resourceId: workflowInput.state?.resourceId,
+        pubsub: this.pubsub,
+      });
+      // Parent the workflow run under the AGENT_RUN span so the trace exports under it.
+      await run.start({
+        inputData: workflowInput,
+        requestContext,
+        ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
+      });
+    } finally {
+      unpinGlobalRunRegistryEntry(runId);
     }
-    // Reaching any non-suspended terminal status means the run is done and its
-    // persisted snapshot rows will never be resumed. Delete them so snapshot
-    // storage doesn't grow one stale row per completed run. Suspended runs
-    // keep their snapshots so `resume()` / `recoverActiveRuns()` can find them.
-    if (result?.status && result.status !== 'suspended') {
-      await this.deleteRunSnapshots(runId);
+  }
+
+  /** Handle terminal lifecycle for synchronous and evented workflow engines. */
+  protected async onDurableWorkflowFinish(result: WorkflowFinishCallbackResult): Promise<void> {
+    if (['running', 'suspended', 'waiting', 'pending', 'paused'].includes(result.status)) return;
+
+    try {
+      await this.deleteTerminalRunSnapshots(result.runId);
+    } catch (error) {
+      // Terminal cleanup is deliberately best-effort. Storage implementations
+      // normally fail closed inside deleteTerminalRunSnapshots(), but an
+      // override or adapter must not prevent failure delivery either.
+      this.#mastra?.getLogger?.()?.warn?.('[DurableAgent] Failed to delete terminal workflow snapshots', {
+        runId: result.runId,
+        error,
+      });
+    }
+    if (result.status === 'failed' || result.status === 'tripwire') {
+      await this.emitError(result.runId, new Error(result.error?.message ?? 'Workflow execution failed'));
     }
   }
 
@@ -961,6 +1041,7 @@ export class DurableAgent<
     return createDurableAgenticWorkflow(
       {
         maxSteps: this.#maxSteps,
+        onFinish: result => this.onDurableWorkflowFinish(result),
       },
       this.logger,
     );
@@ -979,35 +1060,1214 @@ export class DurableAgent<
     await emitErrorEvent(this.pubsub, runId, error);
   }
 
-  /**
-   * Delete the persisted workflow snapshot rows for a completed durable run.
-   *
-   * A durable agent write two rows per run: one for the outer `AGENTIC_LOOP`
-   * workflow and one for the nested `AGENTIC_EXECUTION` workflow (persisted
-   * under the same `runId`). Once the run reaches a non-suspended terminal
-   * state neither row is needed again — leaving them behind fills snapshot
-   * storage with stale `pending`/`running` rows for every completed run and
-   * pollutes `listActiveRuns` / `recoverActiveRuns` on the next boot.
-   *
-   * Best-effort: a cleanup failure must never turn a finished run into an
-   * error — a stale row is preferable to a broken exit path.
-   *
-   * @internal
-   */
-  protected async deleteRunSnapshots(runId: string): Promise<void> {
-    try {
-      const workflow = this.getWorkflow();
-      await workflow.deleteWorkflowRunById(runId);
-      const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
-      await workflowsStore?.deleteWorkflowRunById({
+  /** Best-effort deletion of the outer and nested snapshots for a terminal run. */
+  protected async deleteTerminalRunSnapshots(runId: string): Promise<void> {
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    const deleteWithRetry = async (deletion: () => Promise<void>) => {
+      try {
+        await deletion();
+        return;
+      } catch {
+        // Retry once for transient driver failures. If both attempts fail,
+        // preserve the original terminal row and its status for later cleanup.
+        try {
+          await deletion();
+          return;
+        } catch (cause) {
+          throw cause;
+        }
+      }
+    };
+    const deletions = await Promise.allSettled([
+      deleteWithRetry(() => this.getWorkflow().deleteWorkflowRunById(runId)),
+      deleteWithRetry(async () => {
+        await workflowsStore?.deleteWorkflowRunById({
+          runId,
+          workflowName: DurableStepIds.AGENTIC_EXECUTION,
+        });
+      }),
+    ]);
+    const errors = deletions
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map(result => result.reason);
+    if (errors.length > 0) {
+      this.#mastra?.getLogger()?.warn?.('[DurableAgent] Failed to delete terminal workflow snapshots', {
         runId,
-        workflowName: DurableStepIds.AGENTIC_EXECUTION,
+        errors,
       });
-    } catch (error) {
-      this.#mastra
-        ?.getLogger?.()
-        ?.warn?.(`[DurableAgent] Failed to delete workflow snapshot rows after terminal state`, { runId, error });
     }
+  }
+
+  #throwRunIdConflict(runId: string): never {
+    throw new MastraError({
+      id: 'DURABLE_AGENT_RUN_ID_CONFLICT',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.USER,
+      text: `DurableAgent "${this.name}" cannot claim runId "${runId}" because it is already in use.`,
+      details: {
+        agentName: this.name,
+        runId,
+      },
+    });
+  }
+
+  #getPreparedRequestObjectId(value: object): number {
+    const existing = this.#preparedRequestObjectIds.get(value);
+    if (existing !== undefined) return existing;
+    const id = this.#nextPreparedRequestObjectId++;
+    this.#preparedRequestObjectIds.set(value, id);
+    return id;
+  }
+
+  #normalizePreparedPropertyKey(key: PropertyKey): unknown {
+    if (typeof key !== 'symbol') return { $stringKey: String(key) };
+    const globalKey = Symbol.keyFor(key);
+    if (globalKey !== undefined) return { $globalSymbolKey: globalKey };
+    let identity = this.#preparedRequestSymbolIds.get(key);
+    if (identity === undefined) {
+      identity = this.#nextPreparedRequestSymbolId++;
+      this.#preparedRequestSymbolIds.set(key, identity);
+    }
+    return { $localSymbolKey: identity, $description: key.description ?? '' };
+  }
+
+  #normalizePreparedObjectProperties(
+    value: object,
+    seen: WeakMap<object, number>,
+    nextReference: { value: number },
+  ): Array<[unknown, unknown]> {
+    const normalizedKeys = new Map<PropertyKey, unknown>();
+    const keys = Reflect.ownKeys(value).sort((left, right) => {
+      const normalizedLeft = this.#normalizePreparedPropertyKey(left);
+      const normalizedRight = this.#normalizePreparedPropertyKey(right);
+      normalizedKeys.set(left, normalizedLeft);
+      normalizedKeys.set(right, normalizedRight);
+      return stableStringify(normalizedLeft).localeCompare(stableStringify(normalizedRight));
+    });
+    return keys.map(key => {
+      const normalizedKey = normalizedKeys.get(key) ?? this.#normalizePreparedPropertyKey(key);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) {
+        return [normalizedKey, { $missingDescriptor: true }] as [unknown, unknown];
+      }
+      const normalizedDescriptor =
+        'value' in descriptor
+          ? {
+              configurable: descriptor.configurable,
+              enumerable: descriptor.enumerable,
+              writable: descriptor.writable,
+              value: this.#normalizePreparedRequestValue(descriptor.value, seen, nextReference),
+            }
+          : {
+              configurable: descriptor.configurable,
+              enumerable: descriptor.enumerable,
+              get: this.#normalizePreparedRequestValue(descriptor.get, seen, nextReference),
+              set: this.#normalizePreparedRequestValue(descriptor.set, seen, nextReference),
+            };
+      return [normalizedKey, normalizedDescriptor] as [unknown, unknown];
+    });
+  }
+
+  #normalizePreparedRequestValue(
+    value: unknown,
+    seen = new WeakMap<object, number>(),
+    nextReference = { value: 1 },
+  ): unknown {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+      return value;
+    }
+    if (value === undefined) return { $undefined: true };
+    if (typeof value === 'number') {
+      if (Number.isNaN(value)) return { $number: 'NaN' };
+      if (value === Infinity) return { $number: 'Infinity' };
+      if (value === -Infinity) return { $number: '-Infinity' };
+      if (Object.is(value, -0)) return { $number: '-0' };
+      return value;
+    }
+    if (typeof value === 'bigint') return { $bigint: String(value) };
+    if (typeof value === 'symbol') return this.#normalizePreparedPropertyKey(value);
+    const existingReference = seen.get(value);
+    if (existingReference !== undefined) return { $ref: existingReference };
+    const reference = nextReference.value++;
+    seen.set(value, reference);
+    const properties = () => this.#normalizePreparedObjectProperties(value, seen, nextReference);
+
+    if (typeof value === 'function') {
+      return {
+        $id: reference,
+        $identity: this.#getPreparedRequestObjectId(value),
+        $type: 'function',
+        $properties: properties(),
+      };
+    }
+
+    if (value instanceof RequestContext) {
+      return {
+        $id: reference,
+        $requestContext: this.#normalizePreparedRequestValue(Array.from(value.entries()), seen, nextReference),
+        $properties: properties(),
+      };
+    }
+    if (value instanceof Date) {
+      return {
+        $id: reference,
+        $date: Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString(),
+        $properties: properties(),
+      };
+    }
+    if (value instanceof RegExp && Object.getPrototypeOf(value) === RegExp.prototype) {
+      return {
+        $id: reference,
+        $regexp: value.source,
+        $flags: value.flags,
+        $properties: properties(),
+      };
+    }
+    if (value instanceof Map) {
+      return {
+        $id: reference,
+        $map: Array.from(value.entries(), ([key, entryValue]) => [
+          this.#normalizePreparedRequestValue(key, seen, nextReference),
+          this.#normalizePreparedRequestValue(entryValue, seen, nextReference),
+        ]),
+        $properties: properties(),
+      };
+    }
+    if (value instanceof Set) {
+      return {
+        $id: reference,
+        $set: Array.from(value, entry => this.#normalizePreparedRequestValue(entry, seen, nextReference)),
+        $properties: properties(),
+      };
+    }
+    if (Array.isArray(value)) {
+      return {
+        $id: reference,
+        $array: value.map(item => this.#normalizePreparedRequestValue(item, seen, nextReference)),
+        $properties: properties(),
+      };
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return {
+        $id: reference,
+        $identity: this.#getPreparedRequestObjectId(value),
+        $type: value.constructor?.name ?? 'object',
+        $properties: properties(),
+      };
+    }
+
+    return {
+      $id: reference,
+      $prototype: Object.getPrototypeOf(value) === null ? 'null' : 'object',
+      $object: properties(),
+    };
+  }
+
+  #preparedRequestFingerprint(
+    messages: MessageListInput,
+    options?: AgentExecutionOptions<TOutput> | DurableAgentStreamOptions<TOutput>,
+  ): string {
+    const {
+      runId: _runId,
+      onChunk: _onChunk,
+      onStepFinish: _onStepFinish,
+      onFinish: _onFinish,
+      onError: _onError,
+      onAbort: _onAbort,
+      onSuspended: _onSuspended,
+      ...preparationOptions
+    } = (options ?? {}) as AgentExecutionOptions<TOutput> & DurableAgentStreamOptions<TOutput>;
+    return stableStringify(this.#normalizePreparedRequestValue({ messages, options: preparationOptions }));
+  }
+
+  #preparedExecutionIntegrityFingerprint(preparation: PreparationResult<TOutput>): string {
+    return stableStringify(
+      this.#normalizePreparedRequestValue({
+        runId: preparation.runId,
+        messageId: preparation.messageId,
+        workflowInput: preparation.workflowInput,
+        runtimeBindings: this.#preparedRegistryIntegrityFingerprint(preparation.registryEntry),
+        threadId: preparation.threadId,
+        resourceId: preparation.resourceId,
+      }),
+    );
+  }
+
+  #preparedRegistryIntegrityFingerprint(entry: RunRegistryEntry): string {
+    const {
+      cleanup: _cleanup,
+      workflowExecution: _workflowExecution,
+      messageList: _messageList,
+      ...runtimeBindings
+    } = entry;
+    return stableStringify(this.#normalizePreparedRequestValue(runtimeBindings));
+  }
+
+  #createPrivatePreparation(preparation: PreparationResult<TOutput>): PreparationResult<TOutput> {
+    const registryEntry: RunRegistryEntry = {
+      ...preparation.registryEntry,
+      tools: Object.fromEntries(
+        Object.entries(preparation.registryEntry.tools).map(([toolId, tool]) => [toolId, { ...tool }]),
+      ),
+      modelList: preparation.registryEntry.modelList?.map(entry => ({ ...entry })),
+      versions: preparation.registryEntry.versions ? structuredClone(preparation.registryEntry.versions) : undefined,
+      // Keep the private context object captured by converted tool closures.
+      // prepare() snapshots the caller's options before preparation, so cloning
+      // again here would only sever runtime signals such as delegation bail.
+      requestContext: preparation.registryEntry.requestContext,
+      inputProcessors: preparation.registryEntry.inputProcessors?.slice(),
+      outputProcessors: preparation.registryEntry.outputProcessors?.slice(),
+      errorProcessors: preparation.registryEntry.errorProcessors?.slice(),
+      processorStates: preparation.registryEntry.processorStates
+        ? new Map(preparation.registryEntry.processorStates)
+        : undefined,
+    };
+    return {
+      ...preparation,
+      workflowInput: snapshotAgentExecutionValue(preparation.workflowInput),
+      registryEntry,
+    };
+  }
+
+  #getPreparedExecution(runId: string, requestFingerprint: string) {
+    const prepared = this.#preparedExecutions.get(runId);
+    const localEntry = this.#runRegistry.get(runId);
+    const globalEntry = getGlobalRunRegistryEntry(runId);
+    const messageList = this.#runRegistry.getMessageList(runId);
+    if (!prepared) {
+      if (localEntry || globalEntry || messageList) this.#throwRunIdConflict(runId);
+      return undefined;
+    }
+    if (
+      !localEntry ||
+      !globalEntry ||
+      !messageList ||
+      globalEntry !== localEntry ||
+      prepared.requestFingerprint !== requestFingerprint ||
+      prepared.integrityFingerprint !== this.#preparedExecutionIntegrityFingerprint(prepared.preparation) ||
+      this.#preparedRegistryIntegrityFingerprint(globalEntry) !==
+        this.#preparedRegistryIntegrityFingerprint(prepared.preparation.registryEntry) ||
+      globalEntry.messageList !== messageList ||
+      prepared.preparation.registryEntry !== localEntry ||
+      prepared.preparation.messageList !== messageList
+    ) {
+      this.#throwRunIdConflict(runId);
+    }
+    return prepared.preparation;
+  }
+
+  #consumePreparedExecution(runId: string): void {
+    this.#preparedExecutions.delete(runId);
+  }
+
+  #coordinateRegistryCleanup(runId: string, entry: RunRegistryEntry): void {
+    const existingCleanup = entry.cleanup;
+    let cleaning = false;
+    entry.cleanup = () => {
+      if (cleaning) return;
+      cleaning = true;
+      try {
+        this.#preparedExecutions.delete(runId);
+        if (this.#runRegistry.get(runId) === entry) {
+          this.#runRegistry.cleanupBound(runId, entry.runtimeBindingId);
+        }
+        if (getGlobalRunRegistryEntry(runId) === entry) {
+          clearPinnedRunRegistryEntry(runId);
+          deleteBoundRunRegistryEntry(runId, entry.runtimeBindingId);
+        }
+        existingCleanup?.();
+      } finally {
+        cleaning = false;
+      }
+    };
+  }
+
+  #activeRegistryPairIsValid(runId: string, expectedEntry: RunRegistryEntry): boolean {
+    const localEntry = this.#runRegistry.get(runId);
+    const globalEntry = getGlobalRunRegistryEntry(runId);
+    const messageList = this.#runRegistry.getMessageList(runId);
+    if (!localEntry && !globalEntry && !messageList) return false;
+    if (
+      localEntry !== expectedEntry ||
+      globalEntry !== expectedEntry ||
+      !globalEntry ||
+      !messageList ||
+      globalEntry.messageList !== messageList ||
+      globalEntry.runtimeBindingId !== expectedEntry.runtimeBindingId ||
+      globalEntry.agentId !== expectedEntry.agentId ||
+      globalEntry.threadId !== expectedEntry.threadId ||
+      globalEntry.resourceId !== expectedEntry.resourceId ||
+      globalEntry.tools !== expectedEntry.tools ||
+      globalEntry.model !== expectedEntry.model ||
+      globalEntry.modelList !== expectedEntry.modelList ||
+      globalEntry.memory !== expectedEntry.memory ||
+      globalEntry.saveQueueManager !== expectedEntry.saveQueueManager ||
+      globalEntry.workspace !== expectedEntry.workspace ||
+      globalEntry.requestContext !== expectedEntry.requestContext ||
+      globalEntry.versions !== expectedEntry.versions ||
+      globalEntry.inputProcessors !== expectedEntry.inputProcessors ||
+      globalEntry.llmRequestInputProcessors !== expectedEntry.llmRequestInputProcessors ||
+      globalEntry.outputProcessors !== expectedEntry.outputProcessors ||
+      globalEntry.errorProcessors !== expectedEntry.errorProcessors ||
+      globalEntry.processorStates !== expectedEntry.processorStates ||
+      globalEntry.backgroundTaskManager !== expectedEntry.backgroundTaskManager ||
+      globalEntry.backgroundTasksConfig !== expectedEntry.backgroundTasksConfig ||
+      globalEntry.cleanup !== expectedEntry.cleanup
+    ) {
+      this.#throwRunIdConflict(runId);
+    }
+    return true;
+  }
+
+  #isReusablePreparedEntry(
+    runId: string,
+    expectedOwner?: Pick<RunRegistryEntry, 'agentId' | 'threadId' | 'resourceId'>,
+  ): boolean {
+    if (!expectedOwner) return false;
+    if (!this.#preparedExecutions.has(runId)) return false;
+    const entries = [this.#runRegistry.get(runId), getGlobalRunRegistryEntry(runId)];
+    return entries.every(
+      entry =>
+        entry !== undefined &&
+        entry.workflowExecution === undefined &&
+        entry.agentId === this.id &&
+        entry.agentId === expectedOwner.agentId &&
+        entry.threadId === expectedOwner.threadId &&
+        entry.resourceId === expectedOwner.resourceId,
+    );
+  }
+
+  #assertNoRegistryCollision(
+    runId: string,
+    ignorePending = false,
+    reusablePreparedOwner?: Pick<RunRegistryEntry, 'agentId' | 'threadId' | 'resourceId'>,
+  ): void {
+    const canReusePreparedEntry = this.#isReusablePreparedEntry(runId, reusablePreparedOwner);
+    if (
+      (!ignorePending && pendingDurableRunIds.has(runId)) ||
+      ((this.#runRegistry.has(runId) || getGlobalRunRegistryEntry(runId)) && !canReusePreparedEntry)
+    ) {
+      this.#throwRunIdConflict(runId);
+    }
+  }
+
+  async #assertRunIdAvailable(
+    runId: string,
+    ignorePending = false,
+    reusablePreparedOwner?: Pick<RunRegistryEntry, 'agentId' | 'threadId' | 'resourceId'>,
+  ): Promise<void> {
+    this.#assertNoRegistryCollision(runId, ignorePending, reusablePreparedOwner);
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) return;
+    let persisted: unknown[];
+    try {
+      persisted = await Promise.all([
+        workflowsStore.getWorkflowRunById({ workflowName: DurableStepIds.AGENTIC_LOOP, runId }),
+        workflowsStore.getWorkflowRunById({ workflowName: DurableStepIds.AGENTIC_EXECUTION, runId }),
+      ]);
+    } catch {
+      // An unreadable row still occupies the identifier and must not be overwritten.
+      this.#throwRunIdConflict(runId);
+    }
+    if (persisted.some(Boolean)) this.#throwRunIdConflict(runId);
+  }
+
+  async #reserveRunId(
+    runId: string,
+    reusablePreparedOwner?: Pick<RunRegistryEntry, 'agentId' | 'threadId' | 'resourceId'>,
+  ): Promise<() => void> {
+    if (pendingDurableRunIds.has(runId)) this.#throwRunIdConflict(runId);
+    pendingDurableRunIds.add(runId);
+    try {
+      await this.#assertRunIdAvailable(runId, true, reusablePreparedOwner);
+    } catch (error) {
+      pendingDurableRunIds.delete(runId);
+      throw error;
+    }
+    return () => pendingDurableRunIds.delete(runId);
+  }
+
+  #getDurableWorkflowInput(snapshot: any): DurableAgenticWorkflowInput | undefined {
+    const input = snapshot?.context?.input as DurableAgenticWorkflowInput | undefined;
+    return input?.__workflowKind === 'durable-agent' ? input : undefined;
+  }
+
+  async #assertPublicAgentResumePreflight(options: {
+    requestContext?: RequestContext;
+    memory?: AgentMemoryOption;
+    runId: string;
+    snapshotMemoryInfo?: { threadId?: string; resourceId?: string };
+  }): Promise<void> {
+    await this.#wrappedAgent.__assertAgentResumePreflight({
+      ...options,
+      agentId: this.id,
+      agentName: this.name,
+    });
+  }
+
+  #durableSnapshotPairIsConsistent(
+    runId: string,
+    outerRun: any,
+    outerSnapshot: any,
+    nestedRun: any,
+    nestedSnapshot: any,
+  ): boolean {
+    if (!nestedRun || nestedSnapshot?.status !== 'suspended') return false;
+    const outerInput = this.#getDurableWorkflowInput(outerSnapshot);
+    const nestedInput = this.#getDurableWorkflowInput(nestedSnapshot);
+    if (!outerInput || !nestedInput) return false;
+    if (
+      outerInput.runId !== runId ||
+      nestedInput.runId !== runId ||
+      outerInput.agentId !== nestedInput.agentId ||
+      (outerRun.resourceId && nestedRun.resourceId && outerRun.resourceId !== nestedRun.resourceId)
+    ) {
+      return false;
+    }
+    const outerCalls = this.#getDurableSuspendedToolCalls(outerSnapshot);
+    const nestedCalls = this.#getDurableSuspendedToolCalls(nestedSnapshot);
+    if (outerCalls.hasLabelConflict || nestedCalls.hasLabelConflict) return false;
+    if (stableStringify(outerCalls.toolCalls) !== stableStringify(nestedCalls.toolCalls)) return false;
+
+    const ownerValues = (input: DurableAgenticWorkflowInput, row: any) => ({
+      threadIds: [input.state?.threadId, input.messageListState?.memoryInfo?.threadId].filter(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      ),
+      resourceIds: [row?.resourceId, input.state?.resourceId, input.messageListState?.memoryInfo?.resourceId].filter(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      ),
+    });
+    const outerOwner = ownerValues(outerInput, outerRun);
+    const nestedOwner = ownerValues(nestedInput, nestedRun);
+    if (new Set([...outerOwner.threadIds, ...nestedOwner.threadIds]).size > 1) return false;
+    if (new Set([...outerOwner.resourceIds, ...nestedOwner.resourceIds]).size > 1) return false;
+
+    const recoveryContract = (input: DurableAgenticWorkflowInput) => ({
+      versions: input.versions,
+      hasProcessors: input.hasProcessors,
+      runtimeBindings: input.runtimeBindings,
+      runtimeResolution: input.runtimeResolution,
+      toolsMetadata: input.toolsMetadata,
+      modelConfig: input.modelConfig,
+      modelList: input.modelList,
+      options: input.options,
+    });
+    return stableStringify(recoveryContract(outerInput)) === stableStringify(recoveryContract(nestedInput));
+  }
+
+  #findDurableResumeLabel(snapshot: any, stepId: string): string | undefined {
+    const matchingLabels = Object.entries(snapshot?.resumeLabels ?? {}).filter(
+      ([, target]) => (target as { stepId?: string } | undefined)?.stepId === stepId,
+    );
+    return matchingLabels.length === 1 ? matchingLabels[0]![0] : undefined;
+  }
+
+  #getDurableSuspendedToolCalls(snapshot: any): { toolCalls: AgentRunToolCall[]; hasLabelConflict: boolean } {
+    const toolCalls: AgentRunToolCall[] = [];
+    let hasLabelConflict = false;
+    for (const stepId in snapshot?.context) {
+      const step = snapshot.context[stepId];
+      if (step?.status !== 'suspended') continue;
+      const payload = step.suspendPayload;
+      if (!payload || typeof payload !== 'object') continue;
+
+      const approval = payload.requireToolApproval ?? (payload.type === 'approval' ? payload : undefined);
+      if (approval) {
+        const resumeLabel = this.#findDurableResumeLabel(snapshot, stepId);
+        if (!resumeLabel || (approval.toolCallId && approval.toolCallId !== resumeLabel)) {
+          hasLabelConflict = true;
+          continue;
+        }
+        toolCalls.push({
+          toolCallId: resumeLabel,
+          toolName: approval.toolName,
+          args: approval.args,
+          requiresApproval: true,
+        });
+      } else if (payload.toolCallSuspended || payload.type === 'suspension') {
+        const resumeLabel = this.#findDurableResumeLabel(snapshot, stepId);
+        if (!resumeLabel || (payload.toolCallId && payload.toolCallId !== resumeLabel)) {
+          hasLabelConflict = true;
+          continue;
+        }
+        toolCalls.push({
+          toolCallId: resumeLabel,
+          toolName: payload.toolName,
+          requiresApproval: false,
+          suspendPayload: payload.toolCallSuspended,
+        });
+      }
+    }
+    return { toolCalls, hasLabelConflict };
+  }
+
+  async #resolveDurableResumeLabel(
+    runId: string,
+    requestedToolCallId?: string,
+  ): Promise<{ label?: string; persisted: boolean }> {
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) return { label: requestedToolCallId, persisted: false };
+    let persisted;
+    let nestedPersisted;
+    try {
+      [persisted, nestedPersisted] = await Promise.all([
+        workflowsStore.getWorkflowRunById({
+          workflowName: DurableStepIds.AGENTIC_LOOP,
+          runId,
+        }),
+        workflowsStore.getWorkflowRunById({
+          workflowName: DurableStepIds.AGENTIC_EXECUTION,
+          runId,
+        }),
+      ]);
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause;
+      throw new MastraError(
+        {
+          id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent "${this.name}" found an invalid persisted snapshot for run "${runId}".`,
+          details: { agentName: this.name, runId },
+        },
+        cause,
+      );
+    }
+    if (!persisted) return { label: requestedToolCallId, persisted: false };
+
+    let snapshot: any = persisted.snapshot;
+    if (typeof snapshot === 'string') {
+      try {
+        snapshot = JSON.parse(snapshot);
+      } catch {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent "${this.name}" found an invalid persisted snapshot for run "${runId}".`,
+          details: { agentName: this.name, runId },
+        });
+      }
+    }
+    let nestedSnapshot: any = nestedPersisted?.snapshot;
+    if (typeof nestedSnapshot === 'string') {
+      try {
+        nestedSnapshot = JSON.parse(nestedSnapshot);
+      } catch {
+        throw new MastraError({
+          id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent "${this.name}" found an invalid nested snapshot for run "${runId}".`,
+          details: { agentName: this.name, runId },
+        });
+      }
+    }
+    if (snapshot?.status !== 'suspended') {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_RUN_NOT_SUSPENDED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" because it is not suspended.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const input = this.#getDurableWorkflowInput(snapshot);
+    if (!input || input.agentId !== this.id) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_AGENT_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" because it is not owned by this agent.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (!this.#durableSnapshotPairIsConsistent(runId, persisted, snapshot, nestedPersisted, nestedSnapshot)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_SNAPSHOT_PAIR_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found inconsistent outer and nested snapshots for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    const { toolCalls, hasLabelConflict } = this.#getDurableSuspendedToolCalls(snapshot);
+    if (hasLabelConflict) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_LABEL_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found conflicting persisted resume labels for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (toolCalls.length === 0) return { label: requestedToolCallId, persisted: true };
+    if (requestedToolCallId) {
+      const matchingCalls = toolCalls.filter(toolCall => toolCall.toolCallId === requestedToolCallId);
+      if (matchingCalls.length === 1) return { label: requestedToolCallId, persisted: true };
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_TOOL_CALL_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot find suspended tool call "${requestedToolCallId}" in run "${runId}".`,
+        details: { agentName: this.name, runId, toolCallId: requestedToolCallId },
+      });
+    }
+
+    const [onlyCall] = toolCalls;
+    if (toolCalls.length === 1 && onlyCall?.toolCallId) return { label: onlyCall.toolCallId, persisted: true };
+    throw new MastraError({
+      id: 'DURABLE_AGENT_RESUME_AMBIGUOUS_TOOL_CALL',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.USER,
+      text: `DurableAgent "${this.name}" requires an exact toolCallId to resume run "${runId}".`,
+      details: { agentName: this.name, runId },
+    });
+  }
+
+  #assertWarmResumeVersionSelectors(
+    runId: string,
+    entry: RunRegistryEntry,
+    options: Pick<DurableAgentResumeOptions<TOutput>, 'requestContext' | 'versions'>,
+  ): void {
+    const originalVersions = entry.versions;
+    const resumeRequestContext = (options.requestContext ?? entry.requestContext) as RequestContext | undefined;
+    const requestedVersions = resumeRequestContext?.get(MASTRA_VERSIONS_KEY) as VersionOverrides | undefined;
+    let effectiveVersions = mergeVersionOverrides(this.#mastra?.getVersionOverrides(), originalVersions);
+    effectiveVersions = mergeVersionOverrides(effectiveVersions, requestedVersions);
+    if (options.versions) effectiveVersions = mergeVersionOverrides(effectiveVersions, options.versions);
+
+    if (stableStringify(effectiveVersions ?? {}) !== stableStringify(originalVersions ?? {})) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_VERSION_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" with different version selectors.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (effectiveVersions && resumeRequestContext) {
+      resumeRequestContext.set(MASTRA_VERSIONS_KEY, structuredClone(effectiveVersions));
+    }
+  }
+
+  async #rehydrateSuspendedRunRegistry(
+    runId: string,
+    options: Pick<DurableAgentResumeOptions<TOutput>, 'requestContext' | 'memory' | 'versions'> = {},
+  ): Promise<void> {
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_NO_STORAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover suspended run "${runId}" without workflow storage.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    let persisted;
+    let nestedPersisted;
+    try {
+      [persisted, nestedPersisted] = await Promise.all([
+        workflowsStore.getWorkflowRunById({
+          workflowName: DurableStepIds.AGENTIC_LOOP,
+          runId,
+        }),
+        workflowsStore.getWorkflowRunById({
+          workflowName: DurableStepIds.AGENTIC_EXECUTION,
+          runId,
+        }),
+      ]);
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause;
+      throw new MastraError(
+        {
+          id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent "${this.name}" found an invalid persisted snapshot for run "${runId}".`,
+          details: { agentName: this.name, runId },
+        },
+        cause,
+      );
+    }
+    if (!persisted) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_SNAPSHOT_NOT_FOUND',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" could not find suspended run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    let snapshot: any = persisted.snapshot;
+    if (typeof snapshot === 'string') {
+      try {
+        snapshot = JSON.parse(snapshot);
+      } catch (cause) {
+        throw new MastraError(
+          {
+            id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.SYSTEM,
+            text: `DurableAgent "${this.name}" found an invalid persisted snapshot for run "${runId}".`,
+            details: { agentName: this.name, runId },
+          },
+          cause,
+        );
+      }
+    }
+    let nestedSnapshot: any = nestedPersisted?.snapshot;
+    if (typeof nestedSnapshot === 'string') {
+      try {
+        nestedSnapshot = JSON.parse(nestedSnapshot);
+      } catch (cause) {
+        throw new MastraError(
+          {
+            id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.SYSTEM,
+            text: `DurableAgent "${this.name}" found an invalid nested snapshot for run "${runId}".`,
+            details: { agentName: this.name, runId },
+          },
+          cause,
+        );
+      }
+    }
+
+    const workflowInput = this.#getDurableWorkflowInput(snapshot);
+    if (!workflowInput) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found no durable-agent input in run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    const persistedMemoryInfo = workflowInput.messageListState?.memoryInfo ?? undefined;
+    const threadIds = [workflowInput.state?.threadId, persistedMemoryInfo?.threadId].filter(
+      (value): value is string => typeof value === 'string' && value.length > 0,
+    );
+    const resourceIds = [persisted.resourceId, workflowInput.state?.resourceId, persistedMemoryInfo?.resourceId].filter(
+      (value): value is string => typeof value === 'string' && value.length > 0,
+    );
+    if (new Set(threadIds).size > 1 || new Set(resourceIds).size > 1) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_SNAPSHOT_OWNER_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found conflicting persisted ownership for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const threadId = threadIds[0];
+    const resourceId = resourceIds[0];
+    const callerRequestContext = options.requestContext ?? new RequestContext();
+    const requestContext: RequestContext = workflowInput.requestContextEntries
+      ? new RequestContext(Object.entries(workflowInput.requestContextEntries) as Iterable<readonly [string, unknown]>)
+      : new RequestContext();
+    for (const [key, value] of callerRequestContext.entries()) {
+      requestContext.set(key, value);
+    }
+    const requestVersions = callerRequestContext.get(MASTRA_VERSIONS_KEY) as VersionOverrides | undefined;
+    let mergedVersions = mergeVersionOverrides(this.#mastra?.getVersionOverrides(), workflowInput.versions);
+    mergedVersions = mergeVersionOverrides(mergedVersions, requestVersions);
+    if (options.versions) {
+      mergedVersions = mergeVersionOverrides(mergedVersions, options.versions);
+    }
+    if (mergedVersions) {
+      requestContext.set(MASTRA_VERSIONS_KEY, mergedVersions);
+    }
+    // Persisted context is runtime input, never proof of the current caller.
+    // Ownership must come from the live request context (or explicit memory
+    // coordinates when FGA is not configured).
+    const resourceIdFromContext = callerRequestContext.get(MASTRA_RESOURCE_ID_KEY);
+    const hasFga = Boolean(this.#mastra?.getServer()?.fga);
+    const callerResourceId = resourceIdFromContext ?? (hasFga ? undefined : options.memory?.resource);
+    const requestedThread = options.memory?.thread;
+    const memoryThreadId = typeof requestedThread === 'string' ? requestedThread : requestedThread?.id;
+    const threadIdFromContext = callerRequestContext.get(MASTRA_THREAD_ID_KEY);
+    const callerThreadId = threadIdFromContext ?? (hasFga ? undefined : memoryThreadId);
+
+    // Cold recovery has no trusted in-process reservation. Fail closed unless
+    // the caller proves the exact persisted resource and, when supplied, thread.
+    if (!resourceId || !threadId || callerResourceId !== resourceId || callerThreadId !== threadId) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_OWNER_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" from a different thread or resource.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    if (snapshot?.status !== 'suspended') {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_RUN_NOT_SUSPENDED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" because it is not suspended.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (workflowInput.agentId !== this.id) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_AGENT_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" because it is not owned by this agent.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (!this.#durableSnapshotPairIsConsistent(runId, persisted, snapshot, nestedPersisted, nestedSnapshot)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_SNAPSHOT_PAIR_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found inconsistent outer and nested snapshots for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+
+    await this.#assertPublicAgentResumePreflight({
+      requestContext,
+      memory: options.memory,
+      runId,
+      snapshotMemoryInfo: { threadId, resourceId },
+    });
+
+    if (stableStringify(mergedVersions ?? {}) !== stableStringify(workflowInput.versions ?? {})) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_VERSION_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" with different version selectors.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const messageList = new MessageList({ threadId, resourceId });
+    try {
+      messageList.deserialize(workflowInput.messageListState);
+    } catch (cause) {
+      throw new MastraError(
+        {
+          id: 'DURABLE_AGENT_RESUME_INVALID_MESSAGE_STATE',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          text: `DurableAgent "${this.name}" could not restore messages for run "${runId}".`,
+          details: { agentName: this.name, runId },
+        },
+        cause,
+      );
+    }
+
+    const memoryConfig = workflowInput.state?.memoryConfig;
+    const [tools, model, modelList, memory, workspace, inputProcessors, outputProcessors, errorProcessors] =
+      await Promise.all([
+        this.#wrappedAgent.getToolsForExecution({
+          threadId,
+          resourceId,
+          runId,
+          requestContext,
+          memoryConfig,
+          autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
+          agentId: this.id,
+          agentName: this.name,
+        }),
+        this.#wrappedAgent.getModel({ requestContext }),
+        this.#wrappedAgent.getModelList(requestContext),
+        this.#wrappedAgent.getMemory({ requestContext }),
+        this.#wrappedAgent.getWorkspace({ requestContext }),
+        this.#wrappedAgent.listInputProcessors(requestContext),
+        this.#wrappedAgent.listOutputProcessors(requestContext),
+        this.#wrappedAgent.listErrorProcessors(requestContext),
+      ]);
+    if (
+      workflowInput.hasProcessors ||
+      inputProcessors.length > 0 ||
+      outputProcessors.length > 0 ||
+      errorProcessors.length > 0
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot cold-recover run "${runId}" because request-local processor state was not persisted.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const suspendedToolCalls = this.#getDurableSuspendedToolCalls(snapshot);
+    if (suspendedToolCalls.hasLabelConflict) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_LABEL_CONFLICT',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" found conflicting persisted resume labels for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const missingToolNames = suspendedToolCalls.toolCalls
+      .map(toolCall => toolCall.toolName)
+      .filter((toolName): toolName is string => Boolean(toolName && !tools[toolName]));
+    if (missingToolNames.length > 0) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_TOOL_NOT_FOUND',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot restore suspended run "${runId}" because its tool is no longer available.`,
+        details: {
+          agentName: this.name,
+          runId,
+          toolNames: [...new Set(missingToolNames)].join(', '),
+        },
+      });
+    }
+    if (
+      stableStringify({
+        memory: createRuntimeDependencyFingerprint(memory),
+        workspace: createRuntimeDependencyFingerprint(workspace),
+      }) !== stableStringify(workflowInput.runtimeBindings ?? {})
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_RUNTIME_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" because its runtime services changed.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (stableStringify(serializeToolsMetadata(tools)) !== stableStringify(workflowInput.toolsMetadata)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_TOOL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" because its resolved tools changed.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (
+      stableStringify(serializeModelConfig(model as MastraLanguageModel)) !== stableStringify(workflowInput.modelConfig)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_MODEL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" because its resolved model changed.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (
+      stableStringify(modelList ? serializeModelList(modelList) : undefined) !==
+      stableStringify(workflowInput.modelList)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_MODEL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot recover run "${runId}" because its resolved model list changed.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const saveQueueManager = memory ? new SaveQueueManager({ logger: this.#mastra?.getLogger(), memory }) : undefined;
+    const registryEntry: RunRegistryEntry = {
+      runtimeBindingId: workflowInput.runtimeBindingId ?? crypto.randomUUID(),
+      agentId: this.id,
+      threadId,
+      resourceId,
+      tools,
+      model: model as MastraLanguageModel,
+      modelList: modelList?.map(entry => ({
+        id: entry.id,
+        model: entry.model,
+        maxRetries: entry.maxRetries ?? 0,
+        enabled: entry.enabled ?? true,
+      })),
+      memory,
+      saveQueueManager,
+      workspace,
+      requestContext: snapshotAgentExecutionValue(requestContext),
+      versions: workflowInput.versions ? structuredClone(workflowInput.versions) : undefined,
+      inputProcessors,
+      llmRequestInputProcessors: [],
+      outputProcessors,
+      errorProcessors,
+      processorStates: new Map(),
+      backgroundTaskManager: this.#mastra?.backgroundTaskManager,
+      backgroundTasksConfig: this.#wrappedAgent.getBackgroundTasksConfig(),
+      messageList,
+      cleanup: () => {},
+    };
+    this.#coordinateRegistryCleanup(runId, registryEntry);
+    this.#assertNoRegistryCollision(runId);
+    this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
+    registerGlobalRunRegistryEntry(runId, registryEntry);
+  }
+
+  // ===========================================================================
+  // Public API
+  // ===========================================================================
+
+  /** List this durable agent's suspended runs from durable workflow storage. */
+  override async listSuspendedRuns(options: AgentListSuspendedRunsOptions = {}): Promise<AgentListSuspendedRunsResult> {
+    options = snapshotAgentExecutionOptions(options, [
+      'threadId',
+      'resourceId',
+      'requestContext',
+      'fromDate',
+      'toDate',
+      'perPage',
+      'page',
+    ]);
+    const { threadId, resourceId, requestContext, fromDate, toDate, perPage, page } = options;
+    if (perPage !== undefined && (!Number.isInteger(perPage) || perPage <= 0)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_LIST_SUSPENDED_RUNS_INVALID_PER_PAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() requires perPage to be a positive integer.`,
+        details: { agentName: this.name, perPage },
+      });
+    }
+    if (page !== undefined && (!Number.isInteger(page) || page < 0)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_LIST_SUSPENDED_RUNS_INVALID_PAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() requires page to be a non-negative integer.`,
+        details: { agentName: this.name, page },
+      });
+    }
+
+    const hasFga = Boolean(this.#mastra?.getServer()?.fga);
+    const contextResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY);
+    const contextThreadId = requestContext?.get(MASTRA_THREAD_ID_KEY);
+    if (hasFga && (typeof contextResourceId !== 'string' || contextResourceId.trim().length === 0)) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_UNVERIFIED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() requires a verified resource id.`,
+        details: { agentName: this.name },
+      });
+    }
+    if (typeof contextResourceId === 'string' && resourceId && contextResourceId !== resourceId) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_OWNER_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() cannot list a different resource.`,
+        details: { agentName: this.name },
+      });
+    }
+    if (typeof contextThreadId === 'string' && threadId && contextThreadId !== threadId) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_THREAD_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() cannot list a different thread.`,
+        details: { agentName: this.name },
+      });
+    }
+    const scopedResourceId =
+      typeof contextResourceId === 'string' && contextResourceId.trim().length > 0 ? contextResourceId : resourceId;
+    const scopedThreadId =
+      typeof contextThreadId === 'string' && contextThreadId.trim().length > 0 ? contextThreadId : threadId;
+    await this.#assertPublicAgentResumePreflight({
+      requestContext,
+      memory: scopedResourceId && scopedThreadId ? { resource: scopedResourceId, thread: scopedThreadId } : undefined,
+      runId: 'list-suspended-runs',
+    });
+
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) {
+      throw new MastraError({
+        id: 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" listSuspendedRuns() requires workflow storage.`,
+        details: { agentName: this.name },
+      });
+    }
+
+    const [{ runs }, { runs: nestedRuns }] = await Promise.all([
+      workflowsStore.listWorkflowRuns({
+        workflowName: 'durable-agentic-loop',
+        status: 'suspended',
+        resourceId: scopedResourceId,
+        fromDate,
+        toDate,
+        perPage: false,
+      }),
+      workflowsStore.listWorkflowRuns({
+        workflowName: DurableStepIds.AGENTIC_EXECUTION,
+        status: 'suspended',
+        resourceId: scopedResourceId,
+        perPage: false,
+      }),
+    ]);
+    const nestedRunsById = new Map(nestedRuns.map(run => [run.runId, run]));
+    const matchedRuns: AgentListSuspendedRunsResult['runs'] = [];
+    for (const run of runs) {
+      let snapshot: any = run.snapshot;
+      if (typeof snapshot === 'string') {
+        try {
+          snapshot = JSON.parse(snapshot);
+        } catch {
+          continue;
+        }
+      }
+      if (snapshot?.status !== 'suspended') continue;
+      const input = this.#getDurableWorkflowInput(snapshot);
+      if (!input || input.agentId !== this.id) continue;
+
+      const memoryInfo = input.messageListState?.memoryInfo ?? undefined;
+      const threadIds = [input.state?.threadId, memoryInfo?.threadId].filter(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      );
+      const resourceIds = [run.resourceId, input.state?.resourceId, memoryInfo?.resourceId].filter(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      );
+      if (new Set(threadIds).size > 1 || new Set(resourceIds).size > 1) continue;
+      const runThreadId = threadIds[0];
+      const runResourceId = resourceIds[0];
+      if (scopedThreadId && scopedThreadId !== runThreadId) continue;
+      if (scopedResourceId && scopedResourceId !== runResourceId) continue;
+
+      const nestedRun = nestedRunsById.get(run.runId);
+      let nestedSnapshot: any = nestedRun?.snapshot;
+      if (typeof nestedSnapshot === 'string') {
+        try {
+          nestedSnapshot = JSON.parse(nestedSnapshot);
+        } catch {
+          continue;
+        }
+      }
+      if (!this.#durableSnapshotPairIsConsistent(run.runId, run, snapshot, nestedRun, nestedSnapshot)) continue;
+
+      matchedRuns.push({
+        runId: run.runId,
+        status: 'suspended',
+        workflowName: 'durable-agentic-loop',
+        threadId: runThreadId,
+        resourceId: runResourceId,
+        suspendedAt: run.updatedAt,
+        toolCalls: this.#getDurableSuspendedToolCalls(snapshot).toolCalls,
+      });
+    }
+
+    const total = matchedRuns.length;
+    const paginatedRuns =
+      perPage !== undefined && page !== undefined
+        ? matchedRuns.slice(page * perPage, (page + 1) * perPage)
+        : matchedRuns;
+    return { runs: paginatedRuns, total };
   }
 
   /** Preserve caller IDs exactly, but retry the vanishingly rare generated-ID collision. */
@@ -1041,6 +2301,11 @@ export class DurableAgent<
     messages: MessageListInput,
     options?: DurableAgentStreamOptions<TOutput>,
   ): Promise<DurableAgentStreamResult<TOutput>> {
+    messages = snapshotAgentExecutionValue(messages);
+    options = options
+      ? snapshotAgentExecutionOptions(options, ['runId', 'requestContext', 'memory', 'versions'])
+      : undefined;
+
     // Delegate to the idle-loop wrapper when `untilIdle` is set.
     // Strip `untilIdle` before passing to the wrapper so its internal
     // agent.stream() call doesn't recurse.
@@ -1058,20 +2323,66 @@ export class DurableAgent<
       );
     }
 
-    const allocatedRunId = this.#allocateRunId(options?.runId);
-    // 1. Prepare for durable execution (non-durable phase)
-    const preparation = await prepareForDurableExecution<TOutput>({
-      agent: this.#wrappedAgent as Agent<string, any, TOutput>,
-      messages,
-      options: options as AgentExecutionOptions<TOutput>,
-      runId: allocatedRunId,
-      requestContext: options?.requestContext,
-      logger: this.logger,
-      mastra: this.#mastra,
-      durableAgentId: this.id,
-      durableAgentName: this.name,
-    });
+    const allocatedRunId = options?.runId ?? this.#allocateRunId();
+    let releaseRunIdReservation: (() => void) | undefined;
+    let reusedPreparedExecution = false;
+    let preparation: PreparationResult<TOutput> | undefined;
+    try {
+      const prepared = this.#preparedExecutions.get(allocatedRunId)?.preparation;
+      if (prepared) {
+        const snapshotMemoryInfo = { threadId: prepared.threadId, resourceId: prepared.resourceId };
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: options?.requestContext,
+          memory: options?.memory,
+          runId: allocatedRunId,
+          snapshotMemoryInfo,
+        });
+        const requestFingerprint = this.#preparedRequestFingerprint(messages, options);
+        const matchedPreparation = this.#getPreparedExecution(allocatedRunId, requestFingerprint);
+        if (!matchedPreparation) this.#throwRunIdConflict(allocatedRunId);
+        preparation = matchedPreparation;
+        releaseRunIdReservation = await this.#reserveRunId(allocatedRunId, {
+          agentId: preparation.registryEntry.agentId,
+          threadId: preparation.threadId,
+          resourceId: preparation.resourceId,
+        });
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: options?.requestContext,
+          memory: options?.memory,
+          runId: allocatedRunId,
+          snapshotMemoryInfo,
+        });
+        if (this.#getPreparedExecution(allocatedRunId, requestFingerprint) !== preparation) {
+          this.#throwRunIdConflict(allocatedRunId);
+        }
+        reusedPreparedExecution = true;
+      } else {
+        if (options?.runId !== undefined) {
+          await this.#assertPublicAgentResumePreflight({
+            requestContext: options.requestContext,
+            memory: options.memory,
+            runId: allocatedRunId,
+          });
+          releaseRunIdReservation = await this.#reserveRunId(allocatedRunId);
+        }
+        preparation = await prepareForDurableExecution<TOutput>({
+          agent: this.#wrappedAgent as Agent<string, any, TOutput>,
+          messages,
+          options: options as AgentExecutionOptions<TOutput>,
+          runId: allocatedRunId,
+          requestContext: options?.requestContext,
+          logger: this.logger,
+          mastra: this.#mastra,
+          durableAgentId: this.id,
+          durableAgentName: this.name,
+        });
+        preparation.workflowInput.runtimeResolution = 'registry-required';
+      }
+    } finally {
+      releaseRunIdReservation?.();
+    }
 
+    if (!preparation) throw new Error('Durable execution preparation did not complete.');
     const { runId, messageId, workflowInput, registryEntry, messageList, threadId, resourceId } = preparation;
 
     // 1a. Install the abort controller for this run. The controller is owned
@@ -1095,12 +2406,15 @@ export class DurableAgent<
     registryEntry.abortController = abortController;
     registryEntry.abortSignal = abortController.signal;
 
-    // 2. Register non-serializable state (both local and global registries)
-    if (this.#runRegistry.has(runId)) {
-      throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
+    // 2. Register one exact non-serializable capability in both registries.
+    if (reusedPreparedExecution) {
+      this.#consumePreparedExecution(runId);
+    } else {
+      registryEntry.messageList = messageList;
+      this.#coordinateRegistryCleanup(runId, registryEntry);
+      registerGlobalRunRegistryEntry(runId, registryEntry);
+      this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
     }
-    registerGlobalRunRegistryEntry(runId, { ...registryEntry, messageList });
-    this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
     const runtimeBindingId = registryEntry.runtimeBindingId;
 
     // Track cleanup state to avoid double cleanup
@@ -1270,8 +2584,13 @@ export class DurableAgent<
   async resume(
     runId: string,
     resumeData: unknown,
-    options?: DurableAgentStreamOptions<TOutput>,
+    options?: DurableAgentResumeOptions<TOutput>,
   ): Promise<DurableAgentStreamResult<TOutput>> {
+    resumeData = snapshotAgentExecutionValue(resumeData);
+    options = options
+      ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory', 'versions'])
+      : undefined;
+
     // Delegate to the idle-loop wrapper when `untilIdle` is set. Strip
     // `untilIdle` before passing to the wrapper so the inner agent.resume()
     // call (and subsequent agent.stream([]) continuations) don't recurse.
@@ -1282,7 +2601,7 @@ export class DurableAgent<
         this as unknown as DurableAgent<any, any, TOutput>,
         runId,
         resumeData,
-        { ...rest, maxIdleMs } as DurableAgentStreamOptions<TOutput> & { maxIdleMs?: number },
+        { ...rest, maxIdleMs } as DurableAgentResumeOptions<TOutput> & { maxIdleMs?: number },
         {
           activeStreams: this.#activeStreamUntilIdle,
           bgManager: this.#mastra?.backgroundTaskManager,
@@ -1291,72 +2610,110 @@ export class DurableAgent<
     }
 
     let entry = this.#runRegistry.get(runId);
+    let priorExecution = entry?.workflowExecution;
+    const warmMemoryInfo = entry ? this.#runRegistry.getMemoryInfo(runId) : undefined;
+    const hasFga = Boolean(this.#mastra?.getServer()?.fga);
+    const explicitRequestContext = options?.requestContext;
+    const contextResourceId = explicitRequestContext?.get(MASTRA_RESOURCE_ID_KEY);
+    const contextThreadId = explicitRequestContext?.get(MASTRA_THREAD_ID_KEY);
+    const requestedThread = options?.memory?.thread;
+    const requestedThreadId = typeof requestedThread === 'string' ? requestedThread : requestedThread?.id;
+    if (
+      hasFga &&
+      (typeof contextResourceId !== 'string' ||
+        contextResourceId.trim().length === 0 ||
+        typeof contextThreadId !== 'string' ||
+        contextThreadId.trim().length === 0)
+    ) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_OWNER_UNVERIFIED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" requires verified resource and thread ids before resuming run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (
+      (typeof contextResourceId === 'string' &&
+        options?.memory?.resource &&
+        options.memory.resource !== contextResourceId) ||
+      (typeof contextThreadId === 'string' && requestedThreadId && requestedThreadId !== contextThreadId)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_OWNER_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" from a different thread or resource.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const callerMemory =
+      typeof contextResourceId === 'string' && typeof contextThreadId === 'string'
+        ? { resource: contextResourceId, thread: contextThreadId }
+        : options?.memory;
+    await this.#assertPublicAgentResumePreflight({
+      requestContext: explicitRequestContext,
+      memory: callerMemory,
+      runId,
+    });
+    if (
+      (warmMemoryInfo?.resourceId &&
+        (typeof contextResourceId === 'string' ? contextResourceId : options?.memory?.resource) &&
+        (typeof contextResourceId === 'string' ? contextResourceId : options?.memory?.resource) !==
+          warmMemoryInfo.resourceId) ||
+      (warmMemoryInfo?.threadId &&
+        (typeof contextThreadId === 'string' ? contextThreadId : requestedThreadId) &&
+        (typeof contextThreadId === 'string' ? contextThreadId : requestedThreadId) !== warmMemoryInfo.threadId)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_OWNER_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" cannot resume run "${runId}" from a different thread or resource.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    await this.#assertPublicAgentResumePreflight({
+      requestContext: explicitRequestContext,
+      memory:
+        callerMemory ??
+        (warmMemoryInfo?.threadId && warmMemoryInfo.resourceId
+          ? { thread: warmMemoryInfo.threadId, resource: warmMemoryInfo.resourceId }
+          : undefined),
+      runId,
+      snapshotMemoryInfo: warmMemoryInfo,
+    });
+    if (entry && !this.#activeRegistryPairIsValid(runId, entry)) entry = undefined;
+    if (entry) this.#assertWarmResumeVersionSelectors(runId, entry, options ?? {});
+
     if (!entry) {
-      // A persisted durable run can outlive this process (or the registry TTL).
-      // Rebuild the non-serializable runtime state before resuming the stored
-      // workflow snapshot. Keep warm resumes on the existing path to avoid
-      // racing an active registry entry with a second preparation pass.
-      const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
-      const persisted = await workflowsStore?.getWorkflowRunById({
-        runId,
-        workflowName: DurableStepIds.AGENTIC_LOOP,
-      });
-      if (!persisted) {
-        throw new Error(`No registry entry found for run ${runId}. Cannot resume.`);
-      }
-
-      const snapshot =
-        typeof persisted.snapshot === 'string'
-          ? (JSON.parse(persisted.snapshot) as WorkflowRunState)
-          : persisted.snapshot;
-      if (snapshot?.status !== 'suspended') {
-        throw new Error('This workflow run was not suspended');
-      }
-      const workflowInput = snapshot?.context?.input as DurableAgenticWorkflowInput | undefined;
-      if (!workflowInput || workflowInput.__workflowKind !== 'durable-agent') {
-        throw new MastraError({
-          id: 'DURABLE_AGENT_RESUME_INVALID_SNAPSHOT',
-          domain: ErrorDomain.AGENT,
-          category: ErrorCategory.SYSTEM,
-          text: `DurableAgent "${this.name}" resume(${runId}): persisted snapshot does not contain a durable-agent workflow input.`,
-          details: { agentName: this.name, runId },
-        });
-      }
-      if (workflowInput.agentId !== this.id) {
-        throw new MastraError({
-          id: 'DURABLE_AGENT_RESUME_AGENT_MISMATCH',
-          domain: ErrorDomain.AGENT,
-          category: ErrorCategory.USER,
-          text: `DurableAgent "${this.name}" resume(${runId}): persisted run belongs to agent "${workflowInput.agentId}", not "${this.id}".`,
-          details: { agentName: this.name, runId, ownerAgentId: workflowInput.agentId },
-        });
-      }
-
-      const messageListMemoryInfo = (
-        workflowInput.messageListState as { memoryInfo?: { threadId?: string; resourceId?: string } } | undefined
-      )?.memoryInfo;
-      const threadId = workflowInput.state?.threadId ?? messageListMemoryInfo?.threadId;
-      const resourceId = workflowInput.state?.resourceId ?? messageListMemoryInfo?.resourceId;
-      const requestContext =
-        options?.requestContext ??
-        (workflowInput.requestContextEntries
-          ? new RequestContext(
-              Object.entries(workflowInput.requestContextEntries) as Iterable<readonly [string, unknown]>,
-            )
-          : undefined);
-      const memory = options?.memory ?? (threadId ? { thread: threadId, resource: resourceId } : undefined);
-
-      await this.prepare([], {
-        ...(options as AgentExecutionOptions<TOutput>),
-        runId,
-        requestContext,
-        memory,
-      });
+      await this.#rehydrateSuspendedRunRegistry(runId, options);
       entry = this.#runRegistry.get(runId);
     }
-    if (!entry) {
-      throw new Error(`Failed to rehydrate registry entry for run ${runId}. Cannot resume.`);
+    priorExecution ??= entry?.workflowExecution;
+    if (priorExecution) {
+      await priorExecution.catch(() => {
+        // The prior segment already emits its own error event.
+      });
     }
+    const resolvedResumeLabel = await this.#resolveDurableResumeLabel(runId, options?.toolCallId);
+    if (!entry || !this.#activeRegistryPairIsValid(runId, entry)) {
+      await this.#rehydrateSuspendedRunRegistry(runId, options);
+      entry = this.#runRegistry.get(runId);
+    }
+    if (!entry || !this.#activeRegistryPairIsValid(runId, entry)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_REGISTRY_REHYDRATION_FAILED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.SYSTEM,
+        text: `DurableAgent "${this.name}" could not restore runtime state for run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const runtimeBindingId = entry.runtimeBindingId;
+    const prevalidatedResumeLabel = resolvedResumeLabel.persisted ? resolvedResumeLabel.label : undefined;
+    const memoryInfo = this.#runRegistry.getMemoryInfo(runId);
+    const typedResumeRequestContext = (options?.requestContext ?? entry.requestContext) as RequestContext | undefined;
 
     // Install a fresh abort controller for the resumed segment. The original
     // controller is gone (the stream that owned it has already settled), so
@@ -1382,8 +2739,6 @@ export class DurableAgent<
       globalEntryForAbort.abortSignal = abortController.signal;
     }
 
-    const memoryInfo = this.#runRegistry.getMemoryInfo(runId);
-
     // Track cleanup state to avoid double cleanup
     let cleanedUp = false;
     let autoCleanupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1392,13 +2747,13 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#cleanupBoundRun(runId, entry.runtimeBindingId);
+          this.#cleanupBoundRun(runId, runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
     };
 
-    const globalEntry = getBoundRunRegistryEntry(runId, entry.runtimeBindingId);
+    const globalEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
     const resumeModel = globalEntry?.model as any;
 
     // Skip events already broadcast by the original run (e.g. the SUSPENDED
@@ -1439,7 +2794,7 @@ export class DurableAgent<
 
     // Wait for subscription to be ready, then resume workflow
     const workflow = this.getWorkflow();
-    const requestContext = getBoundRunRegistryEntry(runId, entry.runtimeBindingId)?.requestContext;
+    const requestContext = typedResumeRequestContext;
 
     // Open a fresh AGENT_RUN + MODEL_GENERATION for the resumed segment on the same
     // traceId — the originals were ended as `suspended` and can't be reopened. Post-resume
@@ -1492,42 +2847,42 @@ export class DurableAgent<
       }
     }
 
-    // Capture the prior workflow execution BEFORE creating the new promise.
-    // If we read it inside the `.then()` callback, the global registry will
-    // already point to the NEW promise (assigned synchronously below),
-    // causing a self-referential deadlock.
-    const priorExecution = globalRunRegistry.get(runId)?.workflowExecution;
-
     const workflowExecution = ready
       .then(async () => {
-        // Wait for the prior workflow execution (stream / previous resume) to
-        // fully settle so the snapshot is persisted as 'suspended' before we
-        // attempt to resume it.  Without this, the pubsub tool-call-suspended
-        // event can arrive (and the consumer can call resumeStream) before the
-        // engine has finished writing the snapshot, leading to
-        // "This workflow run was not suspended".
-        if (priorExecution) {
-          await priorExecution.catch(() => {
-            /* errors already handled by the prior segment */
+        if (!entry || !this.#activeRegistryPairIsValid(runId, entry)) {
+          await this.#rehydrateSuspendedRunRegistry(runId, options);
+          entry = this.#runRegistry.get(runId);
+        }
+        const deferredResumeLabel = prevalidatedResumeLabel
+          ? undefined
+          : await this.#resolveDurableResumeLabel(runId, options?.toolCallId);
+        const resumeLabel = prevalidatedResumeLabel ?? deferredResumeLabel?.label;
+        if (!entry || !this.#activeRegistryPairIsValid(runId, entry)) {
+          throw new MastraError({
+            id: 'DURABLE_AGENT_RESUME_REGISTRY_REHYDRATION_FAILED',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.SYSTEM,
+            text: `DurableAgent "${this.name}" lost runtime state before resuming run "${runId}".`,
+            details: { agentName: this.name, runId },
           });
         }
-
-        const run = await workflow.createRun({ runId, pubsub: this.pubsub });
-        const result = await run.resume({
-          resumeData,
-          requestContext,
-          ...createObservabilityContext({ currentSpan: entry.resumeAgentSpan ?? entry.agentSpan }),
-        });
-        if (result?.status === 'failed') {
-          const error = new Error((result as any).error?.message || 'Workflow resume failed');
-          void this.emitError(runId, error);
-        }
-        // Same snapshot cleanup as the initial `start()` path: once resume
-        // settles on any non-suspended terminal status the persisted rows are
-        // no longer needed. A resume that re-suspends must keep them so the
-        // next resume/recover can find the snapshot.
-        if (result?.status && result.status !== 'suspended') {
-          await this.deleteRunSnapshots(runId);
+        const activeEntry = entry;
+        const pinnedEntry = pinGlobalRunRegistryEntry(runId);
+        if (pinnedEntry !== activeEntry) this.#throwRunIdConflict(runId);
+        try {
+          const run = await workflow.createRun({
+            runId,
+            resourceId: memoryInfo?.resourceId,
+            pubsub: this.pubsub,
+          });
+          await run.resume({
+            resumeData,
+            label: resumeLabel,
+            requestContext,
+            ...createObservabilityContext({ currentSpan: activeEntry.resumeAgentSpan ?? activeEntry.agentSpan }),
+          });
+        } finally {
+          unpinGlobalRunRegistryEntry(runId);
         }
       })
       .catch(error => {
@@ -1564,7 +2919,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#cleanupBoundRun(runId, entry.runtimeBindingId);
+        this.#cleanupBoundRun(runId, runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -1694,6 +3049,9 @@ export class DurableAgent<
     const requestContext: RequestContext = workflowInput.requestContextEntries
       ? new RequestContext(Object.entries(workflowInput.requestContextEntries) as Iterable<readonly [string, unknown]>)
       : new RequestContext();
+    if (workflowInput.versions) {
+      requestContext.set(MASTRA_VERSIONS_KEY, structuredClone(workflowInput.versions));
+    }
 
     // 3. Rebuild MessageList from the persisted state. threadId/resourceId
     //    come from the workflow input's `state` block when present; older
@@ -1713,23 +3071,87 @@ export class DurableAgent<
       this.#mastra?.getLogger?.()?.warn?.(`[DurableAgent] recover(${runId}) messageList deserialize skipped: ${err}`);
     }
 
-    // 4. Resolve model/memory from the live agent. Tools are rebuilt by the
-    //    durable step from `toolsMetadata`, so we only need the live agent's
-    //    memory here to enable message persistence at the terminal step.
+    // 4. Rebuild the exact native agent runtime. Registry-required runs cannot
+    // fall back to name-based substitution inside a workflow step.
     const wrapped = this.#wrappedAgent as Agent<string, any, TOutput>;
-    let model;
-    try {
-      model = await wrapped.getModel({ requestContext });
-    } catch (err) {
-      const logger = this.#mastra?.getLogger?.();
-      logger?.warn?.(`[DurableAgent] Failed to resolve model during recover(${runId}): ${err}`);
+    if (workflowInput.options?.toolSurfaceFence !== undefined) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_REPLACEMENT_TOOLS_UNRECOVERABLE',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) cannot reconstruct call-time replacement tool implementations.`,
+        details: { agentName: this.name, runId },
+      });
     }
-    let memory;
-    try {
-      memory = await wrapped.getMemory({ requestContext });
-    } catch (err) {
-      const logger = this.#mastra?.getLogger?.();
-      logger?.warn?.(`[DurableAgent] Failed to resolve memory during recover(${runId}): ${err}`);
+    const [tools, resolvedModel, memory, workspace, modelList] = await Promise.all([
+      wrapped.getToolsForExecution({
+        runId,
+        threadId,
+        resourceId,
+        requestContext,
+        memoryConfig: workflowInput.state?.memoryConfig,
+        autoResumeSuspendedTools: workflowInput.options?.autoResumeSuspendedTools,
+        agentId: this.id,
+        agentName: this.name,
+      }),
+      wrapped.getModel({ requestContext }),
+      wrapped.getMemory({ requestContext }),
+      wrapped.getWorkspace({ requestContext }),
+      wrapped.getModelList(requestContext),
+    ]);
+    if (!isSupportedLanguageModel(resolvedModel)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_UNSUPPORTED_MODEL',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) requires an AI SDK v5+ model.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    const model = resolvedModel;
+    if (stableStringify(serializeToolsMetadata(tools)) !== stableStringify(workflowInput.toolsMetadata)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_TOOL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) resolved a different tool surface.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (stableStringify(serializeModelConfig(model)) !== stableStringify(workflowInput.modelConfig)) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_MODEL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) resolved a different model.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (
+      stableStringify(modelList ? serializeModelList(modelList) : undefined) !==
+      stableStringify(workflowInput.modelList)
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_MODEL_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) resolved a different model list.`,
+        details: { agentName: this.name, runId },
+      });
+    }
+    if (
+      stableStringify({
+        memory: createRuntimeDependencyFingerprint(memory),
+        workspace: createRuntimeDependencyFingerprint(workspace),
+      }) !== stableStringify(workflowInput.runtimeBindings ?? {})
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RECOVER_RUNTIME_BINDING_MISMATCH',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `DurableAgent "${this.name}" recover(${runId}) resolved different runtime services.`,
+        details: { agentName: this.name, runId },
+      });
     }
     const saveQueueManager = memory
       ? new SaveQueueManager({ logger: this.#mastra?.getLogger?.() as any, memory })
@@ -1821,11 +3243,26 @@ export class DurableAgent<
     //    input to reconstruct them, so we only need the fields that the
     //    terminal `.map(...)` step and stream adapter read from the registry:
     //    saveQueueManager + memory + agentSpan + abortController.
-    const registryEntry: any = {
+    const registryEntry: RunRegistryEntry = {
+      runtimeBindingId: workflowInput.runtimeBindingId ?? crypto.randomUUID(),
+      agentId: this.id,
+      threadId,
+      resourceId,
+      tools,
       model,
+      modelList: modelList?.map(entry => ({
+        id: entry.id,
+        model: entry.model,
+        maxRetries: entry.maxRetries ?? 0,
+        enabled: entry.enabled ?? true,
+        headers: entry.headers,
+      })),
       memory,
+      workspace,
       saveQueueManager,
       requestContext,
+      versions: workflowInput.versions ? structuredClone(workflowInput.versions) : undefined,
+      messageList,
       agentSpan: recoverAgentSpan,
       abortController,
       abortSignal: abortController.signal,
@@ -1841,8 +3278,11 @@ export class DurableAgent<
 
     // 7. Register the reconstructed state in both the per-instance and global
     //    registries so the workflow steps + terminal memory flush can find it.
+    this.#coordinateRegistryCleanup(runId, registryEntry);
+    this.#assertNoRegistryCollision(runId);
+    registerGlobalRunRegistryEntry(runId, registryEntry);
     this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
-    globalRunRegistry.set(runId, { ...registryEntry, messageList });
+    const runtimeBindingId = registryEntry.runtimeBindingId;
 
     // 8. Cleanup plumbing (mirrors stream()/resume()).
     let cleanedUp = false;
@@ -1851,9 +3291,7 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#runRegistry.cleanup(runId);
-          globalRunRegistry.delete(runId);
-          this.#clearPubsubTopic(runId);
+          this.#cleanupBoundRun(runId, runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
@@ -1910,12 +3348,6 @@ export class DurableAgent<
           requestContext,
           ...createObservabilityContext({ currentSpan: recoverAgentSpan }),
         } as any);
-        // Snapshot cleanup runs for every non-suspended terminal (success or
-        // failed) so storage stays bounded — mirrors the start()/resume()
-        // contract.
-        if (result?.status && result.status !== 'suspended') {
-          await this.deleteRunSnapshots(runId);
-        }
         if (result?.status === 'failed') {
           const error = new Error((result as any).error?.message || 'Workflow recover failed');
           void this.emitError(runId, error);
@@ -1943,9 +3375,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#runRegistry.cleanup(runId);
-        globalRunRegistry.delete(runId);
-        this.#clearPubsubTopic(runId);
+        this.#cleanupBoundRun(runId, runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -1978,7 +3408,14 @@ export class DurableAgent<
    * Returns just the `MastraModelOutput` (matching the base Agent's return
    * type) while internally delegating to `this.resume()`.
    */
-  override async resumeStream(resumeData: any, streamOptions?: any): Promise<MastraModelOutput<TOutput>> {
+  override async resumeStream<OUTPUT = TOutput>(
+    resumeData: unknown,
+    streamOptions?: AgentExecutionOptionsBase<any> & {
+      structuredOutput?: unknown;
+      toolCallId?: string;
+      model?: unknown;
+    },
+  ): Promise<MastraModelOutput<OUTPUT>> {
     const runId = streamOptions?.runId;
     if (!runId) {
       throw new Error('resumeStream() on DurableAgent requires a runId in streamOptions.');
@@ -1991,7 +3428,7 @@ export class DurableAgent<
       // indefinitely when the resumed turn hits another suspend point.
       [CLOSE_ON_SUSPEND]: true,
     } as Parameters<DurableAgent<TAgentId, TTools, TOutput>['resume']>[2]);
-    return result.output;
+    return result.output as unknown as MastraModelOutput<OUTPUT>;
   }
 
   /**
@@ -2047,18 +3484,38 @@ export class DurableAgent<
     messages: MessageListInput,
     options?: DurableAgentStreamOptions<TOutput>,
   ): Promise<FullOutput<TOutput>> {
-    // 1. Prepare for durable execution (non-durable phase)
-    const preparation = await prepareForDurableExecution<TOutput>({
-      agent: this.#wrappedAgent as Agent<string, any, TOutput>,
-      messages,
-      options: options as AgentExecutionOptions<TOutput>,
-      runId: options?.runId,
-      requestContext: options?.requestContext,
-      mastra: this.#mastra,
-      methodType: 'generate',
-      durableAgentId: this.id,
-      durableAgentName: this.name,
-    });
+    messages = snapshotAgentExecutionValue(messages);
+    options = options
+      ? snapshotAgentExecutionOptions(options, ['runId', 'requestContext', 'memory', 'versions'])
+      : undefined;
+    const allocatedRunId = options?.runId ?? this.#allocateRunId();
+    let releaseRunIdReservation: (() => void) | undefined;
+    let preparation: PreparationResult<TOutput>;
+    try {
+      if (options?.runId !== undefined) {
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: options.requestContext,
+          memory: options.memory,
+          runId: allocatedRunId,
+        });
+        releaseRunIdReservation = await this.#reserveRunId(allocatedRunId);
+      }
+      preparation = await prepareForDurableExecution<TOutput>({
+        agent: this.#wrappedAgent as Agent<string, any, TOutput>,
+        messages,
+        options: options as AgentExecutionOptions<TOutput>,
+        runId: allocatedRunId,
+        requestContext: options?.requestContext,
+        logger: this.logger,
+        mastra: this.#mastra,
+        methodType: 'generate',
+        durableAgentId: this.id,
+        durableAgentName: this.name,
+      });
+      preparation.workflowInput.runtimeResolution = 'registry-required';
+    } finally {
+      releaseRunIdReservation?.();
+    }
 
     const { runId, messageId, workflowInput, registryEntry, messageList, threadId, resourceId } = preparation;
 
@@ -2083,9 +3540,12 @@ export class DurableAgent<
     registryEntry.abortController = abortController;
     registryEntry.abortSignal = abortController.signal;
 
-    // 2. Register non-serializable state (both local and global registries)
+    // 2. Register the same capability object in both registries.
+    registryEntry.messageList = messageList;
+    this.#coordinateRegistryCleanup(runId, registryEntry);
+    registerGlobalRunRegistryEntry(runId, registryEntry);
     this.#runRegistry.registerWithMessageList(runId, registryEntry, messageList, { threadId, resourceId });
-    globalRunRegistry.set(runId, { ...registryEntry, messageList });
+    const runtimeBindingId = registryEntry.runtimeBindingId;
 
     // Track cleanup state to avoid double cleanup
     let cleanedUp = false;
@@ -2096,9 +3556,7 @@ export class DurableAgent<
       if (autoCleanupTimer || cleanedUp || this.#cleanupTimeoutMs === 0) return;
       autoCleanupTimer = setTimeout(() => {
         if (!cleanedUp) {
-          this.#runRegistry.cleanup(runId);
-          globalRunRegistry.delete(runId);
-          this.#clearPubsubTopic(runId);
+          this.#cleanupBoundRun(runId, runtimeBindingId);
           cleanedUp = true;
         }
       }, this.#cleanupTimeoutMs);
@@ -2176,9 +3634,7 @@ export class DurableAgent<
       }
       if (!cleanedUp) {
         streamCleanup();
-        this.#runRegistry.cleanup(runId);
-        globalRunRegistry.delete(runId);
-        this.#clearPubsubTopic(runId);
+        this.#cleanupBoundRun(runId, runtimeBindingId);
         cleanedUp = true;
       }
     };
@@ -2657,44 +4113,80 @@ export class DurableAgent<
   /**
    * Prepare for durable execution without starting it.
    */
-  async prepare(messages: MessageListInput, options?: AgentExecutionOptions<TOutput>) {
-    const allocatedRunId = this.#allocateRunId(options?.runId);
-    const preparation = await prepareForDurableExecution<TOutput>({
-      agent: this.#wrappedAgent as Agent<string, any, TOutput>,
-      messages,
-      options,
-      // Forward the caller-provided runId (mirrors stream()) — #allocateRunId
-      // preserves caller IDs exactly. Without this, prepareForDurableExecution
-      // mints a fresh id, so prepare() registers a different run than requested
-      // and a follow-up resume(runId) — e.g. when rehydrating a persisted,
-      // suspended run in a fresh process — can't find its registry entry.
-      runId: allocatedRunId,
-      requestContext: options?.requestContext,
-      logger: this.logger,
-      mastra: this.#mastra,
-    });
+  async prepare(
+    messages: MessageListInput,
+    options?: AgentExecutionOptions<TOutput>,
+  ): Promise<DurableAgentPreparationResult> {
+    messages = snapshotAgentExecutionValue(messages);
+    options = options
+      ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory', 'versions'])
+      : undefined;
+    let releaseRunIdReservation: (() => void) | undefined;
+    let preparation: PreparationResult<TOutput>;
+    let cleanup = () => {};
+    try {
+      if (options?.runId !== undefined) {
+        validateMaxSteps(options.maxSteps, this.logger);
+        if (options.runId.trim().length === 0) {
+          throw new Error('DurableAgent runId must be a non-empty string.');
+        }
+        await this.#assertPublicAgentResumePreflight({
+          requestContext: options.requestContext,
+          memory: options.memory,
+          runId: options.runId,
+        });
+        releaseRunIdReservation = await this.#reserveRunId(options.runId);
+      }
+      preparation = await prepareForDurableExecution<TOutput>({
+        agent: this.#wrappedAgent as Agent<string, any, TOutput>,
+        durableAgentId: this.id,
+        durableAgentName: this.name,
+        messages,
+        options,
+        runId: options?.runId,
+        requestContext: options?.requestContext,
+        logger: this.logger,
+        mastra: this.#mastra,
+      });
+      preparation.workflowInput.runtimeResolution = 'registry-required';
 
-    if (this.#runRegistry.has(preparation.runId)) {
-      throw new Error(
-        `Durable run ${preparation.runId} is already active. Refusing to replace its runtime dependencies.`,
+      const privatePreparation = this.#createPrivatePreparation(preparation);
+      privatePreparation.registryEntry.messageList = privatePreparation.messageList;
+      this.#coordinateRegistryCleanup(privatePreparation.runId, privatePreparation.registryEntry);
+      this.#preparedExecutions.set(privatePreparation.runId, {
+        requestFingerprint: this.#preparedRequestFingerprint(messages, options),
+        integrityFingerprint: this.#preparedExecutionIntegrityFingerprint(privatePreparation),
+        preparation: privatePreparation,
+      });
+      registerGlobalRunRegistryEntry(privatePreparation.runId, privatePreparation.registryEntry);
+      this.#runRegistry.registerWithMessageList(
+        privatePreparation.runId,
+        privatePreparation.registryEntry,
+        privatePreparation.messageList,
+        {
+          threadId: privatePreparation.threadId,
+          resourceId: privatePreparation.resourceId,
+        },
       );
+      let cleanupRequested = false;
+      cleanup = () => {
+        if (cleanupRequested) return;
+        const current = this.#preparedExecutions.get(privatePreparation.runId);
+        if (current?.preparation !== privatePreparation) return;
+        cleanupRequested = true;
+        privatePreparation.registryEntry.cleanup?.();
+      };
+    } finally {
+      releaseRunIdReservation?.();
     }
-    registerGlobalRunRegistryEntry(preparation.runId, {
-      ...preparation.registryEntry,
-      messageList: preparation.messageList,
-    });
-    this.#runRegistry.registerWithMessageList(preparation.runId, preparation.registryEntry, preparation.messageList, {
-      threadId: preparation.threadId,
-      resourceId: preparation.resourceId,
-    });
 
     return {
       runId: preparation.runId,
       messageId: preparation.messageId,
       workflowInput: preparation.workflowInput,
-      registryEntry: preparation.registryEntry,
       threadId: preparation.threadId,
       resourceId: preparation.resourceId,
+      cleanup,
     };
   }
 

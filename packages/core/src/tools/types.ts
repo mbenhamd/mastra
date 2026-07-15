@@ -416,6 +416,8 @@ export type CoreTool = {
   parameters: FlexibleSchema<any> | Schema;
   outputSchema?: FlexibleSchema<any> | Schema;
   execute?: (params: any, options: MastraToolInvocationOptions) => Promise<any>;
+  /** @internal Stable binding used to reject changed tool implementations during durable recovery. */
+  recoveryFingerprint?: string;
   /**
    * Enables strict tool input generation for providers that support it.
    */

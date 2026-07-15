@@ -147,9 +147,11 @@ describe('DurableAgent tool payload transform', () => {
       transformToolPayload: () => 'x',
     };
 
-    const { workflowInput, registryEntry } = await durableAgent.prepare('hello', {
+    const prepared = await durableAgent.prepare('hello', {
       transform: policy,
     });
+    const { workflowInput } = prepared;
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     // Serializable shadow: only `targets`, never the closure.
     expect(workflowInput.options.transform).toEqual({ targets: ['display'] });
@@ -177,7 +179,9 @@ describe('DurableAgent tool payload transform', () => {
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { workflowInput, registryEntry } = await durableAgent.prepare('hello');
+    const prepared = await durableAgent.prepare('hello');
+    const { workflowInput } = prepared;
+    const registryEntry = durableAgent.runRegistry.get(prepared.runId)!;
 
     expect(workflowInput.options.transform).toBeUndefined();
     expect(registryEntry.toolPayloadTransform).toBeUndefined();

@@ -74,7 +74,7 @@ describe('DurableAgent header handling', () => {
     expect(result.workflowInput.options.modelSettings?.headers).toBeUndefined();
 
     // Registry entry should have the headers
-    expect(result.registryEntry.callTimeHeaders).toEqual({
+    expect(durableAgent.runRegistry.get(result.runId)?.callTimeHeaders).toEqual({
       authorization: 'Bearer secret-token',
       'x-custom': 'custom-value',
     });
@@ -130,7 +130,7 @@ describe('DurableAgent header handling', () => {
       modelSettings: { temperature: 0.5 },
     });
 
-    expect(result.registryEntry.callTimeHeaders).toBeUndefined();
+    expect(durableAgent.runRegistry.get(result.runId)?.callTimeHeaders).toBeUndefined();
   });
 
   it('prepareStep-injected headers merge with callTimeHeaders', async () => {
@@ -194,7 +194,7 @@ describe('DurableAgent header handling', () => {
     });
 
     // Only string values should survive
-    expect(result.registryEntry.callTimeHeaders).toEqual({ valid: 'yes' });
+    expect(durableAgent.runRegistry.get(result.runId)?.callTimeHeaders).toEqual({ valid: 'yes' });
     expect(result.workflowInput.options.modelSettings?.headers).toBeUndefined();
   });
 });

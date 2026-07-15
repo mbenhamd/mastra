@@ -12,6 +12,8 @@
 
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
+import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { defaultNameGenerator, getLLMRecordingsDir, getLLMTestMode } from '@internal/llm-recorder';
 import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -40,6 +42,80 @@ function normalizeDynamicBackgroundFields({ url, body }: { url: string; body: un
   stringifiedBody = stringifiedBody.replaceAll(/msg_[A-Za-z0-9]+/g, 'NORMALIZED_MESSAGE_ID');
 
   return { url, body: JSON.parse(stringifiedBody) };
+}
+
+function createMemoryBackgroundModel(): LanguageModelV2 {
+  let call = 0;
+  const responses = [
+    [
+      { type: 'stream-start' as const, warnings: [] },
+      { type: 'response-metadata' as const, id: 'research-call', modelId: 'mock', timestamp: new Date(0) },
+      {
+        type: 'tool-call' as const,
+        toolCallId: 'call-research',
+        toolName: 'research',
+        input: JSON.stringify({ topic: 'neural networks' }),
+        providerExecuted: false,
+      },
+      {
+        type: 'finish' as const,
+        finishReason: 'tool-calls' as const,
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      },
+    ],
+    [
+      { type: 'stream-start' as const, warnings: [] },
+      { type: 'response-metadata' as const, id: 'research-response', modelId: 'mock', timestamp: new Date(0) },
+      { type: 'text-start' as const, id: 'research-text' },
+      { type: 'text-delta' as const, id: 'research-text', delta: 'Research started.' },
+      { type: 'text-end' as const, id: 'research-text' },
+      {
+        type: 'finish' as const,
+        finishReason: 'stop' as const,
+        usage: { inputTokens: 15, outputTokens: 5, totalTokens: 20 },
+      },
+    ],
+    [
+      { type: 'stream-start' as const, warnings: [] },
+      { type: 'response-metadata' as const, id: 'greet-call', modelId: 'mock', timestamp: new Date(0) },
+      {
+        type: 'tool-call' as const,
+        toolCallId: 'call-greet',
+        toolName: 'greet',
+        input: JSON.stringify({ name: 'Bob' }),
+        providerExecuted: false,
+      },
+      {
+        type: 'finish' as const,
+        finishReason: 'tool-calls' as const,
+        usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 },
+      },
+    ],
+    [
+      { type: 'stream-start' as const, warnings: [] },
+      { type: 'response-metadata' as const, id: 'greet-response', modelId: 'mock', timestamp: new Date(0) },
+      { type: 'text-start' as const, id: 'greet-text' },
+      { type: 'text-delta' as const, id: 'greet-text', delta: 'Hello, Bob!' },
+      { type: 'text-end' as const, id: 'greet-text' },
+      {
+        type: 'finish' as const,
+        finishReason: 'stop' as const,
+        usage: { inputTokens: 25, outputTokens: 5, totalTokens: 30 },
+      },
+    ],
+  ];
+
+  return new MockLanguageModelV2({
+    doStream: async () => {
+      const response = responses[call++];
+      if (!response) throw new Error(`Unexpected memory background model call ${call}.`);
+      return {
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream(response),
+      };
+    },
+  }) as LanguageModelV2;
 }
 
 let mockGateway: any;
@@ -243,7 +319,10 @@ describe('DurableAgent Background Tasks E2E', () => {
         'When asked to research something, use the research tool. ' +
         'When asked to greet someone, use the greet tool. ' +
         'Always respond concisely.',
-      model: 'openai/gpt-4o-mini',
+      // This test exercises cross-turn memory and background-task delivery.
+      // A deterministic model keeps those runtime assertions independent of
+      // fuzzy LLM-recording selection as completion callbacks update memory.
+      model: createMemoryBackgroundModel(),
       tools: { research: researchTool, greet: greetTool },
       memory: mockMemory,
       backgroundTasks: {

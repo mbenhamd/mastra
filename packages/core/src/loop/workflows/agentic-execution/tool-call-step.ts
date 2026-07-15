@@ -1037,7 +1037,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     ...expectedResumeIdentity,
                     type: 'approval',
                     approvalSource: 'tool-execution',
-                    toolCallId: inputData.toolCallId,
+                    toolCallId: metadataToolCallId,
                     toolName: inputData.toolName,
                     args: inputData.args,
                     resumeSchema: JSON.stringify(
@@ -1065,7 +1065,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
               // Add approval metadata to message before persisting
               addToolMetadata({
-                toolCallId: inputData.toolCallId,
+                toolCallId: metadataToolCallId,
                 toolName: inputData.toolName,
                 args: inputData.args,
                 type: 'approval',
@@ -1098,7 +1098,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     approvalSource: 'tool-execution',
                   },
                   requireToolApproval: {
-                    toolCallId: inputData.toolCallId,
+                    toolCallId: metadataToolCallId,
                     toolName: inputData.toolName,
                     args: inputData.args,
                   },
@@ -1114,7 +1114,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   suspendedToolRunId: options.runId,
                 },
                 {
-                  resumeLabel: inputData.toolCallId,
+                  resumeLabel: metadataToolCallId,
                 },
               );
             } else {
@@ -1165,7 +1165,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolCallSuspended: suspendPayload,
                   __streamState: streamState.serialize(),
                   __agentId: agentId,
-                  toolCallId: inputData.toolCallId,
+                  toolCallId: metadataToolCallId,
                   toolName: inputData.toolName,
                   resumeLabel: options?.resumeLabel,
                 },

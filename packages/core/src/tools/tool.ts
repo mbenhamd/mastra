@@ -4,6 +4,7 @@ import { RequestContext } from '../request-context';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
 import type { SuspendOptions } from '../workflows';
+import { createToolRecoveryFingerprint, normalizeToolRecoverySchemaIdentity } from './recovery-fingerprint';
 import type {
   McpMetadata,
   MCPToolProperties,
@@ -89,6 +90,9 @@ export class Tool<
 > implements ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext> {
   /** Unique identifier for the tool */
   id: TId;
+
+  /** @internal Binding to the original implementation used by durable cold recovery. */
+  recoveryFingerprint: string;
 
   /** Description of what the tool does */
   description: string;
@@ -276,6 +280,31 @@ export class Tool<
   constructor(opts: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
+    this.recoveryFingerprint = createToolRecoveryFingerprint({
+      id: opts.id,
+      description: opts.description,
+      schemas: {
+        input: normalizeToolRecoverySchemaIdentity(opts.inputSchema),
+        output: normalizeToolRecoverySchemaIdentity(opts.outputSchema),
+        suspend: normalizeToolRecoverySchemaIdentity(opts.suspendSchema),
+        resume: normalizeToolRecoverySchemaIdentity(opts.resumeSchema),
+        requestContext: normalizeToolRecoverySchemaIdentity(opts.requestContextSchema),
+      },
+      execute: opts.execute,
+      requireApproval: opts.requireApproval,
+      strict: opts.strict,
+      providerOptions: opts.providerOptions,
+      toModelOutput: opts.toModelOutput,
+      transform: opts.transform,
+      inputExamples: opts.inputExamples,
+      mcp: opts.mcp,
+      mcpMetadata: opts.mcpMetadata,
+      background: opts.background,
+      onInputStart: opts.onInputStart,
+      onInputDelta: opts.onInputDelta,
+      onInputAvailable: opts.onInputAvailable,
+      onOutput: opts.onOutput,
+    });
     this.description = opts.description;
     this.inputSchema = opts.inputSchema ? toStandardSchema(opts.inputSchema) : undefined;
     this.outputSchema = opts.outputSchema ? toStandardSchema(opts.outputSchema) : undefined;

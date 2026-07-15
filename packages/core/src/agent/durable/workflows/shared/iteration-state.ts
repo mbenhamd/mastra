@@ -81,10 +81,15 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
   const stepRecord = buildStepRecord(executionOutput);
 
   return {
+    __workflowKind: currentState.__workflowKind,
     runId: currentState.runId,
     runtimeBindingId: currentState.runtimeBindingId,
     agentId: currentState.agentId,
     agentName: currentState.agentName,
+    versions: currentState.versions,
+    hasProcessors: currentState.hasProcessors,
+    runtimeBindings: currentState.runtimeBindings,
+    runtimeResolution: currentState.runtimeResolution,
     messageListState: executionOutput.messageListState,
     toolsMetadata: currentState.toolsMetadata,
     modelConfig: currentState.modelConfig,
