@@ -70,7 +70,7 @@ import { Memory } from '@mastra/memory'
 import { LibSQLStore } from '@mastra/libsql'
 
 const memory = new Memory({
-  storage: new LibSQLStore({ url: 'file:./collab.db' }),
+  storage: new LibSQLStore({ id: 'collab-storage', url: 'file:./collab.db' }),
   options: {
     lastMessages: 20,
   },
@@ -140,7 +140,7 @@ import { Memory } from '@mastra/memory'
 import { LibSQLStore } from '@mastra/libsql'
 
 const memory = new Memory({
-  storage: new LibSQLStore({ url: 'file:./collab.db' }),
+  storage: new LibSQLStore({ id: 'collab-storage', url: 'file:./collab.db' }),
   options: {
     lastMessages: 20,
   },
@@ -160,7 +160,7 @@ import { Memory } from '@mastra/memory'
 import { LibSQLStore } from '@mastra/libsql'
 
 const memory = new Memory({
-  storage: new LibSQLStore({ url: 'file:./collab.db' }),
+  storage: new LibSQLStore({ id: 'collab-storage', url: 'file:./collab.db' }),
   options: {
     lastMessages: 20,
     observationalMemory: true,
@@ -187,7 +187,7 @@ import { Memory } from '@mastra/memory'
 import { LibSQLStore } from '@mastra/libsql'
 
 const memory = new Memory({
-  storage: new LibSQLStore({ url: 'file:./collab.db' }),
+  storage: new LibSQLStore({ id: 'collab-storage', url: 'file:./collab.db' }),
   options: {
     lastMessages: 20,
     workingMemory: {
