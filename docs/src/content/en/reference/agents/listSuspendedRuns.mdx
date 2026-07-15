@@ -211,11 +211,11 @@ The built-in durable runtime keeps validated tool, model, memory, workspace, pro
 
 When function-level authorization (FGA) is configured, pass an authenticated `requestContext`. Discovery requires a non-empty reserved resource ID, rejects conflicting resource or thread filters, validates the agent request context, and checks `AGENTS_EXECUTE` before scanning workflow storage. Durable resume requires non-empty reserved resource and thread IDs and preflights the restored owner before dependency resolution. Standard resume snapshots supported caller-owned inputs before awaiting authorization or storage, rejects any persisted status other than `suspended`, and rechecks execution authorization against the verified owner immediately before execution. An agent `requestContextSchema` is always validated before discovery, including when FGA isn't configured.
 
-Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable; monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/memory/storage). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
+Only suspended runs are returned. Terminal durable snapshot cleanup is best-effort: Mastra retries transient deletion failures and then attempts to write a terminal tombstone. If storage rejects both deletion and tombstoning, a stale suspended row can remain discoverable; monitor the emitted warning and reconcile storage before accepting another decision for that run. Suspended runs survive restarts only when the Mastra instance has a persistent [storage provider](/docs/storage/overview). Calling this method without configured workflow storage throws `AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE`.
 
 This core method doesn't add an HTTP server route or client SDK method. It also doesn't atomically claim a suspended checkpoint across workers, and `(runId, toolCallId)` isn't a one-time approval token. Until an application adds a storage-backed claim/lease and checkpoint token, route approvals through a single serialized consumer that authenticates the caller and supplies verified resource and thread IDs.
 
 ## Related
 
 - [Agent approval](/docs/agents/agent-approval)
-- [Storage](/docs/memory/storage)
+- [Storage](/docs/storage/overview)

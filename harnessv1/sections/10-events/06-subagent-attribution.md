@@ -5,18 +5,18 @@ subagent's. This keeps a single live event stream as the source of truth for
 everything the user sees during a turn. Each `subagent_*` event carries:
 
 - `toolCallId` — the parent's tool-call ID that spawned the subagent. Stable for
-the subagent's lifetime; pair `subagent_start`/`subagent_end` on this after
-`subagent_start` exists.
+  the subagent's lifetime; pair `subagent_start`/`subagent_end` on this after
+  `subagent_start` exists.
 - `subagentSessionId` — the **child session's ID**. The subagent runs on its own
-persisted `SessionRecord` (§5.6); this field exposes that ID on every subagent
-event so a UI can address the child session directly without a round-trip to
-look it up. Stable for the subagent's lifetime.
-- `parentId` — the parent's tool-call ID *one level up* in the chain.
-`undefined` for a top-level subagent (parent is the user turn, not another
-subagent). Used to reconstruct the tree when subagents nest.
+  persisted `SessionRecord` (§5.6); this field exposes that ID on every subagent
+  event so a UI can address the child session directly without a round-trip to
+  look it up. Stable for the subagent's lifetime.
+- `parentId` — the parent's tool-call ID _one level up_ in the chain.
+  `undefined` for a top-level subagent (parent is the user turn, not another
+  subagent). Used to reconstruct the tree when subagents nest.
 - `depth` — `1` for a top-level subagent, `2` for a subagent of a subagent, and
-otherwise the actual persisted `parentSessionId`-chain depth. New descendant
-creation is capped by `sessions.maxSubagentDepth` (§8).
+  otherwise the actual persisted `parentSessionId`-chain depth. New descendant
+  creation is capped by `sessions.maxSubagentDepth` (§8).
 
 When the built-in `subagent` tool call is rejected before creating a child
 session — for example because the §8 depth cap is exceeded — no
@@ -34,16 +34,16 @@ information. They surface on the **parent** session's subscriber with:
 
 - `source: 'subagent'`
 - `subagentToolCallId: <parent-side tool-call>` — the same handle as
-`toolCallId` on the corresponding `subagent_start`. Used by the UI to associate
-the prompt with the right subagent card.
+  `toolCallId` on the corresponding `subagent_start`. Used by the UI to associate
+  the prompt with the right subagent card.
 - `subagentSessionId: <child session ID>` — the session that actually owns the
-pending item. **The client MUST post the response to this session's inbox**, not
-the parent's (§13.2). The pending approval / suspension / question / plan record
-lives on the child session's `SessionRecord`; the parent session has no record
-of it and does not know how to resume it.
+  pending item. **The client MUST post the response to this session's inbox**, not
+  the parent's (§13.2). The pending approval / suspension / question / plan record
+  lives on the child session's `SessionRecord`; the parent session has no record
+  of it and does not know how to resume it.
 - `itemId: <pending item ID>` — the inbox route/action key. It may equal the
-tool call ID in v1, but clients should route by `itemId` so future pending-item
-IDs can diverge.
+  tool call ID in v1, but clients should route by `itemId` so future pending-item
+  IDs can diverge.
 
 If a client misses the parent SSE events that carried `subagentSessionId` (for
 example after replay-buffer overflow), it can recover the active descendant

@@ -41,6 +41,19 @@ export function getPackageManager(): PackageManager {
   return 'npm'; // Default fallback
 }
 
+/**
+ * Wrap an async commander action so failures print a clean error message
+ * (never a stack trace) and exit non-zero.
+ */
+export function wrapAction(fn: (...args: any[]) => Promise<void>): (...args: any[]) => void {
+  return (...args: any[]) => {
+    fn(...args).catch((err: Error) => {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    });
+  };
+}
+
 export function parseMcp(value: string) {
   if (!isValidEditor(value)) {
     throw new InvalidArgumentError(`Choose a valid value: ${EDITOR.join(', ')}`);
@@ -54,6 +67,14 @@ export function parseSkills(value: string) {
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+export function parseTimeout(value: string): number {
+  const timeout = Number(value);
+  if (value.trim() === '' || !Number.isSafeInteger(timeout) || timeout < 0) {
+    throw new InvalidArgumentError('Timeout must be a non-negative integer in milliseconds');
+  }
+  return timeout;
 }
 
 export function parseComponents(value: string) {

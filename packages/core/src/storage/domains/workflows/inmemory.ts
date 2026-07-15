@@ -1426,7 +1426,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     }
     const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
     if (ownership.status === 'ownership_conflict') return ownership;
-    if ((ownership.status === 'already_bound') !== Boolean(existingRecovery)) {
+    if (ownership.status === 'bound' && existingRecovery) {
       return { status: 'ancestry_conflict' };
     }
     if (ownership.status === 'already_bound' && existingRecovery) {
@@ -1438,11 +1438,22 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         childSnapshotState,
       };
     }
+    // A transient nested run can become durable only when it suspends. Its
+    // parent owner was bound at initial dispatch, while the child snapshot and
+    // recovery ancestry did not exist yet. Promote that matching owner once a
+    // retained (or atomically initialized) child snapshot proves the run; do
+    // not treat the expected transient -> durable transition as an ancestry
+    // conflict.
+    if (ownership.status === 'already_bound' && !existingChildSnapshot && !initialChildSnapshot) {
+      return { status: 'ancestry_conflict' };
+    }
     const storedSnapshot = cloneRunData(ownership.snapshot);
     const storedRecovery = copyWorkflowTerminalRecoveryAncestryRecord(recovery);
     this.db.workflowTerminalRecoveryAncestries.set(childKey, storedRecovery);
-    this.db.workflows.set(parentKey, { ...run, snapshot: storedSnapshot, updatedAt: new Date() });
-    this.bumpParentRevision(parentKey);
+    if (ownership.status === 'bound') {
+      this.db.workflows.set(parentKey, { ...run, snapshot: storedSnapshot, updatedAt: new Date() });
+      this.bumpParentRevision(parentKey);
+    }
     const childSnapshotState = ensureInitialChildSnapshot();
     return {
       status: 'admitted',

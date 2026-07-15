@@ -276,9 +276,10 @@ describe('§S4.2 — unserializable event becomes a sentinel AT THE EXACT live s
       // custom-event JSON validation), so it fails at the persistence snapshot.
       const circular: Record<string, unknown> = {};
       circular.self = circular;
-      const badEvent = (
-        session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } }
-      )._emitter.emit({ type: 'badns.bad', payload: circular });
+      const badEvent = (session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } })._emitter.emit({
+        type: 'badns.bad',
+        payload: circular,
+      });
       const badSeq = parseHarnessEventId(badEvent.id).sequence;
 
       await session.setState({ a: 2 }); // good event #2 — must still persist after the sentinel
@@ -438,9 +439,9 @@ describe('listEventsAfter — boundary hostility', () => {
       await expect(session.listEventsAfter({ epoch: '', afterSequence: 0, limit: 1 })).rejects.toBeInstanceOf(
         HarnessValidationError,
       );
-      await expect(
-        session.listEventsAfter({ epoch: state.epoch, afterSequence: -1, limit: 1 }),
-      ).rejects.toBeInstanceOf(HarnessValidationError);
+      await expect(session.listEventsAfter({ epoch: state.epoch, afterSequence: -1, limit: 1 })).rejects.toBeInstanceOf(
+        HarnessValidationError,
+      );
       await expect(
         session.listEventsAfter({ epoch: state.epoch, afterSequence: 1.5, limit: 1 }),
       ).rejects.toBeInstanceOf(HarnessValidationError);
@@ -571,9 +572,9 @@ describe('getActivityTimeline — cursor forgery rejects BEFORE any message read
     const { harness, session, memory } = await seeded();
     try {
       const readSpy = vi.spyOn(memory, 'listMessages');
-      await expect(
-        session.getActivityTimeline({ cursor: 'not-base64-json!!!', limit: 1 }),
-      ).rejects.toBeInstanceOf(HarnessValidationError);
+      await expect(session.getActivityTimeline({ cursor: 'not-base64-json!!!', limit: 1 })).rejects.toBeInstanceOf(
+        HarnessValidationError,
+      );
       expect(readSpy).not.toHaveBeenCalled();
     } finally {
       await harness.shutdown();
@@ -626,7 +627,7 @@ describe('getActivityTimeline — cursor forgery rejects BEFORE any message read
       // The next page must contain ONLY entries strictly after the cursor key — the
       // back-dated message (occurredAt < cursorO) must NOT resurface.
       const secondPage = await session.getActivityTimeline({ cursor: firstPage.nextCursor, limit: 10 });
-      expect(secondPage.entries.every(e => e.occurredAt > cursorO || (e.occurredAt === cursorO))).toBe(true);
+      expect(secondPage.entries.every(e => e.occurredAt > cursorO || e.occurredAt === cursorO)).toBe(true);
       expect(secondPage.entries.some(e => e.entryId.includes('skew'))).toBe(false);
       // No overlap with the first page either.
       const firstIds = new Set(firstPage.entries.map(e => e.entryId));
@@ -747,9 +748,10 @@ describe('custom event payload bomb — cap applied + ledger contiguity', () => 
       await session.setState({ before: true });
 
       const big = 'x'.repeat(3_000_000); // ~3 MB, far over the 64-byte cap.
-      const bomb = (
-        session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } }
-      )._emitter.emit({ type: 'custom.bomb', payload: { blob: big } });
+      const bomb = (session as unknown as { _emitter: { emit(e: unknown): HarnessEvent } })._emitter.emit({
+        type: 'custom.bomb',
+        payload: { blob: big },
+      });
       const bombSeq = parseHarnessEventId(bomb.id).sequence;
 
       // The LIVE emitted event is already capped (live === replay by construction).

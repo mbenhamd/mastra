@@ -166,9 +166,7 @@ describe('Hono adapter — per-route skipBodyParse + bodyLimit decoupling (§14.
   it('rejects an oversized body with 413 BEFORE buffering, from route.maxBodySize, with NO global bodyLimitOptions', async () => {
     const captured: { value?: CapturedRequest } = {};
     const maxBodySize = 1024; // 1 KiB cap for the test route
-    const app = await setupAdapter([
-      makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize }),
-    ]);
+    const app = await setupAdapter([makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize })]);
 
     const oversized = 'x'.repeat(maxBodySize + 1);
     const response = await app.request(
@@ -190,9 +188,7 @@ describe('Hono adapter — per-route skipBodyParse + bodyLimit decoupling (§14.
   it('allows an under-cap body through the per-route bodyLimit (no false 413)', async () => {
     const captured: { value?: CapturedRequest } = {};
     const maxBodySize = 1024;
-    const app = await setupAdapter([
-      makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize }),
-    ]);
+    const app = await setupAdapter([makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize })]);
 
     const body = JSON.stringify({ small: true });
     const response = await app.request(
@@ -219,9 +215,7 @@ describe('Hono adapter — per-route skipBodyParse + bodyLimit decoupling (§14.
     // skip drains ALL chunks via the context-middleware parse first.
     const captured: { value?: CapturedRequest } = {};
     const maxBodySize = 1024; // 1 KiB cap
-    const app = await setupAdapter([
-      makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize }),
-    ]);
+    const app = await setupAdapter([makeRecorderRoute('/webhook', captured, { skipBodyParse: true, maxBodySize })]);
 
     const numChunks = 100;
     const chunkSize = 512; // 51200 bytes total, far over the 1 KiB cap

@@ -35,7 +35,13 @@ export type WorkspaceNotice =
       providerId?: string;
       status: 'initializing' | 'ready' | 'destroying' | 'destroyed' | 'lost' | 'error';
     }
-  | { kind: 'error'; sessionId?: string; resourceId?: string; providerId?: string; error: { name: string; message: string } };
+  | {
+      kind: 'error';
+      sessionId?: string;
+      resourceId?: string;
+      providerId?: string;
+      error: { name: string; message: string };
+    };
 
 // ---------------------------------------------------------------------------
 // Internal entry shapes.

@@ -7,6 +7,8 @@ import type { RequestContext } from '../../../request-context';
 import { createStep } from '../../../workflows/workflow';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
 import type { AgentMethodType } from '../../types';
+import type { PrepareStreamRunScope } from './run-scope';
+import { CONVERTED_TOOLS_KEY } from './run-scope-keys';
 import type { AgentCapabilities } from './schema';
 import { prepareToolsStepOutputSchema } from './schema';
 
@@ -20,7 +22,9 @@ interface PrepareToolsStepOptions<OUTPUT = undefined> {
   agentSpan?: Span<SpanType.AGENT_RUN>;
   methodType: AgentMethodType;
   memory?: MastraMemory;
+  isResume?: boolean;
   backgroundTaskEnabled?: boolean;
+  runScope: PrepareStreamRunScope<OUTPUT>;
 }
 
 export function createPrepareToolsStep<OUTPUT = undefined>({
@@ -33,7 +37,9 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
   agentSpan,
   methodType,
   memory: _memory,
+  isResume,
   backgroundTaskEnabled,
+  runScope,
 }: PrepareToolsStepOptions<OUTPUT>) {
   return createStep({
     id: 'prepare-tools-step',
@@ -44,6 +50,7 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
 
       const convertedTools = await capabilities.convertTools({
         toolsets: options?.toolsets,
+        toolsetsMode: options?.toolsetsMode,
         clientTools: options?.clientTools,
         threadId,
         resourceId,
@@ -58,6 +65,9 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         pubsub: options._pubsub,
         backgroundTaskEnabled,
         inputProcessors: options.inputProcessors,
+        hooks: options.hooks,
+        isResume,
+        toolSurfaceFenceOwnerId: options._toolSurfaceFenceOwnerId,
       });
 
       // Update the agent span with available tool names for observability
@@ -70,9 +80,10 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         });
       }
 
-      return {
-        convertedTools,
-      };
+      // Tool records contain `execute` functions and are not JSON-serializable.
+      // Park them on the factory closure's runScope; map-results-step reads them.
+      runScope.set(CONVERTED_TOOLS_KEY, convertedTools);
+      return {};
     },
   });
 }

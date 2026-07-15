@@ -342,7 +342,7 @@ describe('Session goal — continuation wording (TUI parity)', () => {
     });
     const events = record(session, ['queue_full_dropped']);
 
-    const goal = await session.setGoal({ objective: 'ship the thing' });
+    const _goal = await session.setGoal({ objective: 'ship the thing' });
 
     expect(session.getRecord().pendingQueue).toEqual([
       expect.objectContaining({ id: existing.queuedItemId, admissionId: 'goal-full-existing' }),

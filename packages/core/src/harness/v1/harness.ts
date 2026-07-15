@@ -1228,6 +1228,9 @@ export class Harness {
           `cannot set both "tools" and "additionalTools" — choose replace OR augment`,
         );
       }
+      if (mode.harnessBuiltins !== undefined && !['include', 'exclude'].includes(mode.harnessBuiltins)) {
+        throw new HarnessConfigError(`modes[${mode.id}].harnessBuiltins`, 'must be either "include" or "exclude"');
+      }
       if (mode.permissions !== undefined) {
         const { permissions } = mode;
         const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -5328,6 +5331,9 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      if (eventPersistenceError.error instanceof HarnessStorageError) {
+        throw eventPersistenceError.error;
+      }
       throw new HarnessStorageError({
         operation: 'session_save',
         sessionId: eventPersistenceError.sessionId,
@@ -5362,6 +5368,9 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      if (eventPersistenceError.error instanceof HarnessStorageError) {
+        throw eventPersistenceError.error;
+      }
       throw new HarnessStorageError({
         operation: 'session_save',
         sessionId: eventPersistenceError.sessionId,

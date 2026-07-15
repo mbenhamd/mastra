@@ -73,9 +73,10 @@ External work enters through the harness and is written as the owning durable ro
   <path d="M 530 220 L 705 210" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-inbound)"/>
   <path d="M 530 240 C 605 240, 655 310, 705 310" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-inbound)"/>
 
-  <text x="617" y="205" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">record</text>
+<text x="617" y="205" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">record</text>
 
-  <text x="450" y="408" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.2 — Inbound: ingress to durable record</text>
+<text x="450" y="408" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.2 — Inbound: ingress to durable record</text>
 </svg>
+
 <figcaption>The three primary ingress source kinds and the durable rows they own; §3 owns admission, §5 owns persistence and crash-recovery, §14.1 owns channel binding mechanics.</figcaption>
 </figure>

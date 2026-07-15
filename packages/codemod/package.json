@@ -1,7 +1,7 @@
 {
   "name": "@mastra/codemod",
   "type": "module",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "license": "Apache-2.0",
   "description": "Codemod CLI for Mastra",
   "bin": {
@@ -27,10 +27,12 @@
     "codemod"
   ],
   "dependencies": {
-    "@clack/prompts": "^1.1.0",
+    "@clack/prompts": "^1.7.0",
     "commander": "^14.0.3",
     "debug": "^4.4.3",
-    "jscodeshift": "^17.3.0"
+    "execa": "^9.6.1",
+    "jscodeshift": "^17.3.0",
+    "signal-exit": "^4.1.0"
   },
   "devDependencies": {
     "@commander-js/extra-typings": "^14.0.0",

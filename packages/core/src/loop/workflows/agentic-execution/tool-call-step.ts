@@ -30,8 +30,26 @@ import type { MastraToolInvocationOptions, RequireToolApproval } from '../../../
 import { ensureSerializable } from '../../../utils';
 import type { SuspendOptions } from '../../../workflows/step';
 import { createStep } from '../../../workflows/workflow';
+import type { RunScopeContext } from '../../run-scope-access';
+import { readScoped, writeScoped } from '../../run-scope-access';
+import {
+  AGENT_BACKGROUND_CONFIG_KEY,
+  BACKGROUND_TASK_MANAGER_CONFIG_KEY,
+  BACKGROUND_TASK_MANAGER_KEY,
+  GENERATE_ID_KEY,
+  MEMORY_CONFIG_KEY,
+  MEMORY_KEY,
+  RESOURCE_ID_KEY,
+  SAVE_QUEUE_MANAGER_KEY,
+  STEP_ACTIVE_TOOLS_KEY,
+  STEP_TOOLS_KEY,
+  STEP_WORKSPACE_KEY,
+  THREAD_EXISTS_KEY,
+  THREAD_ID_KEY,
+  TOOL_PAYLOAD_TRANSFORM_KEY,
+} from '../../run-scope-keys';
 import type { OuterLLMRun } from '../../types';
-import { ToolNotFoundError } from '../errors';
+import { serializeToolError, ToolNotFoundError } from '../errors';
 import { toolCallInputSchema, toolCallOutputSchema } from '../schema';
 import { notifyToolDenied } from './tool-permission-notify';
 
@@ -109,23 +127,28 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   logger,
   agentId,
   mastra,
+  requireToolApproval: requireToolApprovalFromFactory,
+  actor,
 }: OuterLLMRun<Tools, OUTPUT>) {
   return createStep({
     id: 'toolCallStep',
     inputSchema: toolCallInputSchema,
     outputSchema: toolCallOutputSchema,
     execute: async ({ inputData, suspend, resumeData: workflowResumeData, suspendData, requestContext }) => {
-      // Use tools from _internal.stepTools if available (set by llmExecutionStep via prepareStep/processInputStep)
-      // This avoids serialization issues - _internal is a mutable object that preserves execute functions
-      // Fall back to the original tools from the closure if not set
-      const stepTools = (_internal?.stepTools as Tools) || tools;
-      const stepActiveTools = _internal?.stepActiveTools;
+      // Resolve run-scoped state from either the Mastra-managed RunScope (production
+      // path via loop.ts hydration) or the legacy `_internal` bag (tests).
+      const scopeCtx: RunScopeContext = { mastra, runId, _internal };
+      // Use tools from the scope (set by llmExecutionStep via prepareStep/processInputStep)
+      // when available. This avoids serialization — execute functions live off-the-wire.
+      // Fall back to the original tools from the closure if not set.
+      const stepTools = (readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as Tools | undefined) || tools;
+      const stepActiveTools = readScoped(scopeCtx, STEP_ACTIVE_TOOLS_KEY, 'stepActiveTools');
       const tool =
         stepTools?.[inputData.toolName] ||
         findProviderToolByName(stepTools, inputData.toolName) ||
         Object.values(stepTools || {})?.find((t: any) => `id` in t && t.id === inputData.toolName);
       const transformSource = {
-        policy: _internal?.toolPayloadTransform,
+        policy: readScoped(scopeCtx, TOOL_PAYLOAD_TRANSFORM_KEY, 'toolPayloadTransform'),
         toolTransform: (tool as { transform?: unknown } | undefined)?.transform as any,
       };
       const transformChunk = async (
@@ -285,6 +308,28 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
       const removeToolMetadata = async (toolCallId: string, toolName: string, type: 'suspension' | 'approval') => {
         const { saveQueueManager, memoryConfig, threadId } = _internal || {};
 
+        if (!saveQueueManager || !threadId) {
+          return;
+        }
+
+        // Maps are keyed by toolCallId. Resolve this call's key in order: exact toolCallId (key,
+        // then entry value), then toolName (entry value, then legacy toolName key). The toolName
+        // match covers autoResumeSuspendedTools, where resume runs in a fresh turn so the resumed
+        // toolCallId differs from the suspended one, plus pre-upgrade metadata keyed by toolName.
+        const resolveEntryKey = (entries: Record<string, any> | undefined): string | undefined => {
+          if (!entries) return undefined;
+          if (entries[toolCallId]) return toolCallId;
+          const byCallId = Object.keys(entries).find(key => entries[key]?.toolCallId === toolCallId);
+          if (byCallId) return byCallId;
+          const byName = Object.keys(entries).find(key => entries[key]?.toolName === toolName);
+          if (byName) return byName;
+          return entries[toolName] ? toolName : undefined;
+        };
+
+        // Match this call's data part. Prefer toolCallId; otherwise fall back to toolName so the
+        // autoResume (fresh-turn) and legacy paths still resolve.
+        const partMatches = (data: any): boolean => data?.toolCallId === toolCallId || data?.toolName === toolName;
+
         const getMetadata = (message: MastraDBMessage) => {
           const content = message.content;
           if (!content) return undefined;
@@ -303,15 +348,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const lastAssistantMessage = [...allMessages].reverse().find(msg => {
           const metadata = getMetadata(msg);
           const suspendedTools = metadata?.[metadataKey] as Record<string, any> | undefined;
-          const foundTool = Boolean(suspendedTools && Object.hasOwn(suspendedTools, toolCallId));
-          if (foundTool) {
+          if (resolveEntryKey(suspendedTools)) {
             return true;
           }
           const dataToolSuspendedParts = msg.content.parts?.filter(
             part => part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval',
           );
           if (dataToolSuspendedParts && dataToolSuspendedParts.length > 0) {
-            const foundTool = dataToolSuspendedParts.find((part: any) => part.data.toolCallId === toolCallId);
+            const foundTool = dataToolSuspendedParts.find((part: any) => partMatches(part.data));
             if (foundTool) {
               return true;
             }
@@ -328,7 +372,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               ?.reduce(
                 (acc, part) => {
                   if (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') {
-                    acc[(part.data as any).toolCallId] = part.data;
+                    const data = part.data as any;
+                    acc[data.toolCallId ?? data.toolName] = data;
                   }
                   return acc;
                 },
@@ -338,11 +383,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
           if (suspendedTools && typeof suspendedTools === 'object') {
             if (metadata) {
-              delete suspendedTools[toolCallId];
+              const entryKey = resolveEntryKey(suspendedTools);
+              if (entryKey) {
+                delete suspendedTools[entryKey];
+              }
             } else {
               lastAssistantMessage.content.parts = lastAssistantMessage.content.parts?.map(part => {
                 if (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') {
-                  if ((part.data as any).toolCallId === toolCallId) {
+                  if (partMatches(part.data)) {
                     return {
                       ...part,
                       data: {
@@ -375,7 +423,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
       // Helper function to flush messages before suspension
       const flushMessagesBeforeSuspension = async () => {
-        const { saveQueueManager, memoryConfig, threadId, resourceId, memory } = _internal || {};
+        const saveQueueManager = readScoped(scopeCtx, SAVE_QUEUE_MANAGER_KEY, 'saveQueueManager');
+        const memoryConfig = readScoped(scopeCtx, MEMORY_CONFIG_KEY, 'memoryConfig');
+        const threadId = readScoped(scopeCtx, THREAD_ID_KEY, 'threadId');
+        const resourceId = readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId');
+        const memory = readScoped(scopeCtx, MEMORY_KEY, 'memory');
 
         if (!saveQueueManager || !threadId) {
           return;
@@ -383,7 +435,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         try {
           // Ensure thread exists before flushing messages
-          if (memory && !_internal.threadExists && resourceId) {
+          const threadExists = readScoped(scopeCtx, THREAD_EXISTS_KEY, 'threadExists');
+          if (memory && !threadExists && resourceId) {
             const thread = await memory.getThreadById?.({ threadId });
             if (!thread) {
               // Thread doesn't exist yet, create it now
@@ -393,7 +446,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 memoryConfig,
               });
             }
-            _internal.threadExists = true;
+            writeScoped(scopeCtx, THREAD_EXISTS_KEY, 'threadExists', true);
           }
 
           // Flush all pending messages immediately
@@ -421,8 +474,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const availableToolsStr =
           availableToolNames.length > 0 ? ` Available tools: ${availableToolNames.join(', ')}` : '';
         return {
-          error: new ToolNotFoundError(
-            `Tool "${inputData.toolName}" not found.${availableToolsStr}. Call tools by their exact name only — never add prefixes, namespaces, or colons.`,
+          // The workflow step output crosses the evented engine's pubsub boundary, where
+          // `JSON.stringify` reduces Error instances to `{}`. Serialize to a plain object
+          // here so `name`/`message`/`stack` survive and the consumer can reify the Error.
+          error: serializeToolError(
+            new ToolNotFoundError(
+              `Tool "${inputData.toolName}" not found.${availableToolsStr}. Call tools by their exact name only — never add prefixes, namespaces, or colons.`,
+            ),
           ),
           ...inputData,
         };
@@ -449,7 +507,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
       let resumeTargetToolCallId: string | undefined;
 
       try {
-        const requireToolApproval = requestContext.get('__mastra_requireToolApproval');
+        // The factory closure value is authoritative when set: a function-valued policy
+        // doesn't survive `RequestContext.toJSON()` across the evented engine's event bus,
+        // so reading only from requestContext would lose it. Fall back to requestContext for
+        // direct callers (e.g. legacy tests) that seed the value there.
+        const requireToolApproval =
+          requireToolApprovalFromFactory ?? requestContext.get('__mastra_requireToolApproval');
 
         let resumeDataFromArgs: any = undefined;
         let args: any = inputData.args;
@@ -460,16 +523,16 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           resumeDataFromArgs = resumeDataFromInput;
         }
 
-        const resumeData = resumeDataFromArgs !== undefined ? resumeDataFromArgs : workflowResumeData;
+        let resumeData = resumeDataFromArgs !== undefined ? resumeDataFromArgs : workflowResumeData;
 
-        const isResumeToolCall = resumeDataFromArgs !== undefined;
+        let isResumeToolCall = resumeDataFromArgs !== undefined;
         const isAgentTool = inputData.toolName?.startsWith('agent-');
         const isWorkflowTool = inputData.toolName?.startsWith('workflow-');
         const suspendedToolCallId =
           isResumeToolCall && typeof args?.suspendedToolCallId === 'string' && args.suspendedToolCallId.length > 0
             ? args.suspendedToolCallId
             : undefined;
-        if (suspendedToolCallId !== undefined) {
+        if (args && typeof args === 'object' && Object.hasOwn(args, 'suspendedToolCallId')) {
           const { suspendedToolCallId: _suspendedToolCallId, ...argsWithoutCallId } = args;
           args = argsWithoutCallId;
         }
@@ -477,7 +540,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           isResumeToolCall && typeof args?.suspendedToolRunId === 'string' && args.suspendedToolRunId.length > 0
             ? args.suspendedToolRunId
             : undefined;
-        if (suppliedSuspendedToolRunId !== undefined) {
+        if (args && typeof args === 'object' && Object.hasOwn(args, 'suspendedToolRunId')) {
           const { suspendedToolRunId: _suspendedToolRunId, ...argsWithoutRunId } = args;
           args = argsWithoutRunId;
         }
@@ -622,6 +685,23 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const hasAuthoritativeResumeEnvelope = authoritativeResumeEnvelope !== undefined;
         const authoritativeIdentityMatches =
           hasAuthoritativeResumeEnvelope && matchesExpectedResumeIdentity(authoritativeResumeEnvelope);
+        // Some providers materialize optional workflow/agent-tool control fields
+        // as null on a fresh call. Null is also a valid resumed tool payload, so
+        // normalize it only when no durable or caller-supplied resume identity
+        // exists. Non-null values and calls naming a suspended run/call remain
+        // fail-closed below.
+        const isEvidenceFreeNullResumePlaceholder =
+          isResumeToolCall &&
+          resumeDataFromArgs === null &&
+          workflowResumeData === undefined &&
+          suspendedToolCallId === undefined &&
+          suppliedSuspendedToolRunId === undefined &&
+          !hasAuthoritativeResumeEnvelope &&
+          storedResumeMetadata === undefined;
+        if (isEvidenceFreeNullResumePlaceholder) {
+          resumeData = undefined;
+          isResumeToolCall = false;
+        }
         const authoritativeResumeType = authoritativeIdentityMatches
           ? (authoritativeResumeEnvelope as { type?: unknown }).type
           : undefined;
@@ -832,7 +912,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               },
               'approval',
             );
-            safeEnqueue(controller, approvalChunk);
+            if (outputWriter) {
+              await outputWriter(approvalChunk);
+            } else {
+              safeEnqueue(controller, approvalChunk);
+            }
 
             // Add approval metadata to message before persisting
             addToolMetadata({
@@ -928,17 +1012,20 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           outputWriter,
           // Pass current step span as parent for tool call spans
           tracingContext: modelSpanTracker?.getTracingContext(),
-          // Pass workspace from _internal (set by llmExecutionStep via prepareStep/processInputStep)
-          workspace: _internal?.stepWorkspace,
+          // Pass workspace from the run scope (set by llmExecutionStep via prepareStep/processInputStep)
+          workspace: readScoped(scopeCtx, STEP_WORKSPACE_KEY, 'stepWorkspace'),
           // Forward requestContext so tools receive values set by the workflow step
           requestContext: toolRequestContext,
+          actor,
           // Let tools that read thread history mid-stream (e.g. forked subagents
           // cloning the parent thread) drain the save queue so the store reflects
           // the latest user/assistant messages before they read.
-          flushMessages:
-            _internal?.saveQueueManager && _internal?.threadId
-              ? () => _internal.saveQueueManager!.flushMessages(messageList, _internal.threadId, _internal.memoryConfig)
-              : undefined,
+          flushMessages: (() => {
+            const sqm = readScoped(scopeCtx, SAVE_QUEUE_MANAGER_KEY, 'saveQueueManager');
+            const tid = readScoped(scopeCtx, THREAD_ID_KEY, 'threadId');
+            const mcfg = readScoped(scopeCtx, MEMORY_CONFIG_KEY, 'memoryConfig');
+            return sqm && tid ? () => sqm.flushMessages(messageList, tid, mcfg) : undefined;
+          })(),
           suspend: async (suspendPayload: any, options?: SuspendOptions) => {
             if (options?.requireToolApproval) {
               const approvalChunk = await transformChunk(
@@ -970,7 +1057,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 },
                 'approval',
               );
-              safeEnqueue(controller, approvalChunk);
+              if (outputWriter) {
+                await outputWriter(approvalChunk);
+              } else {
+                safeEnqueue(controller, approvalChunk);
+              }
 
               // Add approval metadata to message before persisting
               addToolMetadata({
@@ -1013,6 +1104,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   },
                   __streamState: streamState.serialize(),
                   __agentId: agentId,
+                  // Persist the inner suspended run id in the workflow snapshot, partitioned
+                  // per tool call (resumeLabel = toolCallId). The shared per-message
+                  // pendingToolApprovals metadata is keyed by toolName and flushed/rehydrated
+                  // concurrently across parallel branches of the same assistant step, so for two
+                  // delegations to the same sub-agent the second branch's entry is overwritten,
+                  // leaving its run id unrecoverable on resume (AGENT_RESUME_NO_SNAPSHOT_FOUND).
+                  // The foreach snapshot is collision-free, so it is the reliable source here.
+                  suspendedToolRunId: options.runId,
                 },
                 {
                   resumeLabel: metadataToolCallId,
@@ -1084,25 +1183,46 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // but omitted suspendedToolRunId — without it, workflow tools start a fresh run and re-suspend.
         const needsRunIdLookup = resumeDataToPassToToolOptions !== undefined && (isAgentTool || isWorkflowTool);
         if (needsRunIdLookup) {
-          let suspendedToolRunId = '';
+          // Primary source: the per-iteration workflow suspend payload, which carries the
+          // suspended run id partitioned per tool call (resumeLabel = toolCallId). This is
+          // collision-free for parallel delegations to the same sub-agent, where the shared,
+          // toolName-keyed per-message pendingToolApprovals metadata is overwritten by a sibling
+          // branch — so the message lookup below would return the wrong (surviving) run id and
+          // resume the wrong call (or fail with AGENT_RESUME_NO_SNAPSHOT_FOUND). The message
+          // metadata / data parts remain as a fallback for page-refresh resumes where the
+          // workflow snapshot is unavailable.
+          let suspendedToolRunId = (suspendData as any)?.suspendedToolRunId || '';
           const shouldUsePartsFallback = !isResumeToolCall || !args.suspendedToolRunId;
           const messages = messageList.get.all.db();
           const assistantMessages = [...messages].reverse().filter(message => message.role === 'assistant');
-
           for (const message of assistantMessages) {
+            if (suspendedToolRunId) break;
             const suspendedTools = message.content.metadata?.suspendedTools as Record<string, any> | undefined;
             const pendingToolApprovals = message.content.metadata?.pendingToolApprovals as
               | Record<string, any>
               | undefined;
-            const storedTool =
-              suspendedTools && Object.hasOwn(suspendedTools, metadataToolCallId)
-                ? suspendedTools[metadataToolCallId]
-                : pendingToolApprovals && Object.hasOwn(pendingToolApprovals, metadataToolCallId)
-                  ? pendingToolApprovals[metadataToolCallId]
-                  : undefined;
-            if (storedTool) {
-              suspendedToolRunId = storedTool.runId;
-              break;
+            const pendingOrSuspendedTools =
+              suspendedTools || pendingToolApprovals
+                ? { ...(pendingToolApprovals ?? {}), ...(suspendedTools ?? {}) }
+                : undefined;
+            if (pendingOrSuspendedTools) {
+              // Entries are keyed by toolCallId so parallel calls to the SAME tool each keep
+              // their own suspension. Resolution order:
+              //   1. Exact resolved toolCallId match (key, then entry value) — used by
+              //      approveToolCall-style resumes and model resumes that supplied
+              //      suspendedToolCallId (metadataToolCallId is the original pending call).
+              //   2. toolName match — used by autoResumeSuspendedTools, where resume happens via a
+              //      fresh stream() turn so inputData.toolCallId differs from the suspended call.
+              //      Also covers legacy metadata that was keyed by toolName.
+              const entry =
+                pendingOrSuspendedTools[metadataToolCallId] ??
+                Object.values(pendingOrSuspendedTools).find((e: any) => e?.toolCallId === metadataToolCallId) ??
+                pendingOrSuspendedTools[inputData.toolName] ??
+                Object.values(pendingOrSuspendedTools).find((e: any) => e?.toolName === inputData.toolName);
+              if (entry) {
+                suspendedToolRunId = entry.runId;
+                break;
+              }
             }
 
             if (shouldUsePartsFallback) {
@@ -1112,9 +1232,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   !(part.data as any).resumed,
               );
               if (dataToolSuspendedParts && dataToolSuspendedParts.length > 0) {
-                const foundTool = dataToolSuspendedParts.find(
-                  (part: any) => part.data.toolCallId === metadataToolCallId,
-                );
+                // Prefer the part for this exact (resolved) tool call; fall back to toolName for
+                // fresh-turn autoResume and older parts that may not carry a toolCallId.
+                const foundTool =
+                  dataToolSuspendedParts.find((part: any) => part.data.toolCallId === metadataToolCallId) ??
+                  dataToolSuspendedParts.find((part: any) => part.data.toolName === inputData.toolName);
                 if (foundTool) {
                   suspendedToolRunId = (foundTool as any).data.runId;
                   break;
@@ -1135,8 +1257,10 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         if (args === null || args === undefined) {
           return {
-            error: new Error(
-              `Tool "${inputData.toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
+            error: serializeToolError(
+              new Error(
+                `Tool "${inputData.toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
+              ),
             ),
             ...inputData,
           };
@@ -1144,8 +1268,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         if (isAgentTool) {
           if (typeof args === 'object' && args !== null && 'prompt' in args) {
-            args.threadId = _internal?.threadId;
-            args.resourceId = _internal?.resourceId;
+            args.threadId = readScoped(scopeCtx, THREAD_ID_KEY, 'threadId');
+            args.resourceId = readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId');
           }
         }
 
@@ -1153,20 +1277,26 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const toolFgaProvider = mastra?.getServer?.()?.fga;
         if (toolFgaProvider) {
           const fgaUser = requestContext?.get('user');
-          const { checkFGA, FGADeniedError } = await import('../../../auth/ee/fga-check');
-          if (!fgaUser) {
-            throw new FGADeniedError(
-              { id: 'unknown' },
-              { type: 'tool', id: inputData.toolName },
-              MastraFGAPermissions.TOOLS_EXECUTE,
-            );
+          const { builtToolEnforcesFGAProvider, checkFGA, getBuiltToolFGAResourceId, getStandaloneToolFGAResourceId } =
+            await import('../../../auth/ee/fga-check');
+          const builtResourceId = getBuiltToolFGAResourceId(tool);
+          // CoreToolBuilder owns the check only when it will use this exact
+          // provider. Converted tools without a builder provider (for example,
+          // browser tools) retain their canonical identity but are authorized
+          // here; raw tools fail closed to the standalone identity.
+          if (!builtToolEnforcesFGAProvider(tool, toolFgaProvider)) {
+            await checkFGA({
+              fgaProvider: toolFgaProvider,
+              user: fgaUser,
+              resource: {
+                type: 'tool',
+                id: builtResourceId ?? getStandaloneToolFGAResourceId(inputData.toolName),
+              },
+              permission: MastraFGAPermissions.TOOLS_EXECUTE,
+              actor,
+              requestContext: toolRequestContext,
+            });
           }
-          await checkFGA({
-            fgaProvider: toolFgaProvider,
-            user: fgaUser,
-            resource: { type: 'tool', id: inputData.toolName },
-            permission: MastraFGAPermissions.TOOLS_EXECUTE,
-          });
         }
 
         const llmBgOverrides =
@@ -1177,14 +1307,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
 
         // --- Background task dispatch ---
-        const backgroundTaskManager = _internal?.backgroundTaskManager;
-        const agentBgConfigCheck = _internal?.agentBackgroundConfig;
+        const backgroundTaskManager = readScoped(scopeCtx, BACKGROUND_TASK_MANAGER_KEY, 'backgroundTaskManager');
+        const agentBgConfigCheck = readScoped(scopeCtx, AGENT_BACKGROUND_CONFIG_KEY, 'agentBackgroundConfig');
         // Skip background dispatch entirely when disabled (e.g., for sub-agents whose
         // entire invocation is itself dispatched as a background task by the parent)
         if (backgroundTaskManager && !agentBgConfigCheck?.disabled && typeof args === 'object' && args !== null) {
           const toolBgConfig = (tool as any).backgroundConfig as ToolBackgroundConfig | undefined;
           const agentBgConfig = agentBgConfigCheck;
-          const managerConfig = _internal?.backgroundTaskManagerConfig;
+          const managerConfig = readScoped(scopeCtx, BACKGROUND_TASK_MANAGER_CONFIG_KEY, 'backgroundTaskManagerConfig');
 
           const bgResolved = resolveBackgroundConfig({
             llmBgOverrides,
@@ -1196,7 +1326,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
           if (bgResolved.runInBackground) {
             // Resolve the tool executor from the current closure
-            const stepTools = (_internal?.stepTools as Tools) || tools;
+            const stepTools = (readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as Tools | undefined) || tools;
             const resolvedTool =
               stepTools?.[inputData.toolName] ||
               Object.values(stepTools || {})?.find((t: any) => 'id' in t && t.id === inputData.toolName);
@@ -1212,8 +1342,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               toolCallId: inputData.toolCallId,
               args: args as Record<string, unknown>,
               agentId,
-              threadId: _internal?.threadId,
-              resourceId: _internal?.resourceId,
+              threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
+              resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
               timeoutMs: bgResolved.timeoutMs,
               maxRetries: bgResolved.maxRetries,
               runId,
@@ -1448,7 +1578,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                           {
                             role: 'tool' as const,
                             type: 'tool-call',
-                            id: _internal?.generateId?.() ?? randomUUID(),
+                            id: readScoped(scopeCtx, GENERATE_ID_KEY, 'generateId')?.() ?? randomUUID(),
                             createdAt: new Date(),
                             content: [
                               {
@@ -1483,59 +1613,31 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   }
 
                   // Flush to memory if available
-                  if (_internal?.saveQueueManager && _internal?.threadId) {
-                    await _internal.saveQueueManager.flushMessages(
-                      messageList,
-                      _internal.threadId,
-                      _internal.memoryConfig,
-                    );
+                  {
+                    const sqm = readScoped(scopeCtx, SAVE_QUEUE_MANAGER_KEY, 'saveQueueManager');
+                    const tid = readScoped(scopeCtx, THREAD_ID_KEY, 'threadId');
+                    if (sqm && tid) {
+                      await sqm.flushMessages(
+                        messageList,
+                        tid,
+                        readScoped(scopeCtx, MEMORY_CONFIG_KEY, 'memoryConfig'),
+                      );
+                    }
                   }
                 },
-                // Execution injector — updates the existing tool-invocation in the
-                // message list (keyed by toolCallId) background task startedAt.
+                // Execution injector — records background task lifecycle metadata on the
+                // assistant message without changing the model-visible tool result.
                 onExecution: async params => {
-                  const inputTransform = await transformToolPayloadForTargets(
-                    {
-                      phase: 'input-available',
-                      toolName: params.toolName,
-                      toolCallId: params.toolCallId,
-                      input: args,
-                      providerMetadata: inputData.providerMetadata as Record<string, unknown> | undefined,
-                    },
-                    transformSource,
-                    logger,
-                  );
-                  const transformCarrier = withToolPayloadTransformMetadata(
-                    { metadata: {} as Record<string, any> },
-                    inputTransform,
-                  );
-                  const providerMetadata = withToolPayloadTransformProviderMetadata(
-                    inputData.providerMetadata as ProviderMetadata | undefined,
-                    transformCarrier.metadata,
-                  ) as ProviderMetadata | undefined;
-
-                  messageList.updateToolInvocation(
-                    {
-                      type: 'tool-invocation',
-                      toolInvocation: {
-                        state: 'call',
-                        toolCallId: params.toolCallId,
-                        toolName: params.toolName,
-                        args,
-                      },
-                      ...(providerMetadata ? { providerMetadata } : {}),
-                    },
-                    {
-                      mode: 'stream',
-                      backgroundTasks: {
-                        [params.toolCallId]: {
-                          startedAt: params.startedAt,
-                          suspendedAt: params.suspendedAt,
-                          taskId: params.taskId,
-                        },
+                  messageList.updateMessageMetadataByToolCallId(params.toolCallId, {
+                    mode: 'stream',
+                    backgroundTasks: {
+                      [params.toolCallId]: {
+                        startedAt: params.startedAt,
+                        suspendedAt: params.suspendedAt,
+                        taskId: params.taskId,
                       },
                     },
-                  );
+                  });
                 },
 
                 // Per-task callbacks
@@ -1548,8 +1650,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               toolCallId: inputData.toolCallId,
               runId,
               agentId,
-              threadId: _internal?.threadId,
-              resourceId: _internal?.resourceId,
+              threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
+              resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
               toolName: inputData.toolName,
             });
             if (isSuspended && resumeDataToPassToToolOptions !== undefined) {
@@ -1573,8 +1675,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               // bubbles up through the AI-SDK-v5 tool builder and gets
               // wrapped as `TOOL_EXECUTION_FAILED: Invalid state:
               // Controller is already closed`.
-              safeEnqueue(controller, {
-                type: 'background-task-started' as any,
+              const backgroundTaskStartedChunk = {
+                type: 'background-task-started' as const,
                 runId,
                 from: ChunkFrom.AGENT,
                 payload: {
@@ -1582,7 +1684,19 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolName: inputData.toolName,
                   toolCallId: inputData.toolCallId,
                 },
-              });
+              };
+              safeEnqueue(controller, backgroundTaskStartedChunk);
+              try {
+                await options?.onChunk?.(backgroundTaskStartedChunk);
+              } catch (error) {
+                logger?.warn?.('Error invoking onChunk for background-task-started', {
+                  toolCallId: inputData.toolCallId,
+                  toolName: inputData.toolName,
+                  error,
+                  errorMessage: error instanceof Error ? error.message : undefined,
+                  errorStack: error instanceof Error ? error.stack : undefined,
+                });
+              }
 
               // Return placeholder result so the LLM can continue
               return {
@@ -1620,7 +1734,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           throw error;
         }
         return {
-          error: error as Error,
+          error: serializeToolError(error),
           ...inputData,
           ...(resumeTargetToolCallId ? { resumeTargetToolCallId } : {}),
           ...(approvalGrant ?? {}),

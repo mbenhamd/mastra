@@ -72,6 +72,7 @@ remain the authoritative field inventory):
     <rect style="fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 14;" x="40" y="450" width="950" height="68" />
     <text style="font: 600 14px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="515" y="478" text-anchor="middle">Workers claim and renew the inbox, outbox, and receipt rows under TTL; the token row is never claimed.</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="515" y="500" text-anchor="middle">Inbox/Outbox/Receipt carry bindingId + bindingGeneration; binding replacement fences stale rows rather than retargeting them.</text>
+
   </svg>
   <figcaption>Provider callbacks resolve through the callback-binding row to a per-conversation ChannelBinding; the four work rows hang off that binding with separate state machines and claim semantics.</figcaption>
 </figure>
@@ -90,18 +91,18 @@ type ChannelBindingMode = 'per-user-resource' | 'thread-resource' | 'shared-reso
 interface ChannelBinding {
   id: string;
   harnessName: string;
-  channelId: string;                  // registered Harness channel key
-  providerId: string;                  // registered Mastra ChannelProvider key used for delivery
+  channelId: string; // registered Harness channel key
+  providerId: string; // registered Mastra ChannelProvider key used for delivery
   status: 'active' | 'replaced' | 'closed' | 'undeliverable';
-  platform: string;                    // e.g. 'slack', 'discord', 'teams'
-  externalTenantId?: string;           // workspace / guild / org
-  externalChannelId?: string;          // room/channel/DM identifier
-  externalThreadId: string;            // platform thread/conversation identifier
+  platform: string; // e.g. 'slack', 'discord', 'teams'
+  externalTenantId?: string; // workspace / guild / org
+  externalChannelId?: string; // room/channel/DM identifier
+  externalThreadId: string; // platform thread/conversation identifier
   resourceId: string;
   threadId: string;
   sessionId: string;
-  mode: ChannelBindingMode;             // resource-resolution mode, not platform conversation kind
-  generation: number;                  // starts at 1; increments on replacement
+  mode: ChannelBindingMode; // resource-resolution mode, not platform conversation kind
+  generation: number; // starts at 1; increments on replacement
   createdAt: number;
   updatedAt: number;
   lastInboundAt?: number;
@@ -133,18 +134,18 @@ type HarnessProviderCallbackBindingStatus = 'active' | 'disabled' | 'replaced' |
 
 interface HarnessProviderCallbackBinding {
   id: string;
-  providerId: string;                // Mastra channels registration key, not platform type ID
+  providerId: string; // Mastra channels registration key, not platform type ID
   selectorKind: 'installation' | 'route-key' | 'external-tenant';
-  selectorValue: string;             // canonical normalized key
+  selectorValue: string; // canonical normalized key
   harnessName: string;
-  channelId: string;                 // registered Harness channel key
+  channelId: string; // registered Harness channel key
   status: HarnessProviderCallbackBindingStatus;
   origin?: 'provisioned' | 'migrated';
   migratedFrom?: { owner: 'agentchannels'; agentId?: string; installationId?: string };
   migratedAt?: number;
   replacedByBindingId?: string;
   undeliverableReason?: string;
-  environment?: string;              // audit metadata, not part of uniqueness key
+  environment?: string; // audit metadata, not part of uniqueness key
   metadata?: Record<string, JsonValue>;
   createdAt: number;
   updatedAt: number;
@@ -155,10 +156,10 @@ interface ChannelInboxItem {
   harnessName: string;
   channelId: string;
   providerId: string;
-  idempotencyKey: string;            // unique provider event/message ID for this channel
-  payloadHash: string;               // stable hash of normalized content/files/context
-  admissionHash?: string;            // stable hash of persisted session admission payload
-  admissionId: string;               // passed to `signal` / `queue` for de-dupe
+  idempotencyKey: string; // unique provider event/message ID for this channel
+  payloadHash: string; // stable hash of normalized content/files/context
+  admissionHash?: string; // stable hash of persisted session admission payload
+  admissionId: string; // passed to `signal` / `queue` for de-dupe
   bindingId?: string;
   resourceId?: string;
   threadId?: string;
@@ -175,7 +176,7 @@ interface ChannelInboxItem {
   deadAt?: number;
   updatedAt: number;
   status: 'received' | 'admitted' | 'accepted' | 'queued' | 'failed' | 'dead';
-  delivery?: 'signal' | 'queue';     // required before admitted->accepted/queued
+  delivery?: 'signal' | 'queue'; // required before admitted->accepted/queued
   // Trusted channel policy may choose per-turn mode/model overrides. These
   // are persisted before admission, replayed unchanged on retries as
   // ordinary `signal` / `queue` overrides, and never mutate session
@@ -196,7 +197,7 @@ interface ChannelProviderDeliveryReceipt {
   providerMessageId?: string;
   providerThreadId?: string;
   deliveryId?: string;
-  metadata?: JsonValue;             // adapter-normalized provider acknowledgement safe to persist
+  metadata?: JsonValue; // adapter-normalized provider acknowledgement safe to persist
 }
 
 interface ChannelOutboxItem {
@@ -204,14 +205,14 @@ interface ChannelOutboxItem {
   harnessName: string;
   channelId: string;
   providerId: string;
-  bindingId: string;                // delivery binding / platform target
-  bindingGeneration: number;         // generation loaded when item was enqueued
+  bindingId: string; // delivery binding / platform target
+  bindingGeneration: number; // generation loaded when item was enqueued
   idempotencyKey: string;
   payloadHash: string;
   resourceId: string;
   threadId: string;
-  sessionId: string;                // delivery session from the binding
-  owningSessionId: string;          // session that produced/owns the item
+  sessionId: string; // delivery session from the binding
+  owningSessionId: string; // session that produced/owns the item
   source?: 'parent' | 'subagent';
   target: {
     platform: string;
@@ -219,10 +220,18 @@ interface ChannelOutboxItem {
     externalChannelId?: string;
     externalThreadId: string;
   };
-  kind: 'assistant-message' | 'message-edit' | 'inbox-prompt' | 'inbox-resolution' | 'status' | 'tool-result' | 'reaction' | 'custom';
+  kind:
+    | 'assistant-message'
+    | 'message-edit'
+    | 'inbox-prompt'
+    | 'inbox-resolution'
+    | 'status'
+    | 'tool-result'
+    | 'reaction'
+    | 'custom';
   operationKind: ChannelOutboxOperationKind;
   operationName?: string;
-  payload: JsonValue;                // adapter-owned JSON payload
+  payload: JsonValue; // adapter-owned JSON payload
   deliverySemantics: ChannelDeliverySemantics;
   status: 'pending' | 'claimed' | 'sent' | 'failed' | 'dead';
   attempts: number;
@@ -238,22 +247,22 @@ interface ChannelOutboxItem {
 }
 
 interface ChannelActionToken {
-  actionTokenId: string;             // deterministic prompt/action group ID; stable for every control that answers this pending item
+  actionTokenId: string; // deterministic prompt/action group ID; stable for every control that answers this pending item
   harnessName: string;
   channelId: string;
   providerId: string;
   resourceId: string;
   owningSessionId: string;
-  itemId: string;                    // stable pending interaction ID
+  itemId: string; // stable pending interaction ID
   kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
-  bindingId: string;                 // delivery binding used by the rendered prompt
+  bindingId: string; // delivery binding used by the rendered prompt
   bindingGeneration: number;
-  runId: string;                     // pending item's runId, used to reject stale tokens
-  pendingRequestedAt: number;        // pending item's requestedAt, used to reject itemId reuse
-  audience: ChannelActionAudience;    // JSON-safe deployment policy snapshot for first use
-  metadataHash: string;              // canonical hash of immutable token metadata, including audience
-  transportHash: string;             // canonical hash of the rendered token string/handle
-  keyId?: string;                    // signing or verification profile for stable re-rendering
+  runId: string; // pending item's runId, used to reject stale tokens
+  pendingRequestedAt: number; // pending item's requestedAt, used to reject itemId reuse
+  audience: ChannelActionAudience; // JSON-safe deployment policy snapshot for first use
+  metadataHash: string; // canonical hash of immutable token metadata, including audience
+  transportHash: string; // canonical hash of the rendered token string/handle
+  keyId?: string; // signing or verification profile for stable re-rendering
   expiresAt?: number;
   revokedAt?: number;
   // Subset of `HarnessRowErrorCode` (§4.5d). Force-delete cascade writes
@@ -270,9 +279,9 @@ interface ChannelActionReceipt {
   harnessName: string;
   channelId: string;
   providerId: string;
-  actionTokenId: string;            // Harness prompt/action group ID; first response wins
-  actionId: string;                 // provider retry/idempotency ID for this callback
-  bindingId: string;                // delivery binding used by the action card
+  actionTokenId: string; // Harness prompt/action group ID; first response wins
+  actionId: string; // provider retry/idempotency ID for this callback
+  bindingId: string; // delivery binding used by the action card
   bindingGeneration: number;
   resourceId: string;
   owningSessionId: string;
@@ -280,9 +289,9 @@ interface ChannelActionReceipt {
   kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval';
   runId: string;
   pendingRequestedAt: number;
-  audience: ChannelActionAudience;   // copied from the token's JSON-safe policy snapshot
+  audience: ChannelActionAudience; // copied from the token's JSON-safe policy snapshot
   verifiedActor?: ChannelRequestContext['actor'];
-  responseHash: string;             // stable hash of the normalized response
+  responseHash: string; // stable hash of the normalized response
   response: JsonValue;
   status: 'received' | 'accepted' | 'applied' | 'conflict' | 'failed' | 'dead';
   conflictReason?:

@@ -2,7 +2,7 @@
 '@mastra/core': patch
 ---
 
-Fixed `iterationCount` always being 1 for `dountil` and `dowhile` loops on the evented workflow engine. The count was never carried forward between iterations, so conditions that needed it to advance beyond 1 could run forever.
+Fixed `iterationCount` always being 1 for `dountil` and `dowhile` loops on the evented workflow engine. The count was never carried forward between iterations, so any loop whose condition depended on `iterationCount` never advanced and ran forever.
 
 **Before**
 

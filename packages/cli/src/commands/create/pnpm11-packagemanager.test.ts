@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   const mockExec = vi.fn();
+  const mockExeca = vi.fn().mockResolvedValue({ stdout: '' });
+  const mockInstallPackages = vi.fn().mockResolvedValue(undefined);
   const mockChildProcess = {
     exec: (cmd: string, opts: any, cb: any) => {
       mockExec(cmd);
@@ -28,6 +30,8 @@ const mocks = vi.hoisted(() => {
 
   return {
     mockExec,
+    mockExeca,
+    mockInstallPackages,
     mockChildProcess,
     mockRm,
     mockExistsSync,
@@ -40,6 +44,10 @@ const mocks = vi.hoisted(() => {
     },
   };
 });
+
+vi.mock('execa', () => ({
+  execa: mocks.mockExeca,
+}));
 
 vi.mock('node:child_process', () => ({
   default: mocks.mockChildProcess,
@@ -84,6 +92,7 @@ vi.mock('@clack/prompts', () => ({
 vi.mock('../../services/service.deps.js', () => ({
   DepsService: class {
     addScriptsToPackageJson = vi.fn().mockResolvedValue(undefined);
+    installPackages = mocks.mockInstallPackages;
   },
 }));
 
@@ -104,6 +113,9 @@ describe('pnpm v11 packageManager normalization', () => {
     process.exit = mockExit;
     mocks.mockExec.mockReset();
     mocks.mockExec.mockResolvedValue({ stdout: '' });
+    mocks.mockExeca.mockReset();
+    mocks.mockExeca.mockResolvedValue({ stdout: '' });
+    mocks.mockInstallPackages.mockClear();
     mocks.mockRm.mockClear();
     mocks.mockWriteFile.mockClear();
     mocks.mockExistsSync.mockReturnValue(false);
@@ -149,6 +161,15 @@ describe('pnpm v11 packageManager normalization', () => {
     // because corepack ≤0.35.0 rejects ranges in both fields
     expect(written.packageManager).toBeUndefined();
     expect(written.devEngines).toBeUndefined();
+
+    // Verify that the pnpm-workspace.yaml configuration is correctly generated and includes excludes
+    const workspaceWrite = writeFileCalls.find(
+      (call: any[]) => typeof call[0] === 'string' && call[0] === 'pnpm-workspace.yaml',
+    );
+    expect(workspaceWrite).toBeDefined();
+    expect(workspaceWrite![1]).toContain('minimumReleaseAgeExclude:');
+    expect(workspaceWrite![1]).toContain('- mastra');
+    expect(workspaceWrite![1]).toContain('- "@mastra/*"');
   });
 
   it('should remove legacy packageManager field with range', async () => {

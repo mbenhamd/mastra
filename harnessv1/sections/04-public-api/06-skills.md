@@ -39,7 +39,6 @@ interface HarnessSkill {
   metadata?: Record<string, unknown>; // Static or workspace metadata
   //   (e.g. `goal` flag, custom keys).
 }
-
 ```
 
 `UseSkillOptions` is defined once in §4.4b. This section owns skill resolution,

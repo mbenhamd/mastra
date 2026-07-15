@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -151,11 +151,14 @@ describe('findProjectRoot', () => {
     expect(findProjectRoot(src)).toBe(project);
   });
 
-  it('returns null when nothing found', () => {
+  it('ignores directories without project markers', () => {
     const deep = join(tempDir, 'a', 'b', 'c');
     mkdirSync(deep, { recursive: true });
 
-    expect(findProjectRoot(deep)).toBeNull();
+    // The system temp directory can itself live inside a project (for example,
+    // a developer may have /tmp/package.json). The empty fixture must not be
+    // mistaken for a project root, while any real external ancestor still is.
+    expect(findProjectRoot(deep)).toBe(findProjectRoot(dirname(tempDir)));
   });
 });
 

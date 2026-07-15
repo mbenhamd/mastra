@@ -9,10 +9,10 @@ state or a one-turn override, the option name is the same.
 
 ```ts
 interface HarnessOverrides {
-  model?: string;          // Use a different model for this turn only
-  mode?: string;           // Use a different mode for this turn only
+  model?: string; // Use a different model for this turn only
+  mode?: string; // Use a different mode for this turn only
   addTools?: ToolsetInput; // Add extra tools for this turn (merged on top, separate namespace)
-  yolo?: boolean;          // Bypass approval prompts for this run only
+  yolo?: boolean; // Bypass approval prompts for this run only
 }
 
 interface PersistedRunOverrides {
@@ -75,7 +75,7 @@ on hydration with row `error.code = 'tool_surface_unrehydratable'` (bare
 `HarnessRowErrorCode` per §4.5d; wire surfaces project through §13.3f.1 to
 `harness.session_corrupt` with
 `error.details.reason = 'tool_surface_unrehydratable'`; see §5.7 and §6.2).
-Independent of that per-run fail-closed branch, Harness treats *any* recovered
+Independent of that per-run fail-closed branch, Harness treats _any_ recovered
 active run as unable to accept new `signal({ addTools })` calls until the
 thread is idle: it rejects with `HarnessOverrideConflictError` instead of
 assuming the lost live tool surface was empty. `queue(...)` still rejects
@@ -94,41 +94,41 @@ idle thread or `useSkill(...)`, where the override is bound to a run that exists
 for its full lifetime in memory.
 
 **Overrides bind to a turn boundary, not to user input.** A per-turn override is
-a property of the *agent run* the entry point starts. The run surface — which
+a property of the _agent run_ the entry point starts. The run surface — which
 mode-selected agent is running, which model is talking, which selected-agent
 prompt and tool surface are exposed, and which per-turn tools were added — is
 committed when the run starts and is invariant for that run's lifetime. Signals
-only let user content interleave into a live run; they do *not* let the surface
+only let user content interleave into a live run; they do _not_ let the surface
 mutate underneath the model. This matters because `signal()` has two delivery
 modes:
 
-| Delivery mode | Override behavior |
-| --- | --- |
-| `signal()` lands while the thread is **idle** → starts a new run | Overrides apply to that run, exactly as they do for `queue` and `useSkill`; a `mode` override selects that mode's bound agent. |
-| `signal()` drains as user input into an **already-active** run | The run's surface and run-scoped approval-bypass policy were already committed; the signal cannot retroactively change `agentId`, `model`, `mode`, `addTools`, or `yolo`. |
-| `queue()` item, drained later as a fresh standalone turn | Overrides apply to that item's run when it eventually drains (see above). |
-| `useSkill(...)` | New non-duplicate admission requires an idle thread; when admitted, it starts a fresh run and overrides apply normally. Exact untyped duplicate `admissionId` retries return retained evidence before the busy check. |
+| Delivery mode                                                    | Override behavior                                                                                                                                                                                                     |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signal()` lands while the thread is **idle** → starts a new run | Overrides apply to that run, exactly as they do for `queue` and `useSkill`; a `mode` override selects that mode's bound agent.                                                                                        |
+| `signal()` drains as user input into an **already-active** run   | The run's surface and run-scoped approval-bypass policy were already committed; the signal cannot retroactively change `agentId`, `model`, `mode`, `addTools`, or `yolo`.                                             |
+| `queue()` item, drained later as a fresh standalone turn         | Overrides apply to that item's run when it eventually drains (see above).                                                                                                                                             |
+| `useSkill(...)`                                                  | New non-duplicate admission requires an idle thread; when admitted, it starts a fresh run and overrides apply normally. Exact untyped duplicate `admissionId` retries return retained evidence before the busy check. |
 
 For `signal()` in the second row, the harness's behavior depends on whether
 the call carries overrides:
 
 - **No overrides** — accepted normally. The signal is delivered, the user
-content interleaves into the live run, the run keeps its committed surface. This
-is the common case.
+  content interleaves into the live run, the run keeps its committed surface. This
+  is the common case.
 - **Any of `model`, `mode`, `addTools`, or `yolo: true` set** — admission-time
-reject with `HarnessOverrideConflictError`. The run cannot honour the override
-and silently dropping it would be a footgun; for `yolo`, accepting the signal
-would introduce a second approval-bypass scope after `currentRun.yolo` and
-`agent_start.overrides` were already committed. The caller decides what to do:
-drop the override and resend; abort the live run via the agent-layer surface
-(see §3 — there is no `session.abort()` in v1) and resend (the next signal will
-start a fresh run with the override applied); or — for `model`, `mode`, or
-`yolo` — call `session.queue(...)` so the override applies to the queued
-standalone turn. `queue(...)` rejects `addTools` of its own accord (see below),
-so callers who specifically need a one-shot tool surface have to wait for the
-live run to end and resend via `signal(...)` on idle, or use `useSkill(...)`.
+  reject with `HarnessOverrideConflictError`. The run cannot honour the override
+  and silently dropping it would be a footgun; for `yolo`, accepting the signal
+  would introduce a second approval-bypass scope after `currentRun.yolo` and
+  `agent_start.overrides` were already committed. The caller decides what to do:
+  drop the override and resend; abort the live run via the agent-layer surface
+  (see §3 — there is no `session.abort()` in v1) and resend (the next signal will
+  start a fresh run with the override applied); or — for `model`, `mode`, or
+  `yolo` — call `session.queue(...)` so the override applies to the queued
+  standalone turn. `queue(...)` rejects `addTools` of its own accord (see below),
+  so callers who specifically need a one-shot tool surface have to wait for the
+  live run to end and resend via `signal(...)` on idle, or use `useSkill(...)`.
 
-The check looks at the run that this *specific signal* would deliver into, not
+The check looks at the run that this _specific signal_ would deliver into, not
 at the session generally — so once the live run finishes and the next
 `signal()` lands on an idle thread, overrides apply normally again. The run's
 committed serializable surface is reported on `agent_start.overrides` so

@@ -73,6 +73,7 @@ and per-method invariants):
     <text style="font: 600 15px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="520" y="436" text-anchor="middle">Storage-enforced guards</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="520" y="458" text-anchor="middle">owner-key uniqueness on (harnessName, resourceId, threadId) · lease owner check · ifVersion CAS · tenant-safe not-found</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #64748b;" x="520" y="476" text-anchor="middle">direct-ID primitives do not enforce resource scoping; the Harness layer cross-checks before returning</text>
+
   </svg>
   <figcaption>Thread/message work composes with shared memory rows; active-session creation, hydration, and CAS-fenced writes live in the Harness session ledger.</figcaption>
 </figure>

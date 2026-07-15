@@ -3,7 +3,8 @@ import { z } from 'zod/v4';
 
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
-import { createStep, createWorkflow } from './workflow';
+import { createWorkflow } from './create';
+import { createStep } from './workflow';
 
 describe('Workflow startAsync', () => {
   it('returns an observable promise for the background execution', async () => {

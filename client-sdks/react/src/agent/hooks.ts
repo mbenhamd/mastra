@@ -5,6 +5,7 @@ import { AIV5Adapter } from '@mastra/core/agent/message-list';
 import type { CoreUserMessage } from '@mastra/core/llm';
 import type { TracingOptions } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
+import type { TaskItem } from '@mastra/core/signals';
 import type { ChunkType, DataChunkType, NetworkChunkType } from '@mastra/core/stream';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -16,6 +17,11 @@ import {
 } from '../lib/mastra-db';
 import type { MastraDBMessageMetadata } from '../lib/mastra-db';
 import { useMastraClient } from '../mastra-client-context';
+import {
+  extractLatestTasksFromMessages,
+  extractTasksFromSignalChunk,
+  extractTasksFromToolResultChunk,
+} from './extract-tasks';
 import { extractRunIdFromMessages } from './extractRunIdFromMessages';
 import { convertSignalDataToBase64String } from './signal-data';
 import type { ClientToolsInput, ModelSettings } from './types';
@@ -290,6 +296,7 @@ export const useChat = ({
   const _threadSubscriptionPromiseRef = useRef<Promise<void> | null>(null);
   const _threadSignalsUnsupportedRef = useRef(false);
   const [messages, setMessages] = useState<MastraDBMessage[]>([]);
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [toolCallApprovals, setToolCallApprovals] = useState<{
     [toolCallId: string]: { status: 'approved' | 'declined' };
   }>({});
@@ -305,6 +312,7 @@ export const useChat = ({
   useEffect(() => {
     const formattedMessages = resolveInitialMessages(initialMessages ?? []);
     setMessages(formattedMessages);
+    setTasks(extractLatestTasksFromMessages(formattedMessages));
     pendingToolApprovalIdsRef.current = extractPendingToolApprovalIdsFromMessages(formattedMessages);
     setIsAwaitingToolApproval(pendingToolApprovalIdsRef.current.size > 0);
     _currentRunId.current = extractRunIdFromMessages(formattedMessages);
@@ -316,13 +324,8 @@ export const useChat = ({
 
   type SignalContentPart =
     | { type: 'text'; text: string }
-    | { type: 'file'; data: string; mimeType: string; filename?: string }
-    | { type: 'image'; image: string; mimeType?: string };
-  type SerializableCoreUserMessage = {
-    role: 'user';
-    content: string | SignalContentPart[];
-  };
-  type UserMessageSignalContents = string | SerializableCoreUserMessage | SerializableCoreUserMessage[];
+    | { type: 'file'; data: string; mediaType: string; filename?: string };
+  type UserMessageSignalContents = string | SignalContentPart[];
 
   const normalizeSignalFileData = (data: string | URL | ArrayBuffer | Uint8Array) => {
     if (data instanceof URL) return data.toString();
@@ -330,40 +333,35 @@ export const useChat = ({
   };
 
   const getSignalContents = (coreUserMessages: CoreUserMessage[]): UserMessageSignalContents => {
-    if (coreUserMessages.length === 1 && typeof coreUserMessages[0]?.content === 'string') {
-      return coreUserMessages[0].content;
-    }
-
-    const messages = coreUserMessages.map<SerializableCoreUserMessage>(message => {
+    const parts = coreUserMessages.reduce<SignalContentPart[]>((allParts, message) => {
       if (typeof message.content === 'string') {
-        return { role: 'user', content: message.content };
+        allParts.push({ type: 'text', text: message.content });
+        return allParts;
       }
 
-      const parts = message.content.reduce<SignalContentPart[]>((allParts, part) => {
+      for (const part of message.content) {
         if (part.type === 'text') {
           allParts.push({ type: 'text', text: part.text });
         } else if (part.type === 'file') {
           allParts.push({
             type: 'file',
             data: normalizeSignalFileData(part.data),
-            mimeType: part.mimeType,
+            mediaType: part.mimeType,
             ...(part.filename ? { filename: part.filename } : {}),
           });
         } else if (part.type === 'image') {
           allParts.push({
-            type: 'image',
-            image: normalizeSignalFileData(part.image),
-            ...(part.mimeType ? { mimeType: part.mimeType } : {}),
+            type: 'file',
+            data: normalizeSignalFileData(part.image),
+            mediaType: part.mimeType ?? 'image/png',
           });
         }
+      }
 
-        return allParts;
-      }, []);
+      return allParts;
+    }, []);
 
-      return { role: 'user', content: parts };
-    });
-
-    return messages.length === 1 ? messages[0]! : messages;
+    return parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
   };
 
   const markThreadSignalsUnsupported = useCallback(() => {
@@ -407,6 +405,11 @@ export const useChat = ({
   const processStreamChunk = useCallback(
     async (chunk: ChunkType, onChunk?: (chunk: ChunkType) => Promise<void>) => {
       setMessages(prev => accumulateChunk({ chunk, conversation: prev, metadata: { mode: 'stream' } }));
+
+      const signalTasks = extractTasksFromSignalChunk(chunk);
+      if (signalTasks !== undefined) setTasks(signalTasks);
+      const toolTasks = extractTasksFromToolResultChunk(chunk);
+      if (toolTasks !== undefined) setTasks(toolTasks);
 
       if (
         chunk.type === 'data-user-message' &&
@@ -457,6 +460,16 @@ export const useChat = ({
       _threadSubscriptionAbortRef.current = subscriptionAbort;
       _threadSubscriptionKeyRef.current = subscriptionKey;
 
+      // Release the cached subscription state, but only while this attempt
+      // still owns it — a newer attempt cleans up after itself.
+      const releaseSubscriptionRefs = () => {
+        if (_threadSubscriptionAbortRef.current !== subscriptionAbort) return;
+        _threadSubscriptionRef.current = null;
+        _threadSubscriptionAbortRef.current = null;
+        _threadSubscriptionKeyRef.current = undefined;
+        _threadSubscriptionPromiseRef.current = null;
+      };
+
       const clientWithAbort = new MastraClient({
         ...baseClient!.options,
         abortSignal: subscriptionAbort.signal,
@@ -487,25 +500,20 @@ export const useChat = ({
               if (_threadSubscriptionRef.current === subscription) {
                 _threadSubscriptionRef.current = null;
               }
-              if (_threadSubscriptionAbortRef.current === subscriptionAbort) {
-                _threadSubscriptionAbortRef.current = null;
-                _threadSubscriptionKeyRef.current = undefined;
-                _threadSubscriptionPromiseRef.current = null;
-              }
+              releaseSubscriptionRefs();
             });
         })
         .catch(error => {
+          // Release on every failure so the next call retries with a fresh
+          // fetch instead of re-awaiting this rejected promise. Without this,
+          // an aborted mount-time subscribe strands the channel and the reply
+          // never arrives until reload (issue #18768).
+          releaseSubscriptionRefs();
+
           if (isThreadSignalUnsupportedError(error)) {
             markThreadSignalsUnsupported();
-            if (_threadSubscriptionAbortRef.current === subscriptionAbort) {
-              _threadSubscriptionRef.current = null;
-              _threadSubscriptionAbortRef.current = null;
-              _threadSubscriptionKeyRef.current = undefined;
-              _threadSubscriptionPromiseRef.current = null;
-            }
             return;
           }
-
           if (!isAbortError(error)) {
             console.error('[useChat] Thread subscription failed', error);
             setIsRunning(false);
@@ -758,9 +766,6 @@ export const useChat = ({
       providerOptions: providerOptions as any,
       requireToolApproval,
       tracingOptions,
-      // Keep in sync with the sendMessage ifIdle.streamOptions below: the
-      // sendSignal fallback reuses this object, so omitting clientTools here
-      // would silently stop client-tool execution on the fallback path.
       clientTools: resolvedClientTools,
     };
 
@@ -902,7 +907,7 @@ export const useChat = ({
     _requestContext.current = undefined;
   };
 
-  const approveToolCall = async (toolCallId: string) => {
+  const approveToolCall = async (toolCallId: string, resumeData?: unknown) => {
     const onChunk = _onChunk.current;
     const currentRunId = _currentRunId.current;
 
@@ -920,6 +925,7 @@ export const useChat = ({
           threadId,
           toolCallId,
           approved: true,
+          ...(resumeData !== undefined ? { resumeData } : {}),
           requestContext: _requestContext.current,
         });
         pendingToolApprovalIdsRef.current.delete(toolCallId);
@@ -1150,12 +1156,19 @@ export const useChat = ({
       setMessages(s => [...s, dbUserMessage]);
     }
 
-    if (mode === 'generate') {
-      await generate({ ...args, coreUserMessages });
-    } else if (mode === 'stream') {
-      await stream({ ...args, coreUserMessages, signalId, clientMessageId });
-    } else if (mode === 'network') {
-      await network({ ...args, coreUserMessages });
+    try {
+      if (mode === 'generate') {
+        await generate({ ...args, coreUserMessages });
+      } else if (mode === 'stream') {
+        await stream({ ...args, coreUserMessages, signalId, clientMessageId });
+      } else if (mode === 'network') {
+        await network({ ...args, coreUserMessages });
+      }
+    } catch (error) {
+      // A failed send (subscription setup, request, or stream) must not leave
+      // the chat stranded in a "running" state until reload (issue #18768).
+      setIsRunning(false);
+      throw error;
     }
   };
 
@@ -1165,6 +1178,7 @@ export const useChat = ({
     isRunning,
     isAwaitingToolApproval,
     messages,
+    tasks,
     approveToolCall,
     declineToolCall,
     approveToolCallGenerate,

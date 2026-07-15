@@ -2434,6 +2434,18 @@ describe('Harness v1 — construction', () => {
     ).toThrow(HarnessConfigError);
   });
 
+  it('throws HarnessConfigError for an unknown harnessBuiltins policy', () => {
+    expect(
+      () =>
+        new Harness({
+          agents: { default: makeAgent() },
+          modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'sometimes' as any }],
+          defaultModeId: 'default',
+          sessions: { storage: makeStorage() },
+        }),
+    ).toThrow(HarnessConfigError);
+  });
+
   it('mints a unique ownerId per Harness instance', () => {
     const a = makeHarness();
     const b = makeHarness();
@@ -6054,17 +6066,16 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     expect(recoveredRow?.attachments.length).toBe(1);
     expect(recoveredRow?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt' });
 
-    // The dispatched turn carries the file part — the SAME shape the non-channel
-    // queue/live path forwards (role:'user' with a file content part).
+    // The dispatched signal carries the same canonical content-part array as the
+    // non-channel queue/live path.
     for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
       await new Promise<void>(resolve => setImmediate(resolve));
     }
-    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
-      role?: string;
-      content?: Array<{ type: string; filename?: string }>;
-    };
-    expect(dispatched.role).toBe('user');
-    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as Array<{
+      type: string;
+      filename?: string;
+    }>;
+    expect(dispatched.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
   });
 
   it('normalizes inbound files into durable row attachments and forwards them to the queued turn', async () => {
@@ -6106,17 +6117,17 @@ describe('Harness.admitChannelInbound — signal delivery + attachments (§14.2 
     expect(row?.attachments.length).toBe(1);
     expect(row?.attachments[0]).toMatchObject({ kind: 'ref', attachmentId, name: 'note.txt', mimeType: 'text/plain' });
 
-    // The queued turn dispatched a structured user message carrying the file part.
+    // The queued turn dispatched a canonical signal content array carrying the file part.
     for (let i = 0; i < 200 && agent.streamCalls.length < 1; i++) {
       await new Promise<void>(resolve => setImmediate(resolve));
     }
-    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as {
-      role?: string;
-      content?: Array<{ type: string; mediaType?: string; filename?: string }>;
-    };
-    expect(dispatched.role).toBe('user');
-    expect(dispatched.content?.some(p => p.type === 'text')).toBe(true);
-    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+    const dispatched = extractSignalContents(agent.streamCalls[agent.streamCalls.length - 1]?.messages) as Array<{
+      type: string;
+      mediaType?: string;
+      filename?: string;
+    }>;
+    expect(dispatched.some(p => p.type === 'text')).toBe(true);
+    expect(dispatched.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
   });
 
   it('the idempotency key distinguishes two inbound messages that differ only by their files', async () => {

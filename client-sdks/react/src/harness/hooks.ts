@@ -346,6 +346,7 @@ function trimEvents(events: HarnessEvent[], maxEvents: number): HarnessEvent[] {
 
 function isTerminalSubscriptionError(error: unknown, reconnect: boolean): boolean {
   if (!reconnect) return true;
-  const status = typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : undefined;
+  const status =
+    typeof (error as { status?: unknown })?.status === 'number' ? (error as { status: number }).status : undefined;
   return status !== undefined && status >= 400 && status < 500;
 }

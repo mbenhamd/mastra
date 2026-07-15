@@ -10,10 +10,158 @@ import { createChildProcessLogger } from '../deploy/log.js';
 
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
+const PROCESS_BOOTSTRAP_ENV_KEYS = ['PATH', 'SystemRoot', 'ComSpec', 'PATHEXT', 'WINDIR'] as const;
+
+const PACKAGE_MANAGER_REGISTRY_ENV_KEYS = [
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'all_proxy',
+  'NPM_TOKEN',
+  'NODE_AUTH_TOKEN',
+  'YARN_NPM_AUTH_TOKEN',
+  'YARN_NPM_AUTH_IDENT',
+] as const;
+
+const PACKAGE_MANAGER_NETWORK_CONFIG_KEYS = new Set([
+  'registry',
+  'proxy',
+  'https_proxy',
+  'https-proxy',
+  'noproxy',
+  'no_proxy',
+  'no-proxy',
+  'strict_ssl',
+  'strict-ssl',
+  'cafile',
+  'cert',
+  'key',
+]);
+
+function isPackageManagerNetworkOrAuthConfig(key: string): boolean {
+  const normalizedKey = key.toLowerCase();
+  const prefix = normalizedKey.startsWith('npm_config_')
+    ? 'npm_config_'
+    : normalizedKey.startsWith('pnpm_config_')
+      ? 'pnpm_config_'
+      : undefined;
+  if (!prefix) {
+    return false;
+  }
+
+  const configKey = normalizedKey.slice(prefix.length);
+  return (
+    PACKAGE_MANAGER_NETWORK_CONFIG_KEYS.has(configKey) ||
+    /^@[^:]+:registry$/.test(configKey) ||
+    /^\/\/.+\/:(_auth|_authtoken|username|_password|email|always-auth)$/.test(configKey)
+  );
+}
+
+function getProcessBootstrapEnv({ registryAccess = true }: { registryAccess?: boolean } = {}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of PROCESS_BOOTSTRAP_ENV_KEYS) {
+    const value = process.env[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  if (!registryAccess) {
+    return env;
+  }
+  for (const key of PACKAGE_MANAGER_REGISTRY_ENV_KEYS) {
+    const value = process.env[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  for (const [key, value] of Object.entries(process.env)) {
+    // Package-manager config also includes execution-changing settings such as
+    // script-shell. Forward only the network and authentication subset needed
+    // for private registries; the child still inherits no ambient shell config.
+    if (value && isPackageManagerNetworkOrAuthConfig(key)) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
 interface ArchitectureOptions {
   os?: string[];
   cpu?: string[];
   libc?: string[];
+}
+
+const PNPM_CONFIG_KEYS_TO_COPY = new Set([
+  'allowBuilds',
+  'onlyBuiltDependencies',
+  'ignoredBuiltDependencies',
+  'neverBuiltDependencies',
+  'minimumReleaseAge',
+  'minimumReleaseAgeExclude',
+  'trustPolicy',
+  'trustPolicyExclude',
+  'trustPolicyIgnoreAfter',
+  'supportedArchitectures',
+]);
+
+function getTopLevelYamlKey(line: string) {
+  const match = /^(?!\s)([\w-]+):/.exec(line);
+  return match?.[1];
+}
+
+export function copyPnpmWorkspaceSettings(source: string, options: ArchitectureOptions = {}) {
+  const hasArchitecture = Boolean(options.os?.length || options.cpu?.length || options.libc?.length);
+  const lines = source.split(/\r?\n/);
+  const blocks: string[] = [];
+
+  for (let index = 0; index < lines.length; ) {
+    const key = getTopLevelYamlKey(lines[index] ?? '');
+    if (!key) {
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    index += 1;
+    while (index < lines.length && !getTopLevelYamlKey(lines[index] ?? '')) {
+      index += 1;
+    }
+
+    if (!PNPM_CONFIG_KEYS_TO_COPY.has(key) || (key === 'supportedArchitectures' && hasArchitecture)) {
+      continue;
+    }
+
+    const block = lines.slice(start, index).join('\n').trimEnd();
+    if (block) {
+      blocks.push(block);
+    }
+  }
+
+  if (hasArchitecture) {
+    const architectureBlock = ['supportedArchitectures:'];
+    if (options.os?.length) {
+      architectureBlock.push(`  os: ${JSON.stringify(options.os)}`);
+    }
+    if (options.cpu?.length) {
+      architectureBlock.push(`  cpu: ${JSON.stringify(options.cpu)}`);
+    }
+    if (options.libc?.length) {
+      architectureBlock.push(`  libc: ${JSON.stringify(options.libc)}`);
+    }
+    blocks.push(architectureBlock.join('\n'));
+  }
+
+  return ["packages:\n  - '.'", ...blocks].join('\n\n') + '\n';
 }
 
 export class Deps extends MastraBase {
@@ -62,66 +210,69 @@ export class Deps extends MastraBase {
   }
 
   public async pack({ dir, destination, sanitizedName }: { dir: string; destination: string; sanitizedName: string }) {
+    // Package-manager option parsers can reinterpret a relative destination
+    // beginning with `-`. Resolve it against the child process cwd so it stays
+    // a value while preserving the previous cwd-relative behavior.
+    const resolvedDestination = path.resolve(dir, destination);
+    let args = ['pack', '--pack-destination', resolvedDestination];
+    if (this.packageManager === 'yarn') {
+      if (
+        !sanitizedName ||
+        sanitizedName === '.' ||
+        sanitizedName === '..' ||
+        path.posix.basename(sanitizedName) !== sanitizedName ||
+        path.win32.basename(sanitizedName) !== sanitizedName
+      ) {
+        throw new Error(`Sanitized package name must be a filename segment: ${JSON.stringify(sanitizedName)}`);
+      }
+
+      // %s includes an '@' at the start of packages names with an '@'
+      // so we need to use our sanitizedName instead.
+      args = ['pack', '--out', path.join(resolvedDestination, `${sanitizedName}-%v.tgz`)];
+    }
+    if (this.packageManager === 'bun') {
+      // bun uses `pm pack` instead of `pack`
+      // bun uses --destination instead of --pack-destination
+      args = ['pm', 'pack', '--destination', resolvedDestination];
+    }
+
     const cpLogger = createChildProcessLogger({
       logger: this.logger,
       root: dir,
     });
 
-    let packCmd = 'pack';
-    let destinationFlag = `--pack-destination ${destination}`;
-    if (this.packageManager === 'yarn') {
-      // %s includes an '@' at the start of packages names with an '@'
-      // so we need to use our sanitizedName instead.
-      destinationFlag = `--out ${destination}/${sanitizedName}-%v.tgz`;
-    }
-    if (this.packageManager === 'bun') {
-      // bun uses `pm pack` instead of `pack`
-      packCmd = 'pm pack';
-      // bun uses --destination instead of --pack-destination
-      destinationFlag = `--destination ${destination}`;
-    }
-
     return cpLogger({
-      cmd: `${this.packageManager} ${packCmd} ${destinationFlag}`,
-      args: [],
-      env: {
-        PATH: process.env.PATH!,
-      },
+      cmd: this.packageManager,
+      args,
+      env: getProcessBootstrapEnv({ registryAccess: false }),
     });
   }
 
-  private async writePnpmConfig(dir: string, options: ArchitectureOptions) {
+  private findPnpmWorkspaceFile(dir: string): string | null {
     const workspaceYamlPath = path.join(dir, 'pnpm-workspace.yaml');
-
-    const lines: string[] = [
-      'packages:',
-      "  - '.'",
-      'allowBuilds:',
-      '  bcrypt: true',
-      '  esbuild: true',
-      '  sharp: true',
-      '  protobufjs: true',
-      '  workerd: true',
-      '  bufferutil: true',
-      '  utf-8-validate: true',
-      'minimumReleaseAge: 0',
-    ];
-    if (options.os?.length || options.cpu?.length || options.libc?.length) {
-      lines.push('');
-      lines.push('supportedArchitectures:');
-      if (options.os?.length) {
-        lines.push(`  os: ${JSON.stringify(options.os)}`);
-      }
-      if (options.cpu?.length) {
-        lines.push(`  cpu: ${JSON.stringify(options.cpu)}`);
-      }
-      if (options.libc?.length) {
-        lines.push(`  libc: ${JSON.stringify(options.libc)}`);
-      }
+    if (fs.existsSync(workspaceYamlPath)) {
+      return workspaceYamlPath;
     }
-    lines.push('');
 
-    await fsPromises.writeFile(workspaceYamlPath, lines.join('\n'), 'utf-8');
+    const parentDir = path.resolve(dir, '..');
+    if (parentDir !== dir) {
+      return this.findPnpmWorkspaceFile(parentDir);
+    }
+
+    return null;
+  }
+
+  private async writePnpmConfig(dir: string, options: ArchitectureOptions = {}) {
+    const sourceWorkspaceYamlPath = this.findPnpmWorkspaceFile(this.rootDir);
+    const sourceWorkspaceYaml = sourceWorkspaceYamlPath
+      ? await fsPromises.readFile(sourceWorkspaceYamlPath, 'utf-8')
+      : '';
+
+    await fsPromises.writeFile(
+      path.join(dir, 'pnpm-workspace.yaml'),
+      copyPnpmWorkspaceSettings(sourceWorkspaceYaml, options),
+      'utf-8',
+    );
   }
 
   private async writeYarnConfig(dir: string, options: ArchitectureOptions) {
@@ -154,20 +305,27 @@ export class Deps extends MastraBase {
    * Depending on whether we want to install or add a package, this function returns the appropriate commands.
    * All package managers support both commands (e.g. npm install has an alias on "add")
    */
-  private getPackageManagerCommand(pm: PackageManager, type: 'install' | 'add'): string {
+  private getPackageManagerArgs(pm: PackageManager, type: 'install' | 'add'): string[] {
     const cmd = type === 'install' ? 'install' : 'add';
 
     switch (pm) {
       case 'npm':
-        return `${cmd} --audit=false --fund=false --loglevel=error --progress=false --update-notifier=false`;
+        return [
+          cmd,
+          '--audit=false',
+          '--fund=false',
+          '--loglevel=error',
+          '--progress=false',
+          '--update-notifier=false',
+        ];
       case 'yarn':
-        return `${cmd}`;
+        return [cmd];
       case 'pnpm':
-        return cmd === 'install' ? `${cmd} --loglevel=error` : `${cmd} --loglevel=error`;
+        return [cmd, '--loglevel=error'];
       case 'bun':
-        return cmd;
+        return [cmd];
       default:
-        return cmd;
+        return [cmd];
     }
   }
 
@@ -176,14 +334,11 @@ export class Deps extends MastraBase {
     architecture,
   }: { dir?: string; architecture?: ArchitectureOptions } = {}) {
     const pm = this.packageManager;
-    const installCommand = this.getPackageManagerCommand(pm, 'install');
-    let args: string[] = [];
+    const args = this.getPackageManagerArgs(pm, 'install');
 
     switch (pm) {
       case 'pnpm':
-        if (architecture) {
-          await this.writePnpmConfig(dir, architecture);
-        }
+        await this.writePnpmConfig(dir, architecture);
         break;
       case 'yarn':
         // similar to --ignore-workspace but for yarn
@@ -194,7 +349,7 @@ export class Deps extends MastraBase {
         break;
       case 'npm':
         if (architecture) {
-          args = this.getNpmArgs(architecture);
+          args.push(...this.getNpmArgs(architecture));
         }
         break;
       default:
@@ -207,7 +362,7 @@ export class Deps extends MastraBase {
     });
 
     return cpLogger({
-      cmd: `${pm} ${installCommand}`,
+      cmd: pm,
       args,
       env: process.env as Record<string, string>,
     });
@@ -215,14 +370,11 @@ export class Deps extends MastraBase {
 
   public async installPackages(packages: string[]) {
     const pm = this.packageManager;
-    const installCommand = this.getPackageManagerCommand(pm, 'add');
+    const installArgs = this.getPackageManagerArgs(pm, 'add');
 
-    const env: Record<string, string> = {
-      PATH: process.env.PATH!,
-    };
-
-    if (process.env.npm_config_registry) {
-      env.npm_config_registry = process.env.npm_config_registry;
+    const optionLikePackage = packages.find(packageSpec => packageSpec.startsWith('-'));
+    if (optionLikePackage) {
+      throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
     }
 
     const cpLogger = createChildProcessLogger({
@@ -231,9 +383,9 @@ export class Deps extends MastraBase {
     });
 
     return cpLogger({
-      cmd: `${pm} ${installCommand}`,
-      args: packages,
-      env,
+      cmd: pm,
+      args: [...installArgs, ...packages],
+      env: getProcessBootstrapEnv(),
     });
   }
 

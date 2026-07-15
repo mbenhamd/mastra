@@ -703,7 +703,13 @@ describe('HarnessPG', () => {
       completedAt,
       durationMs: 10,
       usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
-      toolRollup: { count: 1, errors: 0, totalDurationMs: 4, maxDurationMs: 4, perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } } },
+      toolRollup: {
+        count: 1,
+        errors: 0,
+        totalDurationMs: 4,
+        maxDurationMs: 4,
+        perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } },
+      },
       createdAt: completedAt,
       ...over,
     });
@@ -711,7 +717,9 @@ describe('HarnessPG', () => {
     const saved = await harness.saveRunSummary({ summary: mk('rs-1', 100) as any });
     expect(saved.durationMs).toBe(10);
     // Idempotent: a later write for the same runId is a no-op.
-    const again = await harness.saveRunSummary({ summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any });
+    const again = await harness.saveRunSummary({
+      summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any,
+    });
     expect(again.durationMs).toBe(10);
     expect(again.status).toBe('completed');
 
@@ -741,7 +749,12 @@ describe('HarnessPG', () => {
     let cursorC: number | undefined;
     let cursorR: string | undefined;
     for (let i = 0; i < 10; i++) {
-      const p = await harness.listRunSummaries({ sessionId: 'session-rs', limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      const p = await harness.listRunSummaries({
+        sessionId: 'session-rs',
+        limit: 1,
+        beforeCompletedAt: cursorC,
+        beforeRunId: cursorR,
+      });
       seen.push(...p.summaries.map(s => s.runId));
       if (p.nextBeforeCompletedAt === undefined) break;
       cursorC = p.nextBeforeCompletedAt;
@@ -2399,7 +2412,13 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       const after = await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
       expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
       // The updated link also hydrates through a subtree read (not just list).
-      const afterSub = await harness.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'd1', depth: 0, limit: 10 });
+      const afterSub = await harness.loadPlanTaskSubtree({
+        harnessName: 'default',
+        sessionId,
+        rootTaskId: 'd1',
+        depth: 0,
+        limit: 10,
+      });
       expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
     });
   });

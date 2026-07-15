@@ -8,7 +8,7 @@ const harness = new Harness({
   },
 });
 
-session.subscribe((event) => {
+session.subscribe(event => {
   if (event.type === 'subagent_start') {
     console.log(
       `[depth=${event.depth}] subagent ${event.agentType} started`,

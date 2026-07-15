@@ -34,6 +34,7 @@ describe('validate', () => {
     // Create an empty module resolve map
     moduleMapPath = join(tempDir, 'module-resolve-map.json');
     await writeFile(moduleMapPath, JSON.stringify({}));
+    await writeFile(join(tempDir, 'package.json'), JSON.stringify({ type: 'module' }));
   });
 
   afterAll(async () => {

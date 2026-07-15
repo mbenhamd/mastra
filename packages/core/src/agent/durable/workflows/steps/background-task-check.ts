@@ -2,10 +2,10 @@ import { z } from 'zod';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
 import { ChunkFrom } from '../../../../stream/types';
-import { createStep } from '../../../../workflows';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { createStep } from '../../../../workflows/workflow';
 import { DurableStepIds } from '../../constants';
-import { getGlobalRunRegistryEntry } from '../../run-registry';
+import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 
 const BG_CHECK_STEP_ID = `${DurableStepIds.AGENTIC_EXECUTION}-bg-task-check`;
@@ -22,11 +22,13 @@ const bgCheckOutputSchema = z.any();
  *
  * Mirrors the regular agent's backgroundTaskCheckStep pattern:
  * - After tool calls complete, checks if any background tasks are still running
- * - First invocation (retryCount === 0): returns immediately with backgroundTaskPending=true
- *   so the loop can re-enter without blocking
- * - Subsequent invocations: waits with timeout for the next task to complete,
- *   then sets isContinued=true so the LLM processes the result
  * - If no running tasks: passes through unchanged
+ * - If an explicit waitTimeoutMs is configured and retryCount === 0: returns
+ *   immediately with backgroundTaskPending=true (caller drives continuation)
+ * - Otherwise: waits for the next task to complete using the configured
+ *   waitTimeoutMs or a 1 s default — this keeps the workflow (and its pubsub
+ *   subscription) alive so background-task tool-result chunks are delivered
+ * - When a task completes: sets isContinued=true so the LLM processes the result
  */
 export function createDurableBackgroundTaskCheckStep() {
   return createStep({
@@ -34,20 +36,21 @@ export function createDurableBackgroundTaskCheckStep() {
     inputSchema: bgCheckInputSchema,
     outputSchema: bgCheckOutputSchema,
     execute: async params => {
-      const { inputData, retryCount, getInitData } = params;
+      const { inputData, getInitData, retryCount } = params;
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       const typedInput = inputData as Record<string, any>;
 
       const initData = getInitData<{
         runId: string;
+        runtimeBindingId?: string;
         agentId: string;
         runtimeResolution?: 'registry-required';
         options?: { skipBgTaskWait?: boolean };
         state?: { threadId?: string; resourceId?: string };
       }>();
-      const { runId, agentId } = initData;
+      const { runId, runtimeBindingId, agentId } = initData;
 
-      const registryEntry = getGlobalRunRegistryEntry(runId);
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       if (!registryEntry && initData.runtimeResolution === 'registry-required') {
         throw new MastraError({
           id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
@@ -76,7 +79,7 @@ export function createDurableBackgroundTaskCheckStep() {
       }
 
       // When the outer caller drives continuation externally (e.g. streamUntilIdle),
-      // skip the in-loop wait. We still mark pending so downstream knows.
+      // skip the in-loop wait. We still mark pending so ownstream knows.
       if (initData.options?.skipBgTaskWait) {
         return { ...typedInput, backgroundTaskPending: true };
       }
@@ -87,10 +90,34 @@ export function createDurableBackgroundTaskCheckStep() {
       const managerConfig = bgManager.config;
       const waitTimeoutMs = bgConfig?.waitTimeoutMs ?? managerConfig?.waitTimeoutMs;
 
-      // First invocation: signal pending but don't block
-      if (retryCount === 0 || !waitTimeoutMs) {
+      // The regular agent gates on `retryCount === 0 || !waitTimeoutMs`
+      // and can afford to skip waiting because tool-result chunks from
+      // background tasks are pushed directly into the ReadableStream
+      // controller via safeEnqueue — that works even after this step
+      // returns.
+      //
+      // The durable agent emits tool-result chunks via pubsub.  The
+      // pubsub subscription is torn down when the stream closes and the
+      // consumer calls cleanup().  If this step returns without waiting,
+      // the workflow finishes, FINISH fires, the stream closes, cleanup
+      // runs, and the pubsub subscriber is gone before the background
+      // task can deliver its result.
+      //
+      // Therefore the durable agent must always wait when background
+      // tasks are running — using the configured waitTimeoutMs, or a
+      // sensible 1 s default to keep the workflow (and pubsub) alive.
+
+      // First invocation without explicit waitTimeoutMs — match the
+      // regular agent's "signal pending, don't block" on retryCount 0,
+      // but only when the caller provided an explicit timeout (meaning
+      // they'll drive continuation externally).
+      if (retryCount === 0 && waitTimeoutMs) {
         return { ...typedInput, backgroundTaskPending: true };
       }
+
+      // Use configured timeout, or default to 1 s so the workflow stays
+      // alive long enough for pubsub to deliver background-task results.
+      const effectiveWaitMs = waitTimeoutMs ?? 1000;
 
       // Emit initial progress chunk
       if (pubsub) {
@@ -109,7 +136,7 @@ export function createDurableBackgroundTaskCheckStep() {
       // Wait for the next task to complete (or until timeout)
       try {
         await bgManager.waitForNextTask(taskIds, {
-          timeoutMs: waitTimeoutMs,
+          timeoutMs: effectiveWaitMs,
           onProgress: (elapsedMs: number) => {
             if (!pubsub) return;
             void emitChunkEvent(pubsub, runId, {

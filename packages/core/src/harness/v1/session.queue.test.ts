@@ -56,6 +56,21 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
+  it('threads replacement mode semantics through queue drain and recovery options', async () => {
+    const agent = new MockAgent({ id: 'default' });
+    const { harness } = setupHarness({
+      agents: { default: agent },
+      modes: [{ id: 'default', agentId: 'default', tools: { queueTool: {} as any } }],
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    await session.queue({ content: 'queued' });
+
+    expect(agent.streamCalls[0]!.options.toolsetsMode).toBe('replace');
+    expect(agent.streamCalls[0]!.options.toolsets['mode:default']).toHaveProperty('queueTool');
+    await session.close();
+  });
+
   it('drained item settles with queue_completed carrying queuedItemId + signalId (§10.2)', async () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
@@ -1709,6 +1724,87 @@ describe('Session.queue() — suspension', () => {
     expect(replaySession.getRecord().queueAdmissionReceipts?.[queuedItemId]).toMatchObject({
       status: 'failed',
       error: { code: 'harness.queue_resume_recovery_stale' },
+    });
+  });
+
+  it('continues draining after a direct response discovers a stale queued resume', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({ finishReason: 'stop', text: 'next completed' });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const now = Date.now();
+    const staleAt = now - 31_000;
+    const staleId = 'q-stale-direct-response';
+    const nextId = 'q-after-stale-direct-response';
+    await (session as any)._flushUpdate((prev: any) => ({
+      ...prev,
+      pendingQueue: [
+        {
+          id: staleId,
+          admissionId: 'admission-stale-direct-response',
+          admissionHash: 'hash-stale-direct-response',
+          enqueuedAt: now,
+          content: 'stale resumed turn',
+          attachments: [],
+        },
+        {
+          id: nextId,
+          admissionId: 'admission-after-stale-direct-response',
+          admissionHash: 'hash-after-stale-direct-response',
+          enqueuedAt: now + 1,
+          content: 'run after stale recovery',
+          attachments: [],
+        },
+      ],
+      pendingResume: {
+        kind: 'tool-approval',
+        itemId: 'tool-approval:stale-call',
+        runId: 'stale-run',
+        toolCallId: 'stale-call',
+        toolName: 'shell',
+        source: 'parent',
+        requestedAt: staleAt,
+        resumedAt: staleAt,
+        queuedItemId: staleId,
+        payload: { input: { cmd: 'echo stale' } },
+      },
+      queueAdmissionReceipts: {
+        [staleId]: {
+          admissionId: 'admission-stale-direct-response',
+          admissionHash: 'hash-stale-direct-response',
+          queuedItemId: staleId,
+          status: 'accepted',
+          runId: 'stale-run',
+          signalId: 'signal-stale',
+          attempts: 1,
+          enqueuedAt: now,
+          acceptedAt: now,
+          updatedAt: now,
+        },
+        [nextId]: {
+          admissionId: 'admission-after-stale-direct-response',
+          admissionHash: 'hash-after-stale-direct-response',
+          queuedItemId: nextId,
+          status: 'accepted',
+          attempts: 0,
+          enqueuedAt: now + 1,
+          acceptedAt: now + 1,
+          updatedAt: now + 1,
+        },
+      },
+    }));
+
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toMatchObject({
+      code: 'harness.queue_resume_recovery_stale',
+    });
+    await session.waitForIdle({ timeoutMs: 1_000 });
+
+    expect(agent.resumeCalls).toHaveLength(0);
+    expect(agent.streamCalls.map(call => extractSignalContents(call.messages))).toEqual(['run after stale recovery']);
+    expect(session.getRecord().pendingQueue).toEqual([]);
+    expect(session.getRecord().queueAdmissionReceipts?.[staleId]).toMatchObject({ status: 'failed' });
+    expect(session.getRecord().queueAdmissionReceipts?.[nextId]).toMatchObject({
+      status: 'completed',
+      result: expect.objectContaining({ text: 'next completed' }),
     });
   });
 });

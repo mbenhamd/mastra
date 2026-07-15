@@ -10,15 +10,6 @@ export { BACKGROUND_TASK_WORKFLOW_ID } from './workflow-id';
 
 const inputSchema = z.object({ taskId: z.string() });
 
-const attemptOutcomeSchema = z.enum(['success', 'retry', 'cancelled', 'timed_out']);
-
-const attemptOutputSchema = z.object({
-  taskId: z.string(),
-  outcome: attemptOutcomeSchema,
-  result: z.unknown().optional(),
-  error: z.any().optional(),
-});
-
 const bodyIOSchema = z.object({
   taskId: z.string(),
   done: z.boolean().optional(),
@@ -36,16 +27,12 @@ const WORKFLOW_STATUS_TO_PERSIST = ['suspended', 'pending', 'paused', 'waiting']
 /**
  * Builds the per-task evented workflow that owns executor + retries.
  *
- * Shape: outer workflow runs an inner `[run-attempt, classify-outcome]`
- * workflow inside a `dountil` loop. `run-attempt` invokes the executor and
- * categorises the outcome; `classify-outcome` persists final state, advances
- * retry bookkeeping, and decides whether the loop is done. The dountil
- * predicate exits on `done === true`.
- *
- * The nested-workflow-as-loop-body path lives in
- * `processWorkflowEnd → processWorkflowLoop` and was fixed in PR #16312.
- * Suspend/resume routes through the runtime's nested-workflow auto-detect
- * (`processWorkflowStepRun` resume branch).
+ * A single `run-attempt` step is the `dountil` body. It invokes the executor,
+ * persists the outcome, advances retry bookkeeping, and returns whether the
+ * loop is done. Keeping the durable loop body as a step gives each retry the
+ * outer run's iteration identity; a nested durable workflow would need a
+ * separate iteration-scoped ownership contract before it could be replayed
+ * safely.
  *
  * Step bodies close over `manager` directly — the bg-tasks layer is the only
  * consumer of the `@internal` private fields.
@@ -54,18 +41,18 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
   const runAttemptStep = createStep({
     id: 'run-attempt',
     inputSchema: bodyIOSchema,
-    outputSchema: attemptOutputSchema,
+    outputSchema: bodyOutputSchema,
     execute: async ({ inputData, abortSignal: workflowAbortSignal, suspend, resumeData }) => {
       const { taskId } = inputData;
       const storage = await manager.getStorage();
       const task = await storage.getTask(taskId);
       if (!task || task.status === 'cancelled') {
         manager.deregisterTaskContext(taskId);
-        return { taskId, outcome: 'cancelled' as const };
+        return { taskId, done: true };
       }
       if (manager.isShuttingDown()) {
         manager.deregisterTaskContext(taskId);
-        return { taskId, outcome: 'cancelled' as const };
+        return { taskId, done: true };
       }
 
       // Resolve the executor. Two paths:
@@ -91,7 +78,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
           await manager.publishLifecycleEvent('task.failed', failedTask);
         }
         manager.deregisterTaskContext(taskId);
-        throw new Error(errorInfo.message);
+        return { taskId, done: true };
       }
 
       // Throttled progress publisher.
@@ -114,7 +101,7 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         abortController.abort(new Error(BACKGROUND_TASK_SHUTDOWN_ABORT_MESSAGE));
         manager.activeAbortControllers.delete(taskId);
         manager.deregisterTaskContext(taskId);
-        return { taskId, outcome: 'cancelled' as const };
+        return { taskId, done: true };
       }
       // Wire the workflow's run-level abort signal into our local controller
       // so `workflow.getRun(taskId).cancel()` propagates to the executor.
@@ -162,8 +149,78 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
         pendingSuspend = { data, suspendOptions };
       };
 
+      const persistAttemptOutcome = async ({
+        outcome,
+        result,
+        error,
+      }: {
+        outcome: 'success' | 'retry' | 'cancelled' | 'timed_out';
+        result?: unknown;
+        error?: { message: string; stack?: string };
+      }) => {
+        const currentTask = await storage.getTask(taskId);
+        if (!currentTask) return { taskId, done: true };
+
+        if (outcome === 'cancelled') {
+          manager.deregisterTaskContext(taskId);
+          return { taskId, done: true };
+        }
+
+        if (outcome === 'timed_out') {
+          const status = currentTask.status as string;
+          if (status !== 'timed_out' && status !== 'cancelled') {
+            await storage.updateTask(taskId, {
+              status: 'timed_out',
+              error: { message: `Task timed out after ${currentTask.timeoutMs}ms` },
+              completedAt: new Date(),
+            });
+            const timedOutTask = await storage.getTask(taskId);
+            if (timedOutTask) await manager.publishLifecycleEvent('task.failed', timedOutTask);
+          }
+          return { taskId, done: true };
+        }
+
+        if (outcome === 'success') {
+          if ((currentTask.status as BackgroundTaskStatus) === 'cancelled') {
+            manager.deregisterTaskContext(taskId);
+            return { taskId, done: true };
+          }
+          await storage.updateTask(taskId, { status: 'completed', result, completedAt: new Date() });
+          const completedTask = await storage.getTask(taskId);
+          if (completedTask) {
+            await manager.runLocalCompletionHooks(completedTask, 'completed', { result });
+            await manager.publishLifecycleEvent('task.completed', completedTask);
+          }
+          return { taskId, done: true, result };
+        }
+
+        if (currentTask.retryCount < currentTask.maxRetries) {
+          await storage.updateTask(taskId, {
+            retryCount: currentTask.retryCount + 1,
+            error: undefined,
+            startedAt: new Date(),
+          });
+          return { taskId, done: false };
+        }
+
+        // A tool failure is a modeled background-task result, not an engine
+        // failure. Persist it and end the loop cleanly; throwing from a loop
+        // body would ask the workflow engine to retry the transition itself.
+        const errorInfo = error ?? { message: 'Unknown error' };
+        await storage.updateTask(taskId, { status: 'failed', error: errorInfo, completedAt: new Date() });
+        const failedTask = await storage.getTask(taskId);
+        if (failedTask) {
+          await manager.runLocalCompletionHooks(failedTask, 'failed', { error: errorInfo });
+          await manager.publishLifecycleEvent('task.failed', failedTask);
+        }
+        return { taskId, done: true };
+      };
+
+      let outcome: 'success' | 'retry' | 'cancelled' | 'timed_out';
+      let attemptResult: unknown;
+      let attemptError: { message: string; stack?: string } | undefined;
       try {
-        const result = await executor.execute(task.args, {
+        attemptResult = await executor.execute(task.args, {
           abortSignal: abortController.signal,
           onProgress,
           suspend: wrappedSuspend,
@@ -178,143 +235,49 @@ export function buildBackgroundTaskWorkflow(manager: BackgroundTaskManager) {
 
         if (wasShutdownAbort()) {
           manager.deregisterTaskContext(taskId);
-          return { taskId, outcome: 'cancelled' as const };
+          outcome = 'cancelled';
+        } else {
+          outcome = 'success';
         }
-
-        return { taskId, outcome: 'success' as const, result };
       } catch (error: any) {
         const currentTask = await storage.getTask(taskId);
         if (!currentTask || (currentTask.status as BackgroundTaskStatus) === 'cancelled') {
           manager.deregisterTaskContext(taskId);
-          return { taskId, outcome: 'cancelled' as const };
-        }
-
-        // Shutdown aborts are local process teardown, not task timeouts. Other
-        // aborted-signal exits are treated as timeouts; explicit cancellation is
-        // already handled by the storage-status check above.
-        if (wasShutdownAbort()) {
+          outcome = 'cancelled';
+        } else if (wasShutdownAbort()) {
+          // Shutdown aborts are local process teardown, not task timeouts.
           manager.deregisterTaskContext(taskId);
-          return { taskId, outcome: 'cancelled' as const };
-        }
-
-        if (
+          outcome = 'cancelled';
+        } else if (
           abortController.signal.aborted ||
           error?.name === 'AbortError' ||
           error?.message === 'Task cancelled' ||
           error?.message?.startsWith('Task timed out after ')
         ) {
-          return { taskId, outcome: 'timed_out' as const };
+          outcome = 'timed_out';
+        } else {
+          outcome = 'retry';
+          attemptError = { message: error?.message ?? 'Unknown error', stack: error?.stack };
         }
-
-        return {
-          taskId,
-          outcome: 'retry' as const,
-          error: { message: error?.message ?? 'Unknown error', stack: error?.stack },
-        };
       } finally {
         clearTimeout(timeoutHandle);
         workflowAbortSignal.removeEventListener('abort', onWorkflowAbort);
         manager.activeAbortControllers.delete(taskId);
       }
+
+      return persistAttemptOutcome({ outcome, result: attemptResult, error: attemptError });
     },
   });
-
-  const classifyOutcomeStep = createStep({
-    id: 'classify-outcome',
-    inputSchema: attemptOutputSchema,
-    outputSchema: bodyOutputSchema,
-    execute: async ({ inputData }) => {
-      const { taskId, outcome, result, error } = inputData;
-      const storage = await manager.getStorage();
-      const task = await storage.getTask(taskId);
-      if (!task) return { taskId, done: true };
-
-      if (outcome === 'cancelled') {
-        manager.deregisterTaskContext(taskId);
-        return { taskId, done: true };
-      }
-
-      if (outcome === 'timed_out') {
-        const status = task.status as string;
-        if (status !== 'timed_out' && status !== 'cancelled') {
-          await storage.updateTask(taskId, {
-            status: 'timed_out',
-            error: { message: `Task timed out after ${task.timeoutMs}ms` },
-            completedAt: new Date(),
-          });
-          const timedOutTask = await storage.getTask(taskId);
-          if (timedOutTask) await manager.publishLifecycleEvent('task.failed', timedOutTask);
-        }
-        return { taskId, done: true };
-      }
-
-      if (outcome === 'success') {
-        if ((task.status as BackgroundTaskStatus) === 'cancelled') {
-          manager.deregisterTaskContext(taskId);
-          return { taskId, done: true };
-        }
-        await storage.updateTask(taskId, { status: 'completed', result, completedAt: new Date() });
-        const completedTask = await storage.getTask(taskId);
-        if (completedTask) {
-          await manager.runLocalCompletionHooks(completedTask, 'completed', { result });
-          await manager.publishLifecycleEvent('task.completed', completedTask);
-        }
-        return { taskId, done: true, result };
-      }
-
-      // outcome === 'retry'
-      if (task.retryCount < task.maxRetries) {
-        await storage.updateTask(taskId, {
-          retryCount: task.retryCount + 1,
-          error: undefined,
-          startedAt: new Date(),
-        });
-        return { taskId, done: false };
-      }
-
-      // Retries exhausted: persist failure and throw so the workflow run ends
-      // in `failed` rather than completing cleanly. Throw matches the prior
-      // single-step behavior — workflow-run history stays accurate.
-      const errorInfo = error ?? { message: 'Unknown error' };
-      await storage.updateTask(taskId, { status: 'failed', error: errorInfo, completedAt: new Date() });
-      const failedTask = await storage.getTask(taskId);
-      if (failedTask) {
-        await manager.runLocalCompletionHooks(failedTask, 'failed', { error: errorInfo });
-        await manager.publishLifecycleEvent('task.failed', failedTask);
-      }
-      const thrown = new Error(errorInfo.message);
-      if (errorInfo.stack) thrown.stack = errorInfo.stack;
-      throw thrown;
-    },
-  });
-
-  const attemptBodyWorkflow = createWorkflow({
-    id: `${BACKGROUND_TASK_WORKFLOW_ID}__attempt`,
-    inputSchema: bodyIOSchema,
-    outputSchema: bodyOutputSchema,
-    steps: [runAttemptStep, classifyOutcomeStep],
-    options: {
-      // `dountil` feeds the prior iteration's output back in as input. The
-      // body's actual entry point only needs `taskId`, but the loop's
-      // feedback shape includes `done`/`result`/etc. Skip validation rather
-      // than widen every step's input schema.
-      validateInputs: false,
-      shouldPersistSnapshot: ({ workflowStatus }) => WORKFLOW_STATUS_TO_PERSIST.includes(workflowStatus),
-    },
-  })
-    .then(runAttemptStep)
-    .then(classifyOutcomeStep)
-    .commit();
 
   return createWorkflow({
     id: BACKGROUND_TASK_WORKFLOW_ID,
     inputSchema,
     outputSchema: bodyOutputSchema,
-    steps: [attemptBodyWorkflow],
+    steps: [runAttemptStep],
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => WORKFLOW_STATUS_TO_PERSIST.includes(workflowStatus),
     },
   })
-    .dountil(attemptBodyWorkflow, async ({ inputData }) => inputData?.done === true)
+    .dountil(runAttemptStep, async ({ inputData }) => inputData?.done === true)
     .commit();
 }

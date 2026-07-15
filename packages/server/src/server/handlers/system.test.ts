@@ -40,7 +40,22 @@ const mockObservabilityStorageCapabilities = {
   persistence: 'persistent',
 };
 
-const createMockMastra = (hasEditor: boolean, storage?: MockStorage, hasObservability = false) =>
+type MockEditor = {
+  getSource?: () => 'code' | 'db' | undefined;
+  getSourceControlProvider?: () =>
+    | {
+        id: string;
+        displayName: string;
+        getCapabilities: () => Promise<{
+          canWrite: boolean;
+          canOpenChangeRequest: boolean;
+          reason?: string;
+        }>;
+      }
+    | undefined;
+};
+
+const createMockMastra = (editor: boolean | MockEditor, storage?: MockStorage, hasObservability = false) =>
   ({
     getEditor: () => (editor === true ? {} : editor || undefined),
     getStorage: () => storage,

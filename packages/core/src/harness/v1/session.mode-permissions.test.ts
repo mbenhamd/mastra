@@ -211,10 +211,15 @@ describe('Mode workspace tool profile (§4.2e)', () => {
         workspaceTools: { expose: ['read'] },
       },
     ];
-    const { harness } = setupHarness({ modes, defaultModeId: 'reader', toolCategoryResolver: categoryResolver });
+    const { harness, agent } = setupHarness({
+      modes,
+      defaultModeId: 'reader',
+      toolCategoryResolver: categoryResolver,
+    });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
-      const toolsets = (session as any)._buildToolsets(harness.getMode('reader')!);
+      await session.message({ content: 'inspect tools' });
+      const toolsets = agent.streamCalls.at(-1)!.options.toolsets;
       const modeTools = Object.keys(toolsets['mode:reader']).sort();
       // editDoc (edit) + runCmd (execute) withheld; readDoc kept; mcpThing + misc (uncategorized) untouched.
       expect(modeTools).toEqual(['mcpThing', 'misc', 'readDoc']);
@@ -234,10 +239,11 @@ describe('Mode workspace tool profile (§4.2e)', () => {
         workspaceTools: { expose: ['read', 'edit', 'execute'] },
       },
     ];
-    const { harness } = setupHarness({ modes, defaultModeId: 'full', toolCategoryResolver: categoryResolver });
+    const { harness, agent } = setupHarness({ modes, defaultModeId: 'full', toolCategoryResolver: categoryResolver });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
-      const toolsets = (session as any)._buildToolsets(harness.getMode('full')!);
+      await session.message({ content: 'inspect tools' });
+      const toolsets = agent.streamCalls.at(-1)!.options.toolsets;
       expect(Object.keys(toolsets['mode:full']).sort()).toEqual(['editDoc', 'readDoc', 'runCmd']);
     } finally {
       await harness.shutdown();
@@ -246,12 +252,13 @@ describe('Mode workspace tool profile (§4.2e)', () => {
 
   it('a SubagentDefinition.tools override is layered onto the subagent tool surface (§9)', async () => {
     const modes: HarnessMode[] = [{ id: 'sub', agentId: 'default' }];
-    const { harness } = setupHarness({ modes, defaultModeId: 'sub' });
+    const { harness, agent } = setupHarness({ modes, defaultModeId: 'sub' });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
       // Simulate the spawn/delegate wiring that sets the child's override.
       (session as any)._subagentToolsOverride = { extraTool: tool('extraTool') };
-      const toolsets = (session as any)._buildToolsets(harness.getMode('sub')!);
+      await session.message({ content: 'inspect tools' });
+      const toolsets = agent.streamCalls.at(-1)!.options.toolsets;
       expect(toolsets['subagent:tools']).toBeDefined();
       expect(Object.keys(toolsets['subagent:tools'])).toEqual(['extraTool']);
     } finally {
@@ -263,10 +270,11 @@ describe('Mode workspace tool profile (§4.2e)', () => {
     const modes: HarnessMode[] = [
       { id: 'all', agentId: 'default', tools: { readDoc: tool('readDoc'), editDoc: tool('editDoc') } },
     ];
-    const { harness } = setupHarness({ modes, defaultModeId: 'all', toolCategoryResolver: categoryResolver });
+    const { harness, agent } = setupHarness({ modes, defaultModeId: 'all', toolCategoryResolver: categoryResolver });
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
-      const toolsets = (session as any)._buildToolsets(harness.getMode('all')!);
+      await session.message({ content: 'inspect tools' });
+      const toolsets = agent.streamCalls.at(-1)!.options.toolsets;
       expect(Object.keys(toolsets['mode:all']).sort()).toEqual(['editDoc', 'readDoc']);
     } finally {
       await harness.shutdown();

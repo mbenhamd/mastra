@@ -14,10 +14,10 @@ It persists like any other session. This means:
 
 - Subagent state survives restarts the same way parent state does.
 - Walking `parentSessionId` rebuilds the subagent tree without needing in-memory
-state.
+  state.
 - Public `listSessions(...)` stays resource-scoped; storage exposes
-`listChildSessions(...)` so recovery and outbox projection can rebuild subagent
-trees after restart.
+  `listChildSessions(...)` so recovery and outbox projection can rebuild subagent
+  trees after restart.
 
 **Ownership model.** A subagent session is **independently addressable** by its
 own `sessionId`: direct SSE under §10.6 and direct inbox writes under §13.2 are
@@ -46,7 +46,7 @@ Subagent depth is computed from the persisted `parentSessionId` chain per §2.4;
 isolated by `(harnessName, sessionId)`: a parent and each subagent child own
 disjoint plan trees, and plan-task reads/writes never cross the session boundary.
 A child session keeps its own plan tree under its own `sessionId` even though it
-shares the parent's lease for *write ownership* — plan-task mutators are fenced on
+shares the parent's lease for _write ownership_ — plan-task mutators are fenced on
 **the owning session's** lease/version, and because a child shares the parent's
 `ownerId`, the same live owner serializes both trees' writes.
 
@@ -57,7 +57,7 @@ in-turn child the parent awaits inline (§9) — delegation is DURABLE and spans
 turns and restarts:
 
 - **Link + status, one transaction.** `task_delegate({ taskId, agentType, task?,
-  includeSubtree? })` creates a subagent session via the normal subagent-session
+includeSubtree? })` creates a subagent session via the normal subagent-session
   path (`origin: 'subagent-tool'`, `parentSessionId`, depth+1, §8 cap enforced
   before any mutation), then writes `delegatedSubagentSessionId` onto the plan
   task AND drives it `in_progress` in ONE `mutatePlanTasksForSession` write under

@@ -15,12 +15,12 @@ type HarnessWorkspaceConfig =
   | {
       kind: 'per-resource';
       create: (ctx: { resourceId: string }) => Workspace | Promise<Workspace>;
-      eager?: boolean;                                // Provision on first session(); default false
+      eager?: boolean; // Provision on first session(); default false
     }
   | {
       kind: 'per-session';
-      provider: WorkspaceProvider;                    // see below
-      eager?: boolean;                                // Provision on harness.session(); default false
+      provider: WorkspaceProvider; // see below
+      eager?: boolean; // Provision on harness.session(); default false
     };
 
 // The contract a per-session workspace provider must satisfy. The harness

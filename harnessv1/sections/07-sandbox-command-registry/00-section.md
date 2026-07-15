@@ -52,6 +52,7 @@ not carry executable callbacks, per-principal grants, argument validators, or
 environment mutation.
 
 Form classification:
+
 - Structured form: `args` is supplied (including empty `[]`). The registry is
   consulted by command name and arguments are passed through as argv; they are
   never reparsed as shell syntax.
@@ -68,6 +69,7 @@ Form classification:
   model-visible tool name.
 
 Current-code migration boundary:
+
 - Restricted command policy may be enforced by a core provider, provider
   adapter, or Harness wrapper, but the resolved workspace path is valid only
   when every command-start entrypoint exposed for that workspace routes through
@@ -100,6 +102,7 @@ Current-code migration boundary:
   authorized.
 
 Resolution rules:
+
 - The same resolution applies before every sandbox command start, including
   foreground `executeCommand` and background process-manager spawn paths. A
   replayed tool call under `'restricted'` fails closed if the configured policy

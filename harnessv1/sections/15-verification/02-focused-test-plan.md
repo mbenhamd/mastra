@@ -1877,7 +1877,7 @@ existing harness-domain good-citizen pattern.
 
 The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
 
-- *Tools (§6.4 injection).* `createPlanTaskTools(session)` registers
+- _Tools (§6.4 injection)._ `createPlanTaskTools(session)` registers
   `task_add` / `task_decompose` / `task_reparent` / `task_update` /
   `task_complete` / `plan_task_check` / `task_write` (back-compat) under the
   `harness:builtin` toolset the agent receives every turn; each tool routes its
@@ -1885,29 +1885,29 @@ The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
   only. A rejected mutation returns an `isError` tool payload (it does not abort
   the turn). `plan_task_check({ rootTaskId?, depth?, status?, limit })` returns a
   BOUNDED next-N slice (never the whole tree by default) and emits no event.
-- *Custom event (§10.3).* Every MUTATING tool emits the dotted custom event
+- _Custom event (§10.3)._ Every MUTATING tool emits the dotted custom event
   `papersflow.plan_task.updated` (carrying the op + affected task ids) through
   the session's `_emitCustomEvent` path — not a §10.2 built-in union member, not
   a built-in-prefix family.
-- *Rollup (RATIFIED truth-table).* A parent whose `statusSource` is `'derived'`
+- _Rollup (RATIFIED truth-table)._ A parent whose `statusSource` is `'derived'`
   recomputes bottom-up on every status mutation: any child `failed` → failed;
   else any `in_progress` → in_progress; else `blocked` (own unsatisfied
   `blockedBy` dep or any child `blocked`) → blocked; else all children terminal
   with at least one `completed` (`cancelled` counts as skipped/ok) → completed;
   else all `cancelled` → cancelled; else pending. An explicit terminal status
   (`statusSource: 'explicit'`) is NEVER overwritten by rollup.
-- *`blockedBy`.* An unsatisfied dependency (a dep still pending / in_progress /
+- _`blockedBy`._ An unsatisfied dependency (a dep still pending / in_progress /
   blocked) factors into rollup as `blocked`; a `completed` / `cancelled` /
   `failed` dep releases the block.
-- *Cycle prevention.* `task_reparent` rejects a move that would make a task its
+- _Cycle prevention._ `task_reparent` rejects a move that would make a task its
   own ancestor, and `task_update` rejects a `blockedBy` edge that would close a
   dependency cycle — both with a typed `HarnessPlanTaskCycleError`.
-- *Per-root single in_progress.* Setting a task `in_progress` is rejected with
+- _Per-root single in_progress._ Setting a task `in_progress` is rejected with
   `HarnessPlanTaskInProgressConflictError` when another task in the SAME root
   subtree is already `in_progress` (the spec-faithful choice is REJECT, so the
   plan stays an explicit auditable record; the model must complete/pause the
   current focus first).
-- *Transaction atomicity.* `task_decompose` / `task_reparent` and any rollup
+- _Transaction atomicity._ `task_decompose` / `task_reparent` and any rollup
   write set commit through `mutatePlanTasksForSession` all-or-nothing under one
   session-owner fence; a stale fence rejects and writes no rows.
 
@@ -1916,7 +1916,7 @@ The built-in plan-task tools and the TM-4 hierarchy layer are tests-first:
 The `task_delegate` tool and its durable wait-point / rollup / recovery are
 tests-first:
 
-- *Delegate write.* `task_delegate({ taskId, agentType, task?, includeSubtree? })`
+- _Delegate write._ `task_delegate({ taskId, agentType, task?, includeSubtree? })`
   spawns a subagent session (the normal `origin: 'subagent-tool'` /
   `parentSessionId` path; §8 depth cap enforced BEFORE any mutation), writes
   `delegatedSubagentSessionId` onto the plan task, and drives the task
@@ -1925,7 +1925,7 @@ tests-first:
   `in_progress`-per-root invariant still rejects a conflicting delegation, an
   unknown `agentType` returns an `isError` payload (the zod enum rejects it), and
   the tool is registered only when subagent types exist.
-- *Durable wait-point + rollup.* The delegated task stays `in_progress` until the
+- _Durable wait-point + rollup._ The delegated task stays `in_progress` until the
   subagent session terminalizes. A completion hook rolls it up: subagent
   completed → `completed`; subagent error / abort / cancelled session → `failed`.
   The §5.1k truth-table then cascades the derived status to ancestors. The link
@@ -1933,7 +1933,7 @@ tests-first:
   coupling to `suspendTool` / the agent loop), and the rollup write is fenced and
   emits its delta best-effort (out-of-turn terminalization skips the turn-gated
   event; the durable write + summary are authoritative).
-- *Recovery on rehydrate.* Hydration scans non-terminal delegated tasks and
+- _Recovery on rehydrate._ Hydration scans non-terminal delegated tasks and
   reconciles each against the subagent session's durable state: terminalized
   while down → roll up from the outcome; still live → re-attach the hook; subagent
   gone/deleted → fail closed (`failed`). Reconcile is idempotent (a terminal task

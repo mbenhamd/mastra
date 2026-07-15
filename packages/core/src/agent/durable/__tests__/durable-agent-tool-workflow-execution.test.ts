@@ -365,11 +365,11 @@ describe('DurableAgent tool approval workflow execution', () => {
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const prep = await durableAgent.prepare('Use the tool', { requireToolApproval: true });
-    const events = collectPubsubEvents(pubsub, prep.runId);
+    const runId = 'tool-approval-pubsub-run';
+    const events = collectPubsubEvents(pubsub, runId);
 
     const { cleanup } = await durableAgent.stream('Use the tool', {
-      runId: prep.runId,
+      runId,
       requireToolApproval: true,
     });
 
@@ -539,11 +539,11 @@ describe('DurableAgent in-execution tool suspension', () => {
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const prep = await durableAgent.prepare('Use the tool');
-    const events = collectPubsubEvents(pubsub, prep.runId);
+    const runId = 'tool-suspension-pubsub-run';
+    const events = collectPubsubEvents(pubsub, runId);
 
     const { cleanup } = await durableAgent.stream('Use the tool', {
-      runId: prep.runId,
+      runId,
     });
 
     // Wait for suspension

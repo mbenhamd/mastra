@@ -20,7 +20,7 @@ let activeSession = existing.items[0]
   : await harness.session({ resourceId: 'local-user', threadId: { fresh: true } });
 
 // Subscribe to events for live rendering.
-const unsubscribe = activeSession.subscribe((event) => {
+const unsubscribe = activeSession.subscribe(event => {
   switch (event.type) {
     case 'text_delta':
       process.stdout.write(event.delta);

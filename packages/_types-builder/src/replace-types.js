@@ -39,13 +39,6 @@ function matchesBundledPackage(moduleSpecifier, bundledPackage) {
   return packageName === bundledPackage || getTypesPackageName(packageName) === bundledPackage;
 }
 
-function declarationPathToRuntimeSpecifier(declarationPath) {
-  return declarationPath
-    .replace(/\.d\.mts$/, '.mjs')
-    .replace(/\.d\.cts$/, '.cjs')
-    .replace(/\.d\.ts$/, '.js');
-}
-
 async function getPackageRootPath(packageName, parentPath) {
   let rootPath;
 
@@ -249,7 +242,11 @@ async function replaceBundledReferences(file, rootDir, bundledPackages, visited,
 
     await copyDeclarationGraph(sourceTypesPath, sourcePkgRootPath, destTypesRoot, rootDir, bundledPackages, visited);
 
-    let relativeImport = relative(fileDirname, declarationPathToRuntimeSpecifier(destTypesPath));
+    // Module specifiers must always use POSIX separators ('/'), but path.relative()
+    // returns OS-native separators (backslashes on Windows). Without this normalization,
+    // generated .d.ts files contain unresolvable specifiers like '..\_types\...' that
+    // break `moduleResolution: "bundler"` on Windows. On POSIX, sep === '/' so this is a no-op.
+    let relativeImport = relative(fileDirname, destTypesPath).split(sep).join('/');
     if (!relativeImport.startsWith('.')) {
       relativeImport = './' + relativeImport;
     }

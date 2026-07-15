@@ -19,7 +19,7 @@ Several built-in systems publish and subscribe to events through the same pub/su
 
 - **Workflow execution**: The scheduler publishes a `workflow.start` event, and a long-lived worker consumes it to run the workflow. Step and lifecycle events flow over pub/sub during execution.
 - **Scheduled workflows**: The scheduler dispatches due runs by publishing to the workflow topic. See [Scheduled workflows](/docs/workflows/scheduled-workflows).
-- **Background tasks**: A task manager dispatches work to a worker group and fans task lifecycle updates out to subscribers, which is how background task streams stay live. See [Background task streaming](/docs/streaming/background-task-streaming).
+- **Background tasks**: A task manager dispatches work to a worker group and fans task lifecycle updates out to subscribers, which is how background task streams stay live. See [Background task streaming](/docs/long-running-agents/background-tasks#subscribe-to-all-task-events).
 - **Agent signals**: Sending a signal to an active agent run publishes an event on a thread topic, so a run executing in another process receives the signal.
 - **Resumable streams**: Stream chunks are published per run, so a client that reconnects can replay what it missed.
 
@@ -83,7 +83,7 @@ Both backends below deliver across processes and hosts and persist events for re
 
 The pub/sub backend owns workflow-event delivery identity and, when supported, the `deliveryAttempt` count. Mastra may execute the source workflow event while that count is within its bounded budget. After the budget is exhausted, later deliveries retry terminal failure propagation only; they don't run the source event again. This keeps the budget stable when another worker claims the event or the receiving process restarts. Backends that don't provide a tracked positive attempt value can't provide this cross-process guarantee.
 
-If terminal failure publication is temporarily unavailable, or a configured workflow store can't yet observe the durable run snapshot, Mastra calls `nack` and leaves the source event with the backend. A missing snapshot in a configured store is not treated as proof that the event is stale. When workflow storage isn't configured, Mastra publishes the terminal failure without this stale-state guard. A `workflow.fail` event never publishes another `workflow.fail`; failure processing retries the existing terminal event instead.
+If terminal failure publication is temporarily unavailable, or a configured workflow store can't yet observe the durable run snapshot, Mastra calls `nack` and leaves the source event with the backend. A missing snapshot in a configured store isn't treated as proof that the event is stale. When workflow storage isn't configured, Mastra publishes the terminal failure without this stale-state guard. A `workflow.fail` event never publishes another `workflow.fail`; failure processing retries the existing terminal event instead.
 
 This is an at-least-once transport contract. Broker-owned attempts prevent a fresh source budget, but they don't make parent or finish notifications exactly once. Those effects need stable logical keys and idempotent consumers; a journal can make terminalization state durable, while a retained source event or outbox payload is required to retry the effect. Neither can retract an effect that was already delivered.
 
@@ -108,7 +108,7 @@ The bracketed parent path is skipped for a root workflow. The journal reserves o
 
 `persistWorkflowTerminalState` is the only operation that can enter `run_state_persisted`. It replaces the canonical workflow snapshot and advances the journal in one in-memory critical section or PostgreSQL transaction, so the phase can't certify a snapshot that was never written. The canonical snapshot remains replaceable; a later producer-outbox capability must retain immutable recovery evidence before source acknowledgment. Generic phase advancement can't enter snapshot, outbox, or effect-evidence phases; each evidence-producing capability owns its atomic transition.
 
-This storage capability is an adapter primitive; configuring a supporting store does not by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter, keep the original event or a durable outbox payload available for recovery, use a stable idempotency key for every external effect, and acknowledge the source event only after `complete`. The journal alone doesn't store an effect payload and doesn't claim exactly-once delivery.
+This storage capability is an adapter primitive; configuring a supporting store doesn't by itself change workflow-event execution. A runtime consuming it must fail visibly when durable mode is requested with an unsupported adapter, keep the original event or a durable outbox payload available for recovery, use a stable idempotency key for every external effect, and acknowledge the source event only after `complete`. The journal alone doesn't store an effect payload and doesn't claim exactly-once delivery.
 
 Completed records deliberately survive normal workflow-run deletion. Delete them only after a retention horizon longer than every broker redelivery and reclaim window; deleting deduplication evidence earlier allows a sufficiently late delivery to acquire the run again.
 
@@ -156,15 +156,11 @@ export const mastra = new Mastra({
 })
 ```
 
-:::note
-
 Visit the [PubSub reference](/reference/pubsub/base) for the full delivery contract and the configuration options for each backend.
-
-:::
 
 ## Related
 
 - [PubSub reference](/reference/pubsub/base)
 - [Mastra class](/reference/core/mastra-class)
-- [Background task streaming](/docs/streaming/background-task-streaming)
+- [Background task streaming](/docs/long-running-agents/background-tasks#subscribe-to-all-task-events)
 - [Scheduled workflows](/docs/workflows/scheduled-workflows)

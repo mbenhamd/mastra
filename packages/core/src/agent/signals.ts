@@ -29,6 +29,15 @@ type SignalFilePart = {
  * @experimental Agent signals are experimental and may change in a future release.
  */
 export type AgentSignalContents = string | Array<TextPart | FilePart>;
+
+/** Convert signal contents to the text representation used by reminder and status surfaces. */
+export function signalContentsToText(contents: unknown): string {
+  return signalContentsToParts(contents)
+    .filter((part): part is TextPart => part.type === 'text')
+    .map(part => part.text)
+    .join('\n');
+}
+
 export type AgentSignalAttributes = Record<string, string | number | boolean | null | undefined>;
 export type AgentStateSignalMode = 'snapshot' | 'delta';
 
@@ -85,6 +94,7 @@ export type AgentSignalDataPart = {
     acceptedAt?: string;
     attributes?: AgentSignalAttributes;
     metadata?: Record<string, unknown>;
+    providerOptions?: MastraProviderMetadata;
   };
   transient: true;
 };
@@ -311,6 +321,12 @@ function contentsToSignalParts(contents: AgentSignalContents): SignalPart[] {
   });
 }
 
+/** Normalize current or persisted legacy signal contents into canonical text/file parts. */
+export function signalContentsToParts(contents: unknown): SignalPart[] {
+  const normalized = legacyContentsToSignalContents(contents);
+  return normalized === undefined ? [] : contentsToSignalParts(normalized);
+}
+
 // Narrow a storage parts array down to SignalPart. Signal rows should only ever contain text/file
 // parts (that's what contentsToSignalParts produces), but the storage type permits richer parts —
 // so the read boundary filters defensively.
@@ -438,6 +454,7 @@ function signalToDataPart(signal: ReturnType<typeof normalizeSignal>, parts: Sig
       ...(signal.acceptedAt ? { acceptedAt: signal.acceptedAt.toISOString() } : {}),
       ...(signal.attributes ? { attributes: signal.attributes } : {}),
       ...(signal.metadata ? { metadata: signal.metadata } : {}),
+      ...(signal.providerOptions ? { providerOptions: signal.providerOptions } : {}),
     },
     transient: true,
   };

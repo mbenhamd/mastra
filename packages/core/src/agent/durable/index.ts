@@ -90,13 +90,17 @@ export { EventedAgent, isEventedAgentClass, type EventedAgentConfig } from './ev
 export { createEventedAgent, isEventedAgent, type CreateEventedAgentOptions } from './create-evented-agent';
 
 // Stream until idle (durable variant)
-export { runDurableStreamUntilIdle, type DurableStreamUntilIdleDeps } from './durable-stream-until-idle';
+export {
+  runDurableStreamUntilIdle,
+  runResumeDurableStreamUntilIdle,
+  type DurableStreamUntilIdleDeps,
+} from './durable-stream-until-idle';
 
 // Preparation utilities
 export { prepareForDurableExecution, type PreparationOptions, type PreparationResult } from './preparation';
 
 // Run registry for non-serializable state
-export { RunRegistry, ExtendedRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
+export { RunRegistry, ExtendedRunRegistry, globalRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
 
 // Stream adapter for pubsub-based streaming
 export {
@@ -121,6 +125,7 @@ export type {
   SerializableModelConfig,
   SerializableDurableState,
   SerializableDurableOptions,
+  SerializableModelSettings,
   DurableAgenticWorkflowInput,
   // Step I/O types
   DurableLLMStepOutput,
@@ -153,12 +158,14 @@ export {
 // Utility functions for runtime resolution
 export {
   resolveRuntimeDependencies,
+  rebuildRunToolsFromMastra,
   resolveModel,
   resolveInternalState,
   resolveTool,
   toolRequiresApproval,
   type ResolvedRuntimeDependencies,
   type ResolveRuntimeOptions,
+  type RebuiltRunTools,
 } from './utils/resolve-runtime';
 
 // Workflow creation
@@ -184,6 +191,7 @@ export {
   calculateAccumulatedUsage,
   buildStepRecord,
   createBaseIterationStateUpdate,
+  resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {
   ToolExecutionContext,

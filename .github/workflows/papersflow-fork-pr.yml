@@ -2,7 +2,9 @@ name: PapersFlow Fork PR Validation
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - 'ci/**'
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -49,6 +51,52 @@ jobs:
         with:
           node-version: 22.13.0
 
+      - name: Resolve trusted base
+        id: trusted-base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # github.event.pull_request.base.sha is pinned when the PR is opened
+          # and goes stale as the base branch advances, so validator and policy
+          # upgrades on the protected base never reach already-open PRs.
+          # Resolve the CURRENT protected-base tip instead: it is exactly as
+          # trusted (same protected ref) and strictly fresher, and it matches
+          # the merge commit this workflow actually checks out.
+          git fetch --no-tags origin "${BASE_REF}"
+          echo "sha=$(git rev-parse "origin/${BASE_REF}")" >> "$GITHUB_OUTPUT"
+
+      - name: Classify dependency-graph changes before install
+        id: install-policy
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
+          trusted_script="${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          /usr/bin/git show "${BASE_SHA}:${script_path}" > "$trusted_script"
+          if grep -Fq -- '--classify-install' "$trusted_script"; then
+            /bin/bash "$trusted_script" --classify-install
+          else
+            # One-time bootstrap for this policy PR. The protected base still
+            # owns the previous fail-closed rule and this PR does not change a
+            # dependency manifest.
+            mapfile -t manifest_changes < <(
+              git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+                .npmrc .pnpmfile.cjs pnpmfile.cjs package.json \
+                pnpm-workspace.yaml patches packages/server/package.json
+            )
+            if (( ${#manifest_changes[@]} > 0 )); then
+              echo "These dependency-graph changes require dedicated validation and are rejected before install:" >&2
+              printf '%s\n' "${manifest_changes[@]}" >&2
+              exit 1
+            fi
+            echo 'lane=standard' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install pnpm
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
         with:
@@ -58,7 +106,40 @@ jobs:
           cache_dependency_path: pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        env:
+          VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
+        run: |
+          if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' ]]; then
+            # Nested workspace manifests are part of the reconciled source
+            # tree, not part of the exact pre-install allowlist. Suppress all
+            # lifecycle scripts; validation executes only the explicit commands
+            # selected by the trusted-base script below.
+            pnpm install --frozen-lockfile --ignore-pnpmfile --ignore-scripts
+          else
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Exercise PF-558 admission policy
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
+          policy_script="${RUNNER_TEMP}/pf558-policy-self-test.bash"
+          /usr/bin/git show "${BASE_SHA}:${script_path}" > "$policy_script"
+          if grep -Fq -- '--self-test-pf558-upstream-sync' "$policy_script"; then
+            : # The protected base owns the policy fixtures.
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$HEAD_REF" == 'ci/pf-558-upstream-sync-validation' ]]; then
+            echo 'Bootstrapping the PF-558 policy fixtures from this same-repository policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$policy_script"
+          else
+            echo 'The trusted base does not contain the PF-558 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$policy_script" --self-test-pf558-upstream-sync
 
       - name: Start Redis test service
         run: |
@@ -75,9 +156,13 @@ jobs:
 
       - name: Validate fork PR
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
           if /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}"; then
@@ -91,4 +176,9 @@ jobs:
             echo "The trusted base commit does not contain the fork validator." >&2
             exit 1
           fi
-          /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' ]]; then
+            /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+              --validate-pf558-upstream-sync
+          else
+            /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          fi

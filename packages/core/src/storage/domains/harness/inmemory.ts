@@ -2950,7 +2950,8 @@ export class InMemoryHarness extends HarnessStorage {
     // Keyset cursor on the (parentTaskId, order, taskId) sort key — identical token
     // + continuation semantics to PG/LibSQL (a deleted cursor row still continues
     // from its sort position instead of silently restarting from the head).
-    const after = cursor === undefined ? matched : matched.filter(t => planTaskAfterCursor(t, decodePlanTaskCursor(cursor)));
+    const after =
+      cursor === undefined ? matched : matched.filter(t => planTaskAfterCursor(t, decodePlanTaskCursor(cursor)));
     const page = after.slice(0, limit);
     const result: ListPlanTasksResult = { tasks: page.map(clonePlanTask) };
     if (after.length > limit && page.length > 0) {
@@ -3045,7 +3046,7 @@ export class InMemoryHarness extends HarnessStorage {
         beforeCursor(s),
     );
     // Newest first; ties broken by runId descending for a stable keyset order.
-    rows.sort((a, b) => (b.completedAt - a.completedAt) || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0));
+    rows.sort((a, b) => b.completedAt - a.completedAt || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0));
     const cap = limit ?? 50;
     const page = rows.slice(0, cap);
     const result: ListRunSummariesResult = { summaries: page.map(cloneJson) };
@@ -3143,7 +3144,13 @@ function normalizeExternalId(value: string | undefined): string {
 /** True when a binding addresses the same platform-conversation tuple as `b` (§14.1). */
 function channelBindingTupleMatches(
   a: ChannelBinding,
-  b: { channelId: string; platform: string; externalTenantId?: string; externalChannelId?: string; externalThreadId: string },
+  b: {
+    channelId: string;
+    platform: string;
+    externalTenantId?: string;
+    externalChannelId?: string;
+    externalThreadId: string;
+  },
 ): boolean {
   return (
     a.channelId === b.channelId &&

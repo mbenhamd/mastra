@@ -319,7 +319,12 @@ describe('span-summary — durable run history (Slice B)', () => {
     let cursorC: number | undefined;
     let cursorR: string | undefined;
     for (let i = 0; i < 10; i++) {
-      const p = await storage.listRunSummaries({ sessionId: session.id, limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      const p = await storage.listRunSummaries({
+        sessionId: session.id,
+        limit: 1,
+        beforeCompletedAt: cursorC,
+        beforeRunId: cursorR,
+      });
       seen.push(...p.summaries.map(s => s.runId));
       if (p.nextBeforeCompletedAt === undefined) break;
       cursorC = p.nextBeforeCompletedAt;

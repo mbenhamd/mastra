@@ -91,7 +91,6 @@ agent resume APIs before the row is durable. MCP progress notifications,
 elicitation requests, resource update/list-change subscriptions, and app
 callbacks remain live/process-local until a concrete source owns those rows.
 
-
 The invariant is the boundary, not the table name: an external retrying source
 never calls `agent.stream(...)`, `agent.generate(...)`,
 `agent.approveToolCall(...)`, `agent.resumeStream(...)`,

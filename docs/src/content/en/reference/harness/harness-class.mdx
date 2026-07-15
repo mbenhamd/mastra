@@ -100,7 +100,7 @@ const support = mastra.getHarness('support')
 
 ## Session action catalog
 
-Harness v1 sessions expose a read-only action catalog for desktop command palettes. The catalog combines skill action metadata with MCP tool descriptors. It does not execute actions or grant permissions.
+Harness v1 sessions expose a read-only action catalog for desktop command palettes. The catalog combines skill action metadata with MCP tool descriptors. It doesn't execute actions or grant permissions.
 
 ```typescript
 const session = await defaultHarness.session({
@@ -219,7 +219,8 @@ Use the returned `source` field to route execution through the owning surface, s
           {
             name: 'tools',
             type: 'ToolsInput',
-            description: "Replaces the backing agent's tools for this mode. Mutually exclusive with `additionalTools`.",
+            description:
+              "Replaces every backing-agent tool source for this mode. Harness built-ins remain available unless `harnessBuiltins` is `'exclude'`. Mutually exclusive with `additionalTools`.",
             isOptional: true,
           },
           {
@@ -227,6 +228,14 @@ Use the returned `source` field to route execution through the owning surface, s
             type: 'ToolsInput',
             description: "Tools layered on top of the backing agent's tools. Mutually exclusive with `tools`.",
             isOptional: true,
+          },
+          {
+            name: 'harnessBuiltins',
+            type: "'include' | 'exclude'",
+            description:
+              "Controls Harness-owned plan-task and subagent built-ins for this mode. Defaults to `'include'`.",
+            isOptional: true,
+            defaultValue: "'include'",
           },
           {
             name: 'agent',
@@ -530,7 +539,7 @@ await harness.deleteSession({
 })
 ```
 
-Without `force`, the target session and descendants must already be closed. With `force`, Harness closes the subtree first, then deletes the session rows and owned attachments. The `resourceId` parameter is required so callers do not delete a session from another resource by ID.
+Without `force`, the target session and descendants must already be closed. With `force`, Harness closes the subtree first, then deletes the session rows and owned attachments. The `resourceId` parameter is required so callers don't delete a session from another resource by ID.
 
 ### State
 
@@ -824,7 +833,7 @@ Responding to a pending tool approval is owned by the session — see [`session.
 
 Respond to a pending tool suspension. Interactive built-in tools such as `ask_user` and `request_access` pause through the native tool-suspension primitive, which emits a `tool_suspended` event carrying `toolCallId`, `toolName`, and `suspendPayload`. Pass `resumeData` to resume the suspended tool with the user's response.
 
-Provide `toolCallId` to select which suspension to resume. It is required when more than one tool is suspended at the same time (for example, parallel `ask_user` calls). When omitted, it resolves to the sole pending suspension.
+Provide `toolCallId` to select which suspension to resume. It's required when more than one tool is suspended at the same time (for example, parallel `ask_user` calls). When omitted, it resolves to the sole pending suspension.
 
 ```typescript
 harness.subscribe(event => {
@@ -976,7 +985,7 @@ The model can also pass `forked: true` (or `forked: false`) per-invocation in th
 - **Memory required.** Forked mode calls `memory.cloneThread` to create the fork, so the harness must have `memory` configured and an active parent thread. Calls without those return a structured error rather than throwing.
 - **Parent agent reused.** The fork runs through the parent agent's `stream(...)` call. The parent's instructions, tools, model, and processors apply; reusing that parent agent surface is what preserves the prompt-cache prefix. The subagent definition's `instructions`, `tools`, `allowedHarnessTools`, `allowedWorkspaceTools`, `defaultModelId`, `maxSteps`, `stopWhen`, `inputProcessors`, and `outputProcessors` are ignored in forked mode. The subagent tool uses fork-specific loop controls so the model can recover if it accidentally calls an inherited-but-disabled tool.
 - **Toolsets inherited, recursive forks blocked at runtime.** Forks inherit the parent's toolsets verbatim (`ask_user`, `submit_plan`, user-configured harness tools, _including the `subagent` tool itself_) so the LLM request prefix — system prompt + tool list + tool schemas + tool descriptions — stays byte-identical to the parent's. This is what preserves the prompt cache. The `subagent` entry is kept on the model side but its `execute` is replaced inside the fork with a stub that returns an error tool result with a clear "tool unavailable inside a forked subagent" message: nested forks are blocked at the runtime layer without perturbing the cached prefix.
-- **Fork threads are tagged.** Each fork thread is created with `metadata.forkedSubagent === true` and `metadata.parentThreadId === <parent>`. By default, [`listThreads`](#listthreadsoptions) hides these so they don't show up in user-facing thread pickers / startup flows. Pass `includeForkedSubagents: true` to see them in admin / debug tooling.
+- **Fork threads are tagged.** Each fork thread is created with `metadata.forkedSubagent === true` and `metadata.parentThreadId === <parent>`. By default, [`session.thread.list()`](/reference/harness/session#thread) hides these so they don't show up in user-facing thread pickers / startup flows. Pass `includeForkedSubagents: true` to see them in admin / debug tooling.
 - **Save-queue flushed before clone.** The agent stream batches message saves through a debounced `SaveQueueManager`, so the parent's latest user / assistant turn may not be on disk yet when the subagent tool call fires. The fork tool flushes pending saves first via the `flushMessages` callback on `AgentToolExecutionContext` before cloning, so the fork actually carries the latest turn. Flush failures are non-fatal — the clone still runs.
 - **Parent thread untouched.** All subagent activity (messages, OM writes) lands on the fork. The parent thread is never appended to during a forked subagent run.
 

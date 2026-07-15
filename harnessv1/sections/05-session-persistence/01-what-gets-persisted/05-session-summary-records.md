@@ -81,5 +81,4 @@ interface SessionPendingInboxSummary {
   // into the parent's list row.
   sessionOwnedOnly: true;
 }
-
 ```

@@ -63,6 +63,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-write-concurrency);" d="M540 306 L609 306" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-write-concurrency);" d="M815 101 C875 115 925 145 938 169" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-write-concurrency);" d="M815 306 C875 285 925 252 938 243" />
+
   </svg>
   <figcaption>The active session lease is the thread-runtime write authority; stale or stolen owners stop before mutating durable state or provider-visible work.</figcaption>
 </figure>
@@ -70,36 +71,36 @@ authoritative):
 **Lease lifecycle.**
 
 - `harness.session(...)` acquires the lease as part of hydration. The harness
-instance has a stable `ownerId` (process-scoped UUID, generated at
-construction).
+  instance has a stable `ownerId` (process-scoped UUID, generated at
+  construction).
 - Fresh active sessions are admitted through `createOrLoadCurrentSessionOwner(...)`.
   When that call creates the row, it installs the caller's initial lease in the
   same atomic storage operation using `ttlMs = sessions.lockTtlMs`. When it
   returns an existing row, the resolver applies the lock policy below before
   hydrating it.
 - The owner renews the lease on every flush. Synchronous (durable) flushes
-always renew; debounced flushes renew opportunistically. A separate keep-alive
-interval (default `sessions.lockRenewMs`, `10s`) renews the lease even if no
-flush has happened, so a long-idle but in-memory session keeps its claim.
-Keep-alive renewal owns lease liveness; flush-driven renewal is opportunistic,
-and overlapping same-owner renewals are harmless. If renewal cannot prove the
-same `ownerId` still owns an unexpired lease, the instance marks ownership lost,
-stops accepting new admissions/resumes, stops queue drain and provider-visible
-work, emits an `error` event, and requires a fresh `harness.session(...)`
-acquisition before any mutation can continue. Lease renewal failure is not
-treated like debounced flush backoff: once ownership cannot be proven, safety
-beats liveness and the live owner fences itself before doing more work. Agent
-signals that already crossed the acceptance boundary follow §5.7's
-post-acceptance durability boundary, but a stale owner must not flush new
-durable state, project outbox items, or make new provider-visible calls from
-completions observed after ownership was lost.
+  always renew; debounced flushes renew opportunistically. A separate keep-alive
+  interval (default `sessions.lockRenewMs`, `10s`) renews the lease even if no
+  flush has happened, so a long-idle but in-memory session keeps its claim.
+  Keep-alive renewal owns lease liveness; flush-driven renewal is opportunistic,
+  and overlapping same-owner renewals are harmless. If renewal cannot prove the
+  same `ownerId` still owns an unexpired lease, the instance marks ownership lost,
+  stops accepting new admissions/resumes, stops queue drain and provider-visible
+  work, emits an `error` event, and requires a fresh `harness.session(...)`
+  acquisition before any mutation can continue. Lease renewal failure is not
+  treated like debounced flush backoff: once ownership cannot be proven, safety
+  beats liveness and the live owner fences itself before doing more work. Agent
+  signals that already crossed the acceptance boundary follow §5.7's
+  post-acceptance durability boundary, but a stale owner must not flush new
+  durable state, project outbox items, or make new provider-visible calls from
+  completions observed after ownership was lost.
 - `session.close()` enters Closing under the current parent/root lease, renews
-that lease while waiting for live work to settle, and releases it only after
-`closedAt` is written or after another owner fences the close owner.
-`harness.shutdown()` releases the lease cleanly. Idle eviction (§5.4) also
-releases — eviction is a release, not a steal.
+  that lease while waiting for live work to settle, and releases it only after
+  `closedAt` is written or after another owner fences the close owner.
+  `harness.shutdown()` releases the lease cleanly. Idle eviction (§5.4) also
+  releases — eviction is a release, not a steal.
 - On owner crash, the lease expires after `sessions.lockTtlMs` (default `30s`)
-and the record becomes hydratable again.
+  and the record becomes hydratable again.
 - Lease expiry checks use the storage time contract in §5.2 and the validation
   rules in §9. Initial lease installation, acquire, renew, `saveSession`
   owner-expiry checks, `'steal'`, `'wait'`, and descendant lease mirroring all
@@ -160,7 +161,6 @@ goal-continuation paths. `RemoteSession` operation options do not carry a
 request payload. The defaults — `'fail'` for ordinary contention,
 `'wait'` for browser-reconnect retry-on-busy — remain unchanged.
 
-
 `acquireSessionLease(...)` succeeds for records that are active or being
 explicitly reopened. If storage observes `closedAt` during acquisition, the
 harness treats the row as a reopen candidate: it must prove the same
@@ -195,7 +195,7 @@ tries to save with the pre-closing `ifVersion`, storage CAS rejects it; if it
 tries through the live `Session` API after observing the marker, the API rejects
 with `HarnessSessionClosingError` or `HarnessSessionClosedError`.
 
-**`setState` atomicity** is a *within-process* guarantee: the owner serialises
+**`setState` atomicity** is a _within-process_ guarantee: the owner serialises
 updaters through a single in-memory queue, so `setState(prev => next)` is always
 read-modify-write against the latest state. Cross-process atomicity is not
 promised, because cross-process writers are not promised — that's what the lease
@@ -266,7 +266,7 @@ owning `SessionRecord` still has `ownerId` holding an unexpired lease and a
 `version` matching `ifSessionVersion` before any plan-task row changes, exactly
 as `saveSession` fences. The session is the serialized writer, so the fence is on
 the **session's** lease + version, not bare per-row OCC; the per-row plan-task
-`version` is the field-write OCC token *inside* that fence (catching a stale
+`version` is the field-write OCC token _inside_ that fence (catching a stale
 in-memory plan-task read), not an independent cross-process authority. Multi-row
 plan-task operations are transaction-shaped (all-or-nothing under one adapter
 boundary). A stale or stolen owner whose `ifSessionVersion` no longer matches —
@@ -285,11 +285,11 @@ expired.
 **Errors raised.**
 
 - `HarnessSessionLockedError` — `harness.session(...)` could not acquire the
-lease under `lockMode: 'fail'`. Includes `currentOwnerId` and `expiresAt` for
-diagnostic logging and for clients that want to route the request to the holding
-instance.
+  lease under `lockMode: 'fail'`. Includes `currentOwnerId` and `expiresAt` for
+  diagnostic logging and for clients that want to route the request to the holding
+  instance.
 - `HarnessStorageError` — durable write rejected by the adapter. After one
-transparent retry, surfaced to the caller.
+  transparent retry, surfaced to the caller.
 
 **Configuration.** §9 defines the knobs:
 

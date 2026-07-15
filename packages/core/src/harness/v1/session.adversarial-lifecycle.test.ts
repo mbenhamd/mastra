@@ -39,9 +39,7 @@ import {
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
   HarnessSessionClosingError,
-  HarnessSessionDeletedError,
   HarnessStorageError,
-  HarnessValidationError,
 } from './errors';
 import { Harness } from './harness';
 

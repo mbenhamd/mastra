@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { MessageList } from '../../../message-list';
 import { createToolCallIdentityDigest } from '../../../tool-call-identity';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableToolCallStep } from './tool-call';
@@ -32,6 +33,7 @@ const { emitChunkEvent } = await import('../../stream-adapter');
 const { resolveTool: _resolveTool } = await import('../../utils/resolve-runtime');
 
 const RUN_ID = 'run-bg-1';
+const RUNTIME_BINDING_ID = 'binding-bg-1';
 const AGENT_ID = 'agent-1';
 const TOOL_NAME = 'research';
 const TOOL_CALL_ID = 'call-1';
@@ -51,6 +53,7 @@ function baseInput() {
 function makeInitData(overrides: Record<string, any> = {}) {
   return {
     runId: RUN_ID,
+    runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: AGENT_ID,
     options: { requireToolApproval: false },
     state: {
@@ -64,11 +67,10 @@ function makeInitData(overrides: Record<string, any> = {}) {
 }
 
 function makeMessageList() {
-  return {
-    updateToolInvocation: vi.fn().mockReturnValue(true),
-    updateMessageMetadataByToolCallId: vi.fn().mockReturnValue(true),
-    add: vi.fn(),
-  };
+  const messageList = new MessageList({ threadId: 'thread-1', resourceId: 'user-1' });
+  vi.spyOn(messageList, 'updateToolInvocation');
+  vi.spyOn(messageList, 'updateMessageMetadataByToolCallId');
+  return messageList;
 }
 
 function makeSaveQueueManager() {
@@ -81,6 +83,7 @@ function setupRegistry(overrides: Record<string, any> = {}) {
   const bgManager = { config: {}, listTasks: vi.fn() };
 
   const entry = {
+    runtimeBindingId: RUNTIME_BINDING_ID,
     tools: {
       [TOOL_NAME]: {
         execute: vi.fn().mockResolvedValue({ summary: 'done' }),
@@ -137,6 +140,84 @@ describe('durable tool-call background task dispatch', () => {
     const result = await executeStep(pubsub, makeInitData({ runtimeResolution: 'registry-required' }));
     expect(result.error).toMatchObject({ name: 'ToolNotFoundError' });
     expect(_resolveTool).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a replacement run loses its registry before tool dispatch', async () => {
+    await expect(
+      executeStep(
+        mockPubsub(),
+        makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: [TOOL_NAME] } }),
+      ),
+    ).rejects.toThrow(/Cannot reconstruct replacement tool implementations/);
+  });
+
+  it('fails closed when a replacement registry loses an allowed implementation before dispatch', async () => {
+    setupRegistry({ tools: {} });
+    const backingExecute = vi.fn().mockResolvedValue('backing');
+    vi.mocked(_resolveTool).mockReturnValue({ execute: backingExecute } as any);
+
+    await expect(
+      executeStep(
+        mockPubsub(),
+        makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: [TOOL_NAME] } }),
+      ),
+    ).rejects.toThrow(/has no own concrete implementation/);
+    expect(backingExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch an out-of-fence registry tool or a same-name backing tool', async () => {
+    const allowedExecute = vi.fn().mockResolvedValue('allowed');
+    const hiddenExecute = vi.fn().mockResolvedValue('hidden');
+    const backingExecute = vi.fn().mockResolvedValue('backing');
+    setupRegistry({
+      tools: {
+        allowedTool: { execute: allowedExecute },
+        hiddenTool: { execute: hiddenExecute },
+      },
+    });
+    vi.mocked(_resolveTool).mockReturnValue({ execute: backingExecute } as any);
+
+    const result = await executeStep(
+      mockPubsub(),
+      makeInitData({ options: { requireToolApproval: false, toolSurfaceFence: ['allowedTool'] } }),
+      { ...baseInput(), toolName: 'hiddenTool' },
+    );
+
+    expect(result.error).toEqual(expect.objectContaining({ name: 'ToolNotFoundError' }));
+    expect(result.error.message).toContain('Available tools: allowedTool.');
+    expect(result.error.message).not.toContain('Available tools: allowedTool, hiddenTool');
+    expect(allowedExecute).not.toHaveBeenCalled();
+    expect(hiddenExecute).not.toHaveBeenCalled();
+    expect(backingExecute).not.toHaveBeenCalled();
+  });
+
+  it('does not advertise fenced-out tools retained in activeTools', async () => {
+    setupRegistry({
+      tools: {
+        allowedTool: { execute: vi.fn().mockResolvedValue('allowed') },
+        hiddenTool: { execute: vi.fn().mockResolvedValue('hidden') },
+      },
+    });
+
+    const result = await executeStep(
+      mockPubsub(),
+      makeInitData({
+        options: {
+          requireToolApproval: false,
+          toolSurfaceFence: ['allowedTool'],
+          activeTools: ['allowedTool', 'hiddenTool'],
+        },
+      }),
+      { ...baseInput(), toolName: 'hiddenTool' },
+    );
+
+    expect(result.error).toEqual(
+      expect.objectContaining({
+        name: 'ToolNotFoundError',
+        message: expect.stringContaining('Available tools: allowedTool.'),
+      }),
+    );
+    expect(result.error.message).not.toContain('Available tools: allowedTool, hiddenTool');
   });
 
   it.each([false, 0, '', null])('resumes a suspended background task with falsy payload %#', async resumeData => {
@@ -227,6 +308,8 @@ describe('durable tool-call background task dispatch', () => {
     const mockTask = { id: 'task-abc' };
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: mockTask, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: mockTask,
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -252,6 +335,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 't1' }, fallbackToSync: true }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't1' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -276,6 +361,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockRejectedValue(new Error('dispatch boom')),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't1' } as any,
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -300,6 +387,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 'task-x' }, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 'task-x' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -337,6 +426,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnResult = opts.context.onResult;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-r' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-r' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -377,7 +468,7 @@ describe('durable tool-call background task dispatch', () => {
     expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
   });
 
-  it('onExecution hook updates the tool invocation with startedAt/taskId metadata', async () => {
+  it('onExecution hook updates message metadata with startedAt/taskId', async () => {
     const pubsub = mockPubsub();
     const { messageList } = setupRegistry();
     const initData = makeInitData();
@@ -393,6 +484,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnExecution = opts.context.onExecution;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-e' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-e' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -411,14 +504,8 @@ describe('durable tool-call background task dispatch', () => {
       startedAt,
     });
 
-    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
-      expect.objectContaining({
-        toolInvocation: expect.objectContaining({
-          state: 'call',
-          toolCallId: TOOL_CALL_ID,
-          toolName: TOOL_NAME,
-        }),
-      }),
+    expect(messageList.updateMessageMetadataByToolCallId).toHaveBeenCalledWith(
+      TOOL_CALL_ID,
       expect.objectContaining({
         backgroundTasks: expect.objectContaining({
           [TOOL_CALL_ID]: expect.objectContaining({
@@ -428,7 +515,7 @@ describe('durable tool-call background task dispatch', () => {
         }),
       }),
     );
-    expect(messageList.updateMessageMetadataByToolCallId).not.toHaveBeenCalled();
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
   });
 
   it('onChunk emits tool-call + tool-result chunks via PubSub on completion', async () => {
@@ -447,6 +534,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnChunk = opts.context.onChunk;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-c' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-c' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -489,6 +578,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnChunk = opts.context.onChunk;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-f' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-f' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -527,6 +618,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 't-p' }, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't-p' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),

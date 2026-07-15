@@ -1,5 +1,5 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
@@ -7,6 +7,11 @@ import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import { delay } from '../../utils';
 import { Agent } from '../agent';
+import { agentThreadStreamRuntime } from '../thread-stream-runtime';
+
+beforeEach(() => {
+  agentThreadStreamRuntime.resetForTests();
+});
 
 /**
  * Helper to verify tool execution order.
@@ -257,7 +262,6 @@ async function verifyToolExecutionOrder(
 
 describe('Tool Concurrency', () => {
   const mockMemory = new MockMemory();
-  const mockStorage = new InMemoryStore();
 
   // Helper to create a mock model that triggers two tools
   function createMockModel() {
@@ -333,7 +337,7 @@ describe('Tool Concurrency', () => {
     const mastra = new Mastra({
       agents: { agent: new Agent(agentConfig) },
       logger: false,
-      storage: mockStorage,
+      storage: new InMemoryStore(),
     });
 
     const agent = mastra.getAgent('agent');
@@ -378,7 +382,7 @@ describe('Tool Concurrency', () => {
     const mastra = new Mastra({
       agents: { agent: new Agent(agentConfig) },
       logger: false,
-      storage: mockStorage,
+      storage: new InMemoryStore(),
     });
 
     const agent = mastra.getAgent('agent');
@@ -435,7 +439,7 @@ describe('Tool Concurrency', () => {
     const mastra = new Mastra({
       agents: { agent: new Agent(agentConfig) },
       logger: false,
-      storage: mockStorage,
+      storage: new InMemoryStore(),
     });
 
     const agent = mastra.getAgent('agent');
@@ -512,7 +516,7 @@ describe('Tool Concurrency', () => {
     const mastra = new Mastra({
       agents: { agent: new Agent(agentConfig) },
       logger: false,
-      storage: mockStorage,
+      storage: new InMemoryStore(),
     });
 
     const agent = mastra.getAgent('agent');

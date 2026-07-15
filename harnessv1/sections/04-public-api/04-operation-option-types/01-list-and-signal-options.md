@@ -28,10 +28,7 @@ interface SignalOptions<S extends PublicSchema | undefined = undefined> extends 
   type?: 'user-message' | 'system-reminder' | string;
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   files?: FileAttachment[];
   attributes?: Record<string, JsonValue>;
   metadata?: Record<string, JsonValue>;
@@ -57,5 +54,4 @@ interface SignalOptions<S extends PublicSchema | undefined = undefined> extends 
   tracingContext?: TracingContext;
   tracingOptions?: TracingOptions;
 }
-
 ```

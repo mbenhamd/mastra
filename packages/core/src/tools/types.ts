@@ -12,6 +12,7 @@ import type { ElicitRequest, ElicitResult } from '@modelcontextprotocol/sdk/type
 
 import type { MastraPrimitives, MastraUnion } from '../action';
 export type { MastraPrimitives, MastraUnion };
+import type { ActorSignal } from '../auth/ee';
 import type { ToolBackgroundConfig } from '../background-tasks';
 import type { MastraBrowser } from '../browser/browser';
 import type { Mastra } from '../mastra';
@@ -79,6 +80,51 @@ export type NeedsApprovalContext = {
  * `createTool` over setting this directly.
  */
 export type NeedsApprovalFn = (input: any, ctx?: NeedsApprovalContext) => boolean | Promise<boolean>;
+
+export interface ToolHookContext<
+  TInput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> {
+  /** The name exposed to the model for this tool call. */
+  toolName: string;
+  /** Input passed to the tool. */
+  input: TInput;
+  /** Execution context passed to the tool. */
+  context: TContext;
+  /** Optional adapter-specific metadata. */
+  metadata?: TMetadata;
+}
+
+export interface ToolBeforeHookResult<TOutput = unknown> {
+  /** Set to false to skip the tool execution and return `output` instead. */
+  proceed: false;
+  output: TOutput;
+}
+
+export interface ToolAfterHookContext<
+  TInput = unknown,
+  TOutput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> extends ToolHookContext<TInput, TContext, TMetadata> {
+  /** Tool output when execution completed. Undefined when execution failed before producing output. */
+  output?: TOutput;
+  /** Error thrown by the tool, if execution failed. */
+  error?: unknown;
+}
+
+export interface ToolHooks<
+  TInput = unknown,
+  TOutput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> {
+  beforeToolCall?: (
+    context: ToolHookContext<TInput, TContext, TMetadata>,
+  ) => void | ToolBeforeHookResult<TOutput> | Promise<void | ToolBeforeHookResult<TOutput>>;
+  afterToolCall?: (context: ToolAfterHookContext<TInput, TOutput, TContext, TMetadata>) => void | Promise<void>;
+}
 
 export type ToolPayloadTransformTarget = 'display' | 'transcript';
 
@@ -188,6 +234,9 @@ export interface WorkflowToolExecutionContext<TSuspend, TResume> {
   resumeData?: TResume;
 }
 
+/** Log levels for MCP `notifications/message`, ordered per RFC 5424. */
+export type MCPLoggingLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical' | 'alert' | 'emergency';
+
 // MCP tool execution context - properties specific when tools are executed via Model Context Protocol
 export interface MCPToolExecutionContext {
   /** MCP protocol context passed by the server */
@@ -196,6 +245,16 @@ export interface MCPToolExecutionContext {
   elicitation: {
     sendRequest: (request: ElicitRequest['params']) => Promise<ElicitResult>;
   };
+  /**
+   * Sends a `notifications/message` log notification to the calling client.
+   * Messages below the client's minimum level (set via `logging/setLevel`) are dropped.
+   */
+  log?: (level: MCPLoggingLevel, message: string, data?: Record<string, unknown>) => Promise<void>;
+  /**
+   * Sends a `notifications/progress` notification to the calling client.
+   * No-op if the caller did not request progress tracking (no progressToken in `_meta`).
+   */
+  progress?: (params: { progress: number; total?: number; message?: string }) => Promise<void>;
 }
 
 /**
@@ -228,11 +287,14 @@ export type MastraToolInvocationOptions = ToolInvocationOptions &
      */
     workspace?: Workspace;
     /**
-     * Request context for tool execution. When provided at execution time, this overrides
-     * any requestContext configured at tool build time. Allows workflow steps to forward
-     * their requestContext (e.g., authenticated API clients, feature flags) to tools.
+     * Request context for tool execution. Execution-time application keys override
+     * build-time values, while existing infrastructure-owned build values remain
+     * authoritative. Infrastructure keys absent at build time can still be supplied
+     * by the execution context.
      */
     requestContext?: RequestContext;
+    /** Trusted server-side signal for this tool FGA check. */
+    actor?: ActorSignal;
     /**
      * Flushes the parent stream's pending messages to persistent storage.
      *
@@ -471,6 +533,8 @@ export interface ToolExecutionContext<
   mastra?: MastraUnion;
   requestContext?: RequestContext<TRequestContext>;
   abortSignal?: AbortSignal;
+  /** Trusted server-side signal forwarded for nested FGA checks. */
+  actor?: ActorSignal;
 
   /**
    * Workspace available for tool execution. When provided, tools can access:

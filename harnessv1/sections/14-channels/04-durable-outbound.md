@@ -80,6 +80,7 @@ for transitions, idempotency, and capability semantics):
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="870" y="402" text-anchor="middle">no provider reconciliation</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="870" y="420" text-anchor="middle">retries may duplicate</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #64748b;" x="870" y="442" text-anchor="middle">duplicate possible</text>
+
   </svg>
   <figcaption>Outbox rows move through one canonical state machine; the snapshotted delivery-semantics class on each row decides whether retries can duplicate a provider side effect.</figcaption>
 </figure>
@@ -147,14 +148,14 @@ Outbound guarantees depend on the adapter/provider operation capability
 snapshotted onto the outbox row at enqueue time:
 
 - `native-idempotency` — the provider accepts a client idempotency key and
-suppresses duplicate sends for that key.
+  suppresses duplicate sends for that key.
 - `client-message-id` — the adapter can choose a deterministic platform message
-ID or nonce and retry safely.
+  ID or nonce and retry safely.
 - `lookup-reconcile` — the adapter implements `reconcileDelivery(...)` and can
-search by stored client metadata after a crash before sending again.
+  search by stored client metadata after a crash before sending again.
 - `at-least-once` — no provider reconciliation exists; duplicate user-visible
-posts are possible after a crash between provider acknowledgement and
-`markChannelOutboxSent`.
+  posts are possible after a crash between provider acknowledgement and
+  `markChannelOutboxSent`.
 
 Harness v1 guarantees no duplicate outbox row for one
 `(bindingId, idempotencyKey)`: exact duplicate enqueue requires the same
@@ -254,11 +255,11 @@ delete, and duplicate suppression remains governed by the row's snapshotted
 Typical outbox producers:
 
 - recoverable assistant text and file-reference output, within the §11.5/§15.3
-artifact deferral, that should be delivered to the bound platform thread;
+  artifact deferral, that should be delivered to the bound platform thread;
 - approval, question, suspension, and plan prompts that need channel
-buttons/forms;
+  buttons/forms;
 - durable tool-result notifications projected from persisted run/thread/tool
-state;
+  state;
 - status messages for long-running queued or proactive work;
 - edits/resolutions that replace an approval card after a user acts;
 - stale-card edits/resolutions that disable or explain a previously delivered
@@ -352,7 +353,6 @@ only in a live stream map are not projectable.
 Stable `idempotencyKey` inputs: A trusted bridge/adapter key that is stable
 across restart and scoped to the binding. Provider payload fields never supply
 this key directly.
-
 
 Harness v1 ships built-in `add_reaction` and `remove_reaction` model tools as
 the outbox-backed substitute for the legacy `AgentChannels.getTools()` reaction

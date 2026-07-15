@@ -52,38 +52,38 @@ stored as replay inputs.
 URL ingestion is a server-owned fetch/copy with a normative security policy:
 
 - The initial URL and every redirect hop must use `http:` or `https:`. Other
-schemes reject with
-`HarnessAttachmentUnavailableError.reason = 'unsupported_url'`.
+  schemes reject with
+  `HarnessAttachmentUnavailableError.reason = 'unsupported_url'`.
 - Redirects are capped by `HarnessConfig.files.maxUrlRedirects`; exceeding the
-cap rejects with `reason = 'redirect_limit_exceeded'`. Every hop is revalidated
-before following it.
+  cap rejects with `reason = 'redirect_limit_exceeded'`. Every hop is revalidated
+  before following it.
 - Unless `HarnessConfig.files.allowPrivateNetworkUrls` is explicitly enabled for
-the deployment, DNS resolution and connection targets must reject loopback,
-link-local, private, multicast, reserved, and cloud metadata-service address
-ranges. The check applies to the initial URL, every redirect hop, and the
-connection target so DNS rebinding cannot bypass the policy. Blocked targets,
-including DNS rebinding discoveries at connection time, reject with
-`reason = 'network_target_blocked'`.
+  the deployment, DNS resolution and connection targets must reject loopback,
+  link-local, private, multicast, reserved, and cloud metadata-service address
+  ranges. The check applies to the initial URL, every redirect hop, and the
+  connection target so DNS rebinding cannot bypass the policy. Blocked targets,
+  including DNS rebinding discoveries at connection time, reject with
+  `reason = 'network_target_blocked'`.
 - The server never forwards caller `Authorization`, `Cookie`, session, bearer,
-API-key, or ambient server credentials to a caller-supplied URL. A signed URL's
-own query string may be used for that fetch, but the raw URL is transient input
-and is not persisted.
+  API-key, or ambient server credentials to a caller-supplied URL. A signed URL's
+  own query string may be used for that fetch, but the raw URL is transient input
+  and is not persisted.
 - Fetching enforces `HarnessConfig.files.urlFetchTimeoutMs` and a streamed
-stored-byte cap of `HarnessConfig.files.maxUrlBytes`; `Content-Length` alone is
-not sufficient. Timeout aborts reject with `reason = 'fetch_timeout'`; oversized
-bodies abort with `reason = 'too_large'` before admission.
+  stored-byte cap of `HarnessConfig.files.maxUrlBytes`; `Content-Length` alone is
+  not sufficient. Timeout aborts reject with `reason = 'fetch_timeout'`; oversized
+  bodies abort with `reason = 'too_large'` before admission.
 - The caller-declared `mimeType`, response `Content-Type` when present, and
-byte-sniffed content type must be compatible and must satisfy
-`HarnessConfig.files.allowedUrlMimeTypes` when configured. Mismatches reject
-with `reason = 'mime_mismatch'`.
+  byte-sniffed content type must be compatible and must satisfy
+  `HarnessConfig.files.allowedUrlMimeTypes` when configured. Mismatches reject
+  with `reason = 'mime_mismatch'`.
 - The persisted digest is SHA-256 over the exact bytes written to Harness-owned
-attachment storage. A digest write/verification mismatch rejects with
-`reason = 'digest_mismatch'`.
+  attachment storage. A digest write/verification mismatch rejects with
+  `reason = 'digest_mismatch'`.
 - Deployment or storage-adapter malware scanning and content policy may run
-before admission. Harness v1 does not guarantee a built-in malware scanner; when
-a configured policy blocks the content or cannot produce a required allow
-verdict, the operation rejects before admission with
-`reason = 'blocked_by_policy'`.
+  before admission. Harness v1 does not guarantee a built-in malware scanner; when
+  a configured policy blocks the content or cannot produce a required allow
+  verdict, the operation rejects before admission with
+  `reason = 'blocked_by_policy'`.
 
 Policy, target, redirect, timeout, scan, and content-validation failures leave
 no durable queue, channel inbox, wakeup, accepted-signal, thread-history, or

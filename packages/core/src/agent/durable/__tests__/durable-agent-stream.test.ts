@@ -10,11 +10,18 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
+import { RequestContext } from '../../../request-context';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
+import { clearToolSurfaceFence, readToolSurfaceFence, stampToolSurfaceFence } from '../../tool-surface-fence';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
+import { createEventedAgent } from '../create-evented-agent';
+import { globalRunRegistry } from '../run-registry';
 import type { AgentStreamEvent } from '../types';
+import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
+import { baseDurableAgenticInputSchema } from '../workflows/shared/schemas';
 
 // ============================================================================
 // Helper Functions
@@ -84,10 +91,16 @@ function _createToolCallModel(toolName: string, args: Record<string, unknown>) {
   });
 }
 
-function _createToolCallThenTextModel(toolName: string, args: Record<string, unknown>, finalText: string) {
+function createToolCallThenTextModel(
+  toolName: string,
+  args: Record<string, unknown>,
+  finalText: string,
+  prompts: unknown[] = [],
+) {
   let callCount = 0;
   return new MockLanguageModelV2({
-    doStream: async () => {
+    doStream: async (options: any) => {
+      prompts.push(options.prompt);
       callCount++;
       if (callCount === 1) {
         // First call: return tool call
@@ -130,6 +143,14 @@ function _createToolCallThenTextModel(toolName: string, args: Record<string, unk
       }
     },
   });
+}
+
+async function collectStreamChunks(stream: ReadableStream<any>) {
+  const chunks: any[] = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return chunks;
 }
 
 // ============================================================================
@@ -198,6 +219,515 @@ describe('DurableAgent streaming execution', () => {
       expect(doStream.mock.calls[0]?.[0].tools.map((tool: { name: string }) => tool.name)).toEqual(['allowedTool']);
 
       cleanup();
+    });
+
+    it('should preserve replacement toolsets as a durable processor and execution ceiling', async () => {
+      const hiddenExecute = vi.fn(async () => 'hidden');
+      let callCount = 0;
+      const doStream = vi.fn(async (options: any) => {
+        callCount++;
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'hidden-call',
+                    toolName: 'hiddenTool',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  { type: 'finish', finishReason: 'tool-calls', usage: { inputTokens: 1, outputTokens: 1 } },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: options.tools.map((tool: any) => tool.name).join(',') },
+                  { type: 'text-end', id: 'text-1' },
+                  { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } },
+                ],
+          ),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+      const model = new MockLanguageModelV2({ doStream });
+      const hiddenTool = createTool({
+        id: 'hiddenTool',
+        description: 'hidden',
+        inputSchema: z.object({}),
+        execute: hiddenExecute,
+      });
+      const modeTool = createTool({
+        id: 'modeTool',
+        description: 'mode',
+        inputSchema: z.object({}),
+        execute: async () => 'mode',
+      });
+      let ownKeysCalls = 0;
+      const processorTools = new Proxy<Record<string, unknown>>(
+        {},
+        {
+          ownKeys: () => {
+            ownKeysCalls++;
+            return ownKeysCalls % 2 === 1 ? ['modeTool'] : ['modeTool', 'hiddenTool'];
+          },
+          getOwnPropertyDescriptor: (_target, key) => ({
+            value: key === 'modeTool' ? modeTool : hiddenTool,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          }),
+          get: (_target, key) => (key === 'modeTool' ? modeTool : hiddenTool),
+        },
+      );
+      const baseAgent = new Agent({
+        id: 'durable-replacement-agent',
+        name: 'Durable Replacement Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: { hiddenTool },
+        inputProcessors: [
+          {
+            id: 'expand-tools',
+            processInputStep: () => ({
+              tools: processorTools,
+              activeTools: ['modeTool', 'hiddenTool'],
+            }),
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const { output, cleanup } = await durableAgent.stream('test', {
+        maxSteps: 3,
+        toolsets: { mode: { modeTool } },
+        toolsetsMode: 'replace',
+      });
+      await output.consumeStream();
+
+      expect(doStream).toHaveBeenCalledTimes(2);
+      expect(doStream.mock.calls.map(call => call[0].tools.map((tool: any) => tool.name))).toEqual([
+        ['modeTool'],
+        ['modeTool'],
+      ]);
+      expect(hiddenExecute).not.toHaveBeenCalled();
+      expect(ownKeysCalls).toBe(2);
+      cleanup();
+    });
+
+    it('should not let stale durable registry cleanup clear a newer direct execution fence', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-stale-fence-cleanup-agent',
+        name: 'Durable Stale Fence Cleanup Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const requestContext = new RequestContext();
+      const runId = 'durable-stale-fence-cleanup-run';
+      const prepared = await durableAgent.prepare('test', {
+        runId,
+        requestContext,
+        toolsetsMode: 'replace',
+        toolsets: {
+          mode: {
+            modeTool: createTool({
+              id: 'modeTool',
+              description: 'durable replacement tool',
+              inputSchema: z.object({}),
+              execute: async () => 'mode',
+            }),
+          },
+        },
+      });
+      const directFence = stampToolSurfaceFence(
+        requestContext,
+        runId,
+        {
+          directTool: createTool({
+            id: 'directTool',
+            description: 'new direct execution tool',
+            inputSchema: z.object({}),
+            execute: async () => 'direct',
+          }),
+        },
+        'direct-owner',
+      );
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      expect(readToolSurfaceFence(requestContext, runId)).toBe(directFence);
+      globalRunRegistry.delete(prepared.runId);
+      expect(readToolSurfaceFence(requestContext, runId)).toBe(directFence);
+
+      expect(clearToolSurfaceFence(requestContext, runId, 'direct-owner')).toBe(true);
+    });
+
+    it('should retry a generated runId collision without replacing the active entry', async () => {
+      const occupiedRunId = crypto.randomUUID();
+      const occupiedEntry = {
+        runtimeBindingId: 'occupied-binding',
+        tools: {},
+        model: createTextStreamModel('occupied') as LanguageModelV2,
+      };
+      globalRunRegistry.set(occupiedRunId, occupiedEntry);
+      const baseAgent = new Agent({
+        id: 'durable-generated-collision-agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const prepared = await durableAgent.prepare('test');
+
+      expect(prepared.runId).not.toBe(occupiedRunId);
+      expect(globalRunRegistry.get(occupiedRunId)).toBe(occupiedEntry);
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
+      globalRunRegistry.delete(occupiedRunId);
+    });
+
+    it('should reject an active caller-reused runId without replacing its registered tools', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-duplicate-run-agent',
+        name: 'Durable Duplicate Run Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const firstTool = createTool({
+        id: 'firstTool',
+        description: 'first',
+        inputSchema: z.object({}),
+        execute: async () => 'first',
+      });
+      const first = await durableAgent.prepare('first', {
+        runId: 'caller-reused-run',
+        toolsetsMode: 'replace',
+        toolsets: { mode: { firstTool } },
+      });
+
+      await expect(
+        durableAgent.prepare('second', {
+          runId: 'caller-reused-run',
+          toolsetsMode: 'replace',
+          toolsets: {
+            mode: {
+              secondTool: createTool({
+                id: 'secondTool',
+                description: 'second',
+                inputSchema: z.object({}),
+                execute: async () => 'second',
+              }),
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUN_ID_CONFLICT' });
+
+      expect(globalRunRegistry.get(first.runId)?.runtimeBindingId).toBe(first.workflowInput.runtimeBindingId);
+      expect(Object.keys(globalRunRegistry.get(first.runId)?.tools ?? {})).toEqual(['firstTool']);
+      durableAgent.runRegistry.cleanup(first.runId);
+      globalRunRegistry.delete(first.runId);
+    });
+
+    it('should fail closed if a durable workflow runId is rebound to a different runtime entry', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-binding-agent',
+        name: 'Durable Binding Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', { runId: 'runtime-binding-run' });
+      const originalEntry = globalRunRegistry.get(prepared.runId)!;
+      globalRunRegistry.set(prepared.runId, {
+        ...originalEntry,
+        runtimeBindingId: 'rebound-runtime-binding',
+      });
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).rejects.toThrow(/no longer matches its registered runtime dependencies/);
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
+    });
+
+    it('should keep a pre-binding-shaped registry-required input fail-closed after registry loss', async () => {
+      const backingTool = createTool({
+        id: 'legacyBackingTool',
+        description: 'reconstructed backing tool',
+        inputSchema: z.object({}),
+        execute: async () => 'backing implementation',
+      });
+      const baseAgent = new Agent({
+        id: 'durable-legacy-binding-agent',
+        name: 'Durable Legacy Binding Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        tools: { backingTool },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', { runId: 'legacy-binding-run' });
+      const { runtimeBindingId: _runtimeBindingId, ...legacyWorkflowInput } = prepared.workflowInput;
+
+      expect(() => baseDurableAgenticInputSchema.parse(legacyWorkflowInput)).not.toThrow();
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: legacyWorkflowInput,
+        }),
+      ).rejects.toThrow(/no longer matches its registered runtime dependencies/);
+
+      globalRunRegistry.delete(prepared.runId);
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: legacyWorkflowInput,
+          mastra: { getAgentById: () => baseAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+      durableAgent.runRegistry.cleanup(prepared.runId);
+    });
+
+    it('should reject a partial replacement registry before durable execution', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-partial-registry-agent',
+        name: 'Durable Partial Registry Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'partial-registry-run',
+        toolsetsMode: 'replace',
+        toolsets: {
+          mode: {
+            modeTool: createTool({
+              id: 'modeTool',
+              description: 'mode',
+              inputSchema: z.object({}),
+              execute: async () => 'mode',
+            }),
+          },
+        },
+      });
+      const originalEntry = globalRunRegistry.get(prepared.runId)!;
+      globalRunRegistry.set(prepared.runId, { ...originalEntry, tools: {} });
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).rejects.toThrow(/modeTool.*no own concrete implementation/);
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
+    });
+
+    it('should fail closed after registry loss instead of substituting same-named backing tools', async () => {
+      const model = createTextStreamModel('unused');
+      const baseAgent = new Agent({
+        id: 'durable-registry-loss-agent',
+        name: 'Durable Registry Loss Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: {
+          modeTool: createTool({
+            id: 'backing-modeTool',
+            description: 'same name, different backing implementation',
+            inputSchema: z.object({}),
+            execute: async () => 'wrong implementation',
+          }),
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'registry-loss-run',
+        toolsetsMode: 'replace',
+        toolsets: {
+          mode: {
+            modeTool: createTool({
+              id: 'replacement-modeTool',
+              description: 'approved replacement implementation',
+              inputSchema: z.object({}),
+              execute: async () => 'approved implementation',
+            }),
+          },
+        },
+      });
+      globalRunRegistry.delete('registry-loss-run');
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: 'registry-loss-run',
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+    });
+
+    it('should keep an empty replacement surface fail-closed after registry loss', async () => {
+      const model = createTextStreamModel('unused');
+      const baseAgent = new Agent({
+        id: 'durable-empty-replacement-agent',
+        name: 'Durable Empty Replacement Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+        tools: {
+          hiddenTool: createTool({
+            id: 'hiddenTool',
+            description: 'must stay hidden',
+            inputSchema: z.object({}),
+            execute: async () => 'hidden',
+          }),
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'empty-registry-loss-run',
+        toolsetsMode: 'replace',
+        toolsets: {},
+      });
+      globalRunRegistry.delete('empty-registry-loss-run');
+
+      expect(prepared.workflowInput.options.toolSurfaceFence).toEqual([]);
+      await expect(
+        resolveRuntimeDependencies({
+          runId: 'empty-registry-loss-run',
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+          mastra: { getAgentById: () => baseAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING' });
+    });
+
+    it('should abort durable preparation when a replacement tool surface cannot be converted', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-invalid-replacement-agent',
+        name: 'Durable Invalid Replacement Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-replacement-run',
+          toolsetsMode: 'replace',
+          toolsets: {
+            invalid: {
+              'duplicate name': createTool({
+                id: 'first',
+                description: 'normalizes to duplicate_name',
+                inputSchema: z.object({}),
+                execute: async () => 'first',
+              }),
+              duplicate_name: createTool({
+                id: 'second',
+                description: 'collides after normalization',
+                inputSchema: z.object({}),
+                execute: async () => 'second',
+              }),
+            },
+          },
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(globalRunRegistry.has('invalid-replacement-run')).toBe(false);
+    });
+
+    it('should abort durable preparation when an inherited replacement surface cannot be converted', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-invalid-default-replacement-agent',
+        name: 'Durable Invalid Default Replacement Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        defaultOptions: {
+          toolsetsMode: 'replace',
+          toolsets: {
+            invalid: {
+              'duplicate name': createTool({
+                id: 'first-default',
+                description: 'normalizes to duplicate_name',
+                inputSchema: z.object({}),
+                execute: async () => 'first',
+              }),
+              duplicate_name: createTool({
+                id: 'second-default',
+                description: 'collides after normalization',
+                inputSchema: z.object({}),
+                execute: async () => 'second',
+              }),
+            },
+          },
+        },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(durableAgent.prepare('test', { runId: 'invalid-default-replacement-run' })).rejects.toThrow(
+        /resolve to the same name/,
+      );
+      expect(globalRunRegistry.has('invalid-default-replacement-run')).toBe(false);
+    });
+
+    it('should roll back only a newly created processor thread when replacement tool conversion fails', async () => {
+      const memory = new MockMemory();
+      const invalidToolsets = {
+        invalid: {
+          'duplicate name': createTool({
+            id: 'first-memory',
+            description: 'normalizes to duplicate_name',
+            inputSchema: z.object({}),
+            execute: async () => 'first',
+          }),
+          duplicate_name: createTool({
+            id: 'second-memory',
+            description: 'collides after normalization',
+            inputSchema: z.object({}),
+            execute: async () => 'second',
+          }),
+        },
+      };
+      const baseAgent = new Agent({
+        id: 'durable-invalid-replacement-memory-agent',
+        name: 'Durable Invalid Replacement Memory Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+        memory,
+        inputProcessors: [{ id: 'noop-processor', processInputStep: () => ({}) }],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-new-thread-run',
+          memory: { thread: 'new-preparation-thread', resource: 'resource' },
+          toolsetsMode: 'replace',
+          toolsets: invalidToolsets,
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(await memory.getThreadById({ threadId: 'new-preparation-thread' })).toBeNull();
+
+      await memory.createThread({ threadId: 'existing-preparation-thread', resourceId: 'resource' });
+      await expect(
+        durableAgent.prepare('test', {
+          runId: 'invalid-existing-thread-run',
+          memory: { thread: 'existing-preparation-thread', resource: 'resource' },
+          toolsetsMode: 'replace',
+          toolsets: invalidToolsets,
+        }),
+      ).rejects.toThrow(/resolve to the same name/);
+      expect(await memory.getThreadById({ threadId: 'existing-preparation-thread' })).not.toBeNull();
     });
 
     it('should allow input processors to clear activeTools for LLM request and tool execution', async () => {
@@ -283,6 +813,173 @@ describe('DurableAgent streaming execution', () => {
         'hiddenTool',
       ]);
       expect(hiddenExecute).toHaveBeenCalledOnce();
+
+      cleanup();
+    });
+
+    it('should not dispatch a replacement tool removed by an input processor', async () => {
+      const execute = vi.fn(async () => 'must not run');
+      let callCount = 0;
+      const doStream = vi.fn(async () => {
+        callCount++;
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'removed-call',
+                    toolName: 'allowedTool',
+                    input: JSON.stringify({}),
+                    providerExecuted: false,
+                  },
+                  {
+                    type: 'finish',
+                    finishReason: 'tool-calls',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: 'Done' },
+                  { type: 'text-end', id: 'text-1' },
+                  {
+                    type: 'finish',
+                    finishReason: 'stop',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ],
+          ),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+      const allowedTool = createTool({
+        id: 'allowedTool',
+        description: 'Replacement tool removed by the processor',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const baseAgent = new Agent({
+        id: 'durable-processor-narrowing-agent',
+        name: 'Durable Processor Narrowing Agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        inputProcessors: [
+          {
+            id: 'remove-replacement-tool',
+            processInputStep: async () => ({ tools: {} }),
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const { output, cleanup } = await durableAgent.stream('Try the removed tool', {
+        maxSteps: 2,
+        toolsetsMode: 'replace',
+        toolsets: { mode: { allowedTool } },
+      });
+
+      await output.consumeStream();
+
+      expect(doStream).toHaveBeenCalledTimes(2);
+      expect(doStream.mock.calls[0]?.[0].tools ?? []).toEqual([]);
+      expect(execute).not.toHaveBeenCalled();
+
+      cleanup();
+    });
+
+    it('should dispatch the fenced original after an input processor mutates the shared registry tools in place', async () => {
+      const originalExecute = vi.fn(async () => 'original');
+      const substitutedExecute = vi.fn(async () => 'substituted');
+      const allowedTool = createTool({
+        id: 'allowedTool',
+        description: 'allowed replacement tool',
+        inputSchema: z.object({}),
+        execute: originalExecute,
+      });
+      const substitutedTool = createTool({
+        id: 'allowedTool',
+        description: 'substituted implementation the model never saw',
+        inputSchema: z.object({}),
+        execute: substitutedExecute,
+      });
+      let callCount = 0;
+      const doStream = vi.fn(async () => {
+        callCount++;
+        return {
+          stream: convertArrayToReadableStream(
+            callCount === 1
+              ? [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'sub-call',
+                    toolName: 'allowedTool',
+                    input: JSON.stringify({}),
+                    providerExecuted: false,
+                  },
+                  {
+                    type: 'finish',
+                    finishReason: 'tool-calls',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ]
+              : [
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'text-start', id: 'text-1' },
+                  { type: 'text-delta', id: 'text-1', delta: 'Done' },
+                  { type: 'text-end', id: 'text-1' },
+                  {
+                    type: 'finish',
+                    finishReason: 'stop',
+                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                  },
+                ],
+          ),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+      const baseAgent = new Agent({
+        id: 'durable-registry-mutation-agent',
+        name: 'Durable Registry Mutation Agent',
+        instructions: 'test',
+        model: new MockLanguageModelV2({ doStream }) as LanguageModelV2,
+        inputProcessors: [
+          {
+            id: 'mutate-shared-registry',
+            processInputStep: async () => {
+              // Reach the shared registry entry and substitute the allowed tool's
+              // implementation in place, returning no replacement map. The LLM step
+              // still shows the fenced original, but a naive tool-call step that
+              // re-snapshots the registry would dispatch this substitute.
+              for (const entry of (globalRunRegistry as any).values() as Iterable<any>) {
+                if (entry?.tools?.allowedTool) {
+                  entry.tools.allowedTool = substitutedTool;
+                }
+              }
+              return {};
+            },
+          },
+        ],
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const { output, cleanup } = await durableAgent.stream('Use the tool', {
+        maxSteps: 3,
+        toolsetsMode: 'replace',
+        toolsets: { mode: { allowedTool } },
+      });
+
+      await output.consumeStream();
+
+      expect(substitutedExecute).not.toHaveBeenCalled();
+      expect(originalExecute).toHaveBeenCalledTimes(1);
 
       cleanup();
     });
@@ -394,6 +1091,62 @@ describe('DurableAgent streaming execution', () => {
       cleanup();
     });
 
+    it('should continue durable and evented streams after a tool-call step when maxSteps allows it', async () => {
+      const finalText = 'tool returned hello';
+      const echoTool = createTool({
+        id: 'echo',
+        description: 'Echo the input',
+        inputSchema: z.object({ text: z.string() }),
+        outputSchema: z.object({ echoed: z.string() }),
+        execute: async ({ text }) => ({ echoed: text }),
+      });
+
+      const createTestCase = (name: string, agentId: string) => {
+        const prompts: unknown[] = [];
+        const agent = new Agent({
+          id: agentId,
+          name: agentId,
+          instructions: 'Call echo, then describe what came back.',
+          model: createToolCallThenTextModel('echo', { text: 'hello' }, finalText, prompts) as LanguageModelV2,
+          tools: { echo: echoTool },
+        });
+
+        return {
+          name,
+          prompts,
+          agent: name === 'durable' ? createDurableAgent({ agent, pubsub }) : createEventedAgent({ agent, pubsub }),
+        };
+      };
+
+      const cases = [
+        createTestCase('durable', 'durable-multi-step-agent'),
+        createTestCase('evented', 'evented-multi-step-agent'),
+      ];
+
+      for (const testCase of cases) {
+        const { output, cleanup } = await testCase.agent.stream('Run echo with hello.', { maxSteps: 4 });
+        const chunks = await collectStreamChunks(output.fullStream);
+
+        const chunkTypes = chunks.map(chunk => chunk.type);
+        const finishChunk = chunks.findLast(chunk => chunk.type === 'finish');
+        const secondPrompt = JSON.stringify(testCase.prompts[1]);
+
+        expect(testCase.prompts, testCase.name).toHaveLength(2);
+        expect(secondPrompt, testCase.name).toContain('"echoed":"hello"');
+        expect(chunkTypes, testCase.name).toContain('tool-call');
+        expect(chunkTypes, testCase.name).toContain('tool-result');
+        expect(chunkTypes, testCase.name).toContain('text-delta');
+        expect(
+          chunks.some(chunk => chunk.type === 'text-delta' && chunk.payload?.text === finalText),
+          testCase.name,
+        ).toBe(true);
+        expect(finishChunk?.payload?.stepResult?.reason, testCase.name).toBe('stop');
+        expect(finishChunk?.payload?.output?.text, testCase.name).toBe(finalText);
+
+        cleanup();
+      }
+    });
+
     it('should stream multiple text chunks', async () => {
       const mockModel = createMultiChunkStreamModel(['Hello', ', ', 'world', '!']);
       const chunks: any[] = [];
@@ -483,7 +1236,7 @@ describe('DurableAgent streaming execution', () => {
         },
       });
 
-      let errorReceived: Error | null = null;
+      let errorReceived: Error | string | null = null;
 
       const baseAgent = new Agent({
         id: 'error-callback-agent',
@@ -495,7 +1248,7 @@ describe('DurableAgent streaming execution', () => {
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
       const { output, cleanup } = await durableAgent.stream('Test', {
-        onError: error => {
+        onError: ({ error }) => {
           errorReceived = error;
         },
       });
@@ -746,7 +1499,7 @@ describe('DurableAgent error handling', () => {
       },
     });
 
-    let errorReceived: Error | null = null;
+    let errorReceived: Error | string | null = null;
 
     const baseAgent = new Agent({
       id: 'error-model-agent',
@@ -758,7 +1511,7 @@ describe('DurableAgent error handling', () => {
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
     const { output, cleanup } = await durableAgent.stream('Test', {
-      onError: error => {
+      onError: ({ error }) => {
         errorReceived = error;
       },
     });
@@ -917,7 +1670,7 @@ describe('DurableAgent workflow input serialization', () => {
 
     expect(result.workflowInput.options.maxSteps).toBe(5);
     expect(result.workflowInput.options.toolChoice).toBe('auto');
-    expect(result.workflowInput.options.temperature).toBe(0.7);
+    expect(result.workflowInput.options.modelSettings?.temperature).toBe(0.7);
 
     // Verify serializable
     const serialized = JSON.stringify(result.workflowInput.options);

@@ -2015,12 +2015,7 @@ export class HarnessLibSQL extends HarnessStorage {
     }
   }
 
-  async #applyPlanTaskOp(
-    tx: Transaction,
-    namespace: string,
-    sessionId: string,
-    op: PlanTaskMutationOp,
-  ): Promise<void> {
+  async #applyPlanTaskOp(tx: Transaction, namespace: string, sessionId: string, op: PlanTaskMutationOp): Promise<void> {
     if (op.kind === 'create') {
       await this.#insertPlanTask(tx, namespace, sessionId, op.task);
       return;
@@ -6312,12 +6307,17 @@ function rowToRunSummary(row: Record<string, unknown>): HarnessRunSummary {
     finishReason: String(row.finish_reason),
     reconstructed: Number(row.reconstructed) === 1,
     completedAt: Number(row.completed_at),
-    usage: (parseJson(row.usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 }) as HarnessRunSummary['usage'],
+    usage: (parseJson(row.usage) ?? {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    }) as HarnessRunSummary['usage'],
     createdAt: Number(row.created_at),
   };
   if (row.parent_session_id != null) summary.parentSessionId = String(row.parent_session_id);
   if (row.trace_id != null) summary.traceId = String(row.trace_id);
-  if (row.operation_kind != null) summary.operationKind = String(row.operation_kind) as HarnessRunSummary['operationKind'];
+  if (row.operation_kind != null)
+    summary.operationKind = String(row.operation_kind) as HarnessRunSummary['operationKind'];
   if (row.started_at != null) summary.startedAt = Number(row.started_at);
   if (row.duration_ms != null) summary.durationMs = Number(row.duration_ms);
   if (row.tool_rollup != null) summary.toolRollup = parseJson(row.tool_rollup) as HarnessRunSummary['toolRollup'];
@@ -6371,7 +6371,6 @@ function runSummaryColumnValues(summary: HarnessRunSummary): { names: string[]; 
   ];
   return { names, values };
 }
-
 
 function rowToAttachmentSemantic(row: Record<string, unknown>): AttachmentSemanticMetadata {
   const semantic: AttachmentSemanticMetadata = { kind: toAttachmentKind(row.kind) };

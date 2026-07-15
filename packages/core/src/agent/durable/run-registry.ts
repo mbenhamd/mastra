@@ -63,6 +63,76 @@ export function clearPinnedRunRegistryEntry(runId: string): void {
   pinnedRunRegistry.delete(runId);
 }
 
+/** Reset every global runtime binding, including entries pinned by an unfinished segment. */
+export function clearGlobalRunRegistry(): void {
+  const cachedEntries = new Set(globalRunRegistry.values());
+  const pinnedOnlyEntries = new Set(
+    [...pinnedRunRegistry.values()].map(({ entry }) => entry).filter(entry => !cachedEntries.has(entry)),
+  );
+  pinnedRunRegistry.clear();
+  globalRunRegistry.clear();
+  for (const entry of pinnedOnlyEntries) entry.cleanup?.();
+}
+
+/**
+ * End a run's root spans (MODEL_GENERATION then AGENT_RUN) with an error so the trace
+ * still exports — stores persist only span-end events. After a resume the fresh resume
+ * spans are the active root, so prefer them. Ending an already-ended span is a no-op,
+ * so the duplicate error paths (workflow failure + emitError) are safe. Never throws.
+ */
+export function endRunSpansWithError(runId: string, error: Error): void {
+  try {
+    const entry = globalRunRegistry.get(runId);
+    (entry?.resumeModelSpan ?? entry?.modelSpan)?.error({ error, endSpan: true });
+    (entry?.resumeAgentSpan ?? entry?.agentSpan)?.error({ error, endSpan: true });
+  } catch {
+    // Span bookkeeping must never break error reporting.
+  }
+}
+
+/**
+ * Read a run entry only when it is the exact entry captured by the durable
+ * workflow input. A caller-reused runId must never rebind an older workflow to
+ * a newer run's tools, processors, model, memory, or request context.
+ */
+export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: string): RunRegistryEntry | undefined {
+  const entry = getGlobalRunRegistryEntry(runId);
+  if (
+    entry &&
+    // Placeholder entries are cross-process carriers (e.g. the abort
+    // controller seeded by @mastra/inngest resume()). They hold no usable
+    // runtime dependencies — consumers rebuild from the Mastra instance — so
+    // a binding check would only break legitimate cross-process resumes.
+    entry.isPlaceholder !== true &&
+    (entry.runtimeBindingId !== runtimeBindingId ||
+      // Inputs persisted before runtime bindings existed may reconstruct after
+      // a process restart, but must never attach to a newly registered run that
+      // happens to reuse the same caller-provided ID.
+      runtimeBindingId === undefined)
+  ) {
+    throw new Error(
+      `Durable run ${runId} no longer matches its registered runtime dependencies. Refusing to execute a rebound run identifier.`,
+    );
+  }
+  return entry;
+}
+
+/** Register without replacing another active run that happens to reuse the same ID. */
+export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
+  if (globalRunRegistry.has(runId)) {
+    throw new Error(`Durable run ${runId} is already active. Refusing to replace its runtime dependencies.`);
+  }
+  globalRunRegistry.set(runId, entry);
+}
+
+/** Delete only the entry owned by the caller; stale cleanup must not delete a newer binding. */
+export function deleteBoundRunRegistryEntry(runId: string, runtimeBindingId: string): boolean {
+  const entry = globalRunRegistry.get(runId);
+  if (entry?.runtimeBindingId !== runtimeBindingId) return false;
+  globalRunRegistry.delete(runId);
+  return true;
+}
+
 /**
  * Registry for per-run non-serializable state.
  *
@@ -146,6 +216,13 @@ export class RunRegistry {
     }
   }
 
+  /** Ignore cleanup callbacks retained by an older execution that reused the same runId. */
+  cleanupBound(runId: string, runtimeBindingId: string): boolean {
+    if (this.#entries.get(runId)?.runtimeBindingId !== runtimeBindingId) return false;
+    this.cleanup(runId);
+    return true;
+  }
+
   /**
    * Get the number of active runs in the registry
    */
@@ -201,6 +278,11 @@ export class ExtendedRunRegistry extends RunRegistry {
     messageList: MessageList,
     memoryInfo?: { threadId?: string; resourceId?: string },
   ): void {
+    // Durable workflow steps deserialize a fresh MessageList and publish it
+    // through the shared registry entry. Keep that entry as the live source
+    // of truth so resume observers never read the stale list captured when
+    // the run was first registered.
+    entry.messageList = messageList;
     this.register(runId, entry);
     this.#messageLists.set(runId, messageList);
     if (memoryInfo) {
@@ -212,7 +294,7 @@ export class ExtendedRunRegistry extends RunRegistry {
    * Get MessageList for a specific run
    */
   getMessageList(runId: string): MessageList | undefined {
-    return this.#messageLists.get(runId);
+    return this.get(runId)?.messageList ?? this.#messageLists.get(runId);
   }
 
   /**

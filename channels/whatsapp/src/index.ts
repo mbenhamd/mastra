@@ -1,9 +1,5 @@
 export { WhatsAppHarnessAdapter, WHATSAPP_PLATFORM } from './harness-adapter';
-export {
-  verifyWhatsAppSignature,
-  verifyWebhookChallenge,
-  type WebhookChallengeResult,
-} from './crypto';
+export { verifyWhatsAppSignature, verifyWebhookChallenge, type WebhookChallengeResult } from './crypto';
 export {
   DEFAULT_WHATSAPP_API_VERSION,
   DEFAULT_GRAPH_API_BASE_URL,

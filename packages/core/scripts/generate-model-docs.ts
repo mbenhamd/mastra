@@ -117,6 +117,16 @@ const GATEWAY_PROVIDERS = ['netlify', 'openrouter', 'vercel', 'azure-openai'];
 
 const MANUALLY_DOCUMENTED_PROVIDERS = ['azure-openai'];
 const MANUALLY_DOCUMENTED_GATEWAYS = ['azure-openai', 'mastra'];
+const MANUAL_ENV_VARS: Record<string, string[]> = {
+  'azure-openai': [
+    'AZURE_API_KEY',
+    'AZURE_TENANT_ID',
+    'AZURE_CLIENT_ID',
+    'AZURE_CLIENT_SECRET',
+    'AZURE_SUBSCRIPTION_ID',
+  ],
+  mastra: ['MASTRA_GATEWAY_API_KEY'],
+};
 
 function formatProviderUrl(url: string): string {
   return /\$\{[^}]+\}/.test(url) ? `\`${url}\`` : `"${url}"`;
@@ -593,6 +603,56 @@ ${modelTable}
 `;
 }
 
+function formatEnvVarsForTable(envVars: string[]): string {
+  if (envVars.length === 0) return 'Configured in code';
+  return envVars.map(envVar => `\`${envVar}\``).join(', ');
+}
+
+function generateEnvListPage(grouped: GroupedProviders): string {
+  const providerRows = [...grouped.popular, ...grouped.other]
+    .map(provider => ({
+      type: 'Provider',
+      name: provider.name,
+      href: `/models/providers/${provider.id}`,
+      prefix: `${provider.id}/*`,
+      envVars: MANUAL_ENV_VARS[provider.id] ?? getRequiredEnvVars(provider),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const gatewayRows = Array.from(grouped.gateways.entries())
+    .map(([gatewayId, providers]) => ({
+      type: 'Gateway',
+      name: formatProviderName(gatewayId),
+      href: `/models/gateways/${gatewayId}`,
+      prefix: `${gatewayId}/*`,
+      envVars: MANUAL_ENV_VARS[gatewayId] ?? (providers[0] ? getRequiredEnvVars(providers[0]) : []),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const rows = [...providerRows, ...gatewayRows];
+
+  return `---
+title: "Environment variables | Models"
+description: "A list of environment variables used by Mastra for each model provider and gateway."
+---
+
+${getGeneratedComment()}
+
+# Environment variables
+
+List of required environment variables for each model provider and gateway supported by Mastra's [model router](/models).
+
+| Name | Model prefix | Environment variables |
+| ---- | ------------ | --------------------- |
+${rows
+  .map(
+    row =>
+      `| [${row.name}](${row.href}) ${row.type === 'Gateway' ? '(Gateway)' : ''} | \`${row.prefix}\` | ${formatEnvVarsForTable(row.envVars)} |`,
+  )
+  .join('\n')}
+`;
+}
+
 function generateIndexPage(grouped: GroupedProviders): string {
   const totalProviders = grouped.popular.length + grouped.other.length + grouped.gateways.size;
   const totalModels =
@@ -643,7 +703,7 @@ Mastra reads the relevant environment variable (e.g. \`ANTHROPIC_API_KEY\`) and 
       id: "my-agent",
       name: "My Agent",
       instructions: "You are a helpful assistant",
-      model: "openai/gpt-5.5"
+      model: "__GATEWAY_OPENAI_MODEL__"
     })
     \`\`\`
 
@@ -657,7 +717,7 @@ Mastra reads the relevant environment variable (e.g. \`ANTHROPIC_API_KEY\`) and 
       id: "my-agent",
       name: "My Agent",
       instructions: "You are a helpful assistant",
-      model: "anthropic/claude-sonnet-4-6"
+      model: "__GATEWAY_ANTHROPIC_MODEL_SONNET__"
     })
     \`\`\`
 
@@ -671,7 +731,7 @@ Mastra reads the relevant environment variable (e.g. \`ANTHROPIC_API_KEY\`) and 
       id: "my-agent",
       name: "My Agent",
       instructions: "You are a helpful assistant",
-      model: "google/gemini-2.5-flash"
+      model: "__GATEWAY_GOOGLE_MODEL_FLASH__"
     })
     \`\`\`
 
@@ -685,7 +745,7 @@ Mastra reads the relevant environment variable (e.g. \`ANTHROPIC_API_KEY\`) and 
       id: "my-agent",
       name: "My Agent",
       instructions: "You are a helpful assistant",
-      model: "xai/grok-4"
+      model: "xai/grok-4.3"
     })
     \`\`\`
 
@@ -797,7 +857,7 @@ const documentProcessor = new Agent({
   id: "document-processor",
   name: "Document Processor",
   instructions: "Extract and summarize key information from documents",
-  model: "openai/gpt-4o-mini"
+  model: "__GATEWAY_OPENAI_MODEL__"
 })
 
 // Use a powerful reasoning model for complex analysis
@@ -805,7 +865,7 @@ const reasoningAgent = new Agent({
   id: "reasoning-agent",
   name: "Reasoning Agent",
   instructions: "Analyze data and provide strategic recommendations",
-  model: "anthropic/claude-opus-4-1"
+  model: "__GATEWAY_ANTHROPIC_MODEL_OPUS__"
 })
 \`\`\`
 
@@ -847,7 +907,7 @@ const planner = new Agent({
       openai: { reasoningEffort: "low" }
     }
   },
-  model: "openai/o3-pro",
+  model: "__GATEWAY_OPENAI_MODEL__",
 });
 
 const lowEffort =
@@ -874,7 +934,7 @@ const agent = new Agent({
   id: "custom-agent",
   name: "Custom Agent",
   model: {
-    id: "openai/gpt-4-turbo",
+    id: "__GATEWAY_OPENAI_MODEL__",
     apiKey: process.env.OPENAI_API_KEY,
     headers: {
       "OpenAI-Organization": "org-abc123"
@@ -902,15 +962,15 @@ const agent = new Agent({
   instructions: 'You are a helpful assistant.',
   model: [
     {
-      model: "openai/gpt-5",
+      model: "__GATEWAY_OPENAI_MODEL__",
       maxRetries: 3,
     },
     {
-      model: "anthropic/claude-4-5-sonnet",
+      model: "__GATEWAY_ANTHROPIC_MODEL_SONNET__",
       maxRetries: 2,
     },
     {
-      model: "google/gemini-2.5-pro",
+      model: "__GATEWAY_GOOGLE_MODEL__",
       maxRetries: 2,
     },
   ],
@@ -934,13 +994,13 @@ const agent = new Agent({
   instructions: 'You are a helpful assistant.',
   model: [
     {
-      model: 'google/gemini-2.5-flash',
+      model: '__GATEWAY_GOOGLE_MODEL_FLASH__',
       maxRetries: 2,
       modelSettings: { temperature: 0.3 },
       providerOptions: { google: { thinkingConfig: { thinkingBudget: 0 } } },
     },
     {
-      model: 'openai/gpt-5-mini',
+      model: '__GATEWAY_OPENAI_MODEL_MINI__',
       maxRetries: 2,
       modelSettings: { temperature: 0.7 },
       providerOptions: { openai: { reasoningEffort: 'low' } },
@@ -1243,6 +1303,11 @@ const sidebars = {
     "index",
     "embeddings",
     {
+      type: 'doc',
+      id: 'environment-variables',
+      label: 'Environment Variables',
+    },
+    {
       type: "category",
       label: "Gateways",
       collapsed: false,
@@ -1290,6 +1355,11 @@ async function generateDocs() {
   const indexContent = generateIndexPage(grouped);
   await fs.writeFile(path.join(docsDir, 'index.mdx'), indexContent);
   console.info('✅ Generated models/index.mdx');
+
+  // Generate environment variables page
+  const envListContent = generateEnvListPage(grouped);
+  await fs.writeFile(path.join(docsDir, 'environment-variables.mdx'), envListContent);
+  console.info('✅ Generated models/environment-variables.mdx');
 
   // Generate gateways overview page
   const gatewaysIndexContent = generateGatewaysIndexPage(grouped);
@@ -1394,6 +1464,7 @@ export {
   parseProviders,
   generateProviderPage,
   generateGatewayPage,
+  generateEnvListPage,
   generateIndexPage,
   generateSidebarsFile,
 };

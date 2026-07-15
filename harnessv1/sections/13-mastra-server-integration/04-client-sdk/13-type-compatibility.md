@@ -25,12 +25,12 @@ async function summarize(session: RemoteSafeSession) {
   return session.signal({ type: 'user-message', contents: 'Summarize the diff', output: SummarySchema, sync: true });
 }
 
-summarize(localSession);   // ✅
-summarize(remoteSession);  // ✅
+summarize(localSession); // ✅
+summarize(remoteSession); // ✅
 
 // Local-only: requires direct workspace access.
 async function tarball(session: Session) {
-  const ws = session.getWorkspace();           // not on RemoteSession
+  const ws = session.getWorkspace(); // not on RemoteSession
   return ws?.exec('tar', ['-czf', 'out.tgz', '.']);
 }
 ```

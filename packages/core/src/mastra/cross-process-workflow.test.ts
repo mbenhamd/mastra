@@ -523,6 +523,17 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
     await mastra.shutdown();
   });
 
+  it('tags scheduler-spawned background workflow events as localOnly', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+
+    const schedRunId = 'sched___mastra_notification_dispatch_1781099940000';
+    await mastra.pubsub.publish('workflows', makeStartEvent('__mastra_notification_dispatcher', schedRunId, false));
+
+    expect(pubsub.calls[0]!.localOnly).toBe(true);
+    await mastra.shutdown();
+  });
+
   it('keeps real scheduled public workflow starts portable', async () => {
     const pubsub = new RecordingPushOnlyPubSub();
     const storage = new MockStore();
@@ -810,6 +821,45 @@ describe('mastra.pubsub proxy localOnly tagging', () => {
       data: { type: 'new-generation-released' },
     } as unknown as Event);
     expect(pubsub.calls.at(-1)!.localOnly).toBe(false);
+    await mastra.shutdown();
+  });
+
+  it('does not let a terminal event unregister a replacement created while completion publishes', async () => {
+    const pubsub = new RecordingPushOnlyPubSub();
+    const workflowId = 'terminal-replacement';
+    const runId = 'reused-terminal-run';
+    const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: {} as any, pubsub });
+    mastra.__registerInternalWorkflow(makeNoopWorkflow(workflowId) as any, runId);
+
+    let replacementGeneration: number | undefined;
+    const publish = pubsub.publish.bind(pubsub);
+    vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event, options) => {
+      if (topic === 'workflows-finish' && event.runId === runId && replacementGeneration === undefined) {
+        replacementGeneration = mastra.__registerInternalWorkflow(makeNoopWorkflow(workflowId) as any, runId);
+      }
+      await publish(topic, event, options);
+    });
+
+    const terminalEvent = makeStartEvent(workflowId, runId);
+    terminalEvent.type = 'workflow.end';
+    terminalEvent.data = {
+      ...terminalEvent.data,
+      activeStepsPath: {},
+      resumeSteps: [],
+    };
+
+    expect(await mastra.handleWorkflowEvent(terminalEvent)).toEqual({ ok: true });
+    expect(replacementGeneration).toBeDefined();
+    expect(mastra.__hasInternalWorkflow(workflowId, runId)).toBe(true);
+
+    await mastra.pubsub.publish(`workflow.events.v2.${runId}`, {
+      type: 'watch',
+      runId,
+      data: { type: 'replacement-still-owned' },
+    } as unknown as Event);
+    expect(pubsub.calls.at(-1)!.localOnly).toBe(true);
+
+    mastra.__unregisterInternalWorkflow(workflowId, runId, replacementGeneration);
     await mastra.shutdown();
   });
 

@@ -95,7 +95,11 @@ function interactiveReplyPayload(
       ? { type: 'button_reply', button_reply: { id: reply.id, title: reply.title } }
       : {
           type: 'list_reply',
-          list_reply: { id: reply.id, title: reply.title, ...(reply.description !== undefined ? { description: reply.description } : {}) },
+          list_reply: {
+            id: reply.id,
+            title: reply.title,
+            ...(reply.description !== undefined ? { description: reply.description } : {}),
+          },
         };
   return {
     object: 'whatsapp_business_account',
@@ -139,7 +143,9 @@ function statusCallbackPayload(): WhatsAppWebhookPayload {
             value: {
               messaging_product: 'whatsapp',
               metadata: { phone_number_id: PHONE_NUMBER_ID, display_phone_number: '15550009999' },
-              statuses: [{ id: 'wamid.INT-1', status: 'delivered', timestamp: '1700001234', recipient_id: '14155551234' }],
+              statuses: [
+                { id: 'wamid.INT-1', status: 'delivered', timestamp: '1700001234', recipient_id: '14155551234' },
+              ],
             },
           },
         ],
@@ -215,7 +221,14 @@ describe('WhatsAppHarnessAdapter — real Harness/Mastra route context', () => {
       channels: { whatsapp: channelConfig(adapter) },
     });
     new Mastra({
-      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as never }) },
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: 'openai/gpt-4o-mini' as never,
+        }),
+      },
       channels: { whatsapp: whatsappProvider() },
       harnesses: { primary: harness },
     });
@@ -277,8 +290,15 @@ describe('WhatsAppHarnessAdapter — real Harness/Mastra route context', () => {
     });
 
     // resolveResource (the channel's ingress policy) keys on externalThreadId.
-    const config = (harness as unknown as { _channelRegistry: { getConfig: (id: string) => HarnessChannelConfig } })._channelRegistry.getConfig('whatsapp');
-    const resolved = await config.ingress.resolveResource({ ...envelope, harnessName: 'primary', channelId: 'whatsapp', providerId: WHATSAPP_PLATFORM } as never);
+    const config = (
+      harness as unknown as { _channelRegistry: { getConfig: (id: string) => HarnessChannelConfig } }
+    )._channelRegistry.getConfig('whatsapp');
+    const resolved = await config.ingress.resolveResource({
+      ...envelope,
+      harnessName: 'primary',
+      channelId: 'whatsapp',
+      providerId: WHATSAPP_PLATFORM,
+    } as never);
     expect(resolved).toEqual({ resourceId: '14155551234', mode: 'per-user-resource' });
   });
 
@@ -314,7 +334,12 @@ describe('WhatsAppHarnessAdapter — real Harness/Mastra route context', () => {
 
   it('maps an interactive list_reply into a chat ingress envelope (title as content, id+description in raw)', async () => {
     const { harness, adapter } = setup();
-    const payload = interactiveReplyPayload({ kind: 'list', id: 'row-2', title: 'Standard shipping', description: '3-5 days' });
+    const payload = interactiveReplyPayload({
+      kind: 'list',
+      id: 'row-2',
+      title: 'Standard shipping',
+      description: '3-5 days',
+    });
     const req = signedRequest(payload);
     const ctx = harnessRouteContext(harness);
 
@@ -406,7 +431,14 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
       channels: { whatsapp: channelConfig(adapter) },
     });
     new Mastra({
-      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as never }) },
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: 'openai/gpt-4o-mini' as never,
+        }),
+      },
       storage: composite,
       channels: { whatsapp: whatsappProvider() },
       harnesses: { primary: harness },
@@ -434,7 +466,11 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
     const req = signedRequest(messageEventPayload());
     req.rawBody = String(req.rawBody) + 'X';
     const result = await harness.handleChannelInboundRequest('whatsapp', req as never);
-    expect(result).toMatchObject({ kind: 'verify_failed', httpStatus: 401, error: { code: 'harness.permission_denied' } });
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 401,
+      error: { code: 'harness.permission_denied' },
+    });
     const message = (result as { error: { message: string } }).error.message;
     expect(message).not.toContain('signature');
   });
@@ -442,8 +478,12 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
   it('treats an exact provider retry of the same signed event as a duplicate', async () => {
     const { harness } = setup();
     const payload = messageEventPayload();
-    const first = await harness.handleChannelInboundRequest('whatsapp', signedRequest(payload) as never, { continueAdmission: true });
-    const second = await harness.handleChannelInboundRequest('whatsapp', signedRequest(payload) as never, { continueAdmission: true });
+    const first = await harness.handleChannelInboundRequest('whatsapp', signedRequest(payload) as never, {
+      continueAdmission: true,
+    });
+    const second = await harness.handleChannelInboundRequest('whatsapp', signedRequest(payload) as never, {
+      continueAdmission: true,
+    });
     expect(first).toMatchObject({ kind: 'ok', duplicate: false });
     expect(second).toMatchObject({ kind: 'ok', duplicate: true });
   });
@@ -462,9 +502,24 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
     const adapter = new WhatsAppHarnessAdapter(adapterConfig());
     const composite = new InMemoryStore();
     const storage = composite.stores.harness;
-    const rows = new Map<string, { delivery?: string; runId?: string; signalId?: string; queuedItemId?: string; acceptedAt?: number; status: string }>();
-    const realUpdate = (storage as unknown as { updateChannelInboxItem: (...a: never[]) => Promise<void> }).updateChannelInboxItem.bind(storage);
-    (storage as unknown as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (record: { id: string } & Record<string, unknown>, opts: { claimId: string }) => {
+    const rows = new Map<
+      string,
+      {
+        delivery?: string;
+        runId?: string;
+        signalId?: string;
+        queuedItemId?: string;
+        acceptedAt?: number;
+        status: string;
+      }
+    >();
+    const realUpdate = (
+      storage as unknown as { updateChannelInboxItem: (...a: never[]) => Promise<void> }
+    ).updateChannelInboxItem.bind(storage);
+    (storage as unknown as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: { id: string } & Record<string, unknown>,
+      opts: { claimId: string },
+    ) => {
       await realUpdate(record as never, opts as never);
       rows.set(record.id, { ...(record as never) });
     };
@@ -474,7 +529,11 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
       adapter,
       ingress: {
         // The POLICY selects signal delivery (steer an active run), independent of the adapter.
-        resolveResource: async ctx => ({ resourceId: ctx.externalThreadId, mode: 'per-user-resource', admission: { delivery: 'signal' } }),
+        resolveResource: async ctx => ({
+          resourceId: ctx.externalThreadId,
+          mode: 'per-user-resource',
+          admission: { delivery: 'signal' },
+        }),
       },
     };
     const harness = new Harness({
@@ -484,7 +543,14 @@ describe('WhatsAppHarnessAdapter integration (ingress → admission via Harness)
       channels: { whatsapp: channel },
     });
     new Mastra({
-      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as never }) },
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: 'openai/gpt-4o-mini' as never,
+        }),
+      },
       storage: composite,
       channels: { whatsapp: whatsappProvider() },
       harnesses: { primary: harness },

@@ -21,3 +21,4 @@ export * from './stored-skill';
 export * from './responses';
 export * from './channels';
 export * from './harness';
+export * from './agent-controller';

@@ -8,7 +8,7 @@ interface TransformOptions {
   dry?: true;
   print?: true;
   verbose?: true;
-  jscodeshift?: string;
+  jscodeshift?: string[];
 }
 
 const log = debug('codemod:upgrade');

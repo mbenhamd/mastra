@@ -740,11 +740,7 @@ describe.each([
       const { agent } = createSuspendedSetup();
       const { runId, toolCallId } = await suspendRun(agent, 'thread-1', 'resource-1');
 
-      const resumeStream = await agent.approveToolCall({
-        runId,
-        toolCallId,
-        memory: { thread: 'thread-1', resource: 'resource-1' },
-      });
+      const resumeStream = await agent.approveToolCall({ runId, toolCallId });
       for await (const _chunk of resumeStream.fullStream) {
         // consume
       }
@@ -784,11 +780,7 @@ describe.each([
       ]);
 
       // Approve the first call; the loop resumes and re-suspends on the second.
-      const afterFirst = await agent.approveToolCall({
-        runId: stream.runId,
-        toolCallId: 'call-A',
-        memory: { thread: 'thread-par', resource: 'resource-par' },
-      });
+      const afterFirst = await agent.approveToolCall({ runId: stream.runId, toolCallId: 'call-A' });
       for await (const _chunk of afterFirst.fullStream) {
         // consume until the next suspension
       }
@@ -801,11 +793,7 @@ describe.each([
       ]);
 
       // Approve the second call; the run completes and is no longer discoverable.
-      const afterSecond = await agent.approveToolCall({
-        runId: stream.runId,
-        toolCallId: 'call-B',
-        memory: { thread: 'thread-par', resource: 'resource-par' },
-      });
+      const afterSecond = await agent.approveToolCall({ runId: stream.runId, toolCallId: 'call-B' });
       for await (const _chunk of afterSecond.fullStream) {
         // consume to completion
       }
@@ -949,7 +937,7 @@ describe.each([
       expect(new Set(allRunIds).size).toBe(3);
     }, 30000);
 
-    it('fails explicitly for a standalone agent without workflow storage', async () => {
+    it('returns an empty list for a standalone agent (ephemeral in-memory storage)', async () => {
       const agent = new Agent({
         id: 'no-storage-agent',
         name: 'No Storage Agent',
@@ -958,9 +946,7 @@ describe.each([
         tools: { findUserTool: createFindUserTool() },
       });
 
-      await expect(agent.listSuspendedRuns()).rejects.toMatchObject({
-        id: 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE',
-      });
+      expect((await agent.listSuspendedRuns()).runs).toEqual([]);
     }, 30000);
 
     it('validates a required request context before scanning storage', async () => {
@@ -1385,7 +1371,7 @@ describe.each([
       // Simulate a server restart: a fresh Agent + Mastra process sharing the
       // same storage. The in-memory thread-run map is empty, but the suspended
       // snapshot is still in storage.
-      const { agent: restartedAgent } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const { agent: restartedAgent, mastra } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
       expect(restartedAgent.getActiveThreadRunId({ threadId: 'thread-1', resourceId: 'resource-1' })).toBeUndefined();
 
       const result = await restartedAgent.sendToolApproval({
@@ -1398,10 +1384,11 @@ describe.each([
 
       // The resumed run executes the approved tool and runs to completion,
       // leaving no suspended rows behind.
+      const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
       await vi.waitFor(
         async () => {
           expect(mockFindUser).toHaveBeenCalledWith(expect.objectContaining({ name: 'Dero Israel' }));
-          expect((await restartedAgent.listSuspendedRuns({ resourceId: 'resource-1' })).runs).toHaveLength(0);
+          expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
         },
         { timeout: 10000 },
       );
@@ -1450,7 +1437,7 @@ describe.each([
 
       // Fresh process: the run must be resolved from storage, and the id taken
       // from the tool-call-suspended chunk has to match the discovered run.
-      const { agent: restartedAgent } = makeAskUserAgent(false);
+      const { agent: restartedAgent, mastra } = makeAskUserAgent(false);
       expect(restartedAgent.getActiveThreadRunId({ threadId: 'thread-1', resourceId: 'resource-1' })).toBeUndefined();
 
       const result = await restartedAgent.sendToolApproval({
@@ -1462,10 +1449,11 @@ describe.each([
       });
       expect(result).toEqual({ accepted: true, runId: stream.runId, toolCallId: suspendedToolCallId });
 
+      const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
       await vi.waitFor(
         async () => {
           expect(resumedTool).toHaveBeenCalledWith(expect.objectContaining({ name: 'Dero Israel' }));
-          expect((await restartedAgent.listSuspendedRuns({ resourceId: 'resource-1' })).runs).toHaveLength(0);
+          expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
         },
         { timeout: 10000 },
       );
@@ -1476,7 +1464,7 @@ describe.each([
       const { agent } = createSuspendedSetup({ storage });
       const { runId } = await suspendRun(agent, 'thread-1', 'resource-1');
 
-      const { agent: restartedAgent } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const { agent: restartedAgent, mastra } = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
 
       const result = await restartedAgent.sendToolApproval({
         threadId: 'thread-1',
@@ -1485,9 +1473,15 @@ describe.each([
       });
       expect(result.runId).toBe(runId);
 
+      const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
       await vi.waitFor(
         async () => {
-          expect((await restartedAgent.listSuspendedRuns({ resourceId: 'resource-1' })).runs).toHaveLength(0);
+          const remainingRuns = (await workflowsStore.listWorkflowRuns({})).runs.map(run => ({
+            workflowName: run.workflowName,
+            runId: run.runId,
+            status: run.snapshot.status,
+          }));
+          expect(remainingRuns).toEqual([]);
         },
         { timeout: 10000 },
       );

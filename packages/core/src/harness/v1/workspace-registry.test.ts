@@ -15,7 +15,11 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import type { Workspace } from '../../workspace';
 
-import { HarnessResourceWorkspaceInUseError, HarnessWorkspaceLostError, HarnessWorkspaceProviderMismatchError } from './errors';
+import {
+  HarnessResourceWorkspaceInUseError,
+  HarnessWorkspaceLostError,
+  HarnessWorkspaceProviderMismatchError,
+} from './errors';
 import { Harness } from './harness';
 import type { WorkspaceProvider, WorkspaceProviderContext } from './workspace-provider';
 import { nonDurableProvider } from './workspace-provider';

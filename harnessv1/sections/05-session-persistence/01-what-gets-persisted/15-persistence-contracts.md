@@ -1,6 +1,5 @@
 ### 5.1i Persistence Contracts
 
-
 For `HarnessRunOperationRef.kind === 'message'`, `signalId` is required once
 `currentRun.status` is `running` or later. For `kind === 'queue'`, `signalId`
 is required once the queued item has drained into an agent signal. These fields

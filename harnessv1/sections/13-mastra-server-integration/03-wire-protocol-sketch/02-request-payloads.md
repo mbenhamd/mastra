@@ -11,9 +11,7 @@ of crossing the process boundary directly. Example for `POST /signals`:
 // execution with `400 harness.validation`.
 type JsonSchema = Record<string, JsonValue>;
 
-type WireSchemaRef =
-  | { schema: JsonSchema; schemaId?: never }
-  | { schemaId: string; schema?: never };
+type WireSchemaRef = { schema: JsonSchema; schemaId?: never } | { schemaId: string; schema?: never };
 
 interface WireSchemaDescriptor {
   schema: JsonSchema;
@@ -28,16 +26,13 @@ interface SignalRequest {
   type?: 'user-message' | 'system-reminder' | string;
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   files?: WireAttachment[];
   attributes?: Record<string, JsonValue>;
   metadata?: Record<string, JsonValue>;
-  output?: WireSchemaRef;           // Not a local PublicSchema/Zod object.
-  admissionId?: string;             // Optional retry/idempotency key for signal dispatch;
-                                    // rejected when sync/output bypasses signals
+  output?: WireSchemaRef; // Not a local PublicSchema/Zod object.
+  admissionId?: string; // Optional retry/idempotency key for signal dispatch;
+  // rejected when sync/output bypasses signals
   // Per-turn overrides
   model?: string;
   mode?: string;
@@ -61,8 +56,8 @@ Skill invocation uses the same attachment and serializable override rules, with
 interface SkillInvocationRequest {
   args?: Record<string, unknown>;
   files?: WireAttachment[];
-  output?: WireSchemaRef;           // Same schema transport caveat as SignalRequest.
-  admissionId?: string;             // Optional only when `output` is absent.
+  output?: WireSchemaRef; // Same schema transport caveat as SignalRequest.
+  admissionId?: string; // Optional only when `output` is absent.
   model?: string;
   mode?: string;
   yolo?: boolean;

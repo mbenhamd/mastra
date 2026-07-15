@@ -86,6 +86,7 @@ remain the authoritative field inventory):
 
     <rect style="fill: none; stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 4 4; rx: 12;" x="20" y="290" width="1000" height="106" />
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #64748b;" x="30" y="305">per-session state slots</text>
+
   </svg>
   <figcaption>The session row owns one in-flight pending work band and one per-session state band, with the thread row joining it through the owner-key tuple and the lease band guarding writes.</figcaption>
 </figure>
@@ -99,7 +100,7 @@ interface HarnessThread {
   // projections include the resolved value either way.
   harnessName?: string;
   resourceId: string;
-  title?: string;                 // user-facing conversation label; not app metadata
+  title?: string; // user-facing conversation label; not app metadata
   createdAt: number;
   updatedAt: number;
   metadata?: ThreadMetadata;
@@ -158,20 +159,20 @@ that can be rebuilt from the canonical owner.
 
 MastraCode ownership map:
 
-| Current MastraCode state family | V1 owner |
-|---|---|
-| `projectPath`, `configDir`, project binding hints | `SessionRecord.state` / workspace session state after legacy import |
-| `sandboxAllowedPaths`, sandbox/runtime preferences | workspace/session state unless a future sandbox owner defines a canonical field |
-| `thinkingLevel`, `notifications`, `escapeAsCancel`, `smartEditing`, UI preferences | `SessionRecord.state` as product state |
-| `activePlan`, plan draft/render state | pending plan/inbox fields when approval is required; otherwise `SessionRecord.state` for product UI state |
-| `activeBrowserSettings` | serializable workspace/session preferences only; live browser handles never persist |
-| `tasks` / task UI state | `SessionRecord.state` only for UI projection; committed work, tool results, and recovery authority stay in canonical ledgers |
-| `yolo` / permission bypass state | per-operation override or `SessionRecord` permission/grant fields; not app metadata |
-| `activeModelPackId` | `SessionRecord.state.modelPackId` as MastraCode product state |
-| `modeModelId_*` | canonical session model/mode fields, or `SessionRecord.state.modeModelOverrides` when MastraCode needs per-mode product overrides |
-| subagent model choices | `SessionRecord.subagentModelOverrides` |
-| goals | `SessionRecord.goal` |
-| OM settings | `SessionRecord.observationalMemory` |
+| Current MastraCode state family                                                    | V1 owner                                                                                                                          |
+| ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `projectPath`, `configDir`, project binding hints                                  | `SessionRecord.state` / workspace session state after legacy import                                                               |
+| `sandboxAllowedPaths`, sandbox/runtime preferences                                 | workspace/session state unless a future sandbox owner defines a canonical field                                                   |
+| `thinkingLevel`, `notifications`, `escapeAsCancel`, `smartEditing`, UI preferences | `SessionRecord.state` as product state                                                                                            |
+| `activePlan`, plan draft/render state                                              | pending plan/inbox fields when approval is required; otherwise `SessionRecord.state` for product UI state                         |
+| `activeBrowserSettings`                                                            | serializable workspace/session preferences only; live browser handles never persist                                               |
+| `tasks` / task UI state                                                            | `SessionRecord.state` only for UI projection; committed work, tool results, and recovery authority stay in canonical ledgers      |
+| `yolo` / permission bypass state                                                   | per-operation override or `SessionRecord` permission/grant fields; not app metadata                                               |
+| `activeModelPackId`                                                                | `SessionRecord.state.modelPackId` as MastraCode product state                                                                     |
+| `modeModelId_*`                                                                    | canonical session model/mode fields, or `SessionRecord.state.modeModelOverrides` when MastraCode needs per-mode product overrides |
+| subagent model choices                                                             | `SessionRecord.subagentModelOverrides`                                                                                            |
+| goals                                                                              | `SessionRecord.goal`                                                                                                              |
+| OM settings                                                                        | `SessionRecord.observationalMemory`                                                                                               |
 
 ```ts
 interface SessionRecord {
@@ -179,7 +180,7 @@ interface SessionRecord {
   harnessName: string;
   resourceId: string;
   threadId: string;
-  parentSessionId?: string;          // subagent linkage
+  parentSessionId?: string; // subagent linkage
 
   // Per-session runtime defaults. `modeId` is seeded at session creation from
   // the configured default mode (`default: true`, otherwise `modes[0]`) and
@@ -319,18 +320,18 @@ interface SessionRecord {
   // Lifecycle
   createdAt: number;
   lastActivityAt: number;
-  closingAt?: number;             // closeSession has durably entered the bounded closing phase
-  closeDeadlineAt?: number;       // storage-time deadline for live work before forced terminal close
+  closingAt?: number; // closeSession has durably entered the bounded closing phase
+  closeDeadlineAt?: number; // storage-time deadline for live work before forced terminal close
   closedAt?: number;
 
   // Write-concurrency — see §5.8.
-  version: number;            // Monotonically incremented on every successful saveSession.
-                              //   Used for optimistic-CAS conflict detection and
-                              //   remote state PATCH validators (§13.2).
-  ownerId?: string;           // ownerId of the Harness instance currently holding the lease,
-                              //   or undefined if the record is unowned (no live Session).
-  leaseExpiresAt?: number;    // Epoch ms — when the current lease TTLs out. Adapters that
-                               //   provide a native lease primitive may store this implicitly.
+  version: number; // Monotonically incremented on every successful saveSession.
+  //   Used for optimistic-CAS conflict detection and
+  //   remote state PATCH validators (§13.2).
+  ownerId?: string; // ownerId of the Harness instance currently holding the lease,
+  //   or undefined if the record is unowned (no live Session).
+  leaseExpiresAt?: number; // Epoch ms — when the current lease TTLs out. Adapters that
+  //   provide a native lease primitive may store this implicitly.
 }
 
 // JSON-serializable point-in-time display snapshot. This is the public

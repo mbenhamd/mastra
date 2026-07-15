@@ -11,6 +11,7 @@
  */
 
 import type { WorkflowFinishCallbackResult } from '../../workflows/types';
+import { createObservabilityContext } from '../../observability';
 import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';
@@ -82,7 +83,7 @@ export class EventedAgent<
   protected override async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     try {
       const workflow = this.getWorkflow();
-      const requestContext = pinGlobalRunRegistryEntry(runId)?.requestContext;
+      const entry = pinGlobalRunRegistryEntry(runId);
       const run = await workflow.createRun({
         runId,
         resourceId: workflowInput.state?.resourceId,
@@ -91,7 +92,13 @@ export class EventedAgent<
       // The caller already runs executeWorkflow() in the background. Keep this
       // promise pending until the current workflow segment settles so resume()
       // can wait for its suspended snapshot to finish persisting.
-      const { execution } = await run.startAsync({ inputData: workflowInput, requestContext });
+      // Preserve the caller's request context and parent the workflow segment
+      // under the AGENT_RUN span created during durable preparation.
+      const { execution } = await run.startAsync({
+        inputData: workflowInput,
+        requestContext: entry?.requestContext,
+        ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
+      });
       if (execution) {
         await execution
           .catch(async error => {

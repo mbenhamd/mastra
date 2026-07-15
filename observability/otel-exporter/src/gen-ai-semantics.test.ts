@@ -22,6 +22,19 @@ function createModelGenerationSpan(attributes: ModelGenerationAttributes): AnyEx
   } as AnyExportedSpan;
 }
 
+function createRagEmbeddingSpan(attributes: RagEmbeddingAttributes): AnyExportedSpan {
+  return {
+    id: 'test-span-id',
+    traceId: 'test-trace-id',
+    name: 'test-embedding',
+    type: SpanType.RAG_EMBEDDING,
+    startTime: new Date(),
+    isRootSpan: false,
+    isEvent: false,
+    attributes,
+  } as AnyExportedSpan;
+}
+
 function createSpan(type: SpanType, metadata?: Record<string, unknown>): AnyExportedSpan {
   return {
     id: 'test-span-id',

@@ -1062,9 +1062,17 @@ export function applyWorkflowTerminalParentContinuationPatch(input: {
     readContinuationStoredState('parent', () => {
       const loopResult = normalizedDataRecord(next.context[loopWrite.stepId], 'parent loop step result');
       const metadata = optionalNormalizedDataRecord(loopResult.metadata, 'parent loop metadata');
+      const nextIterationMetadata = { ...metadata };
+      if (contract.action.reason === 'loop-continue') {
+        delete nextIterationMetadata.nestedRunId;
+      }
       defineDataProperty(next.context, loopWrite.stepId, {
         ...loopResult,
-        metadata: { ...metadata, iterationCount: loopWrite.iterationCount },
+        // Continuing the loop atomically retires the completed nested child
+        // owner so the next iteration derives and binds its own run id. An
+        // exit retains the completed owner, matching the live callback/exit
+        // path and preserving the authenticated terminal-source evidence.
+        metadata: { ...nextIterationMetadata, iterationCount: loopWrite.iterationCount },
       } as unknown as WorkflowRunState['context'][string]);
       if (contract.action.reason === 'loop-continue') {
         defineDataProperty(next.activeStepsPath, loopWrite.stepId, sourcePath(contract.source));

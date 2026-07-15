@@ -56,8 +56,9 @@ After a crash, inbound recovery workers claim durable rows from the logbook, re-
   <path d="M 690 190 L 730 190" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-recovery)"/>
   <text x="710" y="180" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">rehydrate</text>
 
-  <text x="450" y="328" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.5 — Recovery: workers reopen the room</text>
+<text x="450" y="328" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.5 — Recovery: workers reopen the room</text>
 </svg>
+
 <figcaption>After a crash, recovery workers claim durable rows and re-enter the harness so sessions rehydrate through normal admission; §5 owns recovery and §15 owns the verification rules.</figcaption>
 </figure>
 
@@ -87,14 +88,14 @@ through Harness and are admitted by the target Session.
 
 Reading matrix for the diagrams:
 
-| Block | Reader rule |
-| --- | --- |
-| Storage logbook | §5 owns shared persistence and cross-source crash-recovery boundaries; source-specific mechanics stay with their owning sections. |
-| Durable record families | §5 owns shared record shapes and serialization rules; §14 owns channel row/claim/dispatch mechanics. |
-| Memory/context | Memory is advisory agent context; §5 and §6 own persistence and request-context details. |
-| Replayable context | §5 owns what can be replayed or recovered from durable state. |
-| Workers | §13.6 owns readiness and server lifecycle; §5.7 owns cross-source recovery; §14.4 owns channel outbox claim/dispatch mechanics (§14.1 owns binding lifecycle, §14.5 owns action receipts); §15 verifies these promises. |
-| Channel dispatch | §14.1 owns binding, §14.4 owns outbox and provider-delivery, §14.5 owns action receipts. |
-| Request context | §6 and §13 own local and wire request-context semantics. |
+| Block                   | Reader rule                                                                                                                                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Storage logbook         | §5 owns shared persistence and cross-source crash-recovery boundaries; source-specific mechanics stay with their owning sections.                                                                                       |
+| Durable record families | §5 owns shared record shapes and serialization rules; §14 owns channel row/claim/dispatch mechanics.                                                                                                                    |
+| Memory/context          | Memory is advisory agent context; §5 and §6 own persistence and request-context details.                                                                                                                                |
+| Replayable context      | §5 owns what can be replayed or recovered from durable state.                                                                                                                                                           |
+| Workers                 | §13.6 owns readiness and server lifecycle; §5.7 owns cross-source recovery; §14.4 owns channel outbox claim/dispatch mechanics (§14.1 owns binding lifecycle, §14.5 owns action receipts); §15 verifies these promises. |
+| Channel dispatch        | §14.1 owns binding, §14.4 owns outbox and provider-delivery, §14.5 owns action receipts.                                                                                                                                |
+| Request context         | §6 and §13 own local and wire request-context semantics.                                                                                                                                                                |
 
 ---

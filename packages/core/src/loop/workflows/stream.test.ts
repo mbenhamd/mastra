@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../../agent/message-list';
+import { Mastra } from '../../mastra';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
+import { InMemoryStore } from '../../storage';
+import { createEmptyWorkflowSnapshot } from '../../storage/workflow-snapshot';
 import { ChunkFrom } from '../../stream/types';
 import type { ChunkType } from '../../stream/types';
 
@@ -14,7 +17,9 @@ vi.mock('./agentic-loop', () => ({
     capturedOutputWriter = params.outputWriter;
 
     return {
+      id: 'agentic-loop',
       __registerMastra: vi.fn(),
+      __registerPrimitives: vi.fn(),
       deleteWorkflowRunById: vi.fn().mockResolvedValue(undefined),
       createRun: vi.fn().mockImplementation(async (args: any) => {
         capturedCreateRunArgs = args;
@@ -120,5 +125,50 @@ describe('workflowLoopStream', () => {
 
     expect(capturedCreateRunArgs).toBeDefined();
     expect(capturedCreateRunArgs.resourceId).toBe('user-abc-123');
+  });
+
+  it('deletes the evented nested execution row by its retained child run id', async () => {
+    const mastra = new Mastra({ logger: false, storage: new InMemoryStore() });
+    const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
+    const runId = 'run-cleanup';
+    const nestedRunId = 'wfn:v1:nested-cleanup';
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'agentic-loop',
+      runId,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'suspended',
+        context: {
+          executionWorkflow: {
+            status: 'suspended',
+            metadata: { nestedRunId },
+          },
+        } as any,
+      },
+    });
+    const deleteWorkflowRunById = vi.spyOn(workflowsStore, 'deleteWorkflowRunById');
+
+    const stream = workflowLoopStream({
+      mastra,
+      messageId: 'msg-cleanup',
+      runId,
+      startTimestamp: Date.now(),
+      agentId: 'test-agent',
+      messageList: new MessageList({ threadId: 'test-thread' }),
+      models: [{ model: {} as any, toolChoice: undefined }],
+      _internal: {},
+      streamState: { serialize: () => ({}), deserialize: () => {} },
+      methodType: 'stream',
+    });
+
+    for await (const _chunk of stream) {
+      // consume
+    }
+
+    expect(deleteWorkflowRunById).toHaveBeenCalledWith({
+      workflowName: 'executionWorkflow',
+      runId: nestedRunId,
+    });
+    await mastra.shutdown();
   });
 });

@@ -88,6 +88,39 @@ class FailingTerminalPubSub extends EventEmitterPubSub {
   }
 }
 
+class BlockingTerminalPubSub extends EventEmitterPubSub {
+  readonly terminalPublicationStarted: Promise<void>;
+  readonly #terminalPublicationGate: Promise<void>;
+  #markTerminalPublicationStarted!: () => void;
+  #releaseTerminalPublication!: () => void;
+
+  constructor() {
+    super();
+    this.terminalPublicationStarted = new Promise(resolve => {
+      this.#markTerminalPublicationStarted = resolve;
+    });
+    this.#terminalPublicationGate = new Promise(resolve => {
+      this.#releaseTerminalPublication = resolve;
+    });
+  }
+
+  releaseTerminalPublication() {
+    this.#releaseTerminalPublication();
+  }
+
+  override async publish(
+    topic: string,
+    event: Parameters<EventEmitterPubSub['publish']>[1],
+    options?: { localOnly?: boolean },
+  ): Promise<void> {
+    if (topic === 'workflows' && event.type === 'workflow.fail') {
+      this.#markTerminalPublicationStarted();
+      await this.#terminalPublicationGate;
+    }
+    return super.publish(topic, event, options);
+  }
+}
+
 class ManualPushPubSub extends PubSub {
   callback?: EventCallback;
 
@@ -148,6 +181,62 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
       retry: false,
     });
     expect(AlwaysThrowsProcessor.dispatchCalls).toBe(3);
+
+    await mastra.shutdown();
+  });
+
+  it.each([3, 4])('retains internal ownership until terminal publication settles at attempt %s', async attempt => {
+    const pubsub = new BlockingTerminalPubSub();
+    const workflow = makeWorkflow('wf');
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { wf: workflow } as any,
+      pubsub,
+    });
+    const runId = `owned-terminal-${attempt}`;
+    await persistRun(mastra, 'wf', runId);
+    const generation = mastra.__registerInternalWorkflow(workflow as any, runId)!;
+    const endEvent = vi.spyOn(mastra, '__endInternalWorkflowEvent');
+    AlwaysThrowsProcessor.dispatchCalls = 0;
+
+    const handling = new AlwaysThrowsProcessor({ mastra }).handle(makeStartEvent('wf', runId, attempt));
+    await pubsub.terminalPublicationStarted;
+
+    expect(endEvent).not.toHaveBeenCalled();
+    mastra.__unregisterInternalWorkflow('wf', runId, generation);
+    const retainedInternalEvent = makeStartEvent('wf', runId, attempt);
+    (retainedInternalEvent.data as Record<string, unknown>).__mastraInternalWorkflow = true;
+    expect(mastra.__shouldProcessWorkflowEvent(retainedInternalEvent)).toBe(true);
+
+    pubsub.releaseTerminalPublication();
+    await expect(handling).resolves.toEqual({ ok: false, retry: false });
+    expect(endEvent).toHaveBeenCalledOnce();
+    expect(endEvent).toHaveBeenCalledWith('wf', runId, generation, false);
+    expect(mastra.__shouldProcessWorkflowEvent(retainedInternalEvent)).toBe(false);
+    expect(AlwaysThrowsProcessor.dispatchCalls).toBe(attempt === 3 ? 1 : 0);
+
+    await mastra.shutdown();
+  });
+
+  it('acknowledges terminal outcomes but retains retryable ones through the deprecated pull wrapper', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { wf: makeWorkflow('wf') } as any,
+      pubsub,
+    });
+    await persistRun(mastra, 'wf', 'pull-wrapper');
+    AlwaysThrowsProcessor.dispatchCalls = 0;
+    const processor = new AlwaysThrowsProcessor({ mastra });
+    const ack = vi.fn(async () => {});
+
+    await processor.process(makeStartEvent('wf', 'pull-wrapper', 1), ack);
+    expect(ack).not.toHaveBeenCalled();
+
+    await processor.process(makeStartEvent('wf', 'pull-wrapper', 3), ack);
+    expect(ack).toHaveBeenCalledOnce();
 
     await mastra.shutdown();
   });
@@ -332,13 +421,17 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
     await mastra.shutdown();
   });
 
-  it('publishes terminal failure without a state guard when workflow storage is not configured', async () => {
+  it('publishes terminal failure without a state guard when workflow storage is unavailable', async () => {
     const pubsub = new FailingTerminalPubSub();
     const mastra = new Mastra({
       logger: false,
       workflows: { wf: makeWorkflow('wf') } as any,
       pubsub,
     });
+    // Mastra now supplies an in-memory store by default. Stub the defensive
+    // no-storage boundary explicitly instead of relying on the old constructor
+    // behavior where an omitted storage option left getStorage() undefined.
+    vi.spyOn(mastra, 'getStorage').mockReturnValue(undefined);
     AlwaysThrowsProcessor.dispatchCalls = 0;
 
     const processor = new AlwaysThrowsProcessor({ mastra });

@@ -15,7 +15,9 @@ function toPlainRequestContext(requestContext?: RequestContextLike): Record<stri
  * (`__mastra_*`) excluded so policies only see public entries (#17337).
  */
 function toPolicyRequestContext(requestContext?: RequestContextLike): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(toPlainRequestContext(requestContext)).filter(([k]) => !k.startsWith('__mastra_')));
+  return Object.fromEntries(
+    Object.entries(toPlainRequestContext(requestContext)).filter(([k]) => !k.startsWith('__mastra_')),
+  );
 }
 
 export interface ResolveToolApprovalParams {
@@ -104,8 +106,8 @@ export async function resolveToolApprovalRequirement({
   const aiSdkNeedsApproval = (tool as any).needsApproval;
   const seedRequiresApproval = Boolean(
     globalRequiresApproval ||
-      (typeof toolRequireApproval === 'boolean' && toolRequireApproval) ||
-      (typeof aiSdkNeedsApproval === 'boolean' && aiSdkNeedsApproval),
+    (typeof toolRequireApproval === 'boolean' && toolRequireApproval) ||
+    (typeof aiSdkNeedsApproval === 'boolean' && aiSdkNeedsApproval),
   );
   const needsApprovalFn =
     typeof (tool as any).needsApprovalFn === 'function'

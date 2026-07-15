@@ -77,6 +77,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-persisted-records);" d="M770 480 L819 480" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-persisted-records);" d="M668 445 C660 380 615 315 552 260" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-persisted-records);" d="M590 260 C690 335 820 390 900 444" />
+
   </svg>
   <figcaption>Persisted state centers on the session record, with channel, wakeup, queue, run, and outbox records preserving the recoverable work around it.</figcaption>
 </figure>

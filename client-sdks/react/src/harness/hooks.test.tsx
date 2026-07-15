@@ -81,9 +81,8 @@ function createDeferred<T>() {
 
 class FakeRemoteSession {
   readonly refresh = vi.fn<() => Promise<HarnessSessionSnapshot>>();
-  readonly subscribe = vi.fn<
-    (listener: (event: HarnessEvent) => void | Promise<void>, options: any) => RemoteHarnessEventUnsubscribe
-  >();
+  readonly subscribe =
+    vi.fn<(listener: (event: HarnessEvent) => void | Promise<void>, options: any) => RemoteHarnessEventUnsubscribe>();
   listener: ((event: HarnessEvent) => void | Promise<void>) | undefined;
   unsubscribe = vi.fn();
 
@@ -169,9 +168,10 @@ function renderHarnessHookWithOptions(
   };
 }
 
-function renderHarnessSessionHook(
-  options: Parameters<typeof useHarnessSession>[0] = {},
-): { latest: () => UseRemoteHarnessSessionResult; rerender: (nextOptions: Parameters<typeof useHarnessSession>[0]) => void } {
+function renderHarnessSessionHook(options: Parameters<typeof useHarnessSession>[0] = {}): {
+  latest: () => UseRemoteHarnessSessionResult;
+  rerender: (nextOptions: Parameters<typeof useHarnessSession>[0]) => void;
+} {
   let latest: UseRemoteHarnessSessionResult | undefined;
 
   function Probe({ hookOptions }: { hookOptions: Parameters<typeof useHarnessSession>[0] }) {
@@ -356,7 +356,9 @@ describe('useRemoteHarnessSession', () => {
 
   it('passes replay options through to client-js and refreshes on replay gaps', async () => {
     const first = makeSnapshot();
-    const second = makeSnapshot({ durableWork: { active: [], recentTerminal: [], truncated: true, sessionOwnedOnly: true } });
+    const second = makeSnapshot({
+      durableWork: { active: [], recentTerminal: [], truncated: true, sessionOwnedOnly: true },
+    });
     const session = new FakeRemoteSession([first, second]);
     const onReplayGap = vi.fn();
     const rendered = renderHarnessHook(session, {

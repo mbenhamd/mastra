@@ -6,6 +6,7 @@ import type { AssistantContent, ToolResultPart } from '@internal/ai-sdk-v4';
 import type { MastraMessageV1 } from '../../../memory/types';
 import type { MastraMessageContentV2, MastraDBMessage } from '../../message-list';
 import { attachmentsToParts } from './attachments-to-parts';
+import { resolveFilePartMediaTypeAndData } from './image-utils';
 
 const DEFAULT_TOOL_DENIAL_REASON = 'Tool call was not approved by the user';
 
@@ -96,9 +97,15 @@ export function convertToV1Messages(messages: Array<MastraDBMessage>) {
     const parts: typeof inputParts = [];
     for (const part of inputParts) {
       if (part.type === 'file') {
+        // Persisted parts use the AI SDK v4 shape (`mimeType`/`data`), but parts that
+        // originate from agent output or user uploads can arrive in the v5 shape
+        // (`mediaType`/`url`). The stored union only describes v4, so read both — a v5
+        // file part would otherwise persist with `contentType: undefined`, which makes
+        // `attachmentsToParts` throw. Mirrors #17366.
+        const { mediaType, data } = resolveFilePartMediaTypeAndData(part);
         experimental_attachments.push({
-          url: part.data,
-          contentType: part.mimeType,
+          url: data as string,
+          contentType: mediaType ?? 'application/octet-stream',
         });
       } else {
         parts.push(part);

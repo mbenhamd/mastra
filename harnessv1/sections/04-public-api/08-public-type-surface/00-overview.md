@@ -74,6 +74,7 @@ authoritative):
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-public-types);" d="M520 227 L520 339" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-public-types);" d="M725 227 L725 339" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-public-types);" d="M925 227 L925 339" />
+
   </svg>
   <figcaption>Public types are a shared export surface, but ownership stays with the API, storage, wire, settlement, and server sections that define behavior.</figcaption>
 </figure>

@@ -65,6 +65,7 @@ export class StoreOperationsInMemory extends StoreOperations {
       mastra_harness_run_summaries: new Map(),
       mastra_tool_provider_connections: new Map(),
       mastra_notifications: new Map(),
+      mastra_thread_state: new Map(),
     };
   }
 

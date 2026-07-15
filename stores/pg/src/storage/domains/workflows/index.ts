@@ -103,6 +103,11 @@ import type {
   WorkflowTerminalContinuationPlanRecord,
   WorkflowTerminalizationCapabilities,
   WorkflowTerminalRecoveryAncestryRecord,
+  TABLE_NAMES,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
 import type {
   StepResult,
@@ -122,6 +127,7 @@ import {
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { runPrune, resolveTargets } from '../../retention';
 
 class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
   constructor() {
@@ -195,6 +201,15 @@ export class WorkflowsPG extends WorkflowsStorage {
     TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS,
     TABLE_WORKFLOW_PARENT_REVISIONS,
   ] as const;
+
+  /**
+   * Workflow run snapshots accumulate as runs execute. Anchored on the
+   * timezone-aware `updatedAtZ` mirror column (last activity) so suspended or
+   * long-running runs are not pruned by start age.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    workflowSnapshot: { table: TABLE_WORKFLOW_SNAPSHOT, column: 'updatedAtZ', indexed: true },
+  };
 
   constructor(config: PgDomainConfig) {
     super();
@@ -2825,6 +2840,42 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   /**
+   * Lazily ensures a btree index exists on each configured policy's retention
+   * anchor column so age-based `prune()` deletes stay fast on large tables.
+   * Called from the prune path (not init) so only deployments that configure
+   * retention pay the index's write/disk overhead. Best-effort: failures are
+   * logged and pruning proceeds (correct, just slower).
+   * Created even with `skipDefaultIndexes` — retention is an explicit opt-in,
+   * so its supporting index is not part of the default index set.
+   */
+  private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
+    const prefix = this.#schema && this.#schema !== 'public' ? `${this.#schema}_` : '';
+    for (const [key, entry] of Object.entries(WorkflowsPG.retentionTables)) {
+      if (!entry.indexed || !policies[key]) continue;
+      try {
+        await this.#db.ensureIndex({
+          indexName: `${prefix}mastra_${key}_retention_idx`,
+          tableName: entry.table as TABLE_NAMES,
+          column: entry.column,
+        });
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${entry.table}:`, error);
+      }
+    }
+  }
+
+  /** Delete workflow run snapshots older than the `workflowSnapshot` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    await this.ensureRetentionIndexes(policies);
+    const targets = resolveTargets({
+      policies,
+      descriptor: WorkflowsPG.retentionTables,
+      order: ['workflowSnapshot'],
+    });
+    return runPrune({ db: this.#db, domain: 'workflows', targets, options });
+  }
+
+  /**
    * Creates custom user-defined indexes for this domain's tables.
    */
   async createCustomIndexes(): Promise<void> {
@@ -3058,7 +3109,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
         const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
         if (ownership.status === 'ownership_conflict') return ownership;
-        if ((ownership.status === 'already_bound') !== Boolean(existingRecovery)) {
+        if (ownership.status === 'bound' && existingRecovery) {
           return { status: 'ancestry_conflict' };
         }
 
@@ -3172,6 +3223,14 @@ export class WorkflowsPG extends WorkflowsStorage {
             childSnapshotState,
           };
         }
+        // A nested run may begin transiently and become durable only after it
+        // suspends. In that path the parent owner is already bound while the
+        // retained child snapshot exists without recovery ancestry. Promote
+        // that exact owner under the same transaction; missing child evidence
+        // still fails closed.
+        if (ownership.status === 'already_bound' && !retainedChildSnapshot && !initialChildSnapshot) {
+          return { status: 'ancestry_conflict' };
+        }
         const serialized = sanitizeJsonForPg(JSON.stringify(ownership.snapshot));
         const timestamp = new Date(now);
         await t.none(
@@ -3189,13 +3248,15 @@ export class WorkflowsPG extends WorkflowsStorage {
             recovery.createdAt,
           ],
         );
-        await t.none(
-          `UPDATE ${this.workflowSnapshotTableName()}
-           SET snapshot = $1, "updatedAt" = $2, "updatedAtZ" = $3
-           WHERE workflow_name = $4 AND run_id = $5`,
-          [serialized, timestamp, timestamp, operation.workflowName, operation.runId],
-        );
-        await this.bumpWorkflowParentRevision(t, operation.workflowName, operation.runId, revision);
+        if (ownership.status === 'bound') {
+          await t.none(
+            `UPDATE ${this.workflowSnapshotTableName()}
+             SET snapshot = $1, "updatedAt" = $2, "updatedAtZ" = $3
+             WHERE workflow_name = $4 AND run_id = $5`,
+            [serialized, timestamp, timestamp, operation.workflowName, operation.runId],
+          );
+          await this.bumpWorkflowParentRevision(t, operation.workflowName, operation.runId, revision);
+        }
         const childSnapshotState = await ensureInitialChildSnapshot();
         return {
           status: 'admitted',

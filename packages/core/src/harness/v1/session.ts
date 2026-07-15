@@ -34,7 +34,18 @@ import { z } from 'zod';
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import type { AgentSignalContents } from '../../agent/signals';
+import { AgentThreadOutputDrainError, isAgentThreadOutputDrainTeardownError } from '../../agent/thread-stream-runtime';
+import {
+  captureSuspendedToolSurfaceFenceLease,
+  clearSuspendedToolSurfaceFence,
+  createToolSurfaceFence,
+  materializeToolSurfaceFence,
+  readToolSurfaceFence,
+  stageToolSurfaceFenceRestore,
+} from '../../agent/tool-surface-fence';
+import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
+import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -72,9 +83,6 @@ import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
 import type { Workspace } from '../../workspace';
-import { convertStoredMessageToHarnessMessage } from '../_shared/message-conversion';
-import type { StoredMessageRow } from '../_shared/message-conversion';
-import type { HarnessMessage } from '../types';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
 // always validates caller-reachable input, so the checked variant is bound to the local name.
@@ -147,6 +155,8 @@ import type {
   SubagentToolStartEvent,
 } from './events';
 import type { Harness } from './harness';
+import type { StoredMessageRow } from './message-conversion';
+import { convertStoredMessageToHarnessMessage } from './message-conversion';
 import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import type {
   AddTaskInput,
@@ -293,8 +303,10 @@ type ActionCatalogMcpTimedOutWork = {
  * Shared with the built-in `askUser` / `submitPlan` tools so the contract
  * lives in a single place (`packages/core/src/tools/builtin`).
  */
-/** Defensive cap on the synthetic-aborted-tool tombstone set (§10.2 / S1). */
+/** Defensive cap on the synthetic-tool-terminal tombstone set (§10.2 / S1). */
 const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
+/** Defensive cap on exact-once tool-terminal observations across resumed segments. */
+const MAX_EMITTED_TOOL_TERMINALS = 4096;
 
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
@@ -707,7 +719,7 @@ const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'
  * plan-approval flows the gate itself relies on). Escalation built-ins are
  * different: they cross session/agent capability boundaries and therefore honor
  * the engaged tool policy after anti-escalation allowlist checks. Kept in sync
- * with `_buildToolsets`.
+ * with `_buildToolSurface`.
  */
 const HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
   TASK_ADD_TOOL_ID,
@@ -1019,14 +1031,19 @@ export interface SessionDisplayState {
 
 export type SessionDisplayPending = Omit<
   NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext'
+  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence'
 >;
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
   if (!pending) return null;
   // Strip storage-internal recovery fields (runtimeDependencies) and the caller
   // app bag (requestContext) — neither belongs on the public display projection.
-  const { runtimeDependencies: _runtimeDependencies, requestContext: _requestContext, ...displayPending } = pending;
+  const {
+    runtimeDependencies: _runtimeDependencies,
+    requestContext: _requestContext,
+    toolSurfaceFence: _toolSurfaceFence,
+    ...displayPending
+  } = pending;
   return displayPending;
 }
 
@@ -1149,6 +1166,15 @@ export class Session {
    * `item.requestContext`; resume previously dropped it). Cleared per turn.
    */
   private _currentTurnRequestContext?: PersistedRequestContextInput;
+  /** Live Agent RequestContext for capturing internal per-turn fences on suspend. */
+  private _currentAgentRequestContext?: RequestContext;
+  /** Process-local canonical replacement toolsets for the active turn. */
+  private _currentTurnReplacementToolSurface?: {
+    toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
+    fence: ToolSurfaceFence;
+  };
+  /** At most one process-local replacement snapshot per Session pending slot. */
+  private readonly _pendingReplacementToolSurfaces = new Map<string, ToolSurfaceFence>();
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
@@ -1167,11 +1193,19 @@ export class Session {
   private readonly _operationEvidenceSignalIds = new Set<string>();
   private readonly _activeTools = new Map<string, ActiveToolState>();
   /**
-   * `${runId}:${toolCallId}` of tools for which a SYNTHETIC aborted `tool_end`
-   * was emitted at turn end (§10.2). A late real `tool-result`/`tool-error` chunk
-   * for the same key (the abort path can reach `_endTurn` before the drain
-   * delivers the real result) is suppressed ONCE so the consumer never sees two
-   * terminals for one tool. Bounded by `_maxAbortedToolTombstones`.
+   * `${runId}:${toolCallId}` values whose `tool_end` reached the Harness event
+   * emitter. Registration publication can fail after an in-process subscriber
+   * already drained the resumed segment, so the publication result alone cannot
+   * decide whether a synthetic terminal is still needed. This bounded set is
+   * intentionally turn-independent: a suspended tool starts in one turn and
+   * settles in a later resume that reuses the same run id.
+   */
+  private readonly _emittedToolTerminals = new Set<string>();
+  /**
+   * `${runId}:${toolCallId}` of tools for which a SYNTHETIC `tool_end` was
+   * emitted (§10.2). A late real `tool-result`/`tool-error` chunk for the same
+   * key (turn teardown or registration failure can race the buffered result) is
+   * suppressed ONCE so the consumer never sees two terminals for one tool.
    */
   private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
@@ -1264,7 +1298,7 @@ export class Session {
   // -------------------------------------------------------------------------
 
   /** Cached thread subscription. Lazy. One per Session at a time. */
-  private _threadSubscription?: AgentThreadSubscription<unknown>;
+  private _threadSubscription?: AgentThreadSubscription<any>;
   /** Agent the current subscription was opened against. Used to detect
    *  cross-agent mode switches that require re-opening. */
   private _threadSubscriptionAgent?: Agent;
@@ -1286,6 +1320,14 @@ export class Session {
       reject: (err: unknown) => void;
     }
   >();
+  /**
+   * Runs whose model output has reached its terminal boundary but whose
+   * subscription events are still draining. Closing the subscription must not
+   * replace their already-determined result with a generic close error; the
+   * watcher can finish from the captured output after unsubscribe wakes the
+   * event-drain barrier.
+   */
+  private readonly _modelTerminalRunsPendingEventDrain = new Set<string>();
   /**
    * Cache of run completion results that landed before any caller had a chance
    * to register a waiter. `sendSignal()` returns synchronously and the runtime
@@ -1319,6 +1361,8 @@ export class Session {
    * log stays contiguous (no skipped slot → no undetected replay gap).
    */
   private readonly _failedEventAppends: PendingEventAppend[] = [];
+  /** Original append failure for the active degraded episode. */
+  private _eventPersistenceDegradedCause: unknown;
   /**
    * §S4.1 — true once a transient append failure has been surfaced live (one
    * `storage_error` per degraded episode). Reset when the backlog fully drains.
@@ -1568,7 +1612,7 @@ export class Session {
     if (this._failedEventAppends.length > 0) {
       throw new HarnessStorageError({
         operation: 'session_event_append',
-        cause: undefined,
+        cause: this._eventPersistenceDegradedCause,
         retryable: true,
         sessionId: this._record.id,
         resourceId: this._record.resourceId,
@@ -1671,6 +1715,7 @@ export class Session {
           // Storage has no event ledger at all → nothing to retry; drop the backlog.
           this._failedEventAppends.length = 0;
           this._eventPersistenceDegraded = false;
+          this._eventPersistenceDegradedCause = undefined;
           return;
         }
         if (next) this._backlogFailedAppend(next, err);
@@ -1678,7 +1723,10 @@ export class Session {
       }
     }
     // Backlog fully drained → durable log is contiguous again.
-    if (this._eventPersistenceDegraded) this._eventPersistenceDegraded = false;
+    if (this._eventPersistenceDegraded) {
+      this._eventPersistenceDegraded = false;
+      this._eventPersistenceDegradedCause = undefined;
+    }
 
     if (!next) return;
 
@@ -1700,6 +1748,7 @@ export class Session {
     this._failedEventAppends.push(args);
     if (!this._eventPersistenceDegraded) {
       this._eventPersistenceDegraded = true;
+      this._eventPersistenceDegradedCause = err;
       console.error('[harness/v1] session event persistence failed; backlogged for retry:', err);
       // §10.2: the durable log is lagging. Emit a live, RETRYABLE storage_error so
       // subscribers learn now (vs only discovering the lag on reconnect). The degraded
@@ -1733,6 +1782,7 @@ export class Session {
       });
       this._eventPersistenceError = overflow;
       this._failedEventAppends.length = 0;
+      this._eventPersistenceDegradedCause = undefined;
       console.error(
         `[harness/v1] session event backlog exceeded ${MAX_PENDING_FAILED_EVENT_APPENDS}; durable log fail-stop:`,
         err,
@@ -1771,6 +1821,9 @@ export class Session {
     } else {
       emitted = this._emitter.emit(toEmit);
     }
+    if (emitted.type === 'tool_end') {
+      this._rememberEmittedToolTerminal(emitted.runId, emitted.toolCallId);
+    }
     // Span-summary: open the run span on `agent_start`; finalize (emit
     // `run_completed`) on a terminal `agent_end`. Runs AFTER emit so
     // `run_completed` follows its `agent_end`.
@@ -1785,6 +1838,37 @@ export class Session {
       this._terminalizeAssistantDraft(emitted.runId, emitted.finishReason);
     }
     return emitted;
+  }
+
+  private _toolTerminalKey(runId: string, toolCallId: string): string {
+    return `${runId}:${toolCallId}`;
+  }
+
+  private _rememberEmittedToolTerminal(runId: string, toolCallId: string): void {
+    const key = this._toolTerminalKey(runId, toolCallId);
+    // Refresh insertion order so the bounded set retains the most recently
+    // observed terminal when a duplicate path checks the same key.
+    this._emittedToolTerminals.delete(key);
+    this._emittedToolTerminals.add(key);
+    while (this._emittedToolTerminals.size > MAX_EMITTED_TOOL_TERMINALS) {
+      const oldest = this._emittedToolTerminals.values().next().value;
+      if (oldest === undefined) return;
+      this._emittedToolTerminals.delete(oldest);
+    }
+  }
+
+  private _hasEmittedToolTerminal(runId: string, toolCallId: string): boolean {
+    return this._emittedToolTerminals.has(this._toolTerminalKey(runId, toolCallId));
+  }
+
+  private _rememberSyntheticToolTerminalTombstone(runId: string, toolCallId: string): void {
+    // A synthetic terminal can race one already-buffered real result. Suppress
+    // that late result once, while retaining the existing behavior for any
+    // subsequent duplicate provider chunks.
+    if (this._abortedToolTombstones.size >= MAX_ABORTED_TOOL_TOMBSTONES) {
+      this._abortedToolTombstones.clear();
+    }
+    this._abortedToolTombstones.add(this._toolTerminalKey(runId, toolCallId));
   }
 
   /**
@@ -2113,6 +2197,8 @@ export class Session {
     this._currentRunModelId = undefined;
     this._currentRunSignalId = undefined;
     this._currentTurnRequestContext = undefined;
+    this._currentAgentRequestContext = undefined;
+    this._currentTurnReplacementToolSurface = undefined;
     this._currentMessageId = undefined;
     this._currentTraceId = undefined;
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
@@ -2148,6 +2234,8 @@ export class Session {
       this._currentRunModelId = undefined;
       this._currentRunSignalId = undefined;
       this._currentTurnRequestContext = undefined;
+      this._currentAgentRequestContext = undefined;
+      this._currentTurnReplacementToolSurface = undefined;
       this._currentMessageId = undefined;
       this._currentTraceId = undefined;
       this._activeTools.clear();
@@ -2307,21 +2395,15 @@ export class Session {
    * the run id is unknown (cannot attribute the terminal). Best-effort: emitted on
    * the live subscriber stream like any other turn event.
    */
-  private _emitAbortedToolEnds(): void {
+  private _emitAbortedToolEnds({ force = false }: { force?: boolean } = {}): void {
     if (this._activeTools.size === 0) return;
     // A turn that PARKED for resume (suspend / tool-approval / question /
     // plan-approval) is NOT abandoned — the parked tool resumes and emits its own
     // real tool_end. Only synthesize for genuinely terminal turns (abort / error /
     // complete-with-dangling-tool); never tombstone a tool that will resume.
-    if (this._record.pendingResume !== undefined) return;
+    if (!force && this._record.pendingResume !== undefined) return;
     const runId = this._currentRunId;
     if (runId === undefined) return;
-    // Defensive bound: drop the tombstone set if it grew large (aborted tools
-    // whose late real result never arrived). Losing suppression for very old
-    // entries is harmless — their late result is extremely unlikely by then.
-    if (this._abortedToolTombstones.size > MAX_ABORTED_TOOL_TOMBSTONES) {
-      this._abortedToolTombstones.clear();
-    }
     for (const tool of this._activeTools.values()) {
       this._emitTurnEvent({
         type: 'tool_end',
@@ -2333,8 +2415,61 @@ export class Session {
       } as EmitInput);
       // Suppress a late real terminal for this tool (the drain may still deliver
       // its tool-result/tool-error after this turn ended).
-      this._abortedToolTombstones.add(`${runId}:${tool.toolCallId}`);
+      this._rememberSyntheticToolTerminalTombstone(runId, tool.toolCallId);
+      // Make the helper idempotent within a turn. Some terminal-failure paths
+      // must close dangling tools before emitting agent_end so the run rollup is
+      // complete; the later generic turn teardown must not emit them again.
+      this._activeTools.delete(tool.toolCallId);
     }
+  }
+
+  /**
+   * A resumed segment is broadcast only after its `run-registered` publication
+   * succeeds. If that registration rejects, the provider can still finish and
+   * return a concrete FullOutput, but subscribers never see the segment's
+   * `tool-result`. Project the consumed pending tool's real result directly so
+   * the `tool_start` emitted before suspension still has exactly one terminal.
+   *
+   * Other drain failures happen after registration and may already have
+   * delivered the result, so they must continue through the normal stream path
+   * to avoid duplicate `tool_end` events.
+   */
+  private _emitUndeliveredResumedToolEnd(
+    pending: PendingResume,
+    full: FullOutput<unknown>,
+    error: AgentThreadOutputDrainError,
+  ): void {
+    if (error.reason !== 'registration-publish-failed') return;
+    // EventEmitter-style PubSub delivery is synchronous and can reach this
+    // session before a later subscriber throws. In that partial-publication
+    // case the subscription already emitted the real terminal even though the
+    // registration promise rejects. Never synthesize a second one.
+    if (this._hasEmittedToolTerminal(pending.runId, pending.toolCallId)) return;
+    const resultChunk = full.toolResults.find(chunk => chunk.payload.toolCallId === pending.toolCallId);
+    const result = resultChunk?.payload;
+    const toolName = result?.toolName ?? pending.toolName;
+    if (toolName === undefined) return;
+
+    this._emitTurnEvent({
+      type: 'tool_end',
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      toolName,
+      output: projectToolEventPayloadForJson(
+        result !== undefined
+          ? result.result
+          : {
+              unavailable: true,
+              reason: 'resumed tool result was unavailable after run registration failed',
+            },
+        'tool_end.output',
+        this._harness._internalMaxEventPayloadBytes,
+      ),
+      isError: result?.isError ?? result === undefined,
+    });
+    // If the subscription drain races this fallback and delivers the already-
+    // buffered real terminal afterwards, suppress that late copy once.
+    this._rememberSyntheticToolTerminalTombstone(pending.runId, pending.toolCallId);
   }
 
   private _createActiveTurnWaiter(): ActiveTurnWaiter {
@@ -3863,7 +3998,7 @@ export class Session {
   /**
    * @internal — `SubagentDefinition.tools` for a spawned subagent session, set at
    * spawn/delegate time. Layered onto the subagent's tool surface in
-   * `_buildToolsets` (§9). Undefined for non-subagent sessions.
+   * `_buildToolSurface` (§9). Undefined for non-subagent sessions.
    */
   _subagentToolsOverride?: ToolsInput;
 
@@ -4962,7 +5097,7 @@ export class Session {
    * opens a new one against the new agent so the chunk stream stays in
    * sync with the run the next `sendSignal()` will land on.
    */
-  private async _ensureThreadSubscription(agent: Agent): Promise<AgentThreadSubscription<unknown>> {
+  private async _ensureThreadSubscription(agent: Agent): Promise<AgentThreadSubscription<any>> {
     if (this._threadSubscriptionClosed) {
       if (this._state === 'deleted') {
         throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
@@ -5016,7 +5151,7 @@ export class Session {
     return sub;
   }
 
-  private async _ensureThreadSubscriptionOrDeleted(agent: Agent): Promise<AgentThreadSubscription<unknown>> {
+  private async _ensureThreadSubscriptionOrDeleted(agent: Agent): Promise<AgentThreadSubscription<any>> {
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
     try {
@@ -5097,7 +5232,74 @@ export class Session {
       // Ignore — settlement happens via `_handleRunTerminal` below, which
       // will pick up the run's own error state via `getFullOutput()`.
     }
-    await this._handleRunTerminal(runId, out as MastraModelOutput<unknown>);
+    this._modelTerminalRunsPendingEventDrain.add(runId);
+    try {
+      const outputDrain = this._threadSubscription?._waitForOutputDrain?.(out);
+      if (outputDrain) {
+        try {
+          await outputDrain;
+        } catch (error) {
+          if (!isAgentThreadOutputDrainTeardownError(error)) {
+            let terminalError = error;
+            try {
+              await this._discardPreRegisteredPendingAfterTerminalFailure(runId);
+            } catch (cleanupError) {
+              terminalError = cleanupError;
+            }
+            if (this._currentAgentRequestContext) {
+              const lease = captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, runId);
+              if (lease) clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, runId, lease);
+            }
+            const waiter = this._runCompletionPromises.get(runId);
+            this._runCompletionPromises.delete(runId);
+            this._rememberCompletedRun(runId, { ok: false, err: terminalError });
+            waiter?.reject(terminalError);
+            return;
+          }
+          // Subscription teardown wakes the barrier. Since the model output is
+          // already terminal, preserve that result instead of replacing it with
+          // a generic close error.
+        }
+      }
+      await this._handleRunTerminal(runId, out as MastraModelOutput<unknown>);
+    } finally {
+      this._modelTerminalRunsPendingEventDrain.delete(runId);
+    }
+  }
+
+  /**
+   * `ask_user`, `submit_plan`, and sandbox access persist their HITL record from
+   * inside the tool before the agent publishes its suspended terminal. If that
+   * terminal cannot be published/delivered, the thread runtime discards the run
+   * and there is nothing valid to resume. Remove only a matching pre-registered
+   * record; ordinary approval/suspension records are created later by
+   * `_handleRunTerminal` and therefore cannot be present on this path.
+   */
+  private async _discardPreRegisteredPendingAfterTerminalFailure(runId: string): Promise<void> {
+    let cleared = false;
+    await this._flushUpdate(prev => {
+      const pending = prev.pendingResume;
+      if (
+        pending?.runId !== runId ||
+        pending.resumedAt !== undefined ||
+        (pending.kind !== 'question' && pending.kind !== 'plan-approval' && pending.kind !== 'sandbox-access')
+      ) {
+        return prev;
+      }
+      cleared = true;
+      const next: SessionRecord = { ...prev };
+      delete next.pendingResume;
+      return next;
+    });
+    if (cleared) this._pendingReplacementToolSurfaces.delete(runId);
+  }
+
+  private _rejectNonTerminalRunCompletions(reason: unknown): void {
+    for (const [runId, entry] of this._runCompletionPromises) {
+      if (this._modelTerminalRunsPendingEventDrain.has(runId)) continue;
+      this._runCompletionPromises.delete(runId);
+      entry.reject(reason);
+    }
   }
 
   /**
@@ -5110,7 +5312,7 @@ export class Session {
    * On drain shutdown (stream end or unhandled error) every outstanding
    * completion promise is rejected so callers don't hang.
    */
-  private async _drainSubscriptionStream(sub: AgentThreadSubscription<unknown>): Promise<void> {
+  private async _drainSubscriptionStream(sub: AgentThreadSubscription<any>): Promise<void> {
     try {
       for await (const chunk of sub.stream) {
         const runId = (chunk as { runId?: string }).runId;
@@ -5121,53 +5323,13 @@ export class Session {
         this._emitForChunk(chunk);
       }
     } catch (err) {
-      for (const [, entry] of this._runCompletionPromises) {
-        entry.reject(err);
-      }
-      this._runCompletionPromises.clear();
+      this._rejectNonTerminalRunCompletions(err);
     } finally {
       // Stream ended normally — any caller still waiting for a runId whose
       // completion we never observed would hang forever otherwise.
-      for (const [, entry] of this._runCompletionPromises) {
-        entry.reject(
-          new HarnessValidationError('_drainSubscriptionStream()', 'Thread subscription closed before run completion'),
-        );
-      }
-      this._runCompletionPromises.clear();
-    }
-  }
-
-  /**
-   * Drain a RESUME run's own `fullStream` through `_emitForChunk` so the
-   * approved tool's `tool_end` and any post-approval `text_delta` surface LIVE
-   * (§10.4) to subscribers. Unlike the initial run, a resume reuses the
-   * suspended run's `runId` (`pending.runId`), which the long-lived thread
-   * subscription has already recorded in its `seenRunIds`; the subscription
-   * therefore dedups the re-registered resume run and never re-drains it, so
-   * this local drain is the SOLE consumer of the resumed segment's chunks (no
-   * double-emit). This is an independent evented reader over the output's
-   * shared chunk buffer; it does NOT gate completion delivery, which stays on
-   * the `getFullOutput()` / `_waitUntilFinished()` path. `_emitForChunk` never
-   * emits a terminal `agent_end` — the resume's terminal is emitted explicitly
-   * by `respondTo*` after this drain — so a re-suspend or error mid-resume does
-   * not produce a spurious terminal here.
-   */
-  private async _drainResumeStream(out: MastraModelOutput<unknown>): Promise<void> {
-    const stream = (out as { fullStream?: ReadableStream<unknown> }).fullStream;
-    if (!stream) return;
-    // The resume run replays the approved tool's `tool-result` chunk WITHOUT a
-    // preceding `tool-call` chunk in this segment (the `tool-call` landed in the
-    // initial, suspended turn), so `_activeTools` (seeded only by `tool-call`)
-    // does not necessarily hold the resumed tool. `_emitForChunk` now reads the
-    // `toolName` from the chunk payload itself (which always carries it), so the
-    // live `tool_end` surfaces the real name without re-seeding `_activeTools`.
-    for await (const chunk of stream as AsyncIterable<{
-      type: string;
-      payload?: unknown;
-      data?: unknown;
-      runId?: string;
-    }>) {
-      this._emitForChunk(chunk);
+      this._rejectNonTerminalRunCompletions(
+        new HarnessValidationError('_drainSubscriptionStream()', 'Thread subscription closed before run completion'),
+      );
     }
   }
 
@@ -5505,7 +5667,7 @@ export class Session {
       opts.admissionId !== undefined ? this._messageAdmissionIdentity(opts.admissionId) : undefined;
 
     // Per-turn additionalTools merge with the mode's surface, never replace.
-    const toolsets = this._buildToolsets(mode, opts.additionalTools);
+    const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
 
     const admissionStart =
       opts.admissionId !== undefined
@@ -5542,6 +5704,7 @@ export class Session {
       modeId: effectiveModeId,
       modelId: effectiveModelId,
     });
+    this._setCurrentTurnReplacementToolSurface(toolSurface);
     const turnAbortSignal = turnAbortController.signal;
     const activeTurnWaiter = this._createActiveTurnWaiter();
     void activeTurnWaiter.promise.catch(() => {});
@@ -5591,7 +5754,7 @@ export class Session {
       memory: { thread: this.threadId, resource: this.resourceId },
       abortSignal: turnAbortSignal,
       requestContext,
-      ...(toolsets ? { toolsets } : {}),
+      ...toolSurface,
       ...(mode.instructions ? { instructions: mode.instructions } : {}),
       // §9 per-turn override: caller-supplied model generation settings
       // (temperature, maxOutputTokens, …) layered onto the structured generate
@@ -6886,7 +7049,8 @@ export class Session {
       };
       let dispatched;
       try {
-        const toolsets = this._buildToolsets(mode, opts.additionalTools);
+        const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
+        this._setCurrentTurnReplacementToolSurface(toolSurface);
         const requestContext = await Promise.race([
           this._buildRequestContext({
             modeId: effectiveModeId,
@@ -6900,7 +7064,7 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
-          ...(toolsets ? { toolsets } : {}),
+          ...toolSurface,
           ...(mode.instructions ? { instructions: mode.instructions } : {}),
         };
         assertOwnedSignalTurnNotDeleted();
@@ -7203,7 +7367,8 @@ export class Session {
       };
       let dispatched;
       try {
-        const toolsets = this._buildToolsets(mode, undefined);
+        const toolSurface = this._buildToolSurface(mode, undefined);
+        this._setCurrentTurnReplacementToolSurface(toolSurface);
         const requestContext = await Promise.race([
           this._buildRequestContext({
             modeId: effectiveModeId,
@@ -7216,7 +7381,7 @@ export class Session {
           memory: { thread: this.threadId, resource: this.resourceId },
           abortSignal: turnAbortSignal,
           requestContext,
-          ...(toolsets ? { toolsets } : {}),
+          ...toolSurface,
           ...(mode.instructions ? { instructions: mode.instructions } : {}),
         };
         assertOwnedReminderTurnNotDeleted();
@@ -7369,13 +7534,23 @@ export class Session {
       opts.originSignalId,
     );
     if (pending === undefined) return;
+    const suspendedFenceLease = this._currentAgentRequestContext
+      ? captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, full.runId)
+      : undefined;
     const existing = this._record.pendingResume;
     if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
+      if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
       await this._flushUpdate(prev => prev, { tokenUsageDelta: opts.tokenUsageDelta });
+      if (this._currentAgentRequestContext && suspendedFenceLease) {
+        clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
+      }
       this._clearPendingDurableTurnFlushErrorIfRepaired(full);
       return;
     }
     await this._flushUpdate(prev => ({ ...prev, pendingResume: pending }), { tokenUsageDelta: opts.tokenUsageDelta });
+    if (this._currentAgentRequestContext && suspendedFenceLease) {
+      clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
+    }
     this._clearPendingDurableTurnFlushErrorIfRepaired(full);
 
     // Emit the §10.2 pending event AFTER the durable-parking barrier (§5.4) so
@@ -7418,8 +7593,13 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(full.runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
+        : {}),
       payload: this._buildResumePayload(kind, payload),
     };
+
+    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
 
     if (kind === 'plan-approval') {
       const mode = this._harness._getMode(modeId);
@@ -9204,6 +9384,12 @@ export class Session {
         if (recoveredReceipt) return this._inboxReceiptResult(recoveredReceipt, true);
         return duplicate!;
       }
+      // The original caller owns the in-flight resume. A later delivery of the
+      // same accepted inbox response observes that durable admission and must
+      // not enter the busy resume path or dispatch the agent a second time.
+      if (this._record.pendingResume.resumedAt !== undefined && this._currentTurnAbortController !== undefined) {
+        return duplicate!;
+      }
     }
 
     const cancelRequest = this._currentCancelRequest();
@@ -9220,6 +9406,19 @@ export class Session {
         `respond[${expectedKind}]`,
         `pending resume is "${pending.kind}", not "${expectedKind}"`,
       );
+    }
+    // ask_user / submit_plan / sandbox access persist and emit their pending
+    // record from inside the still-running tool. Do not let an event subscriber
+    // start the resume until the original run has crossed its terminal-delivery
+    // barrier. Otherwise the resume can stamp `resumedAt` while the original
+    // terminal is failing, leaving neither path with exclusive cleanup
+    // ownership. No receipt/admission state has been written at this point, so
+    // the caller can safely retry once the active turn settles.
+    if (
+      this._currentTurnAbortController !== undefined &&
+      (pending.kind === 'question' || pending.kind === 'plan-approval' || pending.kind === 'sandbox-access')
+    ) {
+      throw new HarnessBusyError(this.id, 'in_flight');
     }
 
     const itemId = pending.itemId ?? pending.toolCallId;
@@ -9359,6 +9558,22 @@ export class Session {
     const previousModeId = this._record.modeId;
     const resumeModeId = this._modeIdForPendingResume(pending);
     const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
+    let resumeToolSurface = this._buildToolSurface(this._harness._getMode(resumeModeId));
+    if (pending.toolSurfaceFence !== undefined) {
+      const retainedFence = this._pendingReplacementToolSurfaces.get(pending.runId);
+      if (retainedFence === undefined) {
+        throw new HarnessValidationError(
+          `respond[${expectedKind}]`,
+          'cannot resume the replacement tool surface because its original tool implementations are no longer available in this process',
+        );
+      }
+      resumeToolSurface = {
+        toolsets: {
+          'harness:retained-replacement': materializeToolSurfaceFence(retainedFence) as ToolsInput,
+        },
+        toolsetsMode: 'replace',
+      };
+    }
     let agent: Agent;
     try {
       agent = this._harness._resolveAgentForRuntimeDependencies(
@@ -9496,6 +9711,7 @@ export class Session {
     // `session.abort()` can cancel an in-flight resume (e.g. ESC after the
     // user approved a tool that's now grinding through a long workflow).
     const turnAbortController = this._beginTurn(undefined);
+    this._setCurrentTurnReplacementToolSurface(resumeToolSurface);
     // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
     // Re-arm the transient so a re-suspend on this resumed run persists it again.
     this._currentTurnYolo = pending.yolo === true;
@@ -9529,8 +9745,10 @@ export class Session {
       throw redactPublicBoundaryRejection(thrown);
     }
     let full: FullOutput<unknown>;
+    let outputDrainError: AgentThreadOutputDrainError | undefined;
     try {
       assertResumedTurnNotDeleted();
+      const threadSubscription = await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
       // §4.2e / §6.1 — rebuild + pass the harness RequestContext on RESUME too, so
       // the resumed turn carries the 'harness' slot AND the per-tool permission gate
       // resolver. The resolver is a live closure (not serializable into the suspend
@@ -9548,36 +9766,49 @@ export class Session {
         ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
         yolo: pending.yolo === true,
       });
+      if (pending.toolSurfaceFence) {
+        stageToolSurfaceFenceRestore(resumeRequestContext, pending.runId, pending.toolSurfaceFence);
+      }
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
+        memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext: resumeRequestContext,
+        ...resumeToolSurface,
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
-      // §10.4 — suspension events interleave with text/tool events on the live
-      // subscriber stream and are followed by a `tool_end` after resume. The
-      // resume run REUSES the suspended run's `runId` (`pending.runId`), which is
-      // already in the long-lived thread subscription's `seenRunIds`
-      // (thread-stream-runtime.ts), so that subscription dedups the re-registered
-      // resume run and never re-drains it. Drain the resume run's own
-      // `fullStream` through the same `_emitForChunk` path so the approved tool's
-      // `tool_end` and any post-approval `text_delta` surface LIVE to subscribers
-      // before the terminal `agent_end`. This local drain is the SOLE consumer of
-      // the resumed segment's chunks (no double-emit). Completion delivery stays
-      // on the independent `getFullOutput()` path below — draining is a separate
-      // evented reader over the shared chunk buffer and does not gate settlement.
+      // §10.4 — the thread runtime removes a suspended run from its subscriber's
+      // `seenRunIds`, so re-registering the same run id on resume queues the new
+      // segment on the existing long-lived subscription. That subscription stays
+      // the sole event consumer. Reading `out.fullStream` here as well would emit
+      // every resumed tool/text chunk twice.
+      const outputDrain = threadSubscription._waitForOutputDrain?.(out);
+      // Registration can fail before the provider finishes producing FullOutput.
+      // Observe the barrier immediately, then await it after FullOutput so the
+      // durable completion-vs-retry decision still has the concrete model result.
+      void outputDrain?.catch(() => {});
       const fullOutput = out.getFullOutput() as Promise<FullOutput<unknown>>;
       void fullOutput.catch(() => {});
-      const resumeDrain = this._drainResumeStream(out as MastraModelOutput<unknown>);
-      void resumeDrain.catch(() => {});
       full = await Promise.race([fullOutput, activeTurnWaiter.promise]);
-      // The drain feeds `tool_end`/`text_delta` for the resumed segment; await it
-      // (best-effort) so those live events are emitted before the terminal
-      // `agent_end` below. A drain error must not fail the resume — settlement
-      // already came from `getFullOutput()`.
-      await Promise.race([resumeDrain.catch(() => {}), activeTurnWaiter.promise]);
+      if (outputDrain) {
+        try {
+          await Promise.race([outputDrain, activeTurnWaiter.promise]);
+        } catch (error) {
+          // The provider/tool work has already reached a concrete FullOutput at
+          // this point. A thread-terminal publication or delivery failure must
+          // still reject the public resume call, but it must not run the
+          // pre-completion catch below: reverting `resumedAt` there would make an
+          // already-executed approval/suspension retryable. Finish the durable
+          // pending/receipt/queue transition first, then surface the drain error.
+          if (error instanceof AgentThreadOutputDrainError) {
+            outputDrainError = error;
+          } else {
+            throw error;
+          }
+        }
+      }
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
@@ -9656,6 +9887,55 @@ export class Session {
       // The durable signal_failed evidence already uses projectHarnessPublicError,
       // and a HarnessSessionDeletedError from the response-failed write passes
       // through unchanged.
+      throw redactPublicBoundaryRejection(thrown);
+    }
+
+    if (outputDrainError) {
+      this._emitUndeliveredResumedToolEnd(pending, full, outputDrainError);
+    }
+
+    if (outputDrainError && full.finishReason === 'suspended') {
+      let thrown: unknown = outputDrainError;
+      let terminalized = false;
+      try {
+        terminalized = await this._terminalizeUndeliverableResuspension({
+          pending,
+          resumedAt,
+          responseId,
+          queuedItemId: pendingQueuedItemId,
+          modeFlipTarget,
+          previousModeId,
+          full,
+          error: outputDrainError,
+        });
+      } catch (error) {
+        thrown = error;
+      } finally {
+        if (!terminalized) {
+          // The resumed stream may already have published a new tool_start. If
+          // terminalization fails before removing the old durable pending, the
+          // ordinary turn teardown deliberately preserves parked tools and
+          // would skip this one too. This branch is terminal from the caller's
+          // perspective, so force-close every newly active tool while queued
+          // correlation is still attached to its terminal event.
+          this._emitAbortedToolEnds({ force: true });
+        }
+        finishResumedTurn();
+        // Keep queued correlation live through tool_end, resume_failed,
+        // agent_end, run_completed, and generic turn teardown, then always
+        // release the in-process owner. If terminalization failed before its
+        // CAS, the durable pending still carries `resumedAt`; re-kicking the
+        // drain arms the existing stale-recovery timer instead of leaving the
+        // queue parked until an unrelated external call arrives.
+        if (pendingQueuedItemId !== undefined) {
+          this._currentQueuedItemId = undefined;
+          this._currentQueuedItemSource = undefined;
+          this._notifyMaybeIdle();
+        }
+      }
+      if (pendingQueuedItemId !== undefined) {
+        void this._maybeDrainQueue();
+      }
       throw redactPublicBoundaryRejection(thrown);
     }
 
@@ -9790,6 +10070,9 @@ export class Session {
         ),
         activeTurnWaiter.promise,
       ]);
+      if (full.finishReason !== 'suspended') {
+        this._pendingReplacementToolSurfaces.delete(pending.runId);
+      }
 
       // §10.2 defines no suspension_resolved event — resolution is observed via
       // the inbox response transition + display snapshot. A mode flip on a plan
@@ -9840,7 +10123,6 @@ export class Session {
             resolver.resolve(full as AgentResult);
           }
           this._notifyMaybeIdle();
-          void this._maybeDrainQueue();
         }
       }
     } catch (err) {
@@ -9855,12 +10137,176 @@ export class Session {
     } finally {
       finishResumedTurn();
     }
+    // A terminal queued resume clears the active-turn marker in the `finally`
+    // above. Kick the next item only after that teardown; doing this inside the
+    // completion block races `_maybeDrainQueue()` against the still-active
+    // resume, so the busy guard returns and the remaining queue stays parked.
+    if (completingQueuedItemId !== undefined && full.finishReason !== 'suspended') {
+      void this._maybeDrainQueue();
+    }
+    if (outputDrainError) {
+      throw redactPublicBoundaryRejection(outputDrainError);
+    }
     if (responseMode === 'inbox-receipt') {
       const receipt =
         responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
       if (receipt) return this._inboxReceiptResult(receipt, false);
     }
     return full as AgentResult;
+  }
+
+  /**
+   * A resumed segment can execute real side effects and then suspend again. If
+   * its terminal publication/delivery fails, the thread runtime discards that
+   * segment, so persisting the new suspension would create an interaction that
+   * can never be resumed. Atomically consume the exact admitted pending marker,
+   * fail its inbox/queue evidence, and preserve any already-earned token usage
+   * before the public response rejects.
+   */
+  private async _terminalizeUndeliverableResuspension(input: {
+    pending: PendingResume;
+    resumedAt: number;
+    responseId?: string;
+    queuedItemId?: string;
+    modeFlipTarget?: string;
+    previousModeId: string;
+    full: FullOutput<unknown>;
+    error: AgentThreadOutputDrainError;
+  }): Promise<boolean> {
+    const { pending, resumedAt, responseId, queuedItemId, modeFlipTarget, previousModeId, full, error } = input;
+    const failedAt = Date.now();
+    const projectedError = projectHarnessPublicError(error);
+    const usageDelta = this._tokenUsageDeltaFromFullOutput(full);
+    let terminalized = false;
+    let usageDeltaToPersist: TokenUsage | undefined;
+    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
+
+    this._captureTurnRunId(full);
+    await this._flushUpdate(
+      prev => {
+        // `_flushUpdate` can replay this pure updater once after a CAS reload;
+        // reset attempt-local observations before matching the current image.
+        terminalized = false;
+        usageDeltaToPersist = undefined;
+        failedQueueReceipt = undefined;
+        const current = prev.pendingResume;
+        if (
+          current === undefined ||
+          current.kind !== pending.kind ||
+          current.runId !== pending.runId ||
+          current.toolCallId !== pending.toolCallId ||
+          (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
+          current.requestedAt !== pending.requestedAt ||
+          current.resumedAt !== resumedAt
+        ) {
+          return prev;
+        }
+
+        terminalized = true;
+        usageDeltaToPersist = usageDelta;
+        const next: SessionRecord = { ...prev };
+        delete next.pendingResume;
+
+        if (responseId !== undefined) {
+          const receipt = getOwnRecordValue(prev.inboxResponseReceipts, responseId);
+          if (receipt && receipt.status !== 'applied' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+            next.inboxResponseReceipts = {
+              ...(prev.inboxResponseReceipts ?? {}),
+              [responseId]: {
+                ...receipt,
+                status: 'failed',
+                error: projectedError,
+                retryable: false,
+                failedAt: receipt.failedAt ?? failedAt,
+                updatedAt: failedAt,
+              },
+            };
+          }
+        }
+
+        if (queuedItemId !== undefined) {
+          next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
+          const receipt = prev.queueAdmissionReceipts?.[queuedItemId];
+          if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
+            failedQueueReceipt = {
+              ...receipt,
+              status: 'failed',
+              error: projectedError,
+              failedAt: receipt.failedAt ?? failedAt,
+              updatedAt: failedAt,
+            };
+            next.queueAdmissionReceipts = {
+              ...(prev.queueAdmissionReceipts ?? {}),
+              [queuedItemId]: failedQueueReceipt,
+            };
+          }
+        }
+
+        if (modeFlipTarget !== undefined) {
+          next.modeId = modeFlipTarget;
+          const seededRules = this._harness._modePermissionRules(modeFlipTarget);
+          if (seededRules !== undefined) {
+            next.permissionRules = seededRules;
+            next.permissionRulesSeedHash = sha256CanonicalJson(seededRules);
+          }
+        }
+        return next;
+      },
+      { tokenUsageDelta: () => usageDeltaToPersist },
+    );
+
+    if (!terminalized) return false;
+    this._pendingReplacementToolSurfaces.delete(pending.runId);
+
+    if (queuedItemId !== undefined) {
+      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
+      if (settledReceipt?.signalId !== undefined) {
+        await this._writeQueueSignalResultEvidence({
+          status: 'failed',
+          signalId: settledReceipt.signalId,
+          runId: settledReceipt.runId,
+          error: projectedError,
+        }).catch(() => {});
+      }
+      this._emit({
+        type: 'queue_failed',
+        queuedItemId,
+        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
+        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
+        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
+        error: projectedError,
+      });
+      const resolver = this._queueResolvers.get(queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(queuedItemId);
+        resolver.reject(publicErrorProjectionToError(projectedError));
+      }
+    }
+
+    if (pending.originSignalId !== undefined) {
+      await this._settleSignalResult(pending.originSignalId, {
+        status: 'failed',
+        runId: pending.runId,
+        error: projectedError,
+      });
+    }
+    if (modeFlipTarget !== undefined && modeFlipTarget !== previousModeId) {
+      this._emitter.emit({ type: 'mode_changed', modeId: modeFlipTarget, previousModeId });
+    }
+    // The resumed segment may have emitted a new tool_start before its
+    // re-suspension became undeliverable. Close every such tool before the
+    // failed agent terminal so event order and the finalized tool rollup remain
+    // truthful. `_emitAbortedToolEnds` removes emitted entries, making the later
+    // generic turn teardown a no-op for them.
+    this._emitAbortedToolEnds();
+    this._emitTurnEvent({
+      type: 'resume_failed',
+      runId: pending.runId,
+      retryable: false,
+      error: projectedError,
+    });
+    this._emitAgentEnd({ runId: full.runId, finishReason: 'error', full });
+    return true;
   }
 
   private _resolveStoredInboxResponse(
@@ -10167,7 +10613,9 @@ export class Session {
     }
   }
 
-  private async _maybeRecoverStaleQueuedResume(): Promise<QueueResumeRecoveryResult> {
+  private async _maybeRecoverStaleQueuedResume({
+    kickDrainOnStale = true,
+  }: { kickDrainOnStale?: boolean } = {}): Promise<QueueResumeRecoveryResult> {
     if (this._currentTurnAbortController !== undefined) return { status: 'none' };
     const pending = this._record.pendingResume;
     if (pending?.resumedAt === undefined) return { status: 'none' };
@@ -10306,6 +10754,9 @@ export class Session {
       resolver.reject(err);
     }
     this._notifyMaybeIdle();
+    if (kickDrainOnStale && this._state === 'live') {
+      void this._maybeDrainQueue();
+    }
     return { status: 'stale' };
   }
 
@@ -11362,7 +11813,7 @@ export class Session {
     // A live suspension means a previous queued turn is awaiting a
     // `respondTo*` call — drain stays parked until that resolves.
     if (this._record.pendingResume !== undefined) {
-      const recovery = await this._maybeRecoverStaleQueuedResume();
+      const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
       if (recovery.status === 'none') return;
     }
     if (this._currentQueuedItemId !== undefined) return;
@@ -11505,7 +11956,7 @@ export class Session {
       }));
     }
 
-    const toolsets = this._buildToolsets(mode);
+    const toolSurface = this._buildToolSurface(mode);
     // Queued turns run under a session-owned AbortController so
     // `session.abort()` can cancel an in-flight queued run too.
     this._assertOpenForTurn('queue drain');
@@ -11513,6 +11964,7 @@ export class Session {
       modeId: effectiveModeId,
       modelId: item.model ?? this._record.modelId,
     });
+    this._setCurrentTurnReplacementToolSurface(toolSurface);
     // §4.2e — arm per-turn yolo for the drain so suspend-capture persists it onto
     // pendingResume (so a later resume keeps auto-granting). `_beginTurn` reset it.
     this._currentTurnYolo = item.yolo === true;
@@ -11547,7 +11999,7 @@ export class Session {
         memory: { thread: this.threadId, resource: this.resourceId },
         abortSignal: turnAbortController.signal,
         requestContext,
-        ...(toolsets ? { toolsets } : {}),
+        ...toolSurface,
         ...(mode.instructions ? { instructions: mode.instructions } : {}),
       };
 
@@ -12140,6 +12592,9 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
+        : {}),
       payload: {
         question: params.question,
         ...(params.options ? { options: params.options } : {}),
@@ -12158,6 +12613,7 @@ export class Session {
       registered = true;
       return { ...prev, pendingResume: pending };
     });
+    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
     if (!registered) return;
     if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
   }
@@ -12205,6 +12661,9 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
+        : {}),
       payload: {
         sandboxAccess: {
           semanticType: params.semanticType,
@@ -12234,6 +12693,7 @@ export class Session {
       registered = true;
       return { ...prev, pendingResume: pending };
     });
+    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
     if (!registered) return;
     // §10.2: sandbox/path-access has no dedicated event — it projects to
     // question_pending via the captured pending resume.
@@ -12279,6 +12739,9 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentToolSurfaceFenceSnapshot(runId)
+        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
+        : {}),
       payload: {
         ...(params.title !== undefined ? { title: params.title } : {}),
         plan: params.plan,
@@ -12297,6 +12760,7 @@ export class Session {
       registered = true;
       return { ...prev, pendingResume: pending };
     });
+    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
     if (!registered) return;
     if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
   }
@@ -12842,9 +13306,13 @@ export class Session {
    *   - mode.additionalTools merges with agent's tools
    *   - per-call additionalTools layer on top of whatever the mode produced
    *
-   * Returns undefined when no overrides apply (agent runs with its own tools).
+   * Returns the per-turn toolsets and replacement policy. With no mode or
+   * Harness overrides, both fields are omitted and the agent keeps its tools.
    */
-  private _buildToolsets(mode: HarnessMode, callAdditional?: ToolsInput): Record<string, ToolsInput> | undefined {
+  private _buildToolSurface(
+    mode: HarnessMode,
+    callAdditional?: ToolsInput,
+  ): Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'> {
     // §4.2e workspace tool profile: when the mode declares `workspaceTools.expose`,
     // withhold workspace-category tools (read/edit/execute) NOT in the list from
     // the harness-controlled toolsets (mode + per-call). mcp/other/uncategorized
@@ -12852,11 +13320,13 @@ export class Session {
     // `toolCategoryResolver`; with none, categories are null and nothing is hidden.
     const expose = mode.workspaceTools?.expose;
     const profile = (tools: ToolsInput): ToolsInput =>
-      expose ? this._applyWorkspaceToolProfile(tools, expose) : tools;
+      expose ? this._applyWorkspaceToolProfile(tools, expose) : { ...tools };
     const toolsets: Record<string, ToolsInput> = {};
-    if (mode.tools) toolsets[`mode:${mode.id}`] = profile(mode.tools);
-    if (mode.additionalTools) toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
-    if (callAdditional) toolsets[`call:additional`] = profile(callAdditional);
+    if (mode.tools && Object.keys(mode.tools).length > 0) toolsets[`mode:${mode.id}`] = profile(mode.tools);
+    if (mode.additionalTools && Object.keys(mode.additionalTools).length > 0) {
+      toolsets[`mode:${mode.id}:add`] = profile(mode.additionalTools);
+    }
+    if (callAdditional && Object.keys(callAdditional).length > 0) toolsets[`call:additional`] = profile(callAdditional);
     // §9 — a SubagentDefinition.tools override (set on the child session at spawn)
     // is layered onto the subagent's surface, subject to the same workspace-tool
     // profile + permission gate as any other tool.
@@ -12866,18 +13336,49 @@ export class Session {
     // `spawn_subagent` is conditional on subagent types being configured; the
     // plan-task tools are always available. Both close over this session so they
     // act on the calling session only (§6.4 ownership rule).
-    const builtins: ToolsInput = {};
-    const spawn = createSpawnSubagentTool(this);
-    if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
-    // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
-    // for the durable HarnessPlanTask tree; each write routes through this
-    // session under its lease.
-    Object.assign(builtins, createPlanTaskTools(this));
-    if (Object.keys(builtins).length > 0) {
-      toolsets['harness:builtin'] = builtins;
+    if (mode.harnessBuiltins !== 'exclude') {
+      const builtins: ToolsInput = {};
+      const spawn = createSpawnSubagentTool(this);
+      if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+      // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
+      // for the durable HarnessPlanTask tree; each write routes through this
+      // session under its lease.
+      Object.assign(builtins, createPlanTaskTools(this));
+      if (Object.keys(builtins).length > 0) {
+        toolsets['harness:builtin'] = builtins;
+      }
     }
 
-    return Object.keys(toolsets).length === 0 ? undefined : toolsets;
+    return {
+      ...(Object.keys(toolsets).length > 0 || mode.tools !== undefined ? { toolsets } : {}),
+      ...(mode.tools !== undefined ? { toolsetsMode: 'replace' as const } : {}),
+    };
+  }
+
+  /** Capture the canonical per-turn replacement surface after `_beginTurn` resets transient state. */
+  private _setCurrentTurnReplacementToolSurface(
+    toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>,
+  ): void {
+    if (toolSurface.toolsetsMode !== 'replace') {
+      this._currentTurnReplacementToolSurface = undefined;
+      return;
+    }
+    const sourceTools = Object.assign({}, ...Object.values(toolSurface.toolsets ?? {})) as Record<string, unknown>;
+    this._currentTurnReplacementToolSurface = {
+      toolSurface,
+      // Snapshot source descriptors at turn admission. The toolset maps are
+      // already shallow copies, so later mode-map edits cannot swap values;
+      // this fence also restores in-place edits to a retained tool object.
+      fence: createToolSurfaceFence(sourceTools),
+    };
+  }
+
+  /** Retain the admission-time definition snapshot for a later same-process resume. */
+  private _retainCurrentReplacementToolSurface(runId: string): void {
+    const current = this._currentTurnReplacementToolSurface;
+    if (!current) return;
+    this._pendingReplacementToolSurfaces.clear();
+    this._pendingReplacementToolSurfaces.set(runId, current.fence);
   }
 
   /**
@@ -13076,7 +13577,19 @@ export class Session {
     if (turn.yolo === true) {
       entries.push(['__mastra_yoloAutoApprove', true]);
     }
-    return new RequestContext(entries);
+    const requestContext = new RequestContext<unknown>(entries);
+    // Only the currently admitted turn owns the suspend snapshot. Auxiliary
+    // callers such as MCP listTools may also build a context; they must not
+    // overwrite the active turn's fence source.
+    if (this._currentTurnAbortController?.signal === turn.abortSignal) {
+      this._currentAgentRequestContext = requestContext;
+    }
+    return requestContext;
+  }
+
+  private _currentToolSurfaceFenceSnapshot(runId: string): string[] | undefined {
+    const fence = readToolSurfaceFence(this._currentAgentRequestContext, runId);
+    return fence ? [...fence.allowedNames] : undefined;
   }
 
   /**
@@ -13211,7 +13724,15 @@ export class Session {
   }
 
   /** @internal — used by the Harness after descendants are terminalized. */
-  _flushClosedMarker(closedAt: number): Promise<SessionRecord> {
+  async _flushClosedMarker(closedAt: number): Promise<SessionRecord> {
+    // Close can begin before the debounced assistant-draft write fires. Drain
+    // that write while the session is still in the writable `closing` state;
+    // `_markClosed()` intentionally rejects every later `_flushUpdate`.
+    // There can be no new draft deltas after the close drain reaches idle, so
+    // this also cancels the timer and makes the post-close event flush a no-op
+    // for assistant drafts.
+    await this._flushAssistantDraftsNow();
+
     const run = async (): Promise<SessionRecord> => {
       if (this._record.closedAt !== undefined) {
         return this._record;
@@ -13253,6 +13774,7 @@ export class Session {
     // that will never reach a terminal here) so they cannot accumulate.
     this._openRuns.clear();
     this._finalizedRunIds.clear();
+    this._pendingReplacementToolSurfaces.clear();
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
   }
@@ -13264,6 +13786,7 @@ export class Session {
     this._state = 'deleted';
     this._openRuns.clear();
     this._finalizedRunIds.clear();
+    this._pendingReplacementToolSurfaces.clear();
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
     const activeTurn = this._currentTurnAbortController;
@@ -13377,10 +13900,7 @@ export class Session {
     } catch {
       // Best-effort — subscription may already be done.
     }
-    for (const [, entry] of this._runCompletionPromises) {
-      entry.reject(reason);
-    }
-    this._runCompletionPromises.clear();
+    this._rejectNonTerminalRunCompletions(reason);
   }
 
   // -------------------------------------------------------------------------

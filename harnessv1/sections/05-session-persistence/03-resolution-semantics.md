@@ -61,6 +61,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-resolution);" d="M835 189 L884 189" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-resolution);" d="M528 223 L595 284" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-resolution);" d="M745 223 L690 284" />
+
   </svg>
 <figcaption>Creation is linearized only at `createOrLoadCurrentSessionOwner(...)`; read paths prove identity, while live execution/write paths must also prove ownership.</figcaption>
 </figure>
@@ -72,31 +73,31 @@ direct-ID lookup and then apply the same tenant-safe mismatch behavior as the
 `{ sessionId, resourceId }` rows. A public route must not treat a bare
 `sessionId` as globally sufficient authority.
 
-| Input | Live in memory? | Record in storage? | Result |
-|---|---|---|---|
-| `{ sessionId }` | yes | n/a | return live instance |
-| `{ sessionId }` | no | yes (active) | hydrate for read, or acquire lease before live execution/write |
-| `{ sessionId }` | no | yes (closed) | reopen under the normal resource/lease checks, then hydrate |
-| `{ sessionId }` | no | no | throw `HarnessSessionNotFoundError` |
-| `{ sessionId, resourceId }` | yes, `resourceId` matches | n/a | return live instance |
-| `{ sessionId, resourceId }` | yes, `resourceId` mismatches | n/a | throw `HarnessSessionNotFoundError` |
-| `{ sessionId, resourceId }` | no | yes, `resourceId` matches, active | hydrate for read, or acquire lease before live execution/write |
-| `{ sessionId, resourceId }` | no | yes, `resourceId` matches, closed | reopen under the normal resource/lease checks, then hydrate |
-| `{ sessionId, resourceId }` | no | yes, `resourceId` mismatches | throw `HarnessSessionNotFoundError` (do not leak existence) |
-| `{ sessionId, resourceId }` | no | no | throw `HarnessSessionNotFoundError` |
-| `{ sessionId, threadId, resourceId }` | yes, all identities match | n/a | return live instance |
-| `{ sessionId, threadId, resourceId }` | yes, `sessionId` differs from active owner for `(harnessName, resourceId, threadId)` | n/a | throw `HarnessSessionConflictError` |
-| `{ sessionId, threadId, resourceId }` | no | active record exists for `(harnessName, resourceId, threadId)`, `sessionId` matches | hydrate for read, or acquire lease before live execution/write |
-| `{ sessionId, threadId, resourceId }` | no | active record exists for `(harnessName, resourceId, threadId)`, `sessionId` differs | throw `HarnessSessionConflictError` before lease wait/steal |
-| `{ sessionId, threadId, resourceId }` | no | no active record, closed current owner exists for `(harnessName, resourceId, threadId)`, `sessionId` matches | reopen that session if the stored thread/resource match; otherwise conflict/not-found |
-| `{ sessionId, threadId, resourceId }` | no | no active record, closed current owner exists for `(harnessName, resourceId, threadId)`, `sessionId` differs | throw `HarnessSessionConflictError`; do not create a replacement behind the closed owner |
-| `{ sessionId, threadId, resourceId }` | no | no current owner for `(harnessName, resourceId, threadId)` and no record at `sessionId` | create thread if needed, atomically create/load the active session with that ID |
-| `{ threadId, resourceId }` | yes | n/a | return live instance |
-| `{ threadId, resourceId }` | no | active record exists, thread `resourceId` matches | hydrate for read, or acquire lease before live execution/write |
-| `{ threadId, resourceId }` | no | closed owning record exists for matching resource | reopen the closed owning session; do not create a fresh active record |
-| `{ threadId, resourceId }` | no | thread exists but belongs to a **different** resource | tenant-safe not-found; do not create using the colliding explicit `threadId` |
-| `{ threadId, resourceId }` | no | no | create thread if needed, atomically create/load the active session, return |
-| `{ threadId: { fresh: true }, resourceId }` | n/a | n/a | always create a fresh thread + fresh active session |
+| Input                                       | Live in memory?                                                                      | Record in storage?                                                                                           | Result                                                                                   |
+| ------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `{ sessionId }`                             | yes                                                                                  | n/a                                                                                                          | return live instance                                                                     |
+| `{ sessionId }`                             | no                                                                                   | yes (active)                                                                                                 | hydrate for read, or acquire lease before live execution/write                           |
+| `{ sessionId }`                             | no                                                                                   | yes (closed)                                                                                                 | reopen under the normal resource/lease checks, then hydrate                              |
+| `{ sessionId }`                             | no                                                                                   | no                                                                                                           | throw `HarnessSessionNotFoundError`                                                      |
+| `{ sessionId, resourceId }`                 | yes, `resourceId` matches                                                            | n/a                                                                                                          | return live instance                                                                     |
+| `{ sessionId, resourceId }`                 | yes, `resourceId` mismatches                                                         | n/a                                                                                                          | throw `HarnessSessionNotFoundError`                                                      |
+| `{ sessionId, resourceId }`                 | no                                                                                   | yes, `resourceId` matches, active                                                                            | hydrate for read, or acquire lease before live execution/write                           |
+| `{ sessionId, resourceId }`                 | no                                                                                   | yes, `resourceId` matches, closed                                                                            | reopen under the normal resource/lease checks, then hydrate                              |
+| `{ sessionId, resourceId }`                 | no                                                                                   | yes, `resourceId` mismatches                                                                                 | throw `HarnessSessionNotFoundError` (do not leak existence)                              |
+| `{ sessionId, resourceId }`                 | no                                                                                   | no                                                                                                           | throw `HarnessSessionNotFoundError`                                                      |
+| `{ sessionId, threadId, resourceId }`       | yes, all identities match                                                            | n/a                                                                                                          | return live instance                                                                     |
+| `{ sessionId, threadId, resourceId }`       | yes, `sessionId` differs from active owner for `(harnessName, resourceId, threadId)` | n/a                                                                                                          | throw `HarnessSessionConflictError`                                                      |
+| `{ sessionId, threadId, resourceId }`       | no                                                                                   | active record exists for `(harnessName, resourceId, threadId)`, `sessionId` matches                          | hydrate for read, or acquire lease before live execution/write                           |
+| `{ sessionId, threadId, resourceId }`       | no                                                                                   | active record exists for `(harnessName, resourceId, threadId)`, `sessionId` differs                          | throw `HarnessSessionConflictError` before lease wait/steal                              |
+| `{ sessionId, threadId, resourceId }`       | no                                                                                   | no active record, closed current owner exists for `(harnessName, resourceId, threadId)`, `sessionId` matches | reopen that session if the stored thread/resource match; otherwise conflict/not-found    |
+| `{ sessionId, threadId, resourceId }`       | no                                                                                   | no active record, closed current owner exists for `(harnessName, resourceId, threadId)`, `sessionId` differs | throw `HarnessSessionConflictError`; do not create a replacement behind the closed owner |
+| `{ sessionId, threadId, resourceId }`       | no                                                                                   | no current owner for `(harnessName, resourceId, threadId)` and no record at `sessionId`                      | create thread if needed, atomically create/load the active session with that ID          |
+| `{ threadId, resourceId }`                  | yes                                                                                  | n/a                                                                                                          | return live instance                                                                     |
+| `{ threadId, resourceId }`                  | no                                                                                   | active record exists, thread `resourceId` matches                                                            | hydrate for read, or acquire lease before live execution/write                           |
+| `{ threadId, resourceId }`                  | no                                                                                   | closed owning record exists for matching resource                                                            | reopen the closed owning session; do not create a fresh active record                    |
+| `{ threadId, resourceId }`                  | no                                                                                   | thread exists but belongs to a **different** resource                                                        | tenant-safe not-found; do not create using the colliding explicit `threadId`             |
+| `{ threadId, resourceId }`                  | no                                                                                   | no                                                                                                           | create thread if needed, atomically create/load the active session, return               |
+| `{ threadId: { fresh: true }, resourceId }` | n/a                                                                                  | n/a                                                                                                          | always create a fresh thread + fresh active session                                      |
 
 Rows with `closingAt` present and `closedAt` absent are current owners but
 not hydratable for new work. Any lookup shape above that would otherwise return

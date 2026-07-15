@@ -24,7 +24,7 @@ import { z } from 'zod/v4';
 // Type definitions for the workflow data
 export interface LLMIterationStepResult {
   /** Includes 'tripwire' and 'retry' for processor scenarios */
-  reason: LanguageModelV2FinishReason | 'tripwire' | 'retry';
+  reason: LanguageModelV2FinishReason | 'tripwire' | 'retry' | 'abort';
   warnings: LanguageModelV2CallWarning[];
   isContinued: boolean;
   logprobs?: LanguageModelV1LogProbs;
@@ -92,6 +92,8 @@ export interface LLMIterationData<Tools extends ToolSet = ToolSet, OUTPUT = unde
    * iteration to process it. When set, isTaskCompleteStep is skipped.
    */
   backgroundTaskPending?: boolean;
+  /** Persisted name-only ceiling for reconstructing replacement tools after resume. */
+  toolSurfaceFence?: string[];
 }
 
 // Zod schemas for common types used in validation
@@ -161,6 +163,7 @@ export const llmIterationOutputSchema = z.object({
   processorRetryFeedback: z.string().optional(),
   isTaskCompleteCheckFailed: z.boolean().optional(), //true if the isTaskComplete check failed and LLM has to run again
   backgroundTaskPending: z.boolean().optional(), // true if a background task result was injected and LLM needs to process it
+  toolSurfaceFence: z.array(z.string()).optional(),
 });
 
 export const toolCallInputSchema = z.object({

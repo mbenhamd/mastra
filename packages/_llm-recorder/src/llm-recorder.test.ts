@@ -28,6 +28,9 @@ import {
   getLLMTestMode,
   setupLLMRecording,
   getActiveRecorder,
+  hasLLMRecording,
+  listLLMRecordings,
+  deleteLLMRecording,
 } from './llm-recorder';
 import type { LLMRecording } from './llm-recorder';
 
@@ -389,11 +392,113 @@ describe('recording file format', () => {
     );
 
     process.env.LLM_TEST_MODE = 'replay';
+    expect(hasLLMRecording(name, tempDir)).toBe(true);
+    expect(listLLMRecordings(tempDir)).toContain(name);
     const recorder = setupLLMRecording({ name, recordingsDir: tempDir });
 
     expect(recorder.mode).toBe('replay');
     expect(recorder.recordingCount).toBe(0);
     recorder.stop();
+  });
+
+  it('replays split per-test recording files when no suite monolith exists', async () => {
+    const name = 'split-recording-format';
+    const splitDir = path.join(tempDir, name);
+    const requestBody = { model: 'gpt-4o', input: 'split fixture' };
+    fs.mkdirSync(splitDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(splitDir, 'test-a.json'),
+      JSON.stringify(
+        {
+          meta: {
+            name: 'test-a',
+            testFile: '/tmp/split-recording.test.ts',
+            testName: 'recording file format > another test',
+            provider: 'openai',
+            model: 'gpt-4o',
+            createdAt: '2026-07-15T00:00:00.000Z',
+          },
+          recordings: [
+            {
+              hash: '3bce2e1ae9f70afd',
+              request: {
+                url: 'https://api.openai.com/v1/responses',
+                method: 'POST',
+                body: requestBody,
+                timestamp: 1,
+              },
+              response: {
+                status: 200,
+                statusText: 'OK',
+                headers: { 'content-type': 'application/json' },
+                body: { id: 'wrong-test-response' },
+                isStreaming: false,
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+    fs.writeFileSync(
+      path.join(splitDir, 'test-z.json'),
+      JSON.stringify(
+        {
+          meta: {
+            name: 'test-z',
+            testFile: '/tmp/split-recording.test.ts',
+            testName: 'recording file format > replays split per-test recording files when no suite monolith exists',
+            provider: 'openai',
+            model: 'gpt-4o',
+            createdAt: '2026-07-15T00:00:00.000Z',
+          },
+          recordings: [
+            {
+              hash: '3bce2e1ae9f70afd',
+              request: {
+                url: 'https://api.openai.com/v1/responses',
+                method: 'POST',
+                body: requestBody,
+                timestamp: 1,
+              },
+              response: {
+                status: 200,
+                statusText: 'OK',
+                headers: { 'content-type': 'application/json' },
+                body: { id: 'split-response' },
+                isStreaming: false,
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+
+    process.env.LLM_TEST_MODE = 'replay';
+    const recorder = setupLLMRecording({ name, recordingsDir: tempDir });
+    recorder.start();
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ id: 'split-response' });
+    } finally {
+      recorder.stop();
+    }
+
+    deleteLLMRecording(name, tempDir);
+    expect(hasLLMRecording(name, tempDir)).toBe(false);
+    expect(listLLMRecordings(tempDir)).not.toContain(name);
   });
 
   it('update mode re-records but preserves createdAt', async () => {

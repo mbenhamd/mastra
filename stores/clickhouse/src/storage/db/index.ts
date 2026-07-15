@@ -427,7 +427,7 @@ export class ClickhouseDB extends MastraBase {
                 SELECT ${selectExpressions}
                 FROM ${backupTableName}
                 ORDER BY ${quoteClickHouseIdentifier('traceId')}, ${quoteClickHouseIdentifier('spanId')},
-                         (endedAt IS NOT NULL AND endedAt != '') DESC,
+                         (endedAt IS NOT NULL) DESC,
                          COALESCE(${quoteClickHouseIdentifier('updatedAt')}, ${quoteClickHouseIdentifier('createdAt')}) DESC,
                          ${quoteClickHouseIdentifier('createdAt')} DESC
                 LIMIT 1 BY ${quoteClickHouseIdentifier('traceId')}, ${quoteClickHouseIdentifier('spanId')}`,

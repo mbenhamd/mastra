@@ -44,6 +44,8 @@ import type {
   SendAgentSignalParams,
   QueueAgentMessageParams,
   SubscribeAgentThreadParams,
+  ListAgentSuspendedRunsParams,
+  ListAgentSuspendedRunsResponse,
   ProcessAgentThreadStreamOptions,
   CreateCodeAgentVersionParams,
   ActivateAgentVersionResponse,
@@ -64,6 +66,15 @@ type ResumeStreamParams<OUTPUT extends {}> = StreamParamsBaseWithoutMessages<OUT
   runId: string;
   toolCallId?: string;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
+};
+
+type RecoverParams = {
+  runId: string;
+  requestContext?: Record<string, unknown>;
+  versions?: {
+    agents?: Record<string, { versionId: string } | { status: 'draft' | 'published' }>;
+    defaultStatus?: 'draft' | 'published';
+  };
 };
 
 type ToolCallRespondFn<OUTPUT> = (
@@ -248,6 +259,12 @@ async function executeToolCallAndRespond<OUTPUT>({
           },
         });
 
+        const modelOutput = await getClientToolModelOutput(clientTool, result);
+
+        // Build the tool-result content block. If we have observability
+        // data (carrier + buffered spans/logs), attach it directly on
+        // the result so it travels with the specific tool call it
+        // belongs to, not on the top-level request body.
         const toolResultContent: Record<string, unknown> = {
           type: 'tool-result',
           toolCallId: toolCall.payload.toolCallId,
@@ -791,6 +808,11 @@ export class Agent extends BaseResource {
               toolCallId: toolCall.toolCallId,
               toolName: toolCall.toolName,
               output: { type: 'json', value: serializedResult },
+              // Carry the client-side toModelOutput result so the server uses it
+              // when building the model prompt, while output keeps the raw result.
+              ...(modelOutput != null
+                ? { providerOptions: { mastra: { modelOutput: modelOutput as JSONValue } } }
+                : {}),
               ...(observability ? { __mastraObservability: observability } : {}),
             } satisfies AIV5Type.ToolResultPart & { __mastraObservability?: ClientToolObservabilityEnvelope };
 
@@ -2777,6 +2799,31 @@ export class Agent extends BaseResource {
     return streamResponse;
   }
 
+  /**
+   * Lists suspended runs for this agent from storage — runs waiting on a
+   * tool-call approval or on a tool that suspended. Backed by storage, so it
+   * works after a server restart and across server instances. Pass the
+   * returned runId to approveToolCall(), declineToolCall(), or resumeStream().
+   * @param params - Optional filters (threadId, resourceId, fromDate, toDate) and pagination (perPage, page)
+   * @param requestContext - Optional request context
+   * @returns Promise containing the matching runs and the total count before pagination
+   */
+  async listSuspendedRuns(
+    params?: ListAgentSuspendedRunsParams,
+    requestContext?: RequestContext | Record<string, any>,
+  ): Promise<ListAgentSuspendedRunsResponse> {
+    const searchParams = new URLSearchParams(requestContextQueryString(requestContext).slice(1));
+    if (params?.threadId) searchParams.set('threadId', params.threadId);
+    if (params?.resourceId) searchParams.set('resourceId', params.resourceId);
+    if (params?.fromDate) searchParams.set('fromDate', params.fromDate.toISOString());
+    if (params?.toDate) searchParams.set('toDate', params.toDate.toISOString());
+    if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
+    if (params?.page !== undefined) searchParams.set('page', String(params.page));
+
+    const query = searchParams.size ? `?${searchParams}` : '';
+    return this.request<ListAgentSuspendedRunsResponse>(`/agents/${this.agentId}/suspended-runs${query}`);
+  }
+
   async approveToolCall(params: {
     runId: string;
     toolCallId: string;
@@ -2837,6 +2884,7 @@ export class Agent extends BaseResource {
     threadId: string;
     toolCallId: string;
     approved: boolean;
+    resumeData?: unknown;
     requestContext?: RequestContext | Record<string, any>;
     messages?: MessageListInput;
     streamOptions?: StreamParamsBaseWithoutMessages<any>;
@@ -3015,6 +3063,60 @@ export class Agent extends BaseResource {
       statusText: response.statusText,
       headers: response.headers,
     }) as Response & {
+      processDataStream: ({
+        onChunk,
+      }: {
+        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+      }) => Promise<void>;
+    };
+
+    streamResponse.processDataStream = async ({
+      onChunk,
+    }: {
+      onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+    }) => {
+      await processMastraStream({
+        stream: streamResponse.body as ReadableStream<Uint8Array>,
+        onChunk,
+      });
+    };
+
+    return streamResponse;
+  }
+
+  /**
+   * Re-drives an orphaned RUNNING durable-agent run after a process restart.
+   *
+   * Only supported when the target agent is a durable agent (createDurableAgent).
+   * The server rebuilds the runtime state from the persisted snapshot, replays
+   * past chunks, and continues the loop to completion.
+   */
+  async recover(params: RecoverParams): Promise<
+    Response & {
+      processDataStream: ({
+        onChunk,
+      }: {
+        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+      }) => Promise<void>;
+    }
+  > {
+    const body = {
+      runId: params.runId,
+      requestContext: parseClientRequestContext(params.requestContext),
+      versions: params.versions,
+    };
+
+    const response: Response = await this.request(`/agents/${this.agentId}/recover`, {
+      method: 'POST',
+      body,
+      stream: true,
+    });
+
+    if (!response.body) {
+      throw new Error('No response body');
+    }
+
+    const streamResponse = response as Response & {
       processDataStream: ({
         onChunk,
       }: {

@@ -44,17 +44,20 @@ function setupRegistry({
   const bgManager = { listTasks, waitForNextTask, config: {} } as any;
 
   const runId = 'run-1';
+  const runtimeBindingId = 'binding-run-1';
   const agentId = 'a1';
 
   globalRunRegistry.set(runId, {
+    runtimeBindingId,
     backgroundTaskManager: bgManager,
     backgroundTasksConfig: waitTimeoutMs ? { waitTimeoutMs } : undefined,
     tools: {},
     model: {} as any,
   } as any);
 
-  const getInitData = () => ({
+  const getInitData = () => () => ({
     runId,
+    runtimeBindingId,
     agentId,
     options: skipBgTaskWait ? { skipBgTaskWait } : undefined,
     state: { threadId: 'thread-1', resourceId: 'user-1' },
@@ -86,14 +89,15 @@ describe('createDurableBackgroundTaskCheckStep', () => {
 
   it('passes through unchanged when no manager is configured', async () => {
     const runId = 'run-no-mgr';
-    globalRunRegistry.set(runId, { tools: {}, model: {} as any } as any);
+    const runtimeBindingId = 'binding-no-mgr';
+    globalRunRegistry.set(runId, { runtimeBindingId, tools: {}, model: {} as any } as any);
 
     const step = createDurableBackgroundTaskCheckStep();
     const input = baseInput();
     const result = await (step as any).execute({
       inputData: input,
       retryCount: 0,
-      getInitData: () => ({ runId, agentId: 'a1' }),
+      getInitData: () => ({ runId, runtimeBindingId, agentId: 'a1' }),
     });
 
     expect(result).toBe(input);
@@ -108,7 +112,7 @@ describe('createDurableBackgroundTaskCheckStep', () => {
     const result = await (step as any).execute({
       inputData: input,
       retryCount: 0,
-      getInitData,
+      getInitData: getInitData(),
     });
 
     expect(result).toBe(input);
@@ -124,39 +128,60 @@ describe('createDurableBackgroundTaskCheckStep', () => {
 
     const result = await (step as any).execute({
       inputData: baseInput(),
-      retryCount: 1,
-      getInitData,
+      retryCount: 0,
+      getInitData: getInitData(),
     });
 
     expect(waitForNextTask).not.toHaveBeenCalled();
     expect(result.backgroundTaskPending).toBe(true);
   });
 
-  it('flags pending without waiting on first invocation (retryCount=0)', async () => {
+  it('returns immediately on retryCount=0 when waitTimeoutMs IS configured', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({ waitTimeoutMs: 60_000 });
     const step = createDurableBackgroundTaskCheckStep();
 
     const result = await (step as any).execute({
       inputData: baseInput(),
       retryCount: 0,
-      getInitData,
+      getInitData: getInitData(),
     });
 
+    // When waitTimeoutMs is explicitly configured, the caller drives
+    // continuation externally — match the regular agent's retryCount=0 skip.
     expect(waitForNextTask).not.toHaveBeenCalled();
     expect(result.backgroundTaskPending).toBe(true);
   });
 
-  it('waits for next task when retryCount > 0 and a wait timeout is configured', async () => {
+  it('waits with 1s default when no waitTimeoutMs is configured (retryCount=0)', async () => {
+    const { waitForNextTask, getInitData } = setupRegistry({});
+    const step = createDurableBackgroundTaskCheckStep();
+
+    const result = await (step as any).execute({
+      inputData: baseInput(),
+      retryCount: 0,
+      getInitData: getInitData(),
+    });
+
+    // No explicit waitTimeoutMs — durable agent must wait with a default
+    // to keep the workflow and pubsub subscription alive.
+    expect(waitForNextTask).toHaveBeenCalledTimes(1);
+    expect(waitForNextTask).toHaveBeenCalledWith(['t1'], expect.objectContaining({ timeoutMs: 1000 }));
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('waits with configured timeout on subsequent invocations (retryCount>0)', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({ waitTimeoutMs: 60_000 });
     const step = createDurableBackgroundTaskCheckStep();
 
     const result = await (step as any).execute({
       inputData: baseInput(),
       retryCount: 1,
-      getInitData,
+      getInitData: getInitData(),
     });
 
     expect(waitForNextTask).toHaveBeenCalledTimes(1);
+    expect(waitForNextTask).toHaveBeenCalledWith(['t1'], expect.objectContaining({ timeoutMs: 60_000 }));
     expect(result.backgroundTaskPending).toBe(true);
     expect(result.stepResult.isContinued).toBe(true);
   });

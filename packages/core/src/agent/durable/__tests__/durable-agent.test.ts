@@ -10,6 +10,7 @@ import { Agent } from '../../agent';
 import { MessageList } from '../../message-list';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
+import { DurableAgent } from '../durable-agent';
 import { RunRegistry, ExtendedRunRegistry, globalRunRegistry } from '../run-registry';
 import type { AgentStreamEvent } from '../types';
 
@@ -425,6 +426,7 @@ describe('DurableAgent', () => {
       const runId = 'test-dispose-' + crypto.randomUUID();
 
       globalRunRegistry.set(runId, {
+        runtimeBindingId: `binding-${runId}`,
         tools: {},
         model: { provider: 'test', modelId: 'test' } as any,
         cleanup: cleanupSpy,
@@ -803,6 +805,7 @@ describe('RunRegistry', () => {
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
     registry.register(runId, {
+      runtimeBindingId: `binding-${runId}`,
       tools,
       saveQueueManager: undefined as any,
       model: mockModel,
@@ -820,9 +823,24 @@ describe('RunRegistry', () => {
     const registry = new RunRegistry();
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
-    registry.register('run-1', { tools: { a: {} } as any, saveQueueManager: undefined as any, model: mockModel });
-    registry.register('run-2', { tools: { b: {} } as any, saveQueueManager: undefined as any, model: mockModel });
-    registry.register('run-3', { tools: { c: {} } as any, saveQueueManager: undefined as any, model: mockModel });
+    registry.register('run-1', {
+      runtimeBindingId: 'binding-run-1',
+      tools: { a: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
+    registry.register('run-2', {
+      runtimeBindingId: 'binding-run-2',
+      tools: { b: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
+    registry.register('run-3', {
+      runtimeBindingId: 'binding-run-3',
+      tools: { c: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
 
     expect(registry.size).toBe(3);
     expect(registry.runIds).toContain('run-1');
@@ -841,12 +859,27 @@ describe('RunRegistry', () => {
     const tools1 = { tool1: { description: 'First' } } as any;
     const tools2 = { tool2: { description: 'Second' } } as any;
 
-    registry.register(runId, { tools: tools1, saveQueueManager: undefined as any, model: mockModel });
+    registry.register(runId, {
+      runtimeBindingId: `binding-${runId}-1`,
+      tools: tools1,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.getTools(runId)).toBe(tools1);
 
-    registry.register(runId, { tools: tools2, saveQueueManager: undefined as any, model: mockModel });
+    registry.register(runId, {
+      runtimeBindingId: `binding-${runId}-2`,
+      tools: tools2,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.getTools(runId)).toBe(tools2);
     expect(registry.size).toBe(1);
+
+    registry.cleanupBound(runId, `binding-${runId}-1`);
+    expect(registry.getTools(runId)).toBe(tools2);
+    registry.cleanupBound(runId, `binding-${runId}-2`);
+    expect(registry.has(runId)).toBe(false);
   });
 });
 
@@ -863,7 +896,7 @@ describe('ExtendedRunRegistry', () => {
 
     registry.registerWithMessageList(
       runId,
-      { tools: {}, saveQueueManager: undefined as any, model: mockModel },
+      { runtimeBindingId: `binding-${runId}`, tools: {}, saveQueueManager: undefined as any, model: mockModel },
       messageList,
       {
         threadId: 'thread-1',
@@ -887,7 +920,12 @@ describe('ExtendedRunRegistry', () => {
     const mockModel = { provider: 'test', modelId: 'test-model' } as any;
 
     // Can use basic register
-    registry.register('basic-run', { tools: { t: {} } as any, saveQueueManager: undefined as any, model: mockModel });
+    registry.register('basic-run', {
+      runtimeBindingId: 'binding-basic-run',
+      tools: { t: {} } as any,
+      saveQueueManager: undefined as any,
+      model: mockModel,
+    });
     expect(registry.has('basic-run')).toBe(true);
     expect(registry.getTools('basic-run')).toBeDefined();
 
@@ -895,7 +933,12 @@ describe('ExtendedRunRegistry', () => {
     const messageList = new MessageList({});
     registry.registerWithMessageList(
       'extended-run',
-      { tools: {}, saveQueueManager: undefined as any, model: mockModel },
+      {
+        runtimeBindingId: 'binding-extended-run',
+        tools: {},
+        saveQueueManager: undefined as any,
+        model: mockModel,
+      },
       messageList,
       { threadId: 't1' },
     );
@@ -1091,11 +1134,6 @@ describe('DurableAgent resume model metadata', () => {
     const runId = 'test-resume-model';
 
     const mockModel = { modelId: 'gpt-4', provider: 'openai' };
-    globalRunRegistry.set(runId, {
-      tools: {},
-      model: mockModel as any,
-      cleanup: () => {},
-    });
 
     const mockLM = new MockLanguageModelV2({
       doStream: async () => ({
@@ -1115,11 +1153,17 @@ describe('DurableAgent resume model metadata', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, cache: false });
 
-    durableAgent.runRegistry.register(runId, {
+    const messageList = new MessageList({});
+    const registryEntry = {
+      runtimeBindingId: `binding-${runId}`,
+      agentId: durableAgent.id,
       tools: {},
       model: mockModel as any,
+      messageList,
       cleanup: () => {},
-    });
+    };
+    globalRunRegistry.set(runId, registryEntry);
+    durableAgent.runRegistry.registerWithMessageList(runId, registryEntry, messageList);
 
     const result = await durableAgent.resume(runId, { approved: true });
 
@@ -1133,5 +1177,86 @@ describe('DurableAgent resume model metadata', () => {
     globalRunRegistry.delete(runId);
     createStreamSpy.mockRestore();
     await pubsub.close();
+  });
+
+  // ==========================================================================
+  // __fork — per-request editor override path
+  //
+  // The editor serves per-request agents by calling `__fork()` on the registered
+  // agent and then mutating the fork (instructions/tools). The base Agent.__fork
+  // builds a bare Agent, which for a DurableAgent dropped the wrapped agent and
+  // every delegating override — the served agent lost all of its tools.
+  // ==========================================================================
+  describe('__fork (editor override path)', () => {
+    const ping = createTool({
+      id: 'ping',
+      description: 'Ping',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: async () => ({ ok: true }),
+    });
+
+    it('re-wraps as a DurableAgent that keeps the wrapped agent tools and delegating behavior', async () => {
+      const pubsub = new EventEmitterPubSub();
+      const baseAgent = new Agent({
+        id: 'fork-agent',
+        name: 'Fork Agent',
+        instructions: 'Code instructions',
+        model: 'openai/gpt-4o',
+        tools: { ping },
+        editor: { instructions: true, tools: false },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      // The editor reads tool/instruction ownership from the served agent.
+      expect(durableAgent.__getEditorConfig()).toEqual({ instructions: true, tools: false });
+
+      const fork = durableAgent.__fork();
+
+      // The served fork stays a DurableAgent (delegating behavior intact)…
+      expect(fork).toBeInstanceOf(DurableAgent);
+      // …and keeps the wrapped agent's code-owned tool.
+      expect(Object.keys(await fork.listTools())).toContain('ping');
+
+      // An instructions override applied to the fork is reflected…
+      fork.__updateInstructions('Overridden instructions');
+      expect(await fork.getInstructions()).toBe('Overridden instructions');
+
+      // …without mutating the original singleton.
+      expect(await durableAgent.getInstructions()).toBe('Code instructions');
+      expect(Object.keys(await durableAgent.listTools())).toContain('ping');
+
+      await pubsub.close();
+    });
+
+    it('forwards __setTools on the fork to the wrapped agent', async () => {
+      const pubsub = new EventEmitterPubSub();
+      const extra = createTool({
+        id: 'extra',
+        description: 'Extra',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+      const baseAgent = new Agent({
+        id: 'fork-tools-agent',
+        name: 'Fork Tools Agent',
+        instructions: 'Code instructions',
+        model: 'openai/gpt-4o',
+        tools: { ping },
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const fork = durableAgent.__fork();
+      const codeTools = await fork.listTools();
+      fork.__setTools({ ...codeTools, extra });
+
+      // The merged tool set is served by the fork…
+      expect(Object.keys(await fork.listTools())).toEqual(expect.arrayContaining(['ping', 'extra']));
+      // …while the original singleton is untouched.
+      expect(Object.keys(await durableAgent.listTools())).not.toContain('extra');
+
+      await pubsub.close();
+    });
   });
 });

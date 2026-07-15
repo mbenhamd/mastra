@@ -17,16 +17,14 @@ import {
   HarnessStorageChannelInboxClaimConflictError,
   HarnessStorageChannelInboxTransitionError,
 } from '../../storage/domains/harness';
-import {
-  HarnessBusyError,
-  HarnessStorageError,
-  HarnessValidationError,
-} from './errors';
+import { HarnessBusyError, HarnessStorageError, HarnessValidationError } from './errors';
 import { projectHarnessPublicError } from './events';
 
 describe('projectHarnessPublicError', () => {
   it('maps a raw TypeError to harness.internal with a redacted message (no raw text leak)', () => {
-    const raw = new TypeError('connect ECONNREFUSED 10.0.0.5:5432 — password authentication failed for user "postgres"');
+    const raw = new TypeError(
+      'connect ECONNREFUSED 10.0.0.5:5432 — password authentication failed for user "postgres"',
+    );
     const projected = projectHarnessPublicError(raw);
     expect(projected.code).toBe('harness.internal');
     expect(projected.message).toBe('An internal harness error occurred');
@@ -59,10 +57,9 @@ describe('projectHarnessPublicError', () => {
     // F2 residual: trust is by INSTANCE, not by the `.code` string. A raw Error
     // that spoofs a namespaced code must still be redacted — otherwise its raw
     // driver/SQL/path message would leak across the wire under a trusted code.
-    const forgedStorage = Object.assign(
-      new Error('relation "sessions" does not exist (host db.internal:5432)'),
-      { code: 'harness.storage' },
-    );
+    const forgedStorage = Object.assign(new Error('relation "sessions" does not exist (host db.internal:5432)'), {
+      code: 'harness.storage',
+    });
     const projectedStorage = projectHarnessPublicError(forgedStorage);
     expect(projectedStorage.code).toBe('harness.internal');
     expect(projectedStorage.message).toBe('An internal harness error occurred');

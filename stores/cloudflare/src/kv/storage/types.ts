@@ -8,6 +8,22 @@ import type {
   TABLE_BACKGROUND_TASKS,
   TABLE_TRACES,
   TABLE_HARNESS_SESSIONS,
+  TABLE_HARNESS_ATTACHMENTS,
+  TABLE_HARNESS_ATTACHMENT_REFERENCES,
+  TABLE_HARNESS_MESSAGE_RESULTS,
+  TABLE_HARNESS_OPERATION_TOMBSTONES,
+  TABLE_HARNESS_SESSION_EVENTS,
+  TABLE_HARNESS_THREAD_DELETE_FENCES,
+  TABLE_HARNESS_CHANNEL_INBOX,
+  TABLE_HARNESS_CHANNEL_BINDINGS,
+  TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS,
+  TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
+  TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+  TABLE_HARNESS_CHANNEL_OUTBOX,
+  TABLE_HARNESS_WAKEUPS,
+  TABLE_HARNESS_WORKSPACE_ACTIONS,
+  TABLE_HARNESS_PLAN_TASKS,
+  TABLE_HARNESS_RUN_SUMMARIES,
   TABLE_RESOURCES,
   TABLE_NAMES,
   StorageResourceType,
@@ -49,7 +65,22 @@ import type {
   StorageBlobEntry,
   StorageFavoriteType,
   StorageToolProviderConnection,
+  AgentSignalResultEvidence,
+  AttachmentRecord,
+  ChannelActionReceipt,
+  ChannelActionToken,
+  ChannelBinding,
+  ChannelInboxItem,
+  ChannelOutboxItem,
+  HarnessPlanTask,
+  HarnessProviderCallbackBinding,
+  HarnessRunSummary,
+  HarnessSessionEventRecord,
+  HarnessWakeupItem,
+  OperationAdmissionTombstone,
+  SaveAttachmentReferenceInput,
   SessionRecord,
+  WorkspaceActionJournalEntry,
 } from '@mastra/core/storage';
 import type { AgentVersion } from '@mastra/core/storage/domains/agents';
 import type { MCPClientVersion } from '@mastra/core/storage/domains/mcp-clients';
@@ -159,6 +190,22 @@ export type RecordTypes = {
   [TABLE_SCORERS]: ScoreRowData;
   [TABLE_TRACES]: any;
   [TABLE_HARNESS_SESSIONS]: SessionRecord;
+  [TABLE_HARNESS_ATTACHMENTS]: AttachmentRecord;
+  [TABLE_HARNESS_ATTACHMENT_REFERENCES]: SaveAttachmentReferenceInput;
+  [TABLE_HARNESS_MESSAGE_RESULTS]: AgentSignalResultEvidence;
+  [TABLE_HARNESS_OPERATION_TOMBSTONES]: OperationAdmissionTombstone;
+  [TABLE_HARNESS_SESSION_EVENTS]: HarnessSessionEventRecord;
+  [TABLE_HARNESS_THREAD_DELETE_FENCES]: Record<string, any>;
+  [TABLE_HARNESS_CHANNEL_INBOX]: ChannelInboxItem;
+  [TABLE_HARNESS_CHANNEL_BINDINGS]: ChannelBinding;
+  [TABLE_HARNESS_PROVIDER_CALLBACK_BINDINGS]: HarnessProviderCallbackBinding;
+  [TABLE_HARNESS_CHANNEL_ACTION_TOKENS]: ChannelActionToken;
+  [TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS]: ChannelActionReceipt;
+  [TABLE_HARNESS_CHANNEL_OUTBOX]: ChannelOutboxItem;
+  [TABLE_HARNESS_WAKEUPS]: HarnessWakeupItem;
+  [TABLE_HARNESS_WORKSPACE_ACTIONS]: WorkspaceActionJournalEntry;
+  [TABLE_HARNESS_PLAN_TASKS]: HarnessPlanTask;
+  [TABLE_HARNESS_RUN_SUMMARIES]: HarnessRunSummary;
   [TABLE_RESOURCES]: StorageResourceType;
   [TABLE_SPANS]: SpanRecord;
   [TABLE_AGENTS]: StorageAgentType;

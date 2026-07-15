@@ -35,9 +35,10 @@ export function sanitizeToolCallInput(input: string): string {
     return input;
   } catch {
     // Input is not valid JSON — strip LLM-specific tokens and retry.
-    // Find tokens from their literal delimiter to keep matching linear on long
-    // whitespace prefixes. Trim whitespace from each disjoint pre-token segment
-    // so a token inserted inside a JSON lexical value does not leave `1 2`.
+    // Find tokens from their literal delimiter (`<|`, no leading `\s*`) to keep
+    // matching linear on adversarial inputs (CodeQL js/polynomial-redos). Trim
+    // whitespace from each disjoint pre-token segment so a token inserted
+    // inside a JSON lexical value does not leave `1 2`.
     const tokenPattern = /<\|[^|]*\|>\s*/g;
     let sanitized = '';
     let previousEnd = 0;

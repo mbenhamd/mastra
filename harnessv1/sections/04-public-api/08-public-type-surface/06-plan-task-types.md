@@ -14,13 +14,7 @@ storage record fields and the `HarnessStorage` method shapes live with §5.1k an
 // plan_task_* custom event projection (§10.3) are TM-3 / TM-5 and are NOT yet
 // part of the closed public/event surface.
 
-type HarnessPlanTaskStatus =
-  | 'pending'
-  | 'in_progress'
-  | 'blocked'
-  | 'completed'
-  | 'cancelled'
-  | 'failed';
+type HarnessPlanTaskStatus = 'pending' | 'in_progress' | 'blocked' | 'completed' | 'cancelled' | 'failed';
 
 // Whether the current `status` was written by an explicit caller/model action
 // or derived by the harness from child rollup (rollup itself is TM-4 — until
