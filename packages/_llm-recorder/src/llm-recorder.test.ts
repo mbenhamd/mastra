@@ -501,6 +501,103 @@ describe('recording file format', () => {
     expect(listLLMRecordings(tempDir)).not.toContain(name);
   });
 
+  describe('per-test divergent replay ordinals', () => {
+    const name = 'split-divergent-replay-ordinals';
+    const splitDir = path.join(tempDir, name);
+    const requestBody = { model: 'gpt-4o', input: 'split fixture' };
+    const requestHash = '3bce2e1ae9f70afd';
+    const request = {
+      url: 'https://api.openai.com/v1/responses',
+      method: 'POST',
+      body: requestBody,
+      timestamp: 1,
+    };
+    const writeFixture = (fileName: string, testName: string, responsePrefix: string) => {
+      fs.writeFileSync(
+        path.join(splitDir, fileName),
+        JSON.stringify(
+          {
+            meta: {
+              name: fileName.replace(/\.json$/, ''),
+              testFile: '/tmp/split-divergent-replay.test.ts',
+              testName,
+              provider: 'openai',
+              model: 'gpt-4o',
+              createdAt: '2026-07-15T00:00:00.000Z',
+            },
+            recordings: [
+              {
+                hash: requestHash,
+                request,
+                response: {
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'content-type': 'application/json' },
+                  body: { id: `${responsePrefix}-first` },
+                  isStreaming: false,
+                },
+              },
+              {
+                hash: requestHash,
+                request,
+                response: {
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'content-type': 'application/json' },
+                  body: { id: `${responsePrefix}-second` },
+                  isStreaming: false,
+                },
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+    };
+
+    fs.mkdirSync(splitDir, { recursive: true });
+    writeFixture(
+      'test-a.json',
+      'recording file format > per-test divergent replay ordinals > first split fixture starts at its first response',
+      'test-a',
+    );
+    writeFixture(
+      'test-b.json',
+      'recording file format > per-test divergent replay ordinals > second split fixture also starts at its first response',
+      'test-b',
+    );
+
+    const modeBeforeSetup = process.env.LLM_TEST_MODE;
+    process.env.LLM_TEST_MODE = 'replay';
+    useLLMRecording(name, { recordingsDir: tempDir, exactMatch: true });
+    if (modeBeforeSetup === undefined) {
+      delete process.env.LLM_TEST_MODE;
+    } else {
+      process.env.LLM_TEST_MODE = modeBeforeSetup;
+    }
+
+    const fetchResponses = async () => {
+      const requestInit = {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      };
+      const first = await (await fetch('https://api.openai.com/v1/responses', requestInit)).json();
+      const second = await (await fetch('https://api.openai.com/v1/responses', requestInit)).json();
+      return [first.id, second.id];
+    };
+
+    it('first split fixture starts at its first response', async () => {
+      expect(await fetchResponses()).toEqual(['test-a-first', 'test-a-second']);
+    });
+
+    it('second split fixture also starts at its first response', async () => {
+      expect(await fetchResponses()).toEqual(['test-b-first', 'test-b-second']);
+    });
+  });
+
   it('update mode re-records but preserves createdAt', async () => {
     const name = 'update-mode-test';
     const filePath = path.join(tempDir, `${name}.json`);
@@ -580,6 +677,97 @@ describe('recording file format', () => {
     expect(parsed.meta.updatedAt).toBeDefined();
     expect(parsed.recordings.length).toBe(1);
     expect(parsed.recordings[0].hash).not.toBe('old-hash');
+  });
+
+  it('collapses identical request/response pairs but keeps divergent responses in record order', async () => {
+    const name = 'dedupe-divergent-responses';
+    const filePath = path.join(tempDir, `${name}.json`);
+
+    process.env.LLM_TEST_MODE = 'record';
+
+    // Same request issued three times: the first two got the same response
+    // (collapse to one entry), the third got a different response (kept as a
+    // second entry so the recorded chain replays in order).
+    const makeResponse = (id: string) =>
+      new Response(JSON.stringify({ id, output: [] }), {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'content-type': 'application/json' },
+      });
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(makeResponse('first-response'))
+      .mockResolvedValueOnce(makeResponse('first-response'))
+      .mockResolvedValueOnce(makeResponse('second-response'));
+
+    const recorder = setupLLMRecording({ name, recordingsDir: tempDir });
+    recorder.start();
+    const requestInit = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', input: 'same prompt' }),
+    };
+    await fetch('https://api.openai.com/v1/responses', requestInit);
+    await fetch('https://api.openai.com/v1/responses', requestInit);
+    await fetch('https://api.openai.com/v1/responses', requestInit);
+    await recorder.save();
+    recorder.stop();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    expect(parsed.recordings.length).toBe(2);
+    expect(parsed.recordings[0].hash).toBe(parsed.recordings[1].hash);
+    expect(parsed.recordings[0].response.body.id).toBe('first-response');
+    expect(parsed.recordings[1].response.body.id).toBe('second-response');
+  });
+
+  it('replays divergent responses for the same request sequentially in record order', async () => {
+    const name = 'replay-divergent-responses';
+    const filePath = path.join(tempDir, `${name}.json`);
+
+    process.env.LLM_TEST_MODE = 'record';
+
+    const makeResponse = (id: string) =>
+      new Response(JSON.stringify({ id, output: [] }), {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'content-type': 'application/json' },
+      });
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(makeResponse('first-response'))
+      .mockResolvedValueOnce(makeResponse('second-response'));
+
+    const requestInit = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', input: 'same prompt' }),
+    };
+
+    const recorder = setupLLMRecording({ name, recordingsDir: tempDir });
+    recorder.start();
+    await fetch('https://api.openai.com/v1/responses', requestInit);
+    await fetch('https://api.openai.com/v1/responses', requestInit);
+    await recorder.save();
+    recorder.stop();
+
+    expect(JSON.parse(fs.readFileSync(filePath, 'utf-8')).recordings.length).toBe(2);
+
+    // Replay: same request three times — first two consume the entries in
+    // record order, the third keeps serving the last entry.
+    vi.restoreAllMocks();
+    process.env.LLM_TEST_MODE = 'replay';
+
+    const replayer = setupLLMRecording({ name, recordingsDir: tempDir });
+    replayer.start();
+    const first = await (await fetch('https://api.openai.com/v1/responses', requestInit)).json();
+    const second = await (await fetch('https://api.openai.com/v1/responses', requestInit)).json();
+    const third = await (await fetch('https://api.openai.com/v1/responses', requestInit)).json();
+    replayer.stop();
+
+    expect(first.id).toBe('first-response');
+    expect(second.id).toBe('second-response');
+    expect(third.id).toBe('second-response');
   });
 
   it('tolerates corrupted JSON in record mode', () => {

@@ -99,6 +99,12 @@ type PendingWorkerStart = {
   ignoreShutdownError?: boolean;
 };
 
+type PushWorkflowSubscription = {
+  topic: string;
+  cb: EventCallback;
+  subscribed: boolean;
+};
+
 type InternalWorkflowOwnershipState = {
   latestGeneration: number;
   ownedGenerations: Set<number>;
@@ -846,13 +852,28 @@ export class Mastra<
    * worker-existence checks and double-subscribe to the scheduling topics.
    */
   #schedulingWorkersStartPromise?: Promise<void>;
+  /**
+   * In-flight promise for `__ensureExecutionWorkersStarted()`. Serializes
+   * concurrent lazy startups triggered by background-task dispatches so two
+   * first dispatches on a cold instance can't both init/start the same
+   * workers.
+   */
+  #executionWorkersStartPromise?: Promise<void>;
+  /**
+   * Fast path for `__ensureExecutionWorkersStarted()`. Set once the execution
+   * workers + push wiring are confirmed running; reset by `stopWorkers()`.
+   * Kept separate from `#workersStarted`, which partial `startWorkers(name)`
+   * calls also set without starting the workflow consumer.
+   */
+  #executionWorkersStarted = false;
   // Lazily-constructed processor used by handleWorkflowEvent(). Shared between
   // pull-mode workers (OrchestrationWorker) and push-mode entry points
   // (in-process EventEmitter listener, the /api/workers/events HTTP route).
   #workflowEventProcessor?: WorkflowEventProcessor;
   // Callback registered against the pubsub when running in push mode so we can
   // unsubscribe it cleanly during stopWorkers().
-  #pushSubscription?: { topic: string; cb: EventCallback };
+  #pushSubscription?: PushWorkflowSubscription;
+  #pushSubscriptionStartPromise?: Promise<PushWorkflowSubscription | undefined>;
   // Tracks (topic, listener) pairs registered against the pubsub on behalf of
   // user-defined event listeners during startWorkers(). Used to make
   // startWorkers()/stopWorkers() idempotent — a second startWorkers() call
@@ -5929,6 +5950,9 @@ export class Mastra<
     }
 
     if (!name) {
+      if (this.#executionWorkersStartPromise) {
+        await this.#executionWorkersStartPromise;
+      }
       if (this.#allWorkersStartPromise) {
         return this.#allWorkersStartPromise;
       }
@@ -5971,13 +5995,7 @@ export class Mastra<
     let workersRunningBeforeStartup: WeakSet<MastraWorker> | undefined;
     let workersStartingBeforeStartup: WeakSet<MastraWorker> | undefined;
     let workersStartedBeforeStartup = false;
-    let startupPushSubscription:
-      | {
-          topic: string;
-          cb: EventCallback;
-          subscribed: boolean;
-        }
-      | undefined;
+    let startupPushSubscription: PushWorkflowSubscription | undefined;
     const startupUserEventSubscriptions: Array<{
       topic: string;
       cb: (event: Event, ack?: () => Promise<void>) => Promise<void>;
@@ -6016,83 +6034,16 @@ export class Mastra<
         }
       }
 
-      // For push-mode pubsubs (e.g. EventEmitterPubSub) there is no
-      // OrchestrationWorker pulling events — wire handleWorkflowEvent directly
-      // to the pubsub so workflow events still get processed in-process.
       if (!name) {
-        const modes = this.#pubsub.supportedModes ?? ['pull'];
-        const pushOnly = modes.includes('push') && !modes.includes('pull');
-        if (pushOnly && !this.#pushSubscription) {
-          const cb: EventCallback = (event, ack, nack) => {
-            const data = event.data as Record<string, unknown> | undefined;
-            const workflowId = data?.workflowId as string | undefined;
-            if (!this.__shouldProcessWorkflowEvent(event)) {
-              this.#logger?.debug?.('Skipping workflow event not owned by this Mastra instance', {
-                workflowId,
-                eventType: event.type,
-                ownership: 'foreign',
-              });
-              if (ack) {
-                void ack().catch(error => this.#logger?.error?.('Error acking skipped workflow event', error));
-              }
-              return;
-            }
-            void this.handleWorkflowEvent(event)
-              .then(result => {
-                if (result.ok) {
-                  if (ack) {
-                    return ack().catch(err =>
-                      this.#logger?.error?.('Error acking workflow event in push subscription', err),
-                    );
-                  }
-                  return;
-                }
-
-                if (result.retry) {
-                  if (nack) {
-                    return nack().catch(err =>
-                      this.#logger?.error?.('Error nacking workflow event in push subscription', err),
-                    );
-                  }
-                  this.#logger?.error?.('Retryable workflow event cannot be requeued because nack is unavailable', {
-                    type: event.type,
-                    runId: event.runId,
-                  });
-                  return;
-                }
-
-                if (ack) {
-                  return ack().catch(err =>
-                    this.#logger?.error?.('Error acking terminal workflow event in push subscription', err),
-                  );
-                }
-              })
-              .catch(err => this.#logger?.error?.('Unhandled error in workflow event push subscription', err));
-          };
-          startupPushSubscription = { topic: 'workflows', cb, subscribed: false };
-          this.#pushSubscription = startupPushSubscription;
-          await this.#pubsub.subscribe('workflows', cb);
-          startupPushSubscription.subscribed = true;
-          if (
-            !this.#workersStarted ||
-            (startupLifecycleGeneration !== undefined && this.#workerLifecycleGeneration !== startupLifecycleGeneration)
-          ) {
-            const ownsPushSubscription = this.#pushSubscription === startupPushSubscription;
-            try {
-              await this.#pubsub.unsubscribe('workflows', cb);
-            } catch (error) {
-              if (ownsPushSubscription || !this.#pushSubscription) {
-                this.#pushSubscription = startupPushSubscription;
-                throw error;
-              }
-              this.#logger?.error('Failed to cleanup stale workflow push subscription after shutdown', error);
-            }
-            if (ownsPushSubscription && this.#pushSubscription === startupPushSubscription) {
-              this.#pushSubscription = undefined;
-            }
-            startupPushSubscription = undefined;
-            return;
-          }
+        startupPushSubscription = await this.#wirePushWorkflowSubscription({
+          onlyIfWorkersStarted: true,
+          onlyIfLifecycleGeneration: startupLifecycleGeneration,
+        });
+        if (
+          !this.#workersStarted ||
+          (startupLifecycleGeneration !== undefined && this.#workerLifecycleGeneration !== startupLifecycleGeneration)
+        ) {
+          return;
         }
       }
 
@@ -6162,6 +6113,7 @@ export class Mastra<
         !startupComplete &&
         (this.#workerLifecycleGeneration === startupLifecycleGeneration || !this.#workersStarted)
       ) {
+        this.#executionWorkersStarted = false;
         this.#workersStarted =
           this.#workerLifecycleGeneration === startupLifecycleGeneration ? workersStartedBeforeStartup : false;
         this.#workerLifecycleGeneration += 1;
@@ -6222,9 +6174,11 @@ export class Mastra<
       onlyIfLifecycleGeneration?: number;
       onlyIfShutdownGeneration?: number;
       onError?: (error: unknown) => void;
+      onStarted?: () => void;
       startLifecycleGeneration?: number;
       stopIfWorkersStopped?: boolean;
       stopIfLifecycleGenerationChangesFrom?: number;
+      stopIfShutdownGenerationChangesFrom?: number;
     } = {},
   ): Promise<void> {
     const existingStart = this.#workerStartPromises.get(worker);
@@ -6289,6 +6243,7 @@ export class Mastra<
       onAfterStart: () => {
         didStart = true;
         recordLatestStartToken();
+        opts.onStarted?.();
       },
     });
     const promise = start.finally(async () => {
@@ -6314,11 +6269,13 @@ export class Mastra<
       const lifecycleChanged =
         opts.stopIfLifecycleGenerationChangesFrom !== undefined &&
         this.#workerLifecycleGeneration !== opts.stopIfLifecycleGenerationChangesFrom;
+      const shutdownGenerationChanged =
+        opts.stopIfShutdownGenerationChangesFrom !== undefined &&
+        this.#workerShutdownGeneration !== opts.stopIfShutdownGenerationChangesFrom;
       const isLatestStart = this.#latestWorkerStartTokens.get(worker) === startToken;
       if (
-        opts.stopIfWorkersStopped &&
         isLatestStart &&
-        (!this.#workersStarted || lifecycleChanged) &&
+        ((opts.stopIfWorkersStopped && (!this.#workersStarted || lifecycleChanged)) || shutdownGenerationChanged) &&
         worker.isRunning
       ) {
         try {
@@ -6380,6 +6337,252 @@ export class Mastra<
   }
 
   /**
+   * Wire `handleWorkflowEvent` directly to the pubsub when it is push-only
+   * (no pull mode for an OrchestrationWorker to drive). Idempotent — no-op
+   * when the pubsub supports pull or the subscription already exists.
+   * Shared by `startWorkers()` and `__ensureExecutionWorkersStarted()`.
+   */
+  async #wirePushWorkflowSubscription(
+    opts: {
+      onlyIfWorkersStarted?: boolean;
+      onlyIfLifecycleGeneration?: number;
+      onlyIfShutdownGeneration?: number;
+    } = {},
+  ): Promise<PushWorkflowSubscription | undefined> {
+    const modes = this.#pubsub.supportedModes ?? ['pull'];
+    const pushOnly = modes.includes('push') && !modes.includes('pull');
+    if (!pushOnly) return undefined;
+
+    const startupIsCurrent = () =>
+      (!opts.onlyIfWorkersStarted || this.#workersStarted) &&
+      (opts.onlyIfLifecycleGeneration === undefined ||
+        this.#workerLifecycleGeneration === opts.onlyIfLifecycleGeneration) &&
+      (opts.onlyIfShutdownGeneration === undefined || this.#workerShutdownGeneration === opts.onlyIfShutdownGeneration);
+
+    if (!startupIsCurrent()) return undefined;
+
+    if (this.#pushSubscriptionStartPromise) {
+      await this.#pushSubscriptionStartPromise;
+      if (!startupIsCurrent()) return undefined;
+      if (!this.#pushSubscription) {
+        return this.#wirePushWorkflowSubscription(opts);
+      }
+      if (!this.#pushSubscription.subscribed) {
+        throw new Error('Workflow push subscription did not finish starting');
+      }
+      return undefined;
+    }
+
+    if (this.#pushSubscription) {
+      if (!this.#pushSubscription.subscribed) {
+        throw new Error('Workflow push subscription did not finish starting');
+      }
+      return undefined;
+    }
+
+    const cb: EventCallback = (event, ack, nack) => {
+      const data = event.data as Record<string, unknown> | undefined;
+      const workflowId = data?.workflowId as string | undefined;
+      if (!this.__shouldProcessWorkflowEvent(event)) {
+        this.#logger?.debug?.('Skipping workflow event not owned by this Mastra instance', {
+          workflowId,
+          eventType: event.type,
+          ownership: 'foreign',
+        });
+        if (ack) {
+          void ack().catch(error => this.#logger?.error?.('Error acking skipped workflow event', error));
+        }
+        return;
+      }
+
+      void this.handleWorkflowEvent(event)
+        .then(result => {
+          if (result.ok) {
+            if (ack) {
+              return ack().catch(error =>
+                this.#logger?.error?.('Error acking workflow event in push subscription', error),
+              );
+            }
+            return;
+          }
+
+          if (result.retry) {
+            if (nack) {
+              return nack().catch(error =>
+                this.#logger?.error?.('Error nacking workflow event in push subscription', error),
+              );
+            }
+            this.#logger?.error?.('Retryable workflow event cannot be requeued because nack is unavailable', {
+              type: event.type,
+              runId: event.runId,
+            });
+            return;
+          }
+
+          if (ack) {
+            return ack().catch(error =>
+              this.#logger?.error?.('Error acking terminal workflow event in push subscription', error),
+            );
+          }
+        })
+        .catch(error => this.#logger?.error?.('Unhandled error in workflow event push subscription', error));
+    };
+    const subscription: PushWorkflowSubscription = { topic: 'workflows', cb, subscribed: false };
+    this.#pushSubscription = subscription;
+
+    const start = (async (): Promise<PushWorkflowSubscription | undefined> => {
+      try {
+        await this.#pubsub.subscribe(subscription.topic, subscription.cb);
+        subscription.subscribed = true;
+      } catch (error) {
+        try {
+          await this.#pubsub.unsubscribe(subscription.topic, subscription.cb);
+          if (this.#pushSubscription === subscription) {
+            this.#pushSubscription = undefined;
+          }
+        } catch (cleanupError) {
+          this.#logger?.error('Failed to cleanup workflow push subscription after startup failure', cleanupError);
+        }
+        throw error;
+      }
+
+      if (!startupIsCurrent()) {
+        try {
+          await this.#pubsub.unsubscribe(subscription.topic, subscription.cb);
+          if (this.#pushSubscription === subscription) {
+            this.#pushSubscription = undefined;
+          }
+        } catch (error) {
+          if (this.#pushSubscription === subscription || !this.#pushSubscription) {
+            this.#pushSubscription = subscription;
+            throw error;
+          }
+          this.#logger?.error('Failed to cleanup stale workflow push subscription after shutdown', error);
+        }
+        return undefined;
+      }
+
+      return subscription;
+    })();
+    this.#pushSubscriptionStartPromise = start;
+    try {
+      return await start;
+    } finally {
+      if (this.#pushSubscriptionStartPromise === start) {
+        this.#pushSubscriptionStartPromise = undefined;
+      }
+    }
+  }
+
+  /**
+   * Ensure the execution-side machinery — the `orchestration` and
+   * `backgroundTasks` workers, plus the push-mode workflow subscription —
+   * is running. Called lazily by {@link BackgroundTaskManager} when a task
+   * is dispatched or resumed, so background tasks execute in "library mode"
+   * where nothing ever calls `startWorkers()` (no server, no `mastra dev`;
+   * see #19339).
+   *
+   * Deliberately narrower than `startWorkers()`: it never injects or starts
+   * the scheduler/agent-schedule workers and never subscribes user event
+   * listeners — dispatching a background task must not boot cron machinery
+   * as a side effect.
+   *
+   * Honors the same opt-outs as the rest of the worker lifecycle:
+   * `workers: false` / `MASTRA_WORKERS=false` (standalone-worker topologies
+   * run their own worker processes, so this instance must not start local
+   * ones) and the `MASTRA_WORKERS` name filter.
+   *
+   * The fast path is its own `#executionWorkersStarted` flag, NOT
+   * `#workersStarted` — the latter is set by any `startWorkers(name)` call,
+   * including partial named starts (e.g. `startWorkers('backgroundTasks')`)
+   * that never start the orchestration worker or push wiring, which would
+   * leave dispatched tasks stuck again. The pass itself is idempotent
+   * (per-worker `isRunning` checks, idempotent push wiring), so running it
+   * once after a full `startWorkers()` boot is a cheap no-op.
+   *
+   * @internal
+   */
+  async __ensureExecutionWorkersStarted(): Promise<void> {
+    if (this.#workersStopPromise) {
+      await this.#workersStopPromise;
+    }
+    if (this.#allWorkersStartPromise) {
+      await this.#allWorkersStartPromise;
+    }
+    if (this.#executionWorkersStarted) return;
+    if (this.#workersDisabled) return;
+    // Memoize the in-flight startup so concurrent first dispatches on a cold
+    // instance share one start instead of racing worker.init()/start().
+    // Cleared on settle so a dispatch after stopWorkers() can start again.
+    if (this.#executionWorkersStartPromise) {
+      await this.#executionWorkersStartPromise;
+      return;
+    }
+
+    const start = this.#startExecutionWorkers();
+    this.#executionWorkersStartPromise = start;
+    try {
+      await start;
+    } finally {
+      if (this.#executionWorkersStartPromise === start) {
+        this.#executionWorkersStartPromise = undefined;
+      }
+    }
+  }
+
+  async #startExecutionWorkers(): Promise<void> {
+    const startupLifecycleGeneration = this.#workerLifecycleGeneration;
+    const startupShutdownGeneration = this.#workerShutdownGeneration;
+
+    // Storage init is memoized (see augmentWithInit) — cheap when already run.
+    if (this.#storage) {
+      await this.#storage.init();
+    }
+
+    const startupIsCurrent = () =>
+      this.#workerLifecycleGeneration === startupLifecycleGeneration &&
+      this.#workerShutdownGeneration === startupShutdownGeneration;
+    if (!startupIsCurrent()) return;
+
+    const workersStartedByThisPass: MastraWorker[] = [];
+    try {
+      for (const worker of this.#workers) {
+        if (worker.name !== 'orchestration' && worker.name !== 'backgroundTasks') continue;
+        if (this.#workerFilter && !this.#workerFilter.has(worker.name)) continue;
+        if (worker.isRunning) continue;
+        await this.#trackWorkerStart(worker, {
+          onlyIfShutdownGeneration: startupShutdownGeneration,
+          stopIfShutdownGenerationChangesFrom: startupShutdownGeneration,
+          onStarted: () => workersStartedByThisPass.push(worker),
+        });
+        if (!startupIsCurrent()) return;
+      }
+
+      await this.#wirePushWorkflowSubscription({
+        onlyIfLifecycleGeneration: startupLifecycleGeneration,
+        onlyIfShutdownGeneration: startupShutdownGeneration,
+      });
+      if (!startupIsCurrent()) return;
+      this.#executionWorkersStarted = true;
+    } catch (error) {
+      this.#executionWorkersStarted = false;
+      if (startupIsCurrent()) {
+        for (const worker of [...workersStartedByThisPass].reverse()) {
+          if (!worker.isRunning) continue;
+          try {
+            await worker.stop();
+            this.#latestWorkerStartTokens.delete(worker);
+            this.#latestWorkerStartLifecycleGenerations.delete(worker);
+          } catch (cleanupError) {
+            this.#logger?.error(`Failed to stop worker "${worker.name}" after execution startup failure`, cleanupError);
+          }
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Stop all running workers and unsubscribe event listeners.
    */
   public async stopWorkers(): Promise<void> {
@@ -6400,8 +6603,34 @@ export class Mastra<
 
   async #stopWorkers(): Promise<void> {
     this.#workersStarted = false;
+    this.#executionWorkersStarted = false;
     this.#workerLifecycleGeneration += 1;
     this.#workerShutdownGeneration += 1;
+    const executionWorkersStartAtShutdown = this.#executionWorkersStartPromise;
+    const pushSubscriptionStartAtShutdown = this.#pushSubscriptionStartPromise;
+    let executionWorkersStartTimeout: ReturnType<typeof setTimeout> | undefined;
+    const executionWorkersStartSettlement = executionWorkersStartAtShutdown
+      ? Promise.race([
+          executionWorkersStartAtShutdown.then(
+            () => ({ status: 'fulfilled' as const }),
+            reason => ({ status: 'rejected' as const, reason }),
+          ),
+          new Promise<{ status: 'timed-out'; reason: Error }>(resolve => {
+            executionWorkersStartTimeout = setTimeout(() => {
+              resolve({
+                status: 'timed-out',
+                reason: new Error(
+                  `Timed out waiting for execution worker startup during shutdown after ${PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS}ms`,
+                ),
+              });
+            }, PENDING_WORKER_START_SHUTDOWN_TIMEOUT_MS);
+          }),
+        ]).finally(() => {
+          if (executionWorkersStartTimeout) {
+            clearTimeout(executionWorkersStartTimeout);
+          }
+        })
+      : undefined;
     let stopError: unknown;
     let hasStopError = false;
     const recordStopError = (message: string, error: unknown) => {
@@ -6498,6 +6727,20 @@ export class Mastra<
 
     await stopRunningWorkers();
     await settlePendingWorkerStarts(pendingWorkerStartsAtShutdown);
+    if (executionWorkersStartSettlement) {
+      const result = await executionWorkersStartSettlement;
+      if (result.status === 'rejected') {
+        this.#logger?.error('Execution worker startup failed during shutdown', result.reason);
+      } else if (result.status === 'timed-out') {
+        if (this.#executionWorkersStartPromise === executionWorkersStartAtShutdown) {
+          this.#executionWorkersStartPromise = undefined;
+        }
+        if (pushSubscriptionStartAtShutdown && this.#pushSubscriptionStartPromise === pushSubscriptionStartAtShutdown) {
+          this.#pushSubscriptionStartPromise = undefined;
+        }
+        recordStopError('Timed out waiting for execution worker startup during shutdown', result.reason);
+      }
+    }
     await settlePendingWorkerStarts();
     if (timedOutWorkerStarts.size > 0 && ![...timedOutWorkerStarts].some(start => start.phase === 'start')) {
       this.#allWorkersStartPromise = undefined;
@@ -6506,9 +6749,12 @@ export class Mastra<
 
     // Tear down the in-process push subscription wired during startWorkers().
     if (this.#pushSubscription) {
+      const pushSubscription = this.#pushSubscription;
       try {
-        await this.#pubsub.unsubscribe(this.#pushSubscription.topic, this.#pushSubscription.cb);
-        this.#pushSubscription = undefined;
+        await this.#pubsub.unsubscribe(pushSubscription.topic, pushSubscription.cb);
+        if (this.#pushSubscription === pushSubscription) {
+          this.#pushSubscription = undefined;
+        }
       } catch (error) {
         recordStopError('Failed to unsubscribe workflow push subscription', error);
       }
@@ -6536,6 +6782,8 @@ export class Mastra<
     } catch (error) {
       recordStopError('Failed to flush pubsub during worker shutdown', error);
     }
+    this.#workersStarted = false;
+    this.#executionWorkersStarted = false;
     if (hasStopError) {
       throw stopError;
     }

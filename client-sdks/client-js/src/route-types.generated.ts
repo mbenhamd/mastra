@@ -88255,6 +88255,7 @@ export type GetDatasetsDatasetIdItems_Response = {
     id: string;
     datasetId: string;
     datasetVersion: number;
+    externalId?: (string | undefined) | null;
     input: unknown;
     groundTruth?: unknown | undefined;
     expectedTrajectory?: unknown | undefined;
@@ -88331,6 +88332,8 @@ export type PostDatasetsDatasetIdItems_PathParams = {
 };
 
 export type PostDatasetsDatasetIdItems_Body = {
+  /** Caller-defined, dataset-local item identity */
+  externalId?: (string | undefined) | null;
   /** Input data for the dataset item */
   input: unknown;
   /** Expected output for comparison */
@@ -88627,6 +88630,7 @@ export type PostDatasetsDatasetIdItems_Response = {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  externalId?: (string | undefined) | null;
   input: unknown;
   groundTruth?: unknown | undefined;
   expectedTrajectory?: unknown | undefined;
@@ -88697,6 +88701,7 @@ export type PostDatasetsDatasetIdItemsBatch_PathParams = {
 
 export type PostDatasetsDatasetIdItemsBatch_Body = {
   items: {
+    externalId?: (string | undefined) | null;
     input: unknown;
     groundTruth?: unknown | undefined;
     /** Expected trajectory configuration for trajectory scoring */
@@ -88991,6 +88996,7 @@ export type PostDatasetsDatasetIdItemsBatch_Response = {
     id: string;
     datasetId: string;
     datasetVersion: number;
+    externalId?: (string | undefined) | null;
     input: unknown;
     groundTruth?: unknown | undefined;
     expectedTrajectory?: unknown | undefined;
@@ -89107,6 +89113,7 @@ export type GetDatasetsDatasetIdItemsItemId_Response = {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  externalId?: (string | undefined) | null;
   input: unknown;
   groundTruth?: unknown | undefined;
   expectedTrajectory?: unknown | undefined;
@@ -89472,6 +89479,7 @@ export type PatchDatasetsDatasetIdItemsItemId_Response = {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  externalId?: (string | undefined) | null;
   input: unknown;
   groundTruth?: unknown | undefined;
   expectedTrajectory?: unknown | undefined;
@@ -89690,6 +89698,7 @@ export type GetDatasetsDatasetIdItemsItemIdVersionsDatasetVersion_Response = {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  externalId?: (string | undefined) | null;
   input: unknown;
   groundTruth?: unknown | undefined;
   expectedTrajectory?: unknown | undefined;
