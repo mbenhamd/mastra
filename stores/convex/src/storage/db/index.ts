@@ -264,7 +264,7 @@ export class ConvexDB extends MastraBase {
     expectedValue,
     patch,
   }: {
-    tableName: TABLE_NAMES;
+    tableName: ConvexStorageTable;
     id: string;
     field: string;
     expectedValue: string | number | boolean | null;
