@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { TestIntegration } from '../../integration/openapi-toolset.mock';
 import { Mastra } from '../../mastra';
+import { MockMemory } from '../../memory/mock';
 import { ToolSearchProcessor } from '../../processors/processors/tool-search';
 import { MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
@@ -212,12 +213,14 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       const agentOne = mastra.getAgent('testAgent');
 
       if (version === 'v1') {
-        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required' });
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
       } else {
-        await agentOne.generate('Call testTool');
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
       }
 
-      expect(calls.slice(0, 2)).toEqual([
+      // Asserted on the whole array, not a slice: a duplicated hook layer would
+      // append a second before/after pair, and a slice would hide it.
+      expect(calls).toEqual([
         { phase: 'before', toolName: 'testTool', input: {} },
         {
           phase: 'after',
@@ -429,6 +432,7 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
     });
 
     it('runs afterToolCall when a tool errors', async () => {
+      const beforeToolCall = vi.fn();
       const afterToolCall = vi.fn();
       const testTool = createTool({
         id: 'testTool',
@@ -444,7 +448,7 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
         instructions: 'You are an agent that calls testTool',
         model: mockModel,
         tools: { testTool },
-        hooks: { afterToolCall },
+        hooks: { beforeToolCall, afterToolCall },
       });
       const mastra = new Mastra({
         agents: {
@@ -468,6 +472,10 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
           error: expect.any(Error),
         }),
       );
+      // Both halves are pinned: a duplicated hook layer on a throwing tool would
+      // re-enter beforeToolCall as well, which counting only afterToolCall misses.
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'testTool', input: {} }));
       expect(afterToolCall).toHaveBeenCalledOnce();
     });
 
@@ -2110,5 +2118,145 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     expect(secondSubAgentTool).not.toBe(firstSubAgentTool);
     expect(secondSchemas.inputSchema).toBe(firstSchemas.inputSchema);
     expect(secondSchemas.outputSchema).toBe(firstSchemas.outputSchema);
+  });
+});
+
+describe('sub-agent delegation tool hooks through the Agent loop', () => {
+  // Companion to the `convertTools` unit test above. That one proves the wrap is
+  // APPLIED at conversion time by invoking the tool directly; this one proves the
+  // wrapped sub-agent tool survives a real `generate()` — i.e. that the parent's
+  // agentic loop actually dispatches through the hook layer exactly once, and
+  // that no later stage in the loop re-wraps or replaces it.
+  it('runs hooks exactly once around a sub-agent tool driven by supervisorAgent.generate', async () => {
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const subAgent = new Agent({
+      id: 'research-agent',
+      name: 'research-agent',
+      description: 'Sub-agent: research-agent',
+      instructions: 'You are a helpful sub-agent.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 5, outputTokens: 10, totalTokens: 15 },
+          content: [{ type: 'text', text: 'Dolphins are marine mammals.' }],
+          warnings: [],
+        }),
+      }),
+    });
+
+    let supervisorCall = 0;
+    const supervisorAgent = new Agent({
+      id: 'supervisor',
+      name: 'supervisor',
+      instructions: 'You orchestrate sub-agents.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => {
+          supervisorCall++;
+          if (supervisorCall === 1) {
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              finishReason: 'tool-calls' as const,
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+              content: [
+                {
+                  type: 'tool-call' as const,
+                  toolCallId: 'call-1',
+                  toolName: 'agent-researchAgent',
+                  input: JSON.stringify({ prompt: 'research dolphins' }),
+                },
+              ],
+              warnings: [],
+            };
+          }
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            content: [{ type: 'text' as const, text: 'Done' }],
+            warnings: [],
+          };
+        },
+      }),
+      agents: { researchAgent: subAgent },
+      memory: new MockMemory(),
+      hooks: { beforeToolCall, afterToolCall },
+    });
+
+    // maxSteps: 3 deliberately leaves room for more than one step, so a hook
+    // firing per step (rather than per call) would show up as a second call.
+    const result = await supervisorAgent.generate('Research dolphins', { maxSteps: 3 });
+
+    expect(result.text).toBe('Done');
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
+    expect(afterToolCall).toHaveBeenCalledOnce();
+    expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
+  });
+});
+
+describe('multi-step agent tool hooks', () => {
+  it('runs hooks exactly once per call when the SAME tool is called across steps', async () => {
+    const execute = vi.fn(async ({ index }: { index: number }) => ({ index }));
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const counterTool = createTool({
+      id: 'counter',
+      description: 'Records a call index',
+      inputSchema: z.object({ index: z.number() }),
+      execute,
+    });
+
+    let modelCall = 0;
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => {
+        modelCall++;
+        if (modelCall <= 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: `counter-call-${modelCall}`,
+                toolName: 'counter',
+                input: JSON.stringify({ index: modelCall }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'multi-step-hook-agent',
+      name: 'multi-step-hook-agent',
+      instructions: 'Call counter twice.',
+      model,
+      tools: { counter: counterTool },
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    new Mastra({ agents: { agent }, logger: false });
+
+    const result = await agent.generate('Count twice.', { maxSteps: 3 });
+
+    expect(result.text).toBe('done');
+    // Two calls to the same tool across two steps: the hook layer must be
+    // re-applied per step without accumulating, so exactly one before/after per
+    // call — not two per call on the second step.
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(beforeToolCall.mock.calls.map(([context]) => context.input)).toEqual([{ index: 1 }, { index: 2 }]);
+    expect(afterToolCall.mock.calls.map(([context]) => context.output)).toEqual([{ index: 1 }, { index: 2 }]);
+    expect(beforeToolCall).toHaveBeenCalledTimes(2);
+    expect(afterToolCall).toHaveBeenCalledTimes(2);
   });
 });
