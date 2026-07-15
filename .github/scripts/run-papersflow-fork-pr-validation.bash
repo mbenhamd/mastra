@@ -6,6 +6,241 @@ VALIDATOR_REPOSITORY_ROOT="$(git rev-parse --show-toplevel)"
 TYPESCRIPT_MODULE_PATH="$VALIDATOR_REPOSITORY_ROOT/node_modules/typescript"
 readonly VALIDATOR_REPOSITORY_ROOT TYPESCRIPT_MODULE_PATH
 
+pf558_config() {
+  PF558_PR_NUMBER="${PAPERSFLOW_PF558_PR_NUMBER:-266}"
+  PF558_HEAD_REPOSITORY="${PAPERSFLOW_PF558_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF558_HEAD_REF="${PAPERSFLOW_PF558_HEAD_REF:-feature/pf-558-upstream-sync-20260714}"
+  PF558_BASE_REF="${PAPERSFLOW_PF558_BASE_REF:-main}"
+  PF558_MERGE_COMMIT="${PAPERSFLOW_PF558_MERGE_COMMIT:-4254efbde98cabeca4c25cc0ed1b0fcbb439f877}"
+  PF558_FORK_PARENT="${PAPERSFLOW_PF558_FORK_PARENT:-4c04e3065035c7684f53e8a0f7262374cc7cf31a}"
+  PF558_UPSTREAM_PARENT="${PAPERSFLOW_PF558_UPSTREAM_PARENT:-b0f0de20a108a7613c0ec5cef673c35cec54919a}"
+  PF558_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF558_PACKAGE_JSON_SHA256:-b1d868e7a503a92f40bde288cf514274f6214e16a81820cc5f01ea62623b18ba}"
+  PF558_SERVER_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF558_SERVER_PACKAGE_JSON_SHA256:-93cc906bfc540917e19972ec922d01ff17753142d0fe03a20227c858afddd5ad}"
+  PF558_WORKSPACE_SHA256="${PAPERSFLOW_PF558_WORKSPACE_SHA256:-5bb3de828ab1c3372ca2e962ec8d3671ef53c1852307c8a94bab857ff4050817}"
+  PF558_LOCKFILE_SHA256="${PAPERSFLOW_PF558_LOCKFILE_SHA256:-97453f0cc0a6549049573818eb494267ed0ce783526794ea5d48f4acfec8a72a}"
+  readonly \
+    PF558_PR_NUMBER PF558_HEAD_REPOSITORY PF558_HEAD_REF PF558_BASE_REF \
+    PF558_MERGE_COMMIT PF558_FORK_PARENT PF558_UPSTREAM_PARENT \
+    PF558_PACKAGE_JSON_SHA256 PF558_SERVER_PACKAGE_JSON_SHA256 PF558_WORKSPACE_SHA256 \
+    PF558_LOCKFILE_SHA256
+}
+
+git_blob_sha256() {
+  local revision="$1"
+  local path="$2"
+  git show "${revision}:${path}" | sha256sum | awk '{print $1}'
+}
+
+git_regular_file_at_revision() {
+  local revision="$1"
+  local path="$2"
+  git ls-tree "$revision" -- "$path" | grep -Eq '^100(644|755) blob '
+}
+
+emit_validation_lane() {
+  local lane="$1"
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
+  else
+    printf 'lane=%s\n' "$lane"
+  fi
+}
+
+classify_install_lane() (
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local manifest_changes
+  manifest_changes="$(mktemp)"
+  trap 'rm -f "$manifest_changes"' EXIT
+  git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+    .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
+    patches packages/server/package.json |
+    sort -u > "$manifest_changes"
+
+  if [[ ! -s "$manifest_changes" ]]; then
+    emit_validation_lane standard
+    return
+  fi
+
+  pf558_config
+  : "${PR_NUMBER:?PR_NUMBER is required for a dependency-graph exception}"
+  : "${HEAD_REPOSITORY:?HEAD_REPOSITORY is required for a dependency-graph exception}"
+  : "${HEAD_REF:?HEAD_REF is required for a dependency-graph exception}"
+  : "${BASE_REF:?BASE_REF is required for a dependency-graph exception}"
+
+  if [[ "$PR_NUMBER" != "$PF558_PR_NUMBER" || \
+    "$HEAD_REPOSITORY" != "$PF558_HEAD_REPOSITORY" || \
+    "$HEAD_REF" != "$PF558_HEAD_REF" || "$BASE_REF" != "$PF558_BASE_REF" ]]; then
+    echo 'Dependency-graph changes do not match the reviewed PF-558 upstream-sync lane.' >&2
+    cat "$manifest_changes" >&2
+    return 1
+  fi
+
+  local expected_changes
+  expected_changes="$(mktemp)"
+  trap 'rm -f "$manifest_changes" "$expected_changes"' EXIT
+  printf '%s\n' package.json packages/server/package.json pnpm-workspace.yaml | sort > "$expected_changes"
+  if ! cmp -s "$expected_changes" "$manifest_changes"; then
+    echo 'PF-558 changed dependency-graph paths outside the exact reviewed set:' >&2
+    diff -u "$expected_changes" "$manifest_changes" >&2 || true
+    return 1
+  fi
+
+  local merge_topology
+  merge_topology="$(git rev-list --parents -n 1 "$PF558_MERGE_COMMIT")"
+  if [[ "$merge_topology" != "$PF558_MERGE_COMMIT $PF558_FORK_PARENT $PF558_UPSTREAM_PARENT" ]] || \
+    ! git merge-base --is-ancestor "$PF558_MERGE_COMMIT" "$HEAD_SHA"; then
+    echo 'PF-558 no longer contains the reviewed upstream merge topology.' >&2
+    return 1
+  fi
+
+  local path expected_hash actual_hash
+  while IFS=$'\t' read -r path expected_hash; do
+    if ! git_regular_file_at_revision "$HEAD_SHA" "$path"; then
+      echo "PF-558 approved dependency file is not a regular blob: $path" >&2
+      return 1
+    fi
+    actual_hash="$(git_blob_sha256 "$HEAD_SHA" "$path")"
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+      echo "PF-558 approved dependency file hash changed: $path" >&2
+      echo "expected: $expected_hash" >&2
+      echo "actual:   $actual_hash" >&2
+      return 1
+    fi
+  done <<EOF
+package.json	$PF558_PACKAGE_JSON_SHA256
+packages/server/package.json	$PF558_SERVER_PACKAGE_JSON_SHA256
+pnpm-workspace.yaml	$PF558_WORKSPACE_SHA256
+pnpm-lock.yaml	$PF558_LOCKFILE_SHA256
+EOF
+
+  echo 'PF-558 exact dependency-graph exception accepted from trusted base policy.'
+  emit_validation_lane pf558-upstream-sync
+)
+
+run_pf558_admission_self_tests() (
+  local script_path test_root fixture_repo base_sha fork_parent upstream_parent merge_commit head_sha output
+  local package_hash server_hash workspace_hash lockfile_hash
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  trap 'rm -rf -- "$test_root"' EXIT
+  mkdir -p "$fixture_repo/packages/server"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-558 admission fixture'
+  printf '{"name":"fixture"}\n' > "$fixture_repo/package.json"
+  printf '{"name":"server"}\n' > "$fixture_repo/packages/server/package.json"
+  printf 'packages: []\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m base
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  fork_parent="$base_sha"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  printf 'upstream\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add upstream.txt
+  git -C "$fixture_repo" commit -q -m upstream
+  upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" switch -q main
+  git -C "$fixture_repo" merge -q --no-ff upstream -m merge
+  merge_commit="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  printf '{"name":"approved"}\n' > "$fixture_repo/package.json"
+  printf '{"name":"approved-server"}\n' > "$fixture_repo/packages/server/package.json"
+  printf 'packages:\n  - packages/*\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\nsettings:\n  autoInstallPeers: false\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m approved
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  package_hash="$(sha256sum "$fixture_repo/package.json" | awk '{print $1}')"
+  server_hash="$(sha256sum "$fixture_repo/packages/server/package.json" | awk '{print $1}')"
+  workspace_hash="$(sha256sum "$fixture_repo/pnpm-workspace.yaml" | awk '{print $1}')"
+  lockfile_hash="$(sha256sum "$fixture_repo/pnpm-lock.yaml" | awk '{print $1}')"
+
+  run_fixture_admission() {
+    local fixture_output="$1"
+    shift
+    (
+      cd "$fixture_repo"
+      env \
+        BASE_SHA="$base_sha" HEAD_SHA="$head_sha" PR_NUMBER=266 \
+        HEAD_REPOSITORY=mbenhamd/mastra HEAD_REF=feature/pf-558-upstream-sync-20260714 BASE_REF=main \
+        PAPERSFLOW_PF558_MERGE_COMMIT="$merge_commit" \
+        PAPERSFLOW_PF558_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF558_UPSTREAM_PARENT="$upstream_parent" \
+        PAPERSFLOW_PF558_PACKAGE_JSON_SHA256="$package_hash" \
+        PAPERSFLOW_PF558_SERVER_PACKAGE_JSON_SHA256="$server_hash" \
+        PAPERSFLOW_PF558_WORKSPACE_SHA256="$workspace_hash" \
+        PAPERSFLOW_PF558_LOCKFILE_SHA256="$lockfile_hash" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$output"
+  grep -Fxq 'lane=pf558-upstream-sync' "$output"
+
+  printf '{"name":"tampered"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" commit -q -am tampered
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-558 manifest unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'approved dependency file hash changed: package.json' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  printf 'lockfileVersion: 9.0\ntampered: true\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" commit -q -am 'tamper lockfile'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered-lockfile.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-558 lockfile unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'approved dependency file hash changed: pnpm-lock.yaml' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  mkdir -p "$fixture_repo/patches"
+  printf 'unreviewed\n' > "$fixture_repo/patches/unreviewed.patch"
+  git -C "$fixture_repo" add patches/unreviewed.patch
+  git -C "$fixture_repo" commit -q -m unreviewed
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/unreviewed.log"
+  if run_fixture_admission "$output"; then
+    echo 'Unreviewed PF-558 dependency path unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'outside the exact reviewed set' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/wrong-pr.log"
+  if run_fixture_admission "$output" PR_NUMBER=999; then
+    echo 'Wrong PR metadata unexpectedly passed PF-558 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match the reviewed PF-558' "$output"
+
+  echo 'PF-558 upstream-sync admission fixtures passed.'
+)
+
+case "${1:-}" in
+  --classify-install)
+    classify_install_lane
+    exit
+    ;;
+  --self-test-pf558-upstream-sync)
+    run_pf558_admission_self_tests
+    exit
+    ;;
+esac
+
 run_validator_self_tests() {
   local validator_path
   local test_root
@@ -1154,6 +1389,103 @@ TEST
   trap - EXIT
 )
 
+run_pf558_upstream_sync_validation() {
+  : "${BASE_SHA:?BASE_SHA is required}"
+  : "${HEAD_SHA:?HEAD_SHA is required}"
+
+  local admission_output merge_base_sha path
+  admission_output="$(mktemp)"
+  GITHUB_OUTPUT="$admission_output" classify_install_lane
+  if ! grep -Fxq 'lane=pf558-upstream-sync' "$admission_output"; then
+    echo 'PF-558 dedicated validation ran without exact admission.' >&2
+    rm -f "$admission_output"
+    return 1
+  fi
+  rm -f "$admission_output"
+
+  merge_base_sha="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+  git diff --check "${merge_base_sha}..${HEAD_SHA}"
+
+  # The upstream AgentController surface is additive. These Harness v1 paths
+  # are the fork-owned compatibility boundary and must remain real tracked
+  # files in the proposed tree.
+  while IFS= read -r path; do
+    if ! git_regular_file_at_revision "$HEAD_SHA" "$path"; then
+      echo "PF-558 removed or replaced a required Harness/AgentController boundary: $path" >&2
+      return 1
+    fi
+  done <<'EOF'
+packages/core/src/harness/v1/contracts.ts
+packages/core/src/harness/v1/harness.ts
+packages/core/src/harness/v1/index.ts
+packages/core/src/harness/v1/session.ts
+packages/core/src/agent-controller/agent-controller.ts
+packages/core/src/agent-controller/index.ts
+packages/server/src/server/handlers/harness.ts
+packages/server/src/server/handlers/agent-controller.ts
+packages/server/src/server/server-adapter/routes/harness.ts
+packages/server/src/server/server-adapter/routes/agent-controller.ts
+client-sdks/client-js/src/resources/harness.ts
+client-sdks/client-js/src/resources/agent-controller.ts
+docs/src/content/en/docs/harness/overview.mdx
+EOF
+
+  echo 'Building and typechecking the preserved and adopted runtime boundaries.'
+  run_with_validation_budget 900 pnpm --filter @mastra/core --fail-if-no-match check
+  run_with_validation_budget 900 pnpm run build:core
+  run_with_validation_budget 900 pnpm run build:server
+  run_with_validation_budget 900 pnpm --filter @mastra/client-js --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match build:js
+  run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match check
+  run_with_validation_budget 900 pnpm run build:mastracode
+  run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter @mastra/core --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/client-js --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match typecheck
+  run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:core-imports
+  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match check:permissions
+  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:route-types
+  run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match generate:api-cli-route-metadata
+  if ! git diff --exit-code "$HEAD_SHA" -- \
+    client-sdks/client-js/src/route-types.generated.ts \
+    packages/cli/src/commands/api/route-metadata.generated.ts \
+    packages/core/src/auth/ee/interfaces/permissions.generated.ts; then
+    echo 'PF-558 generated route or permission artifacts are stale.' >&2
+    return 1
+  fi
+
+  echo 'Running the Harness v1, AgentController, workflow, and reconciliation suites.'
+  run_with_validation_budget 1200 \
+    pnpm --dir packages/core exec vitest run --reporter=dot \
+      src/harness/v1 src/agent-controller src/workflows/evented
+  run_with_validation_budget 600 \
+    pnpm --dir client-sdks/client-js exec vitest run --reporter=dot \
+      src/resources/harness.test.ts src/resources/agent-controller.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir packages/server exec vitest run --reporter=dot \
+      src/server/handlers/harness.test.ts src/server/handlers/agent-controller.test.ts \
+      src/server/server-adapter/routes/agent-controller.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir client-sdks/react exec vitest run --reporter=dot \
+      src/agent/hooks.test.ts src/voice/use-speech-recognition.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir channels/slack exec vitest run --reporter=dot \
+      src/__tests__/legacy-tool-display.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir workspaces/vercel exec vitest run --reporter=dot src/serverless/index.test.ts
+
+  if [[ -f scripts/affected-tests.test.ts ]]; then
+    run_with_validation_budget 600 pnpm exec vitest run --reporter=dot scripts/affected-tests.test.ts
+  fi
+
+  echo 'PF-558 dedicated upstream-sync validation passed.'
+}
+
 case "${1:-}" in
   --self-test-stagehand)
     run_stagehand_validation_self_test
@@ -1161,6 +1493,10 @@ case "${1:-}" in
     ;;
   --self-test-vitest-selection)
     run_vitest_selection_regressions
+    exit
+    ;;
+  --validate-pf558-upstream-sync)
+    run_pf558_upstream_sync_validation
     exit
     ;;
   '') ;;
