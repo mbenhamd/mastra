@@ -28,13 +28,14 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   stacked feature PR to prove a new trusted-base validation target before that
   policy branch reaches `main`.
 - PF-558 PR `#266` has one base-owned upstream-sync lane because its reviewed
-  upstream merge necessarily updates the root manifest, Server manifest, and
-  workspace policy. Admission is bound to the same-repository PR number, exact
-  head/base refs, the preserved two-parent upstream merge commit, the exact
-  three changed dependency-graph paths, and SHA-256 hashes for all three
-  manifests plus the lockfile. Any extra patch, manifest, `.npmrc`, or pnpm-hook
-  change fails before install. The lane installs with pnpm hooks and lifecycle
-  scripts disabled, verifies Harness v1 and
+  upstream merge necessarily updates the root manifest, Server manifest,
+  workspace policy, and upstream's pinned `pi-tui` patch. Admission is bound to
+  the same-repository PR number, exact head/base refs, the preserved two-parent
+  upstream merge commit, the exact four changed dependency-graph paths, and
+  SHA-256 hashes for all three manifests, the lockfile, and that patch. Any
+  additional patch, manifest, `.npmrc`, or pnpm-hook change fails before
+  install. The lane installs with pnpm hooks and lifecycle scripts disabled,
+  verifies Harness v1 and
   AgentController boundaries, and runs the owning Core, Server, Client SDK,
   React, MastraCode, Slack, Vercel, Harness, AgentController, and evented
   workflow build/test surface. The exception is intentionally not reusable by
