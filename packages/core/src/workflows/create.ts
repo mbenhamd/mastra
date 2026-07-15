@@ -13,7 +13,7 @@
  * By keeping the Workflow class in `workflow.ts` and the factories here,
  * neither module needs to import the other's runtime dependencies.
  */
-import type { InferPublicSchema, PublicSchema } from '../schema';
+import type { InferPublicSchema, InferPublicSchemaInput, PublicSchema } from '../schema';
 import { createWorkflow as createEventedWorkflowImpl } from './evented/workflow';
 import type { Step } from './step';
 import type { CreateWorkflowParams, DefaultEngineType, InferSchemaOutput } from './types';
@@ -40,7 +40,8 @@ export function createWorkflow<
       InferPublicSchema<TInputSchema>,
       InferPublicSchema<TOutputSchema>,
       InferPublicSchema<TInputSchema>,
-      InferSchemaOutput<TRequestContextSchema>
+      InferSchemaOutput<TRequestContextSchema>,
+      InferPublicSchemaInput<TInputSchema>
     >;
   }
   return new Workflow<
@@ -51,7 +52,8 @@ export function createWorkflow<
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
     InferPublicSchema<TInputSchema>,
-    InferSchemaOutput<TRequestContextSchema>
+    InferSchemaOutput<TRequestContextSchema>,
+    InferPublicSchemaInput<TInputSchema>
   >(params as any);
 }
 
@@ -77,7 +79,8 @@ export function createEventedWorkflow<
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
     InferPublicSchema<TInputSchema>,
-    InferSchemaOutput<TRequestContextSchema>
+    InferSchemaOutput<TRequestContextSchema>,
+    InferPublicSchemaInput<TInputSchema>
   >;
 }
 
@@ -96,18 +99,20 @@ export function cloneWorkflow<
     DefaultEngineType
   >[],
   TPrevSchema = TInput,
+  TRawInput = TInput,
 >(
-  workflow: Workflow<DefaultEngineType, TSteps, string, TState, TInput, TOutput, TPrevSchema>,
+  workflow: Workflow<DefaultEngineType, TSteps, string, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput>,
   opts: { id: TWorkflowId },
-): Workflow<DefaultEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
-  const wf: Workflow<DefaultEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> = new Workflow({
-    id: opts.id,
-    inputSchema: workflow.inputSchema,
-    outputSchema: workflow.outputSchema,
-    steps: workflow.stepDefs,
-    mastra: workflow.mastra,
-    options: workflow.options,
-  });
+): Workflow<DefaultEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput> {
+  const wf: Workflow<DefaultEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, unknown, TRawInput> =
+    new Workflow({
+      id: opts.id,
+      inputSchema: workflow.inputSchema,
+      outputSchema: workflow.outputSchema,
+      steps: workflow.stepDefs,
+      mastra: workflow.mastra,
+      options: workflow.options,
+    });
 
   wf.setStepFlow(workflow.stepGraph);
   wf.commit();

@@ -57,6 +57,23 @@ describe('createTool execute inputData type inference (issue #16528)', () => {
     });
   });
 
+  it('accepts raw defaulted input while the callback receives parsed input', async () => {
+    const tool = createTool({
+      id: 'defaulted-input',
+      description: 'Test',
+      inputSchema: z.object({ mode: z.enum(['safe', 'fast']).default('safe') }),
+      execute: async inputData => {
+        expectTypeOf(inputData).toEqualTypeOf<{ mode: 'safe' | 'fast' }>();
+        return inputData.mode;
+      },
+    });
+
+    await tool.execute?.({});
+    await tool.execute?.({ mode: 'fast' });
+    // @ts-expect-error - raw input still rejects values outside the schema
+    await tool.execute?.({ mode: 'invalid' });
+  });
+
   it('does not break tools without an inputSchema', () => {
     createTool({
       id: 'no-input',

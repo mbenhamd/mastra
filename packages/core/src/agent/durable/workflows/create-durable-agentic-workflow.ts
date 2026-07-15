@@ -11,8 +11,8 @@ import { createObservabilityContext, InternalSpans } from '../../../observabilit
 import type { AIModelGenerationSpan, ExportedSpan, SpanType } from '../../../observability';
 import { RequestContext } from '../../../request-context';
 import { PUBSUB_SYMBOL } from '../../../workflows/constants';
-import type { WorkflowOptions } from '../../../workflows/types';
 import { createWorkflow } from '../../../workflows/create';
+import type { WorkflowOptions } from '../../../workflows/types';
 import { MessageList } from '../../message-list';
 import { DurableStepIds, DurableAgentDefaults } from '../constants';
 import { getBoundRunRegistryEntry, globalRunRegistry } from '../run-registry';

@@ -1539,7 +1539,47 @@ export function isProcessor(obj: unknown): obj is Processor {
  * Use this instead of manually specifying `Workflow<any, any, ...>` so that
  * adding or removing type parameters only requires updating one place.
  */
-export type AnyWorkflow = Workflow<any, any, any, any, any, any, any, any>;
+export type AnyWorkflow = Workflow<any, any, any, any, any, any, any, any, any>;
+
+type ReplaceRunInputData<TArgs, TRawInput> = TArgs extends object
+  ? Omit<TArgs, 'inputData'> & { inputData?: TRawInput }
+  : TArgs;
+
+/** A workflow run whose public entrypoints accept pre-validation schema input. */
+export type RunWithRawInput<
+  TEngineType,
+  TSteps extends Step<string, any, any, any, any, any, TEngineType, any>[],
+  TState,
+  TInput,
+  TOutput,
+  TRequestContext extends Record<string, any> | unknown,
+  TRawInput,
+> = Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext> & {
+  start(
+    args: ReplaceRunInputData<
+      Parameters<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['start']>[0],
+      TRawInput
+    >,
+  ): ReturnType<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['start']>;
+  startAsync(
+    args: ReplaceRunInputData<
+      Parameters<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['startAsync']>[0],
+      TRawInput
+    >,
+  ): ReturnType<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['startAsync']>;
+  streamLegacy(
+    args?: ReplaceRunInputData<
+      NonNullable<Parameters<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['streamLegacy']>[0]>,
+      TRawInput
+    >,
+  ): ReturnType<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['streamLegacy']>;
+  stream(
+    args: ReplaceRunInputData<
+      Parameters<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['stream']>[0],
+      TRawInput
+    >,
+  ): ReturnType<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>['stream']>;
+};
 
 export class Workflow<
   TEngineType = DefaultEngineType,
@@ -1558,6 +1598,7 @@ export class Workflow<
   TOutput = unknown,
   TPrevSchema = TInput,
   TRequestContext extends Record<string, any> | unknown = unknown,
+  TRawInput = TInput,
 >
   extends MastraBase
   implements Step<TWorkflowId, TState, TInput, TOutput | undefined, any, any, DefaultEngineType, TRequestContext>
@@ -1727,7 +1768,8 @@ export class Workflow<
       TInput,
       TOutput,
       TSchemaOut,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -1766,7 +1808,8 @@ export class Workflow<
       TInput,
       TOutput,
       TPrevSchema,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -1804,7 +1847,8 @@ export class Workflow<
       TInput,
       TOutput,
       TPrevSchema,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -1849,7 +1893,7 @@ export class Workflow<
         }
       | ExecuteFunction<TState, TPrevSchema, any, any, any, TEngineType>,
     stepOptions?: { id?: string | null },
-  ): Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, any, TRequestContext> {
+  ): Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, any, TRequestContext, TRawInput> {
     // Create an implicit step that handles the mapping
     if (typeof mappingConfig === 'function') {
       const mappingStep: any = createStep({
@@ -1881,7 +1925,8 @@ export class Workflow<
         TInput,
         TOutput,
         any,
-        TRequestContext
+        TRequestContext,
+        TRawInput
       >;
     }
 
@@ -2013,7 +2058,8 @@ export class Workflow<
       TInput,
       TOutput,
       MappedOutputSchema,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2075,7 +2121,8 @@ export class Workflow<
           StepsRecord<TParallelSteps>[K]['outputSchema']
         >;
       },
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2133,7 +2180,8 @@ export class Workflow<
           StepsRecord<ExtractedSteps[]>[K]['outputSchema']
         >;
       },
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2181,7 +2229,8 @@ export class Workflow<
       TInput,
       TOutput,
       TSchemaOut,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2229,7 +2278,8 @@ export class Workflow<
       TInput,
       TOutput,
       TSchemaOut,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2281,7 +2331,8 @@ export class Workflow<
       TInput,
       TOutput,
       TSchemaOut[],
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2312,7 +2363,8 @@ export class Workflow<
       TInput,
       TOutput,
       TOutput,
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >;
   }
 
@@ -2338,7 +2390,7 @@ export class Workflow<
     disableScorers?: boolean;
     /** Optional pubsub instance for streaming events. If not provided, a new EventEmitterPubSub is created. */
     pubsub?: PubSub;
-  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>> {
+  }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
     if (this.stepFlow.length === 0) {
       throw new Error(
         'Execution flow of workflow is not defined. Add steps to the workflow via .then(), .branch(), etc.',
@@ -2439,7 +2491,7 @@ export class Workflow<
       });
     }
 
-    return run;
+    return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>;
   }
 
   async listScorers({
