@@ -103,16 +103,12 @@ describe('AgentController ↔ Mastra registration', () => {
     expect(persisted?.id).toBe(thread.id);
   });
 
-  // Backwards-compatibility: the deprecated `harnesses` config key and
-  // `getHarness`/`getHarnessById`/`listHarnesses` accessors must keep resolving
-  // to the same AgentController instances as their canonical replacements.
-  it('supports the deprecated harnesses config key and getHarness* accessors', () => {
+  it('keeps AgentControllers out of the Harness v1 registry', () => {
     const controller = createTestController({ id: 'code-controller', storage: new InMemoryStore() });
-    const mastra = new Mastra({ harnesses: { code: controller } });
+    const mastra = new Mastra({ agentControllers: { code: controller } });
 
-    expect(mastra.getHarness('code')).toBe(controller);
-    expect(mastra.getHarness('code')).toBe(mastra.getAgentController('code'));
-    expect(mastra.getHarnessById('code-controller')).toBe(controller);
-    expect(mastra.listHarnesses()).toEqual(mastra.listAgentControllers());
+    expect(mastra.getAgentController('code')).toBe(controller);
+    expect(mastra.getHarnesses()).toEqual({});
+    expect(() => mastra.getHarness('code')).toThrow('Harness with name "code" not found');
   });
 });
