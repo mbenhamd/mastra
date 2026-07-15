@@ -27,6 +27,18 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 - The validator also runs for PRs targeting `ci/**` policy branches, allowing a
   stacked feature PR to prove a new trusted-base validation target before that
   policy branch reaches `main`.
+- PF-558 PR `#266` has one base-owned upstream-sync lane because its reviewed
+  upstream merge necessarily updates the root manifest, Server manifest, and
+  workspace policy. Admission is bound to the same-repository PR number, exact
+  head/base refs, the preserved two-parent upstream merge commit, the exact
+  three changed dependency-graph paths, and SHA-256 hashes for all three
+  manifests plus the lockfile. Any extra patch, manifest, `.npmrc`, or pnpm-hook
+  change fails before install. The lane installs with pnpm hooks and lifecycle
+  scripts disabled, verifies Harness v1 and
+  AgentController boundaries, and runs the owning Core, Server, Client SDK,
+  React, MastraCode, Slack, Vercel, Harness, AgentController, and evented
+  workflow build/test surface. The exception is intentionally not reusable by
+  another PR or branch.
 - `.github/workflows/papersflow-fork-pr.yml` always builds and type-checks Core,
   runs explicit affected-package checks for Okta Auth, Stagehand, Internal Core, CLI,
   Codemod, Deployer, MCP, Memory, Server, AI SDK, shared Storage Test Utils,
@@ -119,9 +131,10 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   coverage while current `main` has unrelated MastraCode and dependency-build
   baseline errors.
 - The workflow has `contents: read`, does not receive repository secrets, and
-  checks out with persisted credentials disabled. Its validation script is
-  loaded from the PR's trusted base commit. The first same-repository rollout
-  may bootstrap that script from its head commit; external PRs may not.
+  checks out with persisted credentials disabled. Install classification and
+  validation scripts are loaded from the PR's trusted base commit. The first
+  same-repository rollout may bootstrap only the new policy fixtures from its
+  exact CI branch; external PRs may not.
 - Redis and PostgreSQL are disposable job services matching the repository test
   ports and credentials, not shared runtime infrastructure.
 - `pull_request_target` metadata workflows may use GitHub-hosted runners only
@@ -134,6 +147,7 @@ or command plan:
 
 ```bash
 .github/scripts/run-papersflow-fork-pr-validation.bash --self-test
+.github/scripts/run-papersflow-fork-pr-validation.bash --self-test-pf558-upstream-sync
 ```
 
 The fixtures use an isolated temporary Git repository and mocked package
