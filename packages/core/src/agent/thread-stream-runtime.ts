@@ -1267,11 +1267,20 @@ export class AgentThreadStreamRuntime {
    * approval-suspended record was cleared for this thread key.
    */
   #clearApprovalSuspendedRunForResume(state: AgentThreadRuntimeState, runId: string, key: string): boolean {
-    if (!state.approvalSuspendedRunIds.has(runId)) return false;
+    // A retained record is released to a same-runId re-registration when the
+    // prior segment can no longer produce visible work: any suspension kind
+    // (suspended records are retained precisely so a later resume can
+    // re-attach) or a segment already marked completed whose terminal delivery
+    // is still being finalized by its completion watcher (the watcher's later
+    // cleanup is identity/streamId-guarded, so it cannot clobber the new
+    // registration). A live 'running' record still rejects duplicates.
+    const retainedRecord = state.threadRunsById.get(runId);
+    const suspended = this.#isSuspendedRun(state, runId) || retainedRecord?.lifecycle === 'suspended';
+    const terminalInFlight = retainedRecord?.lifecycle === 'completed';
+    if (!suspended && !terminalInFlight) return false;
     const reservedKey = state.threadKeysByRunId.get(runId);
     if (reservedKey !== undefined && reservedKey !== key) return false;
 
-    const retainedRecord = state.threadRunsById.get(runId);
     this.#clearSuspendedRun(state, runId);
     state.threadRunsById.delete(runId);
     if (retainedRecord) {

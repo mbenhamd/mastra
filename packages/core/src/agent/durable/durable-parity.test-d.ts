@@ -78,6 +78,11 @@ type ConsumedDuringPreparation =
   // getToolsForExecution() in preparation
   | 'toolsets'
   | 'clientTools'
+  // PF-1790: toolsetsMode is consumed by getToolsForExecution() during
+  // preparation; a 'replace' mode is persisted as the serialized
+  // `toolSurfaceFence` name ceiling plus the registry's immutable
+  // `replacementToolSurface`.
+  | 'toolsetsMode'
   // Hooks are passed to getToolsForExecution() during preparation
   | 'hooks'
   // Delegation config contains closures; stored on registry indirectly via
@@ -135,6 +140,7 @@ type PhantomSerializedKeys = Exclude<
   | 'transform' // shadow of transform policy (targets only)
   | 'isTaskComplete' // shadow of isTaskComplete (scorer names only)
   | 'structuredOutput' // serialized form of structuredOutput
+  | 'toolSurfaceFence' // PF-1790: derived name ceiling from toolsets + toolsetsMode: 'replace'
 >;
 
 describe('DurableAgent ↔ Agent parity gate', () => {
