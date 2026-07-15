@@ -96,9 +96,12 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
 - Docs Playwright changes are covered by the fork-enabled Docs E2E workflow.
   The deterministic, in-process Core Harness real-agent E2E suite is explicitly
   allowlisted and runs through Vitest because it uses a mock language model and
-  `InMemoryStore`. The exact Server favorites integration suite is also
+  `InMemoryStore`. The durable-agent background-task E2E suite is likewise
+  allowlisted because it self-provisions its local recorder gateway, uses
+  committed replay fixtures, and uses the deterministic AI SDK mock for its
+  cross-turn case. The exact Server favorites integration suite is also
   allowlisted because it exercises route handlers exclusively against
-  `InMemoryStore`. Both exact-path exceptions are content-conditioned: edits
+  `InMemoryStore`. All exact-path exceptions are content-conditioned: edits
   that add Playwright, environment credentials, external provider or storage
   packages (including scoped OpenAI SDKs), or direct network/process
   primitives fail closed before the path exception is considered. Newly added
