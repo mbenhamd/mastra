@@ -11,18 +11,19 @@ pf558_config() {
   PF558_HEAD_REPOSITORY="${PAPERSFLOW_PF558_HEAD_REPOSITORY:-mbenhamd/mastra}"
   PF558_HEAD_REF="${PAPERSFLOW_PF558_HEAD_REF:-feature/pf-558-upstream-sync-20260714}"
   PF558_BASE_REF="${PAPERSFLOW_PF558_BASE_REF:-main}"
-  PF558_MERGE_COMMIT="${PAPERSFLOW_PF558_MERGE_COMMIT:-4254efbde98cabeca4c25cc0ed1b0fcbb439f877}"
-  PF558_FORK_PARENT="${PAPERSFLOW_PF558_FORK_PARENT:-4c04e3065035c7684f53e8a0f7262374cc7cf31a}"
-  PF558_UPSTREAM_PARENT="${PAPERSFLOW_PF558_UPSTREAM_PARENT:-b0f0de20a108a7613c0ec5cef673c35cec54919a}"
-  PF558_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF558_PACKAGE_JSON_SHA256:-b1d868e7a503a92f40bde288cf514274f6214e16a81820cc5f01ea62623b18ba}"
+  PF558_MERGE_COMMIT="${PAPERSFLOW_PF558_MERGE_COMMIT:-56b439e70131ed553b56041609701d073d1b9f4a}"
+  PF558_FORK_PARENT="${PAPERSFLOW_PF558_FORK_PARENT:-02b1f450bec836b63aa7224a565838edbcb13e2c}"
+  PF558_UPSTREAM_PARENT="${PAPERSFLOW_PF558_UPSTREAM_PARENT:-899997e52c6a1f05089f3e7ead3ebd64b6036eea}"
+  PF558_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF558_PACKAGE_JSON_SHA256:-626a82759c7dc79883eb14ea0ff9a2e25be7e027ac9932c86d9d229117a77e93}"
   PF558_SERVER_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF558_SERVER_PACKAGE_JSON_SHA256:-93cc906bfc540917e19972ec922d01ff17753142d0fe03a20227c858afddd5ad}"
-  PF558_WORKSPACE_SHA256="${PAPERSFLOW_PF558_WORKSPACE_SHA256:-5bb3de828ab1c3372ca2e962ec8d3671ef53c1852307c8a94bab857ff4050817}"
-  PF558_LOCKFILE_SHA256="${PAPERSFLOW_PF558_LOCKFILE_SHA256:-97453f0cc0a6549049573818eb494267ed0ce783526794ea5d48f4acfec8a72a}"
+  PF558_WORKSPACE_SHA256="${PAPERSFLOW_PF558_WORKSPACE_SHA256:-768f91f814be021bfe09b79ec178d0e8a676ad07f0a5e6d5257da5de5d4b82f0}"
+  PF558_LOCKFILE_SHA256="${PAPERSFLOW_PF558_LOCKFILE_SHA256:-4a686859ab820a2d19ae0ba5c66194b50678596f8dde7a5beb23cde917aee9f2}"
+  PF558_PI_TUI_PATCH_SHA256="${PAPERSFLOW_PF558_PI_TUI_PATCH_SHA256:-88572df39a8452647fa073db5bc0907de3f1cb04c52c4559c8cc6e662973818b}"
   readonly \
     PF558_PR_NUMBER PF558_HEAD_REPOSITORY PF558_HEAD_REF PF558_BASE_REF \
     PF558_MERGE_COMMIT PF558_FORK_PARENT PF558_UPSTREAM_PARENT \
     PF558_PACKAGE_JSON_SHA256 PF558_SERVER_PACKAGE_JSON_SHA256 PF558_WORKSPACE_SHA256 \
-    PF558_LOCKFILE_SHA256
+    PF558_LOCKFILE_SHA256 PF558_PI_TUI_PATCH_SHA256
 }
 
 git_blob_sha256() {
@@ -80,7 +81,11 @@ classify_install_lane() (
   local expected_changes
   expected_changes="$(mktemp)"
   trap 'rm -f "$manifest_changes" "$expected_changes"' EXIT
-  printf '%s\n' package.json packages/server/package.json pnpm-workspace.yaml | sort > "$expected_changes"
+  printf '%s\n' \
+    package.json \
+    packages/server/package.json \
+    patches/@earendil-works__pi-tui@0.80.6.patch \
+    pnpm-workspace.yaml | sort > "$expected_changes"
   if ! cmp -s "$expected_changes" "$manifest_changes"; then
     echo 'PF-558 changed dependency-graph paths outside the exact reviewed set:' >&2
     diff -u "$expected_changes" "$manifest_changes" >&2 || true
@@ -113,6 +118,7 @@ package.json	$PF558_PACKAGE_JSON_SHA256
 packages/server/package.json	$PF558_SERVER_PACKAGE_JSON_SHA256
 pnpm-workspace.yaml	$PF558_WORKSPACE_SHA256
 pnpm-lock.yaml	$PF558_LOCKFILE_SHA256
+patches/@earendil-works__pi-tui@0.80.6.patch	$PF558_PI_TUI_PATCH_SHA256
 EOF
 
   echo 'PF-558 exact dependency-graph exception accepted from trusted base policy.'
@@ -121,7 +127,7 @@ EOF
 
 run_pf558_admission_self_tests() (
   local script_path test_root fixture_repo base_sha fork_parent upstream_parent merge_commit head_sha output
-  local package_hash server_hash workspace_hash lockfile_hash
+  local package_hash server_hash workspace_hash lockfile_hash patch_hash
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   test_root="$(mktemp -d)"
   fixture_repo="$test_root/repo"
@@ -163,6 +169,8 @@ run_pf558_admission_self_tests() (
   printf '{"name":"approved-server"}\n' > "$fixture_repo/packages/server/package.json"
   printf 'packages:\n  - packages/*\n' > "$fixture_repo/pnpm-workspace.yaml"
   printf 'lockfileVersion: 9.0\nsettings:\n  autoInstallPeers: false\n' > "$fixture_repo/pnpm-lock.yaml"
+  mkdir -p "$fixture_repo/patches"
+  printf 'approved patch\n' > "$fixture_repo/patches/@earendil-works__pi-tui@0.80.6.patch"
   git -C "$fixture_repo" add .
   git -C "$fixture_repo" commit -q -m approved
   head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
@@ -170,6 +178,7 @@ run_pf558_admission_self_tests() (
   server_hash="$(sha256sum "$fixture_repo/packages/server/package.json" | awk '{print $1}')"
   workspace_hash="$(sha256sum "$fixture_repo/pnpm-workspace.yaml" | awk '{print $1}')"
   lockfile_hash="$(sha256sum "$fixture_repo/pnpm-lock.yaml" | awk '{print $1}')"
+  patch_hash="$(sha256sum "$fixture_repo/patches/@earendil-works__pi-tui@0.80.6.patch" | awk '{print $1}')"
 
   run_fixture_admission() {
     local fixture_output="$1"
@@ -187,6 +196,7 @@ run_pf558_admission_self_tests() (
         PAPERSFLOW_PF558_SERVER_PACKAGE_JSON_SHA256="$server_hash" \
         PAPERSFLOW_PF558_WORKSPACE_SHA256="$workspace_hash" \
         PAPERSFLOW_PF558_LOCKFILE_SHA256="$lockfile_hash" \
+        PAPERSFLOW_PF558_PI_TUI_PATCH_SHA256="$patch_hash" \
         "$@" bash "$script_path" --classify-install
     ) > "$fixture_output" 2>&1
   }
@@ -217,7 +227,17 @@ run_pf558_admission_self_tests() (
   grep -Fq 'approved dependency file hash changed: pnpm-lock.yaml' "$output"
 
   git -C "$fixture_repo" reset -q --hard HEAD^
-  mkdir -p "$fixture_repo/patches"
+  printf 'tampered patch\n' > "$fixture_repo/patches/@earendil-works__pi-tui@0.80.6.patch"
+  git -C "$fixture_repo" commit -q -am 'tamper approved patch'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered-patch.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-558 approved patch unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'approved dependency file hash changed: patches/@earendil-works__pi-tui@0.80.6.patch' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
   printf 'unreviewed\n' > "$fixture_repo/patches/unreviewed.patch"
   git -C "$fixture_repo" add patches/unreviewed.patch
   git -C "$fixture_repo" commit -q -m unreviewed
@@ -1450,6 +1470,7 @@ EOF
   run_with_validation_budget 900 pnpm run build:server
   run_with_validation_budget 900 pnpm --filter @mastra/client-js --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match build:js
+  run_with_validation_budget 600 pnpm --filter @mastra/code-sdk --fail-if-no-match check
   run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match check
   run_with_validation_budget 900 pnpm run build:mastracode
   run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match build
@@ -1458,6 +1479,7 @@ EOF
   run_with_validation_budget 600 pnpm --filter @mastra/server --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter @mastra/client-js --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter @mastra/react --fail-if-no-match lint
+  run_with_validation_budget 600 pnpm --filter @mastra/code-sdk --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter mastracode --fail-if-no-match lint
   run_with_validation_budget 600 pnpm --filter @mastra/slack --fail-if-no-match typecheck
   run_with_validation_budget 600 pnpm --filter @mastra/vercel --fail-if-no-match lint
@@ -1477,6 +1499,7 @@ EOF
   run_with_validation_budget 1200 \
     pnpm --dir packages/core exec vitest run --reporter=dot \
       src/harness/v1 src/agent-controller src/workflows/evented
+  run_with_validation_budget 1200 pnpm run test:mastracode
   run_with_validation_budget 600 \
     pnpm --dir client-sdks/client-js exec vitest run --reporter=dot \
       src/resources/harness.test.ts src/resources/agent-controller.test.ts
@@ -1734,10 +1757,10 @@ while IFS= read -r file; do
         printf '%s\n' "$file" >> "$missing_mastracode_tests"
       else
         case "$file" in
-          mastracode/src/tui/components/login-dialog.test.ts | \
-            mastracode/src/tui/event-dispatch.test.ts | \
-            mastracode/src/tui/notify.test.ts | \
-            mastracode/src/utils/__tests__/signals-pubsub.test.ts) ;;
+          mastracode/tui/src/tui/components/login-dialog.test.ts | \
+            mastracode/tui/src/tui/event-dispatch.test.ts | \
+            mastracode/tui/src/tui/notify.test.ts | \
+            mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
       fi
@@ -1745,22 +1768,22 @@ while IFS= read -r file; do
     fi
     required_test=""
     case "$file" in
-      mastracode/src/tui/components/login-dialog.ts)
-        required_test="mastracode/src/tui/components/login-dialog.test.ts"
+      mastracode/tui/src/tui/components/login-dialog.ts)
+        required_test="mastracode/tui/src/tui/components/login-dialog.test.ts"
         ;;
-      mastracode/src/tui/event-dispatch.ts)
-        required_test="mastracode/src/tui/event-dispatch.test.ts"
+      mastracode/tui/src/tui/event-dispatch.ts)
+        required_test="mastracode/tui/src/tui/event-dispatch.test.ts"
         ;;
-      mastracode/src/tui/notify.ts)
-        required_test="mastracode/src/tui/notify.test.ts"
+      mastracode/tui/src/tui/notify.ts)
+        required_test="mastracode/tui/src/tui/notify.test.ts"
         ;;
-      mastracode/src/utils/signals-pubsub.ts)
-        required_test="mastracode/src/utils/__tests__/signals-pubsub.test.ts"
+      mastracode/sdk/src/utils/signals-pubsub.ts)
+        required_test="mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts"
         ;;
-      mastracode/src/index.ts)
-        # Composition root: no unit suite owns it; the mastracode lane's
-        # build:mastracode compiles it and the owned TUI suites exercise its
-        # wiring. Restoration-only edits are accepted under the build gate.
+      mastracode/sdk/src/index.ts | mastracode/tui/src/main.ts)
+        # Composition roots: no single unit suite owns them; build:mastracode
+        # compiles both packages and their owned suites exercise the wiring.
+        # Restoration-only edits are accepted under the build gate.
         ;;
       *)
         printf '%s\n' "$file" >> "$unsupported_mastracode_sources"
@@ -2627,15 +2650,15 @@ if (( ${#detected_tests[@]} > 0 )); then
     elif [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
-      "$file" == mastracode/e2e/* || \
+      "$file" == mastracode/tui/e2e/* || \
       "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || \
       grep -Eq "['\"]@playwright/test['\"]" "$file"; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" == mastracode/* && \
-      "$file" != mastracode/src/tui/components/login-dialog.test.ts && \
-      "$file" != mastracode/src/tui/event-dispatch.test.ts && \
-      "$file" != mastracode/src/tui/notify.test.ts && \
-      "$file" != mastracode/src/utils/__tests__/signals-pubsub.test.ts ]]; then
+      "$file" != mastracode/tui/src/tui/components/login-dialog.test.ts && \
+      "$file" != mastracode/tui/src/tui/event-dispatch.test.ts && \
+      "$file" != mastracode/tui/src/tui/notify.test.ts && \
+      "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
