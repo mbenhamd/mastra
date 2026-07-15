@@ -3,6 +3,7 @@ import type { PubSub } from '../../../../events/pubsub';
 import type { Mastra } from '../../../../mastra';
 import { EntityType, SpanType } from '../../../../observability';
 import type { ExportedSpan } from '../../../../observability';
+import { ChunkFrom } from '../../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { MessageList } from '../../../message-list';
@@ -130,12 +131,25 @@ export function createDurableLLMMappingStep() {
         resourceId: state.resourceId,
       });
       messageList.deserialize(llmOutput.messageListState);
+      const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
 
       // A declined approval has no `result` but is fully resolved: persist it as `output-denied`
       // with the approval decision (rather than as a successful `result`) so it round-trips on
       // recall. Mirrors the non-durable llm-mapping-step.
       const isDeniedApproval = (toolResult: { approval?: { approved?: boolean } }) =>
         toolResult?.approval?.approved === false;
+      const persistInvocation = (part: Parameters<typeof messageList.updateToolInvocation>[0]) => {
+        if (messageList.updateToolInvocation(part)) return;
+        messageList.add(
+          {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: { format: 2, parts: [part] },
+            createdAt: new Date(),
+          },
+          'response',
+        );
+      };
 
       // 2. Add tool results to message list
       // Look up tools from the in-process registry for toModelOutput support
@@ -162,11 +176,12 @@ export function createDurableLLMMappingStep() {
       if (toolResults.length > 0) {
         for (const toolResult of toolResults) {
           if (isDeniedApproval(toolResult)) {
-            messageList.updateToolInvocation({
+            const deniedToolCallId = toolResult.resumeTargetToolCallId ?? toolResult.toolCallId;
+            persistInvocation({
               type: 'tool-invocation' as const,
               toolInvocation: {
                 state: 'output-denied' as const,
-                toolCallId: toolResult.toolCallId,
+                toolCallId: deniedToolCallId,
                 toolName: toolResult.toolName,
                 args: toolResult.args,
                 approval: {
@@ -176,6 +191,33 @@ export function createDurableLLMMappingStep() {
                 },
               },
             });
+            if (deniedToolCallId !== toolResult.toolCallId) {
+              persistInvocation({
+                type: 'tool-invocation' as const,
+                toolInvocation: {
+                  state: 'result' as const,
+                  toolCallId: toolResult.toolCallId,
+                  toolName: toolResult.toolName,
+                  args: toolResult.args,
+                  result: toolResult.approval?.reason ?? 'Tool call was not approved by the user',
+                },
+              });
+            }
+            if (pubsub) {
+              await emitChunkEvent(pubsub, _runId, {
+                type: 'tool-result',
+                runId: _runId,
+                from: ChunkFrom.AGENT,
+                payload: {
+                  toolCallId: toolResult.toolCallId,
+                  toolName: toolResult.toolName,
+                  args: toolResult.args,
+                  result: toolResult.approval?.reason ?? 'Tool call was not approved by the user',
+                  providerMetadata: toolResult.providerMetadata as any,
+                  providerExecuted: toolResult.providerExecuted,
+                },
+              });
+            }
             continue;
           }
 
@@ -226,11 +268,12 @@ export function createDurableLLMMappingStep() {
             }
           }
 
-          const updated = messageList.updateToolInvocation({
+          const resolvedToolCallId = toolResult.resumeTargetToolCallId ?? toolResult.toolCallId;
+          persistInvocation({
             type: 'tool-invocation' as const,
             toolInvocation: {
               state: 'result' as const,
-              toolCallId: toolResult.toolCallId,
+              toolCallId: resolvedToolCallId,
               toolName: toolResult.toolName,
               args: toolResult.args,
               result,
@@ -241,24 +284,18 @@ export function createDurableLLMMappingStep() {
             ...(providerMetadata ? { providerMetadata: providerMetadata as any } : {}),
           });
 
-          if (!updated) {
-            messageList.add(
-              [
-                {
-                  role: 'tool' as const,
-                  content: [
-                    {
-                      type: 'tool-result' as const,
-                      toolCallId: toolResult.toolCallId,
-                      toolName: toolResult.toolName,
-                      result,
-                      isError: toolResult.error !== undefined,
-                    },
-                  ],
-                },
-              ],
-              'response',
-            );
+          if (resolvedToolCallId !== toolResult.toolCallId) {
+            persistInvocation({
+              type: 'tool-invocation' as const,
+              toolInvocation: {
+                state: 'result' as const,
+                toolCallId: toolResult.toolCallId,
+                toolName: toolResult.toolName,
+                args: toolResult.args,
+                result,
+              },
+              ...(providerMetadata ? { providerMetadata: providerMetadata as any } : {}),
+            });
           }
         }
       }
@@ -351,7 +388,6 @@ export function createDurableLLMMappingStep() {
       // matches the regular agent's chunk ordering which MastraModelOutput
       // relies on for correct step content reconstruction in onStepFinish.
       const deferredChunk = llmOutput.deferredStepFinishChunk as any;
-      const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       if (deferredChunk && pubsub) {
         try {
           // Build step content directly from this iteration's data.

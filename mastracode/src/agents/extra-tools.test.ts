@@ -24,17 +24,16 @@ function makeRequestContext(
   } = {},
 ) {
   const ctx = new RequestContext();
+  const state = {
+    projectPath: overrides.projectPath ?? '/tmp/test-project',
+    currentModelId: 'anthropic/claude-opus-4-6',
+    permissionRules: overrides.permissionRules ?? { categories: {}, tools: {} },
+  };
   ctx.set('harness', {
-    session: {
-      modeId: overrides.modeId ?? 'build',
-      modelId: 'anthropic/claude-opus-4-6',
-      state: {
-        get: () => ({
-          projectPath: overrides.projectPath ?? '/tmp/test-project',
-          permissionRules: overrides.permissionRules ?? { categories: {}, tools: {} },
-        }),
-      },
-    },
+    modeId: overrides.modeId ?? 'build',
+    modelId: 'anthropic/claude-opus-4-6',
+    state,
+    getState: () => state,
   });
   return ctx;
 }

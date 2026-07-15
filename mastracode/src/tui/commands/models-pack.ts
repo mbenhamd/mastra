@@ -384,25 +384,25 @@ async function applyPack(ctx: SlashCommandContext, pack: ModePack, previousPackI
     const modelId = (pack.models as Record<string, string>)[mode.id];
     if (modelId) {
       (mode as any).defaultModelId = modelId;
-      await ctx.state.session.thread.setSetting({ key: `modeModelId_${mode.id}`, value: modelId });
+      await ctx.harness.setThreadSetting({ key: `modeModelId_${mode.id}`, value: modelId });
     }
   }
 
-  const currentModeId = ctx.state.session.mode.get();
+  const currentModeId = ctx.harness.getCurrentModeId();
   const currentModeModel = (pack.models as Record<string, string>)[currentModeId];
   if (currentModeModel) {
-    await ctx.state.session.model.switch({ modelId: currentModeModel });
+    await ctx.harness.switchModel({ modelId: currentModeModel });
   }
 
   const subagentModeMap: Record<string, string> = { explore: 'fast', plan: 'plan', execute: 'build' };
   for (const [agentType, modeId] of Object.entries(subagentModeMap)) {
     const saModelId = (pack.models as Record<string, string>)[modeId];
     if (saModelId) {
-      await ctx.state.session.subagents.model.set({ modelId: saModelId, agentType });
+      await ctx.harness.setSubagentModelId({ modelId: saModelId, agentType });
     }
   }
 
-  await ctx.state.session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: pack.id });
+  await ctx.harness.setThreadSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: pack.id });
 
   const s = loadSettings();
   const modeDefaults: Record<string, string> = {};
@@ -421,9 +421,9 @@ async function applyPack(ctx: SlashCommandContext, pack: ModePack, previousPackI
   s.models.subagentModels = {};
 
   const hasOpenAI = Object.values(pack.models).some(m => m.startsWith('openai/'));
-  const currentThinking = ((ctx.state.session.state.get() as any)?.thinkingLevel ?? 'off') as string;
+  const currentThinking = ((ctx.harness.getState() as any)?.thinkingLevel ?? 'off') as string;
   if (hasOpenAI && currentThinking === 'off') {
-    await ctx.state.session.state.set({ thinkingLevel: 'low' } as any);
+    await ctx.harness.setState({ thinkingLevel: 'low' } as any);
     s.preferences.thinkingLevel = 'low';
   }
 
@@ -469,11 +469,11 @@ async function saveCustomPackEdits(ctx: SlashCommandContext, pack: ModePack, pre
   saveSettings(settings);
 
   if (previousPackId && previousPackId !== pack.id) {
-    const threadId = ctx.state.session.thread.getId();
-    const thread = threadId ? (await ctx.state.session.thread.list()).find(t => t.id === threadId) : undefined;
+    const threadId = ctx.harness.getCurrentThreadId();
+    const thread = threadId ? (await ctx.harness.listThreads()).find(t => t.id === threadId) : undefined;
     const threadPackId = (thread?.metadata?.[THREAD_ACTIVE_MODEL_PACK_ID_KEY] as string | undefined) ?? null;
     if (threadPackId === previousPackId) {
-      await ctx.state.session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: pack.id });
+      await ctx.harness.setThreadSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: pack.id });
     }
   }
 }
@@ -481,8 +481,8 @@ async function saveCustomPackEdits(ctx: SlashCommandContext, pack: ModePack, pre
 async function deleteCustomPack(ctx: SlashCommandContext, pack: ModePack): Promise<void> {
   if (!pack.id.startsWith('custom:')) return;
 
-  const threadId = ctx.state.session.thread.getId();
-  const thread = threadId ? (await ctx.state.session.thread.list()).find(t => t.id === threadId) : undefined;
+  const threadId = ctx.harness.getCurrentThreadId();
+  const thread = threadId ? (await ctx.harness.listThreads()).find(t => t.id === threadId) : undefined;
   const threadPackId = (thread?.metadata?.[THREAD_ACTIVE_MODEL_PACK_ID_KEY] as string | undefined) ?? null;
 
   const settings = loadSettings();
@@ -490,7 +490,7 @@ async function deleteCustomPack(ctx: SlashCommandContext, pack: ModePack): Promi
   saveSettings(settings);
 
   if (threadPackId === pack.id) {
-    await ctx.state.session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: null });
+    await ctx.harness.setThreadSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: null });
   }
 }
 
@@ -605,8 +605,8 @@ export async function handleModelsPackCommand(ctx: SlashCommandContext): Promise
     return;
   }
 
-  const threadId = ctx.state.session.thread.getId();
-  const thread = threadId ? (await ctx.state.session.thread.list()).find(t => t.id === threadId) : undefined;
+  const threadId = ctx.harness.getCurrentThreadId();
+  const thread = threadId ? (await ctx.harness.listThreads()).find(t => t.id === threadId) : undefined;
   const currentPackId = resolveThreadActiveModelPackId(
     settings,
     packs,

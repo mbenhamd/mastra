@@ -1,11 +1,5 @@
 {
-  "attachment": [
-    "openai/gpt-4.1",
-    "openai/gpt-4.1-mini",
-    "openai/gpt-4.1-nano",
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini"
-  ],
+  "attachment": ["openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4.1-nano", "openai/gpt-4o", "openai/gpt-4o-mini"],
   "temperature": [
     "ai21-labs/ai21-jamba-1.5-large",
     "ai21-labs/ai21-jamba-1.5-mini",

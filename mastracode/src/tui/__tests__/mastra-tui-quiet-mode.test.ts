@@ -81,6 +81,7 @@ function createBareTui() {
   };
   const tui = Object.create(MastraTUI.prototype) as any;
   tui.state = {
+    harness: { getCurrentMode: vi.fn(() => ({ color: undefined })) },
     ui: { requestRender: vi.fn() },
     quietMode: false,
     quietModeMaxToolPreviewLines: 2,

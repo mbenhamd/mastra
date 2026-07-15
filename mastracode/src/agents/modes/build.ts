@@ -5,9 +5,7 @@
  * read and write tools to complete it. It can modify files, run commands,
  * and perform actual development work within a constrained scope.
  */
-import type { HarnessMode } from '@mastra/core/harness';
-
-export const buildMode: HarnessMode = {
+export const buildMode = {
   id: 'build',
   name: 'Build',
   description:

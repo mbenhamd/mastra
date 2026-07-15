@@ -2,14 +2,118 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
-import { getPackageManagerAddCommand } from '../utils/package-manager';
+import type { ResultPromise } from 'execa';
+import { onExit } from 'signal-exit';
+import { getPackageManagerAddArgs } from '../utils/package-manager';
 import type { PackageManager } from '../utils/package-manager';
+
+type InstallPackagesOptions = {
+  dev?: boolean;
+  timeout?: number;
+  cancelSignal?: AbortSignal;
+};
+
+const FORCE_KILL_DELAY_MS = 1_000;
+
+function getTaskkillPath(): string {
+  const configuredWindowsRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  const windowsRoot =
+    configuredWindowsRoot && path.win32.isAbsolute(configuredWindowsRoot) ? configuredWindowsRoot : 'C:\\Windows';
+  return path.win32.join(windowsRoot, 'System32', 'taskkill.exe');
+}
+
+async function terminateInstallTree(subprocess: ResultPromise, signal: NodeJS.Signals): Promise<void> {
+  const pid = subprocess.pid;
+  if (!pid) {
+    subprocess.kill(signal);
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const result = await execa(getTaskkillPath(), ['/T', '/F', '/PID', String(pid)], {
+        reject: false,
+        stdio: 'ignore',
+        timeout: 5_000,
+      });
+      if (result.exitCode === 0) return;
+    } catch {
+      // Fall through when taskkill is unavailable.
+    }
+  } else {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+      // Fall through when the process group could not be reached.
+    }
+  }
+
+  subprocess.kill(signal);
+}
+
+function scheduleInstallTreeTermination(subprocess: ResultPromise, timeout?: number, cancelSignal?: AbortSignal) {
+  let terminationPromise: Promise<void> | undefined;
+  const terminate = () => {
+    terminationPromise ??= (async () => {
+      if (process.platform === 'win32') {
+        await terminateInstallTree(subprocess, 'SIGKILL');
+        return;
+      }
+
+      await terminateInstallTree(subprocess, 'SIGTERM');
+      await new Promise<void>(resolve => setTimeout(resolve, FORCE_KILL_DELAY_MS));
+      await terminateInstallTree(subprocess, 'SIGKILL');
+    })().catch(() => {});
+    return terminationPromise;
+  };
+
+  const terminateOnExit = () => {
+    const pid = subprocess.pid;
+    if (process.platform !== 'win32' && pid) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+        return;
+      } catch {
+        // Fall through when the detached process group has already exited.
+      }
+    }
+    try {
+      subprocess.kill('SIGKILL');
+    } catch {
+      // Best-effort cleanup during process exit cannot be awaited or retried.
+    }
+  };
+  const terminateOnAbort = () => void terminate();
+
+  const timeoutTimer = timeout === undefined || timeout <= 0 ? undefined : setTimeout(() => void terminate(), timeout);
+  timeoutTimer?.unref();
+  if (cancelSignal?.aborted) {
+    void terminate();
+  } else {
+    cancelSignal?.addEventListener('abort', terminateOnAbort, { once: true });
+  }
+  // signal-exit runs the callback exactly once for normal exits and for fatal
+  // signals such as SIGINT/SIGTERM (which never emit Node's `exit` event),
+  // then re-raises the signal so the CLI dies with the conventional code.
+  const removeExitCleanup = onExit(terminateOnExit);
+
+  return {
+    terminate,
+    clear() {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      cancelSignal?.removeEventListener('abort', terminateOnAbort);
+      removeExitCleanup();
+    },
+  };
+}
 
 export class DepsService {
   readonly packageManager: PackageManager;
 
-  constructor() {
-    this.packageManager = this.getPackageManager();
+  constructor(packageManager?: PackageManager) {
+    this.packageManager = packageManager ?? this.getPackageManager();
   }
 
   private findLockFile(dir: string): string | null {
@@ -43,16 +147,40 @@ export class DepsService {
     }
   }
 
-  public async installPackages(packages: string[]) {
+  public async installPackages(packages: string[], options: InstallPackagesOptions = {}) {
     const pm = this.packageManager;
-    const installCommand = getPackageManagerAddCommand(pm);
+    const installArgs = getPackageManagerAddArgs(pm);
 
-    // Pass arguments as an array (no shell) so package names can't be used
-    // for command injection (CodeQL js/shell-command-constructed-from-input).
-    return execa(pm, [...installCommand.split(' '), ...packages], {
+    const optionLikePackage = packages.find(packageSpec => packageSpec.startsWith('-'));
+    if (optionLikePackage) {
+      throw new Error(`Package specs cannot start with "-": ${JSON.stringify(optionLikePackage)}`);
+    }
+
+    // Keep package specs as discrete arguments so neither a shell nor the
+    // package manager can reinterpret them as command-line options.
+    if (options.dev) {
+      installArgs.push(pm === 'bun' ? '-d' : '-D');
+    }
+
+    const subprocess = execa(pm, [...installArgs, ...packages], {
       all: true,
       stdio: 'pipe',
+      timeout: options.timeout,
+      cancelSignal: options.cancelSignal,
+      killSignal: 'SIGTERM',
+      forceKillAfterDelay: FORCE_KILL_DELAY_MS,
+      detached: process.platform !== 'win32',
     });
+    const treeTermination = scheduleInstallTreeTermination(subprocess, options.timeout, options.cancelSignal);
+
+    try {
+      return await subprocess;
+    } catch (error) {
+      await treeTermination.terminate();
+      throw error;
+    } finally {
+      treeTermination.clear();
+    }
   }
 
   public async checkDependencies(dependencies: string[]): Promise<string> {

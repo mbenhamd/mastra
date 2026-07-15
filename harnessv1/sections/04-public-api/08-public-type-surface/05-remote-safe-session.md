@@ -61,7 +61,9 @@ interface RemoteSafeSession<TState = Record<string, unknown>> {
   respondToToolApproval(opts: ToolApprovalResponse & InboxResponseOptions): Promise<InboxResponseResult>;
   respondToToolSuspension(opts: ToolSuspensionResponse & InboxResponseOptions): Promise<InboxResponseResult>;
   respondToQuestion(opts: { answer: string | string[] } & InboxResponseOptions): Promise<InboxResponseResult>;
-  respondToPlanApproval(opts: { approved: boolean; reason?: string } & InboxResponseOptions): Promise<InboxResponseResult>;
+  respondToPlanApproval(
+    opts: { approved: boolean; reason?: string } & InboxResponseOptions,
+  ): Promise<InboxResponseResult>;
 
   permissions: RemoteSafePermissions;
   om: RemoteSafeObservationalMemory;

@@ -219,9 +219,11 @@ describe('Session token usage — durability', () => {
     );
     expect(session.getDisplayState().currentRunId).toBeUndefined();
 
-    const duplicate = await (session as unknown as {
-      _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
-    })._returnDuplicateMessageResult(
+    const duplicate = await (
+      session as unknown as {
+        _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
+      }
+    )._returnDuplicateMessageResult(
       {
         status: 'pending',
         signalId: 'duplicate-token-signal',
@@ -282,9 +284,11 @@ describe('Session token usage — durability', () => {
       admissionHash: 'duplicate-suspend-token-hash',
     };
 
-    const duplicate = await (session as unknown as {
-      _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
-    })._returnDuplicateMessageResult(evidence, { content: 'hi', model: 'duplicate-dispatched-model' });
+    const duplicate = await (
+      session as unknown as {
+        _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
+      }
+    )._returnDuplicateMessageResult(evidence, { content: 'hi', model: 'duplicate-dispatched-model' });
 
     expect(duplicate).toBe(full);
     expect(completedEvidenceSnapshots).toEqual([
@@ -300,9 +304,11 @@ describe('Session token usage — durability', () => {
     expect(session.getRecord().pendingResume?.runtimeDependencies?.modelId).toBe('duplicate-dispatched-model');
     expect(session.getDisplayState().currentRunId).toBeUndefined();
 
-    const replay = await (session as unknown as {
-      _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
-    })._returnDuplicateMessageResult(evidence, { content: 'hi', model: 'duplicate-dispatched-model' });
+    const replay = await (
+      session as unknown as {
+        _returnDuplicateMessageResult(evidence: unknown, opts: unknown): Promise<unknown>;
+      }
+    )._returnDuplicateMessageResult(evidence, { content: 'hi', model: 'duplicate-dispatched-model' });
     expect(replay).toBe(full);
     expect(session.getTokenUsage()).toEqual({ promptTokens: 1, completionTokens: 1, totalTokens: 2 });
   });
@@ -332,14 +338,16 @@ describe('Session token usage — durability', () => {
       return saveSession(record, opts);
     });
 
-    const capture = (session as unknown as {
-      _captureMessageSuspendWithTokenUsage(
-        full: FullOutput<unknown>,
-        queuedItemId: string | undefined,
-        modeId: string,
-        modelId: string,
-      ): Promise<void>;
-    })._captureMessageSuspendWithTokenUsage.bind(session);
+    const capture = (
+      session as unknown as {
+        _captureMessageSuspendWithTokenUsage(
+          full: FullOutput<unknown>,
+          queuedItemId: string | undefined,
+          modeId: string,
+          modelId: string,
+        ): Promise<void>;
+      }
+    )._captureMessageSuspendWithTokenUsage.bind(session);
     const first = capture(full, undefined, session.getRecord().modeId, session.getRecord().modelId);
     await vi.waitFor(() => expect(pendingResumeSaveCount).toBe(1));
     const second = capture(full, undefined, session.getRecord().modeId, session.getRecord().modelId);
@@ -527,14 +535,21 @@ describe('Session token usage — durability', () => {
     });
     expect(releaseSessionLease).not.toHaveBeenCalled();
 
-    await (session as unknown as {
-      _captureMessageSuspendWithTokenUsage(
-        full: FullOutput<unknown>,
-        queuedItemId: string | undefined,
-        modeId: string,
-        modelId: string,
-      ): Promise<void>;
-    })._captureMessageSuspendWithTokenUsage(suspendedFull, undefined, session.getRecord().modeId, session.getRecord().modelId);
+    await (
+      session as unknown as {
+        _captureMessageSuspendWithTokenUsage(
+          full: FullOutput<unknown>,
+          queuedItemId: string | undefined,
+          modeId: string,
+          modelId: string,
+        ): Promise<void>;
+      }
+    )._captureMessageSuspendWithTokenUsage(
+      suspendedFull,
+      undefined,
+      session.getRecord().modeId,
+      session.getRecord().modelId,
+    );
     await expect(harness.shutdown()).resolves.toBeUndefined();
     expect(releaseSessionLease).toHaveBeenCalledTimes(1);
   });
@@ -555,21 +570,25 @@ describe('Session token usage — durability', () => {
       ...session.getRecord(),
       pendingResume: pending,
     };
-    (session as unknown as {
-      _pendingDurableTurnFlushError?: { error: unknown; pendingResume?: { runId: string; toolCallId: string } };
-    })._pendingDurableTurnFlushError = {
+    (
+      session as unknown as {
+        _pendingDurableTurnFlushError?: { error: unknown; pendingResume?: { runId: string; toolCallId: string } };
+      }
+    )._pendingDurableTurnFlushError = {
       error: new Error('different suspend persist failed'),
       pendingResume: { runId: 'latched-run', toolCallId: 'tc-latched' },
     };
 
-    await (session as unknown as {
-      _maybeCaptureSuspend(
-        full: FullOutput<unknown>,
-        queuedItemId: string | undefined,
-        modeId: string,
-        modelId: string,
-      ): Promise<void>;
-    })._maybeCaptureSuspend(
+    await (
+      session as unknown as {
+        _maybeCaptureSuspend(
+          full: FullOutput<unknown>,
+          queuedItemId: string | undefined,
+          modeId: string,
+          modelId: string,
+        ): Promise<void>;
+      }
+    )._maybeCaptureSuspend(
       {
         finishReason: 'suspended',
         runId: 'unrelated-run',
@@ -597,9 +616,11 @@ describe('Session token usage — durability', () => {
     const { harness } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     asInternals(session)._tokenUsage = { promptTokens: 1, completionTokens: 2, totalTokens: 3 };
-    (session as unknown as {
-      _pendingDurableTurnFlushError?: { error: unknown; pendingResume?: { runId: string; toolCallId: string } };
-    })._pendingDurableTurnFlushError = {
+    (
+      session as unknown as {
+        _pendingDurableTurnFlushError?: { error: unknown; pendingResume?: { runId: string; toolCallId: string } };
+      }
+    )._pendingDurableTurnFlushError = {
       error: new Error('unkeyed durable persist failed'),
     };
 
@@ -628,12 +649,10 @@ describe('Session token usage — durability', () => {
     // §13.3f.1: the raw `saveSession` failure is REDACTED on the public
     // `message()` rejection (`.message` generic, raw original on `.cause`).
     // The behavior under test is shutdown-time repair + single lease release.
-    const thrown = await session
-      .message({ content: 'one', admissionId: 'foreground-token-persist-failure' })
-      .then(
-        () => undefined,
-        (e: unknown) => e,
-      );
+    const thrown = await session.message({ content: 'one', admissionId: 'foreground-token-persist-failure' }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
     expect((thrown as Error).name).toBe('HarnessExecutionError');
     expect((thrown as Error).message).toBe('An internal harness error occurred');
     expect(((thrown as { cause?: Error }).cause as Error).message).toBe('foreground token persist failed');
@@ -742,10 +761,11 @@ describe('Session token usage — durability', () => {
     });
     const first = await harness.session({ resourceId: 'u', threadId: 't-shutdown-partial-release-1' });
     const second = await harness.session({ resourceId: 'u', threadId: 't-shutdown-partial-release-2' });
-    let failSecondEviction = true;
     vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
-      if (failSecondEviction && record.sessionId === second.id) {
-        failSecondEviction = false;
+      // Keep the later session's storage unavailable across shutdown retries.
+      // One-shot append failures are recoverable through the event backlog and
+      // are covered by the transient ledger tests.
+      if (record.sessionId === second.id) {
         throw new Error('second event persistence failed');
       }
       return appendSessionEvent(record);
@@ -756,7 +776,9 @@ describe('Session token usage — durability', () => {
       cause: expect.objectContaining({ message: 'second event persistence failed' }),
     });
     expect(releaseSessionLease).not.toHaveBeenCalled();
-    await expect(storage.loadSession({ harnessName: first.getRecord().harnessName, sessionId: first.id })).resolves.toMatchObject({
+    await expect(
+      storage.loadSession({ harnessName: first.getRecord().harnessName, sessionId: first.id }),
+    ).resolves.toMatchObject({
       ownerId: harness.ownerId,
     });
 

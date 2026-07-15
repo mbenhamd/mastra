@@ -27,8 +27,7 @@ import { getMarkdownTheme } from '../theme.js';
 import type { EventHandlerContext } from './types.js';
 
 function getCurrentModeColor(ctx: EventHandlerContext): string | undefined {
-  const color = ctx.state.session?.mode?.resolve?.()?.metadata?.color;
-  return typeof color === 'string' ? color : undefined;
+  return ctx.state.harness.getCurrentMode().color;
 }
 
 /**

@@ -23,11 +23,11 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { Agent } from '../../agent';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import type { Workspace } from '../../workspace';
 
+import { MockAgent } from './__test-utils__/mock-agent';
 import { setupHarness } from './__test-utils__/setup';
 import { HarnessConfigError, HarnessWorkspaceProvisioningError } from './errors';
 import { Harness } from './harness';
@@ -67,7 +67,7 @@ function makeWorkspace(label?: string): Workspace {
 }
 
 function makeAgent(name: string) {
-  return new Agent({ id: name, name, instructions: 'fake', model: 'openai/gpt-4o-mini' as any });
+  return new MockAgent({ id: name });
 }
 
 function multiAgentConfig(extra: Record<string, any> = {}) {

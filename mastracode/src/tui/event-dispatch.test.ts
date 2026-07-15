@@ -13,29 +13,22 @@ function createMockHarness(initialState: Record<string, unknown> = {}, previousT
   return {
     state,
     loadOMProgress: vi.fn().mockResolvedValue(undefined),
-    session: {
-      thread: { list: vi.fn().mockResolvedValue([]) },
-      state: {
-        get: () => ({ ...state }),
-        set: setState,
-      },
-      displayState: {
-        get: () => ({
-          isRunning: false,
-          tasks: [],
-          previousTasks,
-          omProgress: { status: 'idle', pendingTokens: 0 },
-          modifiedFiles: new Map(),
-        }),
-      },
-    },
+    listThreads: vi.fn().mockResolvedValue([]),
+    getState: () => ({ ...state }),
+    setState,
+    getDisplayState: () => ({
+      isRunning: false,
+      tasks: [],
+      previousTasks,
+      omProgress: { status: 'idle', pendingTokens: 0 },
+      modifiedFiles: new Map(),
+    }),
   };
 }
 
 function createMockTUIState(harness: ReturnType<typeof createMockHarness>): TUIState {
   return {
     harness: harness as any,
-    session: harness.session as any,
     taskProgress: {
       updateTasks: vi.fn(),
       getTasks: () => [],
@@ -89,7 +82,7 @@ describe('dispatchEvent thread lifecycle', () => {
       state,
     );
 
-    expect(state.session.state.set).toHaveBeenCalledWith(
+    expect(state.harness.setState).toHaveBeenCalledWith(
       expect.objectContaining({
         tasks: [],
         activePlan: null,
@@ -105,7 +98,7 @@ describe('dispatchEvent thread lifecycle', () => {
       state,
     );
 
-    expect(state.session.state.set).toHaveBeenCalledWith(
+    expect(state.harness.setState).toHaveBeenCalledWith(
       expect.objectContaining({
         tasks: [],
         activePlan: null,
@@ -191,7 +184,7 @@ describe('dispatchEvent thread lifecycle', () => {
       state,
     );
 
-    const setStateCall = (state.session.state.set as any).mock.calls[0]![0];
+    const setStateCall = (state.harness.setState as any).mock.calls[0]![0];
     expect(setStateCall).not.toHaveProperty('currentModelId');
   });
 });

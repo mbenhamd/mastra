@@ -28,11 +28,13 @@ export async function processWorkflowLoop(
   }: ProcessorArgs,
   {
     pubsub,
+    mastra,
     stepExecutor,
     step,
     stepResult,
   }: {
     pubsub: PubSub;
+    mastra: Mastra;
     stepExecutor: StepExecutor;
     step: Extract<StepFlowEntry, { type: 'loop' }>;
     stepResult: StepResult<any, any, any, any>;
@@ -62,6 +64,14 @@ export async function processWorkflowLoop(
     iterationCount,
   });
 
+  const previousLoopResult = stepResults[step.step.id] ?? stepResult;
+  const previousLoopMetadata = previousLoopResult?.metadata ?? {};
+  const { nestedRunId: _completedNestedRunId, ...nextIterationMetadata } = previousLoopMetadata;
+  const nextIterationResult: StepResult<any, any, any, any> = {
+    ...previousLoopResult,
+    metadata: { ...nextIterationMetadata, iterationCount },
+  };
+
   // When the loop body runs again, it's a fresh iteration — not a resume — so drop any
   // resume metadata. Otherwise the body would keep receiving the same resumeData on every
   // iteration (and e.g. never re-suspend).
@@ -80,10 +90,11 @@ export async function processWorkflowLoop(
     // metadata.iterationCount onto the step result. See handlers/step.ts.
     stepResults: {
       ...stepResults,
-      [step.step.id]: {
-        ...stepResults[step.step.id],
-        metadata: { ...stepResults[step.step.id]?.metadata, iterationCount },
-      },
+      // A nested workflow owner belongs only to the iteration that just
+      // completed. Clear it at the same boundary that advances the iteration
+      // counter so the next delivery derives and atomically binds a new child
+      // run id instead of reusing the completed child.
+      [step.step.id]: nextIterationResult,
     },
     prevResult: stepResult,
     resumeData: undefined,
@@ -109,15 +120,27 @@ export async function processWorkflowLoop(
     state: currentState,
     outputOptions,
   };
+  const persistNextIteration = async () => {
+    const workflowsStore = await mastra.getStorage()?.getStore('workflows');
+    await workflowsStore?.updateWorkflowResults({
+      workflowName: workflowId,
+      runId,
+      stepId: step.step.id,
+      result: nextIterationResult,
+      requestContext,
+    });
+  };
 
   if (step.loopType === 'dountil') {
     if (loopCondition) {
       await pubsub.publish('workflows', { type: 'workflow.step.end', runId, data: loopEndData });
     } else {
+      await persistNextIteration();
       await pubsub.publish('workflows', { type: 'workflow.step.run', runId, data: loopAgainData });
     }
   } else {
     if (loopCondition) {
+      await persistNextIteration();
       await pubsub.publish('workflows', { type: 'workflow.step.run', runId, data: loopAgainData });
     } else {
       await pubsub.publish('workflows', { type: 'workflow.step.end', runId, data: loopEndData });

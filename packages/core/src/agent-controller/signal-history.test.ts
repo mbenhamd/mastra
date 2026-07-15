@@ -40,16 +40,13 @@ describe('AgentController signal history rendering', () => {
           {
             id: 'signal-user-1',
             type: 'user-message',
-            contents: {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'hello from signal' },
-                { type: 'file', data: 'data:image/png;base64,abc', mediaType: 'image/png' },
-              ],
-            },
+            contents: [
+              { type: 'text', text: 'hello from signal' },
+              { type: 'file', data: 'data:image/png;base64,abc', mediaType: 'image/png' },
+            ],
             createdAt: new Date('2024-01-01T00:00:00.000Z'),
           },
-          { threadId: thread.id, resourceId: 'test-controller' },
+          { threadId: thread.id, resourceId: thread.resourceId },
         ),
       ],
     });
@@ -104,7 +101,7 @@ describe('AgentController signal history rendering', () => {
             attributes: { type: 'temporal-gap', path: '/tmp/project' },
             createdAt: new Date('2024-01-01T00:00:00.000Z'),
           },
-          { threadId: thread.id, resourceId: 'test-controller' },
+          { threadId: thread.id, resourceId: thread.resourceId },
         ),
       ],
     });
@@ -128,6 +125,7 @@ describe('AgentController signal history rendering', () => {
             timestamp: undefined,
             goalMaxTurns: undefined,
             judgeModelId: undefined,
+            goalEvaluation: undefined,
           },
         ],
       },
@@ -135,7 +133,7 @@ describe('AgentController signal history rendering', () => {
   });
 
   it('renders legacy metadata-only system-reminder signal rows with text fallback', async () => {
-    const { harness, memoryStorage, thread } = await createHarnessWithThread();
+    const { session, memoryStorage, thread } = await createControllerWithThread();
 
     await memoryStorage.saveMessages({
       messages: [
@@ -144,7 +142,7 @@ describe('AgentController signal history rendering', () => {
           role: 'signal',
           createdAt: new Date('2024-01-01T00:00:01.000Z'),
           threadId: thread.id,
-          resourceId: 'test-harness',
+          resourceId: thread.resourceId,
           content: {
             format: 2,
             parts: [{ type: 'text', text: 'legacy reminder text' }],
@@ -159,7 +157,7 @@ describe('AgentController signal history rendering', () => {
       ],
     });
 
-    expect(await harness.listMessages()).toEqual([
+    expect(await session.thread.listActiveMessages()).toEqual([
       {
         id: 'legacy-reminder-signal',
         role: 'user',
@@ -176,6 +174,7 @@ describe('AgentController signal history rendering', () => {
             timestamp: undefined,
             goalMaxTurns: undefined,
             judgeModelId: undefined,
+            goalEvaluation: undefined,
           },
         ],
       },
@@ -183,7 +182,7 @@ describe('AgentController signal history rendering', () => {
   });
 
   it('renders completed tool invocations without result payloads', async () => {
-    const { harness, memoryStorage, thread } = await createHarnessWithThread();
+    const { session, memoryStorage, thread } = await createControllerWithThread();
 
     await memoryStorage.saveMessages({
       messages: [
@@ -192,7 +191,7 @@ describe('AgentController signal history rendering', () => {
           role: 'assistant',
           createdAt: new Date('2024-01-01T00:00:02.000Z'),
           threadId: thread.id,
-          resourceId: 'test-harness',
+          resourceId: thread.resourceId,
           content: {
             format: 2,
             parts: [
@@ -212,7 +211,7 @@ describe('AgentController signal history rendering', () => {
       ],
     });
 
-    expect(await harness.listMessages()).toEqual([
+    expect(await session.thread.listActiveMessages()).toEqual([
       {
         id: 'assistant-tool-resultless',
         role: 'assistant',

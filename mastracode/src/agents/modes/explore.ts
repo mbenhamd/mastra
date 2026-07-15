@@ -5,9 +5,7 @@
  * "understand how module Y works") and uses read-only tools to explore
  * the codebase, then returns a concise summary of its findings.
  */
-import type { HarnessMode } from '@mastra/core/harness';
-
-export const fastMode: HarnessMode = {
+export const fastMode = {
   id: 'fast',
   name: 'Explore',
   description:

@@ -146,11 +146,8 @@ interface BackgroundTaskReconstructableRow extends BackgroundTaskRowBase {
   claimExpiresAt?: number;
 }
 
-type BackgroundTaskStorageRow =
-  | BackgroundTaskDiagnosticRow
-  | BackgroundTaskReconstructableRow;
+type BackgroundTaskStorageRow = BackgroundTaskDiagnosticRow | BackgroundTaskReconstructableRow;
 type ClaimableBackgroundTaskRow = BackgroundTaskReconstructableRow;
-
 ```
 
 These v1 row shapes extend Mastra core's current `BackgroundTask` row

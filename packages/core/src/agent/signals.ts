@@ -29,6 +29,15 @@ type SignalFilePart = {
  * @experimental Agent signals are experimental and may change in a future release.
  */
 export type AgentSignalContents = string | Array<TextPart | FilePart>;
+
+/** Convert signal contents to the text representation used by reminder and status surfaces. */
+export function signalContentsToText(contents: unknown): string {
+  return signalContentsToParts(contents)
+    .filter((part): part is TextPart => part.type === 'text')
+    .map(part => part.text)
+    .join('\n');
+}
+
 export type AgentSignalAttributes = Record<string, string | number | boolean | null | undefined>;
 export type AgentStateSignalMode = 'snapshot' | 'delta';
 
@@ -310,6 +319,12 @@ function contentsToSignalParts(contents: AgentSignalContents): SignalPart[] {
       ...(part.providerOptions ? { providerOptions: part.providerOptions as MastraProviderMetadata } : {}),
     };
   });
+}
+
+/** Normalize current or persisted legacy signal contents into canonical text/file parts. */
+export function signalContentsToParts(contents: unknown): SignalPart[] {
+  const normalized = legacyContentsToSignalContents(contents);
+  return normalized === undefined ? [] : contentsToSignalParts(normalized);
 }
 
 // Narrow a storage parts array down to SignalPart. Signal rows should only ever contain text/file

@@ -80,6 +80,7 @@ identity, result lookups, and error projection):
     <path style="stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#ah-wire-protocol);" d="M260 434 L279 434" />
     <path style="stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#ah-wire-protocol);" d="M500 434 L519 434" />
     <path style="stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#ah-wire-protocol);" d="M740 434 L759 434" />
+
   </svg>
   <figcaption>The wire DTO and envelope contract groups request/result lookups, conditional mutations, the SSE event envelope, and the typed error union; the bottom band is the canonical client reconnect cycle shared by §13.3d and §13.4f.</figcaption>
 </figure>

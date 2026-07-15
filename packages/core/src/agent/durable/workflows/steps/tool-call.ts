@@ -58,6 +58,7 @@ const durableToolCallInputSchema = z.object({
  * Output schema for the durable tool call step
  */
 const durableToolCallOutputSchema = durableToolCallInputSchema.extend({
+  resumeTargetToolCallId: z.string().optional(),
   result: z.any().optional(),
   error: z
     .object({
@@ -247,18 +248,36 @@ export function createDurableToolCallStep() {
         activeTools,
       } = typedInput;
 
-      // Extract resumeData from tool call arguments (autoResumeSuspendedTools path)
-      // When the LLM auto-resumes a suspended tool, it injects `resumeData` into the
-      // tool call arguments. We extract it here to skip re-suspending for approval.
-      // Mirrors the regular agent's tool-call-step.ts logic.
+      // Extract the model-facing resume controls before validating or executing the tool.
+      // A fresh provider call gets a new toolCallId, so the original call and run IDs are
+      // required to bind its resumeData to the exact persisted suspension.
       let resumeDataFromArgs: any = undefined;
+      let suspendedToolCallId: string | undefined;
+      let suppliedSuspendedToolRunId: string | undefined;
       let args: any = rawArgs;
       if (typeof rawArgs === 'object' && rawArgs !== null) {
-        const { resumeData: resumeDataFromInput, ...argsFromInput } = rawArgs as Record<string, any>;
+        const {
+          resumeData: resumeDataFromInput,
+          suspendedToolCallId: suspendedToolCallIdFromInput,
+          suspendedToolRunId: suspendedToolRunIdFromInput,
+          ...argsFromInput
+        } = rawArgs as Record<string, any>;
         args = argsFromInput;
         resumeDataFromArgs = resumeDataFromInput;
+        if (resumeDataFromInput !== undefined && resumeDataFromInput !== null) {
+          suspendedToolCallId =
+            typeof suspendedToolCallIdFromInput === 'string' && suspendedToolCallIdFromInput.length > 0
+              ? suspendedToolCallIdFromInput
+              : undefined;
+          suppliedSuspendedToolRunId =
+            typeof suspendedToolRunIdFromInput === 'string' && suspendedToolRunIdFromInput.length > 0
+              ? suspendedToolRunIdFromInput
+              : undefined;
+        }
       }
       const resumeData = resumeDataFromArgs ?? workflowResumeData;
+      const isFreshTurnResume = resumeDataFromArgs !== undefined && resumeDataFromArgs !== null;
+      const metadataToolCallId = suspendedToolCallId ?? toolCallId;
 
       // Get context from init data (the parent workflow input)
       const initData = getInitData<{
@@ -279,6 +298,7 @@ export function createDurableToolCallStep() {
 
       const { runId, runtimeBindingId, options: agentOptions, state } = initData;
       const logger = (mastra as any)?.getLogger?.();
+      const resumeIdentityDigest = createToolCallIdentityDigest({ toolCallId: metadataToolCallId, toolName, args });
       const identityDigest = createToolCallIdentityDigest({ toolCallId, toolName, args });
 
       // End the open MODEL_STEP + MODEL_GENERATION + AGENT_RUN as `suspended` before
@@ -509,28 +529,76 @@ export function createDurableToolCallStep() {
         });
       };
 
-      const suspendRecord =
+      const workflowSuspendRecord =
         suspendData && typeof suspendData === 'object' && !Array.isArray(suspendData)
           ? (suspendData as Record<string, unknown>)
           : undefined;
+
+      // A model-generated resume happens in a new workflow run, so its workflow
+      // suspendData cannot authenticate the earlier call. Read only the exact original
+      // call ID from persisted assistant metadata; never fall back by tool name.
+      const getStoredSuspendRecord = (originalToolCallId: string): Record<string, unknown> | undefined => {
+        if (!messageList) return undefined;
+        const assistantMessages = [...messageList.get.all.db()]
+          .reverse()
+          .filter(message => message.role === 'assistant');
+        for (const message of assistantMessages) {
+          const metadata =
+            typeof message.content.metadata === 'object' && message.content.metadata !== null
+              ? (message.content.metadata as Record<string, any>)
+              : undefined;
+          for (const metadataKey of ['pendingToolApprovals', 'suspendedTools'] as const) {
+            const entry = metadata?.[metadataKey]?.[originalToolCallId];
+            if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+              return entry as Record<string, unknown>;
+            }
+          }
+
+          const part = message.content.parts?.find(candidate => {
+            if (!('data' in candidate)) return false;
+            return (
+              (candidate.type === 'data-tool-call-approval' || candidate.type === 'data-tool-call-suspended') &&
+              (candidate.data as { toolCallId?: unknown; resumed?: unknown }).toolCallId === originalToolCallId &&
+              !(candidate.data as { resumed?: unknown }).resumed
+            );
+          });
+          const partData = part && 'data' in part ? part.data : undefined;
+          if (partData && typeof partData === 'object' && !Array.isArray(partData)) {
+            return partData as Record<string, unknown>;
+          }
+        }
+        return undefined;
+      };
+
+      const storedSuspendRecord =
+        isFreshTurnResume && suspendedToolCallId ? getStoredSuspendRecord(suspendedToolCallId) : undefined;
+      const suspendRecord = isFreshTurnResume ? storedSuspendRecord : workflowSuspendRecord;
       const suspensionType = suspendRecord?.type;
       const hasKnownSuspendType = suspensionType === 'approval' || suspensionType === 'suspension';
-      const hasMatchingSuspendIdentity =
+      const hasCommonSuspendIdentity =
         suspendRecord !== undefined &&
-        Object.hasOwn(suspendRecord, 'version') &&
         suspendRecord.version === 1 &&
-        Object.hasOwn(suspendRecord, 'runId') &&
-        suspendRecord.runId === runId &&
-        Object.hasOwn(suspendRecord, 'iterationCount') &&
-        suspendRecord.iterationCount === iterationCount &&
-        Object.hasOwn(suspendRecord, 'stepId') &&
         suspendRecord.stepId === DurableStepIds.TOOL_CALL &&
-        Object.hasOwn(suspendRecord, 'toolCallId') &&
-        suspendRecord.toolCallId === toolCallId &&
-        Object.hasOwn(suspendRecord, 'toolName') &&
-        suspendRecord.toolName === toolName &&
-        Object.hasOwn(suspendRecord, 'identityDigest') &&
+        suspendRecord.toolCallId === metadataToolCallId &&
+        suspendRecord.toolName === toolName;
+      const hasMatchingFreshTurnIdentity =
+        isFreshTurnResume &&
+        suspendedToolCallId !== undefined &&
+        suppliedSuspendedToolRunId !== undefined &&
+        hasCommonSuspendIdentity &&
+        suspendRecord?.originRunId === suppliedSuspendedToolRunId &&
+        suspendRecord.runId === suppliedSuspendedToolRunId &&
+        typeof suspendRecord.iterationCount === 'number' &&
+        Number.isInteger(suspendRecord.iterationCount) &&
+        suspendRecord.iterationCount >= 0 &&
+        suspendRecord.identityDigest === resumeIdentityDigest;
+      const hasMatchingWorkflowIdentity =
+        !isFreshTurnResume &&
+        hasCommonSuspendIdentity &&
+        suspendRecord?.runId === runId &&
+        suspendRecord.iterationCount === iterationCount &&
         suspendRecord.identityDigest === identityDigest;
+      const hasMatchingSuspendIdentity = hasMatchingFreshTurnIdentity || hasMatchingWorkflowIdentity;
       const hasInvalidSuspendEnvelope =
         resumeData !== undefined && (!hasKnownSuspendType || !hasMatchingSuspendIdentity);
       const isApprovalResume = suspensionType === 'approval' && hasMatchingSuspendIdentity;
@@ -540,7 +608,7 @@ export function createDurableToolCallStep() {
         hasValidApprovalDecision && suspendRecord?.approvalSource === 'tool-execution';
       const persistedApprovalGrant =
         suspensionType === 'suspension' && hasMatchingSuspendIdentity
-          ? parseToolApprovalGrant(suspendRecord?.approval, toolCallId)
+          ? parseToolApprovalGrant(suspendRecord?.approval, metadataToolCallId)
           : undefined;
 
       // 2. Approval policy input. Prefer the live policy on the in-process
@@ -557,6 +625,8 @@ export function createDurableToolCallStep() {
       // Mirrors the regular agent's `addToolMetadata()`.
       const addToolMetadata = (opts: {
         type: 'approval' | 'suspension';
+        approvalSource?: 'tool-gate' | 'tool-execution';
+        approval?: { id: string; approved: boolean; reason?: string };
         resumeSchema?: string;
         suspendPayload?: unknown;
       }) => {
@@ -578,11 +648,18 @@ export function createDurableToolCallStep() {
         }
         metadata[metadataKey] = metadata[metadataKey] || {};
         metadata[metadataKey][toolCallId] = {
+          version: 1,
+          originRunId: runId,
+          stepId: DurableStepIds.TOOL_CALL,
+          iterationCount,
           toolCallId,
           toolName,
+          identityDigest,
           args,
           type: opts.type,
           runId,
+          ...(opts.approvalSource ? { approvalSource: opts.approvalSource } : {}),
+          ...(opts.approval ? { approval: opts.approval } : {}),
           ...(opts.type === 'suspension' ? { suspendPayload: opts.suspendPayload } : {}),
           ...(opts.resumeSchema ? { resumeSchema: opts.resumeSchema } : {}),
         };
@@ -602,12 +679,7 @@ export function createDurableToolCallStep() {
             typeof content.metadata === 'object' && content.metadata !== null
               ? (content.metadata as Record<string, any>)
               : undefined;
-          return (
-            !!meta?.[metadataKey]?.[toolCallId] ||
-            Object.values(meta?.[metadataKey] ?? {}).some(
-              (e: any) => e?.toolCallId === toolCallId || e?.toolName === toolName,
-            )
-          );
+          return !!meta?.[metadataKey]?.[metadataToolCallId];
         });
         if (!lastAssistantMessage?.content) return;
         const meta =
@@ -615,13 +687,9 @@ export function createDurableToolCallStep() {
             ? (lastAssistantMessage.content.metadata as Record<string, any>)
             : undefined;
         if (!meta?.[metadataKey]) return;
-        // Resolve key: exact toolCallId, then by entry toolCallId, then by toolName
+        // Resume authentication is call-ID based. Remove only the exact persisted entry.
         const entries = meta[metadataKey] as Record<string, any>;
-        const key = entries[toolCallId]
-          ? toolCallId
-          : (Object.keys(entries).find(k => entries[k]?.toolCallId === toolCallId) ??
-            Object.keys(entries).find(k => entries[k]?.toolName === toolName) ??
-            (entries[toolName] ? toolName : undefined));
+        const key = entries[metadataToolCallId] ? metadataToolCallId : undefined;
         if (key) {
           delete entries[key];
           if (Object.keys(entries).length === 0) {
@@ -643,13 +711,17 @@ export function createDurableToolCallStep() {
         };
       }
 
+      const resumeTarget = metadataToolCallId !== toolCallId ? { resumeTargetToolCallId: metadataToolCallId } : {};
+
       if (hasValidApprovalDecision && approvalDecision.approved === false) {
         // Remove pending-approval metadata since we're resuming with a decision.
         await removeToolMetadata('approval');
         return {
           ...typedInput,
+          args,
+          ...resumeTarget,
           approval: {
-            id: toolCallId,
+            id: metadataToolCallId,
             approved: false,
             reason: approvalDecision.reason ?? 'Tool call was not approved by the user',
           },
@@ -722,7 +794,7 @@ export function createDurableToolCallStep() {
         }
 
         // Add approval metadata to message before persisting
-        addToolMetadata({ type: 'approval', resumeSchema });
+        addToolMetadata({ type: 'approval', approvalSource: 'tool-gate', resumeSchema });
 
         // Flush messages before suspension
         await doFlush();
@@ -762,7 +834,7 @@ export function createDurableToolCallStep() {
       const approvalGrant = hasValidApprovalDecision
         ? ({
             approval: {
-              id: toolCallId,
+              id: metadataToolCallId,
               approved: true as const,
               ...(approvalDecision.reason !== undefined ? { reason: approvalDecision.reason } : {}),
             },
@@ -811,6 +883,8 @@ export function createDurableToolCallStep() {
       if (!tool.execute) {
         return {
           ...typedInput,
+          args,
+          ...resumeTarget,
           result: undefined,
           ...(approvalGrant ?? {}),
         };
@@ -900,7 +974,11 @@ export function createDurableToolCallStep() {
             }
 
             // Add approval metadata to message before persisting
-            addToolMetadata({ type: 'approval', resumeSchema: approvalResumeSchema });
+            addToolMetadata({
+              type: 'approval',
+              approvalSource: 'tool-execution',
+              resumeSchema: approvalResumeSchema,
+            });
 
             await doFlush();
 
@@ -961,6 +1039,7 @@ export function createDurableToolCallStep() {
             // Add suspension metadata to message before persisting
             addToolMetadata({
               type: 'suspension',
+              approval: approvalGrant?.approval,
               suspendPayload,
               resumeSchema: suspendOptions?.resumeSchema,
             });
@@ -1204,6 +1283,7 @@ export function createDurableToolCallStep() {
                 return {
                   ...typedInput,
                   args: cleanedArgs,
+                  ...resumeTarget,
                   result: `Background task resumed. Task ID: ${task.id}. The tool "${toolName}" is running in the background. You will be notified when it completes.`,
                   ...(approvalGrant ?? {}),
                 };
@@ -1224,6 +1304,7 @@ export function createDurableToolCallStep() {
               return {
                 ...typedInput,
                 args: cleanedArgs,
+                ...resumeTarget,
                 result: `Background task restarted. Task ID: ${task.id}. The tool "${toolName}" is running in the background. You will be notified when it completes.`,
               };
             }
@@ -1249,6 +1330,7 @@ export function createDurableToolCallStep() {
               return {
                 ...typedInput,
                 args: cleanedArgs,
+                ...resumeTarget,
                 result: `Background task started. Task ID: ${task.id}. The tool "${toolName}" is running in the background. You will be notified when it completes.`,
                 ...(approvalGrant ?? {}),
               };
@@ -1319,6 +1401,8 @@ export function createDurableToolCallStep() {
 
         return {
           ...typedInput,
+          args,
+          ...resumeTarget,
           result,
           ...(approvalGrant ?? {}),
         };
@@ -1361,6 +1445,8 @@ export function createDurableToolCallStep() {
 
         return {
           ...typedInput,
+          args,
+          ...resumeTarget,
           error: toolError,
           ...(approvalGrant ?? {}),
         };

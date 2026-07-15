@@ -1,10 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const harnessConstructorMock = vi.fn();
+const runtimeConstructorMock = vi.fn();
 const createStorageMock = vi.fn((): { storage: unknown; backend?: string } => ({ storage: {} }));
 const createVectorStoreMock = vi.fn(() => ({}));
-const acquireThreadLockMock = vi.fn();
-const releaseThreadLockMock = vi.fn();
 const syncGatewaysMock = vi.fn();
 
 vi.mock('@mastra/core/agent', () => ({
@@ -38,6 +36,8 @@ vi.mock('@mastra/core/processors', () => ({
 }));
 
 vi.mock('@mastra/core/storage', () => ({
+  InMemoryDB: class {},
+  InMemoryHarness: class {},
   MastraCompositeStore: class {
     constructor(readonly config: unknown) {}
   },
@@ -62,17 +62,28 @@ vi.mock('@mastra/observability', () => ({
 
 vi.mock('../agents/instructions.js', () => ({ getDynamicInstructions: vi.fn() }));
 vi.mock('../agents/memory.js', () => ({ getDynamicMemory: vi.fn(() => vi.fn()) }));
-vi.mock('../agents/model.js', () => ({ getDynamicModel: vi.fn(), resolveModel: vi.fn() }));
+vi.mock('../agents/model.js', () => ({
+  createMastraCodeGateway: vi.fn(() => ({})),
+  getDynamicModel: vi.fn(),
+  getGoalJudgeModel: vi.fn(),
+  resolveModel: vi.fn(),
+}));
 vi.mock('../agents/prompts/agent-instructions.js', () => ({ getStaticallyLoadedInstructionPaths: vi.fn(() => []) }));
 vi.mock('../agents/subagents/execute.js', () => ({ executeSubagent: { id: 'execute' } }));
 vi.mock('../agents/subagents/explore.js', () => ({ exploreSubagent: { id: 'explore' } }));
 vi.mock('../agents/subagents/plan.js', () => ({ planSubagent: { id: 'plan' } }));
 vi.mock('../agents/thread-caveman-state.js', () => ({
-  attachCavemanThreadStatePersistence: vi.fn(),
-  restoreCavemanForCurrentThread: vi.fn(() => Promise.resolve()),
+  attachOMThreadStatePersistence: vi.fn(),
+  restoreOMThreadStateForCurrentThread: vi.fn(() => Promise.resolve()),
 }));
-vi.mock('../agents/tools.js', () => ({ createDynamicTools: vi.fn(() => ({})) }));
-vi.mock('../agents/workspace.js', () => ({ getDynamicWorkspace: vi.fn() }));
+vi.mock('../agents/tools.js', () => ({
+  createDynamicTools: vi.fn(() => ({})),
+  createToolHooks: vi.fn(() => ({})),
+}));
+vi.mock('../agents/workspace.js', () => ({
+  getDynamicWorkspace: vi.fn(),
+  getGoalJudgeTools: vi.fn(),
+}));
 vi.mock('../auth/storage.js', () => ({
   AuthStorage: class {
     get() {
@@ -97,6 +108,16 @@ vi.mock('../evals/scorers/index.js', () => ({
 vi.mock('../hooks/index.js', () => ({
   HookManager: class {
     setSessionId() {}
+  },
+}));
+vi.mock('../harness/index.js', () => ({
+  createHarnessV1SubagentAgents: vi.fn(() => ({})),
+  MASTRACODE_HARNESS_NAME: 'mastra-code',
+  MastraCodeHarnessRuntime: class {
+    constructor(config: unknown) {
+      runtimeConstructorMock(config);
+    }
+    subscribe() {}
   },
 }));
 vi.mock('../mcp/index.js', () => ({ createMcpManager: vi.fn() }));
@@ -153,60 +174,40 @@ vi.mock('../utils/storage-factory.js', () => ({
   createStorage: createStorageMock,
   createVectorStore: createVectorStoreMock,
 }));
-vi.mock('../utils/thread-lock.js', () => ({
-  acquireThreadLock: acquireThreadLockMock,
-  releaseThreadLock: releaseThreadLockMock,
-}));
-
-describe('createMastraCode thread lock startup config', () => {
+describe('createMastraCode cross-process signal startup config', () => {
   beforeEach(() => {
     vi.resetModules();
-    harnessConstructorMock.mockReset();
+    runtimeConstructorMock.mockReset();
     createStorageMock.mockClear();
     createVectorStoreMock.mockClear();
-    acquireThreadLockMock.mockClear();
-    releaseThreadLockMock.mockClear();
     syncGatewaysMock.mockClear();
   });
 
-  it('keeps file thread locks when cross-process PubSub mode is disabled', async () => {
+  it('leaves signal routing unset when cross-process PubSub mode is disabled', async () => {
     const { createMastraCode } = await import('../index.js');
 
-    await createMastraCode();
+    const result = await createMastraCode();
 
-    expect(harnessConstructorMock).toHaveBeenCalled();
-    const harnessConfig = harnessConstructorMock.mock.calls[0]?.[0] as
-      | { pubsub?: unknown; threadLock?: unknown }
-      | undefined;
-    expect(harnessConfig?.pubsub).toBeUndefined();
-    expect(harnessConfig?.threadLock).toEqual({
-      acquire: acquireThreadLockMock,
-      release: releaseThreadLockMock,
-    });
+    expect(runtimeConstructorMock).toHaveBeenCalled();
+    expect(result.signalsPubSub).toBeUndefined();
   });
 
-  it('rejects cross-process PubSub mode before storage or Harness setup when PubSub is missing', async () => {
+  it('rejects cross-process PubSub mode before storage or runtime setup when PubSub is missing', async () => {
     const { createMastraCode } = await import('../index.js');
 
-    await expect(createMastraCode({ crossProcessPubSub: true })).rejects.toThrow(
-      'crossProcessPubSub requires config.pubsub',
-    );
+    await expect(createMastraCode({ crossProcessPubSub: true })).rejects.toThrow('requires a pubsub instance');
 
     expect(createStorageMock).not.toHaveBeenCalled();
-    expect(harnessConstructorMock).not.toHaveBeenCalled();
+    expect(runtimeConstructorMock).not.toHaveBeenCalled();
   });
 
-  it('uses configured PubSub instead of file thread locks for cross-process PubSub mode', async () => {
+  it('uses configured PubSub for cross-process signal routing', async () => {
     const pubsub = { id: 'shared-pubsub' };
     const { createMastraCode } = await import('../index.js');
 
-    await createMastraCode({ pubsub: pubsub as never, crossProcessPubSub: true });
+    const result = await createMastraCode({ pubsub: pubsub as never, crossProcessPubSub: true });
 
-    expect(harnessConstructorMock).toHaveBeenCalled();
-    const harnessConfig = harnessConstructorMock.mock.calls[0]?.[0] as
-      | { pubsub?: unknown; threadLock?: unknown }
-      | undefined;
-    expect(harnessConfig?.pubsub).toBe(pubsub);
-    expect(harnessConfig?.threadLock).toBeUndefined();
+    expect(runtimeConstructorMock).toHaveBeenCalled();
+    expect(result.signalsPubSub).toBe(pubsub);
   });
 });

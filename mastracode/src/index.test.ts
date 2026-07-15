@@ -66,6 +66,10 @@ vi.mock('./agents/model.js', () => ({
 vi.mock('./agents/subagents/execute.js', () => ({ executeSubagent: {} }));
 vi.mock('./agents/subagents/explore.js', () => ({ exploreSubagent: {} }));
 vi.mock('./agents/subagents/plan.js', () => ({ planSubagent: {} }));
+vi.mock('./agents/thread-caveman-state.js', () => ({
+  attachOMThreadStatePersistence: vi.fn(),
+  restoreOMThreadStateForCurrentThread: vi.fn(() => Promise.resolve()),
+}));
 vi.mock('./agents/tools.js', () => ({ createDynamicTools: vi.fn(), createToolHooks: vi.fn() }));
 vi.mock('./agents/workspace.js', () => ({ getDynamicWorkspace: vi.fn(), getGoalJudgeTools: vi.fn() }));
 
@@ -82,6 +86,13 @@ vi.mock('./auth/storage.js', () => ({
 }));
 
 vi.mock('./hooks/index.js', () => ({ HookManager: class {} }));
+vi.mock('./harness/index.js', () => ({
+  createHarnessV1SubagentAgents: vi.fn(() => ({})),
+  MASTRACODE_HARNESS_NAME: 'mastra-code',
+  MastraCodeHarnessRuntime: class {
+    subscribe() {}
+  },
+}));
 vi.mock('./mcp/index.js', () => ({ createMcpManager: vi.fn() }));
 
 vi.mock('./onboarding/packs.js', () => ({

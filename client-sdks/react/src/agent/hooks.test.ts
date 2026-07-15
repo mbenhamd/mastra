@@ -943,6 +943,44 @@ describe('useChat forwards clientTools', () => {
     expect(messageCalls[0]?.[0].ifIdle.streamOptions.clientTools).toBe(clientTools);
   });
 
+  it('keeps clientTools when sendMessage falls back to the legacy sendSignal route', async () => {
+    sendMessageMock.mockRejectedValueOnce({
+      status: 400,
+      message: 'No active agent run found for signal target',
+    });
+    const perSendClientTools = {
+      fallbackTool: {
+        id: 'fallbackTool',
+        description: 'fallback tool',
+        execute: vi.fn(),
+      },
+    };
+    const { result } = renderHook(
+      () =>
+        useChat({
+          agentId: 'test-agent',
+          resourceId: 'resource-1',
+          threadId: 'thread-1',
+          clientTools,
+          enableThreadSignals: true,
+        }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.sendMessage({
+        mode: 'stream',
+        message: 'fallback',
+        threadId: 'thread-1',
+        clientTools: perSendClientTools,
+      });
+    });
+
+    const signalCalls = sendSignalMock.mock.calls as unknown as Array<[any]>;
+    expect(signalCalls).toHaveLength(1);
+    expect(signalCalls[0]?.[0].ifIdle.streamOptions.clientTools).toBe(perSendClientTools);
+  });
+
   it('keeps per-send clientTools and continuation options on sendMessage', async () => {
     keepSubscriptionOpen = true;
     const perSendClientTools = {

@@ -1842,7 +1842,7 @@ export class AgentController<TState = {}> {
           if (part.toolInvocation) {
             const inv = part.toolInvocation;
             content.push({ type: 'tool_call', id: inv.toolCallId, name: inv.toolName, args: inv.args });
-            if (inv.state === 'result' && inv.result !== undefined) {
+            if (inv.state === 'result') {
               const partProviderMetadata = part.providerMetadata as Record<string, unknown> | undefined;
               content.push({
                 type: 'tool_result',

@@ -391,7 +391,7 @@ describe('Harness signal messages', () => {
       activeRunId: () => 'run-1',
     });
     const queueMessage = vi.spyOn(agent, 'queueMessage').mockReturnValue({
-      accepted: true,
+      accepted: Promise.resolve({ action: 'deliver', runId: 'queued-run-id' }),
       runId: 'queued-run-id',
       signal: createSignal({ type: 'user', contents: 'queued follow-up' }),
     });
@@ -825,13 +825,10 @@ describe('Harness signal messages', () => {
         data: {
           id: 'signal-file-1',
           type: 'user-message',
-          contents: {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Review this' },
-              { type: 'file', data: 'data:text/plain;base64,aGVsbG8=', mediaType: 'text/plain', filename: 'note.txt' },
-            ],
-          },
+          contents: [
+            { type: 'text', text: 'Review this' },
+            { type: 'file', data: 'data:text/plain;base64,aGVsbG8=', mediaType: 'text/plain', filename: 'note.txt' },
+          ],
           createdAt: '2026-05-04T00:00:00.000Z',
         },
       },

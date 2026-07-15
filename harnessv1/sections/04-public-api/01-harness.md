@@ -52,6 +52,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-harness-api);" d="M470 97 C350 170 285 235 275 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-harness-api);" d="M520 97 L520 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-harness-api);" d="M575 97 C690 170 755 235 765 299" />
+
   </svg>
   <figcaption>The public Harness class is a session-first control surface. Channel bridges, history helpers, background diagnostics, workspace administration, and force-delete operations live behind internal or operator boundaries rather than app-facing methods.</figcaption>
 </figure>
@@ -95,12 +96,14 @@ class Harness<TState = Record<string, unknown>> {
     threadId: string | { fresh: true };
     resourceId: string;
     sessionId?: string;
-    parentSessionId?: string;       // mark this session as a child of another
+    parentSessionId?: string; // mark this session as a child of another
   }): Promise<Session<TState>>;
 
-  listSessions(opts: {
-    resourceId: string;
-  } & ListSessionsOptions): Promise<ListPage<SessionListItem>>;
+  listSessions(
+    opts: {
+      resourceId: string;
+    } & ListSessionsOptions,
+  ): Promise<ListPage<SessionListItem>>;
 
   // Catalogs
   listModes(): HarnessMode[];

@@ -78,7 +78,7 @@ Write commit messages that explain WHY, not just WHAT. Match the repo's existing
 Use \`gh pr create\`. Include a summary of what changed and a test plan. Word the pull request title/description to explain the entire unit of work being shipped, worded to explain it to someone who doesn't know anything about the work being shipped. Do not add details of fixes that were needed along the way.
 
 # Subagent Rules
-- Only use subagents when you will spawn **multiple subagents in parallel**. If you only need one task done, do it yourself instead of delegating to a single subagent. Exception: the **audit-tests** subagent may be used on its own.
+- Only use subagents when you will spawn **multiple subagents in parallel**. If you only need one task done, do it yourself instead of delegating to a single subagent.
 - Use \`spawn_subagent\` with a self-contained task that includes every file path, constraint, and relevant finding the subagent needs.
 - Set \`forked: true\` only for context-dependent parallel work that needs this conversation, prior tool results, or your current tool environment.
 - Without \`forked: true\`, do not assume the subagent can see this conversation, prior tool results, or your current tool environment unless you included that context in the task.

@@ -245,7 +245,7 @@ export interface AdmitWorkflowNestedRunInput extends BindWorkflowNestedRunOwners
   recoveryAncestry: WorkflowTerminalRecoveryAncestryV1;
   /** Canonical graph identity expected for retained or newly initialized child state. */
   expectedChildGraphFingerprint: string;
-  /** Initial child state created only when the durable child row is absent. */
+  /** Pending or running child state created only when the durable child row is absent. */
   initialChildSnapshot?: {
     snapshot: WorkflowRunState;
     resourceId?: string;

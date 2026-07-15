@@ -67,7 +67,7 @@ type RequestContextStub = {
 
 function createRequestContext(state: Record<string, unknown>): RequestContextStub {
   return {
-    get: vi.fn(key => (key === 'harness' ? { session: { state: { get: () => state } } } : undefined)),
+    get: vi.fn(key => (key === 'harness' ? { state, getState: () => state } : undefined)),
   };
 }
 

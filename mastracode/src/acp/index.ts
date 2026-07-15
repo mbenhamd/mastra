@@ -1,5 +1,3 @@
-import type { HarnessMode } from '@mastra/core/harness';
-
 import { createMastraCode } from '../index.js';
 import { releaseAllThreadLocks } from '../utils/thread-lock.js';
 import { setAutoApprove } from './event-mapper.js';
@@ -32,13 +30,6 @@ export async function acpMain(options?: { dangerousAutoApprove?: boolean }): Pro
 
     const { harness, mcpManager, signalsPubSub } = result;
 
-    // Default modes (same as createMastraCode defaults)
-    const modes: HarnessMode[] = [
-      { id: 'build', name: 'Build' },
-      { id: 'plan', name: 'Plan' },
-      { id: 'fast', name: 'Fast' },
-    ];
-
     // Cleanup function (mirrors main.ts asyncCleanup)
     const cleanup = async () => {
       releaseAllThreadLocks();
@@ -64,7 +55,7 @@ export async function acpMain(options?: { dangerousAutoApprove?: boolean }): Pro
     process.on('SIGINT', handleSignal);
     process.on('SIGTERM', handleSignal);
 
-    await runAcpServer(harness, modes, cleanup);
+    await runAcpServer(harness, cleanup);
   } catch (error) {
     process.stderr.write(`[acp] Fatal error: ${error}\n`);
     // eslint-disable-next-line no-console

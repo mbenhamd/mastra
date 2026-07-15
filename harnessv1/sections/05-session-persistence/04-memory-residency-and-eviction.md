@@ -6,10 +6,10 @@ cap is exceeded or a session has been idle past the configured timeout:
 1. The in-memory `Session` flushes any dirty state to storage.
 2. The instance is dropped from the live map.
 3. The active record stays in storage with `closedAt: undefined` and no closing
-marker.
+   marker.
 4. The next `harness.session({ sessionId })` call rehydrates transparently.
 
-**Pending interrupts pin the session in memory.** A session is *not* eligible
+**Pending interrupts pin the session in memory.** A session is _not_ eligible
 for idle-timeout eviction while any of `pendingApproval`, `pendingSuspension`,
 `pendingQuestion`, or `pendingPlan` is set. For parent-bound subagent sessions,
 a live descendant with one of those pending fields also pins the parent/root
@@ -44,10 +44,11 @@ outlive individual session evictions and are cleaned up only by
 an explicit workspace-admin/operator teardown path or shutdown.
 
 Configuration knobs (see §9):
+
 - `sessions.maxLive` — cap on hydrated sessions (default `Infinity` — no cap;
-opt in to a finite cap if you need eviction-by-pressure).
+  opt in to a finite cap if you need eviction-by-pressure).
 - `sessions.idleTimeoutMs` — auto-evict after this period of no activity
-(default `2 hours`). The check is skipped while a session has a pending
-approval/suspension/question/plan.
+  (default `2 hours`). The check is skipped while a session has a pending
+  approval/suspension/question/plan.
 - `sessions.flushDebounceMs` — debounce window for writing dirty state (default
-`500ms`).
+  `500ms`).

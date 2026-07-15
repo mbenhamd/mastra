@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockGatewayRegistrySyncGateways = vi.fn();
 const mockGatewayRegistryGetProviders = vi.fn(() => ({}));
+const mockProviderRegistry: Record<string, { apiKeyEnvVar?: string | string[] }> = {};
 const mockGatewayRegistryGetInstance = vi.fn(() => ({
   syncGateways: mockGatewayRegistrySyncGateways,
   getProviders: mockGatewayRegistryGetProviders,
@@ -11,7 +12,7 @@ vi.mock('@mastra/core/llm', () => ({
   GatewayRegistry: {
     getInstance: mockGatewayRegistryGetInstance,
   },
-  PROVIDER_REGISTRY: {},
+  PROVIDER_REGISTRY: mockProviderRegistry,
 }));
 
 vi.mock('@mastra/core/agent', () => ({
@@ -24,6 +25,8 @@ vi.mock('@mastra/core/agent', () => ({
 }));
 
 const mockAgentConstructor = vi.fn();
+const mockCreateMastraCodeGateway = vi.fn(() => ({}));
+const mockResolveModel = vi.fn();
 
 const mockHarnessConstructor = vi.fn();
 const mockLoadSettings = vi.fn();
@@ -91,6 +94,7 @@ vi.mock('@mastra/core/harness', () => ({
 
 vi.mock('../harness/index.js', () => ({
   createHarnessV1SubagentAgents: vi.fn(() => ({})),
+  MASTRACODE_HARNESS_NAME: 'mastra-code',
   MastraCodeHarnessRuntime: class {
     constructor(config: unknown) {
       mockHarnessConstructor(config);
@@ -100,6 +104,9 @@ vi.mock('../harness/index.js', () => ({
     }
     getCurrentThreadId() {
       return mockHarnessGetCurrentThreadId();
+    }
+    getResourceId() {
+      return 'resource-1';
     }
     getState() {
       return mockHarnessState;
@@ -142,9 +149,10 @@ vi.mock('../agents/memory.js', () => ({
 }));
 
 vi.mock('../agents/model.js', () => ({
+  createMastraCodeGateway: mockCreateMastraCodeGateway,
   getDynamicModel: vi.fn(),
   getGoalJudgeModel: vi.fn(),
-  resolveModel: resolveModelMock,
+  resolveModel: mockResolveModel,
 }));
 
 vi.mock('../agents/subagents/execute.js', () => ({
@@ -166,6 +174,7 @@ vi.mock('../agents/tools.js', () => ({
 
 vi.mock('../agents/workspace.js', () => ({
   getDynamicWorkspace: vi.fn(),
+  getGoalJudgeTools: vi.fn(),
 }));
 
 vi.mock('../auth/storage.js', () => ({
@@ -203,6 +212,7 @@ vi.mock('../onboarding/settings.js', () => ({
   getCustomProviderId: vi.fn(),
   loadSettings: mockLoadSettings,
   MEMORY_GATEWAY_PROVIDER: 'mastra',
+  OBSERVABILITY_AUTH_PREFIX: 'observability:',
   resolveModelDefaults: vi.fn(() => ({ build: '', plan: '', fast: '' })),
   resolveOmModel: vi.fn(() => ''),
   resolveOmRoleModel: vi.fn(() => ''),
@@ -223,6 +233,7 @@ vi.mock('../providers/openai-codex.js', () => ({
 }));
 
 vi.mock('../providers/github-copilot.js', () => ({
+  getCopilotModelCatalog: vi.fn(() => Promise.resolve([])),
   setAuthStorage: vi.fn(),
 }));
 
@@ -239,7 +250,7 @@ vi.mock('../tui/theme.js', () => ({
 }));
 
 vi.mock('../utils/gateway-sync.js', () => ({
-  syncGateways: vi.fn(),
+  syncGateways: mockGatewayRegistrySyncGateways,
 }));
 
 vi.mock('../utils/project.js', () => ({
@@ -280,6 +291,11 @@ describe('createMastraCode', () => {
     mockGatewayRegistryGetProviders.mockReset();
     mockGatewayRegistryGetProviders.mockReturnValue({});
     mockGatewayRegistryGetInstance.mockClear();
+    for (const key of Object.keys(mockProviderRegistry)) delete mockProviderRegistry[key];
+    delete process.env.MASTRA_GATEWAY_API_KEY;
+    delete process.env.MASTRA_GATEWAY_URL;
+    delete process.env.MC_E2E_PRIMARY_KEY;
+    delete process.env.MC_E2E_SECONDARY_KEY;
     mockCreateStorage.mockReset();
     mockCreateStorage.mockReturnValue(createMockStorageResult());
     mockCreateVectorStore.mockReset();
@@ -298,6 +314,9 @@ describe('createMastraCode', () => {
     mockLoadSettings.mockReset();
     mockLoadSettings.mockReturnValue(createMockSettings());
     mockAgentConstructor.mockReset();
+    mockCreateMastraCodeGateway.mockReset();
+    mockCreateMastraCodeGateway.mockReturnValue({});
+    mockResolveModel.mockReset();
     mockHarnessConstructor.mockReset();
     mockGatewayRegistryGetInstance.mockImplementation(() => ({
       syncGateways: mockGatewayRegistrySyncGateways,
@@ -305,45 +324,42 @@ describe('createMastraCode', () => {
     }));
   });
 
-  it('registers the MastraCode gateway and app-provided model hooks on Harness', async () => {
+  it('constructs the MastraCode gateway and registers app-provided model hooks on the runtime', async () => {
     const { createMastraCode } = await import('../index.js');
     const subagent = { id: 'review', name: 'Review', instructions: 'Review changes' };
 
     await createMastraCode({ subagents: [subagent as any] });
 
-    expect(createMastraCodeGatewayMock).toHaveBeenCalledWith({
+    expect(mockCreateMastraCodeGateway).toHaveBeenCalledWith({
       mastraGatewayBaseUrl: 'https://gateway-api.mastra.ai',
       mastraGatewayApiKey: undefined,
       routeThroughMastraGateway: false,
       settingsPath: undefined,
     });
 
-    const harnessConfig = harnessConstructorMock.mock.calls[0]?.[0] as
+    const runtimeConfig = mockHarnessConstructor.mock.calls[0]?.[0] as
       | {
-          gateways?: unknown[];
           resolveModel?: unknown;
           modelAuthChecker?: unknown;
           customModelCatalogProvider?: unknown;
           subagents?: unknown[];
         }
       | undefined;
-    expect(harnessConfig?.gateways).toEqual([mastraCodeGatewayMock]);
-    expect(harnessConfig?.subagents).toEqual([subagent]);
-    expect(harnessConfig?.resolveModel).toBe(resolveModelMock);
-    expect(createMastraCodeModelCatalogProviderMock).toHaveBeenCalledWith(mastraCodeGatewayMock);
-    expect(harnessConfig?.modelAuthChecker).toBeUndefined();
-    expect(harnessConfig?.customModelCatalogProvider).toBe(mastraCodeCatalogProviderMock);
+    expect(runtimeConfig?.subagents).toEqual([subagent]);
+    expect(runtimeConfig?.resolveModel).toBe(mockResolveModel);
+    expect(runtimeConfig?.modelAuthChecker).toEqual(expect.any(Function));
+    expect(runtimeConfig?.customModelCatalogProvider).toEqual(expect.any(Function));
   }, 10_000);
 
   it('uses configured memory gateway settings when creating the MastraCode gateway', async () => {
     const settings = createMockSettings();
     settings.memoryGateway = { baseUrl: 'https://gateway.example.com/v1' };
-    loadSettingsMock.mockReturnValue(settings);
+    mockLoadSettings.mockReturnValue(settings);
     const { createMastraCode } = await import('../index.js');
 
     await createMastraCode({ settingsPath: '/tmp/settings.json' });
 
-    expect(createMastraCodeGatewayMock).toHaveBeenCalledWith(
+    expect(mockCreateMastraCodeGateway).toHaveBeenCalledWith(
       expect.objectContaining({
         mastraGatewayBaseUrl: 'https://gateway.example.com',
         settingsPath: '/tmp/settings.json',
@@ -352,7 +368,7 @@ describe('createMastraCode', () => {
   });
 
   it('treats registry providers with any configured API-key env var as startup provider access', async () => {
-    providerRegistryMock['multi-env-provider'] = {
+    mockProviderRegistry['multi-env-provider'] = {
       apiKeyEnvVar: ['MC_E2E_PRIMARY_KEY', 'MC_E2E_SECONDARY_KEY'],
     };
     process.env.MC_E2E_SECONDARY_KEY = 'configured';
@@ -363,19 +379,18 @@ describe('createMastraCode', () => {
     expect(mockGatewayRegistryGetInstance).toHaveBeenCalledWith({ useDynamicLoading: true });
   }, 10_000);
 
-  it('starts gateway sync in the background after loading stored API keys', async () => {
-    let resolveSync: (() => void) | undefined;
-    mockGatewayRegistrySyncGateways.mockReturnValue(
-      new Promise<void>(resolve => {
-        resolveSync = resolve;
-      }),
-    );
+  it('defers gateway sync through a non-immediate heartbeat', async () => {
     const { createMastraCode } = await import('../index.js');
 
     await expect(createMastraCode()).resolves.toBeTruthy();
 
-    expect(mockGatewayRegistrySyncGateways).toHaveBeenCalledWith(true);
-    resolveSync?.();
+    const runtimeConfig = mockHarnessConstructor.mock.calls[0]?.[0] as
+      | { heartbeatHandlers?: Array<{ id?: string; immediate?: boolean; handler?: () => unknown }> }
+      | undefined;
+    expect(runtimeConfig?.heartbeatHandlers).toEqual([
+      expect.objectContaining({ id: 'gateway-sync', immediate: false, handler: expect.any(Function) }),
+    ]);
+    expect(mockGatewayRegistrySyncGateways).not.toHaveBeenCalled();
   });
 
   it('always configures dynamic local memory at startup', async () => {
@@ -394,22 +409,24 @@ describe('createMastraCode', () => {
     );
   });
 
-  it('keeps thread locks enabled for configured PubSub unless cross-process mode is explicit', async () => {
+  it('uses configured PubSub for signal routing without requiring cross-process mode', async () => {
     const pubsub = {} as any;
     const { createMastraCode } = await import('../index.js');
 
-    await createMastraCode({ pubsub, unixSocketPubSub: true });
+    const result = await createMastraCode({ pubsub, unixSocketPubSub: true });
 
     expect(mockHarnessConstructor).toHaveBeenCalled();
+    expect(result.signalsPubSub).toBe(pubsub);
   });
 
-  it('skips thread locks for configured PubSub when cross-process mode is explicit', async () => {
+  it('uses configured PubSub when cross-process mode is explicit', async () => {
     const pubsub = {} as any;
     const { createMastraCode } = await import('../index.js');
 
-    await createMastraCode({ pubsub, crossProcessPubSub: true });
+    const result = await createMastraCode({ pubsub, crossProcessPubSub: true });
 
     expect(mockHarnessConstructor).toHaveBeenCalled();
+    expect(result.signalsPubSub).toBe(pubsub);
   });
 
   it('restores the current thread caveman observation setting at startup', async () => {
@@ -525,27 +542,27 @@ describe('createMastraCode', () => {
     expect(agentConfig?.errorProcessors?.map(processor => processor.id)).toContain('provider-history-compat');
   });
 
-  it('configures GitHubSignals as an input processor for local PR subscriptions', async () => {
+  it('configures GitHubSignals as a native signal provider for local PR subscriptions', async () => {
     mockLoadSettings.mockReturnValue({
       ...createMockSettings(),
       signals: { unixSocketPubSub: false, experimentalGithubSignals: true },
     });
     mockHarnessGetCurrentThreadId.mockReturnValue('thread-1');
     mockHarnessListThreads.mockResolvedValue([{ id: 'thread-1', resourceId: 'thread-resource', metadata: {} }]);
-    const { GithubSignals } = await import('../github-signals/index.js');
+    const { GithubSignals } = await import('@mastra/github-signals');
     const startPollingForThread = vi.spyOn(GithubSignals.prototype, 'startPollingForThread').mockResolvedValue(true);
     const { createMastraCode } = await import('../index.js');
 
     await createMastraCode();
 
     expect(mockAgentConstructor).toHaveBeenCalled();
-    const agentConfig = mockAgentConstructor.mock.calls[0]?.[0] as
-      | { inputProcessors?: Array<{ id?: string }> }
-      | undefined;
-    expect(agentConfig?.inputProcessors?.map(processor => processor.id)).toContain('github-signals');
-    expect(startPollingForThread).toHaveBeenCalledWith(
-      { threadId: 'thread-1', resourceId: 'thread-resource' },
-      { pollImmediately: true },
-    );
+    const agentConfig = mockAgentConstructor.mock.calls[0]?.[0] as { signals?: Array<{ id?: string }> } | undefined;
+    expect(agentConfig?.signals?.map(provider => provider.id)).toContain('github-signals');
+    await vi.waitFor(() => {
+      expect(startPollingForThread).toHaveBeenCalledWith(
+        { threadId: 'thread-1', resourceId: 'thread-resource' },
+        { pollImmediately: true },
+      );
+    });
   });
 });

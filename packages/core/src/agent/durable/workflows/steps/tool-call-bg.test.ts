@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { MessageList } from '../../../message-list';
 import { createToolCallIdentityDigest } from '../../../tool-call-identity';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableToolCallStep } from './tool-call';
@@ -66,11 +67,10 @@ function makeInitData(overrides: Record<string, any> = {}) {
 }
 
 function makeMessageList() {
-  return {
-    updateToolInvocation: vi.fn().mockReturnValue(true),
-    updateMessageMetadataByToolCallId: vi.fn().mockReturnValue(true),
-    add: vi.fn(),
-  };
+  const messageList = new MessageList({ threadId: 'thread-1', resourceId: 'user-1' });
+  vi.spyOn(messageList, 'updateToolInvocation');
+  vi.spyOn(messageList, 'updateMessageMetadataByToolCallId');
+  return messageList;
 }
 
 function makeSaveQueueManager() {

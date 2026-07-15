@@ -46,13 +46,12 @@ import {
   HarnessStorageLeaseConflictError,
   HarnessStorageVersionConflictError,
 } from '@mastra/core/storage';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PostgresStore } from '../..';
 import { TEST_CONFIG } from '../../test-utils';
 
 // Real PG round-trips under contention are slower than the in-memory suite.
-import { vi } from 'vitest';
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 120_000 });
 
 const WRITER_COUNT = 4; // >= 3 independent instances, each its own pool.
@@ -209,9 +208,7 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
           ),
         );
 
-        const fulfilled = results
-          .map((r, i) => ({ r, owner: owners[i]! }))
-          .filter(x => x.r.status === 'fulfilled');
+        const fulfilled = results.map((r, i) => ({ r, owner: owners[i]! })).filter(x => x.r.status === 'fulfilled');
         const rejected = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
 
         // EXACTLY ONE writer acquires; the rest are fenced with a lease conflict.
@@ -363,9 +360,10 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
       const before = await Promise.all(
         [rootId, childId, grandId].map(id => controlHarness().loadSession({ harnessName: HARNESS_NS, sessionId: id })),
       );
-      const expiryBefore = Object.fromEntries(
-        before.map(rec => [rec!.id, rec!.leaseExpiresAt]),
-      ) as Record<string, number | undefined>;
+      const expiryBefore = Object.fromEntries(before.map(rec => [rec!.id, rec!.leaseExpiresAt])) as Record<
+        string,
+        number | undefined
+      >;
 
       // Run the contention many times to actually catch the interleaving where the
       // foreign steal lands between the renewal's FOR UPDATE read and its final
@@ -411,7 +409,9 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
         // AND half-owned by owner-B. Read the authoritative rows from the control
         // pool.
         const [root, child, grand] = await Promise.all(
-          [rootId, childId, grandId].map(id => controlHarness().loadSession({ harnessName: HARNESS_NS, sessionId: id })),
+          [rootId, childId, grandId].map(id =>
+            controlHarness().loadSession({ harnessName: HARNESS_NS, sessionId: id }),
+          ),
         );
 
         if (renewSettled.status === 'fulfilled') {
@@ -548,7 +548,9 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
         ]);
 
         const [root, child, grand] = await Promise.all(
-          [rootId, childId, grandId].map(id => controlHarness().loadSession({ harnessName: HARNESS_NS, sessionId: id })),
+          [rootId, childId, grandId].map(id =>
+            controlHarness().loadSession({ harnessName: HARNESS_NS, sessionId: id }),
+          ),
         );
 
         if (renewSettled.status === 'fulfilled') {

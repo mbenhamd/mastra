@@ -351,6 +351,22 @@ function getInvocationActor(context: unknown): ActorSignal | undefined {
   return (context as { actor?: ActorSignal } | undefined)?.actor;
 }
 
+function isTrustedActorSignal(actor: unknown): actor is ActorSignal {
+  if (actor === true) {
+    return true;
+  }
+
+  if (typeof actor !== 'object' || actor === null) {
+    return false;
+  }
+
+  const candidate = actor as { actorKind?: unknown; sourceWorkflow?: unknown };
+  return (
+    candidate.actorKind === 'system' &&
+    (candidate.sourceWorkflow === undefined || typeof candidate.sourceWorkflow === 'string')
+  );
+}
+
 type ProcessorWorkflowChildrenContainer = {
   steps?: Record<string, unknown> | unknown[];
   children?: Record<string, unknown> | unknown[];
@@ -1474,18 +1490,33 @@ export class Agent<
       memory?: AgentExecutionOptionsBase<any>['memory'];
       runId?: string;
       snapshotMemoryInfo?: AgentSnapshotMemoryInfo;
+      actor?: ActorSignal;
     },
   ) {
     const fgaProvider = this.#mastra?.getServer()?.fga;
     if (fgaProvider) {
       const user = requestContext?.get('user');
+      const actor = options?.actor;
+      const trustedActor = isTrustedActorSignal(actor);
       const { FGADeniedError } = await import(/* @vite-ignore */ '../auth/ee/fga-check');
-      if (!user) {
+      if (!user && !trustedActor) {
         throw new FGADeniedError(
           { id: 'unknown' },
           { type: 'agent', id: this.id },
           MastraFGAPermissions.AGENTS_EXECUTE,
         );
+      }
+
+      if (trustedActor) {
+        const organizationId = requestContext?.get('organizationId');
+        if (typeof organizationId !== 'string' || organizationId.length === 0) {
+          throw new FGADeniedError(
+            user,
+            { type: 'agent', id: this.id },
+            MastraFGAPermissions.AGENTS_EXECUTE,
+            'trusted actor requires organizationId / tenant scope',
+          );
+        }
       }
 
       await this.#validateRequestContext(requestContext);
@@ -1499,6 +1530,7 @@ export class Agent<
         memory: options?.memory,
         runId: options?.runId,
         snapshotMemoryInfo: options?.snapshotMemoryInfo,
+        actor,
       });
       return;
     }
@@ -4750,17 +4782,24 @@ export class Agent<
               messages: sanitizedMessages,
             };
 
+            const suspendedToolRunId = (inputData as any).suspendedToolRunId as string | undefined;
+            const subAgentRunId =
+              suspendedToolRunId ||
+              context?.mastra?.generateId({
+                idType: 'run',
+                source: 'agent',
+                entityId: agent.id,
+                threadId: inputData.threadId ?? threadId,
+                resourceId: inputData.resourceId ?? resourceId,
+              }) ||
+              randomUUID();
+
             // Generate sub-agent thread and resource IDs early (before any rejection)
-            // These are needed for both successful execution and rejection cases
+            // and bind the thread to the invocation's stable run id. Approval
+            // resumes reuse suspendedToolRunId, so they must also reuse the exact
+            // child thread that still owns that run's reservation.
             const slugify = await import(`@sindresorhus/slugify`);
-            const subAgentThreadId = inputData.threadId
-              ? `${inputData.threadId}-${randomUUID()}`
-              : context?.mastra?.generateId({
-                  idType: 'thread',
-                  source: 'agent',
-                  entityId: agentName,
-                  resourceId,
-                }) || randomUUID();
+            const subAgentThreadId = inputData.threadId ? `${inputData.threadId}-${subAgentRunId}` : subAgentRunId;
 
             const subAgentResourceId = inputData.resourceId
               ? `${inputData.resourceId}-${agentName}`
@@ -4795,7 +4834,9 @@ export class Agent<
             // use the correct model version and memory config from the resolved agent.
             let resolvedAgent = agent;
             const versionOverrides = requestContext.get(MASTRA_VERSIONS_KEY) as VersionOverrides | undefined;
-            const agentVersionSelector = versionOverrides?.agents?.[agent.id];
+            const agentVersionSelector =
+              versionOverrides?.agents?.[agent.id] ??
+              (versionOverrides?.defaultStatus ? { status: versionOverrides.defaultStatus } : undefined);
             if (agentVersionSelector && this.#mastra && agent instanceof Agent) {
               try {
                 resolvedAgent = await this.#mastra.resolveVersionedAgent(agent, agentVersionSelector);
@@ -4985,8 +5026,6 @@ export class Agent<
               });
 
               let result: any;
-              const suspendedToolRunId = (inputData as any).suspendedToolRunId;
-
               const { resumeData, suspend } = context?.agent ?? {};
 
               // Apply messageFilter callback (runs after onDelegationStart so effectivePrompt
@@ -5054,6 +5093,7 @@ export class Agent<
                       disableBackgroundTasks: true,
                     })
                   : await resolvedAgent.generate(messagesForSubAgent, {
+                      runId: subAgentRunId,
                       _pubsub: pubsub,
                       requestContext,
                       actor: invocationActor,
@@ -5189,6 +5229,7 @@ export class Agent<
                       disableBackgroundTasks: true,
                     })
                   : await resolvedAgent.stream(messagesForSubAgent, {
+                      runId: subAgentRunId,
                       _pubsub: pubsub,
                       requestContext,
                       actor: invocationActor,
@@ -7055,13 +7096,45 @@ export class Agent<
 
     // Set Tracing context
     // Note this span is ended at the end of #executeOnFinish
+    // For resumed runs, surface resumeData as the span input and link the resumed
+    // span back to the original suspended trace. Mirrors Workflow.resume tracing.
+    const isResume = !!resumeContext;
+    const suspendedToolInfo = isResume ? this.#getSuspendedToolInfo(resumeContext?.snapshot) : undefined;
+    const persistedTracingContext = isResume
+      ? (resumeContext?.snapshot?.tracingContext as
+          | { traceId?: string; spanId?: string; parentSpanId?: string }
+          | undefined)
+      : undefined;
+
+    // Only fall back to persisted traceId/parentSpanId when the caller didn't provide
+    // their own. This prevents cross-trace parentage if the caller is explicit.
+    const userProvidedTraceId = options.tracingOptions?.traceId;
+    const userProvidedParentSpanId = options.tracingOptions?.parentSpanId;
+    const effectiveTraceId =
+      userProvidedTraceId ?? (!userProvidedParentSpanId ? persistedTracingContext?.traceId : undefined);
+    const shouldUsePersistedParentSpan =
+      !userProvidedParentSpanId && (!userProvidedTraceId || userProvidedTraceId === persistedTracingContext?.traceId);
+
+    const resumeTracingOptions =
+      isResume && persistedTracingContext?.traceId
+        ? {
+            ...options.tracingOptions,
+            traceId: effectiveTraceId,
+            parentSpanId: shouldUsePersistedParentSpan ? persistedTracingContext?.spanId : userProvidedParentSpanId,
+          }
+        : options.tracingOptions;
+
+    const spanInput = isResume
+      ? this.#getResumeSpanInput(resumeContext!.resumeData, suspendedToolInfo)
+      : options.messages;
+
     const agentSpan = getOrCreateSpan({
       type: SpanType.AGENT_RUN,
-      name: `agent run: '${this.id}'`,
+      name: `agent run: '${this.id}'${isResume ? ' (resumed)' : ''}`,
       entityType: EntityType.AGENT,
       entityId: this.id,
       entityName: this.name,
-      input: options.messages,
+      input: spanInput,
       attributes: {
         conversationId: threadFromArgs?.id,
         instructions: this.#convertInstructionsToString(instructions),
@@ -7075,12 +7148,13 @@ export class Agent<
         runId,
         resourceId,
         threadId: threadFromArgs?.id,
+        ...(isResume ? { resumed: true, resumedFromSpanId: persistedTracingContext?.spanId } : {}),
         ...(this.toRawConfig()?.resolvedVersionId
           ? { entityVersionId: this.toRawConfig()!.resolvedVersionId as string }
           : {}),
       },
       tracingPolicy: this.#options?.tracingPolicy,
-      tracingOptions: options.tracingOptions,
+      tracingOptions: resumeTracingOptions,
       tracingContext: options.tracingContext,
       requestContext,
       mastra: this.#mastra,
@@ -7773,7 +7847,7 @@ export class Agent<
     const requestContextToUse = options?.requestContext;
     const toolSurfaceFenceOwnerId = randomUUID();
     if (requestContextToUse) {
-      await this.#assertAgentExecutionPreflight(requestContextToUse, { authorize: false });
+      await this.#assertAgentExecutionPreflight(requestContextToUse, { authorize: false, actor: options?.actor });
     }
 
     const defaultOptions = await this.getDefaultOptions({
@@ -7793,7 +7867,10 @@ export class Agent<
     if (requestContextToUse) {
       mergedOptions.requestContext = requestContextToUse;
     } else {
-      await this.#assertAgentExecutionPreflight(mergedOptions.requestContext, { authorize: false });
+      await this.#assertAgentExecutionPreflight(mergedOptions.requestContext, {
+        authorize: false,
+        actor: mergedOptions.actor,
+      });
     }
 
     // Pin the runId before execution so the replacement tool-surface fence can
@@ -8486,13 +8563,32 @@ export class Agent<
       pubsub,
     );
     if (shouldTrackIdleWake && idleThreadId) {
+      // Bind the reserved run to the broker captured for this signal before
+      // async default-context/FGA preflight completes. Callers may immediately
+      // wait by run id, and the agent's active broker can change meanwhile.
+      acceptedIdleRunId = result.runId;
+      this.#rememberThreadStreamPubSubForTarget(
+        {
+          runId: result.runId,
+          resourceId: idleResourceId,
+          threadId: idleThreadId,
+        },
+        pubsub,
+      );
+
       // The unified accepted result carries the run association: `wake` means this
       // process owns the started stream, `deliver` means the signal joined an
       // existing/winning run. Remember the pubsub for either so later
       // runId/thread-targeted calls route through the same broker (PF-557).
       void result.accepted
         .then(accepted => {
-          if (accepted.action !== 'wake' && accepted.action !== 'deliver') return;
+          if (accepted.action !== 'wake' && accepted.action !== 'deliver') {
+            forgetAcceptedIdleRunPubSub();
+            return;
+          }
+          if (accepted.runId !== acceptedIdleRunId) {
+            forgetAcceptedIdleRunPubSub();
+          }
           acceptedIdleRunId = accepted.runId;
           if (accepted.action === 'wake' || accepted.runId !== previousThreadRunId) {
             this.#rememberThreadStreamPubSubForTarget(
@@ -8633,6 +8729,7 @@ export class Agent<
         await this.#assertAgentExecutionPreflight(requestContextToUse, {
           memory: streamOptionsWithRunId.memory,
           runId: streamOptionsWithRunId.runId,
+          actor: streamOptionsWithRunId.actor,
         });
         preflightedRequestContext = requestContextToUse;
         hasPreflightedRequestContext = true;
@@ -8641,6 +8738,7 @@ export class Agent<
         await this.#assertAgentExecutionPreflight(staticDefaultOptions.requestContext, {
           memory: staticDefaultOptions.memory,
           runId: streamOptionsWithRunId.runId,
+          actor: streamOptionsWithRunId.actor ?? staticDefaultOptions.actor,
         });
         preflightedRequestContext = staticDefaultOptions.requestContext;
         hasPreflightedRequestContext = true;
@@ -8672,6 +8770,7 @@ export class Agent<
         await this.#assertAgentExecutionPreflight(mergedOptions.requestContext, {
           memory: mergedOptions.memory,
           runId: mergedOptions.runId,
+          actor: mergedOptions.actor,
         });
       }
       fenceRequestContext = mergedOptions.requestContext;
@@ -8795,12 +8894,7 @@ export class Agent<
           };
           break;
         }
-        await agentThreadStreamRuntime.waitForCrossAgentThreadRun(
-          this as Agent<any, any, any, any>,
-          mergedOptions,
-          pubsub,
-          ownsReservation,
-        );
+        await agentThreadStreamRuntime.waitForThreadRunReservation(mergedOptions, pubsub, this.id);
       }
       if (ownsReservation && reservedThreadTarget) {
         const preparedThreadTarget = this.#getThreadTarget(mergedOptions);
@@ -9022,6 +9116,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(streamOptionsWithPubSub.requestContext, {
         memory: streamOptionsWithPubSub.memory,
         runId: streamOptionsWithPubSub.runId,
+        actor: streamOptionsWithPubSub.actor,
       });
       streamOptionsWithPubSub = {
         ...streamOptionsWithPubSub,
@@ -9038,6 +9133,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(preflightOptions.requestContext, {
         memory: preflightOptions.memory,
         runId: preflightOptions.runId,
+        actor: preflightOptions.actor,
       });
       streamOptionsWithPubSub = {
         ...streamOptionsWithPubSub,
@@ -9131,6 +9227,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(streamOptionsWithPubSub.requestContext, {
         memory: streamOptionsWithPubSub.memory,
         runId: streamOptionsWithPubSub.runId,
+        actor: streamOptionsWithPubSub.actor,
       });
     } else {
       const defaultOptions = await this.getDefaultOptions({
@@ -9143,6 +9240,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(preflightOptions.requestContext, {
         memory: preflightOptions.memory,
         runId: preflightOptions.runId,
+        actor: preflightOptions.actor,
       });
       streamOptionsWithPubSub = {
         ...streamOptionsWithPubSub,
@@ -9240,6 +9338,7 @@ export class Agent<
         await this.#assertAgentExecutionPreflight(requestContextToUse, {
           memory: streamOptionsWithPubSub.memory,
           runId,
+          actor: streamOptionsWithPubSub.actor,
         });
       } else if (this.#requestContextSchema || this.#mastra?.getServer()?.fga) {
         defaultOptions = (await this.getDefaultOptions({
@@ -9248,6 +9347,7 @@ export class Agent<
         await this.#assertAgentExecutionPreflight(defaultOptions.requestContext, {
           memory: defaultOptions.memory,
           runId,
+          actor: streamOptionsWithPubSub?.actor ?? defaultOptions.actor,
         });
       }
     }
@@ -9283,6 +9383,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(ownershipOptions.requestContext, {
         memory: ownershipOptions.memory,
         runId,
+        actor: ownershipOptions.actor,
       });
     }
     this.#assertAgenticLoopResumeOwnership({
@@ -9448,11 +9549,10 @@ export class Agent<
           };
           break;
         }
-        await agentThreadStreamRuntime.waitForCrossAgentThreadRun(
-          this as Agent<any, any, any, any>,
+        await agentThreadStreamRuntime.waitForThreadRunReservation(
           mergedStreamOptions as unknown as AgentExecutionOptions<OUTPUT>,
           pubsub,
-          ownsReservation,
+          this.id,
         );
       }
       if (ownsReservation && reservedThreadTarget) {
@@ -9653,6 +9753,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(requestContextToUse, {
         memory: options?.memory,
         runId: options?.runId,
+        actor: options?.actor,
       });
     } else if (this.#requestContextSchema || this.#mastra?.getServer()?.fga) {
       defaultOptions = (await this.getDefaultOptions({
@@ -9661,6 +9762,7 @@ export class Agent<
       await this.#assertAgentExecutionPreflight(defaultOptions.requestContext, {
         memory: defaultOptions.memory,
         runId: options?.runId,
+        actor: options?.actor ?? defaultOptions.actor,
       });
     }
 

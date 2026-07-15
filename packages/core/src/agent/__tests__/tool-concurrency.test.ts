@@ -1,5 +1,5 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
@@ -7,6 +7,11 @@ import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 import { delay } from '../../utils';
 import { Agent } from '../agent';
+import { agentThreadStreamRuntime } from '../thread-stream-runtime';
+
+beforeEach(() => {
+  agentThreadStreamRuntime.resetForTests();
+});
 
 /**
  * Helper to verify tool execution order.

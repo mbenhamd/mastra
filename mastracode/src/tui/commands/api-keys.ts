@@ -144,7 +144,6 @@ export async function handleApiKeysCommand(ctx: SlashCommandContext): Promise<vo
             if (info.envVar && process.env[info.envVar] === storedKey) {
               delete process.env[info.envVar];
             }
-            ctx.state.harness.invalidateAvailableModelsCache();
             models = await ctx.state.harness.listAvailableModels();
             providers = getProviderList(ctx, models);
             ctx.showInfo(`API key removed for ${info.provider}`);

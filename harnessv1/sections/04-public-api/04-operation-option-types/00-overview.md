@@ -82,6 +82,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-operation-options);" d="M670 218 C640 255 585 285 545 309" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-operation-options);" d="M170 218 C320 255 650 265 800 309" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-operation-options);" d="M670 218 C720 255 770 285 805 309" />
+
   </svg>
   <figcaption>Operation options share serializable admission material, but retry-safe IDs and non-serializable overrides are deliberately constrained by operation kind.</figcaption>
 </figure>

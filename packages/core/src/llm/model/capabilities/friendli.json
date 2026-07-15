@@ -1,7 +1,5 @@
 {
-  "attachment": [
-    "google/gemma-4-31B-it"
-  ],
+  "attachment": ["google/gemma-4-31B-it"],
   "temperature": [
     "MiniMaxAI/MiniMax-M2.5",
     "Qwen/Qwen3-235B-A22B-Instruct-2507",

@@ -137,23 +137,18 @@ describe.each([
     // While suspended, both the loop row and the nested execution row must
     // exist so resumeStream() can restore the run (e.g. after a restart).
     // The default engine persists the nested row under the parent's runId;
-    // the evented engine assigns nested runs their own random runId.
+    // the evented engine assigns a distinct deterministic nested runId.
     const afterSuspend = summarizeRuns((await workflowsStore.listWorkflowRuns({})).runs);
     expect(afterSuspend).toEqual([
       { workflowName: 'agentic-loop', runId: stream.runId, status: 'suspended' },
       { workflowName: 'executionWorkflow', runId: evented ? expect.any(String) : stream.runId, status: 'suspended' },
     ]);
 
-    // The default engine keeps the RunScope alive across the suspend
-    // boundary (the same in-memory loop holds the registration). The evented
-    // engine terminates the run after each step, so the scope is released
-    // when the WEP finishes processing the suspend — resume creates a fresh
-    // registration that hydrates from `_internal` via readScoped fallback.
-    if (evented) {
-      expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
-    } else {
-      expect(mastra.__getRunScope(stream.runId)).toBeDefined();
-    }
+    // Suspension is non-terminal in both engines. Keep the RunScope and its
+    // run-scoped workflow ownership alive so same-process resume events stay
+    // instance-local; a restarted process can still hydrate from the stored
+    // snapshot without relying on this in-memory state.
+    expect(mastra.__getRunScope(stream.runId)).toBeDefined();
 
     const resumeStream = await agent.approveToolCall({ runId: stream.runId, toolCallId });
     for await (const _chunk of resumeStream.fullStream) {
@@ -251,15 +246,9 @@ describe.each([
     expect(afterSuspend.filter(r => r.workflowName === 'executionWorkflow')).toHaveLength(2);
     expect(afterSuspend.every(r => r.status === 'suspended')).toBe(true);
 
-    // Default engine: the supervisor's scope stays alive across the subagent
-    // suspend boundary. Evented engine: each step terminates async, so the
-    // scope is released — resume re-creates it. See the single-agent test
-    // above for the engine-asymmetry rationale.
-    if (evented) {
-      expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
-    } else {
-      expect(mastra.__getRunScope(stream.runId)).toBeDefined();
-    }
+    // Suspension is non-terminal, including when it bubbles through a
+    // subagent. Keep the supervisor's run-scoped ownership until resume.
+    expect(mastra.__getRunScope(stream.runId)).toBeDefined();
 
     const resumeStream = await supervisor.approveToolCall({ runId: stream.runId, toolCallId });
     for await (const _chunk of resumeStream.fullStream) {
@@ -344,15 +333,9 @@ describe.each([
     }
     expect(toolCallId).toBeTruthy();
 
-    // Default engine: scope is held across the suspend boundary so decline
-    // reads back the same memory/transport handles the original stream
-    // registered. Evented engine: scope was released when WEP processed the
-    // suspend; decline re-registers and reads back via readScoped fallback.
-    if (evented) {
-      expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
-    } else {
-      expect(mastra.__getRunScope(stream.runId)).toBeDefined();
-    }
+    // Both engines retain the run-scoped memory/transport handles across the
+    // non-terminal suspend boundary and release them after decline completes.
+    expect(mastra.__getRunScope(stream.runId)).toBeDefined();
 
     const resumeStream = await agent.declineToolCall({ runId: stream.runId, toolCallId });
     for await (const _chunk of resumeStream.fullStream) {

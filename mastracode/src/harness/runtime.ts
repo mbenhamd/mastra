@@ -18,6 +18,7 @@ import type {
 } from '@mastra/core/harness';
 import { convertStoredMessageToHarnessMessage, defaultDisplayState } from '@mastra/core/harness';
 import {
+  createHarnessOperatorThreadController,
   Harness as HarnessV1,
   getHarnessWorkspaceActionPathInput,
   isHarnessWorkspaceFileMutationTool,
@@ -27,6 +28,7 @@ import type {
   HarnessEvent as HarnessV1Event,
   HarnessEventUnsubscribe as HarnessV1EventUnsubscribe,
   HarnessMessageContentPart,
+  HarnessOperatorThreadController,
   Session,
   SessionDisplayState,
   ThreadRecord,
@@ -306,6 +308,14 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   readonly core: HarnessV1;
   readonly mastra: Mastra;
 
+  /**
+   * Operator/server thread-CRUD boundary. Thread create/list/get/rename/clone/
+   * delete/settings are intentionally NOT a public `harness.threads.*` namespace
+   * (§0/§4.1/§11.6e/§13). The internal MastraCode runtime reaches them through
+   * this `@internal` controller. See `createHarnessOperatorThreadController`.
+   */
+  readonly threadOps: HarnessOperatorThreadController;
+
   private session?: Session;
   private resourceId: string;
   private readonly defaultResourceId: string;
@@ -316,6 +326,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   private readonly listeners = new Set<HarnessEventListener>();
   private readonly projector: MastraCodeHarnessEventProjector;
   private sessionEventUnsubscribe?: HarnessV1EventUnsubscribe;
+  private sessionEventHandlingChain: Promise<void> = Promise.resolve();
   private readonly heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
   private readonly heartbeatHandlers = new Map<
     string,
@@ -333,7 +344,6 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   private currentDisplayTasks: TaskItemSnapshot[] = [];
   private readonly activeToolCalls = new Map<string, { name: string; args?: unknown }>();
   private readonly modifiedFiles = new Map<string, { operations: string[]; firstModified: Date }>();
-  private harnessEventUnsubscribe?: HarnessV1EventUnsubscribe;
   private browser: unknown;
 
   readonly actions = Object.freeze({
@@ -376,6 +386,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
           }
         : undefined,
     });
+    this.threadOps = createHarnessOperatorThreadController(this.core);
 
     this.mastra = new Mastra({
       agents: harnessV1Agents,
@@ -393,9 +404,10 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
       event => this.emit(event),
       () => this.getDisplayState(),
       async (threadId, resourceId) => {
-        const thread = await this.core.threads.get({ threadId, resourceId });
+        const thread = await this.threadOps.get({ threadId, resourceId });
         return thread ? toLegacyThread(thread) : undefined;
       },
+      () => this.listMessages(),
     );
 
     for (const handler of config.heartbeatHandlers ?? []) {
@@ -414,12 +426,13 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   async initCore(): Promise<void> {
     await this.core.init();
-    if (!this.harnessEventUnsubscribe) {
-      this.harnessEventUnsubscribe = this.core.subscribe(event => {
-        if (!this.isThreadLifecycleEventForCurrentResource(event)) return;
-        void this.projector.project(event).catch(error => this.emitNonLifecycleError(error));
-      });
-    }
+    // §10.2/§4.1: the harness-v1 event stream no longer carries thread-lifecycle
+    // events (`thread_created` / `thread_cloned` / `thread_renamed`) — thread CRUD
+    // is an internal/operator op via `threadOps` with no stream event. Legacy
+    // `thread_created` is emitted directly at the create call sites
+    // (`createThread` / `selectOrCreateThread`); `thread_changed` is emitted by
+    // `switchThread`; renames flow to the TUI through the `thread_changed`
+    // metadata sync. There is therefore no harness-level subscription to install.
   }
 
   subscribe(listener: HarnessEventListener): () => void {
@@ -459,10 +472,14 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     if (event.type === 'model_changed') {
       this.applyLocalState({ currentModelId: event.modelId } as unknown as Partial<TState>, { emitLegacy: false });
     }
-    if (event.type === 'task_updated') {
-      this.previousDisplayTasks = [...this.currentDisplayTasks];
-      this.currentDisplayTasks = cloneTasks((event as { tasks?: unknown }).tasks);
-    }
+    // TODO(harness-v1): the harness-v1 stream no longer emits a `task_updated`
+    // event carrying a full task snapshot. Plan-task progress now surfaces as the
+    // `papersflow.plan_task.updated` custom event (§10.3), which carries only
+    // bounded per-task DELTAS, not the full `TaskItemSnapshot[]` this projection
+    // needs. Display tasks are still kept current from `state.tasks` via
+    // `state_changed` (`applyLocalState`), so removing the stream-driven branch
+    // loses no behavior; a delta-to-snapshot reconciliation against the custom
+    // event is left as a follow-up if richer streaming task UI is wanted.
     this.applyModifiedFileEvent(event);
     this.applyOMEvent(event as HarnessV1Event | MastraCodeOMEvent);
     await this.projector.project(event);
@@ -470,11 +487,11 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   private applyModifiedFileEvent(event: HarnessV1Event): void {
     if (event.type === 'tool_start') {
-      this.activeToolCalls.set(event.toolCallId, { name: event.toolName, args: event.args });
+      this.activeToolCalls.set(event.toolCallId, { name: event.toolName, args: event.input });
       return;
     }
     if (event.type === 'subagent_tool_start') {
-      this.activeToolCalls.set(event.innerToolCallId, { name: event.toolName, args: event.args });
+      this.activeToolCalls.set(event.innerToolCallId, { name: event.toolName, args: event.input });
       return;
     }
     const endedToolCallId =
@@ -556,15 +573,6 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
       operations: operation ? [operation] : [],
       firstModified: new Date(createdAt),
     });
-  }
-
-  private isThreadLifecycleEventForCurrentResource(
-    event: HarnessV1Event,
-  ): event is Extract<HarnessV1Event, { type: 'thread_created' | 'thread_cloned' | 'thread_renamed' }> {
-    return (
-      (event.type === 'thread_created' || event.type === 'thread_cloned' || event.type === 'thread_renamed') &&
-      event.resourceId === this.resourceId
-    );
   }
 
   private applyOMEvent(event: HarnessV1Event | MastraCodeOMEvent): void {
@@ -669,8 +677,17 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     }
   }
 
+  /**
+   * Emit the legacy `thread_created` event the TUI consumes. The harness-v1
+   * stream no longer carries a `thread_created` event (§10.2/§4.1), so the
+   * runtime emits it directly when it creates a thread through `threadOps`.
+   */
+  private emitThreadCreated(thread: ThreadRecord): void {
+    this.emit({ type: 'thread_created', thread: toLegacyThread(thread) } as unknown as HarnessEvent);
+  }
+
   async selectOrCreateThread(): Promise<HarnessThread> {
-    const existing = await this.core.threads.list({
+    const existing = await this.threadOps.list({
       resourceId: this.resourceId,
       perPage: false,
       orderBy: { column: 'updatedAt', direction: 'DESC' },
@@ -679,14 +696,16 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     const existingThread = projectPath
       ? existing.threads.find(thread => thread.metadata?.projectPath === projectPath)
       : existing.threads[0];
+    let createdThread: ThreadRecord | undefined;
     const thread =
       existingThread ??
-      (await this.core.threads.create({
+      (createdThread = await this.threadOps.create({
         resourceId: this.resourceId,
         title: 'New thread',
         metadata: this.buildThreadMetadata(),
       }));
     await this.applyThreadMetadata(thread.metadata, { persist: false });
+    if (createdThread) this.emitThreadCreated(createdThread);
     this.bindActiveSession(
       await this.core.session({
         resourceId: this.resourceId,
@@ -702,12 +721,13 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   }
 
   async createThread({ title }: { title?: string } = {}): Promise<HarnessThread> {
-    const thread = await this.core.threads.create({
+    const thread = await this.threadOps.create({
       resourceId: this.resourceId,
       title: title ?? 'New thread',
       metadata: this.buildThreadMetadata(),
     });
     await this.applyThreadMetadata(thread.metadata, { persist: false });
+    this.emitThreadCreated(thread);
     this.bindActiveSession(
       await this.core.session({
         resourceId: this.resourceId,
@@ -725,7 +745,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   async switchThread({ threadId }: { threadId: string }): Promise<void> {
     if (this.isRunning()) this.abort();
     const previousThreadId = this.session?.threadId ?? null;
-    const thread = await this.core.threads.get({ resourceId: this.resourceId, threadId });
+    const thread = await this.threadOps.get({ resourceId: this.resourceId, threadId });
     if (!thread) {
       throw new Error(`Thread not found: ${threadId}`);
     }
@@ -756,7 +776,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     resourceId?: string;
   } = {}): Promise<HarnessThread> {
     const sourceId = sourceThreadId ?? threadId ?? this.requireSession().threadId;
-    const cloned = await this.core.threads.clone({
+    const cloned = await this.threadOps.clone({
       resourceId: resourceId ?? this.resourceId,
       threadId: sourceId,
       title,
@@ -770,7 +790,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   async renameThread({ title }: { title: string }): Promise<void> {
     const session = this.requireSession();
-    await this.core.threads.rename({ resourceId: this.resourceId, threadId: session.threadId, title });
+    await this.threadOps.rename({ resourceId: this.resourceId, threadId: session.threadId, title });
   }
 
   async listThreads(options?: { allResources?: boolean; includeForkedSubagents?: boolean }): Promise<HarnessThread[]> {
@@ -786,7 +806,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
         .map(toStoredThread);
     }
 
-    const result = await this.core.threads.list({ resourceId: this.resourceId, perPage: false });
+    const result = await this.threadOps.list({ resourceId: this.resourceId, perPage: false });
     return result.threads
       .filter(thread => options?.includeForkedSubagents || thread.metadata?.forkedSubagent !== true)
       .map(toLegacyThread)
@@ -795,7 +815,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   async setThreadSetting({ key, value }: { key: string; value: unknown }): Promise<void> {
     const session = this.requireSession();
-    await this.core.threads.setSettings({
+    await this.threadOps.setSettings({
       resourceId: this.resourceId,
       threadId: session.threadId,
       patch: { [key]: value },
@@ -804,6 +824,10 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   getCurrentThreadId(): string | null {
     return this.session?.threadId ?? null;
+  }
+
+  detachFromCurrentThread(): void {
+    this.clearActiveSession();
   }
 
   getResourceId(): string {
@@ -1131,13 +1155,17 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     await this.ensureSessionState();
     await this.syncSessionControls();
     const { attachments, inlineFiles } = await this.uploadMessageAttachments(session, files);
-    await session.message({
-      content: messageContents(content, inlineFiles),
-      ...(attachments.length > 0 ? { attachments } : {}),
-      ...((this.state as Record<string, unknown>).yolo === true ? { yolo: true } : {}),
-      ...(admissionId ? { admissionId } : {}),
-      ...(admissionId ? {} : { prepareStep: this.prepareActiveToolsStep }),
-    } as never);
+    try {
+      await session.message({
+        content: messageContents(content, inlineFiles),
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...((this.state as Record<string, unknown>).yolo === true ? { yolo: true } : {}),
+        ...(admissionId ? { admissionId } : {}),
+        ...(admissionId ? {} : { prepareStep: this.prepareActiveToolsStep }),
+      } as never);
+    } finally {
+      await this.sessionEventHandlingChain;
+    }
   }
 
   async listMessages(options?: { limit?: number }): Promise<HarnessMessage[]> {
@@ -1641,8 +1669,6 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
   }
 
   async destroy(): Promise<void> {
-    this.harnessEventUnsubscribe?.();
-    this.harnessEventUnsubscribe = undefined;
     this.clearActiveSession();
     await this.destroyWorkspace();
     await this.stopHeartbeats();
@@ -1778,7 +1804,8 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
     this.sessionEventUnsubscribe?.();
     this.session = session;
     this.sessionEventUnsubscribe = session.subscribe(event => {
-      void this.handleCoreEvent(event).catch(error => {
+      const handled = this.sessionEventHandlingChain.then(() => this.handleCoreEvent(event));
+      this.sessionEventHandlingChain = handled.catch(error => {
         this.emitNonLifecycleError(error);
       });
     });
@@ -1860,7 +1887,7 @@ export class MastraCodeHarnessRuntime<TState extends Record<string, unknown>> {
 
   private async loadModeModelId(modeId: string): Promise<string> {
     const session = this.requireSession();
-    const thread = await this.core.threads.get({ resourceId: this.resourceId, threadId: session.threadId });
+    const thread = await this.threadOps.get({ resourceId: this.resourceId, threadId: session.threadId });
     const stored = thread?.metadata?.[`modeModelId_${modeId}`];
     return typeof stored === 'string' ? stored : this.resolveModeModel(modeId);
   }

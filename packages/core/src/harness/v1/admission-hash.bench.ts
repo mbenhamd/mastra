@@ -26,11 +26,7 @@ import type { JsonValue } from '../../storage/domains/harness';
 import { sha256CanonicalJson } from './canonical-json';
 
 /** Build a hash-input shaped object mirroring `_messageAdmissionHashInput`. */
-function hashInput(opts: {
-  content: string;
-  attachmentCount: number;
-  metadataKeys: number;
-}): JsonValue {
+function hashInput(opts: { content: string; attachmentCount: number; metadataKeys: number }): JsonValue {
   const attachments: JsonValue[] = [];
   for (let i = 0; i < opts.attachmentCount; i++) {
     const metadata: Record<string, JsonValue> = {};

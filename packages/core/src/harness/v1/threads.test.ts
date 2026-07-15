@@ -25,7 +25,7 @@ import { InMemoryMemory } from '../../storage/domains/memory/inmemory';
 import { InMemoryStore } from '../../storage/mock';
 import { MockAgent, setupHarness } from './__test-utils__';
 import { HarnessConfigError, HarnessStorageError, HarnessThreadNotFoundError } from './errors';
-import { createHarnessOperatorThreadController, Harness  } from './harness';
+import { createHarnessOperatorThreadController, Harness } from './harness';
 
 const externalSessionStorageOwnerMetadataKey = '__mastraHarnessExternalSessionStorageOwner';
 const harnessThreadDeleteInProgressMetadataKey = '__mastraHarnessThreadDeleteInProgress';
@@ -56,6 +56,10 @@ function setupMastraWithMemory(opts: { memory: InMemoryMemory; harness?: InMemor
   const agent = new MockAgent({ id: 'default' });
   return {
     getAgent: () => agent,
+    _assertDirectHarnessRegistrationAvailable: vi.fn(),
+    _assertHarnessAgentChannelToolCollisionsForHarness: vi.fn(),
+    _registerDirectHarness: vi.fn(),
+    _unregisterDirectHarness: vi.fn(),
     getStorage: () => ({
       stores: {
         memory: opts.memory,
@@ -116,11 +120,15 @@ describe('harness.threads — CRUD', () => {
       }),
     ).rejects.toBeInstanceOf(HarnessThreadNotFoundError);
 
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: original.id })).resolves.toMatchObject({
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: original.id }),
+    ).resolves.toMatchObject({
       resourceId: 'r1',
       title: 'owned',
     });
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r2', threadId: original.id })).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r2', threadId: original.id }),
+    ).resolves.toBeNull();
   });
 
   it('keeps caller-supplied thread creation compatible with storage adapters that do not implement delete fences', async () => {
@@ -142,16 +150,9 @@ describe('harness.threads — CRUD', () => {
   });
 
   it('keeps caller-supplied thread creation compatible with memory-only thread storage', async () => {
-    const agent = new MockAgent({ id: 'default' });
     const memory = new InMemoryMemory({ db: new InMemoryDB() });
     const harness = new Harness({
-      mastra: {
-        getAgent: () => agent,
-        getStorage: () => ({
-          stores: {},
-          getStore: async (name: string) => (name === 'memory' ? memory : undefined),
-        }),
-      } as any,
+      mastra: setupMastraWithMemory({ memory }),
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
@@ -163,22 +164,17 @@ describe('harness.threads — CRUD', () => {
     });
 
     expect(thread.id).toBe('thread-memory-only');
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: 'thread-memory-only' })).resolves.toMatchObject({
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: 'thread-memory-only' }),
+    ).resolves.toMatchObject({
       id: 'thread-memory-only',
     });
   });
 
   it('fails closed for thread deletion with memory-only thread storage', async () => {
-    const agent = new MockAgent({ id: 'default' });
     const memory = new InMemoryMemory({ db: new InMemoryDB() });
     const harness = new Harness({
-      mastra: {
-        getAgent: () => agent,
-        getStorage: () => ({
-          stores: {},
-          getStore: async (name: string) => (name === 'memory' ? memory : undefined),
-        }),
-      } as any,
+      mastra: setupMastraWithMemory({ memory }),
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
@@ -188,11 +184,13 @@ describe('harness.threads — CRUD', () => {
       title: 'memory-only-delete',
     });
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('lists threads for a resource', async () => {
@@ -217,7 +215,10 @@ describe('harness.threads — CRUD', () => {
     });
     expect(renamed.title).toBe('new');
 
-    const fetched = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: created.id });
+    const fetched = await createHarnessOperatorThreadController(harness).get({
+      resourceId: 'r1',
+      threadId: created.id,
+    });
     expect(fetched!.title).toBe('new');
   });
 
@@ -239,7 +240,10 @@ describe('harness.threads — CRUD', () => {
 
   it('rejects caller writes to reserved Harness metadata keys', async () => {
     const { harness } = setupHarness();
-    const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'reserved' });
+    const created = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'reserved',
+    });
 
     await expect(
       createHarnessOperatorThreadController(harness).create({
@@ -288,13 +292,19 @@ describe('harness.threads — CRUD', () => {
     const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
     await createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: created.id });
 
-    const fetched = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: created.id });
+    const fetched = await createHarnessOperatorThreadController(harness).get({
+      resourceId: 'r1',
+      threadId: created.id,
+    });
     expect(fetched).toBeNull();
   });
 
   it('clears thread-scoped observational memory when deleting a thread', async () => {
     const { harness } = setupHarness();
-    const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'with observations' });
+    const created = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'with observations',
+    });
     const memory = (await harness._internalTryGetMemoryStorage())!;
     await memory.initializeObservationalMemory({
       threadId: created.id,
@@ -318,7 +328,10 @@ describe('harness.threads — resource scoping', () => {
   it('get() returns null for a thread owned by a different resource', async () => {
     const { harness } = setupHarness();
     const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
-    const fetched = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r2', threadId: created.id });
+    const fetched = await createHarnessOperatorThreadController(harness).get({
+      resourceId: 'r2',
+      threadId: created.id,
+    });
     expect(fetched).toBeNull();
   });
 
@@ -337,17 +350,17 @@ describe('harness.threads — resource scoping', () => {
   it('rename() throws HarnessThreadNotFoundError for cross-resource access', async () => {
     const { harness } = setupHarness();
     const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
-    await expect(createHarnessOperatorThreadController(harness).rename({ resourceId: 'r2', threadId: created.id, title: 'x' })).rejects.toThrow(
-      HarnessThreadNotFoundError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).rename({ resourceId: 'r2', threadId: created.id, title: 'x' }),
+    ).rejects.toThrow(HarnessThreadNotFoundError);
   });
 
   it('clone() throws HarnessThreadNotFoundError for cross-resource access', async () => {
     const { harness } = setupHarness();
     const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
-    await expect(createHarnessOperatorThreadController(harness).clone({ resourceId: 'r2', threadId: created.id })).rejects.toThrow(
-      HarnessThreadNotFoundError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).clone({ resourceId: 'r2', threadId: created.id }),
+    ).rejects.toThrow(HarnessThreadNotFoundError);
   });
 
   it('delete() is a silent no-op for cross-resource access', async () => {
@@ -355,21 +368,30 @@ describe('harness.threads — resource scoping', () => {
     const created = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
 
     // Cross-tenant delete must not leak existence.
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r2', threadId: created.id })).resolves.toBeUndefined();
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r2', threadId: created.id }),
+    ).resolves.toBeUndefined();
 
     // Thread should still exist for its real owner.
-    const fetched = await createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: created.id });
+    const fetched = await createHarnessOperatorThreadController(harness).get({
+      resourceId: 'r1',
+      threadId: created.id,
+    });
     expect(fetched).not.toBeNull();
   });
 
   it('rename/clone on a totally missing thread throws HarnessThreadNotFoundError', async () => {
     const { harness } = setupHarness();
-    await expect(createHarnessOperatorThreadController(harness).rename({ resourceId: 'r1', threadId: 'thread-missing', title: 'x' })).rejects.toThrow(
-      HarnessThreadNotFoundError,
-    );
-    await expect(createHarnessOperatorThreadController(harness).clone({ resourceId: 'r1', threadId: 'thread-missing' })).rejects.toThrow(
-      HarnessThreadNotFoundError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).rename({
+        resourceId: 'r1',
+        threadId: 'thread-missing',
+        title: 'x',
+      }),
+    ).rejects.toThrow(HarnessThreadNotFoundError);
+    await expect(
+      createHarnessOperatorThreadController(harness).clone({ resourceId: 'r1', threadId: 'thread-missing' }),
+    ).rejects.toThrow(HarnessThreadNotFoundError);
   });
 });
 
@@ -430,12 +452,14 @@ describe('harness.threads — cascade-on-delete', () => {
     const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'legacy' });
     const session = await harness.session({ threadId: thread.id, resourceId: 'r1' });
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessStorageThreadDeleteFenceUnsupportedError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessStorageThreadDeleteFenceUnsupportedError);
 
     await expect(storage.loadSession({ sessionId: session.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed before deleting sessions when storage adapters cannot prove active thread ownership', async () => {
@@ -446,27 +470,38 @@ describe('harness.threads — cascade-on-delete', () => {
     }
     const storage = new LegacyHarnessStorage({ db: new InMemoryDB() });
     const { harness } = setupHarnessWithHarnessStore(storage);
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'legacy-active-lookup' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'legacy-active-lookup',
+    });
     const session = await harness.session({ threadId: thread.id, resourceId: 'r1' });
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toThrow(
-      'HarnessStorage.listActiveSessionsByThread must be implemented by this storage adapter',
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toThrow('HarnessStorage.listActiveSessionsByThread must be implemented by this storage adapter');
 
     await expect(storage.loadSession({ sessionId: session.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('waits for an active first-party delete fence before completing a concurrent delete', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     let deleteSettled = false;
     let deletePromise: Promise<void> | undefined;
 
     await storage.withThreadDeleteFence(
       { threadId: thread.id, ownerId: 'harness-test:thread-delete:first', ttlMs: 30_000 },
       async () => {
-        deletePromise = createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id });
+        deletePromise = createHarnessOperatorThreadController(harness).delete({
+          resourceId: 'r1',
+          threadId: thread.id,
+        });
         deletePromise.then(
           () => {
             deleteSettled = true;
@@ -482,7 +517,9 @@ describe('harness.threads — cascade-on-delete', () => {
 
     if (!deletePromise) throw new Error('concurrent delete was not started');
     await expect(deletePromise).resolves.toBeUndefined();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeNull();
   });
 
   it('continues root deletion when a descendant thread is already fenced by another delete', async () => {
@@ -494,7 +531,11 @@ describe('harness.threads — cascade-on-delete', () => {
       resourceId: 'r1',
       parentSessionId: parent.id,
     });
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: child.threadId, title: 'child' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: child.threadId,
+      title: 'child',
+    });
     await child.close();
 
     const originalFence = storage.withThreadDeleteFence.bind(storage);
@@ -505,18 +546,27 @@ describe('harness.threads — cascade-on-delete', () => {
       return originalFence(...args);
     }) as typeof storage.withThreadDeleteFence;
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).resolves.toBeUndefined();
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeUndefined();
 
     await expect(storage.loadSession({ sessionId: parent.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: child.id, harnessName: 'default' })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId }),
+    ).resolves.not.toBeNull();
   });
 
   it('force-deletes descendant sessions even when they use separate threads', async () => {
     const { harness, storage } = setupHarness();
     const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'parent' });
-    const childThread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'child' });
+    const childThread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'child',
+    });
     const parent = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const child = await harness.session({
       threadId: childThread.id,
@@ -528,8 +578,12 @@ describe('harness.threads — cascade-on-delete', () => {
 
     await expect(storage.loadSession({ sessionId: parent.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: child.id, harnessName: 'default' })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: childThread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: childThread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('reopens a closed descendant on same-resource thread lookup rather than forking a new owner (§5.3)', async () => {
@@ -545,7 +599,11 @@ describe('harness.threads — cascade-on-delete', () => {
       resourceId: 'r1',
       parentSessionId: parent.id,
     });
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: child.threadId, title: 'child' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: child.threadId,
+      title: 'child',
+    });
     await child.close();
 
     const reused = await harness.session({ threadId: child.threadId, resourceId: 'r1' });
@@ -562,7 +620,11 @@ describe('harness.threads — cascade-on-delete', () => {
       resourceId: 'r1',
       parentSessionId: parent.id,
     });
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: child.threadId, title: 'child' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: child.threadId,
+      title: 'child',
+    });
     await child.close();
 
     const crossResource = await harness.session({ threadId: child.threadId, resourceId: 'r2' });
@@ -572,7 +634,9 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(storage.loadSession({ sessionId: parent.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: child.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: crossResource.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId }),
+    ).resolves.not.toBeNull();
   });
 
   it('keeps an owned descendant thread when another harness namespace has an active session on that thread id', async () => {
@@ -584,7 +648,11 @@ describe('harness.threads — cascade-on-delete', () => {
       resourceId: 'r1',
       parentSessionId: parent.id,
     });
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: child.threadId, title: 'child' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: child.threadId,
+      title: 'child',
+    });
     await child.close();
     await storage.saveSession(
       {
@@ -604,12 +672,17 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(
       storage.loadSession({ sessionId: 'other-harness-session', harnessName: 'other' }),
     ).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: child.threadId }),
+    ).resolves.not.toBeNull();
   });
 
   it('keeps the root thread when a different resource has an active session on that thread id', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const crossResource = await harness.session({ threadId: thread.id, resourceId: 'r2' });
 
@@ -617,12 +690,17 @@ describe('harness.threads — cascade-on-delete', () => {
 
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: crossResource.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('keeps the root thread when another harness namespace has an active session on that thread id', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     await storage.saveSession(
       {
@@ -641,12 +719,17 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(
       storage.loadSession({ sessionId: 'other-harness-session', harnessName: 'other' }),
     ).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('keeps the root thread when a different resource has a closed session on that thread id', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const crossResource = await harness.session({ threadId: thread.id, resourceId: 'r2' });
     await crossResource.close();
@@ -655,7 +738,9 @@ describe('harness.threads — cascade-on-delete', () => {
 
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.toBeNull();
     await expect(storage.loadSession({ sessionId: crossResource.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed before deleting sessions through a separate session storage override', async () => {
@@ -667,15 +752,20 @@ describe('harness.threads — cascade-on-delete', () => {
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'separate-storage' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'separate-storage',
+    });
     const session = await harness.session({ threadId: thread.id, resourceId: 'r1' });
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(storage.loadSession({ sessionId: session.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed when another registered harness uses a separate session storage override on the same memory store', async () => {
@@ -696,13 +786,16 @@ describe('harness.threads — cascade-on-delete', () => {
       storage: sharedStorage,
       harnesses: { primary, override },
     });
-    const thread = await createHarnessOperatorThreadController(primary).create({ resourceId: 'r1', title: 'shared-memory' });
+    const thread = await createHarnessOperatorThreadController(primary).create({
+      resourceId: 'r1',
+      title: 'shared-memory',
+    });
     const visible = await primary.session({ threadId: thread.id, resourceId: 'r1' });
     const hidden = await override.session({ threadId: thread.id, resourceId: 'r2' });
 
-    await expect(createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(
       sharedStorage.stores.harness!.loadSession({ sessionId: visible.id, harnessName: 'primary' }),
@@ -710,41 +803,50 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(
       overrideStorage.loadSession({ sessionId: hidden.id, harnessName: 'override' }),
     ).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed when another Mastra-bound harness uses a separate session storage override on the same memory store', async () => {
     const agent = new MockAgent({ id: 'default' });
     const sharedStorage = new InMemoryStore();
+    const overrideStorage = new InMemoryHarness({ db: new InMemoryDB() });
+    const override = new Harness({
+      sessions: { storage: overrideStorage },
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
     const mastra = new Mastra({
       agents: { default: agent } as any,
       storage: sharedStorage,
+      harnesses: { override },
     });
     const primary = new Harness({
       mastra,
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const overrideStorage = new InMemoryHarness({ db: new InMemoryDB() });
-    const override = new Harness({
-      mastra,
-      sessions: { storage: overrideStorage },
-      modes: [{ id: 'default', agentId: 'default' }],
-      defaultModeId: 'default',
+    const thread = await createHarnessOperatorThreadController(primary).create({
+      resourceId: 'r1',
+      title: 'direct-bound',
     });
-    const thread = await createHarnessOperatorThreadController(primary).create({ resourceId: 'r1', title: 'direct-bound' });
     const visible = await primary.session({ threadId: thread.id, resourceId: 'r1' });
     const hidden = await override.session({ threadId: thread.id, resourceId: 'r2' });
 
-    await expect(createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(
       sharedStorage.stores.harness!.loadSession({ sessionId: visible.id, harnessName: 'default' }),
     ).resolves.not.toBeNull();
-    await expect(overrideStorage.loadSession({ sessionId: hidden.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      overrideStorage.loadSession({ sessionId: hidden.id, harnessName: 'override' }),
+    ).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed when a memory-only harness shares memory with a storage-backed harness', async () => {
@@ -762,18 +864,24 @@ describe('harness.threads — cascade-on-delete', () => {
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const thread = await createHarnessOperatorThreadController(memoryOnly).create({ resourceId: 'r1', threadId: 'shared-memory-only', title: 'root' });
+    const thread = await createHarnessOperatorThreadController(memoryOnly).create({
+      resourceId: 'r1',
+      threadId: 'shared-memory-only',
+      title: 'root',
+    });
     const hidden = await override.session({ threadId: thread.id, resourceId: 'r2' });
     await expect(memory.getThreadById({ threadId: thread.id })).resolves.toMatchObject({
       metadata: expect.objectContaining({ [externalSessionStorageOwnerMetadataKey]: true }),
     });
 
-    await expect(createHarnessOperatorThreadController(memoryOnly).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(memoryOnly).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(overrideStorage.loadSession({ sessionId: hidden.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(memoryOnly).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(memoryOnly).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fails closed when a different Mastra instance shares memory with a session storage override', async () => {
@@ -791,20 +899,25 @@ describe('harness.threads — cascade-on-delete', () => {
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const thread = await createHarnessOperatorThreadController(primary).create({ resourceId: 'r1', title: 'shared-memory-cross-mastra' });
+    const thread = await createHarnessOperatorThreadController(primary).create({
+      resourceId: 'r1',
+      title: 'shared-memory-cross-mastra',
+    });
     const visible = await primary.session({ threadId: thread.id, resourceId: 'r1' });
     const hidden = await override.session({ threadId: thread.id, resourceId: 'r2' });
     await expect(memory.getThreadById({ threadId: thread.id })).resolves.toMatchObject({
       metadata: expect.objectContaining({ [externalSessionStorageOwnerMetadataKey]: true }),
     });
 
-    await expect(createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(primaryStorage.loadSession({ sessionId: visible.id, harnessName: 'default' })).resolves.not.toBeNull();
     await expect(overrideStorage.loadSession({ sessionId: hidden.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('blocks separate session storage attachment while a thread delete is in progress', async () => {
@@ -821,7 +934,10 @@ describe('harness.threads — cascade-on-delete', () => {
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const thread = await createHarnessOperatorThreadController(primary).create({ resourceId: 'r1', title: 'delete-in-progress' });
+    const thread = await createHarnessOperatorThreadController(primary).create({
+      resourceId: 'r1',
+      title: 'delete-in-progress',
+    });
     await memory.updateThread({
       id: thread.id,
       title: thread.title,
@@ -869,7 +985,10 @@ describe('harness.threads — cascade-on-delete', () => {
       modes: [{ id: 'default', agentId: 'default' }],
       defaultModeId: 'default',
     });
-    const thread = await createHarnessOperatorThreadController(primary).create({ resourceId: 'r1', title: 'hydrate-marker' });
+    const thread = await createHarnessOperatorThreadController(primary).create({
+      resourceId: 'r1',
+      title: 'hydrate-marker',
+    });
     const hidden = await override.session({ threadId: thread.id, resourceId: 'r2' });
     await overrideStorage.releaseSessionLease({
       sessionId: hidden.id,
@@ -895,14 +1014,17 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(memory.getThreadById({ threadId: thread.id })).resolves.toMatchObject({
       metadata: expect.objectContaining({ [externalSessionStorageOwnerMetadataKey]: true }),
     });
-    await expect(createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
   });
 
   it('fails closed when a memory thread has a durable external session storage owner marker', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'externally-owned' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'externally-owned',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const memory = await harness.mastra.getStorage()!.getStore('memory');
     await memory!.updateThread({
@@ -911,13 +1033,17 @@ describe('harness.threads — cascade-on-delete', () => {
       metadata: { [externalSessionStorageOwnerMetadataKey]: true },
     });
 
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
 
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id })).resolves.toEqual({});
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toEqual({});
   });
 
   it('preserves reserved ownership metadata when recreating an existing thread id', async () => {
@@ -952,9 +1078,9 @@ describe('harness.threads — cascade-on-delete', () => {
         [externalSessionStorageOwnerMetadataKey]: true,
       }),
     });
-    await expect(createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toBeInstanceOf(
-      HarnessConfigError,
-    );
+    await expect(
+      createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).rejects.toBeInstanceOf(HarnessConfigError);
   });
 
   it('does not keep shutdown harnesses in shared-memory delete ownership checks', async () => {
@@ -979,7 +1105,9 @@ describe('harness.threads — cascade-on-delete', () => {
     await createHarnessOperatorThreadController(primary).delete({ resourceId: 'r1', threadId: thread.id });
 
     await expect(primaryStorage.loadSession({ sessionId: session.id, harnessName: 'default' })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id })).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(primary).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeNull();
   });
 
   it('rolls back the external owner marker when attach loses a thread-delete race', async () => {
@@ -1036,7 +1164,10 @@ describe('harness.threads — cascade-on-delete', () => {
 
   it('rechecks root thread ownership before deleting the global memory thread', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const memory = (await harness.mastra.getStorage()!.getStore('memory')) as any;
     const originalGetThreadById = memory.getThreadById.bind(memory);
@@ -1056,12 +1187,17 @@ describe('harness.threads — cascade-on-delete', () => {
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.toBeNull();
     getThreadSpy.mockRestore();
     deleteThreadSpy.mockRestore();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('fences root thread admission while cascade delete is running', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
     const originalListSessionsByThread = storage.listSessionsByThread.bind(storage);
     let attemptedConcurrentAdmission = false;
@@ -1079,7 +1215,9 @@ describe('harness.threads — cascade-on-delete', () => {
 
     expect(attemptedConcurrentAdmission).toBe(true);
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeNull();
   });
 
   it('fences caller-supplied thread creation while a delete is active for that id', async () => {
@@ -1087,33 +1225,44 @@ describe('harness.threads — cascade-on-delete', () => {
 
     await storage.withThreadDeleteFence({ threadId: 'shared-root', ownerId: 'deleter', ttlMs: 30_000 }, async () => {
       await expect(
-        createHarnessOperatorThreadController(harness).create({ resourceId: 'r2', threadId: 'shared-root', title: 'replacement' }),
+        createHarnessOperatorThreadController(harness).create({
+          resourceId: 'r2',
+          threadId: 'shared-root',
+          title: 'replacement',
+        }),
       ).rejects.toThrow('currently fenced for deletion');
     });
   });
 
   it('reports thread delete contention when caller-supplied thread creation owns the fence', async () => {
     const { harness, storage } = setupHarness();
-    const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 'shared-root' });
+    const thread = await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      title: 'shared-root',
+    });
     const owner = await harness.session({ threadId: thread.id, resourceId: 'r1' });
 
     await storage.withThreadDeleteFence(
       { threadId: thread.id, ownerId: 'harness-test:thread-create:replacement', ttlMs: 30_000 },
       async () => {
-        await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).rejects.toThrow(
-          'currently fenced for deletion',
-        );
+        await expect(
+          createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+        ).rejects.toThrow('currently fenced for deletion');
       },
     );
 
     await expect(storage.loadSession({ sessionId: owner.id, harnessName: 'default' })).resolves.not.toBeNull();
-    await expect(createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id })).resolves.not.toBeNull();
+    await expect(
+      createHarnessOperatorThreadController(harness).get({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.not.toBeNull();
   });
 
   it('deletes cleanly when no live session exists', async () => {
     const { harness } = setupHarness();
     const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
-    await expect(createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id })).resolves.toBeUndefined();
+    await expect(
+      createHarnessOperatorThreadController(harness).delete({ resourceId: 'r1', threadId: thread.id }),
+    ).resolves.toBeUndefined();
   });
 });
 

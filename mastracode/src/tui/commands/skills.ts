@@ -14,7 +14,7 @@ function escapeSkillBoundary(value: string): string {
 async function resolveWorkspace(ctx: SlashCommandContext) {
   let workspace = ctx.getResolvedWorkspace();
   if (!workspace && ctx.harness.hasWorkspace()) {
-    workspace = await ctx.harness.resolveWorkspace({ session: ctx.state.session });
+    workspace = await ctx.harness.resolveWorkspace();
   }
   return workspace;
 }

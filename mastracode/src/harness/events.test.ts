@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import { MastraCodeHarnessEventProjector } from './events.js';
 
-function createProjector(displayState: Record<string, unknown> = {}) {
+function createProjector(displayState: Record<string, unknown> = {}, messages: any[] = []) {
   const events: any[] = [];
   const projector = new MastraCodeHarnessEventProjector(
     event => events.push(event),
@@ -15,49 +15,106 @@ function createProjector(displayState: Record<string, unknown> = {}) {
       createdAt: new Date(0),
       updatedAt: new Date(0),
     }),
+    async () => messages,
   );
   return { events, projector };
 }
 
 describe('MastraCodeHarnessEventProjector', () => {
-  it('projects v1 message deltas into legacy full-message updates', async () => {
+  it('projects v1 text deltas into legacy full-message updates', async () => {
     const { events, projector } = createProjector();
 
-    await projector.project({ type: 'message_start', messageId: 'm1', id: 'e1', timestamp: 1 } as HarnessV1Event);
     await projector.project({
-      type: 'message_update',
-      messageId: 'm1',
+      type: 'text_delta',
+      runId: 'r1',
       delta: 'hel',
-      id: 'e2',
-      timestamp: 2,
+      id: 'e1',
+      timestamp: 1,
     } as HarnessV1Event);
-    await projector.project({
-      type: 'message_update',
-      messageId: 'm1',
-      delta: 'lo',
-      id: 'e3',
-      timestamp: 3,
-    } as HarnessV1Event);
+    await projector.project({ type: 'text_delta', runId: 'r1', delta: 'lo', id: 'e2', timestamp: 2 } as HarnessV1Event);
 
+    const starts = events.filter(event => event.type === 'message_start');
+    expect(starts).toHaveLength(1);
     const updates = events.filter(event => event.type === 'message_update');
     expect(updates.at(-1)?.message.content).toEqual([{ type: 'text', text: 'hello' }]);
   });
 
-  it('projects question suspensions into ask_question events', async () => {
-    const { events, projector } = createProjector({
-      pending: {
-        itemId: 'q1',
-        payload: {
-          question: 'Proceed?',
-          options: [{ label: 'Yes' }],
-        },
-      },
-    });
+  it('flushes the streamed message on agent_end', async () => {
+    const { events, projector } = createProjector();
 
     await projector.project({
-      type: 'suspension_required',
-      kind: 'question',
+      type: 'text_delta',
+      runId: 'r1',
+      delta: 'done',
+      id: 'e1',
+      timestamp: 1,
+    } as HarnessV1Event);
+    await projector.project({
+      type: 'agent_end',
+      runId: 'r1',
+      finishReason: 'stop',
+      usage: {},
+      id: 'e2',
+      timestamp: 2,
+    } as unknown as HarnessV1Event);
+
+    const ends = events.filter(event => event.type === 'message_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.message.content).toEqual([{ type: 'text', text: 'done' }]);
+    expect(events.find(event => event.type === 'agent_end')).toMatchObject({ reason: 'complete' });
+  });
+
+  it('preserves structured parts from the authoritative completed message', async () => {
+    const reminder = {
+      id: 'reminder-1',
+      role: 'user',
+      content: [{ type: 'system_reminder', reminderType: 'dynamic-agents-md', message: 'instructions' }],
+      createdAt: new Date(0),
+    };
+    const assistant = {
+      id: 'stored-message-1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+      createdAt: new Date(0),
+    };
+    const { events, projector } = createProjector({ assistantDrafts: { r1: { messageId: 'stream-part-1' } } }, [
+      reminder,
+      assistant,
+    ]);
+
+    await projector.project({
+      type: 'text_delta',
+      runId: 'r1',
+      delta: 'done',
+      id: 'e1',
+      timestamp: 1,
+    } as HarnessV1Event);
+    await projector.project({
+      type: 'agent_end',
+      runId: 'r1',
+      finishReason: 'complete',
+      usage: {},
+      id: 'e2',
+      timestamp: 2,
+    } as HarnessV1Event);
+
+    const expected = { ...assistant, content: [...reminder.content, ...assistant.content] };
+    expect(events.filter(event => event.type === 'message_update').at(-1)?.message).toEqual(expected);
+    expect(events.find(event => event.type === 'message_end')?.message).toEqual(expected);
+  });
+
+  it('projects question_pending into ask_question events', async () => {
+    const { events, projector } = createProjector();
+
+    await projector.project({
+      type: 'question_pending',
+      runId: 'r1',
+      itemId: 'q1',
+      requestedAt: 1,
       toolCallId: 'tool-1',
+      question: 'Proceed?',
+      options: [{ label: 'Yes' }],
+      source: 'parent',
       id: 'e1',
       timestamp: 1,
     } as HarnessV1Event);
@@ -70,25 +127,22 @@ describe('MastraCodeHarnessEventProjector', () => {
     });
   });
 
-  it('projects request_access question suspensions into sandbox access requests', async () => {
-    const { events, projector } = createProjector({
-      pending: {
-        itemId: 'sandbox_1_123',
-        payload: {
-          question: 'Allow Mastra Code to access /outside/project/dir?\n\nneed to read config',
-          options: [
-            { label: 'Yes', description: 'Grant access for this session.' },
-            { label: 'No', description: 'Deny this access request.' },
-          ],
-          selectionMode: 'single_select',
-        },
-      },
-    });
+  it('projects sandbox-shaped question_pending into sandbox access requests', async () => {
+    const { events, projector } = createProjector();
 
     await projector.project({
-      type: 'suspension_required',
-      kind: 'question',
+      type: 'question_pending',
+      runId: 'r1',
+      itemId: 'sandbox_1_123',
+      requestedAt: 1,
       toolCallId: 'call-1',
+      question: 'Allow Mastra Code to access /outside/project/dir?\n\nneed to read config',
+      options: [
+        { label: 'Yes', description: 'Grant access for this session.' },
+        { label: 'No', description: 'Deny this access request.' },
+      ],
+      selectionMode: 'single_select',
+      source: 'parent',
       id: 'e1',
       timestamp: 1,
     } as HarnessV1Event);
@@ -101,44 +155,18 @@ describe('MastraCodeHarnessEventProjector', () => {
     });
   });
 
-  it('projects native sandbox access requests into sandbox access prompts', async () => {
+  it('keeps malformed sandbox-like questions on the generic ask_question path', async () => {
     const { events, projector } = createProjector();
 
     await projector.project({
-      type: 'sandbox_access_requested',
-      requestId: 'sandbox-native-1',
-      toolCallId: 'sandbox-native-1',
-      semanticType: 'file',
-      reason: 'needs config',
-      payload: { path: '/outside/project/dir' },
-      id: 'e1',
-      timestamp: 1,
-    } as HarnessV1Event);
-
-    expect(events[0]).toMatchObject({
-      type: 'sandbox_access_request',
-      questionId: 'sandbox-native-1',
-      path: '/outside/project/dir',
-      reason: 'needs config',
-      responseKind: 'sandbox-access',
-    });
-  });
-
-  it('keeps malformed sandbox-like questions on the generic ask_question path', async () => {
-    const { events, projector } = createProjector({
-      pending: {
-        itemId: 'sandbox_1_123',
-        payload: {
-          question: 'Can I do something else?',
-          options: [{ label: 'Yes' }],
-        },
-      },
-    });
-
-    await projector.project({
-      type: 'suspension_required',
-      kind: 'question',
+      type: 'question_pending',
+      runId: 'r1',
+      itemId: 'sandbox_1_123',
+      requestedAt: 1,
       toolCallId: 'call-1',
+      question: 'Can I do something else?',
+      options: [{ label: 'Yes' }],
+      source: 'parent',
       id: 'e1',
       timestamp: 1,
     } as HarnessV1Event);
@@ -150,21 +178,18 @@ describe('MastraCodeHarnessEventProjector', () => {
     });
   });
 
-  it('projects plan suspensions into plan approval events', async () => {
-    const { events, projector } = createProjector({
-      pending: {
-        itemId: 'p1',
-        payload: {
-          title: 'Implementation plan',
-          plan: '1. Build it',
-        },
-      },
-    });
+  it('projects plan_approval_required into plan approval events', async () => {
+    const { events, projector } = createProjector();
 
     await projector.project({
-      type: 'suspension_required',
-      kind: 'plan-approval',
+      type: 'plan_approval_required',
+      runId: 'r1',
+      itemId: 'p1',
+      requestedAt: 1,
       toolCallId: 'tool-1',
+      title: 'Implementation plan',
+      plan: '1. Build it',
+      source: 'parent',
       id: 'e1',
       timestamp: 1,
     } as HarnessV1Event);
@@ -177,23 +202,45 @@ describe('MastraCodeHarnessEventProjector', () => {
     });
   });
 
-  it('projects tool suspensions into resumable legacy tool events', async () => {
-    const { events, projector } = createProjector({
-      pending: {
-        itemId: 'tool-1',
-        toolName: 'long_running_tool',
-        payload: {
-          input: { id: 1 },
-          suspendPayload: { step: 'confirm' },
-        },
-      },
-    });
+  it('projects tool_approval_required into legacy tool approval events', async () => {
+    const { events, projector } = createProjector();
 
     await projector.project({
-      type: 'suspension_required',
-      kind: 'tool-suspension',
+      type: 'tool_approval_required',
+      runId: 'r1',
+      itemId: 'tool-1',
+      requestedAt: 1,
+      toolCallId: 'tool-1',
+      toolName: 'run_command',
+      toolCategory: 'execute',
+      approvalReasons: [],
+      input: { command: 'ls' },
+      source: 'parent',
+      id: 'e1',
+      timestamp: 1,
+    } as HarnessV1Event);
+
+    expect(events[0]).toMatchObject({
+      type: 'tool_approval_required',
+      toolCallId: 'tool-1',
+      toolName: 'run_command',
+      args: { command: 'ls' },
+      category: 'execute',
+    });
+  });
+
+  it('projects tool_suspension_required into resumable legacy tool events', async () => {
+    const { events, projector } = createProjector();
+
+    await projector.project({
+      type: 'tool_suspension_required',
+      runId: 'r1',
+      itemId: 'tool-1',
+      requestedAt: 1,
       toolCallId: 'tool-1',
       toolName: 'long_running_tool',
+      suspendData: { input: { id: 1 }, step: 'confirm' },
+      source: 'parent',
       id: 'e1',
       timestamp: 1,
     } as HarnessV1Event);
@@ -203,11 +250,11 @@ describe('MastraCodeHarnessEventProjector', () => {
       toolCallId: 'tool-1',
       toolName: 'long_running_tool',
       args: { id: 1 },
-      suspendPayload: { step: 'confirm' },
+      suspendPayload: { input: { id: 1 }, step: 'confirm' },
     });
   });
 
-  it('projects subagent tool args and stringifies structured subagent output', async () => {
+  it('projects subagent tool args from input and stringifies structured subagent output', async () => {
     const { events, projector } = createProjector();
 
     await projector.project({
@@ -217,7 +264,7 @@ describe('MastraCodeHarnessEventProjector', () => {
       agentType: 'explore',
       innerToolCallId: 'inner-tool',
       toolName: 'read_file',
-      args: { path: 'src/index.ts' },
+      input: { path: 'src/index.ts' },
       depth: 1,
       id: 'e1',
       timestamp: 1,
@@ -242,6 +289,26 @@ describe('MastraCodeHarnessEventProjector', () => {
     });
     expect(events.find(event => event.type === 'subagent_end')).toMatchObject({
       result: JSON.stringify({ summary: 'done' }),
+    });
+  });
+
+  it('maps tool_start.input onto the legacy tool_start.args field', async () => {
+    const { events, projector } = createProjector();
+
+    await projector.project({
+      type: 'tool_start',
+      runId: 'r1',
+      toolCallId: 'tool-1',
+      toolName: 'read_file',
+      input: { path: 'README.md' },
+      id: 'e1',
+      timestamp: 1,
+    } as HarnessV1Event);
+
+    expect(events.find(event => event.type === 'tool_start')).toMatchObject({
+      toolCallId: 'tool-1',
+      toolName: 'read_file',
+      args: { path: 'README.md' },
     });
   });
 });

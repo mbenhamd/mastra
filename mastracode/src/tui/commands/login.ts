@@ -53,7 +53,7 @@ async function performLogin(ctx: SlashCommandContext, providerId: string): Promi
 
         const defaultModel = PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PROVIDER_DEFAULT_MODELS];
         if (defaultModel) {
-          await ctx.state.session.model.switch({ modelId: defaultModel });
+          await ctx.harness.switchModel({ modelId: defaultModel });
           ctx.showInfo(`Logged in to ${providerName} - switched to ${defaultModel}`);
         } else {
           ctx.showInfo(`Successfully logged in to ${providerName}`);
@@ -91,9 +91,9 @@ export async function handleLoginCommand(ctx: SlashCommandContext, mode: 'login'
 
   if (mode === 'login') {
     ctx.analytics?.trackInteractivePrompt('login_provider_selector', {
-      threadId: ctx.state.session.thread.getId(),
-      resourceId: ctx.state.session.identity.getResourceId(),
-      mode: ctx.state.session.mode.get(),
+      threadId: ctx.harness.getCurrentThreadId(),
+      resourceId: ctx.harness.getResourceId(),
+      mode: ctx.harness.getCurrentModeId(),
     });
   }
 

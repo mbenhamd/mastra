@@ -54,7 +54,8 @@ Provider-visible output is recorded as an Outbox row, then a Dispatch worker cla
   <path d="M 525 95 L 555 70" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ah-outbound)"/>
   <text x="538" y="75" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">lookup</text>
 
-  <text x="450" y="220" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.4 — Outbound: runtime to provider</text>
+<text x="450" y="220" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.4 — Outbound: runtime to provider</text>
 </svg>
+
 <figcaption>Provider-visible output is recorded as an outbox row, claimed by a dispatch worker, validated through the registry, and sent to the provider; §14.4 owns outbox dispatch and §14.1 owns the channel binding contract.</figcaption>
 </figure>

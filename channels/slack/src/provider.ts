@@ -914,6 +914,7 @@ export class SlackProvider implements ChannelProvider {
       | SlackAdapter;
     const existing = agent.getChannels() as AgentChannels | undefined;
     const existingConfig = existing?.channelConfig;
+    existing?.close();
     const agentChannels = new AgentChannels({
       ...existingConfig,
       ...this.#forwardedChannelOptions(),

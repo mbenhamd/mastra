@@ -36,7 +36,7 @@ import { logsAction } from './commands/studio/deploy-logs';
 import { statusAction } from './commands/studio/deploy-status';
 import { suggestionsAction } from './commands/studio/deploy-suggestions';
 import { listProjectsAction, createProjectAction } from './commands/studio/projects';
-import { parseComponents, parseLlmProvider, parseMcp, parseSkills, wrapAction } from './commands/utils';
+import { parseComponents, parseLlmProvider, parseMcp, parseSkills, parseTimeout, wrapAction } from './commands/utils';
 import { buildWorker } from './commands/worker/build';
 import { devWorker } from './commands/worker/dev';
 import { startWorker } from './commands/worker/start';
@@ -82,7 +82,11 @@ program
   .option('-k, --llm-api-key <api-key>', 'API key for the model provider')
   .option('-e, --example', 'Include example code')
   .option('-n, --no-example', 'Do not include example code')
-  .option('-t, --timeout [timeout]', 'Configurable timeout for package installation, defaults to 60000 ms')
+  .option(
+    '-t, --timeout [milliseconds]',
+    'Configurable package-install timeout; uses 60000 ms when no value is provided',
+    parseTimeout,
+  )
   .option('-d, --dir <directory>', 'Target directory for Mastra source code (default: src/)')
   .option(
     '-p, --project-name <string>',

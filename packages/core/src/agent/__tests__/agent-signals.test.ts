@@ -1170,7 +1170,7 @@ describe('Agent signals', () => {
 
   it('assigns a new stream identity to same-run registrations without stale cleanup clearing the active stream', async () => {
     const runtime = new AgentThreadStreamRuntime();
-    const pubsub = new EventEmitterPubSub();
+    const pubsub = new BlockingRunCompletedPubSub();
     const agent = { id: 'stream-identity-agent' } as Agent<any, any, any, any>;
     const threadId = 'stream-identity-thread';
     const resourceId = 'stream-identity-resource';
@@ -1216,7 +1216,7 @@ describe('Agent signals', () => {
 
     try {
       const initialRun = readNextRun(iterator);
-      await createRun('initial response', initialFinished);
+      const initialCompletion = createRun('initial response', initialFinished)!;
       await expect(withTimeout(initialRun, 'Timed out waiting for initial stream identity run')).resolves.toMatchObject(
         {
           value: { runId, text: 'initial response' },
@@ -1224,8 +1224,11 @@ describe('Agent signals', () => {
       );
       expect(subscription.activeRunId()).toBe(runId);
 
+      finishInitial();
+      await waitForCondition(() => pubsub.sawRunCompleted);
+
       const resumedRun = readNextRun(iterator);
-      await createRun('resumed response', resumedFinished);
+      const resumedCompletion = createRun('resumed response', resumedFinished)!;
       await expect(withTimeout(resumedRun, 'Timed out waiting for resumed stream identity run')).resolves.toMatchObject(
         {
           value: { runId, text: 'resumed response' },
@@ -1240,12 +1243,14 @@ describe('Agent signals', () => {
       expect(registeredEvents[1].streamId).toEqual(expect.any(String));
       expect(registeredEvents[1].streamId).not.toBe(registeredEvents[0].streamId);
 
-      finishInitial();
+      pubsub.unblockRunCompleted();
+      await initialCompletion;
       await nextTick();
       expect(subscription.activeRunId()).toBe(runId);
 
       finishResumed();
-      await waitForCondition(() => subscription.activeRunId() === null);
+      await resumedCompletion;
+      expect(subscription.activeRunId()).toBeNull();
     } finally {
       subscription.unsubscribe();
     }
@@ -2582,6 +2587,62 @@ describe('Agent signals', () => {
     }
   });
 
+  it('lets the same agent reserve a fresh turn while retaining a suspended run for explicit resume', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new EventEmitterPubSub();
+    const agent = { id: 'suspended-fresh-turn-agent' } as Agent<any, any, any, any>;
+    const threadId = 'suspended-fresh-turn-thread';
+    const resourceId = 'suspended-fresh-turn-user';
+    const suspendedRunId = 'suspended-fresh-turn-old-run';
+
+    const suspendedCompletion = runtime.registerRun(
+      agent,
+      {
+        runId: suspendedRunId,
+        status: 'suspended',
+        fullStream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'start', runId: suspendedRunId });
+            controller.enqueue({
+              type: 'tool-call-approval',
+              runId: suspendedRunId,
+              payload: { toolCallId: 'fresh-turn-tool-call', toolName: 'freshTurnTool' },
+            });
+            controller.close();
+          },
+        }),
+        _waitUntilFinished: () => Promise.resolve(),
+      } as any,
+      {
+        runId: suspendedRunId,
+        memory: { thread: threadId, resource: resourceId },
+      } as any,
+      pubsub,
+    );
+    await withTimeout(suspendedCompletion ?? Promise.resolve(), 'Timed out finalizing retained suspended run');
+
+    expect(runtime.getActiveThreadRunId({ resourceId, threadId }, pubsub)).toBe(suspendedRunId);
+
+    const freshOptions = {
+      runId: 'suspended-fresh-turn-new-run',
+      memory: { thread: threadId, resource: resourceId },
+    } as any;
+    await runtime.waitForThreadRunReservation(freshOptions, pubsub, agent.id);
+    const releaseFreshReservation = runtime.reserveRun(freshOptions, pubsub, agent.id);
+
+    expect(releaseFreshReservation).toBeDefined();
+    expect(runtime.getActiveThreadRunId({ resourceId, threadId }, pubsub)).toBe(freshOptions.runId);
+    expect(runtime.getRunOutput(suspendedRunId, pubsub)).toBeDefined();
+    expect(
+      runtime.getResumableThreadRun(
+        { resourceId, threadId, runId: suspendedRunId, toolCallId: 'fresh-turn-tool-call' },
+        pubsub,
+      ),
+    ).toEqual({ runId: suspendedRunId, toolCallId: 'fresh-turn-tool-call' });
+
+    releaseFreshReservation?.();
+  });
+
   it.each(['request_access', 'ask_user'])('keeps %s suspensions discoverable and blocks idle wake', async toolName => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new EventEmitterPubSub();
@@ -3607,7 +3668,7 @@ describe('Agent signals', () => {
       _waitUntilFinished: () => finished,
     };
 
-    ownerRuntime.registerRun(
+    const completion = ownerRuntime.registerRun(
       { id: 'async-remote-owner' } as any,
       output as any,
       {
@@ -3615,18 +3676,13 @@ describe('Agent signals', () => {
         memory: { resource: 'async-remote-user', thread: 'async-remote-thread' },
       } as any,
       pubsub,
-    );
-    await expect(
-      readNextRun((output.fullStream as ReadableStream<unknown>)[Symbol.asyncIterator]()),
-    ).resolves.toMatchObject({
-      value: { runId, text: 'remote async response' },
-      done: false,
-    });
+    )!;
 
     await expect(nextRun).resolves.toMatchObject({
       value: { runId, text: 'remote async response' },
       done: false,
     });
+    await expect(completion).resolves.toBeUndefined();
 
     subscription.unsubscribe();
   });
@@ -3883,13 +3939,14 @@ describe('Agent signals', () => {
       { type: 'user-message', contents: 'Hello while running' },
       { resourceId: 'pubsub-snapshot-user', threadId: 'pubsub-snapshot-thread' },
     );
-    expect(signalResult).toEqual(expect.objectContaining({ accepted: true }));
+    expect(signalResult.runId).toEqual(expect.any(String));
     releaseDefaultOptions();
 
     const stream = await streamPromise;
     await expect(waitForActiveRun(initialSubscription)).resolves.toBe(stream.runId);
     expect(runner.getRunOutput(stream.runId)).toBe(stream);
-    expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+    expect(signalResult.runId).toBe(stream.runId);
+    await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
 
     releaseFirst();
     const initialRun = await Promise.race([
@@ -4293,7 +4350,8 @@ describe('Agent signals', () => {
     releaseDefaultOptions();
 
     const stream = await streamPromise;
-    expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+    expect(signalResult.runId).toBe(stream.runId);
+    await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
   });
 
   it('does not expose explicit thread streams when request context preflight fails', async () => {
@@ -4811,7 +4869,8 @@ describe('Agent signals', () => {
     releaseDefaultOptions();
 
     const stream = await streamPromise;
-    expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+    expect(signalResult.runId).toBe(stream.runId);
+    await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
   });
 
   it('routes thread-only signals after default options add a resource target', async () => {
@@ -4880,10 +4939,12 @@ describe('Agent signals', () => {
       { threadId: 'thread-only-retargeted-thread' },
     );
 
-    expect(earlySignal).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
-    expect(lateSignal).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+    expect(earlySignal.runId).toBe(stream.runId);
+    expect(lateSignal.runId).toBe(stream.runId);
+    await expect(earlySignal.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
+    await expect(lateSignal.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
     releaseStream();
-    await expect(stream.text).resolves.toBe('thread only retargeted response');
+    await expect(stream.text).resolves.toBe('thread only retargeted responsethread only retargeted response');
   });
 
   it('supports cross-instance thread subscriptions through the Mastra runtime', async () => {
@@ -5170,7 +5231,8 @@ describe('Agent signals', () => {
         { type: 'user-message', contents: 'Hello while running' },
         { resourceId: 'pf-802-aggregate-user', threadId: 'pf-802-aggregate-thread' },
       );
-      expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: stream.runId }));
+      expect(signalResult.runId).toBe(stream.runId);
+      await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver', runId: stream.runId });
 
       releaseFirst();
       const run = await runPromise;
@@ -5755,7 +5817,8 @@ describe('Agent signals', () => {
       },
     );
 
-    expect(signalResult).toEqual(expect.objectContaining({ accepted: true, runId: 'caller-provided-run' }));
+    expect(signalResult.runId).toBe('caller-provided-run');
+    await expect(signalResult.accepted).resolves.toMatchObject({ action: 'wake', runId: 'caller-provided-run' });
     await expect(readNextRun(subscription.stream[Symbol.asyncIterator]())).resolves.toMatchObject({
       value: { runId: 'caller-provided-run', text: 'caller run response' },
       done: false,
@@ -5979,6 +6042,7 @@ describe('Agent signals', () => {
       },
     );
     expect(retryResult.runId).not.toBe(firstResult.runId);
+    await expect(retryResult.accepted).resolves.toMatchObject({ action: 'wake', runId: retryResult.runId });
     expect(stream).toHaveBeenCalledTimes(3);
   });
 
@@ -6059,6 +6123,7 @@ describe('Agent signals', () => {
       },
     );
     void result.output?.catch(() => {});
+    await waitForCondition(() => stream.mock.calls.length === 1);
     expect(stream).toHaveBeenCalledTimes(1);
 
     const waiter = runtime.waitForRunOutput(result.runId);
@@ -6094,6 +6159,7 @@ describe('Agent signals', () => {
       },
       pubsub,
     );
+    await waitForCondition(() => stream.mock.calls.length === 1);
     expect(stream).toHaveBeenCalledTimes(1);
 
     expect(() =>
@@ -6168,6 +6234,7 @@ describe('Agent signals', () => {
       },
       pubsub,
     );
+    await waitForCondition(() => stream.mock.calls.length === 1);
     expect(stream).toHaveBeenCalledTimes(1);
 
     expect(() =>
@@ -6209,6 +6276,7 @@ describe('Agent signals', () => {
         } as any,
       },
     );
+    await waitForCondition(() => stream.mock.calls.length === 1);
     expect(stream).toHaveBeenCalledTimes(1);
 
     let waiterResolved = false;
@@ -6244,6 +6312,7 @@ describe('Agent signals', () => {
       },
     );
     expect(retryResult.runId).not.toBe(result.runId);
+    await expect(retryResult.accepted).resolves.toMatchObject({ action: 'wake', runId: retryResult.runId });
     expect(stream).toHaveBeenCalledTimes(2);
   });
 
@@ -6307,7 +6376,7 @@ describe('Agent signals', () => {
       pubsub,
     );
     expect(laterSignal).toEqual(expect.objectContaining({ runId: 'later-run' }));
-    expect(runtime.drainPendingSignals('later-run', pubsub)).toHaveLength(1);
+    expect(runtime.drainPendingSignals('later-run', pubsub, 'pre-run')).toHaveLength(1);
     laterRelease!();
   });
 
@@ -6382,14 +6451,14 @@ describe('Agent signals', () => {
       },
     } as any;
 
-    expect(
-      runtime.sendSignal(
-        { id: 'queued-duplicate-agent', stream } as any,
-        { type: 'user-message', contents: 'first queued idle' },
-        target,
-        pubsub,
-      ),
-    ).toEqual(expect.objectContaining({ accepted: true, runId: 'queued-duplicate-idle-run' }));
+    const firstQueued = runtime.sendSignal(
+      { id: 'queued-duplicate-agent', stream } as any,
+      { type: 'user-message', contents: 'first queued idle' },
+      target,
+      pubsub,
+    );
+    expect(firstQueued.runId).toBe('queued-duplicate-idle-run');
+    expect(firstQueued.accepted).toBeInstanceOf(Promise);
     expect(() =>
       runtime.sendSignal(
         { id: 'queued-duplicate-agent', stream } as any,
@@ -6885,7 +6954,10 @@ describe('Agent signals', () => {
       { resourceId: 'queued-active-failure-user', threadId: 'queued-active-failure-thread' },
       pubsub,
     );
-    expect(signalResult.accepted).toBe(true);
+    await expect(signalResult.accepted).resolves.toMatchObject({
+      action: 'deliver',
+      runId: 'queued-active-failure-run',
+    });
 
     let waiterResolved = false;
     const waiter = runtime
@@ -7315,7 +7387,10 @@ describe('Agent signals', () => {
       { resourceId: 'completion-drain-user', threadId: 'completion-drain-thread' },
       pubsub,
     );
-    expect(queuedSignal.accepted).toBe(true);
+    await expect(queuedSignal.accepted).resolves.toMatchObject({
+      action: 'deliver',
+      runId: 'completion-drain-active-run',
+    });
 
     finishActive();
     await waitForCondition(() => pubsub.sawRunCompleted);

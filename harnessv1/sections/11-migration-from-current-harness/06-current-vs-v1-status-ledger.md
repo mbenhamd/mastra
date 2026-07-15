@@ -479,7 +479,7 @@ and as the v1 name when the spec section is the source of truth.
 
 #### 11.6d Implementation precursors without exact-name overlap
 
-§11.6a is scoped to *exact-name* identifier overlap with current Mastra
+§11.6a is scoped to _exact-name_ identifier overlap with current Mastra
 `../packages/{core,server,memory,mcp,deployer,cli}/src`. The rows below name
 current-code surfaces that materially **inform** a v1-declared family but ship
 under a different identifier — they are hallucination-risk in the other
@@ -720,10 +720,10 @@ identity. Every `Current code:` line anchor must be re-verified against
 (`../packages/memory`, `../packages/core/src/background-tasks`,
 `../packages/core/src/tools`, `../packages/core/src/storage/domains/**`) drift
 silently when the spec author edits only the harness file, so a grep pass
-  against the source HEAD is part of every §11.6 update. Counts are intentionally
-  not hand-maintained in prose because they drift when section snippets or
-  package-local type aliases change; rerun the inventory before using this ledger
-  as a migration checklist. Duplicate-cutover traps: §11.6e.
+against the source HEAD is part of every §11.6 update. Counts are intentionally
+not hand-maintained in prose because they drift when section snippets or
+package-local type aliases change; rerun the inventory before using this ledger
+as a migration checklist. Duplicate-cutover traps: §11.6e.
 
 #### 11.6e Implementation traps by entity
 
@@ -731,28 +731,28 @@ This table indexes cutover mistakes that create **parallel implementations** whe
 the [§0 Mental model](../../00-mental-model.md) is ignored. It does not add new
 semantics; owning sections remain authoritative.
 
-| Entity | Trap (today on `main`) | v1 owner | Canonical pointer |
-|--------|------------------------|----------|-------------------|
-| **Harness** | Thread-first lifecycle (`createThread`, `switchThread`, `sendMessage`, `followUp`, `steer`) on the singleton | `harness.session()` + `Session.*` | §11.4, §4.1 |
-| **Harness** | `harness.memory.*` duplicates top-level thread methods | Remove from product path; session-first lifecycle | §11.4, `harness.ts` |
-| **Harness** | `harness.threads.*` used as normal app lifecycle | No `harness.threads` product surface; `/operator/threads*` remains only for import/history tooling outside the public Harness class | §4.1, §13.2, §0 |
-| **Storage** | `admissionId`/`admissionHash` redefined in §3/§13/§15 | Canonical hash: §4.4b; canonical rows: §5.1d | §4.4, §5.1d |
-| **Harness** | `POST /agents/.../signals` kept as product path alongside §13 | `/harness/...` projects `Session.signal` admission | §13, §11.6 |
-| **Harness** | Process-local harness fields as config/runtime state | `HarnessConfig` = composition; room state in `SessionRecord` | §9.1, §5.1a.1 |
-| **Session** | `HarnessSession` snapshot from `getSession()` treated as the room | `Session` class + `SessionRecord` | §11.6b |
-| **Session** | `Harness.sendSignal` owns admission/receipts | `Session.signal` + `AgentSignalBoundary` post-accept | §4.2f |
-| **Session** | Process-local queue and pending resolvers | `SessionRecord.pendingQueue`, durable pending inbox | §5.1 |
-| **Session** | `display_state_changed` as public durability | Persisted display snapshots; §10 union excludes legacy display event | §10.2, §5.1a.2 |
-| **Thread** | `--thread`, `/thread`, `switchThread` as lifecycle | Product commands resolving to `harness.session(...)` first | §11.6 migration-sensitive |
-| **Memory** | OM/thread-metadata bootstrap without `SessionRecord` | `SessionRecord.observationalMemory` | §11.6 |
-| **Memory** | Message append mistaken for signal admission | `Session.signal` is not a generic thread write | §4.2, §0 |
-| **Storage** | `threadLock` blocks read/subscribe/signal | Leases for recovery-sensitive work only | §5.8, §11.6 |
-| **Storage** | `SignalsPubSub` loss = data loss | Storage admission/result + §10 replay | §11.6 |
-| **Storage** | Second background-task store | Extend `BackgroundTasksStorage` with §5.2d `claim*`/`renew*` | §11.6d |
-| **Storage** | `registerHeartbeat` as restart-safe scheduling | `HarnessWakeupItem` rows | §11.5 |
-| **Storage** | `ChannelsStorage` provider install/config rows treated as harness inbox/outbox | Keep provider config canonical; add §14 bridge ledgers as channel-domain extensions | §14.7, §11.6d |
-| **Workers** | `BackgroundTaskWorker` substituted for harness wakeup recovery | Harness workers claim logbook rows | §15.2 preamble |
-| **Workers** | Second worker framework beside `packages/core/src/worker/` | Claim semantics on Storage rows | §0 cutover |
-| **Live layer** | `AgentChannels` + harness bridge on same binding | §14.7 init fence | §14.7 |
-| **Live layer** | Stream/pubsub IDs as replay cursors | §10.5 session epoch + buffer | §10.5 |
-| **Live layer** | MCP/HTTP session IDs as recovery keys | Process-local diagnostics only | §11.5 |
+| Entity         | Trap (today on `main`)                                                                                       | v1 owner                                                                                                                            | Canonical pointer         |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| **Harness**    | Thread-first lifecycle (`createThread`, `switchThread`, `sendMessage`, `followUp`, `steer`) on the singleton | `harness.session()` + `Session.*`                                                                                                   | §11.4, §4.1               |
+| **Harness**    | `harness.memory.*` duplicates top-level thread methods                                                       | Remove from product path; session-first lifecycle                                                                                   | §11.4, `harness.ts`       |
+| **Harness**    | `harness.threads.*` used as normal app lifecycle                                                             | No `harness.threads` product surface; `/operator/threads*` remains only for import/history tooling outside the public Harness class | §4.1, §13.2, §0           |
+| **Storage**    | `admissionId`/`admissionHash` redefined in §3/§13/§15                                                        | Canonical hash: §4.4b; canonical rows: §5.1d                                                                                        | §4.4, §5.1d               |
+| **Harness**    | `POST /agents/.../signals` kept as product path alongside §13                                                | `/harness/...` projects `Session.signal` admission                                                                                  | §13, §11.6                |
+| **Harness**    | Process-local harness fields as config/runtime state                                                         | `HarnessConfig` = composition; room state in `SessionRecord`                                                                        | §9.1, §5.1a.1             |
+| **Session**    | `HarnessSession` snapshot from `getSession()` treated as the room                                            | `Session` class + `SessionRecord`                                                                                                   | §11.6b                    |
+| **Session**    | `Harness.sendSignal` owns admission/receipts                                                                 | `Session.signal` + `AgentSignalBoundary` post-accept                                                                                | §4.2f                     |
+| **Session**    | Process-local queue and pending resolvers                                                                    | `SessionRecord.pendingQueue`, durable pending inbox                                                                                 | §5.1                      |
+| **Session**    | `display_state_changed` as public durability                                                                 | Persisted display snapshots; §10 union excludes legacy display event                                                                | §10.2, §5.1a.2            |
+| **Thread**     | `--thread`, `/thread`, `switchThread` as lifecycle                                                           | Product commands resolving to `harness.session(...)` first                                                                          | §11.6 migration-sensitive |
+| **Memory**     | OM/thread-metadata bootstrap without `SessionRecord`                                                         | `SessionRecord.observationalMemory`                                                                                                 | §11.6                     |
+| **Memory**     | Message append mistaken for signal admission                                                                 | `Session.signal` is not a generic thread write                                                                                      | §4.2, §0                  |
+| **Storage**    | `threadLock` blocks read/subscribe/signal                                                                    | Leases for recovery-sensitive work only                                                                                             | §5.8, §11.6               |
+| **Storage**    | `SignalsPubSub` loss = data loss                                                                             | Storage admission/result + §10 replay                                                                                               | §11.6                     |
+| **Storage**    | Second background-task store                                                                                 | Extend `BackgroundTasksStorage` with §5.2d `claim*`/`renew*`                                                                        | §11.6d                    |
+| **Storage**    | `registerHeartbeat` as restart-safe scheduling                                                               | `HarnessWakeupItem` rows                                                                                                            | §11.5                     |
+| **Storage**    | `ChannelsStorage` provider install/config rows treated as harness inbox/outbox                               | Keep provider config canonical; add §14 bridge ledgers as channel-domain extensions                                                 | §14.7, §11.6d             |
+| **Workers**    | `BackgroundTaskWorker` substituted for harness wakeup recovery                                               | Harness workers claim logbook rows                                                                                                  | §15.2 preamble            |
+| **Workers**    | Second worker framework beside `packages/core/src/worker/`                                                   | Claim semantics on Storage rows                                                                                                     | §0 cutover                |
+| **Live layer** | `AgentChannels` + harness bridge on same binding                                                             | §14.7 init fence                                                                                                                    | §14.7                     |
+| **Live layer** | Stream/pubsub IDs as replay cursors                                                                          | §10.5 session epoch + buffer                                                                                                        | §10.5                     |
+| **Live layer** | MCP/HTTP session IDs as recovery keys                                                                        | Process-local diagnostics only                                                                                                      | §11.5                     |

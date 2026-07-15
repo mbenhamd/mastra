@@ -388,45 +388,30 @@ export class MessageList {
   }
 
   private convertSignalForModelPrompt(message: MastraDBMessage): MastraDBMessage[] {
-    const signalMessages = mastraDBMessageToSignal(message).toLLMMessage();
+    const signalMessage = mastraDBMessageToSignal(message).toLLMMessage();
     const createdAt = message.createdAt;
+    const metadata =
+      'metadata' in signalMessage && signalMessage.metadata && typeof signalMessage.metadata === 'object'
+        ? signalMessage.metadata
+        : {};
+    const promptMessage = {
+      ...signalMessage,
+      id: message.id,
+      metadata: { ...metadata, createdAt },
+    };
 
-    return (Array.isArray(signalMessages) ? signalMessages : [signalMessages]).map((signalMessage, index) => {
-      const promptMessageId = index === 0 ? message.id : `${message.id}:prompt:${index}`;
-      const metadata =
-        typeof signalMessage === 'object' &&
-        signalMessage !== null &&
-        !Array.isArray(signalMessage) &&
-        'metadata' in signalMessage &&
-        signalMessage.metadata &&
-        typeof signalMessage.metadata === 'object'
-          ? signalMessage.metadata
-          : {};
-      const promptMessage =
-        typeof signalMessage === `string`
-          ? {
-              role: 'user' as const,
-              content: signalMessage,
-              id: promptMessageId,
-              metadata: { createdAt },
-            }
-          : {
-              ...signalMessage,
-              id: promptMessageId,
-              metadata: { ...metadata, createdAt },
-            };
-
-      return convertInputToMastraDBMessage(promptMessage as MessageInput, 'input', {
+    return [
+      convertInputToMastraDBMessage(promptMessage as MessageInput, 'input', {
         memoryInfo: this.memoryInfo,
-        newMessageId: () => promptMessageId,
+        newMessageId: () => message.id,
         generateCreatedAt: (_messageSource, start) => {
           if (start instanceof Date) return start;
           if (typeof start === 'string' || typeof start === 'number') return new Date(start);
           return createdAt;
         },
         dbMessages: this.messages,
-      });
-    });
+      }),
+    ];
   }
 
   public makeMessageSourceChecker(): {

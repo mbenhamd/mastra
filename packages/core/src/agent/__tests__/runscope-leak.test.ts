@@ -8,16 +8,12 @@
  * 1. Many parallel runs in flight against the same Mastra — scopes must
  *    not bleed between runIds and every one must release on completion.
  * 2. Many sequential runs back-to-back — the scope map must not grow.
- * 3. Abandoned suspended run — when a suspend never resumes, the TTL
- *    sweep must eventually evict both the workflow registration and the
- *    scope. Only meaningful for the default engine since the evented
- *    engine releases the scope at the suspend boundary; the evented case
- *    asserts that there's nothing left to evict.
+ * 3. Suspended run — ownership and scope remain pinned across elapsed time
+ *    so delayed same-process resume events cannot be claimed elsewhere, then
+ *    both are released by explicit terminal resume.
  *
  * Cases 1 and 2 run under both the default and evented engine. The
- * evented engine releases the scope after each step terminates and the
- * run state lives in storage; the default engine keeps the scope alive
- * in-process across the suspend boundary. Both must release on terminal.
+ * Both engines retain the scope across suspension and release it on terminal.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Mastra } from '../../mastra';
@@ -140,7 +136,7 @@ describe.each([
     }
   }, 30000);
 
-  it('evicts the scope when the TTL sweep collects an abandoned suspended run', async () => {
+  it('retains suspended ownership across elapsed time and releases it on terminal resume', async () => {
     // Build a model that emits a tool-call so the run suspends on approval
     // and never resumes. The evented engine writes to storage and releases
     // scope at the boundary; the default engine holds the scope alive. In
@@ -171,11 +167,17 @@ describe.each([
             ]),
           };
         }
-        // Never reached — the run is abandoned at suspend.
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
-          stream: convertArrayToReadableStream([]),
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: 'declined' },
+            { type: 'text-end', id: 'text-1' },
+            { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+          ]),
         };
       },
     });
@@ -203,60 +205,29 @@ describe.each([
     });
 
     const stream = await agent.stream('please', { requireToolApproval: true });
-    let approvalSeen = false;
+    let toolCallId = '';
     for await (const chunk of stream.fullStream) {
-      if (chunk.type === 'tool-call-approval') approvalSeen = true;
+      if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
     }
-    expect(approvalSeen).toBe(true);
-
-    // After suspend the default engine keeps the scope alive (the loop
-    // workflow registration stays); the evented engine releases it at the
-    // step boundary. Two distinct contracts:
-    //   - evented: scope MUST already be gone by the time the stream
-    //     drains. If a future change starts leaking on evented suspend
-    //     this assertion fires immediately.
-    //   - default: scope must remain until the TTL sweep collects it.
-    // The TTL-sweep path is only exercised on the default engine because
-    // there is no remaining registration to evict on evented.
-    if (evented) {
-      expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
-      return;
-    }
+    expect(toolCallId).toBeTruthy();
 
     expect(mastra.__getRunScope(stream.runId)).toBeDefined();
 
-    // Advance virtual time past the TTL using fake timers so the sweep
-    // sees the abandoned registration as stale.
+    // PF-1723 deliberately removed age-based eviction: delayed resume events
+    // must remain bound to the owning Mastra instance until explicit terminal
+    // cleanup. Advancing beyond the former reference TTL must not evict it.
     vi.useFakeTimers({ shouldAdvanceTime: true, now: Date.now() });
     vi.setSystemTime(Date.now() + Mastra.INTERNAL_WORKFLOW_TTL_MS + 1);
-
     try {
-      // Fire any new registration to trigger the sweep (it runs on every
-      // new run-scoped registration). Use a real createWorkflow probe so
-      // the registration path runs end-to-end.
-      const { createWorkflow, createStep } = await import('../../workflows');
-      const probeStep = createStep({
-        id: 'noop',
-        inputSchema: z.object({}),
-        outputSchema: z.object({}),
-        execute: async () => ({}),
-      });
-      const probe = createWorkflow({
-        id: 'sweep-probe',
-        inputSchema: z.object({}),
-        outputSchema: z.object({}),
-        steps: [probeStep],
-      })
-        .then(probeStep)
-        .commit();
-      mastra.__registerInternalWorkflow(probe, 'sweep-probe-runid');
-      mastra.__unregisterInternalWorkflow('sweep-probe', 'sweep-probe-runid');
+      expect(mastra.__getRunScope(stream.runId)).toBeDefined();
     } finally {
       vi.useRealTimers();
     }
 
-    // The abandoned run's scope must now be gone — the TTL sweep evicted
-    // both the workflow registration and the matching scope.
+    const resumed = await agent.declineToolCall({ runId: stream.runId, toolCallId });
+    for await (const _chunk of resumed.fullStream) {
+      // consume
+    }
     expect(mastra.__getRunScope(stream.runId)).toBeUndefined();
   }, 30000);
 });

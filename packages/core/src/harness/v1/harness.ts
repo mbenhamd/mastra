@@ -5331,6 +5331,9 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      if (eventPersistenceError.error instanceof HarnessStorageError) {
+        throw eventPersistenceError.error;
+      }
       throw new HarnessStorageError({
         operation: 'session_save',
         sessionId: eventPersistenceError.sessionId,
@@ -5365,6 +5368,9 @@ export class Harness {
       // and channelWorkerReadiness() reports worker_not_started. Self-gates on
       // no-channels / already-running.
       this._ensureChannelInboxRecoveryLoop();
+      if (eventPersistenceError.error instanceof HarnessStorageError) {
+        throw eventPersistenceError.error;
+      }
       throw new HarnessStorageError({
         operation: 'session_save',
         sessionId: eventPersistenceError.sessionId,

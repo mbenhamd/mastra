@@ -79,10 +79,15 @@ describeForAllEngines(
         },
         collectChunks: true,
       });
-
       // Assert: tool-call-approval chunk emitted (tool suspended)
       const approvalChunks = chunks!.filter(c => c.type === 'tool-call-approval');
       expect(approvalChunks.length).toBeGreaterThan(0);
+      const approvalChunk = approvalChunks[0] as Extract<
+        (typeof approvalChunks)[number],
+        { type: 'tool-call-approval' }
+      >;
+      const suspendedRunId = approvalChunk.runId;
+      const suspendedToolCallId = approvalChunk.payload.toolCallId;
 
       // Tool should NOT have executed yet (suspended before execution)
       expect(toolExecuted).toBe(false);
@@ -108,7 +113,12 @@ describeForAllEngines(
                 {
                   id: 'call-2',
                   name: 'find-user',
-                  arguments: { name: 'Dero Israel', resumeData: { approved: true } },
+                  arguments: {
+                    name: 'Dero Israel',
+                    resumeData: { approved: true },
+                    suspendedToolRunId: suspendedRunId,
+                    suspendedToolCallId,
+                  },
                 },
               ],
             },
@@ -122,7 +132,6 @@ describeForAllEngines(
           );
         },
       });
-
       // Assert: system prompt was modified to mention suspended tools
       // AIMock captures ALL requests across calls; the second call's first request is at index 1
       // (index 0 is from the first call which had no suspended tools yet)

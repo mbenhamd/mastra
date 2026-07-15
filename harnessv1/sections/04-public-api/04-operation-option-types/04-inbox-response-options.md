@@ -54,5 +54,4 @@ interface InboxResponseResult {
   responseId: string;
   duplicate: boolean;
 }
-
 ```

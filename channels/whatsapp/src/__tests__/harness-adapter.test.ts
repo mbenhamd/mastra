@@ -57,7 +57,9 @@ function inboundRequest(payload: unknown, opts: { sign?: boolean; signWith?: str
   const signature =
     opts.sign === false
       ? undefined
-      : `sha256=${createHmac('sha256', opts.signWith ?? APP_SECRET).update(Buffer.from(rawBody, 'utf8')).digest('hex')}`;
+      : `sha256=${createHmac('sha256', opts.signWith ?? APP_SECRET)
+          .update(Buffer.from(rawBody, 'utf8'))
+          .digest('hex')}`;
   return {
     method: 'POST',
     path: '/harness/primary/channels/whatsapp/inbound',
@@ -183,7 +185,9 @@ describe('WhatsAppHarnessAdapter.verifyInbound', () => {
               field: 'messages',
               value: {
                 metadata: { phone_number_id: PHONE_NUMBER_ID },
-                statuses: [{ id: 'wamid.X', status: 'delivered', timestamp: '1700000000', recipient_id: '14155550000' }],
+                statuses: [
+                  { id: 'wamid.X', status: 'delivered', timestamp: '1700000000', recipient_id: '14155550000' },
+                ],
               },
             },
           ],
@@ -210,7 +214,13 @@ describe('WhatsAppHarnessAdapter.verifyInbound', () => {
     const adapter = makeAdapter();
     const payload = textPayload();
     payload.entry[0]!.changes[0]!.value.messages = [
-      { from: '14155550000', id: 'wamid.REACT', timestamp: '1700000000', type: 'reaction', reaction: { message_id: 'wamid.X', emoji: '👍' } } as never,
+      {
+        from: '14155550000',
+        id: 'wamid.REACT',
+        timestamp: '1700000000',
+        type: 'reaction',
+        reaction: { message_id: 'wamid.X', emoji: '👍' },
+      } as never,
     ];
     await expect(adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never)).rejects.toThrow(
       /no inbound chat message/i,
@@ -281,7 +291,10 @@ describe('WhatsAppHarnessAdapter.verifyInbound', () => {
         id: 'wamid.LIST',
         timestamp: '1700000000',
         type: 'interactive',
-        interactive: { type: 'list_reply', list_reply: { id: 'row-2', title: 'Standard shipping', description: '3-5 days' } },
+        interactive: {
+          type: 'list_reply',
+          list_reply: { id: 'row-2', title: 'Standard shipping', description: '3-5 days' },
+        },
       } as never,
     ];
     const envelope = await adapter.verifyInbound(inboundRequest(payload) as never, routeCtx as never);
@@ -371,9 +384,9 @@ describe('WhatsAppHarnessAdapter.deliver', () => {
   });
 
   it('accepts a bare-string payload', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ messages: [{ id: 'wamid.S2' }] }), { status: 200 }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ messages: [{ id: 'wamid.S2' }] }), { status: 200 }));
     const adapter = makeAdapter({ fetch: fetchMock as never });
     const result = await adapter.deliver(outboxItem('plain string body'), deliveryCtx);
     expect(result.providerMessageId).toBe('wamid.S2');
@@ -381,12 +394,11 @@ describe('WhatsAppHarnessAdapter.deliver', () => {
   });
 
   it('surfaces a Graph API error response as a throw', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({ error: { message: 'Invalid OAuth access token', code: 190 } }),
-        { status: 401 },
-      ),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ error: { message: 'Invalid OAuth access token', code: 190 } }), { status: 401 }),
+      );
     const adapter = makeAdapter({ fetch: fetchMock as never });
     await expect(adapter.deliver(outboxItem({ text: 'x' }), deliveryCtx)).rejects.toThrow(
       /WhatsApp send failed \(HTTP 401\).*Invalid OAuth access token.*code 190/,
@@ -394,9 +406,9 @@ describe('WhatsAppHarnessAdapter.deliver', () => {
   });
 
   it('uses the configured api version and base url', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ messages: [{ id: 'm' }] }), { status: 200 }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ messages: [{ id: 'm' }] }), { status: 200 }));
     const adapter = makeAdapter({
       fetch: fetchMock as never,
       apiVersion: 'v19.0',

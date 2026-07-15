@@ -6,16 +6,16 @@ separate **judge model** to evaluate the latest exchange and decide what to do
 next:
 
 - **`done`** — the goal is satisfied. The harness emits `goal_done` and stops
-the loop.
+  the loop.
 - **`continue`** — the goal is not yet satisfied. The harness enqueues the
-judge's `reason` as a continuation message via ordinary FIFO
-`session.queue(...)` with a deterministic `continuation.admissionId`. Queue work
-whose admission commits before the continuation append runs first; queue work
-admitted after it runs behind the continuation. Concurrent queue attempts
-linearize under the session lease.
+  judge's `reason` as a continuation message via ordinary FIFO
+  `session.queue(...)` with a deterministic `continuation.admissionId`. Queue work
+  whose admission commits before the continuation append runs first; queue work
+  admitted after it runs behind the continuation. Concurrent queue attempts
+  linearize under the session lease.
 - **`waiting`** — the goal is at an explicit human checkpoint. The loop stops
-auto-continuing but stays active. The next user `signal(...)` resumes progress;
-the judge re-evaluates after the response.
+  auto-continuing but stays active. The next user `signal(...)` resumes progress;
+  the judge re-evaluates after the response.
 
 Goals implement a durable single-goal continuation loop inspired by the
 Ralph-loop pattern (Hermes `/goal`, Codex `/goal`). The harness ships this
@@ -95,6 +95,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-goal-loop);" d="M785 238 C820 280 850 318 884 328" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-goal-loop);" d="M850 351 L786 365" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-goal-loop);" d="M595 371 C470 360 360 305 425 258" />
+
   </svg>
   <figcaption>The goal loop is durable at the judge decision; continuations re-enter through ordinary queue semantics instead of a hidden priority lane.</figcaption>
 </figure>
@@ -156,65 +157,60 @@ interface GoalJudgeDecision {
 
 interface SetGoalOptions {
   objective: string;
-  judgeModel?: string;            // Default: harness `goals.defaultJudgeModel`
-  maxTurns?: number;              // Default: 50
+  judgeModel?: string; // Default: harness `goals.defaultJudgeModel`
+  maxTurns?: number; // Default: 50
 }
 ```
 
 **Lifecycle.**
+
 1. `await session.setGoal({ objective, judgeModel, maxTurns })` — replaces any
-existing goal, resets the turn counter, persists to `SessionRecord.goal`, and
-resolves with the committed `GoalState`. Emits `goal_cleared` for the replaced
-goal, if any, and `goal_set` only after the durable transition commits.
+   existing goal, resets the turn counter, persists to `SessionRecord.goal`, and
+   resolves with the committed `GoalState`. Emits `goal_cleared` for the replaced
+   goal, if any, and `goal_set` only after the durable transition commits.
 2. After each assistant turn the session drives, the harness reads `getGoal()`.
-If status is `'active'`:
-    - Builds a source-turn cursor from the assistant turn's durable run/signal
-      identity. `runId` is required; `signalId`, `queuedItemId`, and
-      `assistantMessageId` are included when the underlying boundary exposes
-      them.
-    - If `lastDecision.source` already identifies that source turn, the judge
-      is not called again. Recovery honors the stored decision and repairs any
-      missing continuation queue admission with the stored
-      `continuation.admissionId`.
-    - Otherwise, calls the judge model with the recent conversation context and
-      the goal objective, remembering the current `(goal.id, goal.revision)`
-      and the source-turn cursor being judged.
-    - Before committing the result, verifies under the session lease that the
-      current goal still has the same `id`, the same `revision`,
-      `status: 'active'`, and that the remembered source-turn cursor is still
-      the latest durable assistant turn for the session. If the goal was
-      paused, cleared, replaced, already judged during the call, or superseded
-      by a later completed assistant turn, the result is discarded silently:
-      no `lastDecision` update, `turnsUsed` increment, goal event, status
-      transition, budget pause, or continuation queue admission is committed.
-      The latest turn is evaluated through the normal post-turn lifecycle if
-      the goal remains active and no stored `lastDecision.source` covers it.
-    - Commits `lastDecision`, `turnsUsed`, and any status transition as a
-      commit-scoped durable transition before any goal event is emitted. A
-      `continue` decision includes a deterministic
-      `continuation.admissionId` derived from the judge receipt and passes it
-      to `session.queue(...)`. Implementations should write the receipt and
-      queue append atomically when both live in the same `SessionRecord`; if a
-      crash leaves a receipt without the queue append, recovery repairs it with
-      the same admission id as an ordinary queue append at the repair commit
-      point. The existing `QueueAdmissionReceipt` owns FIFO ordering, duplicate
-      queue admission, and terminal settlement from that point forward.
-    - Emits `goal_judged` only after the durable receipt commits and, for a
-      `continue` decision, after the continuation queue append commits (or is
-      already observable). After `goal_judged`, emits exactly one of:
-      `goal_done` (decision was `done`), `goal_waiting` (decision was
-      `waiting`), `goal_paused` (the same durable transition also committed a
-      `budget_exhausted` or `judge_failed` pause), or no further goal event
-      (decision was `continue` and the goal remains active; the continuation
-      queue admission is observable through ordinary queue events).
-      `goal_waiting`, like `goal_done` and `goal_paused`, fires exactly once at
-      decision-commit time and is not re-emitted on hydration; clients recover
-      the waiting state via `getGoal()` / `GoalState.lastDecision`.
+   If status is `'active'`: - Builds a source-turn cursor from the assistant turn's durable run/signal
+   identity. `runId` is required; `signalId`, `queuedItemId`, and
+   `assistantMessageId` are included when the underlying boundary exposes
+   them. - If `lastDecision.source` already identifies that source turn, the judge
+   is not called again. Recovery honors the stored decision and repairs any
+   missing continuation queue admission with the stored
+   `continuation.admissionId`. - Otherwise, calls the judge model with the recent conversation context and
+   the goal objective, remembering the current `(goal.id, goal.revision)`
+   and the source-turn cursor being judged. - Before committing the result, verifies under the session lease that the
+   current goal still has the same `id`, the same `revision`,
+   `status: 'active'`, and that the remembered source-turn cursor is still
+   the latest durable assistant turn for the session. If the goal was
+   paused, cleared, replaced, already judged during the call, or superseded
+   by a later completed assistant turn, the result is discarded silently:
+   no `lastDecision` update, `turnsUsed` increment, goal event, status
+   transition, budget pause, or continuation queue admission is committed.
+   The latest turn is evaluated through the normal post-turn lifecycle if
+   the goal remains active and no stored `lastDecision.source` covers it. - Commits `lastDecision`, `turnsUsed`, and any status transition as a
+   commit-scoped durable transition before any goal event is emitted. A
+   `continue` decision includes a deterministic
+   `continuation.admissionId` derived from the judge receipt and passes it
+   to `session.queue(...)`. Implementations should write the receipt and
+   queue append atomically when both live in the same `SessionRecord`; if a
+   crash leaves a receipt without the queue append, recovery repairs it with
+   the same admission id as an ordinary queue append at the repair commit
+   point. The existing `QueueAdmissionReceipt` owns FIFO ordering, duplicate
+   queue admission, and terminal settlement from that point forward. - Emits `goal_judged` only after the durable receipt commits and, for a
+   `continue` decision, after the continuation queue append commits (or is
+   already observable). After `goal_judged`, emits exactly one of:
+   `goal_done` (decision was `done`), `goal_waiting` (decision was
+   `waiting`), `goal_paused` (the same durable transition also committed a
+   `budget_exhausted` or `judge_failed` pause), or no further goal event
+   (decision was `continue` and the goal remains active; the continuation
+   queue admission is observable through ordinary queue events).
+   `goal_waiting`, like `goal_done` and `goal_paused`, fires exactly once at
+   decision-commit time and is not re-emitted on hydration; clients recover
+   the waiting state via `getGoal()` / `GoalState.lastDecision`.
 3. `await session.pauseGoal()` / `resumeGoal()` — stop or restart
-auto-continuations without losing the goal. Resolves with the committed
-`GoalState | null` and emits `goal_paused` / `goal_resumed` only after commit.
+   auto-continuations without losing the goal. Resolves with the committed
+   `GoalState | null` and emits `goal_paused` / `goal_resumed` only after commit.
 4. `await session.clearGoal()` — drops the goal entirely. Emits `goal_cleared`
-only after commit.
+   only after commit.
 
 **Question prompts.** Core Harness goals do not auto-answer `ask_user` or other
 pending-inbox prompts. A pending question keeps the same owner and response
@@ -226,7 +222,7 @@ and first-response-wins conflict rules, but that controller is product policy an
 not part of the v1 core goal primitive.
 
 **Preemption.** The judge always runs as a side effect of an assistant turn.
-Continuation messages are *enqueued*, not sent inline, and they do not get a
+Continuation messages are _enqueued_, not sent inline, and they do not get a
 hidden priority lane. A user `queue(...)` admitted before the continuation
 append runs first; a user `queue(...)` admitted after it runs behind the
 continuation. A user `signal(...)` posted while the judge is evaluating is
@@ -237,7 +233,7 @@ turn is not admitted merely because its continuation append wins the lease;
 source-turn freshness is checked before the goal receipt or continuation
 admission commits.
 
-**Budget.** `maxTurns` (default 50) is checked *after* each judge call so the
+**Budget.** `maxTurns` (default 50) is checked _after_ each judge call so the
 final turn is never denied a verdict. When the budget is exhausted after a
 non-`done` decision, the harness persists the decision and the pause in the same
 durable transition, does not enqueue a continuation, sets status to `'paused'`,
@@ -263,14 +259,14 @@ receipt exists and hydration may evaluate the same source turn again; once the
 pause is committed, recovery does not retry a paused goal automatically. This
 avoids a hot loop of retries against a flaky judge.
 
-**Subagents.** Subagent sessions do *not* inherit the parent's goal. Subagents
+**Subagents.** Subagent sessions do _not_ inherit the parent's goal. Subagents
 are explicitly bounded units of work that already terminate when the inner task
 is done. If a subagent should also drive a sub-goal, the parent tool can call
 `await subagentSession.setGoal(...)` after spawning.
 
 **Persistence.** `GoalState` lives in `SessionRecord.goal` (see §5.1). It
 survives crashes, server restarts, and session rehydration. A judge call that
-was in flight when the process died is *not* resumed. On hydration, the session
+was in flight when the process died is _not_ resumed. On hydration, the session
 owner computes the latest durable assistant-turn cursor and loads
 `GoalState.lastDecision` first. If the receipt already covers that source turn,
 the judge is not re-run: `done` stays terminal, `waiting` stays active without

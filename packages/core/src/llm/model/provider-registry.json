@@ -828,13 +828,7 @@
       "apiKeyEnvVar": "PRIVATEMODE_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Privatemode AI",
-      "models": [
-        "gemma-3-27b",
-        "gpt-oss-120b",
-        "qwen3-coder-30b-a3b",
-        "qwen3-embedding-4b",
-        "whisper-large-v3"
-      ],
+      "models": ["gemma-3-27b", "gpt-oss-120b", "qwen3-coder-30b-a3b", "qwen3-embedding-4b", "whisper-large-v3"],
       "docUrl": "https://docs.privatemode.ai/api/overview",
       "gateway": "models.dev"
     },
@@ -843,11 +837,7 @@
       "apiKeyEnvVar": "DRUN_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "D.Run (China)",
-      "models": [
-        "public/deepseek-r1",
-        "public/deepseek-v3",
-        "public/minimax-m25"
-      ],
+      "models": ["public/deepseek-r1", "public/deepseek-v3", "public/minimax-m25"],
       "docUrl": "https://www.d.run",
       "gateway": "models.dev"
     },
@@ -856,12 +846,7 @@
       "apiKeyEnvVar": "EBCLOUD_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "EBCloud",
-      "models": [
-        "DeepSeek-V4-Flash",
-        "DeepSeek-V4-Pro",
-        "GLM-5.1",
-        "Kimi-K2.6"
-      ],
+      "models": ["DeepSeek-V4-Flash", "DeepSeek-V4-Pro", "GLM-5.1", "Kimi-K2.6"],
       "docUrl": "https://docs.ebtech.com/ai/model-api.html",
       "gateway": "models.dev"
     },
@@ -1071,15 +1056,7 @@
       "apiKeyEnvVar": "TRUSTEDROUTER_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "TrustedRouter",
-      "models": [
-        "auto",
-        "cheap",
-        "e2e",
-        "fast",
-        "synth",
-        "synth-code",
-        "zdr"
-      ],
+      "models": ["auto", "cheap", "e2e", "fast", "synth", "synth-code", "zdr"],
       "docUrl": "https://trustedrouter.com/docs",
       "gateway": "models.dev"
     },
@@ -1387,10 +1364,7 @@
       "apiKeyEnvVar": "BAILING_API_TOKEN",
       "apiKeyHeader": "Authorization",
       "name": "Bailing",
-      "models": [
-        "Ling-1T",
-        "Ring-1T"
-      ],
+      "models": ["Ling-1T", "Ring-1T"],
       "docUrl": "https://alipaytbox.yuque.com/sxs0ba/ling/intro",
       "gateway": "models.dev"
     },
@@ -1434,10 +1408,7 @@
       "gateway": "models.dev"
     },
     "google": {
-      "apiKeyEnvVar": [
-        "GOOGLE_API_KEY",
-        "GOOGLE_GENERATIVE_AI_API_KEY"
-      ],
+      "apiKeyEnvVar": ["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
       "name": "Google",
       "models": [
         "gemini-2.5-flash",
@@ -1596,10 +1567,7 @@
       "apiKeyEnvVar": "SUBCONSCIOUS_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Subconscious",
-      "models": [
-        "subconscious/glm-5.2",
-        "subconscious/tim-qwen3.6-27b"
-      ],
+      "models": ["subconscious/glm-5.2", "subconscious/tim-qwen3.6-27b"],
       "docUrl": "https://docs.subconscious.dev",
       "gateway": "models.dev",
       "npm": "@ai-sdk/anthropic"
@@ -1662,11 +1630,7 @@
       "apiKeyEnvVar": "STEPFUN_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "StepFun Step Plan (Global)",
-      "models": [
-        "step-3.5-flash",
-        "step-3.5-flash-2603",
-        "step-3.7-flash"
-      ],
+      "models": ["step-3.5-flash", "step-3.5-flash-2603", "step-3.7-flash"],
       "docUrl": "https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api",
       "gateway": "models.dev"
     },
@@ -1675,11 +1639,7 @@
       "apiKeyEnvVar": "LMSTUDIO_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "LMStudio",
-      "models": [
-        "openai/gpt-oss-20b",
-        "qwen/qwen3-30b-a3b-2507",
-        "qwen/qwen3-coder-30b"
-      ],
+      "models": ["openai/gpt-oss-20b", "qwen/qwen3-30b-a3b-2507", "qwen/qwen3-coder-30b"],
       "docUrl": "https://lmstudio.ai/models",
       "gateway": "models.dev"
     },
@@ -1688,11 +1648,7 @@
       "apiKeyEnvVar": "POOLSIDE_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Poolside",
-      "models": [
-        "poolside/laguna-m.1",
-        "poolside/laguna-xs-2.1",
-        "poolside/laguna-xs.2"
-      ],
+      "models": ["poolside/laguna-m.1", "poolside/laguna-xs-2.1", "poolside/laguna-xs.2"],
       "docUrl": "https://platform.poolside.ai",
       "gateway": "models.dev"
     },
@@ -1701,9 +1657,7 @@
       "apiKeyEnvVar": "ZENIFRA_AI_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Zenifra",
-      "models": [
-        "alibaba/qwen3.6-35b-a3b"
-      ],
+      "models": ["alibaba/qwen3.6-35b-a3b"],
       "docUrl": "https://docs.zenifra.com",
       "gateway": "models.dev",
       "modelOverrides": {
@@ -2167,9 +2121,7 @@
       "apiKeyEnvVar": "TENCENT_TOKEN_PLAN_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Tencent Token Plan",
-      "models": [
-        "hy3"
-      ],
+      "models": ["hy3"],
       "docUrl": "https://cloud.tencent.com/document/product/1823/130060",
       "gateway": "models.dev"
     },
@@ -3161,11 +3113,7 @@
       "apiKeyEnvVar": "MORPH_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Morph",
-      "models": [
-        "auto",
-        "morph-v3-fast",
-        "morph-v3-large"
-      ],
+      "models": ["auto", "morph-v3-fast", "morph-v3-large"],
       "docUrl": "https://docs.morphllm.com/api-reference/introduction",
       "gateway": "models.dev"
     },
@@ -3174,11 +3122,7 @@
       "apiKeyEnvVar": "SAKANA_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Sakana AI",
-      "models": [
-        "fugu",
-        "fugu-ultra",
-        "fugu-ultra-20260615"
-      ],
+      "models": ["fugu", "fugu-ultra", "fugu-ultra-20260615"],
       "docUrl": "https://console.sakana.ai/models",
       "gateway": "models.dev",
       "modelOverrides": {
@@ -3264,11 +3208,7 @@
     "cerebras": {
       "apiKeyEnvVar": "CEREBRAS_API_KEY",
       "name": "Cerebras",
-      "models": [
-        "gemma-4-31b",
-        "gpt-oss-120b",
-        "zai-glm-4.7"
-      ],
+      "models": ["gemma-4-31b", "gpt-oss-120b", "zai-glm-4.7"],
       "docUrl": "https://inference-docs.cerebras.ai/models/overview",
       "gateway": "models.dev",
       "npm": "@ai-sdk/cerebras"
@@ -3278,14 +3218,7 @@
       "apiKeyEnvVar": "ZHIPU_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Z.AI Coding Plan",
-      "models": [
-        "glm-4.5-air",
-        "glm-4.7",
-        "glm-5-turbo",
-        "glm-5.1",
-        "glm-5.2",
-        "glm-5v-turbo"
-      ],
+      "models": ["glm-4.5-air", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"],
       "docUrl": "https://docs.z.ai/devpack/overview",
       "gateway": "models.dev"
     },
@@ -3411,11 +3344,7 @@
       "apiKeyEnvVar": "XIAOMI_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Xiaomi",
-      "models": [
-        "mimo-v2.5",
-        "mimo-v2.5-pro",
-        "mimo-v2.5-pro-ultraspeed"
-      ],
+      "models": ["mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed"],
       "docUrl": "https://platform.xiaomimimo.com/#/docs",
       "gateway": "models.dev"
     },
@@ -3424,10 +3353,7 @@
       "apiKeyEnvVar": "INCEPTION_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Inception",
-      "models": [
-        "mercury-2",
-        "mercury-edit-2"
-      ],
+      "models": ["mercury-2", "mercury-edit-2"],
       "docUrl": "https://platform.inceptionlabs.ai/docs",
       "gateway": "models.dev"
     },
@@ -3475,9 +3401,7 @@
       "apiKeyEnvVar": "LYNKR_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Lynkr",
-      "models": [
-        "lynkr-auto"
-      ],
+      "models": ["lynkr-auto"],
       "docUrl": "https://github.com/Fast-Editor/Lynkr",
       "gateway": "models.dev"
     },
@@ -3752,14 +3676,7 @@
       "apiKeyEnvVar": "LLMTR_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "LLMTR",
-      "models": [
-        "gemma-4",
-        "magibu-11b-v8",
-        "medgemma-4b",
-        "qwen3-6-35b",
-        "sincap",
-        "trendyol-7b"
-      ],
+      "models": ["gemma-4", "magibu-11b-v8", "medgemma-4b", "qwen3-6-35b", "sincap", "trendyol-7b"],
       "docUrl": "https://llmtr.com/docs",
       "gateway": "models.dev"
     },
@@ -3768,10 +3685,7 @@
       "apiKeyEnvVar": "SARVAM_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Sarvam AI",
-      "models": [
-        "sarvam-105b",
-        "sarvam-30b"
-      ],
+      "models": ["sarvam-105b", "sarvam-30b"],
       "docUrl": "https://docs.sarvam.ai/api-reference-docs/getting-started/models",
       "gateway": "models.dev"
     },
@@ -3890,9 +3804,7 @@
       "apiKeyEnvVar": "LONGCAT_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "LongCat",
-      "models": [
-        "LongCat-2.0"
-      ],
+      "models": ["LongCat-2.0"],
       "docUrl": "https://longcat.chat/platform/docs/",
       "gateway": "models.dev"
     },
@@ -4037,12 +3949,7 @@
       "apiKeyEnvVar": "KIMI_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Kimi For Coding",
-      "models": [
-        "k2p5",
-        "k2p6",
-        "k2p7",
-        "kimi-k2-thinking"
-      ],
+      "models": ["k2p5", "k2p6", "k2p7", "kimi-k2-thinking"],
       "docUrl": "https://www.kimi.com/code/docs/en/third-party-tools/other-coding-agents.html",
       "gateway": "models.dev",
       "npm": "@ai-sdk/anthropic"
@@ -4052,13 +3959,7 @@
       "apiKeyEnvVar": "DINFERENCE_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "DInference",
-      "models": [
-        "glm-4.7",
-        "glm-5",
-        "glm-5.1",
-        "gpt-oss-120b",
-        "minimax-m2.5"
-      ],
+      "models": ["glm-4.7", "glm-5", "glm-5.1", "gpt-oss-120b", "minimax-m2.5"],
       "docUrl": "https://dinference.com",
       "gateway": "models.dev"
     },
@@ -4171,13 +4072,7 @@
       "apiKeyEnvVar": "AI_ROUTER_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "AI-ROUTER",
-      "models": [
-        "gpt-5.4",
-        "gpt-5.5",
-        "gpt-5.6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra"
-      ],
+      "models": ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"],
       "docUrl": "https://ai-router.dev/openai-compatible-api-gateway/",
       "gateway": "models.dev"
     },
@@ -4252,9 +4147,7 @@
       "apiKeyEnvVar": "ZELDOC_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Zeldoc",
-      "models": [
-        "z-code"
-      ],
+      "models": ["z-code"],
       "docUrl": "https://docs.zeldoc.ai",
       "gateway": "models.dev"
     },
@@ -4375,10 +4268,7 @@
       "apiKeyEnvVar": "TENCENT_TOKENHUB_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Tencent TokenHub",
-      "models": [
-        "hy3",
-        "hy3-preview"
-      ],
+      "models": ["hy3", "hy3-preview"],
       "docUrl": "https://cloud.tencent.com/document/product/1823/130050",
       "gateway": "models.dev"
     },
@@ -4422,9 +4312,7 @@
       "apiKeyEnvVar": "KUAE_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "KUAE Cloud Coding Plan",
-      "models": [
-        "GLM-4.7"
-      ],
+      "models": ["GLM-4.7"],
       "docUrl": "https://docs.mthreads.com/kuaecloud/kuaecloud-doc-online/coding_plan/",
       "gateway": "models.dev"
     },
@@ -4846,12 +4734,7 @@
     "perplexity": {
       "apiKeyEnvVar": "PERPLEXITY_API_KEY",
       "name": "Perplexity",
-      "models": [
-        "sonar",
-        "sonar-deep-research",
-        "sonar-pro",
-        "sonar-reasoning-pro"
-      ],
+      "models": ["sonar", "sonar-deep-research", "sonar-pro", "sonar-reasoning-pro"],
       "docUrl": "https://docs.perplexity.ai",
       "gateway": "models.dev",
       "npm": "@ai-sdk/perplexity"
@@ -4861,13 +4744,7 @@
       "apiKeyEnvVar": "UMANS_AI_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Umans AI",
-      "models": [
-        "umans-coder",
-        "umans-flash",
-        "umans-glm-5.1",
-        "umans-glm-5.2",
-        "umans-kimi-k2.7"
-      ],
+      "models": ["umans-coder", "umans-flash", "umans-glm-5.1", "umans-glm-5.2", "umans-kimi-k2.7"],
       "docUrl": "https://app.umans.ai/offers/code/docs/orgs",
       "gateway": "models.dev"
     },
@@ -5369,10 +5246,7 @@
       "apiKeyEnvVar": "NOVA_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Nova",
-      "models": [
-        "nova-2-lite-v1",
-        "nova-2-pro-v1"
-      ],
+      "models": ["nova-2-lite-v1", "nova-2-pro-v1"],
       "docUrl": "https://nova.amazon.com/dev/documentation",
       "gateway": "models.dev"
     },
@@ -5650,9 +5524,7 @@
       "apiKeyEnvVar": "ABLIT_KEY",
       "apiKeyHeader": "Authorization",
       "name": "abliteration.ai",
-      "models": [
-        "abliterated-model"
-      ],
+      "models": ["abliterated-model"],
       "docUrl": "https://docs.abliteration.ai/models",
       "gateway": "models.dev"
     },
@@ -5661,12 +5533,7 @@
       "apiKeyEnvVar": "STEPFUN_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "StepFun Step Plan (China)",
-      "models": [
-        "step-3.5-flash",
-        "step-3.5-flash-2603",
-        "step-3.7-flash",
-        "step-router-v1"
-      ],
+      "models": ["step-3.5-flash", "step-3.5-flash-2603", "step-3.7-flash", "step-router-v1"],
       "docUrl": "https://platform.stepfun.com/docs/zh/step-plan/integrations/reasoning-api",
       "gateway": "models.dev"
     },
@@ -5675,11 +5542,7 @@
       "apiKeyEnvVar": "XPERSONA_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Xpersona",
-      "models": [
-        "claude-fable-5",
-        "xpersona-frieren-coder",
-        "xpersona-gpt-5.5"
-      ],
+      "models": ["claude-fable-5", "xpersona-frieren-coder", "xpersona-gpt-5.5"],
       "docUrl": "https://www.xpersona.co/docs",
       "gateway": "models.dev"
     },
@@ -5724,10 +5587,7 @@
       "apiKeyEnvVar": "BLUECLAW_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Blue Claw",
-      "models": [
-        "Qwen/Qwen3.6-35B-A3B-FP8",
-        "Qwen3.6-27B"
-      ],
+      "models": ["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.6-27B"],
       "docUrl": "https://blueclaw.network",
       "gateway": "models.dev"
     },
@@ -5736,9 +5596,7 @@
       "apiKeyEnvVar": "META_MODEL_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Meta",
-      "models": [
-        "muse-spark-1.1"
-      ],
+      "models": ["muse-spark-1.1"],
       "docUrl": "https://dev.meta.ai/docs",
       "gateway": "models.dev",
       "npm": "@ai-sdk/openai"
@@ -6400,10 +6258,7 @@
       "apiKeyEnvVar": "MOARK_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Moark",
-      "models": [
-        "GLM-4.7",
-        "MiniMax-M2.1"
-      ],
+      "models": ["GLM-4.7", "MiniMax-M2.1"],
       "docUrl": "https://moark.com/docs/openapi/v1#tag/%E6%96%87%E6%9C%AC%E7%94%9F%E6%88%90",
       "gateway": "models.dev"
     },
@@ -6412,12 +6267,7 @@
       "apiKeyEnvVar": "LILAC_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Lilac",
-      "models": [
-        "google/gemma-4-31b-it",
-        "minimaxai/minimax-m3",
-        "moonshotai/kimi-k2.6",
-        "zai-org/glm-5.2"
-      ],
+      "models": ["google/gemma-4-31b-it", "minimaxai/minimax-m3", "moonshotai/kimi-k2.6", "zai-org/glm-5.2"],
       "docUrl": "https://docs.getlilac.com/inference/models",
       "gateway": "models.dev"
     },
@@ -6551,11 +6401,7 @@
       "apiKeyEnvVar": "UPSTAGE_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Upstage",
-      "models": [
-        "solar-mini",
-        "solar-pro2",
-        "solar-pro3"
-      ],
+      "models": ["solar-mini", "solar-pro2", "solar-pro3"],
       "docUrl": "https://developers.upstage.ai/docs/apis/chat",
       "gateway": "models.dev"
     },
@@ -6564,15 +6410,7 @@
       "apiKeyEnvVar": "ZHIPU_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Zhipu AI Coding Plan",
-      "models": [
-        "glm-4.5-air",
-        "glm-4.6v",
-        "glm-4.7",
-        "glm-5-turbo",
-        "glm-5.1",
-        "glm-5.2",
-        "glm-5v-turbo"
-      ],
+      "models": ["glm-4.5-air", "glm-4.6v", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"],
       "docUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
       "gateway": "models.dev"
     },
@@ -6621,12 +6459,7 @@
       "url": "https://api.deepseek.com",
       "apiKeyEnvVar": "DEEPSEEK_API_KEY",
       "name": "DeepSeek",
-      "models": [
-        "deepseek-chat",
-        "deepseek-reasoner",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro"
-      ],
+      "models": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"],
       "docUrl": "https://api-docs.deepseek.com/quick_start/pricing",
       "gateway": "models.dev"
     },
@@ -6635,13 +6468,7 @@
       "apiKeyEnvVar": "WAFER_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Wafer",
-      "models": [
-        "GLM-5.1",
-        "GLM-5.2",
-        "Kimi-K2.6",
-        "MiniMax-M3",
-        "glm5.2-fast"
-      ],
+      "models": ["GLM-5.1", "GLM-5.2", "Kimi-K2.6", "MiniMax-M3", "glm5.2-fast"],
       "docUrl": "https://docs.wafer.ai/wafer-pass",
       "gateway": "models.dev"
     },
@@ -6766,18 +6593,12 @@
       "apiKeyEnvVar": "CLAUDINIO_API_KEY",
       "apiKeyHeader": "Authorization",
       "name": "Claudinio",
-      "models": [
-        "claudinio",
-        "claudius"
-      ],
+      "models": ["claudinio", "claudius"],
       "docUrl": "https://claudin.io",
       "gateway": "models.dev"
     },
     "netlify": {
-      "apiKeyEnvVar": [
-        "NETLIFY_TOKEN",
-        "NETLIFY_SITE_ID"
-      ],
+      "apiKeyEnvVar": ["NETLIFY_TOKEN", "NETLIFY_SITE_ID"],
       "apiKeyHeader": "Authorization",
       "name": "Netlify",
       "gateway": "netlify",
@@ -7594,24 +7415,9 @@
       "grok-imagine-image-quality",
       "grok-imagine-video"
     ],
-    "privatemode-ai": [
-      "gemma-3-27b",
-      "gpt-oss-120b",
-      "qwen3-coder-30b-a3b",
-      "qwen3-embedding-4b",
-      "whisper-large-v3"
-    ],
-    "drun": [
-      "public/deepseek-r1",
-      "public/deepseek-v3",
-      "public/minimax-m25"
-    ],
-    "ebcloud": [
-      "DeepSeek-V4-Flash",
-      "DeepSeek-V4-Pro",
-      "GLM-5.1",
-      "Kimi-K2.6"
-    ],
+    "privatemode-ai": ["gemma-3-27b", "gpt-oss-120b", "qwen3-coder-30b-a3b", "qwen3-embedding-4b", "whisper-large-v3"],
+    "drun": ["public/deepseek-r1", "public/deepseek-v3", "public/minimax-m25"],
+    "ebcloud": ["DeepSeek-V4-Flash", "DeepSeek-V4-Pro", "GLM-5.1", "Kimi-K2.6"],
     "alibaba-token-plan-cn": [
       "MiniMax-M2.5",
       "deepseek-v3.2",
@@ -7772,15 +7578,7 @@
       "qwen3-coder-480b-a35b-instruct",
       "qwen3-max-2025-09-23"
     ],
-    "trustedrouter": [
-      "auto",
-      "cheap",
-      "e2e",
-      "fast",
-      "synth",
-      "synth-code",
-      "zdr"
-    ],
+    "trustedrouter": ["auto", "cheap", "e2e", "fast", "synth", "synth-code", "zdr"],
     "zhipuai": [
       "glm-4.5",
       "glm-4.5-air",
@@ -7978,10 +7776,7 @@
       "@cf/zai-org/glm-4.7-flash",
       "@cf/zai-org/glm-5.2"
     ],
-    "bailing": [
-      "Ling-1T",
-      "Ring-1T"
-    ],
+    "bailing": ["Ling-1T", "Ring-1T"],
     "anyapi": [
       "anthropic/claude-haiku-4-5",
       "anthropic/claude-opus-4-6",
@@ -8128,10 +7923,7 @@
       "stable-diffusion-3.5-large",
       "wan2-2-t2v-a14b"
     ],
-    "subconscious": [
-      "subconscious/glm-5.2",
-      "subconscious/tim-qwen3.6-27b"
-    ],
+    "subconscious": ["subconscious/glm-5.2", "subconscious/tim-qwen3.6-27b"],
     "crossmodel": [
       "anthropic/claude-fable-5",
       "anthropic/claude-haiku-4-5",
@@ -8177,24 +7969,10 @@
       "z-ai/glm-5.1",
       "z-ai/glm-5.2"
     ],
-    "stepfun-ai-step-plan": [
-      "step-3.5-flash",
-      "step-3.5-flash-2603",
-      "step-3.7-flash"
-    ],
-    "lmstudio": [
-      "openai/gpt-oss-20b",
-      "qwen/qwen3-30b-a3b-2507",
-      "qwen/qwen3-coder-30b"
-    ],
-    "poolside": [
-      "poolside/laguna-m.1",
-      "poolside/laguna-xs-2.1",
-      "poolside/laguna-xs.2"
-    ],
-    "zenifra": [
-      "alibaba/qwen3.6-35b-a3b"
-    ],
+    "stepfun-ai-step-plan": ["step-3.5-flash", "step-3.5-flash-2603", "step-3.7-flash"],
+    "lmstudio": ["openai/gpt-oss-20b", "qwen/qwen3-30b-a3b-2507", "qwen/qwen3-coder-30b"],
+    "poolside": ["poolside/laguna-m.1", "poolside/laguna-xs-2.1", "poolside/laguna-xs.2"],
+    "zenifra": ["alibaba/qwen3.6-35b-a3b"],
     "zenmux": [
       "anthropic/claude-3.5-haiku",
       "anthropic/claude-3.7-sonnet",
@@ -8448,9 +8226,7 @@
       "openai-gpt-5.6-terra",
       "snowflake-llama3.3-70b"
     ],
-    "tencent-token-plan": [
-      "hy3"
-    ],
+    "tencent-token-plan": ["hy3"],
     "github-models": [
       "ai21-labs/ai21-jamba-1.5-large",
       "ai21-labs/ai21-jamba-1.5-mini",
@@ -9281,16 +9057,8 @@
       "kimi-k2.7-code",
       "kimi-k2.7-code-highspeed"
     ],
-    "morph": [
-      "auto",
-      "morph-v3-fast",
-      "morph-v3-large"
-    ],
-    "sakana": [
-      "fugu",
-      "fugu-ultra",
-      "fugu-ultra-20260615"
-    ],
+    "morph": ["auto", "morph-v3-fast", "morph-v3-large"],
+    "sakana": ["fugu", "fugu-ultra", "fugu-ultra-20260615"],
     "deepinfra": [
       "MiniMaxAI/MiniMax-M2.5",
       "MiniMaxAI/MiniMax-M2.7",
@@ -9344,19 +9112,8 @@
       "grok-4.5",
       "kimi-k2.5"
     ],
-    "cerebras": [
-      "gemma-4-31b",
-      "gpt-oss-120b",
-      "zai-glm-4.7"
-    ],
-    "zai-coding-plan": [
-      "glm-4.5-air",
-      "glm-4.7",
-      "glm-5-turbo",
-      "glm-5.1",
-      "glm-5.2",
-      "glm-5v-turbo"
-    ],
+    "cerebras": ["gemma-4-31b", "gpt-oss-120b", "zai-glm-4.7"],
+    "zai-coding-plan": ["glm-4.5-air", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"],
     "nvidia": [
       "abacusai/dracarys-llama-3_1-70b-instruct",
       "baai/bge-m3",
@@ -9458,15 +9215,8 @@
       "openai/whisper-large-v3",
       "openai/whisper-large-v3-turbo"
     ],
-    "xiaomi": [
-      "mimo-v2.5",
-      "mimo-v2.5-pro",
-      "mimo-v2.5-pro-ultraspeed"
-    ],
-    "inception": [
-      "mercury-2",
-      "mercury-edit-2"
-    ],
+    "xiaomi": ["mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed"],
+    "inception": ["mercury-2", "mercury-edit-2"],
     "anthropic": [
       "claude-fable-5",
       "claude-haiku-4-5",
@@ -9491,9 +9241,7 @@
       "minimax-m2.5",
       "tc-code-latest"
     ],
-    "lynkr": [
-      "lynkr-auto"
-    ],
+    "lynkr": ["lynkr-auto"],
     "freemodel": [
       "claude-fable-5",
       "claude-haiku-4-5-20251001",
@@ -9591,18 +9339,8 @@
       "llama-4-maverick-17b-128e-instruct-fp8",
       "llama-4-scout-17b-16e-instruct-fp8"
     ],
-    "llmtr": [
-      "gemma-4",
-      "magibu-11b-v8",
-      "medgemma-4b",
-      "qwen3-6-35b",
-      "sincap",
-      "trendyol-7b"
-    ],
-    "sarvam": [
-      "sarvam-105b",
-      "sarvam-30b"
-    ],
+    "llmtr": ["gemma-4", "magibu-11b-v8", "medgemma-4b", "qwen3-6-35b", "sincap", "trendyol-7b"],
+    "sarvam": ["sarvam-105b", "sarvam-30b"],
     "stepfun": [
       "step-1-32k",
       "step-2-16k",
@@ -9672,9 +9410,7 @@
       "qwen3.7-max",
       "qwen3.7-plus"
     ],
-    "longcat": [
-      "LongCat-2.0"
-    ],
+    "longcat": ["LongCat-2.0"],
     "poe": [
       "anthropic/claude-haiku-3",
       "anthropic/claude-haiku-3.5",
@@ -9803,19 +9539,8 @@
       "xai/grok-4.20-multi-agent",
       "xai/grok-code-fast-1"
     ],
-    "kimi-for-coding": [
-      "k2p5",
-      "k2p6",
-      "k2p7",
-      "kimi-k2-thinking"
-    ],
-    "dinference": [
-      "glm-4.7",
-      "glm-5",
-      "glm-5.1",
-      "gpt-oss-120b",
-      "minimax-m2.5"
-    ],
+    "kimi-for-coding": ["k2p5", "k2p6", "k2p7", "kimi-k2-thinking"],
+    "dinference": ["glm-4.7", "glm-5", "glm-5.1", "gpt-oss-120b", "minimax-m2.5"],
     "perplexity-agent": [
       "anthropic/claude-haiku-4-5",
       "anthropic/claude-opus-4-5",
@@ -9895,13 +9620,7 @@
       "umans-kimi-k2.7",
       "umans-qwen3.6-35b-a3b"
     ],
-    "ai-router": [
-      "gpt-5.4",
-      "gpt-5.5",
-      "gpt-5.6-luna",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra"
-    ],
+    "ai-router": ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"],
     "io-net": [
       "Intel/Qwen3-Coder-480B-A35B-Instruct-int4-mixed-ar",
       "Qwen/Qwen2.5-VL-32B-Instruct",
@@ -9944,9 +9663,7 @@
       "mimo-v2.5-tts-voiceclone",
       "mimo-v2.5-tts-voicedesign"
     ],
-    "zeldoc": [
-      "z-code"
-    ],
+    "zeldoc": ["z-code"],
     "scaleway": [
       "bge-multilingual-gemma2",
       "gemma-3-27b-it",
@@ -10027,10 +9744,7 @@
       "zai-org/GLM-5.1",
       "zai-org/GLM-5.2"
     ],
-    "tencent-tokenhub": [
-      "hy3",
-      "hy3-preview"
-    ],
+    "tencent-tokenhub": ["hy3", "hy3-preview"],
     "wandb": [
       "JetBrains/Mellum2-12B-A2.5B-Instruct",
       "MiniMaxAI/MiniMax-M2.5",
@@ -10058,9 +9772,7 @@
       "zai-org/GLM-5.1",
       "zai-org/GLM-5.2"
     ],
-    "kuae-cloud-coding-plan": [
-      "GLM-4.7"
-    ],
+    "kuae-cloud-coding-plan": ["GLM-4.7"],
     "kilo": [
       "ai21/jamba-large-1.7",
       "aion-labs/aion-1.0",
@@ -10444,19 +10156,8 @@
       "qwen/qwen3.6-27b-fp8",
       "qwen/qwen3.6-35b-a3b-fp8"
     ],
-    "perplexity": [
-      "sonar",
-      "sonar-deep-research",
-      "sonar-pro",
-      "sonar-reasoning-pro"
-    ],
-    "umans-ai": [
-      "umans-coder",
-      "umans-flash",
-      "umans-glm-5.1",
-      "umans-glm-5.2",
-      "umans-kimi-k2.7"
-    ],
+    "perplexity": ["sonar", "sonar-deep-research", "sonar-pro", "sonar-reasoning-pro"],
+    "umans-ai": ["umans-coder", "umans-flash", "umans-glm-5.1", "umans-glm-5.2", "umans-kimi-k2.7"],
     "togetherai": [
       "LiquidAI/LFM2-24B-A2B",
       "MiniMaxAI/MiniMax-M2.7",
@@ -10919,10 +10620,7 @@
       "zai-org/glm-4.7",
       "zai-org/glm-4.7-flash"
     ],
-    "nova": [
-      "nova-2-lite-v1",
-      "nova-2-pro-v1"
-    ],
+    "nova": ["nova-2-lite-v1", "nova-2-pro-v1"],
     "alibaba-token-plan": [
       "MiniMax-M2.5",
       "deepseek-v3.2",
@@ -11102,20 +10800,9 @@
       "z-ai/glm-5",
       "z-ai/glm-5.1"
     ],
-    "abliteration-ai": [
-      "abliterated-model"
-    ],
-    "stepfun-step-plan": [
-      "step-3.5-flash",
-      "step-3.5-flash-2603",
-      "step-3.7-flash",
-      "step-router-v1"
-    ],
-    "xpersona": [
-      "claude-fable-5",
-      "xpersona-frieren-coder",
-      "xpersona-gpt-5.5"
-    ],
+    "abliteration-ai": ["abliterated-model"],
+    "stepfun-step-plan": ["step-3.5-flash", "step-3.5-flash-2603", "step-3.7-flash", "step-router-v1"],
+    "xpersona": ["claude-fable-5", "xpersona-frieren-coder", "xpersona-gpt-5.5"],
     "baseten": [
       "deepseek-ai/DeepSeek-V4-Pro",
       "moonshotai/Kimi-K2.5",
@@ -11136,13 +10823,8 @@
       "gemma-4-E4B-it-IQ4_XS",
       "gemma-4-E4B-it-MLX-4bit"
     ],
-    "blueclaw": [
-      "Qwen/Qwen3.6-35B-A3B-FP8",
-      "Qwen3.6-27B"
-    ],
-    "meta": [
-      "muse-spark-1.1"
-    ],
+    "blueclaw": ["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.6-27B"],
+    "meta": ["muse-spark-1.1"],
     "routing-run": [
       "claude-opus-4-8",
       "claude-sonnet-4-6",
@@ -11779,16 +11461,8 @@
       "zai-org/glm-5:thinking",
       "zai-org/glm-latest"
     ],
-    "moark": [
-      "GLM-4.7",
-      "MiniMax-M2.1"
-    ],
-    "lilac": [
-      "google/gemma-4-31b-it",
-      "minimaxai/minimax-m3",
-      "moonshotai/kimi-k2.6",
-      "zai-org/glm-5.2"
-    ],
+    "moark": ["GLM-4.7", "MiniMax-M2.1"],
+    "lilac": ["google/gemma-4-31b-it", "minimaxai/minimax-m3", "moonshotai/kimi-k2.6", "zai-org/glm-5.2"],
     "ambient": [
       "ambient/large",
       "moonshotai/kimi-k2.6",
@@ -11836,20 +11510,8 @@
       "qwen3-next-80b-a3b-instruct",
       "qwen35-122b-a10b"
     ],
-    "upstage": [
-      "solar-mini",
-      "solar-pro2",
-      "solar-pro3"
-    ],
-    "zhipuai-coding-plan": [
-      "glm-4.5-air",
-      "glm-4.6v",
-      "glm-4.7",
-      "glm-5-turbo",
-      "glm-5.1",
-      "glm-5.2",
-      "glm-5v-turbo"
-    ],
+    "upstage": ["solar-mini", "solar-pro2", "solar-pro3"],
+    "zhipuai-coding-plan": ["glm-4.5-air", "glm-4.6v", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"],
     "chutes": [
       "MiniMaxAI/MiniMax-M2.5-TEE",
       "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
@@ -11874,19 +11536,8 @@
       "MiniMax-M2.7-highspeed",
       "MiniMax-M3"
     ],
-    "deepseek": [
-      "deepseek-chat",
-      "deepseek-reasoner",
-      "deepseek-v4-flash",
-      "deepseek-v4-pro"
-    ],
-    "wafer.ai": [
-      "GLM-5.1",
-      "GLM-5.2",
-      "Kimi-K2.6",
-      "MiniMax-M3",
-      "glm5.2-fast"
-    ],
+    "deepseek": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"],
+    "wafer.ai": ["GLM-5.1", "GLM-5.2", "Kimi-K2.6", "MiniMax-M3", "glm5.2-fast"],
     "minimax": [
       "MiniMax-M2",
       "MiniMax-M2.1",
@@ -11954,10 +11605,7 @@
       "mimo-v2.5-tts-voiceclone",
       "mimo-v2.5-tts-voicedesign"
     ],
-    "claudinio": [
-      "claudinio",
-      "claudius"
-    ],
+    "claudinio": ["claudinio", "claudius"],
     "netlify": [
       "anthropic/claude-fable-5",
       "anthropic/claude-haiku-4-5",

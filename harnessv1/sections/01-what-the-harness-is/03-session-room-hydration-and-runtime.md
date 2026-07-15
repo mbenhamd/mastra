@@ -56,7 +56,8 @@ The harness hydrates a Session, which assembles the request context and workspac
   <path d="M 460 210 L 520 200" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-session)"/>
   <text x="490" y="192" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">feed</text>
 
-  <text x="450" y="348" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.3 — Session room: hydration and runtime</text>
+<text x="450" y="348" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.3 — Session room: hydration and runtime</text>
 </svg>
+
 <figcaption>The harness hydrates a session, which assembles the request context and workspace state and admits the Mastra runtime; §4 owns the Session API and §§5–6 own persistence and request context.</figcaption>
 </figure>

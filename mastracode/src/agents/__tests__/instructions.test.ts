@@ -26,18 +26,20 @@ describe('getDynamicInstructions', () => {
         get: vi.fn(key =>
           key === 'harness'
             ? {
-                session: {
-                  modeId: 'build',
-                  modelId: 'anthropic/claude-opus-4-6',
-                  state: {
-                    get: vi.fn(() => ({
-                      projectPath: '/tmp/project',
-                      projectName: 'test-project',
-                      gitBranch: 'main',
-                      permissionRules: { tools: {} },
-                    })),
-                  },
+                modeId: 'build',
+                modelId: 'anthropic/claude-opus-4-6',
+                state: {
+                  projectPath: '/tmp/project',
+                  projectName: 'test-project',
+                  gitBranch: 'main',
+                  permissionRules: { tools: {} },
                 },
+                getState: vi.fn(() => ({
+                  projectPath: '/tmp/project',
+                  projectName: 'test-project',
+                  gitBranch: 'main',
+                  permissionRules: { tools: {} },
+                })),
               }
             : undefined,
         ),

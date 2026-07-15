@@ -89,11 +89,12 @@ function createState(isRunning: boolean) {
   };
 
   const state = createMockState({
-    session: {
-      run: { isRunning: vi.fn(() => isRunning) },
-      suspensions: { hasPending: vi.fn(() => false) },
-      mode: { get: vi.fn() },
-      state: { get: vi.fn(() => ({})), set: vi.fn() },
+    harness: {
+      isRunning: vi.fn(() => isRunning),
+      getDisplayState: vi.fn(() => ({ isRunning, pendingSuspension: null })),
+      getCurrentModeId: vi.fn(),
+      getState: vi.fn(() => ({})),
+      setState: vi.fn(),
     },
     extra: {
       editor,
@@ -392,7 +393,7 @@ describe('setupKeyboardShortcuts', () => {
     expect(abortController.signal.aborted).toBe(true);
     expect(component.setInterrupted).toHaveBeenCalledTimes(1);
     expect(state.userInitiatedAbort).toBe(true);
-    expect(state.session.abort).toHaveBeenCalledTimes(1);
+    expect(state.harness.abort).toHaveBeenCalledTimes(1);
     expect(editor.setText).not.toHaveBeenCalled();
     expect(state.ui.requestRender).toHaveBeenCalled();
   });
@@ -419,7 +420,7 @@ describe('setupKeyboardShortcuts', () => {
   it('aborts when parked in a tool suspension even though isRunning() is false', () => {
     const { state, editor, actions } = createState(false);
     editor.getText.mockReturnValue('');
-    state.session.suspensions.hasPending.mockReturnValue(true);
+    state.harness.getDisplayState.mockReturnValue({ isRunning: false, pendingSuspension: {} } as any);
 
     setupKeyboardShortcuts(state, {
       stop: vi.fn(),
@@ -429,7 +430,7 @@ describe('setupKeyboardShortcuts', () => {
 
     actions.get('clear')?.();
 
-    expect(state.session.abort).toHaveBeenCalledTimes(1);
+    expect(state.harness.abort).toHaveBeenCalledTimes(1);
     expect(state.userInitiatedAbort).toBe(true);
     expect(editor.setText).not.toHaveBeenCalled();
   });
@@ -450,7 +451,7 @@ describe('setupKeyboardShortcuts', () => {
 
     expect(abortController.abort).toHaveBeenCalledTimes(1);
     expect(component.setInterrupted).toHaveBeenCalledTimes(1);
-    expect(state.session.abort).toHaveBeenCalledTimes(1);
+    expect(state.harness.abort).toHaveBeenCalledTimes(1);
     expect(state.goalManager.pause).toHaveBeenCalledWith('Judge evaluation was interrupted.');
     expect(state.goalManager.saveToThread).toHaveBeenCalledWith(state);
     expect(state.activeGoalJudge).toBeUndefined();
@@ -464,7 +465,7 @@ describe('setupKeyboardShortcuts', () => {
     // aborts and clears the inline plan-approval component.
     const { state, editor, actions } = createState(false);
     editor.getText.mockReturnValue('');
-    state.session.suspensions.hasPending.mockReturnValue(true);
+    state.harness.getDisplayState.mockReturnValue({ isRunning: false, pendingSuspension: {} } as any);
     state.activeInlinePlanApproval = { handleInput: vi.fn() } as any;
 
     setupKeyboardShortcuts(state, {
@@ -475,7 +476,7 @@ describe('setupKeyboardShortcuts', () => {
 
     actions.get('clear')?.();
 
-    expect(state.session.abort).toHaveBeenCalledTimes(1);
+    expect(state.harness.abort).toHaveBeenCalledTimes(1);
     expect(state.activeInlinePlanApproval).toBeUndefined();
     expect(state.userInitiatedAbort).toBe(true);
     expect(editor.setText).not.toHaveBeenCalled();

@@ -308,6 +308,27 @@ describe('useSpeechRecognition (mastra path)', () => {
     await waitFor(() => expect(listenMock).toHaveBeenCalledTimes(1));
   });
 
+  it('transcribes the completed recording after stop() ends an active recorder', async () => {
+    installSpeechRecognition();
+    const { result } = renderHook(() => useSpeechRecognition({ agentId: 'agent-1' }), { wrapper });
+
+    await waitFor(() => expect(getSpeakersMock).toHaveBeenCalled());
+    await waitFor(() => {
+      act(() => result.current.start());
+      expect(recorderStartMock).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => expect(result.current.isListening).toBe(true));
+
+    act(() => result.current.stop());
+    expect(recorderStopMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      onFinishCapture?.(new File(['audio'], 'rec.webm', { type: 'audio/webm' }));
+    });
+    await waitFor(() => expect(listenMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.transcript).toBe('mastra transcript'));
+  });
+
   it('does not transcribe when stop() runs before the recorder resolves', async () => {
     installSpeechRecognition();
     deferRecorder = true;

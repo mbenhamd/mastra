@@ -20,29 +20,26 @@ describe('validateCallerRequestContext — accepted shapes', () => {
   });
 
   it('returns the normalized app bag for valid JSON content', () => {
-    expect(validateCallerRequestContext({ app: { tenant: 't1', nested: { n: [1, 2] }, flag: true, z: null } }, M)).toEqual(
-      { app: { tenant: 't1', nested: { n: [1, 2] }, flag: true, z: null } },
-    );
+    expect(
+      validateCallerRequestContext({ app: { tenant: 't1', nested: { n: [1, 2] }, flag: true, z: null } }, M),
+    ).toEqual({ app: { tenant: 't1', nested: { n: [1, 2] }, flag: true, z: null } });
   });
 
   it('drops undefined app properties (JSON.stringify semantics) but keeps explicit null', () => {
-    expect(validateCallerRequestContext({ app: { a: 1, b: undefined, c: null } }, M)).toEqual({ app: { a: 1, c: null } });
+    expect(validateCallerRequestContext({ app: { a: 1, b: undefined, c: null } }, M)).toEqual({
+      app: { a: 1, c: null },
+    });
   });
 });
 
 describe('validateCallerRequestContext — reserved key rejection', () => {
-  it.each([
-    'harness',
-    'channel',
-    'MastraMemory',
-    'browser',
-    'user',
-    'userPermissions',
-    'userRoles',
-  ])('rejects the infrastructure-owned key %s', key => {
-    expect(() => validateCallerRequestContext({ [key]: {} }, M)).toThrow(HarnessValidationError);
-    expect(() => validateCallerRequestContext({ [key]: {} }, M)).toThrow(/infrastructure-owned/);
-  });
+  it.each(['harness', 'channel', 'MastraMemory', 'browser', 'user', 'userPermissions', 'userRoles'])(
+    'rejects the infrastructure-owned key %s',
+    key => {
+      expect(() => validateCallerRequestContext({ [key]: {} }, M)).toThrow(HarnessValidationError);
+      expect(() => validateCallerRequestContext({ [key]: {} }, M)).toThrow(/infrastructure-owned/);
+    },
+  );
 
   it('rejects mastra__* and __mastra* namespaced keys', () => {
     expect(() => validateCallerRequestContext({ mastra__internal: 1 }, M)).toThrow(/infrastructure-owned/);

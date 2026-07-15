@@ -37,6 +37,7 @@ const flags = {
   compareSymbols: false,
   ignoreTypeOnlySymbols: true,
   includeTypeOnlyTypeTests: true,
+  selfTestSymbolExports: false,
   help: false,
 };
 const positional = [];
@@ -51,6 +52,7 @@ for (const arg of args) {
   else if (arg === '--include-type-only-symbols') flags.ignoreTypeOnlySymbols = false;
   else if (arg === '--ignore-type-only-symbols') flags.ignoreTypeOnlySymbols = true;
   else if (arg === '--no-type-only-type-tests') flags.includeTypeOnlyTypeTests = false;
+  else if (arg === '--self-test-symbol-exports') flags.selfTestSymbolExports = true;
   else if (arg === '--help' || arg === '-h') flags.help = true;
   else positional.push(arg);
 }
@@ -73,6 +75,7 @@ Options:
   --include-type-only-symbols Include type-only edges in the main symbol traversal
   --ignore-type-only-symbols  Ignore type-only edges in the main symbol traversal (default)
   --no-type-only-type-tests   Disable the type-only follow-up pass for Vitest type-test files
+  --self-test-symbol-exports  Verify default-declaration symbol classification and exit
   -h, --help                  Show this help message
 
 Examples:
@@ -84,6 +87,11 @@ Output (default):
   Newline-separated test file paths, pipeable to vitest:
     node scripts/affected-tests.mjs --git | xargs pnpm vitest run
 `);
+  process.exit(0);
+}
+
+if (flags.selfTestSymbolExports) {
+  runSymbolExportSelfTest();
   process.exit(0);
 }
 
@@ -414,6 +422,13 @@ function exportedDeclarationNames(node) {
   }
 
   if (
+    (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+    hasModifier(node, ts.SyntaxKind.DefaultKeyword)
+  ) {
+    return ['default'];
+  }
+
+  if (
     (ts.isFunctionDeclaration(node) ||
       ts.isClassDeclaration(node) ||
       ts.isInterfaceDeclaration(node) ||
@@ -427,6 +442,29 @@ function exportedDeclarationNames(node) {
   }
 
   return [];
+}
+
+function runSymbolExportSelfTest() {
+  const source = ts.createSourceFile(
+    'affected-tests-symbol-exports.ts',
+    [
+      'export default function NamedDefaultFunction() {}',
+      'export default class NamedDefaultClass {}',
+      'export function NamedFunction() {}',
+      'export class NamedClass {}',
+    ].join('\n'),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const actual = source.statements.map(statement => exportedDeclarationNames(statement));
+  const expected = [['default'], ['default'], ['NamedFunction'], ['NamedClass']];
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(
+      `symbol export self-test failed: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+    );
+  }
+  console.log('affected-tests symbol export self-test passed');
 }
 
 function addNamedEdge(edges, moduleName, kind, names, typeOnly = false) {

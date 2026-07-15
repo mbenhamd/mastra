@@ -3,16 +3,15 @@ import path from 'node:path';
 import { Agent } from '@mastra/core/agent';
 import type { PubSub } from '@mastra/core/events';
 import type {
-  Harness,
+  CustomAvailableModel,
   HeartbeatHandler,
   HarnessConfig,
   HarnessEvent,
   HarnessMode,
   HarnessSubagent,
   HarnessRequestContext,
-  Session,
 } from '@mastra/core/harness';
-import { PROVIDER_REGISTRY } from '@mastra/core/llm';
+import { GatewayRegistry, PROVIDER_REGISTRY } from '@mastra/core/llm';
 import type { ProviderConfig } from '@mastra/core/llm';
 import {
   AgentsMDInjector,
@@ -23,6 +22,7 @@ import {
 import { RequestContext } from '@mastra/core/request-context';
 import { TaskSignalProvider } from '@mastra/core/signals';
 import { InMemoryDB, InMemoryHarness, MastraCompositeStore } from '@mastra/core/storage';
+import { DEFAULT_GOAL_JUDGE_PROMPT } from '@mastra/core/tools';
 import { DuckDBStore } from '@mastra/duckdb';
 
 import { GithubSignals } from '@mastra/github-signals';
@@ -51,23 +51,25 @@ import { getDynamicWorkspace, getGoalJudgeTools } from './agents/workspace.js';
 import { AuthStorage } from './auth/storage.js';
 import { DEFAULT_CONFIG_DIR, validateConfigDirName } from './constants.js';
 import { createOutcomeScorer, createEfficiencyScorer } from './evals/scorers/index.js';
-import { createHarnessV1SubagentAgents, MastraCodeHarnessRuntime } from './harness/index.js';
+import { createHarnessV1SubagentAgents, MASTRACODE_HARNESS_NAME, MastraCodeHarnessRuntime } from './harness/index.js';
 import { HookManager } from './hooks/index.js';
 import { createMcpManager } from './mcp/index.js';
 import type { McpServerConfig } from './mcp/index.js';
 import type { ProviderAccess } from './onboarding/packs.js';
 import { getAvailableModePacks, getAvailableOmPacks } from './onboarding/packs.js';
 import {
+  getCustomProviderId,
   loadSettings,
   MEMORY_GATEWAY_PROVIDER,
   OBSERVABILITY_AUTH_PREFIX,
   resolveModelDefaults,
   resolveOmRoleModel,
   saveSettings,
+  toCustomProviderModelId,
 } from './onboarding/settings.js';
 import { getToolCategory } from './permissions.js';
 import { setAuthStorage } from './providers/claude-max.js';
-import { setAuthStorage as setGitHubCopilotAuthStorage } from './providers/github-copilot.js';
+import { getCopilotModelCatalog, setAuthStorage as setGitHubCopilotAuthStorage } from './providers/github-copilot.js';
 import { setAuthStorage as setOpenAIAuthStorage } from './providers/openai-codex.js';
 
 import { mastra } from './tui/theme.js';
@@ -83,6 +85,11 @@ import { createSignalsPubSub } from './utils/signals-pubsub.js';
 import { createStorage, createVectorStore } from './utils/storage-factory.js';
 
 const CODE_AGENT_ID = 'code-agent';
+const PROVIDER_TO_OAUTH_ID: Record<string, string> = {
+  anthropic: 'anthropic',
+  openai: 'openai-codex',
+  'github-copilot': 'github-copilot',
+};
 
 export interface MastraCodeConfig {
   /** Working directory for project detection. Default: process.cwd() */
@@ -135,7 +142,7 @@ export interface MastraCodeConfig {
    *
    * Use this when you need to override memory model behavior completely.
    */
-  memory?: HarnessConfig['memory'];
+  memory?: HarnessConfig['memory'] | false;
   /** Browser provider for browser automation tools. When set, the agent gains access to browser tools. */
   browser?: HarnessConfig['browser'];
   /** PubSub for signal routing. When crossProcessPubSub is true, thread locks are disabled. */
@@ -146,14 +153,7 @@ export interface MastraCodeConfig {
   crossProcessPubSub?: boolean;
 }
 
-export type MastraCodeHarnessPublic = Harness<Record<string, unknown>> & {
-  actions: MastraCodeHarnessRuntime<Record<string, unknown>>['actions'];
-  mcp: MastraCodeHarnessRuntime<Record<string, unknown>>['mcp'];
-  getResolvedMemory: MastraCodeHarnessRuntime<Record<string, unknown>>['getResolvedMemory'];
-  saveSystemReminderMessage: MastraCodeHarnessRuntime<Record<string, unknown>>['saveSystemReminderMessage'];
-  stopHeartbeats: MastraCodeHarnessRuntime<Record<string, unknown>>['stopHeartbeats'];
-  destroy: MastraCodeHarnessRuntime<Record<string, unknown>>['destroy'];
-};
+export type MastraCodeHarnessPublic = MastraCodeHarnessRuntime<Record<string, unknown>>;
 
 export function createAuthStorage() {
   const authStorage = new AuthStorage();
@@ -188,12 +188,9 @@ function resolveCloudObservabilityConfig(
 
 export async function createMastraCode(config?: MastraCodeConfig) {
   const cwd = config?.cwd ?? process.cwd();
-  const homeDir = config?.homeDir ?? config?.initialState?.homeDir;
+  const configuredHomeDir = config?.homeDir ?? config?.initialState?.homeDir;
+  const homeDir = typeof configuredHomeDir === 'string' ? configuredHomeDir : undefined;
   const configDir = config?.configDir ?? DEFAULT_CONFIG_DIR;
-  // The single session for this process, assigned once `createSession()` runs
-  // below. Config callbacks defined before then (e.g. notification stream
-  // options) read it lazily through this holder.
-  let activeSession: Session<MastraCodeState> | undefined;
   if (configDir !== DEFAULT_CONFIG_DIR) {
     validateConfigDirName(configDir);
   }
@@ -204,6 +201,8 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   } catch {
     // No .env file — that's fine, keys may be in shell environment
   }
+
+  const gatewayRegistry = GatewayRegistry.getInstance({ useDynamicLoading: true });
 
   // Auth storage (shared with Claude Max / OpenAI providers and Harness)
   const authStorage = createAuthStorage();
@@ -391,11 +390,9 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   const outcomeScorer = createOutcomeScorer();
   const efficiencyScorer = createEfficiencyScorer();
 
-  // Agent — githubSignals is created before `harness` but the closure below
-  // captures `harness` by reference; it is only invoked at notification time,
-  // well after harness is constructed (line ~692). Explicit type annotations
-  // on githubSignals, codeAgent, modes, and harness break the circular
-  // inference chain this forward reference would otherwise create.
+  // The signal provider is constructed before the runtime because the agent
+  // owns it. Its callback executes only after the runtime has been initialized.
+  let harness: MastraCodeHarnessRuntime<Record<string, unknown>>;
   const githubSignals: GithubSignals | undefined = globalSettings.signals?.experimentalGithubSignals
     ? new GithubSignals({
         cwd: project.rootPath,
@@ -405,36 +402,27 @@ export async function createMastraCode(config?: MastraCodeConfig) {
           process.env.MASTRACODE_GITCRAWL_COMMAND ??
           process.env.GITCRAWL_COMMAND,
         getNotificationStreamOptions: async ({ resourceId, threadId }) => {
-          // Run the woken notification as the session that owns the target
-          // resource so it uses that session's model/mode/state. Fall back to
-          // the current session only when no session owns the resource yet.
-          const session = (await harness.getSessionByResource(resourceId)) ?? activeSession!;
-          // A long-running system must be able to drive work unattended, so a
-          // target session without an explicit model selection falls back to a
-          // real model rather than failing the run: the current session's live
-          // selection (what the user actually picked), then the mode's default.
-          const modeId = session.mode.get();
+          // Resolve the exact native Harness v1 session that owns the target
+          // resource/thread. This avoids a shadow client and keeps notification
+          // execution on the same durable session contract as interactive work.
+          const session = await harness.core.session({ resourceId, threadId });
+          const state = await session.getState<Record<string, unknown>>();
+          const modeId = session.getCurrentModeId();
           const defaultModeModelId = harness.listModes().find(mode => mode.id === modeId)?.defaultModelId;
-          const modelId = session.model.get() || activeSession?.model.get() || defaultModeModelId || '';
+          const modelId = session.models.current() || harness.getCurrentModelId() || defaultModeModelId || '';
           const requestContext = new RequestContext();
-          const harnessContext: HarnessRequestContext = {
-            harnessId: harness.id,
-            state: session.state.get(),
-            getState: () => session.state.get(),
-            setState: updates => session.state.set(updates),
+          const harnessContext: HarnessRequestContext & { modelId: string } = {
+            harnessId: MASTRACODE_HARNESS_NAME,
+            state,
+            getState: () => state,
+            setState: updates => session.setState(updates),
             threadId,
             resourceId,
-            session: {
-              modeId,
-              modelId,
-              state: {
-                get: () => session.state.get(),
-                set: updates => session.state.set(updates),
-                update: updater => session.state.update(updater),
-              },
-            },
-            workspace: harness.getWorkspace(),
-            getSubagentModelId: params => session.subagents.model.get(params ?? {}),
+            modeId,
+            modelId,
+            workspace: await session.getWorkspace(),
+            getSubagentModelId: params =>
+              params?.agentType ? session.models.getSubagent({ agentType: params.agentType }) : null,
           };
           requestContext.set('harness', harnessContext);
 
@@ -443,7 +431,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
             requestContext,
             maxSteps: 1000,
             savePerStep: false,
-            requireToolApproval: (session.state.get() as Record<string, unknown>).yolo !== true,
+            requireToolApproval: state.yolo !== true,
             modelSettings: { temperature: 1 },
           };
         },
@@ -482,7 +470,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       // judge model is configured, keeping the goal step a no-op. Bind the same
       // `settingsPath` used above so the judge model and `maxRuns` come from one
       // config (a custom settings file would otherwise diverge).
-      judge: ctx => getGoalJudgeModel(ctx, config?.settingsPath),
+      judge: (ctx: { requestContext: RequestContext }) => getGoalJudgeModel(ctx, config?.settingsPath),
       maxRuns: globalSettings.models.goalMaxTurns ?? 50,
       prompt: DEFAULT_GOAL_JUDGE_PROMPT,
       // Read-only workspace tools the default goal judge may call to verify the
@@ -498,7 +486,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
           const harnessContext = requestContext?.get('harness') as
             | HarnessRequestContext<{ projectPath?: string }>
             | undefined;
-          const state = harnessContext?.session.state.get();
+          const state = harnessContext?.state;
           return getStaticallyLoadedInstructionPaths(state?.projectPath ?? project.rootPath);
         },
       }),
@@ -506,35 +494,6 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     ],
     errorProcessors: [new StreamErrorRetryProcessor(), new PrefillErrorHandler(), new ProviderHistoryCompat()],
   });
-
-  githubSignalsProcessor?.addAgent(codeAgent, {
-    getNotificationStreamOptions: ({ resourceId, threadId }) => {
-      const requestContext = new RequestContext();
-      const harnessContext: HarnessRequestContext = {
-        harnessId: 'mastra-code',
-        state: harness.getState(),
-        getState: () => harness.getState(),
-        setState: updates => harness.setState(updates),
-        threadId,
-        resourceId,
-        modeId: harness.getCurrentModeId(),
-        workspace: harness.getWorkspace(),
-        getSubagentModelId: params => harness.getSubagentModelId(params),
-      };
-      requestContext.set('harness', harnessContext);
-
-      return {
-        memory: { thread: threadId, resource: resourceId },
-        requestContext,
-        maxSteps: 1000,
-        savePerStep: false,
-        requireToolApproval: (harness.getState() as Record<string, unknown>).yolo !== true,
-        modelSettings: { temperature: 1 },
-      };
-    },
-  });
-
-  const _defaultSubagents = [exploreSubagent, planSubagent, executeSubagent];
 
   const defaultModes: HarnessMode<Record<string, unknown>>[] = [
     {
@@ -631,11 +590,9 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     return savedModel ? { ...mode, defaultModelId: savedModel } : mode;
   });
 
-  // Map subagent types to mode models: explore→fast, plan→plan, execute→build
-  // const subagentModeMap: Record<string, string> = { explore: 'fast', plan: 'plan', execute: 'build' };
-  // Subagents inherit workspace tools from the parent agent's workspace automatically.
-  // Apply disabledTools filter to both default and custom subagents.
-  // const subagents = [];
+  // Upstream no longer registers hard-coded default subagents. Configured
+  // subagents use the native Harness v1 task/signal machinery directly.
+  const subagents = config?.subagents ?? [];
 
   if (memory && !(codeAgent as any).hasOwnMemory?.()) {
     (codeAgent as any).__setMemory?.(memory);
@@ -758,7 +715,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     return customModels;
   };
 
-  const harness = new MastraCodeHarnessRuntime({
+  harness = new MastraCodeHarnessRuntime<Record<string, unknown>>({
     resourceId: project.resourceId,
     storage,
     observability,
@@ -802,7 +759,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
 
   // Sync hookManager session ID on thread changes
   if (hookManager) {
-    session.subscribe((event: HarnessEvent) => {
+    harness.subscribe((event: HarnessEvent) => {
       if (event.type === 'thread_changed') {
         hookManager.setSessionId(event.threadId);
       } else if (event.type === 'thread_created') {
@@ -816,12 +773,12 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       if (!threadId) return;
       githubSignals.stopAllPolling();
       try {
-        const threads = await session.thread.list({ allResources: true });
+        const threads = await harness.listThreads({ allResources: true });
         const thread = threads.find((item: { id: string }) => item.id === threadId);
         await githubSignals.startPollingForThread(
           {
             threadId,
-            resourceId: thread?.resourceId ?? session.identity.getResourceId(),
+            resourceId: thread?.resourceId ?? harness.getResourceId(),
           },
           { pollImmediately: true },
         );
@@ -830,25 +787,22 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       }
     };
 
-    session.subscribe((event: HarnessEvent) => {
+    harness.subscribe((event: HarnessEvent) => {
       if (event.type === 'thread_changed') void startGithubPollingForCurrentThread(event.threadId);
       else if (event.type === 'thread_created') void startGithubPollingForCurrentThread(event.thread.id);
     });
-    void startGithubPollingForCurrentThread(session.thread.getId());
+    void startGithubPollingForCurrentThread(harness.getCurrentThreadId());
   }
 
   // Persist MastraCode-owned /om settings per-thread (mastracode-only concern;
   // intentionally not in core's harness loadThreadMetadata).
-  const omThreadStateSession = session as unknown as Session<Record<string, unknown>>;
-  attachOMThreadStatePersistence(omThreadStateSession);
-  await restoreOMThreadStateForCurrentThread(omThreadStateSession).catch(() => {
+  attachOMThreadStatePersistence(harness);
+  await restoreOMThreadStateForCurrentThread(harness).catch(() => {
     // Persistence is best-effort; don't crash startup if storage hiccups.
   });
 
-  const harnessForConsumers = harness as unknown as MastraCodeHarnessPublic;
-
   return {
-    harness: harnessForConsumers,
+    harness,
     mcpManager,
     hookManager,
     signalsPubSub,

@@ -10,15 +10,13 @@ const session = await harness.session({
 });
 
 // Render goal/judge state in the UI.
-session.subscribe((event) => {
+session.subscribe(event => {
   switch (event.type) {
     case 'goal_set':
       ui.statusLine.set(`goal: ${event.goal.objective}`);
       break;
     case 'goal_judged':
-      ui.statusLine.set(
-        `judge ${event.turnsUsed}/${event.maxTurns} — ${event.decision.decision}`,
-      );
+      ui.statusLine.set(`judge ${event.turnsUsed}/${event.maxTurns} — ${event.decision.decision}`);
       break;
     case 'goal_done':
       ui.toast(`goal done after ${event.turnsUsed} turns: ${event.reason}`);

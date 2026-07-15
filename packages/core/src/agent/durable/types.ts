@@ -362,6 +362,11 @@ export interface DurableToolCallInput {
  * Output from a single tool call step
  */
 export interface DurableToolCallOutput extends DurableToolCallInput {
+  /**
+   * Original pending call resolved by a fresh provider call carrying resume data.
+   * The current call still receives a provider result; persistence resolves both calls.
+   */
+  resumeTargetToolCallId?: string;
   /** Result from tool execution */
   result?: unknown;
   /** Error if tool execution failed */

@@ -35,6 +35,7 @@ vi.mock('./analyze/bundleExternals', () => ({
         name: 'custom-user-external',
         isEntry: true,
         isDynamicEntry: false,
+        moduleIds: [],
         imports: ['custom-user-external/pg-core'],
         importedBindings: {
           'custom-user-external/pg-core': ['pgTable', 'text', 'default', '*', 'pgTable'],

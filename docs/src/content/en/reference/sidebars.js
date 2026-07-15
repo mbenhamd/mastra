@@ -21,25 +21,6 @@ const sidebars = {
     },
     {
       type: 'category',
-      label: 'Harness',
-      collapsed: true,
-      items: [
-        {
-          type: 'doc',
-          id: 'harness/harness-class',
-          label: 'Harness Class',
-          customProps: { tags: ['alpha'] },
-        },
-        {
-          type: 'doc',
-          id: 'harness/session',
-          label: 'Session Class',
-          customProps: { tags: ['alpha'] },
-        },
-      ],
-    },
-    {
-      type: 'category',
       label: 'AgentController',
       collapsed: true,
       items: [
@@ -396,6 +377,25 @@ const sidebars = {
         { type: 'doc', id: 'file-based-agents/tools', label: 'Tools' },
         { type: 'doc', id: 'file-based-agents/workflows', label: 'Workflows' },
         { type: 'doc', id: 'file-based-agents/workspace', label: 'Workspace' },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Harness',
+      collapsed: true,
+      items: [
+        {
+          type: 'doc',
+          id: 'harness/harness-class',
+          label: 'Harness Class',
+          customProps: { tags: ['alpha'] },
+        },
+        {
+          type: 'doc',
+          id: 'harness/session',
+          label: 'Session Class',
+          customProps: { tags: ['alpha'] },
+        },
       ],
     },
     {

@@ -40,14 +40,9 @@ function createContext() {
       stagehand: { env: 'LOCAL' as const },
     },
   };
-  const session = {
-    state: {
-      get: vi.fn(() => harnessState),
-      set: setState,
-    },
-  };
   const harness = {
-    session,
+    getState: vi.fn(() => harnessState),
+    setState,
     listModes: vi.fn(() => [
       { id: 'build', agent: staticAgent },
       { id: 'review', agent: vi.fn(() => dynamicAgent) },
@@ -55,11 +50,9 @@ function createContext() {
   };
   const ctx = {
     state: {
-      session,
       harness,
       ui: {},
     },
-    session,
     harness,
     showInfo: vi.fn(),
     showError: vi.fn(),
@@ -92,7 +85,7 @@ describe('handleBrowserCommand', () => {
     };
     expect(browserMocks.createBrowserFromSettings).toHaveBeenCalledWith(enabledSettings);
     expect(ctx.harness.listModes).toHaveBeenCalledOnce();
-    expect(ctx.state.session.state.get).toHaveBeenCalledOnce();
+    expect(ctx.state.harness.getState).toHaveBeenCalledOnce();
     expect(staticAgent.setBrowser).toHaveBeenCalledWith(browserInstance);
     expect(dynamicAgent.setBrowser).toHaveBeenCalledWith(browserInstance);
     const dynamicMode = (ctx.harness.listModes as ReturnType<typeof vi.fn>).mock.results[0]?.value[1];

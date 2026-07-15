@@ -100,12 +100,12 @@ function applyBrowserToAgents(
   const modes = ctx.harness.listModes();
   let harnessState: unknown;
   for (const mode of modes) {
-    const agent = resolveModeAgent(mode, (harnessState ??= ctx.state.session.state.get()));
+    const agent = resolveModeAgent(mode, (harnessState ??= ctx.harness.getState()));
     agent?.setBrowser?.(browser);
   }
   ctx.harness.setBrowser?.(browser);
   // Track the active browser settings in harness state
-  void ctx.state.session.state.set({ [ACTIVE_BROWSER_KEY]: browserSettings } as any);
+  void ctx.harness.setState({ [ACTIVE_BROWSER_KEY]: browserSettings } as any);
 }
 
 /**
@@ -233,7 +233,7 @@ export async function handleBrowserCommand(ctx: SlashCommandContext, args: strin
 
   if (arg === 'status') {
     // Get the active browser settings from harness state (what's actually running)
-    const state = ctx.state.session.state.get() as any;
+    const state = ctx.harness.getState() as any;
     const activeSettings = state?.[ACTIVE_BROWSER_KEY] as BrowserSettings | undefined;
 
     // Check for config drift between file and active instance
@@ -435,8 +435,8 @@ export async function handleBrowserCommand(ctx: SlashCommandContext, args: strin
       return;
     }
 
-    const currentMode = ctx.state.session.mode.resolve();
-    const currentAgent = resolveModeAgent(currentMode, ctx.state.session.state.get());
+    const currentMode = ctx.harness.getCurrentMode();
+    const currentAgent = resolveModeAgent(currentMode, ctx.harness.getState());
     let browserInstance = currentAgent?.browser;
 
     if (!browserInstance && browser.enabled) {

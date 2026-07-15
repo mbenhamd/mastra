@@ -502,6 +502,7 @@ describe('workflow terminal parent patch semantics', () => {
       executionMode: 'continuous',
     });
     expect((next.context.loop as Record<string, any>).metadata.iterationCount).toBe(1);
+    expect((next.context.loop as Record<string, any>).metadata).not.toHaveProperty('nestedRunId');
     expect(next.activeStepsPath.loop).toEqual([2]);
   });
 

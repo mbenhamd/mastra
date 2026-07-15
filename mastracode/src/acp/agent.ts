@@ -11,7 +11,7 @@ import type {
   ContentBlock,
 } from '@agentclientprotocol/sdk';
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
-import type { Harness, HarnessMode } from '@mastra/core/harness';
+import type { MastraCodeHarnessRuntime } from '../harness/runtime.js';
 import { handleHarnessEvent } from './event-mapper.js';
 import type { PromptState } from './event-mapper.js';
 
@@ -21,8 +21,7 @@ import type { PromptState } from './event-mapper.js';
  */
 export class MastraCodeAcpAgent implements Agent {
   private readonly connection: AgentSideConnection;
-  private readonly harness: Harness;
-  private readonly modes: HarnessMode[];
+  private readonly harness: MastraCodeHarnessRuntime<Record<string, unknown>>;
   private readonly sessionMap = new Map<string, string>(); // sessionId -> threadId
   private currentPromptState: PromptState | null = null;
   private promptMutex: Promise<void> = Promise.resolve();
@@ -35,10 +34,9 @@ export class MastraCodeAcpAgent implements Agent {
     return threadId;
   }
 
-  constructor(connection: AgentSideConnection, harness: Harness, modes: HarnessMode[]) {
+  constructor(connection: AgentSideConnection, harness: MastraCodeHarnessRuntime<Record<string, unknown>>) {
     this.connection = connection;
     this.harness = harness;
-    this.modes = modes;
 
     // Register persistent event listener
     this.harness.subscribe(event => {
@@ -73,18 +71,18 @@ export class MastraCodeAcpAgent implements Agent {
     await this.harness.switchThread({ threadId: thread.id });
 
     // Build modes list from constructor param
-    const availableModes = this.modes.map((m: HarnessMode) => ({
-      id: m.id,
-      name: m.name ?? m.id,
+    const availableModes = this.harness.listModes().map(mode => ({
+      id: mode.id,
+      name: mode.name ?? mode.id,
     }));
 
-    const currentModeId = this.harness.session.mode.get();
+    const currentModeId = this.harness.getCurrentModeId();
 
     // Build models list (best-effort)
     let models: NewSessionResponse['models'];
     try {
       const availableModels = await this.harness.listAvailableModels();
-      const currentModelId = this.harness.session.model.get();
+      const currentModelId = this.harness.getCurrentModelId();
       models = {
         currentModelId: currentModelId ?? '',
         availableModels: availableModels.map(m => ({
@@ -182,13 +180,13 @@ export class MastraCodeAcpAgent implements Agent {
   async setSessionMode(params: { sessionId: string; modeId: string }): Promise<void> {
     const threadId = this.getThreadIdOrThrow(params.sessionId);
     await this.harness.switchThread({ threadId });
-    this.harness.session.mode.set({ modeId: params.modeId });
+    await this.harness.switchMode({ modeId: params.modeId });
   }
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const threadId = this.getThreadIdOrThrow(params.sessionId);
     await this.harness.switchThread({ threadId });
-    this.harness.session.model.set({ modelId: params.modelId });
+    await this.harness.switchModel({ modelId: params.modelId });
   }
 }
 

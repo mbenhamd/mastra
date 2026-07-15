@@ -28,11 +28,11 @@ source ledgers and operator repair APIs remain outside Harness v1 (§5.2,
 Channels are coordinated at two levels:
 
 - **Mastra Server registry** — process-wide. Knows every registered harness,
-every registered channel provider, and which `(harnessName, channelId)` pairs
-are mounted. It owns init-time validation and route fan-out (§13.1).
+  every registered channel provider, and which `(harnessName, channelId)` pairs
+  are mounted. It owns init-time validation and route fan-out (§13.1).
 - **Harness channel bridge** — per harness. Owns binding resolution, session
-admission, inbox/outbox persistence, permissions, and approval routing for
-sessions under that harness.
+  admission, inbox/outbox persistence, permissions, and approval routing for
+  sessions under that harness.
 
 This split is what lets one Mastra Server run multiple harnesses against
 multiple channel providers without making any one harness guess what else is
@@ -141,6 +141,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-channel-flow);" d="M920 566 L920 599" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-channel-flow);" d="M815 628 L751 628" />
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-channel-flow);" d="M820 615 C645 575 485 350 410 122" />
+
   </svg>
   <figcaption>Channel ingress and actions are routed through the registry before session admission; outbound dispatch reads the outbox and consults the registry laterally before calling the provider API.</figcaption>
 </figure>
@@ -214,8 +215,8 @@ interface ChannelActionResult {
 }
 
 interface ChannelOutboxEnqueueOptions {
-  bindingId: string;                 // delivery binding / platform target
-  owningSessionId?: string;          // defaults to the binding's session
+  bindingId: string; // delivery binding / platform target
+  owningSessionId?: string; // defaults to the binding's session
   kind: ChannelOutboxItem['kind'];
   // Trusted bridge/adapter operation identity for delivery semantics. External
   // provider payload fields never set these directly. When omitted, the adapter
@@ -235,7 +236,7 @@ interface ChannelDispatchOptions {
 }
 
 interface MastraChannelOperatorDispatchOptions extends ChannelDispatchOptions {
-  harnessName?: string;              // omitted only for an explicit cross-harness operator worker
+  harnessName?: string; // omitted only for an explicit cross-harness operator worker
 }
 
 interface ChannelDispatchResult {

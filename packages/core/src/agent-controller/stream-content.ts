@@ -1,4 +1,4 @@
-import { createSignal } from '../agent/signals';
+import { createSignal, signalContentsToParts, signalContentsToText } from '../agent/signals';
 import type { AgentSignalContents, AgentSignalInput } from '../agent/signals';
 import { getServerSideFallbackInfo } from '../llm/model/server-side-fallback';
 import { getTransformedToolPayload, hasTransformedToolPayload } from '../tools/payload-transform';
@@ -27,23 +27,19 @@ export function getRecordValue(value: unknown): Record<string, unknown> | undefi
 }
 
 export function signalContentsToControllerContent(contents: AgentSignalContents): AgentControllerMessageContent[] {
-  if (typeof contents === 'string') return [{ type: 'text', text: contents }];
-  return contents.flatMap((part): AgentControllerMessageContent[] => {
+  return signalContentsToParts(contents).map((part): AgentControllerMessageContent => {
     if (part.type === 'text') {
-      return [{ type: 'text', text: part.text }];
+      return { type: 'text', text: part.text };
     }
-    if (typeof part.data !== 'string') return [];
     if (part.mediaType.startsWith('image/')) {
-      return [{ type: 'image', data: part.data, mimeType: part.mediaType }];
+      return { type: 'image', data: part.data, mimeType: part.mediaType };
     }
-    return [
-      {
-        type: 'file',
-        data: part.data,
-        mediaType: part.mediaType,
-        filename: part.filename,
-      },
-    ];
+    return {
+      type: 'file',
+      data: part.data,
+      mediaType: part.mediaType,
+      filename: part.filename,
+    };
   });
 }
 
@@ -52,14 +48,18 @@ export function toSystemReminderContent(
 ): Extract<AgentControllerMessageContent, { type: 'system_reminder' }> | undefined {
   const attributes = getRecordValue(payload.attributes);
   const metadata = getRecordValue(payload.metadata);
-  const message = signalContentsToText(payload.contents);
+  const message = signalContentsToText(payload.contents) || getStringValue(payload.message);
   if (!message) return undefined;
 
   return {
     type: 'system_reminder',
     message,
     reminderType:
-      getStringValue(payload.reminderType) ?? getStringValue(attributes?.type) ?? getStringValue(payload.type),
+      getStringValue(payload.reminderType) ??
+      getStringValue(attributes?.reminderType) ??
+      getStringValue(attributes?.type) ??
+      getStringValue(metadata?.reminderType) ??
+      getStringValue(payload.type),
     path: getStringValue(payload.path) ?? getStringValue(attributes?.path),
     precedesMessageId: getStringValue(payload.precedesMessageId) ?? getStringValue(attributes?.precedesMessageId),
     gapText: getStringValue(payload.gapText) ?? getStringValue(attributes?.gapText),
@@ -108,14 +108,7 @@ export function toUserSignalMessage(payload: Record<string, unknown>): AgentCont
   };
 }
 
-export function signalContentsToText(contents: unknown): string {
-  if (typeof contents === 'string') return contents;
-  if (!Array.isArray(contents)) return '';
-  return contents
-    .filter((part): part is { type: 'text'; text: string } => getRecordValue(part)?.type === 'text')
-    .map(part => part.text)
-    .join('\n');
-}
+export { signalContentsToText } from '../agent/signals';
 
 export function toStateSignalContent(
   payload: Record<string, unknown>,

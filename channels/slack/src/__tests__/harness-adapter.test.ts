@@ -13,11 +13,7 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { Agent } from '@mastra/core/agent';
 import { describe, it, expect, vi } from 'vitest';
 
-import {
-  SlackHarnessAdapter,
-  SlackInboundVerificationError,
-  SlackUrlVerificationChallenge,
-} from '../harness-adapter';
+import { SlackHarnessAdapter, SlackInboundVerificationError, SlackUrlVerificationChallenge } from '../harness-adapter';
 
 const SIGNING_SECRET = 'test-signing-secret';
 const BOT_TOKEN = 'xoxb-test-token';
@@ -94,7 +90,11 @@ function messageEventPayload(overrides: Record<string, unknown> = {}) {
 // ---------------------------------------------------------------------------
 
 describe('SlackHarnessAdapter.verifyInbound', () => {
-  const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, botUserId: BOT_USER_ID });
+  const adapter = new SlackHarnessAdapter({
+    signingSecret: SIGNING_SECRET,
+    botToken: BOT_TOKEN,
+    botUserId: BOT_USER_ID,
+  });
 
   it('maps a correctly-signed channel message into a full ingress envelope', async () => {
     const payload = messageEventPayload();
@@ -187,11 +187,8 @@ describe('SlackHarnessAdapter.verifyInbound', () => {
     await expect(adapter.verifyInbound(req, routeCtx)).rejects.toBeInstanceOf(SlackUrlVerificationChallenge);
   });
 
-  it('emits an empty-content envelope for the bot\'s own message (no agent turn)', async () => {
-    const env = await adapter.verifyInbound(
-      signedRequest(messageEventPayload({ user: BOT_USER_ID })),
-      routeCtx,
-    );
+  it("emits an empty-content envelope for the bot's own message (no agent turn)", async () => {
+    const env = await adapter.verifyInbound(signedRequest(messageEventPayload({ user: BOT_USER_ID })), routeCtx);
     expect(env.content).toBe('');
     // Routing identity preserved so the delivery is still recorded/deduped.
     expect(env.externalChannelId).toBe('C123');
@@ -207,7 +204,12 @@ describe('SlackHarnessAdapter.verifyInbound', () => {
 
   it('emits empty-content for a non message/app_mention event', async () => {
     const env = await adapter.verifyInbound(
-      signedRequest({ type: 'event_callback', team_id: 'T1', event_id: 'Ev9', event: { type: 'reaction_added', item: {} } }),
+      signedRequest({
+        type: 'event_callback',
+        team_id: 'T1',
+        event_id: 'Ev9',
+        event: { type: 'reaction_added', item: {} },
+      }),
       routeCtx,
     );
     expect(env.content).toBe('');
@@ -250,11 +252,12 @@ describe('SlackHarnessAdapter.deliver', () => {
   }
 
   it('posts to the right channel + thread and returns the ts as providerMessageId', async () => {
-    const fetchImpl = mockFetch(() =>
-      new Response(JSON.stringify({ ok: true, ts: '1700000000.000200', channel: 'C123' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }),
+    const fetchImpl = mockFetch(
+      () =>
+        new Response(JSON.stringify({ ok: true, ts: '1700000000.000200', channel: 'C123' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
     );
     const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, fetchImpl });
 
@@ -280,8 +283,8 @@ describe('SlackHarnessAdapter.deliver', () => {
   });
 
   it('throws when Slack returns ok:false', async () => {
-    const fetchImpl = mockFetch(() =>
-      new Response(JSON.stringify({ ok: false, error: 'channel_not_found' }), { status: 200 }),
+    const fetchImpl = mockFetch(
+      () => new Response(JSON.stringify({ ok: false, error: 'channel_not_found' }), { status: 200 }),
     );
     const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, fetchImpl });
     await expect(adapter.deliver(outboxItem(), deliveryCtx)).rejects.toThrow(/channel_not_found/);
@@ -291,7 +294,10 @@ describe('SlackHarnessAdapter.deliver', () => {
     const fetchImpl = mockFetch(() => new Response('{}', { status: 200 }));
     const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, fetchImpl });
     await expect(
-      adapter.deliver(outboxItem({ target: { platform: 'slack', externalThreadId: 't', externalChannelId: undefined } }), deliveryCtx),
+      adapter.deliver(
+        outboxItem({ target: { platform: 'slack', externalThreadId: 't', externalChannelId: undefined } }),
+        deliveryCtx,
+      ),
     ).rejects.toThrow(/externalChannelId/);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -312,7 +318,11 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
   }
 
   function setup() {
-    const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, botUserId: BOT_USER_ID });
+    const adapter = new SlackHarnessAdapter({
+      signingSecret: SIGNING_SECRET,
+      botToken: BOT_TOKEN,
+      botUserId: BOT_USER_ID,
+    });
     const composite = new InMemoryStore();
     const storage = composite.stores.harness;
     const harness = new Harness({
@@ -331,7 +341,14 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
       },
     });
     new Mastra({
-      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as any }) },
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: 'openai/gpt-4o-mini' as any,
+        }),
+      },
       storage: composite,
       channels: { slack: makeChannelProvider('slack') },
       harnesses: { primary: harness },
@@ -359,7 +376,11 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
     const req = signedRequest(messageEventPayload());
     req.rawBody = String(req.rawBody) + 'X';
     const result = await harness.handleChannelInboundRequest('support', req as any);
-    expect(result).toMatchObject({ kind: 'verify_failed', httpStatus: 401, error: { code: 'harness.permission_denied' } });
+    expect(result).toMatchObject({
+      kind: 'verify_failed',
+      httpStatus: 401,
+      error: { code: 'harness.permission_denied' },
+    });
     const message = (result as { error: { message: string } }).error.message;
     expect(message).not.toContain('signature');
   });
@@ -367,8 +388,12 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
   it('treats an exact provider retry of the same signed event as a duplicate', async () => {
     const { harness } = setup();
     const payload = messageEventPayload();
-    const first = await harness.handleChannelInboundRequest('support', signedRequest(payload) as any, { continueAdmission: true });
-    const second = await harness.handleChannelInboundRequest('support', signedRequest(payload) as any, { continueAdmission: true });
+    const first = await harness.handleChannelInboundRequest('support', signedRequest(payload) as any, {
+      continueAdmission: true,
+    });
+    const second = await harness.handleChannelInboundRequest('support', signedRequest(payload) as any, {
+      continueAdmission: true,
+    });
     expect(first).toMatchObject({ kind: 'ok', duplicate: false });
     expect(second).toMatchObject({ kind: 'ok', duplicate: true });
   });
@@ -384,12 +409,31 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
 
   /** Capture the latest durable inbox row per id (storage exposes no get-by-id). */
   function setupSignal() {
-    const adapter = new SlackHarnessAdapter({ signingSecret: SIGNING_SECRET, botToken: BOT_TOKEN, botUserId: BOT_USER_ID });
+    const adapter = new SlackHarnessAdapter({
+      signingSecret: SIGNING_SECRET,
+      botToken: BOT_TOKEN,
+      botUserId: BOT_USER_ID,
+    });
     const composite = new InMemoryStore();
     const storage = composite.stores.harness;
-    const rows = new Map<string, { delivery?: string; runId?: string; signalId?: string; queuedItemId?: string; acceptedAt?: number; status: string }>();
-    const realUpdate = (storage as unknown as { updateChannelInboxItem: (...a: any[]) => Promise<void> }).updateChannelInboxItem.bind(storage);
-    (storage as unknown as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (record: { id: string } & Record<string, unknown>, opts: { claimId: string }) => {
+    const rows = new Map<
+      string,
+      {
+        delivery?: string;
+        runId?: string;
+        signalId?: string;
+        queuedItemId?: string;
+        acceptedAt?: number;
+        status: string;
+      }
+    >();
+    const realUpdate = (
+      storage as unknown as { updateChannelInboxItem: (...a: any[]) => Promise<void> }
+    ).updateChannelInboxItem.bind(storage);
+    (storage as unknown as { updateChannelInboxItem: unknown }).updateChannelInboxItem = async (
+      record: { id: string } & Record<string, unknown>,
+      opts: { claimId: string },
+    ) => {
       await realUpdate(record as any, opts as any);
       rows.set(record.id, { ...(record as any) });
     };
@@ -404,13 +448,24 @@ describe('SlackHarnessAdapter integration (ingress → admission via Harness)', 
           adapter,
           ingress: {
             // The POLICY selects signal delivery (steer an active run), independent of the adapter.
-            resolveResource: async () => ({ resourceId: 'resource-1', mode: 'shared-resource', admission: { delivery: 'signal' } }),
+            resolveResource: async () => ({
+              resourceId: 'resource-1',
+              mode: 'shared-resource',
+              admission: { delivery: 'signal' },
+            }),
           },
         },
       },
     });
     new Mastra({
-      agents: { default: new Agent({ id: 'default', name: 'default', instructions: 'test', model: 'openai/gpt-4o-mini' as any }) },
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'test',
+          model: 'openai/gpt-4o-mini' as any,
+        }),
+      },
       storage: composite,
       channels: { slack: makeChannelProvider('slack') },
       harnesses: { primary: harness },

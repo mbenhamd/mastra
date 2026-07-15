@@ -104,7 +104,9 @@ export function toHarnessV1Modes<TState>(
     ...modes.map(mode => ({
       id: mode.id,
       agentId:
-        typeof mode.agent === 'function' ? modeAgentId(mode.id) : (agentIdsByInstance.get(mode.agent) ?? modeAgentId(mode.id)),
+        typeof mode.agent === 'function'
+          ? modeAgentId(mode.id)
+          : (agentIdsByInstance.get(mode.agent) ?? modeAgentId(mode.id)),
       description: mode.name,
       transitionsTo: mode.id === 'plan' && defaultModeId !== 'plan' ? defaultModeId : undefined,
       metadata: {

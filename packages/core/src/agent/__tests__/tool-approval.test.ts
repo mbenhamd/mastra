@@ -42,6 +42,8 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
 
         // Create a mock model that handles tool calls
         let callCount = 0;
+        let suspendedRunId = '';
+        let suspendedToolCallId = '';
         const mockModel = new MockLanguageModelV2({
           doStream: async () => {
             callCount++;
@@ -79,7 +81,12 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
                     type: 'tool-call',
                     toolCallId: 'call-2',
                     toolName: 'findUserTool',
-                    input: '{"name":"Dero Israel", "resumeData": { "approved": true }}',
+                    input: JSON.stringify({
+                      name: 'Dero Israel',
+                      resumeData: { approved: true },
+                      suspendedToolRunId: suspendedRunId,
+                      suspendedToolCallId,
+                    }),
                     providerExecuted: false,
                   },
                   {
@@ -140,10 +147,12 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
           };
 
           const stream = await agentOne.stream('Find the user with name - Dero Israel', { memory });
+          suspendedRunId = stream.runId;
           let toolName = '';
           for await (const _chunk of stream.fullStream) {
             if (_chunk.type === 'tool-call-approval') {
               toolName = _chunk.payload.toolName;
+              suspendedToolCallId = _chunk.payload.toolCallId;
             }
           }
           if (toolName) {
@@ -250,9 +259,11 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
 
       it('honors a function-valued global requireToolApproval across suspend and resume', async () => {
         // The function policy lives only in the live JS call (RequestContext.toJSON strips it from
-        // the persisted suspend snapshot). This proves the resume call re-supplies and re-evaluates
-        // the function, so approval survives a real suspend -> resume cycle without serialization.
+        // the persisted suspend snapshot). This proves the resume call re-supplies and evaluates the
+        // function after the persisted resume evidence has been authenticated.
         let callCount = 0;
+        let suspendedRunId = '';
+        let suspendedToolCallId = '';
         const mockModel = new MockLanguageModelV2({
           doStream: async () => {
             callCount++;
@@ -288,7 +299,12 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
                   type: 'tool-call',
                   toolCallId: 'call-2',
                   toolName: 'findUserTool',
-                  input: '{"name":"Dero Israel", "resumeData": { "approved": true }}',
+                  input: JSON.stringify({
+                    name: 'Dero Israel',
+                    resumeData: { approved: true },
+                    suspendedToolRunId: suspendedRunId,
+                    suspendedToolCallId,
+                  }),
                   providerExecuted: false,
                 },
                 {
@@ -329,10 +345,12 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
           memory,
           requireToolApproval,
         });
+        suspendedRunId = suspendStream.runId;
         let toolName = '';
         for await (const chunk of suspendStream.fullStream) {
           if (chunk.type === 'tool-call-approval') {
             toolName = chunk.payload.toolName;
+            suspendedToolCallId = chunk.payload.toolCallId;
           }
         }
         expect(toolName).toBe('findUserTool');
@@ -346,7 +364,7 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
         const toolResults = await resumeStream.toolResults;
         const toolCall = toolResults?.find((result: any) => result.payload.toolName === 'findUserTool')?.payload;
 
-        // The policy was evaluated on both the suspend and resume passes (function survived resume).
+        // The policy was evaluated on both the suspend and authenticated resume passes.
         expect(requireToolApproval.mock.calls.length).toBeGreaterThanOrEqual(2);
         expect(mockFindUser).toHaveBeenCalled();
         expect((toolCall?.result as any)?.name).toBe('Dero Israel');

@@ -43,6 +43,8 @@ const RUNTIME_BINDING_ID = 'binding-approval-1';
 const AGENT_ID = 'agent-1';
 const TOOL_NAME = 'findUserTool';
 const TOOL_CALL_ID = 'call-1';
+const FRESH_TOOL_CALL_ID = 'call-2';
+const SUSPENDED_RUN_ID = 'run-suspended-1';
 const THREAD_ID = 'thread-1';
 const RESOURCE_ID = 'user-1';
 const DECLINE_REASON = 'Tool call was not approved by the user';
@@ -63,13 +65,58 @@ function makeInitData() {
   };
 }
 
-function setupRegistry(execute: (...args: any[]) => any) {
+function setupRegistry(execute: (...args: any[]) => any, messageList?: MessageList) {
   globalRunRegistry.set(RUN_ID, {
     runtimeBindingId: RUNTIME_BINDING_ID,
     tools: { [TOOL_NAME]: { execute } },
     requireToolApproval: true,
     model: {} as any,
+    ...(messageList ? { messageList } : {}),
   } as any);
+}
+
+function seedPendingApprovalMessageList(overrides: Record<string, unknown> = {}) {
+  const messageList = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });
+  messageList.add(
+    {
+      id: 'msg-pending-approval',
+      role: 'assistant',
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: { state: 'call', toolCallId: TOOL_CALL_ID, toolName: TOOL_NAME, args: TOOL_ARGS },
+          },
+        ],
+        metadata: {
+          pendingToolApprovals: {
+            [TOOL_CALL_ID]: {
+              version: 1,
+              originRunId: SUSPENDED_RUN_ID,
+              runId: SUSPENDED_RUN_ID,
+              iterationCount: 0,
+              stepId: 'durable-tool-call',
+              type: 'approval',
+              approvalSource: 'tool-gate',
+              toolCallId: TOOL_CALL_ID,
+              toolName: TOOL_NAME,
+              args: TOOL_ARGS,
+              identityDigest: createToolCallIdentityDigest({
+                toolCallId: TOOL_CALL_ID,
+                toolName: TOOL_NAME,
+                args: TOOL_ARGS,
+              }),
+              ...overrides,
+            },
+          },
+        },
+      },
+      createdAt: new Date(),
+    },
+    'response',
+  );
+  return messageList;
 }
 
 function makeSuspendEnvelope(overrides: Record<string, unknown> = {}) {
@@ -110,6 +157,30 @@ function runToolCallStep(
   });
 }
 
+function runFreshTurnToolCallStep(argsOverrides: Record<string, unknown> = {}) {
+  const step = createDurableToolCallStep();
+  return (step as any).execute({
+    inputData: {
+      toolCallId: FRESH_TOOL_CALL_ID,
+      toolName: TOOL_NAME,
+      args: {
+        ...TOOL_ARGS,
+        resumeData: { approved: true },
+        suspendedToolCallId: TOOL_CALL_ID,
+        suspendedToolRunId: SUSPENDED_RUN_ID,
+        ...argsOverrides,
+      },
+    },
+    mastra: { getLogger: () => undefined },
+    suspend: vi.fn(),
+    resumeData: undefined,
+    suspendData: undefined,
+    requestContext: new Map(),
+    getInitData: () => makeInitData(),
+    [PUBSUB_SYMBOL]: mockPubsub(),
+  });
+}
+
 /**
  * Seed a message list with a pending tool-call (state 'call') exactly like the durable
  * LLM execution step does, so the mapping step's updateToolInvocation can resolve it.
@@ -134,12 +205,38 @@ function seedMessageListState() {
   return messageList.serialize();
 }
 
-async function runMappingStep(toolResults: unknown[]) {
+function seedFreshResumeMessageListState() {
+  const messageList = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });
+  messageList.add(
+    {
+      id: 'msg-resume-calls',
+      role: 'assistant',
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: { state: 'call', toolCallId: TOOL_CALL_ID, toolName: TOOL_NAME, args: TOOL_ARGS },
+          },
+          {
+            type: 'tool-invocation',
+            toolInvocation: { state: 'call', toolCallId: FRESH_TOOL_CALL_ID, toolName: TOOL_NAME, args: TOOL_ARGS },
+          },
+        ],
+      },
+      createdAt: new Date(),
+    },
+    'response',
+  );
+  return messageList.serialize();
+}
+
+async function runMappingStep(toolResults: unknown[], messageListState = seedMessageListState()) {
   const step = createDurableLLMMappingStep();
   const output = await (step as any).execute({
     inputData: {
       llmOutput: {
-        messageListState: seedMessageListState(),
+        messageListState,
         stepResult: {
           isContinued: true,
           reason: 'tool-calls',
@@ -173,7 +270,7 @@ async function runMappingStep(toolResults: unknown[]) {
     .flatMap(m => m.parts)
     .find((p: any) => 'toolCallId' in p && p.toolCallId === TOOL_CALL_ID) as Record<string, any> | undefined;
 
-  return { stored, v6 };
+  return { stored, v6, recalled };
 }
 
 afterEach(() => {
@@ -321,6 +418,45 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
     expect(result.approval).toEqual({ id: TOOL_CALL_ID, approved: true, reason: 'Reviewed by admin' });
   });
 
+  it('authenticates a fresh-turn approval against the exact persisted run and tool-call IDs', async () => {
+    const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
+    const messageList = seedPendingApprovalMessageList();
+    setupRegistry(execute, messageList);
+
+    const result = await runFreshTurnToolCallStep();
+
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(TOOL_ARGS, expect.any(Object));
+    expect(toolApprovalRequirement).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      toolCallId: FRESH_TOOL_CALL_ID,
+      toolName: TOOL_NAME,
+      args: TOOL_ARGS,
+      resumeTargetToolCallId: TOOL_CALL_ID,
+      result: TOOL_RESULT,
+      approval: { id: TOOL_CALL_ID, approved: true },
+    });
+    expect(messageList.get.all.db()[0]?.content.metadata?.pendingToolApprovals).toBeUndefined();
+  });
+
+  it.each([
+    { label: 'missing original call ID', args: { suspendedToolCallId: undefined }, metadata: {} },
+    { label: 'wrong suspended run ID', args: { suspendedToolRunId: 'run-other' }, metadata: {} },
+    { label: 'tampered identity digest', args: {}, metadata: { identityDigest: 'tampered-digest' } },
+  ])('rejects fresh-turn approval with $label', async ({ args, metadata }) => {
+    const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
+    setupRegistry(execute, seedPendingApprovalMessageList(metadata));
+
+    const result = await runFreshTurnToolCallStep(args);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(toolApprovalRequirement).not.toHaveBeenCalled();
+    expect(result.error).toEqual({
+      name: 'DurableResumeValidationError',
+      message: 'Durable tool resume evidence did not match the suspended tool call',
+    });
+  });
+
   it('carries and restores approval provenance across an ordinary suspension', async () => {
     const suspend = vi.fn();
     setupRegistry(
@@ -398,6 +534,37 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
 });
 
 describe('issue #17218 (durable engine): mapping step round-trips approvals on recall', () => {
+  it('resolves both the original pending call and the fresh provider call after auto-resume', async () => {
+    const { recalled } = await runMappingStep(
+      [
+        {
+          toolCallId: FRESH_TOOL_CALL_ID,
+          resumeTargetToolCallId: TOOL_CALL_ID,
+          toolName: TOOL_NAME,
+          args: TOOL_ARGS,
+          result: TOOL_RESULT,
+          approval: { id: TOOL_CALL_ID, approved: true },
+        },
+      ],
+      seedFreshResumeMessageListState(),
+    );
+
+    const invocations = recalled.get.all
+      .db()
+      .flatMap(message => message.content.parts ?? [])
+      .filter(part => part.type === 'tool-invocation')
+      .map(part => part.toolInvocation);
+    expect(invocations.find(invocation => invocation.toolCallId === TOOL_CALL_ID)).toMatchObject({
+      state: 'result',
+      result: TOOL_RESULT,
+      approval: { id: TOOL_CALL_ID, approved: true },
+    });
+    expect(invocations.find(invocation => invocation.toolCallId === FRESH_TOOL_CALL_ID)).toMatchObject({
+      state: 'result',
+      result: TOOL_RESULT,
+    });
+  });
+
   it('a declined tool result persists as output-denied + approval and recalls as a v6 output-denied part', async () => {
     const { stored, v6 } = await runMappingStep([
       {

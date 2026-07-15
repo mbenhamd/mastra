@@ -5,8 +5,5 @@
     "lucidquery-agi-01-swift",
     "lucidquery-nexus-coder"
   ],
-  "temperature": [
-    "lucidquery-agi-01-frontier",
-    "lucidquery-agi-01-swift"
-  ]
+  "temperature": ["lucidquery-agi-01-frontier", "lucidquery-agi-01-swift"]
 }

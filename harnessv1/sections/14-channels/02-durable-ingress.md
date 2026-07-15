@@ -9,43 +9,43 @@ recorded. The `ChannelInboxItem` row shape is declared canonically in §5.1h;
 Admission flow:
 
 1. `HarnessChannelRegistry` resolves the route or provider callback to exactly
-one `(harnessName, channelId, providerId)` and passes that route context to the
-adapter. Provider payload fields never choose the harness or channel by
-themselves.
+   one `(harnessName, channelId, providerId)` and passes that route context to the
+   adapter. Provider payload fields never choose the harness or channel by
+   themselves.
 2. Verify and normalize the provider payload using the channel adapter.
 3. Normalize provider attachment inputs — inline bytes, provider file IDs, or
-URL-like references — into Harness-owned attachment storage (§5.2) and rewrite
-them as `PersistedAttachment` references (§5.1) before the inbox row is created;
-URL-like inputs follow §13.7 ingestion policy. Attachment storage keys used in
-hashing are deterministic from a provider file ID or content digest under the
-§5.1 stable-hash profile; retries of the same provider event must not allocate
-fresh random attachment IDs that change the hash. Attachments that exceed
-storage policy fail at the bridge; a queued or retried channel item never
-depends on live provider bytes, temporary URLs, or process-local file handles.
+   URL-like references — into Harness-owned attachment storage (§5.2) and rewrite
+   them as `PersistedAttachment` references (§5.1) before the inbox row is created;
+   URL-like inputs follow §13.7 ingestion policy. Attachment storage keys used in
+   hashing are deterministic from a provider file ID or content digest under the
+   §5.1 stable-hash profile; retries of the same provider event must not allocate
+   fresh random attachment IDs that change the hash. Attachments that exceed
+   storage policy fail at the bridge; a queued or retried channel item never
+   depends on live provider bytes, temporary URLs, or process-local file handles.
 4. After the §13.6 readiness gate permits this ownership scope to create or
-claim durable work, compute an `idempotencyKey` from the provider event/message
-ID and a `payloadHash` from the normalized content/files/context. Atomically
-create or load `ChannelInboxItem(status: 'received', attempts: 0)` with
-`admissionId = inboxItem.id`. If this request will continue admission instead of
-only acknowledging the provider, it creates the row with an initial claim or
-claims it before step 5; an exact duplicate never steals the active claim.
+   claim durable work, compute an `idempotencyKey` from the provider event/message
+   ID and a `payloadHash` from the normalized content/files/context. Atomically
+   create or load `ChannelInboxItem(status: 'received', attempts: 0)` with
+   `admissionId = inboxItem.id`. If this request will continue admission instead of
+   only acknowledging the provider, it creates the row with an initial claim or
+   claims it before step 5; an exact duplicate never steals the active claim.
 5. Resolve or create `ChannelBinding`.
 6. Resolve the owning `Session` with
-`harness.session({ sessionId, resourceId })` or
-`harness.session({ threadId, resourceId, sessionId })`.
+   `harness.session({ sessionId, resourceId })` or
+   `harness.session({ threadId, resourceId, sessionId })`.
 7. Apply the trusted channel admission policy once. This may choose `delivery`
-and per-turn `mode` / `model` overrides, but it cannot set `sync`, `stream`,
-`output`, `addTools`, `yolo`, permission grants, state patches, or
-session-default mutations. Persist the chosen `delivery`, `mode`, and `model`,
-including explicit absence, and compute `admissionHash` from the exact session
-admission payload before runtime admission. Recovery replays the persisted
-fields and does not re-run policy after `admissionHash` exists.
+   and per-turn `mode` / `model` overrides, but it cannot set `sync`, `stream`,
+   `output`, `addTools`, `yolo`, permission grants, state patches, or
+   session-default mutations. Persist the chosen `delivery`, `mode`, and `model`,
+   including explicit absence, and compute `admissionHash` from the exact session
+   admission payload before runtime admission. Recovery replays the persisted
+   fields and does not re-run policy after `admissionHash` exists.
 8. Mark the inbox item `admitted`, then admit the input through the interactive
-`session.signal(...)` form or through `session.queue(...)` with `admissionId`
-and `requestContext.channel`.
+   `session.signal(...)` form or through `session.queue(...)` with `admissionId`
+   and `requestContext.channel`.
 9. Mark the inbox item `accepted` after signal acceptance for `signal` and
-persist `runId` / `signalId`; or mark it `queued` after durable queue append and
-persist `queuedItemId`.
+   persist `runId` / `signalId`; or mark it `queued` after durable queue append and
+   persist `queuedItemId`.
 
 Steps 5-9 require a valid inbox claim. A route that only records the durable row
 and acknowledges the provider stops after step 4; a recovery worker later claims

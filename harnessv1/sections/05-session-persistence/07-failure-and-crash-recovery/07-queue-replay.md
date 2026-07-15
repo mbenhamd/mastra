@@ -1,7 +1,7 @@
 ### 5.7g Queue Replay
 
 **Queue replay.** Items in `pendingQueue` are durable. The head item is removed
-*after* its turn completes successfully. Before `signal.accepted`, recovery may
+_after_ its turn completes successfully. Before `signal.accepted`, recovery may
 retry admission at least once, but it uses the same `admissionId` /
 `admissionHash` so an admission that was accepted just before a crash returns
 the original `runId` / `signalId`. After `signal.accepted`, the queued item is

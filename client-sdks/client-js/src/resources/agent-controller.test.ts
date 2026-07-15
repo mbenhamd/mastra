@@ -131,6 +131,33 @@ describe('AgentController Resource', () => {
     expect(url).toBe('http://localhost:4111/api/agent-controller/code/sessions/user-1');
   });
 
+  it('retargets the session handle after a successful resource change', async () => {
+    const session = client.getAgentController('code').session('old/resource');
+
+    mockJson({ ok: true });
+    await session.setResourceId('new/resource');
+    let [url, init] = lastCall();
+    expect(url).toBe('http://localhost:4111/api/agent-controller/code/sessions/old%2Fresource/resource');
+    expect(JSON.parse(init.body as string)).toEqual({ newResourceId: 'new/resource' });
+
+    mockJson({ controllerId: 'code', resourceId: 'new/resource', modeId: 'build' });
+    await session.state();
+    [url, init] = lastCall();
+    expect(url).toBe('http://localhost:4111/api/agent-controller/code/sessions/new%2Fresource');
+    expect(init.method).toBeUndefined();
+  });
+
+  it('keeps the old session identity when a resource change fails', async () => {
+    const session = client.getAgentController('code').session('old-resource');
+    (global.fetch as any).mockRejectedValueOnce(new Error('rename failed'));
+    await expect(session.setResourceId('new-resource')).rejects.toBeDefined();
+
+    mockJson({ controllerId: 'code', resourceId: 'old-resource', modeId: 'build' });
+    await session.state();
+    const [url] = lastCall();
+    expect(url).toBe('http://localhost:4111/api/agent-controller/code/sessions/old-resource');
+  });
+
   it('switches mode and model', async () => {
     mockJson({ ok: true });
     await client.getAgentController('code').session('user-1').switchMode('plan');

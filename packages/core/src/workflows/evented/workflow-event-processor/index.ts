@@ -65,6 +65,12 @@ export type ProcessorArgs = {
   };
   forEachIndex?: number;
   nestedRunId?: string; // runId of nested workflow when reporting back to parent
+  /** A new nested run whose pending policy requires an initial snapshot. */
+  initializeSnapshot?: boolean;
+  /** Resource identity inherited by a newly initialized nested run. */
+  resourceId?: string;
+  /** Registration generation held by the event currently being dispatched. */
+  internalWorkflowRegistrationGeneration?: number;
 };
 
 export type ParentWorkflow = {
@@ -88,6 +94,8 @@ export type ParentWorkflow = {
   };
   /** Data-only child-to-root identity captured before nested execution starts. */
   recoveryAncestry?: WorkflowTerminalRecoveryAncestryV1;
+  /** Whether this parent transition is represented by a durable workflow snapshot. */
+  shouldPersistSnapshot?: boolean;
 };
 
 function resolveWorkflowStepPath(workflow: Workflow, executionPath: number[] | undefined) {
@@ -464,6 +472,8 @@ export class WorkflowEventProcessor extends EventProcessor {
     state,
     outputOptions,
     forEachIndex,
+    initializeSnapshot,
+    resourceId: requestedResourceId,
   }: ProcessorArgs & { initialState?: Record<string, any> }) {
     // Use initialState from event data if provided, otherwise use state from ProcessorArgs
     const initialState = (arguments[0] as any).initialState ?? state ?? {};
@@ -472,7 +482,26 @@ export class WorkflowEventProcessor extends EventProcessor {
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
     const terminalRecoveryEnabled = workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
     const existingRun = await workflowsStore?.getWorkflowRunById({ runId, workflowName: workflow.id });
-    const resourceId = existingRun?.resourceId;
+    const retainedRunSnapshot = existingRun
+      ? typeof existingRun.snapshot === 'string'
+        ? (JSON.parse(existingRun.snapshot) as WorkflowRunState)
+        : existingRun.snapshot
+      : undefined;
+    const serializedStepGraph = retainedRunSnapshot?.serializedStepGraph ?? workflow.serializedStepGraph;
+    if (
+      terminalRecoveryEnabled &&
+      retainedRunSnapshot &&
+      createWorkflowTerminalGraphFingerprint(serializedStepGraph) !==
+        createWorkflowTerminalGraphFingerprint(workflow.serializedStepGraph)
+    ) {
+      throw new MastraError({
+        id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_GRAPH_CONFLICT',
+        text: 'Workflow graph does not match the retained recovery snapshot',
+        domain: ErrorDomain.MASTRA_WORKFLOW,
+        category: ErrorCategory.SYSTEM,
+      });
+    }
+    const resourceId = existingRun?.resourceId ?? requestedResourceId;
 
     // Check shouldPersistSnapshot option - default to true if not specified.
     // On resume, a false result must not overwrite a retained suspended snapshot.
@@ -481,14 +510,15 @@ export class WorkflowEventProcessor extends EventProcessor {
         stepResults: stepResults ?? {},
         workflowStatus: 'running',
       }) ?? true;
-    const initialWorkflowSnapshot: WorkflowRunState | undefined = shouldPersist
+    const shouldInitializeSnapshot = shouldPersist || initializeSnapshot === true;
+    const initialWorkflowSnapshot: WorkflowRunState | undefined = shouldInitializeSnapshot
       ? {
           activePaths: [],
           suspendedPaths: {},
           resumeLabels: {},
           waitingPaths: {},
           activeStepsPath: {},
-          serializedStepGraph: workflow.serializedStepGraph,
+          serializedStepGraph,
           timestamp: Date.now(),
           runId,
           context: {
@@ -497,12 +527,20 @@ export class WorkflowEventProcessor extends EventProcessor {
             }),
             __state: initialState,
           },
-          status: 'running',
+          status: shouldPersist ? 'running' : 'pending',
           value: initialState,
         }
       : undefined;
+    const initialWorkflowSnapshotToPersist = initialWorkflowSnapshot
+      ? workflow?.options?.pruneSnapshot
+        ? workflow.options.pruneSnapshot({
+            snapshot: initialWorkflowSnapshot,
+            workflowStatus: initialWorkflowSnapshot.status,
+          })
+        : initialWorkflowSnapshot
+      : undefined;
     const retainedChildEvidence =
-      parentWorkflow && terminalRecoveryEnabled && !shouldPersist && workflowsStore
+      parentWorkflow && terminalRecoveryEnabled && !shouldInitializeSnapshot && workflowsStore
         ? await Promise.all([
             workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId }),
             workflowsStore.getWorkflowTerminalization({ workflowName: workflow.id, runId }),
@@ -517,17 +555,27 @@ export class WorkflowEventProcessor extends EventProcessor {
     // or an earlier durable snapshot proves that this is a replay/resume.
     const terminalRecoveryActive =
       terminalRecoveryEnabled &&
-      (shouldPersist ||
+      (shouldInitializeSnapshot ||
         (persistedChildSnapshot !== null && persistedChildSnapshot !== undefined) ||
         retainedChildTerminalization?.status === 'found' ||
         retainedChildRecovery?.status === 'found');
+    // Missing means an older/internal producer did not declare the boundary, so
+    // remain fail-closed. A declared transient parent and transient child can run
+    // entirely in-process even when the configured store supports recovery.
+    const parentRequiresDurableEvidence =
+      parentWorkflow !== undefined &&
+      (parentWorkflow.shouldPersistSnapshot !== false || shouldInitializeSnapshot || terminalRecoveryActive);
 
     let parentSnapshot: WorkflowRunState | null | undefined;
     let parentTerminalStatus: GetWorkflowRunTerminalStatusResult | undefined;
     let parentForEachIndex: number | undefined;
     let recoveryAncestry: WorkflowTerminalRecoveryAncestryV1 | undefined;
     let childSnapshotEnsuredByAdmission = false;
-    if (parentWorkflow && workflowsStore && (shouldPersist || terminalRecoveryActive || terminalRecoveryEnabled)) {
+    if (
+      parentWorkflow &&
+      workflowsStore &&
+      (shouldInitializeSnapshot || terminalRecoveryActive || parentRequiresDurableEvidence)
+    ) {
       [parentSnapshot, parentTerminalStatus] = await Promise.all([
         workflowsStore.loadWorkflowSnapshot({
           workflowName: parentWorkflow.workflowId,
@@ -552,14 +600,6 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (parentSnapshot) {
         if (WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(parentSnapshot.status)) return;
         const parentEntry = parentWorkflow.stepGraph[parentWorkflow.executionPath[0]!];
-        if (parentEntry?.type === 'loop' && terminalRecoveryActive) {
-          throw new MastraError({
-            id: 'MASTRA_WORKFLOW_DURABLE_NESTED_LOOP_OWNERSHIP_UNSUPPORTED',
-            text: 'Durable nested workflow loop ownership requires an iteration-scoped contract',
-            domain: ErrorDomain.MASTRA_WORKFLOW,
-            category: ErrorCategory.SYSTEM,
-          });
-        }
         parentForEachIndex =
           parentEntry?.type === 'foreach' ? (forEachIndex ?? parentWorkflow.executionPath[1]) : undefined;
         const source =
@@ -605,7 +645,7 @@ export class WorkflowEventProcessor extends EventProcessor {
                 ]);
           parentWorkflow.recoveryAncestry = recoveryAncestry;
         }
-      } else if (terminalRecoveryEnabled) {
+      } else if (terminalRecoveryEnabled && parentRequiresDurableEvidence) {
         throw new MastraError({
           id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_PARENT_MISSING',
           text: 'Nested workflow recovery parent evidence is missing',
@@ -615,7 +655,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     }
 
-    if (parentWorkflow && parentSnapshot && workflowsStore && (shouldPersist || terminalRecoveryActive)) {
+    if (parentWorkflow && parentSnapshot && workflowsStore && (shouldInitializeSnapshot || terminalRecoveryActive)) {
       const existing = parentSnapshot.context?.[workflowId] as any;
       const existingMetadata = existing?.metadata ?? {};
       const existingWorkflowMetadata = existingMetadata.__workflow_meta ?? {};
@@ -653,15 +693,15 @@ export class WorkflowEventProcessor extends EventProcessor {
           stepId: parentWorkflow.stepId,
           nestedWorkflowName: workflow.id,
           nestedRunId: runId,
-          expectedChildGraphFingerprint: createWorkflowTerminalGraphFingerprint(workflow.serializedStepGraph),
+          expectedChildGraphFingerprint: createWorkflowTerminalGraphFingerprint(serializedStepGraph),
           forEachIndex: parentForEachIndex,
           result: parentResult,
           requestContext,
           recoveryAncestry,
-          ...(initialWorkflowSnapshot
+          ...(initialWorkflowSnapshotToPersist
             ? {
                 initialChildSnapshot: {
-                  snapshot: initialWorkflowSnapshot,
+                  snapshot: initialWorkflowSnapshotToPersist,
                   ...(resourceId === undefined ? {} : { resourceId }),
                 },
               }
@@ -685,7 +725,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             category: ErrorCategory.SYSTEM,
           });
         }
-        if (initialWorkflowSnapshot) {
+        if (initialWorkflowSnapshotToPersist) {
           if (admission.childSnapshotState === 'not_requested') {
             throw new MastraError({
               id: 'MASTRA_WORKFLOW_NESTED_RUN_INITIALIZATION_UNAVAILABLE',
@@ -746,7 +786,13 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     }
 
-    if (parentWorkflow && workflowsStore && terminalRecoveryEnabled && !terminalRecoveryActive) {
+    if (
+      parentWorkflow &&
+      workflowsStore &&
+      terminalRecoveryEnabled &&
+      !terminalRecoveryActive &&
+      parentRequiresDurableEvidence
+    ) {
       const currentParentTerminalStatus = await workflowsStore.getWorkflowRunTerminalStatus({
         workflowName: parentWorkflow.workflowId,
         runId: parentWorkflow.runId,
@@ -779,14 +825,12 @@ export class WorkflowEventProcessor extends EventProcessor {
       },
     });
 
-    if (shouldPersist && workflowsStore && !childSnapshotEnsuredByAdmission) {
+    if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission) {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflow.id,
         runId,
         resourceId,
-        snapshot: workflow?.options?.pruneSnapshot
-          ? workflow.options.pruneSnapshot({ snapshot: initialWorkflowSnapshot!, workflowStatus: 'running' })
-          : initialWorkflowSnapshot!,
+        snapshot: initialWorkflowSnapshotToPersist!,
       });
     }
 
@@ -955,6 +999,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           },
           {
             pubsub: this.mastra.pubsub,
+            mastra: this.mastra,
             stepExecutor: this.stepExecutor,
             step,
             stepResult: prevResult,
@@ -993,8 +1038,11 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
     // now that all events for this run have been processed.
-    if (this.mastra.__hasInternalWorkflow(args.workflowId, runId)) {
-      this.mastra.__unregisterInternalWorkflow(args.workflowId, runId);
+    if (
+      args.internalWorkflowRegistrationGeneration !== undefined &&
+      this.mastra.__hasInternalWorkflow(args.workflowId, runId)
+    ) {
+      this.mastra.__unregisterInternalWorkflow(args.workflowId, runId, args.internalWorkflowRegistrationGeneration);
     }
   }
 
@@ -1184,8 +1232,11 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
     // now that all events for this run have been processed.
-    if (this.mastra.__hasInternalWorkflow(args.workflowId, runId)) {
-      this.mastra.__unregisterInternalWorkflow(args.workflowId, runId);
+    if (
+      args.internalWorkflowRegistrationGeneration !== undefined &&
+      this.mastra.__hasInternalWorkflow(args.workflowId, runId)
+    ) {
+      this.mastra.__unregisterInternalWorkflow(args.workflowId, runId, args.internalWorkflowRegistrationGeneration);
     }
   }
 
@@ -1483,6 +1534,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         ...(loopIteration === undefined ? {} : { loopIteration }),
       };
       const nestedWorkflow = step.step as Workflow;
+      const parentShouldPersistSnapshot =
+        workflow.options?.shouldPersistSnapshot?.({
+          stepResults,
+          workflowStatus: 'running',
+        }) ?? true;
       // Handle resume with only nested workflow ID specified (auto-detect suspended inner step)
       if (resumeSteps?.length === 1 && resumeSteps[0] === step.step.id) {
         const nestedRunId = stepData?.suspendPayload?.__workflow_meta?.runId;
@@ -1623,6 +1679,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               resumeData,
               resume: true,
               recoveryAncestry: parentWorkflow?.recoveryAncestry ?? [],
+              shouldPersistSnapshot: parentShouldPersistSnapshot,
             },
             executionPath: nestedExecutionPath as any,
             runId: nestedRunId,
@@ -1731,6 +1788,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               resumeData,
               resume: true,
               recoveryAncestry: parentWorkflow?.recoveryAncestry ?? [],
+              shouldPersistSnapshot: parentShouldPersistSnapshot,
             },
             executionPath: nestedExecutionPath,
             runId: nestedRunId,
@@ -1793,6 +1851,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               resumeData,
               resume: false,
               recoveryAncestry: parentWorkflow?.recoveryAncestry ?? [],
+              shouldPersistSnapshot: parentShouldPersistSnapshot,
             },
             executionPath: timeTravelParams.executionPath,
             runId: nestedRunId,
@@ -1843,6 +1902,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               resumeData,
               resume: false,
               recoveryAncestry: parentWorkflow?.recoveryAncestry ?? [],
+              shouldPersistSnapshot: parentShouldPersistSnapshot,
             },
             executionPath: restartParams.activePaths,
             runId: nestedRunId,
@@ -1871,10 +1931,16 @@ export class WorkflowEventProcessor extends EventProcessor {
             stepResults: {},
             workflowStatus: 'pending',
           }) ?? true;
+        const usesAtomicNestedAdmission =
+          workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
         const parentRun = await workflowsStore?.getWorkflowRunById({ runId, workflowName: workflow.id });
 
-        //create nested workflow run snapshot in storage. use parent workflow resource id in nested workflow
-        if (shouldPersist) {
+        // Recovery-capable stores initialize the child with its real input and
+        // state atomically alongside parent ownership in processWorkflowStart.
+        // Pre-writing an empty pending row makes that admission retain the stub
+        // as the replay winner, permanently dropping `context.input`. Legacy
+        // stores still need the established pending-row bootstrap.
+        if (shouldPersist && !usesAtomicNestedAdmission) {
           const pendingSnapshot: WorkflowRunState = {
             runId: nestedRunId,
             status: 'pending',
@@ -1919,6 +1985,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               resumeData,
               resume: false,
               recoveryAncestry: parentWorkflow?.recoveryAncestry ?? [],
+              shouldPersistSnapshot: parentShouldPersistSnapshot,
             },
             executionPath: [0],
             runId: nestedRunId,
@@ -1931,6 +1998,8 @@ export class WorkflowEventProcessor extends EventProcessor {
             initialState: currentState,
             state: currentState,
             outputOptions,
+            initializeSnapshot: shouldPersist,
+            resourceId: parentRun?.resourceId,
           },
         });
       }
@@ -2197,6 +2266,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         },
         {
           pubsub: this.mastra.pubsub,
+          mastra: this.mastra,
           stepExecutor: this.stepExecutor,
           step,
           stepResult,
@@ -3245,7 +3315,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         );
       }
 
-      terminalEventHandled = await this.#dispatch(event);
+      terminalEventHandled = await this.#dispatch(event, internalEventGeneration);
       return { ok: true };
     } catch (err) {
       const exhausted = deliveryAttempt >= WorkflowEventProcessor.MAX_DELIVERY_ATTEMPTS;
@@ -3401,7 +3471,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
   }
 
-  async #dispatch(event: Event): Promise<boolean> {
+  async #dispatch(event: Event, internalWorkflowRegistrationGeneration?: number): Promise<boolean> {
     const { type, data } = event;
 
     const workflowData = data as Omit<ProcessorArgs, 'workflow'>;
@@ -3509,6 +3579,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         await this.processWorkflowEnd({
           workflow: workflowArg,
           ...workflowData,
+          internalWorkflowRegistrationGeneration,
         });
         break;
       case 'workflow.step.end':
@@ -3533,6 +3604,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         await this.processWorkflowFail({
           workflow: workflowArg,
           ...workflowData,
+          internalWorkflowRegistrationGeneration,
         });
         break;
       default:

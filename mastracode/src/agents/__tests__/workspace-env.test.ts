@@ -17,16 +17,11 @@ const originalEnv = { ...process.env };
 
 function createRequestContext(projectPath: string) {
   const requestContext = new RequestContext();
+  const state = { projectPath, sandboxAllowedPaths: [] };
   requestContext.set('harness', {
     modeId: 'build',
-    session: {
-      state: {
-        get: () => ({
-          projectPath,
-          sandboxAllowedPaths: [],
-        }),
-      },
-    },
+    state,
+    getState: () => state,
   });
   return requestContext;
 }

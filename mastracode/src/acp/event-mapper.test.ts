@@ -1,14 +1,15 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk';
-import type { Harness, HarnessEvent } from '@mastra/core/harness';
+import type { HarnessEvent } from '@mastra/core/harness';
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+import type { MastraCodeHarnessRuntime } from '../harness/runtime.js';
 import type { PromptState } from './event-mapper.js';
 import { handleHarnessEvent } from './event-mapper.js';
 
 describe('ACP Event Mapper', () => {
   let mockConnection: AgentSideConnection;
-  let mockHarness: Harness;
+  let mockHarness: MastraCodeHarnessRuntime<Record<string, unknown>>;
   let sessionUpdateSpy: ReturnType<typeof vi.fn>;
   let requestPermissionSpy: ReturnType<typeof vi.fn>;
 
@@ -24,11 +25,9 @@ describe('ACP Event Mapper', () => {
     } as unknown as AgentSideConnection;
 
     mockHarness = {
-      session: {
-        respondToToolApproval: vi.fn(),
-      },
+      respondToToolApproval: vi.fn(),
       respondToToolSuspension: vi.fn(),
-    } as unknown as Harness;
+    } as unknown as MastraCodeHarnessRuntime<Record<string, unknown>>;
   });
 
   function createPromptState(sessionId: string): PromptState {
@@ -251,7 +250,8 @@ describe('ACP Event Mapper', () => {
         });
       });
 
-      expect(mockHarness.session.respondToToolApproval).toHaveBeenCalledWith({
+      expect(mockHarness.respondToToolApproval).toHaveBeenCalledWith({
+        toolCallId: 'tool-123',
         decision: 'approve',
       });
     });
@@ -276,7 +276,8 @@ describe('ACP Event Mapper', () => {
         expect(requestPermissionSpy).toHaveBeenCalled();
       });
 
-      expect(mockHarness.session.respondToToolApproval).toHaveBeenCalledWith({
+      expect(mockHarness.respondToToolApproval).toHaveBeenCalledWith({
+        toolCallId: 'tool-123',
         decision: 'decline',
       });
     });
@@ -299,7 +300,8 @@ describe('ACP Event Mapper', () => {
 
         // Should not request permission
         expect(requestPermissionSpy).not.toHaveBeenCalled();
-        expect(mockHarness.session.respondToToolApproval).toHaveBeenCalledWith({
+        expect(mockHarness.respondToToolApproval).toHaveBeenCalledWith({
+          toolCallId: 'tool-123',
           decision: 'approve',
         });
       } finally {

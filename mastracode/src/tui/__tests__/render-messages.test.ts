@@ -30,8 +30,14 @@ function createState(): TUIState {
     messageComponentsById: new Map(),
     pendingSignalMessageComponentsById: new Map(),
     followUpComponents: [],
-    session: { displayState: { get: () => ({ isRunning: false }) } },
-    harness: { session: { displayState: { get: () => ({ isRunning: false }) } } },
+    harness: {
+      getCurrentMode: () => ({ id: 'default' }),
+      getDisplayState: () => ({ isRunning: false }),
+      getState: () => ({}),
+      listMessages: vi.fn().mockResolvedValue([]),
+      restoreDisplayTasks: vi.fn(),
+      setState: vi.fn().mockResolvedValue(undefined),
+    },
   } as unknown as TUIState;
 }
 
@@ -582,20 +588,13 @@ describe('renderExistingMessages signals', () => {
     const state = createState();
     addPendingUserMessage(state, 'stale-signal', 'stale preview', undefined, { isInterjection: true });
 
-    state.session = {
-      ...state.session,
-      thread: {
-        listActiveMessages: vi
-          .fn()
-          .mockResolvedValue([
-            createUserMessage('continue from history', 'signal-history-1', { delivery: 'while-active' }),
-          ]),
-      },
-    } as unknown as TUIState['session'];
     state.harness = {
-      session: {
-        displayState: { get: () => ({ isRunning: false }) },
-      },
+      ...state.harness,
+      listMessages: vi
+        .fn()
+        .mockResolvedValue([
+          createUserMessage('continue from history', 'signal-history-1', { delivery: 'while-active' }),
+        ]),
     } as unknown as TUIState['harness'];
 
     await renderExistingMessages(state);
@@ -643,13 +642,10 @@ describe('renderExistingMessages subagents', () => {
     };
     const state = createState();
     state.quietMode = true;
-    state.session = {
-      ...state.session,
-      thread: { listActiveMessages: vi.fn().mockResolvedValue([message]) },
-      model: { get: () => 'openai/gpt-5.5' },
-    } as unknown as TUIState['session'];
     state.harness = {
-      session: state.session,
+      ...state.harness,
+      getFullModelId: () => 'openai/gpt-5.5',
+      listMessages: vi.fn().mockResolvedValue([message]),
     } as unknown as TUIState['harness'];
 
     await renderExistingMessages(state);

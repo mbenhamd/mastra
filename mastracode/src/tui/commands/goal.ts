@@ -85,7 +85,7 @@ export async function handleGoalCommand(ctx: SlashCommandContext, args: string[]
     // a plain user message.
     const resumedGoal = goalManager.getGoal();
     try {
-      await state.session.sendSignal(createGoalReminderSignal(resumedGoal!)).accepted;
+      await state.harness.sendSignal(createGoalReminderSignal(resumedGoal!)).accepted;
     } catch (err) {
       goalManager.pause();
       await goalManager.saveToThread(state);
@@ -107,12 +107,12 @@ export async function handleGoalCommand(ctx: SlashCommandContext, args: string[]
     // attempting the goal". Stop it immediately so clear means stop. Mirrors the
     // Esc/abort cleanup so a turn parked in a tool suspension (e.g. ask_user) is
     // also aborted cleanly.
-    if (state.session.run.isRunning() || state.session.suspensions.hasPending()) {
+    if (state.harness.isRunning() || state.harness.getDisplayState().pendingSuspension !== null) {
       state.activeInlineQuestion = undefined;
       state.pendingInlineQuestions.length = 0;
       state.pendingAskUserComponents?.clear();
       state.userInitiatedAbort = true;
-      state.session.abort();
+      state.harness.abort();
     }
     ctx.updateStatusLine();
     ctx.showInfo('Goal cleared.');
@@ -261,7 +261,7 @@ async function promptForJudgeDefaults(ctx: SlashCommandContext, cancelMessage: s
   }
 
   const settings = loadSettings();
-  const preselectedId = settings.models.goalJudgeModel ?? state.session.model.get() ?? undefined;
+  const preselectedId = settings.models.goalJudgeModel ?? state.harness.getCurrentModelId() ?? undefined;
   const defaultMaxTurns =
     typeof settings.models.goalMaxTurns === 'number' && settings.models.goalMaxTurns > 0
       ? settings.models.goalMaxTurns
@@ -328,11 +328,11 @@ async function startGoal(
   const goalManager = state.goalManager;
 
   if (state.pendingNewThread) {
-    await state.session.thread.create();
+    await state.harness.createThread();
     state.pendingNewThread = false;
   }
 
-  const shouldPersistToCreatedThread = !state.session.thread.getId();
+  const shouldPersistToCreatedThread = !state.harness.getCurrentThreadId();
   const goal = await goalManager.setGoal(state, objective, judgeModelId, maxTurns);
   if (!goal) {
     ctx.showError('Failed to set goal.');
@@ -356,7 +356,7 @@ async function startGoal(
   }
 
   try {
-    await state.session.sendSignal(createGoalReminderSignal(goal)).accepted;
+    await state.harness.sendSignal(createGoalReminderSignal(goal)).accepted;
   } catch (err) {
     goalManager.pause();
     await goalManager.saveToThread(state);

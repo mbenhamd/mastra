@@ -42,7 +42,7 @@ describe.skipIf(!VERCEL_TOKEN)('VercelServerlessSandbox Integration', () => {
 
   it('should report correct sandbox info', async () => {
     const info = await sandbox.getInfo!();
-    expect(info.provider).toBe('vercel');
+    expect(info.provider).toBe('vercel-serverless');
     expect(info.status).toBe('running');
     expect(info.metadata?.deploymentUrl).toBeTruthy();
   });

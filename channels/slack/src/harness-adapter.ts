@@ -250,7 +250,9 @@ export class SlackHarnessAdapter implements HarnessChannelAdapter {
     if (!valid) {
       // verifySlackRequest folds both a tampered/incorrect signature AND an
       // expired (>5min) timestamp into `false`; both are verification failures.
-      throw new SlackInboundVerificationError('Slack signature verification failed (bad signature or expired timestamp)');
+      throw new SlackInboundVerificationError(
+        'Slack signature verification failed (bad signature or expired timestamp)',
+      );
     }
 
     if (isUrlVerification) {
@@ -277,9 +279,7 @@ export class SlackHarnessAdapter implements HarnessChannelAdapter {
       event.bot_id !== undefined ||
       event.subtype === 'bot_message';
     const isEditOrDelete =
-      event.subtype === 'message_changed' ||
-      event.subtype === 'message_deleted' ||
-      event.subtype === 'message_replied';
+      event.subtype === 'message_changed' || event.subtype === 'message_deleted' || event.subtype === 'message_replied';
 
     const ts = event.ts ?? String(this.#now() / 1000);
     const threadTs = event.thread_ts ?? ts;
@@ -405,8 +405,7 @@ export class SlackHarnessAdapter implements HarnessChannelAdapter {
       externalTenantId: teamId,
       externalChannelId: event?.channel,
       externalThreadId: event?.thread_ts ?? ts,
-      externalMessageId:
-        (payload as SlackEventCallback).event_id ?? event?.client_msg_id ?? event?.ts ?? ts,
+      externalMessageId: (payload as SlackEventCallback).event_id ?? event?.client_msg_id ?? event?.ts ?? ts,
       content: '',
       receivedAt:
         (payload as SlackEventCallback).event_time !== undefined

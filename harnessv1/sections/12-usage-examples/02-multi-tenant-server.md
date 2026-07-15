@@ -3,11 +3,7 @@
 A web service hosting the same Harness instance for many users. Each request maps to a session.
 
 ```ts
-import {
-  Harness,
-  HarnessSessionNotFoundError,
-  type Session,
-} from '@mastra/core/harness';
+import { Harness, HarnessSessionNotFoundError, type Session } from '@mastra/core/harness';
 
 const harness = new Harness(config);
 await harness.init();
@@ -57,7 +53,7 @@ app.get('/sessions/:sessionId/events', async (req, res) => {
   }
 
   res.setHeader('Content-Type', 'text/event-stream');
-  const unsubscribe = session.subscribe((event) => {
+  const unsubscribe = session.subscribe(event => {
     res.write(`data: ${JSON.stringify(event)}\n\n`);
   });
 

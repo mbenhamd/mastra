@@ -1,5 +1,6 @@
 import type { SessionNotification, RequestPermissionRequest, AgentSideConnection } from '@agentclientprotocol/sdk';
-import type { Harness, HarnessEvent, TokenUsage } from '@mastra/core/harness';
+import type { HarnessEvent, TokenUsage } from '@mastra/core/harness';
+import type { MastraCodeHarnessRuntime } from '../harness/runtime.js';
 
 let autoApprove = false;
 
@@ -55,7 +56,7 @@ export function handleHarnessEvent(
   event: HarnessEvent,
   state: PromptState | null,
   connection: AgentSideConnection,
-  harness: Harness,
+  harness: MastraCodeHarnessRuntime<Record<string, unknown>>,
 ): void {
   if (!state) return;
 
@@ -140,12 +141,12 @@ function sendUpdate(connection: AgentSideConnection, sessionId: string, update: 
 async function handleToolApproval(
   state: PromptState,
   connection: AgentSideConnection,
-  harness: Harness,
+  harness: MastraCodeHarnessRuntime<Record<string, unknown>>,
   event: Extract<HarnessEvent, { type: 'tool_approval_required' }>,
 ): Promise<void> {
   // Auto-approve if --dangerous-auto-approve flag is set
   if (autoApprove) {
-    harness.session.respondToToolApproval({ decision: 'approve' });
+    harness.respondToToolApproval({ toolCallId: event.toolCallId, decision: 'approve' });
     return;
   }
 
@@ -166,20 +167,20 @@ async function handleToolApproval(
     const resp = await connection.requestPermission(req);
     if (resp.outcome.outcome === 'selected') {
       const decision = resp.outcome.optionId === 'approve' ? 'approve' : 'decline';
-      harness.session.respondToToolApproval({ decision });
+      harness.respondToToolApproval({ toolCallId: event.toolCallId, decision });
     } else {
-      harness.session.respondToToolApproval({ decision: 'decline' });
+      harness.respondToToolApproval({ toolCallId: event.toolCallId, decision: 'decline' });
     }
   } catch (err) {
     process.stderr.write(`[acp] requestPermission error: ${err}\n`);
-    harness.session.respondToToolApproval({ decision: 'decline' });
+    harness.respondToToolApproval({ toolCallId: event.toolCallId, decision: 'decline' });
   }
 }
 
 async function handleToolSuspended(
   state: PromptState,
   connection: AgentSideConnection,
-  harness: Harness,
+  harness: MastraCodeHarnessRuntime<Record<string, unknown>>,
   event: Extract<HarnessEvent, { type: 'tool_suspended' }>,
 ): Promise<void> {
   const { toolCallId, toolName, args, suspendPayload } = event;

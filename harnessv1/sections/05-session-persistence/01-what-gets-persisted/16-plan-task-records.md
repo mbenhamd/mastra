@@ -20,7 +20,7 @@ proceeds.
 - `order` — sibling ordering within one parent (and among roots). Listing is
   ordered by `(parentTaskId, order)`.
 - `status` — `'pending' | 'in_progress' | 'blocked' | 'completed' |
-  'cancelled' | 'failed'`.
+'cancelled' | 'failed'`.
 - `statusSource` — `'explicit'` when a caller/model wrote the status, or
   `'derived'` when the harness computed it from child rollup. **Rollup is
   DEFERRED to TM-4**; until then every write is `'explicit'`.
@@ -51,7 +51,7 @@ listing and subtree walks. `blockedBy`, `metadata`, and any structured columns
 are JSON. The adjacency-list shape means a bounded subtree read and a
 cascade-delete both walk `parent_task_id` via a recursive CTE (SQL adapters) or
 a BFS frontier (in-memory); both **defensively guard cycles** with a visited
-set / `UNION` dedupe even though full cycle *prevention* is TM-4.
+set / `UNION` dedupe even though full cycle _prevention_ is TM-4.
 
 **Concurrency model.** All plan-task writes go through the live `Session` under
 its lease (§5.8): the session is the single serialized writer, so the storage
@@ -61,7 +61,7 @@ verifies, against the owning `SessionRecord`, that `ownerId` still holds the
 unexpired lease and that the session's `version` matches `ifSessionVersion`
 before any plan-task row changes — mirroring how `saveSession` fences on the
 session's owner/version. The per-row `version` is the field-write OCC token
-*inside* that fence (so a stale in-memory plan-task read is still caught), not
+_inside_ that fence (so a stale in-memory plan-task read is still caught), not
 an independent cross-process authority. Multi-row operations
 (`mutatePlanTasksForSession`, `deletePlanTaskSubtree`) are transaction-shaped:
 they either apply every row change under one adapter boundary or reject without

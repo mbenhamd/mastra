@@ -16,10 +16,9 @@ function createMockHarness() {
   }> = [];
 
   return {
-    session: {
-      identity: { getResourceId: vi.fn(() => currentResourceId) },
-      thread: { getId: vi.fn(() => currentThreadId), list: vi.fn(async () => threads) },
-    },
+    getCurrentThreadId: vi.fn(() => currentThreadId),
+    getResourceId: vi.fn(() => currentResourceId),
+    listThreads: vi.fn(async () => threads),
     _setCurrentThreadId(threadId: string | null) {
       currentThreadId = threadId;
     },
@@ -46,7 +45,7 @@ function createMockCtx(harness: ReturnType<typeof createMockHarness>) {
     ctx: {
       state: {
         pendingNewThread: false,
-        session: (harness as any).session,
+        harness,
       },
       harness: harness as any,
       showInfo: vi.fn((msg: string) => infoMessages.push(msg)),

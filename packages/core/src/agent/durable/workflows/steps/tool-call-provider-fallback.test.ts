@@ -20,7 +20,7 @@ import { createDurableToolCallStep } from './tool-call';
 
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn(),
-  toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),
   // Cross-process rebuild is a no-op for these tests (no Mastra agent wired) —
   // return undefined so resolution falls through to the existing paths.
   rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
@@ -32,6 +32,7 @@ vi.mock('../../stream-adapter', () => ({
 }));
 
 const RUN_ID = 'run-provider-tool-1';
+const RUNTIME_BINDING_ID = 'binding-provider-tool-1';
 
 function mockPubsub() {
   return { publish: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(), flush: vi.fn() };
@@ -40,6 +41,7 @@ function mockPubsub() {
 function makeInitData() {
   return {
     runId: RUN_ID,
+    runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: 'agent-1',
     options: { requireToolApproval: false },
     state: {
@@ -62,6 +64,7 @@ describe('durable tool-call provider-tool fallback', () => {
     // Provider-defined tool: JS key `webSearch`, model-facing id `openai.web_search`
     // The LLM emits `web_search`, which doesn't match the JS key.
     globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
       tools: {
         webSearch: {
           type: 'provider-defined',
@@ -103,6 +106,7 @@ describe('durable tool-call provider-tool fallback', () => {
 
     // Run registry has no matching tool — resolveTool() should be consulted.
     globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
       tools: {},
       model: {} as any,
     } as any);
@@ -140,6 +144,7 @@ describe('durable tool-call provider-tool fallback', () => {
     vi.mocked(resolveRuntime.resolveTool).mockReturnValueOnce(undefined as any);
 
     globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
       tools: {},
       model: {} as any,
     } as any);
@@ -166,6 +171,7 @@ describe('durable tool-call provider-tool fallback', () => {
 
   it('still emits ToolNotFoundError when no provider tool matches', async () => {
     globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
       tools: {
         webSearch: {
           type: 'provider-defined',

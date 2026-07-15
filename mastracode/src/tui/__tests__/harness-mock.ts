@@ -1,20 +1,7 @@
-import type { Harness } from '@mastra/core/harness';
 import { vi } from 'vitest';
+import type { MastraCodeHarnessRuntime } from '../../harness/runtime.js';
 
-/**
- * Shared mock harness/session factory for TUI tests.
- *
- * The production wiring (see `tui/state.ts`) makes `state.session` the *same*
- * object as `harness.session`. Per-session behavior (thread lifecycle,
- * run-control, mode/model/state/suspensions, the event bus) lives on the
- * Session; only genuinely host-level operations (model catalog, workspace,
- * mode catalog) live on the Harness. This factory mirrors that split so tests
- * don't hand-roll divergent shapes that drift from the real API.
- *
- * Every method is a `vi.fn()` so tests can assert on calls or override return
- * values. Pass `overrides` to deep-merge custom session/harness behavior.
- */
-
+/** Shared direct-runtime test double for TUI tests. */
 type AnyRecord = Record<string, any>;
 
 function deepMerge<T extends AnyRecord>(base: T, overrides?: AnyRecord): T {
@@ -43,145 +30,117 @@ export interface MockHarnessOptions {
   id?: string;
   resourceId?: string;
   threadId?: string | null;
-  /** Deep-merged onto the default `session` mock. */
-  session?: AnyRecord;
-  /** Deep-merged onto the default `harness` mock (excluding `session`). */
+  /** Deep-merged onto the direct MastraCode runtime mock. */
   harness?: AnyRecord;
 }
 
-/**
- * Build a mock Session matching the real per-session surface. Includes the
- * domains the TUI reaches: identity, thread (lifecycle + reads), run, stream,
- * suspensions, model, mode, state, displayState, the event bus, and the
- * run-control methods (sendSignal, sendMessage, respondToToolSuspension, …).
- */
-export function createMockSession(opts: MockHarnessOptions = {}) {
-  const resourceId = opts.resourceId ?? opts.id ?? 'test-harness';
+export function createMockHarness(opts: MockHarnessOptions = {}) {
+  let resourceId = opts.resourceId ?? opts.id ?? 'test-harness';
+  const defaultResourceId = resourceId;
   let currentThreadId: string | null = opts.threadId ?? null;
+  let state: AnyRecord = {};
+  let displayState: AnyRecord = { isRunning: false, pendingSuspension: null };
 
   const base = {
-    identity: {
-      getResourceId: vi.fn(() => resourceId),
-      getDefaultResourceId: vi.fn(() => resourceId),
-    },
-    thread: {
-      getId: vi.fn(() => currentThreadId),
-      list: vi.fn(async () => []),
-      getById: vi.fn(async () => null),
-      messages: vi.fn(async () => []),
-      getSetting: vi.fn(async () => undefined),
-      setSetting: vi.fn(async () => {}),
-      create: vi.fn(async () => {
-        currentThreadId = 'thread-new';
-        return { id: currentThreadId, resourceId, title: 'New thread', createdAt: new Date(), updatedAt: new Date() };
-      }),
-      switch: vi.fn(async ({ threadId }: { threadId: string }) => {
-        currentThreadId = threadId;
-      }),
-      clone: vi.fn(async () => ({ id: 'thread-clone', resourceId })),
-      rename: vi.fn(async () => {}),
-      delete: vi.fn(async () => {}),
-      detachFromCurrent: vi.fn(() => {
-        currentThreadId = null;
-      }),
-      set: vi.fn(({ threadId }: { threadId: string }) => {
-        currentThreadId = threadId;
-      }),
-    },
-    run: {
-      isRunning: vi.fn(() => false),
-      getRunId: vi.fn(() => null),
-    },
-    stream: {
-      isActive: vi.fn(() => false),
-      isOpen: vi.fn(() => false),
-      activeRunId: vi.fn(() => null),
-    },
-    suspensions: {
-      hasPending: vi.fn(() => false),
-      has: vi.fn(() => false),
-    },
-    model: {
-      get: vi.fn(() => 'anthropic/claude-sonnet-4-5'),
-      hasSelection: vi.fn(() => true),
-      displayName: vi.fn(() => 'claude-sonnet-4-5'),
-    },
-    mode: {
-      get: vi.fn(() => 'build'),
-      resolve: vi.fn(() => ({ id: 'build', defaultModelId: undefined })),
-      switch: vi.fn(async () => {}),
-    },
-    state: {
-      get: vi.fn(() => ({})),
-      set: vi.fn(async () => {}),
-      update: vi.fn(async () => {}),
-    },
-    displayState: {
-      get: vi.fn(() => ({ isRunning: false })),
-    },
-    subscribe: vi.fn(() => () => {}),
-    emit: vi.fn(),
+    getResourceId: vi.fn(() => resourceId),
+    getDefaultResourceId: vi.fn(() => defaultResourceId),
+    setResourceId: vi.fn(({ resourceId: nextResourceId }: { resourceId: string }) => {
+      resourceId = nextResourceId;
+      currentThreadId = null;
+    }),
+    getKnownResourceIds: vi.fn(async () => []),
 
-    // Run-control surface (moved off Harness onto Session).
+    getCurrentThreadId: vi.fn(() => currentThreadId),
+    listThreads: vi.fn(async () => []),
+    listMessages: vi.fn(async () => []),
+    listMessagesForThread: vi.fn(async () => []),
+    getFirstUserMessagesForThreads: vi.fn(async () => new Map()),
+    getFirstUserMessageForThread: vi.fn(async () => null),
+    setThreadSetting: vi.fn(async () => {}),
+    createThread: vi.fn(async () => {
+      currentThreadId = 'thread-new';
+      return { id: currentThreadId, resourceId, title: 'New thread', createdAt: new Date(), updatedAt: new Date() };
+    }),
+    switchThread: vi.fn(async ({ threadId }: { threadId: string }) => {
+      currentThreadId = threadId;
+    }),
+    cloneThread: vi.fn(async () => ({ id: 'thread-clone', resourceId })),
+    renameThread: vi.fn(async () => {}),
+    detachFromCurrentThread: vi.fn(() => {
+      currentThreadId = null;
+    }),
+
+    isRunning: vi.fn(() => false),
+    isCurrentThreadStreamActive: vi.fn(() => false),
+    getCurrentRunId: vi.fn(() => null),
+    getCurrentTraceId: vi.fn(() => null),
+    getFollowUpCount: vi.fn(() => 0),
+
+    getCurrentModelId: vi.fn(() => 'anthropic/claude-sonnet-4-5'),
+    getModelName: vi.fn(() => 'claude-sonnet-4-5'),
+    getFullModelId: vi.fn(() => 'anthropic/claude-sonnet-4-5'),
+    hasModelSelected: vi.fn(() => true),
+    getCurrentModelAuthStatus: vi.fn(async () => ({ hasAuth: true, apiKeyEnvVar: undefined })),
+    listAvailableModels: vi.fn(async () => []),
+    switchModel: vi.fn(async () => {}),
+
+    listModes: vi.fn(() => []),
+    getCurrentModeId: vi.fn(() => 'build'),
+    getCurrentMode: vi.fn(() => ({ id: 'build', defaultModelId: undefined })),
+    switchMode: vi.fn(async () => {}),
+
+    getState: vi.fn(() => state),
+    setState: vi.fn(async (updates: AnyRecord) => {
+      state = { ...state, ...updates };
+    }),
+    getDisplayState: vi.fn(() => displayState),
+    restoreDisplayTasks: vi.fn(),
+    subscribe: vi.fn(() => () => {}),
+
     sendMessage: vi.fn(async () => {}),
     sendSignal: vi.fn(() => ({
       id: 'signal-1',
-      type: 'user' as const,
       accepted: Promise.resolve({ accepted: true as const, runId: 'run-1' }),
     })),
-    sendNotificationSignal: vi.fn(async () => ({ accepted: true, runId: 'run-1' })),
     steer: vi.fn(async () => {}),
     followUp: vi.fn(async () => {}),
     abort: vi.fn(),
+    respondToQuestion: vi.fn(),
+    respondToToolApproval: vi.fn(),
     respondToToolSuspension: vi.fn(async () => {}),
+    respondToSandboxAccess: vi.fn(async () => {}),
+    respondToPlanApproval: vi.fn(async () => {}),
     saveSystemReminderMessage: vi.fn(async () => null),
-  };
 
-  return deepMerge(base, opts.session);
-}
-
-/**
- * Build a mock Harness whose `session` is a {@link createMockSession}. Includes
- * the host-level surface the TUI reaches (model catalog, workspace, mode
- * catalog, resource ids). Returns the harness; read `harness.session` for the
- * shared session instance.
- */
-export function createMockHarness(opts: MockHarnessOptions = {}) {
-  const session = createMockSession(opts);
-
-  const base = {
-    session,
-    listModes: vi.fn(() => []),
-    listAvailableModels: vi.fn(async () => []),
     getWorkspace: vi.fn(() => undefined),
     hasWorkspace: vi.fn(() => false),
     resolveWorkspace: vi.fn(async () => undefined),
-    getResolvedWorkspace: vi.fn(async () => undefined),
-    getKnownResourceIds: vi.fn(async () => []),
-    setResourceId: vi.fn(),
-    // Host-level reads that now take the session as an explicit argument.
-    getCurrentAgent: vi.fn(),
-    getCurrentModelAuthStatus: vi.fn(async () => ({ hasAuth: true, apiKeyEnvVar: undefined })),
+    getKnownResources: vi.fn(async () => []),
     loadOMProgress: vi.fn(async () => {}),
     getObservationalMemoryRecord: vi.fn(async () => null),
+    getSessionGrants: vi.fn(() => ({ categories: [], tools: [] })),
+    getPermissionRules: vi.fn(() => ({ categories: {}, tools: {} })),
+    setPermissionForCategory: vi.fn(),
+    setPermissionForTool: vi.fn(),
+    grantSessionCategory: vi.fn(),
+    grantSessionTool: vi.fn(),
+
+    // Test-only setters for mutable snapshots; production callers never see these.
+    _setState: (next: AnyRecord) => {
+      state = next;
+    },
+    _setDisplayState: (next: AnyRecord) => {
+      displayState = next;
+    },
   };
 
-  return deepMerge(base, opts.harness) as unknown as Harness<Record<string, unknown>> & {
-    session: ReturnType<typeof createMockSession>;
-  };
+  return deepMerge(base, opts.harness) as unknown as MastraCodeHarnessRuntime<Record<string, unknown>> & typeof base;
 }
 
-/**
- * Build a partial TUI `state` whose `session` is the *same* object as
- * `harness.session` — matching production wiring. Spread extra fields via
- * `extra`. Cast the result to your context type at the call site.
- */
 export function createMockState(opts: MockHarnessOptions & { extra?: AnyRecord } = {}) {
   const { extra, ...harnessOpts } = opts;
-  const harness = createMockHarness(harnessOpts);
   return {
-    harness,
-    session: harness.session,
+    harness: createMockHarness(harnessOpts),
     ...extra,
   };
 }

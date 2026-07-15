@@ -2,24 +2,24 @@
 
 ```ts
 interface HarnessMode {
-  id: string;                         // Unique mode ID, e.g. 'build', 'plan'.
+  id: string; // Unique mode ID, e.g. 'build', 'plan'.
   name?: string;
-  default?: boolean;                  // Optional bootstrap default. If none is set, modes[0] is the default.
-  agentId: string;                    // References `HarnessConfig.agents`.
-  defaultModelId?: string;            // Mode-level model bootstrap default before a session model is selected.
+  default?: boolean; // Optional bootstrap default. If none is set, modes[0] is the default.
+  agentId: string; // References `HarnessConfig.agents`.
+  defaultModelId?: string; // Mode-level model bootstrap default before a session model is selected.
 }
 
 interface HarnessSubagent {
-  id: string;                         // Stable `agentType` ID exposed by the built-in `subagent` tool.
-  name: string;                       // Human-readable display name.
-  description: string;                // Tool catalog description shown to the parent agent.
-  instructions: AgentInstructions;    // Default instructions for this spawnable subagent type.
-  tools?: ToolsetInput;               // Direct tools available to this subagent type.
-  allowedHarnessTools?: string[];     // Subset of `HarnessConfig.tools` delegated to this subagent type.
-  allowedWorkspaceTools?: string[];   // Optional workspace-tool allow-list after workspace tool wrapping.
-  defaultModelId?: string;            // Subagent model bootstrap default before session override.
-  maxSteps?: number;                  // Optional execution-loop step cap for this subagent type.
-  workspace?: 'inherit' | 'fresh';    // Default: 'inherit'. Fresh requires a per-session workspace provider (§8).
+  id: string; // Stable `agentType` ID exposed by the built-in `subagent` tool.
+  name: string; // Human-readable display name.
+  description: string; // Tool catalog description shown to the parent agent.
+  instructions: AgentInstructions; // Default instructions for this spawnable subagent type.
+  tools?: ToolsetInput; // Direct tools available to this subagent type.
+  allowedHarnessTools?: string[]; // Subset of `HarnessConfig.tools` delegated to this subagent type.
+  allowedWorkspaceTools?: string[]; // Optional workspace-tool allow-list after workspace tool wrapping.
+  defaultModelId?: string; // Subagent model bootstrap default before session override.
+  maxSteps?: number; // Optional execution-loop step cap for this subagent type.
+  workspace?: 'inherit' | 'fresh'; // Default: 'inherit'. Fresh requires a per-session workspace provider (§8).
 }
 
 interface BackgroundTaskExecutorRegistration {
@@ -30,34 +30,34 @@ interface BackgroundTaskExecutorRegistration {
   // stable id/generation before claiming a reconstructable row.
   kind: 'tool';
   toolName: string;
-  generation?: string;                // Optional executor/schema compatibility token.
+  generation?: string; // Optional executor/schema compatibility token.
 }
 
 interface BackgroundTaskCompletionPolicyRegistration {
   // The registered policy implementation owns how a task result or failure is
   // projected into durable Harness/session state. It must commit that durable
   // state or enqueue outbox-producing work before task success is reported.
-  generation?: string;                // Optional policy/metadata compatibility token.
+  generation?: string; // Optional policy/metadata compatibility token.
   validateMetadata?: (metadata: JsonValue) => boolean; // Optional row-level metadata validator.
 }
 
 type ObservationalMemoryConfig =
   | boolean
   | {
-      enabled?: boolean;              // `false` disables OM; omitted means enabled when object form is present.
-      scope?: 'thread' | 'resource';  // Defaults to 'thread'. Creation-time lookup scope for OM records.
-                                      // `resource` is an explicit privacy/authorization choice:
-                                      // OM snapshots may summarize other threads for the same
-                                      // authenticated resource. Existing sessions do not change
-                                      // scope implicitly.
-      model?: string;                 // Default model ID for both observer and reflector.
+      enabled?: boolean; // `false` disables OM; omitted means enabled when object form is present.
+      scope?: 'thread' | 'resource'; // Defaults to 'thread'. Creation-time lookup scope for OM records.
+      // `resource` is an explicit privacy/authorization choice:
+      // OM snapshots may summarize other threads for the same
+      // authenticated resource. Existing sessions do not change
+      // scope implicitly.
+      model?: string; // Default model ID for both observer and reflector.
       observation?: {
-        model?: string;               // Observer model ID.
-        messageTokens?: number;       // Observation trigger threshold.
+        model?: string; // Observer model ID.
+        messageTokens?: number; // Observation trigger threshold.
       };
       reflection?: {
-        model?: string;               // Reflector model ID.
-        observationTokens?: number;   // Reflection trigger threshold.
+        model?: string; // Reflector model ID.
+        observationTokens?: number; // Reflection trigger threshold.
       };
       // Opaque adapter-owned OM processor options. Implementations may reject
       // unsupported keys before init/session persistence. These values never
@@ -68,10 +68,10 @@ type ObservationalMemoryConfig =
 
 interface HeartbeatHandler {
   id: string;
-  intervalMs: number;                                 // Tick interval
+  intervalMs: number; // Tick interval
   handler: () => void | Promise<void>;
-  immediate?: boolean;                                // Fire once on registration. Default: false
-  shutdown?: () => void | Promise<void>;              // Called when the heartbeat is removed
+  immediate?: boolean; // Fire once on registration. Default: false
+  shutdown?: () => void | Promise<void>; // Called when the heartbeat is removed
 }
 
 // Heartbeat handlers are process-local hooks. They are useful for local
@@ -87,5 +87,4 @@ interface HeartbeatHandler {
 // in-flight handler for each affected heartbeat, and then await the optional
 // `shutdown` hook. Missed or skipped heartbeat ticks are not persisted,
 // retried, or replayed.
-
 ```

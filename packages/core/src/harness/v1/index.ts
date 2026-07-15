@@ -211,6 +211,7 @@ export type {
   HarnessChannelRouteContext,
   HarnessChannelTransportRequest,
   HarnessConfig,
+  HarnessRequestContext,
   HarnessMcpServerDescriptor,
   HarnessMcpToolDescriptor,
   HarnessMode,

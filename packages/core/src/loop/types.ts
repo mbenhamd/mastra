@@ -168,6 +168,14 @@ export type LoopConfig<OUTPUT = undefined> = {
 
 export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   mastra?: Mastra;
+  /**
+   * The user-configured Mastra that processor-added tools may receive in their
+   * execution context. `null` explicitly means that the loop's Mastra exists
+   * only to run internal infrastructure and must not be exposed to tools.
+   *
+   * @internal
+   */
+  _toolContextMastra?: Mastra | null;
   resumeContext?: {
     resumeData: any;
     snapshot: any;

@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
 import type {
   ISSOProvider,
   ISessionProvider,
@@ -9,7 +10,6 @@ import type {
 import type { EEUser } from '@internal/auth/ee';
 import type { MastraAuthProviderOptions } from '@internal/auth/provider';
 import { MastraAuthProvider } from '@internal/auth/provider';
-import { createHmac, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { JWTPayload } from 'jose';
 

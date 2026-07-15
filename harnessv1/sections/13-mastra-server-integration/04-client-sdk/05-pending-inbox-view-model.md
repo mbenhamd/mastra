@@ -18,27 +18,27 @@ type PendingInboxItemKind = PendingInboxKind;
 
 type PendingInboxCardState =
   // Server-derived render states.
-  | 'pending'       // pending field exists and no response has won yet
-  | 'accepted'      // response receipt won; resume is still applying/retrying
-  | 'applied'       // resume completed and exact retries return the result
-  | 'failed'        // response/resume became terminally unavailable
+  | 'pending' // pending field exists and no response has won yet
+  | 'accepted' // response receipt won; resume is still applying/retrying
+  | 'applied' // resume completed and exact retries return the result
+  | 'failed' // response/resume became terminally unavailable
   // Client-local render/transport states.
-  | 'submitting'    // HTTP request in flight; keep the same responseId
-  | 'stale'         // owning session/item disappeared or closed before answer
-  | 'consumed'      // prompt disappeared because another actor answered it
-  | 'conflicted';   // server rejected a competing or mismatched response
+  | 'submitting' // HTTP request in flight; keep the same responseId
+  | 'stale' // owning session/item disappeared or closed before answer
+  | 'consumed' // prompt disappeared because another actor answered it
+  | 'conflicted'; // server rejected a competing or mismatched response
 
 interface PendingInboxItemBase {
-  owningSessionId: string;        // URL target for POST /sessions/:owningSessionId/inbox/:itemId
+  owningSessionId: string; // URL target for POST /sessions/:owningSessionId/inbox/:itemId
   itemId: string;
   kind: PendingInboxItemKind;
   runId: string;
   requestedAt: number;
   source: 'parent' | 'subagent';
-  subagentSessionId?: string;     // present when source === 'subagent'
+  subagentSessionId?: string; // present when source === 'subagent'
   subagentToolCallId?: string;
   state: PendingInboxCardState;
-  responseId?: string;            // retained while submitting/retrying
+  responseId?: string; // retained while submitting/retrying
 }
 
 type PendingInboxItem =

@@ -69,38 +69,23 @@ function createState() {
   const setText = vi.fn();
   const memorySetText = vi.fn();
 
-  const session = {
-    displayState: {
-      get: vi.fn(() => ({
-        omProgress: { status: 'idle' },
-        bufferingMessages: false,
-        bufferingObservations: false,
-      })),
-    },
-    followUps: { count: vi.fn(() => 0) },
-    identity: { getResourceId: vi.fn(() => 'resource-1') },
-    thread: { getId: vi.fn(() => 'thread-1') },
-    mode: {
-      get: vi.fn(() => 'build'),
-      resolve: vi.fn(() => ({ id: 'build', name: 'build', metadata: { color: '#00ff00' } })),
-    },
-    state: { get: vi.fn(() => ({ yolo: false })) },
-    model: {
-      get: vi.fn(() => 'anthropic/claude-sonnet-4-20250514'),
-    },
-    om: {
-      observer: { modelId: vi.fn(() => 'openai/gpt-4o') },
-      reflector: { modelId: vi.fn(() => 'openai/gpt-4o-mini') },
-    },
+  const harness = {
+    getCurrentMode: vi.fn(() => ({ id: 'build', name: 'build', metadata: { color: '#00ff00' } })),
+    getCurrentModelId: vi.fn(() => 'anthropic/claude-sonnet-4-20250514'),
+    getDisplayState: vi.fn(() => ({
+      omProgress: { status: 'idle' },
+      bufferingMessages: false,
+      bufferingObservations: false,
+    })),
+    getFollowUpCount: vi.fn(() => 0),
+    getObserverModelId: vi.fn(() => 'openai/gpt-4o'),
+    getReflectorModelId: vi.fn(() => 'openai/gpt-4o-mini'),
+    listModes: vi.fn(() => [{ id: 'build', name: 'build', metadata: { color: '#00ff00' } }]),
   };
 
   return {
     options: {},
-    session,
-    harness: {
-      listModes: vi.fn(() => [{ id: 'build', name: 'build', metadata: { color: '#00ff00' } }]),
-      session,
-    },
+    harness,
     statusLine: { setText },
     memoryStatusLine: { setText: memorySetText },
     editor: {},
@@ -139,7 +124,7 @@ describe('updateStatusLine', () => {
   it('shows queued count in the status line', () => {
     const state = createState();
     state.pendingQueuedActions = ['message', 'slash'];
-    state.session.followUps.count.mockReturnValue(1);
+    state.harness.getFollowUpCount.mockReturnValue(1);
 
     updateStatusLine(state);
 
@@ -222,7 +207,7 @@ describe('updateStatusLine', () => {
 
   it('preserves the gateway prefix when compacting gateway-backed model ids', () => {
     const state = createState();
-    state.harness.session.model.get.mockReturnValue('mastra/anthropic/claude-opus-4.6');
+    state.harness.getCurrentModelId.mockReturnValue('mastra/anthropic/claude-opus-4.6');
     process.stdout.columns = 25;
 
     updateStatusLine(state);
@@ -234,7 +219,7 @@ describe('updateStatusLine', () => {
 
   it('rewrites fireworks-ai long paths and kimi version separator at full width', () => {
     const state = createState();
-    state.harness.session.model.get.mockReturnValue('fireworks-ai/accounts/fireworks/models/kimi-k2p6');
+    state.harness.getCurrentModelId.mockReturnValue('fireworks-ai/accounts/fireworks/models/kimi-k2p6');
     process.stdout.columns = 200;
 
     updateStatusLine(state);
@@ -247,7 +232,7 @@ describe('updateStatusLine', () => {
 
   it('rewrites fireworks-ai long paths and kimi version separator when compacted', () => {
     const state = createState();
-    state.harness.session.model.get.mockReturnValue('fireworks-ai/accounts/fireworks/models/kimi-k2p6');
+    state.harness.getCurrentModelId.mockReturnValue('fireworks-ai/accounts/fireworks/models/kimi-k2p6');
     process.stdout.columns = 25;
 
     updateStatusLine(state);
@@ -260,7 +245,7 @@ describe('updateStatusLine', () => {
 
   it('rewrites kimi version separator for non-fireworks models', () => {
     const state = createState();
-    state.harness.session.model.get.mockReturnValue('moonshot/kimi-k1p5');
+    state.harness.getCurrentModelId.mockReturnValue('moonshot/kimi-k1p5');
     process.stdout.columns = 200;
 
     updateStatusLine(state);
@@ -272,7 +257,7 @@ describe('updateStatusLine', () => {
 
   it('rewrites minimax-m2p7 version separator', () => {
     const state = createState();
-    state.harness.session.model.get.mockReturnValue('fireworks-ai/accounts/fireworks/models/minimax-m2p7');
+    state.harness.getCurrentModelId.mockReturnValue('fireworks-ai/accounts/fireworks/models/minimax-m2p7');
     process.stdout.columns = 200;
 
     updateStatusLine(state);
@@ -387,7 +372,7 @@ describe('updateStatusLine', () => {
     vi.mocked(formatObservationStatus).mockReturnValue('msg 100%');
     vi.mocked(formatReflectionStatus).mockReturnValue('mem 100%');
     const state = createState();
-    state.harness.session.displayState.get.mockReturnValue({
+    state.harness.getDisplayState.mockReturnValue({
       omProgress: { status: 'observing' },
       bufferingMessages: true,
       bufferingObservations: true,

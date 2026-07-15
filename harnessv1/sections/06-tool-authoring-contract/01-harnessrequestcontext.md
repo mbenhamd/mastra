@@ -57,6 +57,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-tool-context);" d="M490 97 C430 175 405 235 400 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-tool-context);" d="M555 97 C610 175 640 235 645 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-tool-context);" d="M615 97 C760 175 870 235 890 299" />
+
   </svg>
   <figcaption>The tool context is a per-turn capability bundle: it carries identity and live helpers while persistence remains owned by the session and storage contracts.</figcaption>
 </figure>
@@ -66,15 +67,14 @@ a tool execution surface at
 `../packages/core/src/tools/types.ts:412`:
 
 ```ts
-export interface ToolExecutionContext<TSuspend, TResume, TRequestContext>
-  extends Partial<ObservabilityContext> {
+export interface ToolExecutionContext<TSuspend, TResume, TRequestContext> extends Partial<ObservabilityContext> {
   mastra?: MastraUnion;
   requestContext?: RequestContext<TRequestContext>;
   abortSignal?: AbortSignal;
   workspace?: Workspace;
   browser?: MastraBrowser;
   writer?: ToolStream;
-  agent?: AgentToolExecutionContext<TSuspend, TResume>;     // non-Harness helper, not v1 authority
+  agent?: AgentToolExecutionContext<TSuspend, TResume>; // non-Harness helper, not v1 authority
   workflow?: WorkflowToolExecutionContext<TSuspend, TResume>; // non-Harness helper, not v1 authority
   mcp?: MCPToolExecutionContext;
 }

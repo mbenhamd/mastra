@@ -18,6 +18,11 @@ import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { MessageList } from '../../message-list';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
+
+afterEach(() => {
+  globalRunRegistry.clear();
+});
 
 // ============================================================================
 // Helper Functions

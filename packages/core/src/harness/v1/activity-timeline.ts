@@ -20,11 +20,7 @@
 import type { HarnessMessage } from '../types';
 
 import { HarnessValidationError } from './errors';
-import type {
-  ActivityTimelineEntry,
-  ActivityTimelineOptions,
-  SessionActivityTimeline,
-} from './types';
+import type { ActivityTimelineEntry, ActivityTimelineOptions, SessionActivityTimeline } from './types';
 
 /** Default + hard cap on entries returned in one page (server-bounded). */
 export const ACTIVITY_TIMELINE_DEFAULT_LIMIT = 100;
@@ -110,11 +106,7 @@ function encodeCursor(key: CursorKey, addressedSessionId: string, includeDescend
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeCursor(
-  cursor: string,
-  addressedSessionId: string,
-  includeDescendants: boolean,
-): CursorKey {
+function decodeCursor(cursor: string, addressedSessionId: string, includeDescendants: boolean): CursorKey {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
@@ -319,10 +311,7 @@ export function buildActivityTimeline(
 
   // Validate limit + decode/validate cursor BEFORE assembling any entries, so a
   // malformed/wrong-scope cursor rejects without a source scan.
-  if (
-    opts.limit !== undefined &&
-    (typeof opts.limit !== 'number' || !Number.isInteger(opts.limit) || opts.limit < 1)
-  ) {
+  if (opts.limit !== undefined && (typeof opts.limit !== 'number' || !Number.isInteger(opts.limit) || opts.limit < 1)) {
     throw new HarnessValidationError('limit', 'must be a positive integer when provided');
   }
   const limit = Math.min(opts.limit ?? ACTIVITY_TIMELINE_DEFAULT_LIMIT, ACTIVITY_TIMELINE_MAX_LIMIT);
@@ -347,7 +336,9 @@ export function buildActivityTimeline(
     push(subagentEntry(src));
   }
 
-  all.sort((a, b) => compareKeys({ o: a.occurredAt, s: a.sessionId, e: a.entryId }, { o: b.occurredAt, s: b.sessionId, e: b.entryId }));
+  all.sort((a, b) =>
+    compareKeys({ o: a.occurredAt, s: a.sessionId, e: a.entryId }, { o: b.occurredAt, s: b.sessionId, e: b.entryId }),
+  );
 
   const visible = after
     ? all.filter(e => compareKeys({ o: e.occurredAt, s: e.sessionId, e: e.entryId }, after) > 0)

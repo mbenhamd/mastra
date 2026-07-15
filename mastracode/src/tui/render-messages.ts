@@ -64,8 +64,7 @@ function getPendingUserMessageLabel(isInterjection?: boolean): string | undefine
 }
 
 function getCurrentModeColor(state: TUIState): string | undefined {
-  const color = state.session.mode.resolve().metadata?.color;
-  return typeof color === 'string' ? color : undefined;
+  return state.harness.getCurrentMode().color;
 }
 
 // =============================================================================
@@ -219,7 +218,7 @@ export function confirmPendingUserMessage(state: TUIState, messageId: string, te
   const pending = state.pendingSignalMessageComponentsById.get(messageId);
   if (!pending) return;
 
-  if (state.streamingComponent && state.session.displayState.get().isRunning) {
+  if (state.streamingComponent && state.harness.getDisplayState().isRunning) {
     state.streamingComponent = undefined;
     state.streamingMessage = undefined;
   }
@@ -571,7 +570,7 @@ export function addUserMessage(state: TUIState, message: HarnessMessage, options
 
     state.messageComponentsById.set(message.id, userComponent);
 
-    if (state.streamingComponent && state.session.displayState.get().isRunning) {
+    if (state.streamingComponent && state.harness.getDisplayState().isRunning) {
       state.chatContainer.addChild(userComponent);
       state.followUpComponents.push(userComponent);
       reconcileChatBoundarySpacers(state.chatContainer);
@@ -676,7 +675,7 @@ function getLatestMessageTimestamp(messages: HarnessMessage[]): number | undefin
  * Called on thread switch and initial load.
  */
 export async function renderExistingMessages(state: TUIState): Promise<void> {
-  const messages = await state.session.thread.listActiveMessages({ limit: STARTUP_MESSAGE_WINDOW_SIZE });
+  const messages = await state.harness.listMessages({ limit: STARTUP_MESSAGE_WINDOW_SIZE });
   state.lastRenderedMessageAt = getLatestMessageTimestamp(messages);
 
   state.chatContainer.clear();
@@ -964,16 +963,16 @@ export async function renderExistingMessages(state: TUIState): Promise<void> {
     if (state.taskProgress) {
       state.taskProgress.updateTasks(previousTasksAcc);
     }
-    const currentTasks = (state.session.state.get() as { tasks?: TaskItemSnapshot[] } | undefined)?.tasks;
+    const currentTasks = (state.harness.getState() as { tasks?: TaskItemSnapshot[] } | undefined)?.tasks;
     if (!areTasksEqual(currentTasks, previousTasksAcc)) {
       try {
-        await state.session.state.set({ tasks: previousTasksAcc });
+        await state.harness.setState({ tasks: previousTasksAcc });
       } catch {
         // Custom harness state schemas may not accept TUI replayed task state.
         // Keep the reconstructed task list local to display state in that case.
       }
     }
-    state.session.displayState.restoreTasks(previousTasksAcc);
+    state.harness.restoreDisplayTasks(previousTasksAcc);
   }
 
   reconcileChatBoundarySpacers(state.chatContainer);

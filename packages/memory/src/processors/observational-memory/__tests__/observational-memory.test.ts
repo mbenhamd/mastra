@@ -2659,9 +2659,10 @@ describe('Observer Agent Helpers', () => {
           ],
         };
 
-        await observer.call(undefined, [message], undefined, {
-          requestContext: { threadId: 'test-thread' } as any,
-        });
+        const requestContext = new RequestContext();
+        requestContext.set(MASTRA_THREAD_ID_KEY, 'test-thread');
+
+        await observer.call(undefined, [message], undefined, { requestContext });
 
         expect(spy).toHaveBeenCalledWith('deepseek/deepseek-v4-flash');
         const content = capturedPrompt[1].content as any[];

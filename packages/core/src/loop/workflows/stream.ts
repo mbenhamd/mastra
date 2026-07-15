@@ -229,12 +229,51 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       // Best-effort: a cleanup failure must never turn a finished run into a
       // stream error (a stale row is preferable to a broken stream).
       const deleteRunSnapshots = async () => {
+        const workflowsStore = await rest.mastra?.getStorage()?.getStore('workflows');
+        const executionRunIds = new Set([runId]);
+        try {
+          const storedLoopRun = await workflowsStore?.getWorkflowRunById({
+            runId,
+            workflowName: agenticLoopWorkflow.id,
+          });
+          const rawSnapshot = storedLoopRun?.snapshot;
+          const snapshot =
+            typeof rawSnapshot === 'string'
+              ? (JSON.parse(rawSnapshot) as Record<string, any>)
+              : (rawSnapshot as Record<string, any> | undefined);
+          const executionStep = snapshot?.context?.[AGENTIC_EXECUTION_WORKFLOW_ID];
+          const nestedRunId =
+            executionStep?.metadata?.nestedRunId ??
+            executionStep?.suspendPayload?.__workflow_meta?.runId ??
+            snapshot?.result?.suspendPayload?.__workflow_meta?.runId;
+          if (typeof nestedRunId === 'string' && nestedRunId.length > 0) {
+            executionRunIds.add(nestedRunId);
+          }
+        } catch (error) {
+          rest.logger?.warn('Failed to resolve nested agent workflow snapshot during terminal cleanup', {
+            runId,
+            error,
+          });
+        }
+
         try {
           await agenticLoopWorkflow.deleteWorkflowRunById(runId);
-          const workflowsStore = await rest.mastra?.getStorage()?.getStore('workflows');
-          await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: AGENTIC_EXECUTION_WORKFLOW_ID });
         } catch (error) {
-          rest.logger?.warn('Failed to delete agentic-loop snapshot rows after terminal state', { runId, error });
+          rest.logger?.warn('Failed to delete agentic-loop snapshot after terminal state', { runId, error });
+        }
+        for (const executionRunId of executionRunIds) {
+          try {
+            await workflowsStore?.deleteWorkflowRunById({
+              runId: executionRunId,
+              workflowName: AGENTIC_EXECUTION_WORKFLOW_ID,
+            });
+          } catch (error) {
+            rest.logger?.warn('Failed to delete nested agent execution snapshot after terminal state', {
+              runId,
+              executionRunId,
+              error,
+            });
+          }
         }
       };
 

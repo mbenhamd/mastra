@@ -50,6 +50,46 @@ export const MASTRA_VERSIONS_KEY = 'mastra__versions';
  */
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
+const SPAN_CONTEXT_MAX_KEYS = 100;
+const SPAN_CONTEXT_MAX_STRING_BYTES = 2_048;
+const SPAN_CONTEXT_MAX_TOTAL_BYTES = 16_384;
+const SPAN_TRUNCATION_MARKER = '[TRUNCATED]';
+const SPAN_TEXT_ENCODER = new TextEncoder();
+const SPAN_TEXT_DECODER = new TextDecoder();
+
+function truncateSpanString(value: string, maxBytes: number): string {
+  const encoded = SPAN_TEXT_ENCODER.encode(value);
+  if (encoded.byteLength <= maxBytes) return value;
+  const marker = SPAN_TEXT_ENCODER.encode(SPAN_TRUNCATION_MARKER);
+  if (marker.byteLength >= maxBytes) return SPAN_TRUNCATION_MARKER.slice(0, maxBytes);
+  let end = maxBytes - marker.byteLength;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
+  return `${SPAN_TEXT_DECODER.decode(encoded.subarray(0, end))}${SPAN_TRUNCATION_MARKER}`;
+}
+
+function setSpanSnapshotEntry(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function spanSnapshotByteLength(snapshot: Record<string, unknown>): number {
+  return SPAN_TEXT_ENCODER.encode(JSON.stringify(snapshot)).byteLength;
+}
+
+function addSpanTruncationMarker(snapshot: Record<string, unknown>, emittedKeys: string[]): void {
+  setSpanSnapshotEntry(snapshot, SPAN_TRUNCATION_MARKER, true);
+  while (spanSnapshotByteLength(snapshot) > SPAN_CONTEXT_MAX_TOTAL_BYTES && emittedKeys.length > 0) {
+    const key = emittedKeys.pop()!;
+    if (key !== SPAN_TRUNCATION_MARKER) {
+      delete snapshot[key];
+    }
+  }
+}
+
 export type VersionSelector = { versionId: string } | { status: 'draft' | 'published' };
 
 export type VersionOverrides = {
@@ -289,30 +329,53 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
   }
 
   /**
-   * Custom span serialization to prevent leaking internal state (like auth
-   * tokens stored in the private `registry` Map) into observability spans.
+   * Returns a bounded snapshot for observability span input.
    *
-   * `deepClean` in `@mastra/observability` calls this method before falling
-   * back to `Object.keys()` — which would walk the runtime-enumerable
-   * `registry` field and serialize its raw Map entries (including any
-   * bearer tokens) into exported spans.
+   * Unlike `toJSON`, this method never traverses stored objects. It redacts the
+   * reserved raw auth token and replaces non-primitive values with type labels,
+   * preventing the internal registry from exposing auth or nested runtime state
+   * when observability serializers inspect a RequestContext instance.
    */
-  serializeForSpan(): Record<string, unknown> {
+  public serializeForSpan(): Record<string, unknown> {
     const safe: Record<string, unknown> = {};
+    const emittedKeys: string[] = [];
+    let keyCount = 0;
+    let truncated = false;
     for (const [key, value] of this.registry.entries()) {
-      if (key === MASTRA_AUTH_TOKEN_KEY) {
-        safe[key] = '[REDACTED]';
-      } else if (
-        value === null ||
-        value === undefined ||
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'boolean'
-      ) {
-        safe[key] = value;
-      } else {
-        safe[key] = `[${typeof value}]`;
+      if (keyCount >= SPAN_CONTEXT_MAX_KEYS) {
+        truncated = true;
+        break;
       }
+      const safeKey = truncateSpanString(key, SPAN_CONTEXT_MAX_STRING_BYTES);
+
+      let safeValue: unknown;
+      if (key === MASTRA_AUTH_TOKEN_KEY) {
+        safeValue = '[REDACTED]';
+      } else if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
+        safeValue = value;
+      } else if (typeof value === 'string') {
+        safeValue = truncateSpanString(value, SPAN_CONTEXT_MAX_STRING_BYTES);
+      } else {
+        safeValue = `[${typeof value}]`;
+      }
+
+      const previous = Object.getOwnPropertyDescriptor(safe, safeKey);
+      if (safeKey === SPAN_TRUNCATION_MARKER || previous) {
+        keyCount += 1;
+        truncated = true;
+        continue;
+      }
+      setSpanSnapshotEntry(safe, safeKey, safeValue);
+      if (spanSnapshotByteLength(safe) > SPAN_CONTEXT_MAX_TOTAL_BYTES) {
+        delete safe[safeKey];
+        truncated = true;
+        break;
+      }
+      emittedKeys.push(safeKey);
+      keyCount += 1;
+    }
+    if (truncated || keyCount < this.registry.size) {
+      addSpanTruncationMarker(safe, emittedKeys);
     }
     return safe;
   }

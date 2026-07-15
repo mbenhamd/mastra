@@ -776,6 +776,13 @@ export class DurableAgent<
   }
 
   // --- PubSub (base Agent fields — DurableAgent has its own pubsub) ---
+  override getPubSub() {
+    // AgentController registration supplies a shared inherited transport. Standalone
+    // DurableAgents still need the thread runtime and inherited Agent APIs to use the
+    // durable stream's actual transport instead of the process-global fallback.
+    return super.getPubSub() ?? this.pubsub;
+  }
+
   override hasOwnPubSub() {
     return this.#wrappedAgent.hasOwnPubSub();
   }
@@ -1153,8 +1160,58 @@ export class DurableAgent<
       messageList,
     });
 
-    // 4. Wait for subscription to be ready, then execute workflow
-    // This prevents race conditions where events are published before subscription
+    // 4. Claim the thread before starting the durable workflow, then register
+    // the output handle. This gives durable streams the same one-run-per-thread
+    // admission invariant as regular Agent.stream(), including the explicit
+    // fresh-turn handoff from a retained suspended run.
+    const runtimePubSub = this.getPubSub();
+    const optionMemory = options?.memory;
+    const threadStreamOptions = {
+      ...(options ?? {}),
+      runId,
+      memory: threadId
+        ? {
+            ...(optionMemory && typeof optionMemory === 'object' ? optionMemory : {}),
+            thread: threadId,
+            ...(resourceId ? { resource: resourceId } : {}),
+          }
+        : optionMemory,
+    } as AgentExecutionOptions<TOutput> & { _threadRunReservationOwner?: boolean };
+    let releaseThreadReservation = agentThreadStreamRuntime.reserveRun(threadStreamOptions, runtimePubSub, this.id);
+    try {
+      await agentThreadStreamRuntime.waitForCrossAgentThreadRun(
+        this as unknown as Agent<any, any, any, any>,
+        threadStreamOptions,
+        runtimePubSub,
+        Boolean(releaseThreadReservation),
+      );
+      while (!releaseThreadReservation && threadId) {
+        releaseThreadReservation = agentThreadStreamRuntime.reserveRun(threadStreamOptions, runtimePubSub, this.id);
+        if (releaseThreadReservation) break;
+        await agentThreadStreamRuntime.waitForThreadRunReservation(threadStreamOptions, runtimePubSub, this.id);
+      }
+
+      // registerRun installs the record synchronously; its return value tracks
+      // terminal delivery. Do not await that promise here: a suspended durable
+      // stream can intentionally remain open until resume, and stream() must
+      // return the output handle before then.
+      void agentThreadStreamRuntime.registerRun(
+        this as unknown as Agent<any, any, any, any>,
+        output,
+        threadStreamOptions,
+        runtimePubSub,
+      );
+    } catch (error) {
+      releaseThreadReservation?.();
+      streamCleanup();
+      this.#cleanupBoundRun(runId, runtimeBindingId);
+      cleanedUp = true;
+      throw error;
+    }
+
+    // 4b. Wait for the durable subscription to be ready, then execute the
+    // workflow. Registration happens first so thread subscribers cannot miss
+    // an immediately emitted start/tool event.
     const workflowExecution = ready
       .then(async () => {
         // Emit 'start' chunk before the workflow begins (matches regular agent's stream.ts).
@@ -1174,17 +1231,6 @@ export class DurableAgent<
     if (trackedEntry) {
       trackedEntry.workflowExecution = workflowExecution;
     }
-
-    // 4b. Register with the thread-stream runtime so subscribeToThread /
-    // sendMessage subscribers receive run-registered events and stream parts.
-    // Uses the Mastra-level pubsub (this.getPubSub()) — not the internal
-    // CachingPubSub (this.pubsub) which carries durable workflow chunks.
-    await agentThreadStreamRuntime.registerRun(
-      this as unknown as Agent<any, any, any, any>,
-      output,
-      options as AgentExecutionOptions<TOutput>,
-      this.getPubSub(),
-    );
 
     // 5. Create cleanup function (cancels auto-cleanup timer if called)
     const cleanup = () => {
@@ -1501,7 +1547,10 @@ export class DurableAgent<
         ? { thread: memoryInfo.threadId, resource: memoryInfo.resourceId }
         : (options as any)?.memory,
     } as AgentExecutionOptions<TOutput>;
-    await agentThreadStreamRuntime.registerRun(
+    // Registration is synchronous; the returned promise is the resumed
+    // segment's terminal-delivery watcher and must not delay returning its
+    // stream handle (especially when the segment re-suspends).
+    void agentThreadStreamRuntime.registerRun(
       this as unknown as Agent<any, any, any, any>,
       output,
       resumeStreamOptions,

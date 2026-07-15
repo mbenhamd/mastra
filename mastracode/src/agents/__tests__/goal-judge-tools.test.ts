@@ -17,16 +17,11 @@ afterEach(() => {
 
 function createRequestContext(projectPath: string) {
   const requestContext = new RequestContext();
+  const state = { projectPath, sandboxAllowedPaths: [] };
   requestContext.set('harness', {
     modeId: 'build',
-    session: {
-      state: {
-        get: () => ({
-          projectPath,
-          sandboxAllowedPaths: [],
-        }),
-      },
-    },
+    state,
+    getState: () => state,
   });
   return requestContext;
 }
@@ -61,7 +56,7 @@ describe('getGoalJudgeTools', () => {
     const { getGoalJudgeTools } = await import('../workspace.js');
     // Empty harness state → getDynamicWorkspace throws → resolver returns undefined.
     const requestContext = new RequestContext();
-    requestContext.set('harness', { modeId: 'build', session: { state: { get: () => ({}) } } });
+    requestContext.set('harness', { modeId: 'build', state: {}, getState: () => ({}) });
     const tools = await getGoalJudgeTools({ requestContext: requestContext as any });
     expect(tools).toBeUndefined();
   });

@@ -745,6 +745,8 @@ export type SerializedStep<TEngineType = DefaultEngineType> = Pick<
   component?: string;
   serializedStepFlow?: SerializedStepFlowEntry[];
   mapConfig?: string;
+  /** Internal marker for a framework-generated step identity. */
+  generatedId?: boolean;
   canSuspend?: boolean;
 };
 

@@ -1,9 +1,5 @@
 {
-  "attachment": [
-    "moonshotai/Kimi-K2.6",
-    "moonshotai/Kimi-K2.6-Fast",
-    "moonshotai/Kimi-K2.7-Code"
-  ],
+  "attachment": ["moonshotai/Kimi-K2.6", "moonshotai/Kimi-K2.6-Fast", "moonshotai/Kimi-K2.7-Code"],
   "temperature": [
     "MiniMaxAI/MiniMax-M2.5",
     "moonshotai/Kimi-K2.6",

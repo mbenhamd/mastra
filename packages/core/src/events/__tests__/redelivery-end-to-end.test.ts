@@ -27,6 +27,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
 import { MockStore } from '../../storage/mock';
+import { createEmptyWorkflowSnapshot } from '../../storage/workflow-snapshot';
 import { createStep, createWorkflow } from '../../workflows/evented';
 import { WorkflowEventProcessor } from '../../workflows/evented/workflow-event-processor';
 import type { Event, EventCallback } from '../types';
@@ -65,6 +66,18 @@ function makeWorkflow(id: string) {
     }) as any,
   ).commit();
   return wf;
+}
+
+async function persistRun(mastra: Mastra, workflow: ReturnType<typeof makeWorkflow>, runId: string) {
+  const workflowsStore = await mastra.getStorage()?.getStore('workflows');
+  await workflowsStore?.persistWorkflowSnapshot({
+    workflowName: workflow.id,
+    runId,
+    snapshot: {
+      ...createEmptyWorkflowSnapshot(runId),
+      serializedStepGraph: workflow.serializedStepGraph,
+    },
+  });
 }
 
 /**
@@ -169,10 +182,11 @@ describe('redelivery end-to-end (UnixSocketPubSub + WorkflowEventProcessor)', ()
     const pubsub = new UnixSocketPubSub(path);
     pubsubs.push(pubsub);
 
+    const workflow = makeWorkflow('wf');
     const mastra = new Mastra({
       logger: false,
       storage: new MockStore(),
-      workflows: { wf: makeWorkflow('wf') } as any,
+      workflows: { wf: workflow } as any,
       pubsub,
     });
 
@@ -191,6 +205,10 @@ describe('redelivery end-to-end (UnixSocketPubSub + WorkflowEventProcessor)', ()
     const flaky = new FlakyProcessor({ mastra }, 2, 'run-flaky-recovers', 'workflow.start');
     await pubsub.subscribe('workflows', makeHandleCallback(flaky));
 
+    // EventedRun persists the initial run before publishing workflow.start.
+    // Mirror that producer contract so retry exhaustion can distinguish a
+    // real running workflow from an orphaned transport delivery.
+    await persistRun(mastra, workflow, 'run-flaky-recovers');
     await pubsub.publish('workflows', makeStartEvent('wf', 'run-flaky-recovers', 'event-recovers-1'));
 
     // Wait until the WEP has been dispatched 3 times: 2 transient failures
@@ -227,10 +245,11 @@ describe('redelivery end-to-end (UnixSocketPubSub + WorkflowEventProcessor)', ()
     const pubsub = new UnixSocketPubSub(path);
     pubsubs.push(pubsub);
 
+    const workflow = makeWorkflow('wf');
     const mastra = new Mastra({
       logger: false,
       storage: new MockStore(),
-      workflows: { wf: makeWorkflow('wf') } as any,
+      workflows: { wf: workflow } as any,
       pubsub,
     });
 
@@ -247,6 +266,7 @@ describe('redelivery end-to-end (UnixSocketPubSub + WorkflowEventProcessor)', ()
     const flaky = new FlakyProcessor({ mastra }, 1000, 'run-flaky-poisoned', 'workflow.start');
     await pubsub.subscribe('workflows', makeHandleCallback(flaky));
 
+    await persistRun(mastra, workflow, 'run-flaky-poisoned');
     await pubsub.publish('workflows', makeStartEvent('wf', 'run-flaky-poisoned', 'event-poisoned-1'));
 
     // workflow.fail must be published exactly once after the WEP

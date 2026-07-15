@@ -25,6 +25,7 @@ import {
   FOLLOW_UP_AGENT_CONTROLLER_SESSION_ROUTE,
   AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE,
   AGENT_CONTROLLER_TOOL_SUSPENSION_ROUTE,
+  createAgentControllerSessionId,
 } from './agent-controller';
 
 function makeAgent(id = 'test-agent') {
@@ -135,6 +136,25 @@ describe('agent-controller routes', () => {
       expect(aAgain.threadId).toBe(a.threadId);
     });
 
+    it('keeps delimiter-shaped resource and scope pairs distinct', async () => {
+      const first = (await CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'resource::scope',
+        sessionScope: 'tail',
+      } as any)) as { threadId?: string };
+      const second = (await CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'resource',
+        sessionScope: 'scope::tail',
+      } as any)) as { threadId?: string };
+
+      expect(first.threadId).toBeDefined();
+      expect(second.threadId).toBeDefined();
+      expect(second.threadId).not.toBe(first.threadId);
+    });
+
     it('routes with a sessionScope address the scoped session, not the unscoped one', async () => {
       await CREATE_AGENT_CONTROLLER_SESSION_ROUTE.handler({
         mastra,
@@ -208,7 +228,11 @@ describe('agent-controller routes', () => {
       await controller.init();
       // Same get-or-create call the route handlers make, so this returns the
       // exact session instance the handler will operate on.
-      return controller.createSession({ resourceId, id: resourceId, ownerId: controller.id });
+      return controller.createSession({
+        resourceId,
+        id: createAgentControllerSessionId(resourceId),
+        ownerId: controller.id,
+      });
     }
 
     function makeRequestContext() {
@@ -345,7 +369,11 @@ describe('agent-controller routes', () => {
       // Emit an event on the session the route subscribed to.
       const controller = mastra.getAgentController('code')!;
       await controller.init();
-      const session = await controller.createSession({ resourceId: 'user-1', id: 'user-1', ownerId: 'code' });
+      const session = await controller.createSession({
+        resourceId: 'user-1',
+        id: createAgentControllerSessionId('user-1'),
+        ownerId: 'code',
+      });
       // Any emit fans out a synthetic display_state_changed to subscribers.
       session.emit({ type: 'agent_start' } as any);
 
@@ -375,7 +403,11 @@ describe('agent-controller routes', () => {
 
       const controller = mastra.getAgentController('code')!;
       await controller.init();
-      const session = await controller.createSession({ resourceId: 'user-err', id: 'user-err', ownerId: 'code' });
+      const session = await controller.createSession({
+        resourceId: 'user-err',
+        id: createAgentControllerSessionId('user-err'),
+        ownerId: 'code',
+      });
       session.emit({ type: 'error', error: new Error('model quota exhausted'), errorType: 'provider' } as any);
 
       let received: any;
@@ -422,7 +454,11 @@ describe('agent-controller routes', () => {
     it('reports running: true while a run is active', async () => {
       const controller = mastra.getAgentController('code')!;
       await controller.init();
-      const session = await controller.createSession({ resourceId: 'user-1', id: 'user-1', ownerId: controller.id });
+      const session = await controller.createSession({
+        resourceId: 'user-1',
+        id: createAgentControllerSessionId('user-1'),
+        ownerId: controller.id,
+      });
       session.displayState.apply({ type: 'agent_start' } as any);
 
       const res = (await GET_AGENT_CONTROLLER_SESSION_STATE_ROUTE.handler({
@@ -476,9 +512,11 @@ describe('agent-controller routes', () => {
         resourceId: 'user-limit',
       } as any);
       // Create a few more threads so there's something to page.
-      const session = await mastra
-        .getAgentController('code')!
-        .createSession({ resourceId: 'user-limit', id: 'user-limit', ownerId: 'code' });
+      const session = await mastra.getAgentController('code')!.createSession({
+        resourceId: 'user-limit',
+        id: createAgentControllerSessionId('user-limit'),
+        ownerId: 'code',
+      });
       for (let i = 0; i < 4; i++) await session.thread.create({ title: `t${i}` });
 
       const res = (await LIST_AGENT_CONTROLLER_THREADS_ROUTE.handler({

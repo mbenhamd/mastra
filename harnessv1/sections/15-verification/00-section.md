@@ -61,6 +61,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-verification);" d="M920 247 C875 300 765 340 761 358" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-verification);" d="M570 358 L506 358" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-verification);" d="M410 325 C365 285 290 245 251 222" />
+
   </svg>
   <figcaption>Verification ties every durability claim to the row that proves it, the recovery path that repairs it, and the focused test that would fail if the contract regresses.</figcaption>
 </figure>

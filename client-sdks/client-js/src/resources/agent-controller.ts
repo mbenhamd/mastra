@@ -348,7 +348,7 @@ export class AgentControllerSession extends BaseResource {
   constructor(
     options: ClientOptions,
     private readonly controllerId: string,
-    private readonly resourceId: string,
+    private resourceId: string,
     private readonly scope?: string,
   ) {
     super(options);
@@ -587,6 +587,7 @@ export class AgentControllerSession extends BaseResource {
       method: 'POST',
       body: { newResourceId },
     });
+    this.resourceId = newResourceId;
   }
 
   /** Get known resource IDs for this session. */

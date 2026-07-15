@@ -248,7 +248,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     await mastra.shutdown();
   });
 
-  it('evaluates persistence once and gates a retained nested loop before admission or dispatch', async () => {
+  it('promotes a retained nested loop from transient ownership into durable recovery', async () => {
     const { mastra, workflows, processor } = await setup();
     const parentRunId = 'loop-parent-run';
     const childRunId = 'loop-child-run';
@@ -256,7 +256,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
       {
         type: 'loop' as const,
         step: { id: 'child', component: 'WORKFLOW' },
-        serializedCondition: { id: 'condition', fn: '() => false' },
+        serializedCondition: { id: 'child-condition', fn: '() => false' },
         loopType: 'dountil' as const,
       },
     ];
@@ -316,13 +316,16 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
         resumeSteps: ['inner'],
         parentWorkflow: { ...parentWorkflow, resume: true, resumeSteps: ['child', 'inner'] },
       }),
-    ).rejects.toMatchObject({ id: 'MASTRA_WORKFLOW_DURABLE_NESTED_LOOP_OWNERSHIP_UNSUPPORTED' });
+    ).resolves.toBeUndefined();
     expect(shouldPersistSnapshot).toHaveBeenCalledTimes(2);
     expect(shouldPersistSnapshot).toHaveBeenLastCalledWith({
       stepResults: {},
       workflowStatus: 'running',
     });
-    expect(publish).not.toHaveBeenCalled();
+    expect(publish.mock.calls.some(([, event]) => event.type === 'workflow.step.run')).toBe(true);
+    await expect(
+      workflows.getWorkflowTerminalRecoveryAncestry({ workflowName: 'child', runId: childRunId }),
+    ).resolves.toMatchObject({ status: 'found' });
     await mastra.shutdown();
   });
 
@@ -969,7 +972,7 @@ describe('WorkflowEventProcessor terminal recovery evidence', () => {
     publish.mockClear();
 
     await expect(processor.start({ ...args, workflow: driftedWorkflow })).rejects.toMatchObject({
-      id: 'MASTRA_WORKFLOW_NESTED_RUN_CHILD_SNAPSHOT_CONFLICT',
+      id: 'MASTRA_WORKFLOW_TERMINAL_RECOVERY_GRAPH_CONFLICT',
     });
     expect(persist).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();

@@ -1361,6 +1361,8 @@ export class Session {
    * log stays contiguous (no skipped slot → no undetected replay gap).
    */
   private readonly _failedEventAppends: PendingEventAppend[] = [];
+  /** Original append failure for the active degraded episode. */
+  private _eventPersistenceDegradedCause: unknown;
   /**
    * §S4.1 — true once a transient append failure has been surfaced live (one
    * `storage_error` per degraded episode). Reset when the backlog fully drains.
@@ -1610,7 +1612,7 @@ export class Session {
     if (this._failedEventAppends.length > 0) {
       throw new HarnessStorageError({
         operation: 'session_event_append',
-        cause: undefined,
+        cause: this._eventPersistenceDegradedCause,
         retryable: true,
         sessionId: this._record.id,
         resourceId: this._record.resourceId,
@@ -1713,6 +1715,7 @@ export class Session {
           // Storage has no event ledger at all → nothing to retry; drop the backlog.
           this._failedEventAppends.length = 0;
           this._eventPersistenceDegraded = false;
+          this._eventPersistenceDegradedCause = undefined;
           return;
         }
         if (next) this._backlogFailedAppend(next, err);
@@ -1720,7 +1723,10 @@ export class Session {
       }
     }
     // Backlog fully drained → durable log is contiguous again.
-    if (this._eventPersistenceDegraded) this._eventPersistenceDegraded = false;
+    if (this._eventPersistenceDegraded) {
+      this._eventPersistenceDegraded = false;
+      this._eventPersistenceDegradedCause = undefined;
+    }
 
     if (!next) return;
 
@@ -1742,6 +1748,7 @@ export class Session {
     this._failedEventAppends.push(args);
     if (!this._eventPersistenceDegraded) {
       this._eventPersistenceDegraded = true;
+      this._eventPersistenceDegradedCause = err;
       console.error('[harness/v1] session event persistence failed; backlogged for retry:', err);
       // §10.2: the durable log is lagging. Emit a live, RETRYABLE storage_error so
       // subscribers learn now (vs only discovering the lag on reconnect). The degraded
@@ -1775,6 +1782,7 @@ export class Session {
       });
       this._eventPersistenceError = overflow;
       this._failedEventAppends.length = 0;
+      this._eventPersistenceDegradedCause = undefined;
       console.error(
         `[harness/v1] session event backlog exceeded ${MAX_PENDING_FAILED_EVENT_APPENDS}; durable log fail-stop:`,
         err,

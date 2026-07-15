@@ -766,6 +766,7 @@ export const useChat = ({
       providerOptions: providerOptions as any,
       requireToolApproval,
       tracingOptions,
+      clientTools: resolvedClientTools,
     };
 
     try {

@@ -456,7 +456,7 @@ describe('createSubagentTool processor propagation', () => {
     const inputProcessors = [inputProcessor];
     const outputProcessors = [outputProcessor];
 
-    const processorSubagents: HarnessSubagent[] = [
+    const processorSubagents: AgentControllerSubagent[] = [
       {
         id: 'specialist',
         name: 'Specialist',
@@ -488,7 +488,7 @@ describe('createSubagentTool processor propagation', () => {
     const parentAgent = { stream: parentStream } as any;
     const cloneThreadForFork = vi.fn().mockResolvedValue({ id: 'fork-processor-thread', resourceId: 'rid' });
 
-    const processorSubagents: HarnessSubagent[] = [
+    const processorSubagents: AgentControllerSubagent[] = [
       {
         id: 'specialist',
         name: 'Specialist',
@@ -519,7 +519,7 @@ describe('createSubagentTool processor propagation', () => {
     });
 
     const requestContext = new RequestContext();
-    requestContext.set('harness', { emitEvent: vi.fn(), threadId: 'p-thread', resourceId: 'rid' });
+    requestContext.set('controller', { emitEvent: vi.fn(), threadId: 'p-thread', resourceId: 'rid' });
 
     const result = await (tool as any).execute(
       { agentType: 'specialist', task: 'Use parent context' },

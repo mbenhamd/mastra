@@ -43,7 +43,7 @@ describe('Session.setGoal — admission', () => {
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     const events = record(session, ['goal_set', 'goal_cleared']);
 
-    const _goal = await session.setGoal({ objective: 'ship the thing', kickoff: false });
+    const goal = await session.setGoal({ objective: 'ship the thing', kickoff: false });
 
     expect(goal.objective).toBe('ship the thing');
     expect(goal.status).toBe('active');

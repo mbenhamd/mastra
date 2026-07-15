@@ -59,8 +59,22 @@ type QueueResultResponse =
       signalId?: string;
     }
   | { kind: 'queue'; status: 'completed'; queuedItemId: string; runId: string; signalId: string; result: AgentResult }
-  | { kind: 'queue'; status: 'failed'; queuedItemId: string; runId?: string; signalId?: string; error: HarnessPublicErrorProjection }
-  | { kind: 'queue'; status: 'expired'; queuedItemId: string; runId?: string; signalId?: string; error: HarnessPublicErrorProjection };
+  | {
+      kind: 'queue';
+      status: 'failed';
+      queuedItemId: string;
+      runId?: string;
+      signalId?: string;
+      error: HarnessPublicErrorProjection;
+    }
+  | {
+      kind: 'queue';
+      status: 'expired';
+      queuedItemId: string;
+      runId?: string;
+      signalId?: string;
+      error: HarnessPublicErrorProjection;
+    };
 ```
 
 `QueueResultResponse` is a settlement DTO, not the complete queue diagnostic

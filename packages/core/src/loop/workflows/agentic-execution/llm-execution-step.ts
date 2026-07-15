@@ -967,6 +967,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   workspace,
   outputWriter,
   mastra,
+  _toolContextMastra,
   rotateResponseMessageId: rotateLoopResponseMessageId,
 }: OuterLLMRun<TOOLS, OUTPUT> & { toolCallForeachOptions?: ToolCallForeachOptions }) {
   const initialUntaggedSystemMessages = messageList.getSystemMessages();
@@ -1248,6 +1249,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               // Convert any raw Mastra Tool objects returned by processors into CoreTool format.
               // Processors like ToolSearchProcessor return raw Tool instances that lack requestContext binding.
               if (processInputStepResult.tools && currentStep.tools) {
+                // `mastra` may be the hidden ephemeral runtime that lets a
+                // standalone Agent execute evented workflows. Processor-added
+                // tools must only see a user-configured Mastra. Direct loop
+                // callers that do not set the internal distinction retain the
+                // historical behavior of using the loop Mastra.
+                const toolContextMastra = _toolContextMastra === undefined ? mastra : (_toolContextMastra ?? undefined);
                 const convertedTools: Record<string, unknown> = {};
                 for (const [name, tool] of Object.entries(currentStep.tools)) {
                   if (isMastraTool(tool)) {
@@ -1259,8 +1266,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
                         resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
                         logger,
-                        mastra: mastra
-                          ? createMastraProxy({ mastra, logger: logger || new ConsoleLogger({ level: 'error' }) })
+                        mastra: toolContextMastra
+                          ? createMastraProxy({
+                              mastra: toolContextMastra,
+                              logger: logger || new ConsoleLogger({ level: 'error' }),
+                            })
                           : undefined,
                         memory: readScoped(scopeCtx, MEMORY_KEY, 'memory'),
                         agentId,
@@ -1330,7 +1340,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // the pre-action gate in tool-call-step). Mirrors the channel-tool-fence
           // pattern above.
           const permissionPolicy = requestContext?.get('__mastra_toolPermissionPolicy') as
-            ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined;
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined;
           if (permissionPolicy && currentStep.tools) {
             const toolSurface = currentStep.tools as Record<string, unknown>;
             const toolChoice = currentStep.toolChoice as { type?: string; toolName?: string } | string | undefined;
@@ -1519,7 +1530,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 ...modelConfig.modelSettings,
               } as Record<string, unknown> | undefined,
               providerOptions: mergeProviderOptions(currentStep.providerOptions, modelConfig.providerOptions) as
-                Record<string, unknown> | undefined,
+                | Record<string, unknown>
+                | undefined,
               availableTools: getStepAvailableToolNames(
                 currentStep.tools as Record<string, unknown> | undefined,
                 currentStep.activeTools as readonly string[] | undefined,

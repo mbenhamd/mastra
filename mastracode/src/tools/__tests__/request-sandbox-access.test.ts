@@ -13,13 +13,12 @@ function createMockLocalFilesystem() {
 }
 
 function createHarnessCtx() {
+  const state = { sandboxAllowedPaths: [] as string[] };
   return {
-    session: {
-      state: {
-        get: () => ({ sandboxAllowedPaths: [] }),
-        set: vi.fn(),
-      },
-    },
+    state,
+    getState: () => state,
+    setState: vi.fn(),
+    registerSandboxAccess: vi.fn(async () => {}),
   };
 }
 
@@ -52,19 +51,23 @@ describe('request_access', () => {
     const harnessCtx = createHarnessCtx();
     const { context, suspend } = suspendPass(harnessCtx);
 
-    const result = await (requestSandboxAccessTool as any).execute(
-      { path: '/outside/project/dir', reason: 'need to read config' },
-      context,
-    );
+    suspend.mockRejectedValueOnce(new Error('suspended'));
+    await expect(
+      (requestSandboxAccessTool as any).execute(
+        { path: '/outside/project/dir', reason: 'need to read config' },
+        context,
+      ),
+    ).rejects.toThrow('suspended');
 
-    // Suspending returns no value; the suspend payload carries the request details.
-    expect(result).toBeUndefined();
+    expect(harnessCtx.registerSandboxAccess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        semanticType: 'file',
+        reason: 'need to read config',
+        payload: { path: '/outside/project/dir' },
+      }),
+    );
     expect(suspend).toHaveBeenCalledTimes(1);
-    expect(suspend.mock.calls[0]![0]).toEqual({
-      kind: 'sandbox_access_request',
-      path: '/outside/project/dir',
-      reason: 'need to read config',
-    });
+    expect(suspend).toHaveBeenCalledWith({}, undefined);
   });
 
   it('calls setAllowedPaths on workspace filesystem when access is approved', async () => {
@@ -83,8 +86,8 @@ describe('request_access', () => {
     // The grant must be persisted to harness state so the workspace factory
     // re-derives the same allowlist on the next tool call (otherwise the
     // factory's setAllowedPaths rebuild clobbers the in-turn widen below).
-    expect(harnessCtx.session.state.set).toHaveBeenCalledTimes(1);
-    expect(harnessCtx.session.state.set).toHaveBeenCalledWith({
+    expect(harnessCtx.setState).toHaveBeenCalledTimes(1);
+    expect(harnessCtx.setState).toHaveBeenCalledWith({
       sandboxAllowedPaths: ['/outside/project/dir'],
     });
 
@@ -104,13 +107,11 @@ describe('request_access', () => {
     // only reachable through the harness request context. Granting access must
     // widen that filesystem so same-turn `view` calls can read the path.
     const { fs, setAllowedPaths } = createMockLocalFilesystem();
+    const state = { sandboxAllowedPaths: [] as string[] };
     const harnessCtx: any = {
-      session: {
-        state: {
-          get: () => ({ sandboxAllowedPaths: [] }),
-          set: vi.fn(),
-        },
-      },
+      state,
+      getState: () => state,
+      setState: vi.fn(),
       workspace: { filesystem: fs },
     };
     // Tool context intentionally has NO workspace, matching production.
@@ -216,15 +217,7 @@ describe('request_access', () => {
 
   it('works when filesystem lacks setAllowedPaths method', async () => {
     const harnessCtx = createHarnessCtx();
-    const context = {
-      requestContext: {
-        get: (key: string) => (key === 'harness' ? mockHarnessCtx : undefined),
-      },
-      workspace: {
-        path: '/mock/project',
-        filesystem: {}, // no setAllowedPaths
-      },
-    };
+    const { context } = resumePass('yes', harnessCtx, {}); // no setAllowedPaths
 
     const result = await (requestSandboxAccessTool as any).execute(
       { path: '/outside/project/dir', reason: 'testing' },

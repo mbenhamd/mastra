@@ -136,17 +136,18 @@ export class ObserverRunner {
    * Extract a router-style model ID (`provider/model`) from a model config.
    * Handles strings, LanguageModel objects, and function-based models.
    */
-  private extractModelRouterId(model: ConcreteObservationModel, requestContext?: RequestContext): string | undefined {
+  private async extractModelRouterId(
+    model: ConcreteObservationModel,
+    requestContext?: RequestContext,
+  ): Promise<string | undefined> {
     if (typeof model === 'string') return model;
 
     // Function-based model — resolve it with requestContext to get the actual model
     if (typeof model === 'function') {
       if (!requestContext) return undefined;
       try {
-        const resolved = model({ requestContext });
-        // Recursion handles the resolved value (string or LanguageModel object)
-        if (resolved instanceof Promise) return undefined; // can't await in sync context
-        return this.extractModelRouterId(resolved as ConcreteObservationModel);
+        const resolved = await model({ requestContext });
+        return this.extractModelRouterId(resolved as ConcreteObservationModel, requestContext);
       } catch {
         return undefined;
       }
@@ -166,14 +167,14 @@ export class ObserverRunner {
    * the provider capabilities registry is consulted to decide whether the
    * model accepts multimodal input.
    */
-  private resolveAttachmentFilter(
+  private async resolveAttachmentFilter(
     model: ConcreteObservationModel,
     requestContext?: RequestContext,
-  ): ObserverAttachmentFilter {
+  ): Promise<ObserverAttachmentFilter> {
     const raw = this.observationConfig.observeAttachments;
     if (raw !== 'auto') return raw;
 
-    const routerId = this.extractModelRouterId(model, requestContext);
+    const routerId = await this.extractModelRouterId(model, requestContext);
     if (!routerId) return true; // can't determine — default to forwarding
     const supports = modelSupportsAttachments(routerId);
     return supports ?? true;
@@ -242,7 +243,7 @@ export class ObserverRunner {
       : this.createAgent(resolvedModel.model, false, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(options?.requestContext, agent.id);
 
-    const attachmentFilter = this.resolveAttachmentFilter(resolvedModel.model, options?.requestContext);
+    const attachmentFilter = await this.resolveAttachmentFilter(resolvedModel.model, options?.requestContext);
 
     const observerMessages = [
       {
@@ -458,7 +459,7 @@ export class ObserverRunner {
     const agent = this.createAgent(resolvedModel.model, true, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(requestContext, agent.id);
 
-    const multiThreadAttachmentFilter = this.resolveAttachmentFilter(resolvedModel.model, requestContext);
+    const multiThreadAttachmentFilter = await this.resolveAttachmentFilter(resolvedModel.model, requestContext);
 
     const observerMessages = [
       {

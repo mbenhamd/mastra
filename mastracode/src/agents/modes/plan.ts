@@ -1,9 +1,7 @@
 /**
  * Plan mode — read-only analysis and planning.
  */
-import type { HarnessMode } from '@mastra/core/harness';
-
-export const planMode: HarnessMode = {
+export const planMode = {
   id: 'plan',
   name: 'Plan',
   transitionsTo: 'build',

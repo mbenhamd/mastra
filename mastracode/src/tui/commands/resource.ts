@@ -2,13 +2,12 @@ import type { SlashCommandContext } from './types.js';
 
 export async function handleResourceCommand(ctx: SlashCommandContext, args: string[]): Promise<void> {
   const { state, harness } = ctx;
-  const { session } = state;
   const sub = args[0]?.trim();
-  const current = session.identity.getResourceId();
-  const defaultId = session.identity.getDefaultResourceId();
+  const current = harness.getResourceId();
+  const defaultId = harness.getDefaultResourceId();
 
   if (!sub) {
-    const knownIds = await harness.getKnownResourceIds(session);
+    const knownIds = await harness.getKnownResourceIds();
     const isOverridden = current !== defaultId;
     const lines = [
       `Current: ${current}${isOverridden ? ` (auto-detected: ${defaultId})` : ''}`,
@@ -32,14 +31,14 @@ export async function handleResourceCommand(ctx: SlashCommandContext, args: stri
     return;
   }
 
-  await harness.setResourceId(session, { resourceId: newId });
+  harness.setResourceId({ resourceId: newId });
 
   // Try to resume the most recent thread for this resource
-  const threads = await session.thread.list();
+  const threads = await harness.listThreads();
   const latest = [...threads].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0];
 
   if (latest) {
-    await session.thread.switch({ threadId: latest.id, emitEvent: false });
+    await harness.switchThread({ threadId: latest.id });
     state.chatContainer.clear();
     state.pendingTools.clear();
     state.pendingTaskToolIds?.clear();

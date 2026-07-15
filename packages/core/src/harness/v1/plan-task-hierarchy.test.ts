@@ -403,9 +403,9 @@ describe('blockedBy — diamond graphs', () => {
   });
 
   it('rejects closing the diamond into a cycle (a depends on d → a→d→b→a)', () => {
-    expect(() =>
-      assertNoBlockedByCycle(diamond(), 'a', ['d'], id => (id === 'a' ? ['d'] : undefined)),
-    ).toThrow(HarnessPlanTaskCycleError);
+    expect(() => assertNoBlockedByCycle(diamond(), 'a', ['d'], id => (id === 'a' ? ['d'] : undefined))).toThrow(
+      HarnessPlanTaskCycleError,
+    );
   });
 });
 

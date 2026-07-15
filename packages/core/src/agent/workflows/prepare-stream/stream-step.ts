@@ -101,6 +101,10 @@ export function createStreamStep<OUTPUT = undefined>({
 
       const streamResult = capabilities.llm.stream({
         ...loopOptions,
+        // A bare Agent still runs on an internal ephemeral Mastra. Keep that
+        // infrastructure runtime distinct from the user-visible tool context:
+        // only a Mastra explicitly attached to the Agent is exposed to tools.
+        _toolContextMastra: capabilities.mastra ?? null,
         outputProcessors: processors,
         returnScorerData,
         ...resolveObservabilityContext(observabilityContext),

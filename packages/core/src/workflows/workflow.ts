@@ -1624,7 +1624,11 @@ export class Workflow<
     this.type = type ?? 'default';
     this.#options = {
       validateInputs: options.validateInputs ?? true,
-      shouldPersistSnapshot: options.shouldPersistSnapshot ?? (() => true),
+      // Processor workflows carry live process-local values such as MessageList,
+      // AbortSignal, and processor-state Maps. They are transient and cannot be
+      // resumed safely from a JSON snapshot unless a caller explicitly supplies
+      // a different persistence policy.
+      shouldPersistSnapshot: options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true),
       pruneSnapshot: options.pruneSnapshot,
       tracingPolicy: options.tracingPolicy,
       onFinish: options.onFinish,
@@ -1862,6 +1866,7 @@ export class Workflow<
         type: 'step',
         step: {
           id: mappingStep.id,
+          generatedId: !stepOptions?.id,
           mapConfig:
             mappingConfig.toString()?.length > 1000
               ? mappingConfig.toString().slice(0, 1000) + '...\n}'
@@ -1993,6 +1998,7 @@ export class Workflow<
       type: 'step',
       step: {
         id: mappingStep.id,
+        generatedId: !stepOptions?.id,
         mapConfig:
           JSON.stringify(newMappingConfig, null, 2)?.length > 1000
             ? JSON.stringify(newMappingConfig, null, 2).slice(0, 1000) + '...\n}'

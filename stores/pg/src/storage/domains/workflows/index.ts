@@ -3109,7 +3109,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
         const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
         if (ownership.status === 'ownership_conflict') return ownership;
-        if ((ownership.status === 'already_bound') !== Boolean(existingRecovery)) {
+        if (ownership.status === 'bound' && existingRecovery) {
           return { status: 'ancestry_conflict' };
         }
 
@@ -3223,6 +3223,14 @@ export class WorkflowsPG extends WorkflowsStorage {
             childSnapshotState,
           };
         }
+        // A nested run may begin transiently and become durable only after it
+        // suspends. In that path the parent owner is already bound while the
+        // retained child snapshot exists without recovery ancestry. Promote
+        // that exact owner under the same transaction; missing child evidence
+        // still fails closed.
+        if (ownership.status === 'already_bound' && !retainedChildSnapshot && !initialChildSnapshot) {
+          return { status: 'ancestry_conflict' };
+        }
         const serialized = sanitizeJsonForPg(JSON.stringify(ownership.snapshot));
         const timestamp = new Date(now);
         await t.none(
@@ -3240,13 +3248,15 @@ export class WorkflowsPG extends WorkflowsStorage {
             recovery.createdAt,
           ],
         );
-        await t.none(
-          `UPDATE ${this.workflowSnapshotTableName()}
-           SET snapshot = $1, "updatedAt" = $2, "updatedAtZ" = $3
-           WHERE workflow_name = $4 AND run_id = $5`,
-          [serialized, timestamp, timestamp, operation.workflowName, operation.runId],
-        );
-        await this.bumpWorkflowParentRevision(t, operation.workflowName, operation.runId, revision);
+        if (ownership.status === 'bound') {
+          await t.none(
+            `UPDATE ${this.workflowSnapshotTableName()}
+             SET snapshot = $1, "updatedAt" = $2, "updatedAtZ" = $3
+             WHERE workflow_name = $4 AND run_id = $5`,
+            [serialized, timestamp, timestamp, operation.workflowName, operation.runId],
+          );
+          await this.bumpWorkflowParentRevision(t, operation.workflowName, operation.runId, revision);
+        }
         const childSnapshotState = await ensureInitialChildSnapshot();
         return {
           status: 'admitted',

@@ -232,7 +232,6 @@ import type {
   ObservationalMemoryModel,
   ObserveHookUsage,
   ObserveHooks,
-  ResolvedActivationTTL,
   ResolvedObservationConfig,
   ResolvedReflectionConfig,
   ThresholdRange,

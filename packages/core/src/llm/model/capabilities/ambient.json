@@ -1,9 +1,5 @@
 {
-  "attachment": [
-    "moonshotai/kimi-k2.6",
-    "moonshotai/kimi-k2.7-code",
-    "stepfun/step-3.7-flash"
-  ],
+  "attachment": ["moonshotai/kimi-k2.6", "moonshotai/kimi-k2.7-code", "stepfun/step-3.7-flash"],
   "temperature": [
     "ambient/large",
     "moonshotai/kimi-k2.6",

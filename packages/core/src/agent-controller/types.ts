@@ -6,6 +6,7 @@ import type { MastraModelGatewayInterface } from '../llm/model/gateways';
 import type { LoopOptions } from '../loop/types';
 import type { MastraMemory } from '../memory/memory';
 import type { ObservabilityEntrypoint } from '../observability/types/core';
+import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { PublicSchema } from '../schema';
 import type { MastraCompositeStore } from '../storage/base';
 import type { GoalEvaluationPayload } from '../stream/types';
@@ -172,6 +173,17 @@ export interface AgentControllerSubagent {
 
   /** Optional stop condition for this subagent's execution loop */
   stopWhen?: LoopOptions['stopWhen'];
+
+  /**
+   * Input processors for non-forked subagent runs.
+   *
+   * Forked subagents reuse the parent Agent and intentionally ignore
+   * definition-level processors to preserve the parent prompt/cache surface.
+   */
+  inputProcessors?: DynamicArgument<InputProcessorOrWorkflow[]>;
+
+  /** Output processors for non-forked subagent runs. */
+  outputProcessors?: DynamicArgument<OutputProcessorOrWorkflow[]>;
 
   /**
    * Workspace tool keys (after any renames) the model is allowed to call.

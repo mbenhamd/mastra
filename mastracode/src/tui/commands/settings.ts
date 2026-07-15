@@ -16,8 +16,7 @@ import { handleApiKeysCommand } from './api-keys.js';
 import type { SlashCommandContext } from './types.js';
 
 function getCurrentModeColor(ctx: SlashCommandContext): string | undefined {
-  const color = ctx.state.session.mode.resolve().metadata?.color;
-  return typeof color === 'string' ? color : undefined;
+  return ctx.harness.getCurrentMode().color;
 }
 
 function commandExists(command: string): Promise<boolean> {
@@ -190,13 +189,13 @@ function applyQuietModeToRenderedTools(ctx: SlashCommandContext, enabled: boolea
 }
 
 export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<void> {
-  const state = ctx.state.session.state.get() as any;
+  const state = ctx.harness.getState() as any;
   const globalSettings = loadSettings();
   const config = {
     notifications: (state?.notifications ?? 'off') as NotificationMode,
     yolo: state?.yolo === true,
     thinkingLevel: (state?.thinkingLevel ?? 'off') as string,
-    currentModelId: ctx.state.session.model.get() ?? '',
+    currentModelId: ctx.harness.getCurrentModelId() ?? '',
     escapeAsCancel: ctx.state.editor.escapeEnabled,
     quietMode: globalSettings.preferences.quietMode,
     quietModeMaxToolPreviewLines: globalSettings.preferences.quietModeMaxToolPreviewLines,
@@ -209,22 +208,22 @@ export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<v
   return new Promise<void>(resolve => {
     const settings = new SettingsComponent(config, {
       onNotificationsChange: async mode => {
-        await ctx.state.session.state.set({ notifications: mode });
+        await ctx.harness.setState({ notifications: mode });
         ctx.showInfo(`Notifications: ${mode}`);
       },
       onYoloChange: async enabled => {
-        await ctx.state.session.state.set({ yolo: enabled } as any);
+        await ctx.harness.setState({ yolo: enabled } as any);
       },
       onThinkingLevelChange: async level => {
-        await ctx.state.session.state.set({ thinkingLevel: level } as any);
+        await ctx.harness.setState({ thinkingLevel: level } as any);
         const current = loadSettings();
         current.preferences.thinkingLevel = level as ThinkingLevelSetting;
         saveSettings(current);
       },
       onEscapeAsCancelChange: async enabled => {
         ctx.state.editor.escapeEnabled = enabled;
-        await ctx.state.session.state.set({ escapeAsCancel: enabled });
-        await ctx.state.session.thread.setSetting({ key: 'escapeAsCancel', value: enabled });
+        await ctx.harness.setState({ escapeAsCancel: enabled });
+        await ctx.harness.setThreadSetting({ key: 'escapeAsCancel', value: enabled });
       },
       onQuietModeChange: enabled => {
         const current = loadSettings();

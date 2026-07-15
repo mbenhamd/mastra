@@ -35,16 +35,14 @@ describe('getAllowedPathsFromContext', () => {
       requestContext: {
         get: (key: string) => {
           if (key === 'harness') {
+            const state = {
+              projectPath: '/test/project',
+              configDir: '.mastracode',
+              sandboxAllowedPaths: ['/user/sandbox/path-1', '/user/sandbox/path-2'],
+            };
             return {
-              session: {
-                state: {
-                  get: () => ({
-                    projectPath: '/test/project',
-                    configDir: '.mastracode',
-                    sandboxAllowedPaths: ['/user/sandbox/path-1', '/user/sandbox/path-2'],
-                  }),
-                },
-              },
+              state,
+              getState: () => state,
             };
           }
           return undefined;
@@ -66,15 +64,13 @@ describe('getAllowedPathsFromContext', () => {
       requestContext: {
         get: (key: string) => {
           if (key === 'harness') {
+            const state = {
+              projectPath: '/test/project',
+              sandboxAllowedPaths: ['/user/sandbox/static-path'],
+            };
             return {
-              session: {
-                state: {
-                  get: () => ({
-                    projectPath: '/test/project',
-                    sandboxAllowedPaths: ['/user/sandbox/static-path'],
-                  }),
-                },
-              },
+              state,
+              getState: () => state,
             };
           }
           return undefined;
@@ -90,14 +86,10 @@ describe('getAllowedPathsFromContext', () => {
       requestContext: {
         get: (key: string) => {
           if (key === 'harness') {
+            const state = { projectPath: '/test/project' };
             return {
-              session: {
-                state: {
-                  get: () => ({
-                    projectPath: '/test/project',
-                  }),
-                },
-              },
+              state,
+              getState: () => state,
             };
           }
           return undefined;
@@ -123,15 +115,13 @@ describe('getAllowedPathsFromContext', () => {
       requestContext: {
         get: (key: string) => {
           if (key === 'harness') {
+            const state = {
+              projectPath: '/test/project',
+              sandboxAllowedPaths: ['/from-session-state'],
+            };
             return {
-              session: {
-                state: {
-                  get: () => ({
-                    projectPath: '/test/project',
-                    sandboxAllowedPaths: ['/from-session-state'],
-                  }),
-                },
-              },
+              state,
+              getState: () => state,
             };
           }
           return undefined;

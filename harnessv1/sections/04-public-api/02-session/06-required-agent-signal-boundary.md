@@ -33,10 +33,7 @@ interface AgentSignalBoundaryInput {
   type: 'user-message' | 'system-reminder' | string;
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   attachments: PersistedAttachment[];
   attributes?: Record<string, JsonValue>;
   metadata?: Record<string, JsonValue>;
@@ -44,10 +41,7 @@ interface AgentSignalBoundaryInput {
   requestContext?: PersistedRequestContextInput;
   admissionId?: string;
   admissionHash?: string;
-  source:
-    | { kind: 'signal' }
-    | { kind: 'queue'; queuedItemId: string }
-    | { kind: 'use-skill'; skillName: string };
+  source: { kind: 'signal' } | { kind: 'queue'; queuedItemId: string } | { kind: 'use-skill'; skillName: string };
   // Present only when the signal is intended to drain into an already-active
   // run. When absent, the agent starts a new run using the committed run
   // surface selected by the session owner: the effective mode resolves to a

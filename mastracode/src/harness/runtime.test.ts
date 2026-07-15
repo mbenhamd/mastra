@@ -135,7 +135,7 @@ describe('MastraCodeHarnessRuntime', () => {
     await runtime.init();
     const firstThreadId = runtime.getCurrentThreadId();
     if (!firstThreadId) throw new Error('expected initial thread');
-    await runtime.core.threads.setSettings({
+    await runtime.threadOps.setSettings({
       resourceId: runtime.getResourceId(),
       threadId: firstThreadId,
       patch: {
@@ -292,9 +292,27 @@ describe('MastraCodeHarnessRuntime', () => {
     const listener = vi.fn();
     runtime.subscribe(listener);
 
-    child._emit({ type: 'message_start', messageId: 'child-message' } as any);
+    child._emit({ type: 'text_delta', runId: 'child-run', delta: 'hi' } as any);
 
     expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message_start' }));
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message_update' }));
+    await runtime.destroy();
+  });
+
+  it('stops projecting events from the previous session after detaching from its thread', async () => {
+    const runtime = createRuntime();
+    await runtime.init();
+    const previousSession = (runtime as any).session;
+    const listener = vi.fn();
+    runtime.subscribe(listener);
+
+    runtime.detachFromCurrentThread();
+    previousSession._emit({ type: 'text_delta', runId: 'stale-run', delta: 'stale output' } as any);
+    await Promise.resolve();
+
+    expect(runtime.getCurrentThreadId()).toBeNull();
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message_start' }));
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message_update' }));
     await runtime.destroy();
   });
 
@@ -478,12 +496,17 @@ describe('MastraCodeHarnessRuntime', () => {
 
     await expect(
       (runtime as any).handleCoreEvent({
-        type: 'task_updated',
-        tasks: [{ id: 'late-task', title: 'Late task', status: 'completed' }],
+        type: 'tool_start',
+        runId: 'late-run',
+        toolCallId: 'late-tool',
+        toolName: 'read_file',
+        input: { path: 'README.md' },
       }),
     ).resolves.toBeUndefined();
 
-    expect(runtime.getDisplayState().tasks).toEqual([{ id: 'late-task', title: 'Late task', status: 'completed' }]);
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tool_start', toolCallId: 'late-tool', args: { path: 'README.md' } }),
+    );
     await expect((runtime as any).handleCoreEvent({ type: 'state_changed' })).resolves.toBeUndefined();
     await expect(
       (runtime as any).handleCoreEvent({ type: 'model_changed', modelId: 'openai/gpt-4o-mini' }),
@@ -932,7 +955,7 @@ describe('MastraCodeHarnessRuntime', () => {
       type: 'tool_start',
       toolCallId: 'tool-1',
       toolName: 'write_file',
-      args: { path: 'src/app.ts' },
+      input: { path: 'src/app.ts' },
     });
     await (runtime as any).handleCoreEvent({
       type: 'tool_end',
@@ -944,7 +967,7 @@ describe('MastraCodeHarnessRuntime', () => {
       type: 'tool_start',
       toolCallId: 'tool-2',
       toolName: 'string_replace_lsp',
-      args: { path: 'src/app.ts' },
+      input: { path: 'src/app.ts' },
     });
     await (runtime as any).handleCoreEvent({
       type: 'tool_end',
@@ -956,7 +979,7 @@ describe('MastraCodeHarnessRuntime', () => {
       type: 'tool_start',
       toolCallId: 'tool-3',
       toolName: 'ast_smart_edit',
-      args: { path: 'src/app.ts' },
+      input: { path: 'src/app.ts' },
     });
     await (runtime as any).handleCoreEvent({
       type: 'tool_end',
@@ -968,7 +991,7 @@ describe('MastraCodeHarnessRuntime', () => {
       type: 'subagent_tool_start',
       innerToolCallId: 'sub-tool-1',
       toolName: 'write_file',
-      args: { path: 'src/from-subagent.ts' },
+      input: { path: 'src/from-subagent.ts' },
     });
     await (runtime as any).handleCoreEvent({
       type: 'subagent_tool_end',
@@ -1042,7 +1065,7 @@ describe('MastraCodeHarnessRuntime', () => {
       type: 'tool_start',
       toolCallId: 'tool-1',
       toolName: 'write_file',
-      args: { path: 'src/app.ts' },
+      input: { path: 'src/app.ts' },
     });
     await (runtime as any).handleCoreEvent({
       type: 'tool_end',

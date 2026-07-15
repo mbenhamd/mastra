@@ -1546,7 +1546,8 @@ export function createWorkflow<
     eventProcessor,
     options: {
       validateInputs: params.options?.validateInputs ?? true,
-      shouldPersistSnapshot: params.options?.shouldPersistSnapshot ?? (() => true),
+      shouldPersistSnapshot:
+        params.options?.shouldPersistSnapshot ?? (params.type === 'processor' ? () => false : () => true),
       pruneSnapshot: params.options?.pruneSnapshot,
       tracingPolicy: params.options?.tracingPolicy,
       onFinish: params.options?.onFinish,

@@ -45,11 +45,7 @@ import {
   runResumeDurableStreamUntilIdle,
   globalRunRegistry,
 } from '@mastra/core/agent/durable';
-import type {
-  AgentStepFinishEventData,
-  AgentSuspendedEventData,
-  RunRegistryEntry,
-} from '@mastra/core/agent/durable';
+import type { AgentStepFinishEventData, AgentSuspendedEventData, RunRegistryEntry } from '@mastra/core/agent/durable';
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';

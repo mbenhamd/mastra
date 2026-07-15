@@ -14,13 +14,10 @@ describe('convertStoredMessageToHarnessMessage', () => {
       {
         id: 'signal-user-1',
         type: 'user-message',
-        contents: {
-          role: 'user',
-          content: [
-            { type: 'text', text: 'hello from signal' },
-            { type: 'file', data: 'data:image/png;base64,abc', mediaType: 'image/png' },
-          ],
-        },
+        contents: [
+          { type: 'text', text: 'hello from signal' },
+          { type: 'file', data: 'data:image/png;base64,abc', mediaType: 'image/png' },
+        ],
         createdAt: new Date('2026-05-01T00:00:00.000Z'),
       },
       { threadId: 'thread-1', resourceId: 'resource-1' },

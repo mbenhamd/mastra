@@ -37,7 +37,7 @@ async function showSubagentModelListForScope(
     return;
   }
 
-  const currentSubagentModel = ctx.state.session.subagents.model.get({ agentType });
+  const currentSubagentModel = ctx.harness.getSubagentModelId({ agentType });
   const scopeLabel = scope === 'global' ? `${agentTypeLabel} · Global` : `${agentTypeLabel} · Thread`;
 
   return new Promise(resolve => {
@@ -50,7 +50,7 @@ async function showSubagentModelListForScope(
         ctx.state.ui.hideOverlay();
         await promptForApiKeyIfNeeded(ctx.state.ui, model, ctx.authStorage);
         try {
-          await ctx.state.session.subagents.model.set({ modelId: model.id, agentType });
+          await ctx.harness.setSubagentModelId({ modelId: model.id, agentType });
           if (scope === 'global') {
             const settings = loadSettings();
             settings.models.subagentModels[agentType] = model.id;

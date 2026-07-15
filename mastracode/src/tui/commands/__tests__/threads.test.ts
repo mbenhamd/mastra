@@ -58,6 +58,16 @@ function createMessage(id: string, text: string): HarnessMessage {
 function createContext(threads: HarnessThread[]) {
   const showOverlay = vi.fn();
   const trackInteractivePrompt = vi.fn();
+  const harness = {
+    cloneThread: vi.fn(),
+    getCurrentModeId: vi.fn(() => 'build'),
+    getCurrentThreadId: vi.fn(() => null),
+    getFirstUserMessagesForThreads: vi.fn(async () => new Map()),
+    getResourceId: vi.fn(() => 'resource-1'),
+    listThreads: vi.fn(async () => threads),
+    setResourceId: vi.fn(),
+    switchThread: vi.fn(),
+  };
   const state = {
     pendingNewThread: false,
     projectInfo: { rootPath: '/repo', gitBranch: 'main' },
@@ -71,24 +81,12 @@ function createContext(threads: HarnessThread[]) {
     chatContainer: { clear: vi.fn(), addChild: vi.fn(), invalidate: vi.fn() },
     allToolComponents: [] as any[],
     pendingTools: new Map(),
-    session: {
-      identity: { getResourceId: vi.fn(() => 'resource-1') },
-      thread: {
-        getId: vi.fn(() => null),
-        list: vi.fn(async () => threads),
-        firstUserMessages: vi.fn(async () => new Map()),
-      },
-      mode: { get: vi.fn(() => 'build') },
-    },
-    harness: {
-      setResourceId: vi.fn(),
-      switchThread: vi.fn(),
-      cloneThread: vi.fn(),
-    },
+    harness,
   };
 
   const ctx = {
     state,
+    harness,
     analytics: { trackInteractivePrompt },
     showInfo: vi.fn(),
     showError: vi.fn(),
@@ -157,7 +155,7 @@ describe('handleThreadsCommand thread listing', () => {
       updatedAt: new Date('2026-03-17T15:10:00.000Z').getTime(),
     });
     state.attemptedThreadPreviewIds.add('thread-1');
-    state.session.thread.firstUserMessages = vi.fn(
+    state.harness.getFirstUserMessagesForThreads = vi.fn(
       async () => new Map([['thread-1', createMessage('message-1', 'slow')]]),
     );
 
@@ -170,7 +168,7 @@ describe('handleThreadsCommand thread listing', () => {
     await expect(selector.options.getMessagePreviews(['thread-1', 'thread-2'])).resolves.toEqual(
       new Map([['thread-1', 'Cached preview']]),
     );
-    expect(state.session.thread.firstUserMessages).not.toHaveBeenCalled();
+    expect(state.harness.getFirstUserMessagesForThreads).not.toHaveBeenCalled();
     expect(state.threadPreviewCache.get('thread-1')).toEqual({
       preview: 'Cached preview',
       updatedAt: new Date('2026-03-17T15:10:00.000Z').getTime(),

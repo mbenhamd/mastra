@@ -179,7 +179,7 @@ stale approval as authority.
 
 **Suspended on tool execution (`suspend(data)`)**
 
-After hydration: `pendingSuspension` is rehydrated — the *separate* persisted
+After hydration: `pendingSuspension` is rehydrated — the _separate_ persisted
 shape (§5.1), not a relabelled `pendingApproval`. The workflow snapshot
 survives. The external resumer (webhook handler, operator, etc.) calls
 `respondToToolSuspension({ itemId, resumeData })`; harness resumes through the
@@ -289,7 +289,6 @@ a replacement closure or treating the raw task row as completed.
 After hydration: The transaction either committed or it didn't. At-least-once
 for queue items applies as above.
 
-
 **Run correlation state.** `SessionRecord.currentRun` is a narrow projection of
 the active or recently interrupted Harness operation: run id, trace id,
 resource/thread/session ids, the committed mode/model surface, source ids such
@@ -304,125 +303,125 @@ On hydration, the session owner reconciles `currentRun` before accepting new
 durable mutations:
 
 - It validates the persisted runtime identities (`modeId`, `agentId`, `modelId`,
-`toolIds`, `mcpBindingIds`, workspace provider) against current config. For a
-non-terminal `currentRun`, `modeId` is the committed run mode, which may differ
-from the session's default `SessionRecord.modeId` because of a per-turn override
-or skill `defaultMode`; the current config must still contain that mode, that
-mode must resolve to the persisted `agentId`, and that agent must still be
-registered. Missing modes/agents/models/tools, changed mode-to-agent bindings,
-MCP bindings absent from current config, or workspace-provider mismatches fail
-closed: the harness does not call the agent with a silently reduced or
-retargeted runtime surface. Persisted tool identity validation accepts only
-stable registry/config identities; tool names, schemas, metadata-only snapshots,
-or same-named registered substitute tools are not proof that the original
-executable surface survived. Direct non-durable runs are marked
-interrupted/failed, queued admissions stay retryable or fail their
-`QueueAdmissionReceipt` according to policy, and source-specific rows such as
-channel inbox/action/wakeup items retry or dead-letter for operator repair. MCP
-connection health (`connecting`, `connected`, `failed`), transport handles, HTTP
-MCP session IDs, tool counts, resource subscriptions, elicitation handlers,
-progress callbacks, config paths, and stderr buffers are diagnostics for the
-local/operator control plane unless a future source-specific provider persists
-them; they do not weaken this fail-closed identity check and do not become
-Harness recovery state by themselves.
+  `toolIds`, `mcpBindingIds`, workspace provider) against current config. For a
+  non-terminal `currentRun`, `modeId` is the committed run mode, which may differ
+  from the session's default `SessionRecord.modeId` because of a per-turn override
+  or skill `defaultMode`; the current config must still contain that mode, that
+  mode must resolve to the persisted `agentId`, and that agent must still be
+  registered. Missing modes/agents/models/tools, changed mode-to-agent bindings,
+  MCP bindings absent from current config, or workspace-provider mismatches fail
+  closed: the harness does not call the agent with a silently reduced or
+  retargeted runtime surface. Persisted tool identity validation accepts only
+  stable registry/config identities; tool names, schemas, metadata-only snapshots,
+  or same-named registered substitute tools are not proof that the original
+  executable surface survived. Direct non-durable runs are marked
+  interrupted/failed, queued admissions stay retryable or fail their
+  `QueueAdmissionReceipt` according to policy, and source-specific rows such as
+  channel inbox/action/wakeup items retry or dead-letter for operator repair. MCP
+  connection health (`connecting`, `connected`, `failed`), transport handles, HTTP
+  MCP session IDs, tool counts, resource subscriptions, elicitation handlers,
+  progress callbacks, config paths, and stderr buffers are diagnostics for the
+  local/operator control plane unless a future source-specific provider persists
+  them; they do not weaken this fail-closed identity check and do not become
+  Harness recovery state by themselves.
 - It checks `currentRun.nonRehydratableToolSurface` (§5.1). When `true` on a
-non-terminal run (`starting`, `running`, `waiting`, or `resuming`), the run's
-tool surface was bound to process-local executable tools that did not survive
-restart, registry loss, or cache eviction. That includes `addTools` closures and
-any current-code input path that admits per-run toolset/client-tool closures
-without stable persisted tool identities. The harness fails closed by the same path as
-missing runtime identities before model, processor, resume, or tool-call
-execution for that run: any persisted `pendingApproval` / `pendingSuspension` /
-`pendingQuestion` / `pendingPlan` for the run is dropped; any matching
-`InboxResponseReceipt(status: 'accepted')` for the run is advanced to `failed`
-with row `error.code = 'tool_surface_unrehydratable'` (bare
-`HarnessRowErrorCode`, §4.5d) and the resume retry described below is *not*
-attempted; `currentRun.status` is set to `interrupted` with the same bare
-row code on `HarnessRunOperationalState.error.code`; the `error` `TurnEvent`
-projects through §13.3f.1 and is emitted with
-`error.code = 'harness.session_corrupt'` and
-`error.details.reason = 'tool_surface_unrehydratable'` so subscribers can
-distinguish this from the missing-snapshot or runtime-identity branches; and
-any affected operation that already has a signal or queue result boundary
-records `signal_failed` / `queue_failed`. Channel-originated responses also
-advance their `ChannelActionReceipt` to `failed`/`dead` with row
-`lastError.code = 'tool_surface_unrehydratable'` (bare `HarnessRowErrorCode`,
-§4.5d). Typed sync output and typed
-skill calls still have no retry-safe result lookup, admission tombstone, or
-automatic retry path in v1 (§15.1). The flag is
-per-`HarnessRunOperationalState`, so a parent run flagged non-rehydratable does
-not propagate to subagent child runs.
+  non-terminal run (`starting`, `running`, `waiting`, or `resuming`), the run's
+  tool surface was bound to process-local executable tools that did not survive
+  restart, registry loss, or cache eviction. That includes `addTools` closures and
+  any current-code input path that admits per-run toolset/client-tool closures
+  without stable persisted tool identities. The harness fails closed by the same path as
+  missing runtime identities before model, processor, resume, or tool-call
+  execution for that run: any persisted `pendingApproval` / `pendingSuspension` /
+  `pendingQuestion` / `pendingPlan` for the run is dropped; any matching
+  `InboxResponseReceipt(status: 'accepted')` for the run is advanced to `failed`
+  with row `error.code = 'tool_surface_unrehydratable'` (bare
+  `HarnessRowErrorCode`, §4.5d) and the resume retry described below is _not_
+  attempted; `currentRun.status` is set to `interrupted` with the same bare
+  row code on `HarnessRunOperationalState.error.code`; the `error` `TurnEvent`
+  projects through §13.3f.1 and is emitted with
+  `error.code = 'harness.session_corrupt'` and
+  `error.details.reason = 'tool_surface_unrehydratable'` so subscribers can
+  distinguish this from the missing-snapshot or runtime-identity branches; and
+  any affected operation that already has a signal or queue result boundary
+  records `signal_failed` / `queue_failed`. Channel-originated responses also
+  advance their `ChannelActionReceipt` to `failed`/`dead` with row
+  `lastError.code = 'tool_surface_unrehydratable'` (bare `HarnessRowErrorCode`,
+  §4.5d). Typed sync output and typed
+  skill calls still have no retry-safe result lookup, admission tombstone, or
+  automatic retry path in v1 (§15.1). The flag is
+  per-`HarnessRunOperationalState`, so a parent run flagged non-rehydratable does
+  not propagate to subagent child runs.
 - It resolves the workspace according to §2.7 before accepting
-workspace-dependent runtime work. For persisted `per-session` workspaces, the
-recovery path first checks `SessionRecord.workspace.lostAt`; when set, it
-fails closed with `HarnessWorkspaceLostError` (using the stored `lostReason`
-when present) without reading `state` or calling `provider.resume(...)` —
-the `lostAt`-first ordering prevents a stale `state` blob from being fed to
-a provider that has already abandoned the workspace. When `lostAt` is unset
-and `durability` is `'durable'`, recovery uses the persisted
-`SessionRecord.workspace.state` and optional `generation` with
-`provider.resume(...)`; `provider.create(...)` is never a recovery path for
-an existing active session. Provider mismatch for a durable workspace uses
-`HarnessWorkspaceProviderMismatchError`. Missing durable state, permanent resume
-failure, destroyed provider generation, or a previously materialised ephemeral
-workspace after restart/eviction fail closed with `HarnessWorkspaceLostError`;
-for stored `durability: 'ephemeral'`, this workspace-lost branch runs before any
-provider-id matching, including factory-shorthand diagnostic IDs. Direct
-interactive work fails immediately; queued/channel/wakeup work remains retryable
-or dead-letters according to the owning source row because the session owner
-cannot rebuild the required runtime surface. Transient provider unavailability
-may retry, but the harness still must not run the agent with a substitute
-workspace.
+  workspace-dependent runtime work. For persisted `per-session` workspaces, the
+  recovery path first checks `SessionRecord.workspace.lostAt`; when set, it
+  fails closed with `HarnessWorkspaceLostError` (using the stored `lostReason`
+  when present) without reading `state` or calling `provider.resume(...)` —
+  the `lostAt`-first ordering prevents a stale `state` blob from being fed to
+  a provider that has already abandoned the workspace. When `lostAt` is unset
+  and `durability` is `'durable'`, recovery uses the persisted
+  `SessionRecord.workspace.state` and optional `generation` with
+  `provider.resume(...)`; `provider.create(...)` is never a recovery path for
+  an existing active session. Provider mismatch for a durable workspace uses
+  `HarnessWorkspaceProviderMismatchError`. Missing durable state, permanent resume
+  failure, destroyed provider generation, or a previously materialised ephemeral
+  workspace after restart/eviction fail closed with `HarnessWorkspaceLostError`;
+  for stored `durability: 'ephemeral'`, this workspace-lost branch runs before any
+  provider-id matching, including factory-shorthand diagnostic IDs. Direct
+  interactive work fails immediately; queued/channel/wakeup work remains retryable
+  or dead-letters according to the owning source row because the session owner
+  cannot rebuild the required runtime surface. Transient provider unavailability
+  may retry, but the harness still must not run the agent with a substitute
+  workspace.
 - It validates `currentRun.runtimeCompatibilityGeneration` against
-`HarnessConfig.runtimeCompatibilityGeneration` for non-terminal runs. When the
-run snapshot carries a generation and the current config generation differs —
-including when the run has one but current config omits it — the runtime surface
-has drifted. The harness fails closed by the same path as missing runtime
-identities: any persisted `pendingApproval` / `pendingSuspension` /
-`pendingQuestion` / `pendingPlan` for the run is dropped; any matching
-`InboxResponseReceipt(status: 'accepted')` for the run is advanced to `failed`
-and any channel-originated `ChannelActionReceipt` is advanced to `failed`/`dead`
-with row `error.code = 'runtime_dependency_drifted'` (bare
-`HarnessRowErrorCode`, §4.5d); `currentRun.status` is set to `interrupted`
-with the same bare row code on `HarnessRunOperationalState.error.code`; the
-`error` `TurnEvent` projects through §13.3f.1 and is emitted with
-`error.code = 'harness.runtime_drift'` and `error.details.missingRefs` /
-`error.details.driftedRefs` populated when known; and per-signal terminal
-correlation records
-`signal_failed` / `queue_failed` for the affected operation. When the run
-snapshot has no generation, hydration falls back to ID-only validation (legacy
-behavior). The guard applies per-run and does not clear `pendingQueue`: after
-`currentRun` is terminalized, subsequent queued items drain under the current
-config generation.
+  `HarnessConfig.runtimeCompatibilityGeneration` for non-terminal runs. When the
+  run snapshot carries a generation and the current config generation differs —
+  including when the run has one but current config omits it — the runtime surface
+  has drifted. The harness fails closed by the same path as missing runtime
+  identities: any persisted `pendingApproval` / `pendingSuspension` /
+  `pendingQuestion` / `pendingPlan` for the run is dropped; any matching
+  `InboxResponseReceipt(status: 'accepted')` for the run is advanced to `failed`
+  and any channel-originated `ChannelActionReceipt` is advanced to `failed`/`dead`
+  with row `error.code = 'runtime_dependency_drifted'` (bare
+  `HarnessRowErrorCode`, §4.5d); `currentRun.status` is set to `interrupted`
+  with the same bare row code on `HarnessRunOperationalState.error.code`; the
+  `error` `TurnEvent` projects through §13.3f.1 and is emitted with
+  `error.code = 'harness.runtime_drift'` and `error.details.missingRefs` /
+  `error.details.driftedRefs` populated when known; and per-signal terminal
+  correlation records
+  `signal_failed` / `queue_failed` for the affected operation. When the run
+  snapshot has no generation, hydration falls back to ID-only validation (legacy
+  behavior). The guard applies per-run and does not clear `pendingQueue`: after
+  `currentRun` is terminalized, subsequent queued items drain under the current
+  config generation.
 - It rebuilds `currentRun.pendingItems` from the authoritative pending fields on
   `SessionRecord`; persisted quick-inspection entries that are extra, missing,
   or wrong-kind are ignored.
 - If exactly one persisted pending approval/suspension/question/plan points at
-the same `runId`, `currentRun.status` becomes `waiting` and the pending item
-field remains authoritative. If more than one points at the same `runId`, the
-corrupted pending-state branch above runs before snapshots, pending inbox
-projection, outbox prompt projection, or response routes expose the ambiguous
-state.
+  the same `runId`, `currentRun.status` becomes `waiting` and the pending item
+  field remains authoritative. If more than one points at the same `runId`, the
+  corrupted pending-state branch above runs before snapshots, pending inbox
+  projection, outbox prompt projection, or response routes expose the ambiguous
+  state.
 - If an accepted `InboxResponseReceipt` exists for the run, `currentRun.status`
-remains `resuming` and recovery retries the resume with the persisted
-`resumeAttemptId` through the §4.2 Required Agent Resume Boundary before
-exposing the run as idle. If the boundary returns the same attempt as already
-applied, recovery records `applied` without resuming the run again; if the
-pending kind is unsupported, recovery terminalizes the receipt instead of
-attempting a weaker resume.
+  remains `resuming` and recovery retries the resume with the persisted
+  `resumeAttemptId` through the §4.2 Required Agent Resume Boundary before
+  exposing the run as idle. If the boundary returns the same attempt as already
+  applied, recovery records `applied` without resuming the run again; if the
+  pending kind is unsupported, recovery terminalizes the receipt instead of
+  attempting a weaker resume.
 - If a queue receipt is `queued`, `admitting`, or retryable `admission_failed`
-and has no `signalId`, queue recovery retries the same admission key. If it is
-`accepted` with `runId` / `signalId`, recovery reconciles that accepted run and
-`currentRun` must not convert it into a fresh signal.
+  and has no `signalId`, queue recovery retries the same admission key. If it is
+  `accepted` with `runId` / `signalId`, recovery reconciles that accepted run and
+  `currentRun` must not convert it into a fresh signal.
 - If an active goal exists, recovery compares the latest assistant-turn cursor
   with `GoalState.lastDecision.source`. A matching receipt is honored before
   any new judge call, including repairing a missing continuation queue append
   with the stored `continuation.admissionId`.
 - If the agent/thread store proves the run completed or failed, the owner writes
-terminal metadata and clears the active pointer when no pending interaction
-remains.
+  terminal metadata and clears the active pointer when no pending interaction
+  remains.
 - If neither pending state nor agent-layer liveness can justify continuing a
-non-terminal `currentRun`, the owner marks it `interrupted`; direct interactive
-messages that were not yet signal-accepted before the crash keep the weaker
-pre-acceptance durability semantics described above, while accepted signals
-still follow the terminal result rules in this section.
+  non-terminal `currentRun`, the owner marks it `interrupted`; direct interactive
+  messages that were not yet signal-accepted before the crash keep the weaker
+  pre-acceptance durability semantics described above, while accepted signals
+  still follow the terminal result rules in this section.

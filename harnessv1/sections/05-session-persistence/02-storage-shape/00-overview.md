@@ -188,6 +188,7 @@ authoritative):
     <path style="stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#ah-storage-shape);" d="M180 236 L180 464" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-storage-shape);" d="M305 363 L364 477" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-storage-shape);" d="M520 401 L520 454" />
+
   </svg>
   <figcaption>The harness storage view owns durable session rows and composes source-specific work, memory rows, replay, and blob bytes through their canonical owners.</figcaption>
 </figure>

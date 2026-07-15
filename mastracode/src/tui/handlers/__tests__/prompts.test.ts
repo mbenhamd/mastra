@@ -8,9 +8,9 @@ import type { EventHandlerContext } from '../types.js';
 function createCtx() {
   const answerQuestion = vi.fn().mockResolvedValue('Verified');
   const state = createMockState({
-    session: {
+    harness: {
       respondToToolSuspension: vi.fn(),
-      displayState: { get: vi.fn(() => ({ isRunning: false })) },
+      getDisplayState: vi.fn(() => ({ isRunning: false })),
     },
     extra: {
       goalManager: {
@@ -54,7 +54,7 @@ describe('handleAskQuestion goal mode', () => {
 
     expect(answerQuestion).not.toHaveBeenCalled();
     expect(state.activeInlineQuestion).toBeDefined();
-    expect(state.session.respondToToolSuspension).not.toHaveBeenCalled();
+    expect(state.harness.respondToToolSuspension).not.toHaveBeenCalled();
     expect(ctx.addChildBeforeFollowUps).not.toHaveBeenCalled();
     expect(state.activeGoalJudge).toBeUndefined();
 
@@ -78,7 +78,7 @@ describe('handleAskQuestion goal mode', () => {
 
     await promise;
 
-    expect(state.session.respondToToolSuspension).toHaveBeenCalledWith({
+    expect(state.harness.respondToToolSuspension).toHaveBeenCalledWith({
       toolCallId: 'q1',
       resumeData: ['React', 'Svelte'],
     });
@@ -108,9 +108,9 @@ function createPlanApprovalCtx() {
   });
   const state = {
     ...createMockState({
-      session: {
-        state: { set: vi.fn().mockResolvedValue(undefined) },
-        identity: { getResourceId: vi.fn(() => 'resource-1') },
+      harness: {
+        setState: vi.fn().mockResolvedValue(undefined),
+        getResourceId: vi.fn(() => 'resource-1'),
         respondToToolSuspension: vi.fn().mockResolvedValue(undefined),
         sendSignal,
       },
@@ -154,7 +154,7 @@ describe('handlePlanApproval goal mode', () => {
     await (component as any).onGoal();
     await promise;
 
-    expect(state.session.respondToToolSuspension).toHaveBeenCalledWith({
+    expect(state.harness.respondToToolSuspension).toHaveBeenCalledWith({
       toolCallId: 'plan-1',
       resumeData: { action: 'approved' },
     });
@@ -168,7 +168,7 @@ describe('handlePlanApproval goal mode', () => {
     expect(ctx.fireMessage).not.toHaveBeenCalled();
     // The goal handler does not send the "begin executing" reminder — the
     // goal judge keeps the agent driving toward the goal.
-    expect(state.session.sendSignal).not.toHaveBeenCalled();
+    expect(state.harness.sendSignal).not.toHaveBeenCalled();
     expect(state.planStartedGoalId).toBe('goal-123');
   });
 
@@ -212,7 +212,7 @@ describe('handlePlanApproval regular approval', () => {
     await (component as any).onApprove();
     await promise;
 
-    expect(state.session.respondToToolSuspension).toHaveBeenCalledWith({
+    expect(state.harness.respondToToolSuspension).toHaveBeenCalledWith({
       toolCallId: 'plan-1',
       resumeData: { action: 'approved' },
     });

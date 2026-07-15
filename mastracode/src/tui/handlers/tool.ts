@@ -29,12 +29,12 @@ type ToolApprovalResponseSurface = {
   respondToToolApproval: (opts: {
     toolCallId?: string;
     decision: 'approve' | 'decline' | 'always_allow_category';
+    reason?: string;
   }) => void;
 };
 
 function getCurrentModeColor(ctx: EventHandlerContext): string | undefined {
-  const color = ctx.state.session?.mode?.resolve?.()?.metadata?.color;
-  return typeof color === 'string' ? color : undefined;
+  return ctx.state.harness.getCurrentMode().color;
 }
 
 export function isTaskMutationTool(toolName: string): boolean {
@@ -175,6 +175,7 @@ export function handleToolApprovalRequired(
     (state.harness as typeof state.harness & ToolApprovalResponseSurface).respondToToolApproval({
       toolCallId,
       decision: 'decline',
+      reason: declineContext?.message ?? declineContext?.reason,
     });
   };
 
@@ -377,7 +378,7 @@ export function handleToolInputStart(ctx: EventHandlerContext, toolCallId: strin
  */
 export function handleToolInputDelta(ctx: EventHandlerContext, toolCallId: string, _argsTextDelta: string): void {
   const { state } = ctx;
-  const ds = state.session.displayState.get();
+  const ds = state.harness.getDisplayState();
   const buffer = ds.toolInputBuffers.get(toolCallId);
   if (buffer === undefined) return;
 

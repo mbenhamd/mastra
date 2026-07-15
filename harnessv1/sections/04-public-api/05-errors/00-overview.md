@@ -59,8 +59,9 @@ authoritative):
   <path d="M 575 126 L 715 145" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-errors)"/>
   <path d="M 375 126 L 715 145" fill="none" stroke="#94a3b8" stroke-width="1.1" stroke-dasharray="4 2" marker-end="url(#ah-errors)"/>
 
-  <text x="450" y="280" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">4.5 — Error families</text>
+<text x="450" y="280" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">4.5 — Error families</text>
 </svg>
+
 <figcaption>Harness error families and how wire-representable classes reach the wire envelope; §4.5 owns the typed class definitions and §13.3 owns the wire code and details mapping.</figcaption>
 </figure>
 

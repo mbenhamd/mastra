@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
+import { createWorkflow } from '../create';
 import type { SerializedStepFlowEntry, WorkflowRunState, WorkflowTerminalEffectRecord } from '../types';
-import { createStep, createWorkflow } from '../workflow';
+import { createStep } from '../workflow';
 import { getWorkflowTerminalEffectIntegrity } from './effect-integrity';
 import { MAX_TERMINAL_LOOP_ITERATIONS } from './graph-fingerprint';
 import {

@@ -89,6 +89,7 @@ remain authoritative for state names, transitions, and field detail):
     <path style="stroke: #94a3b8; stroke-width: 1.8; fill: none; stroke-dasharray: 5 5; marker-end: url(#ah-bg-wakeup-run);" d="M685 200 C685 380 685 405 685 411" />
 
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="40" y="528">Background task rows: reconstructable rows persist trusted owner + executor/policy refs; closure-backed diagnostic rows fail closed after restart and surface through the owning Harness row.</text>
+
   </svg>
   <figcaption>Run and wakeup rows have separate state machines; persisted attachments anchor durable inputs across all admission row families; background-task rows that lack reconstructable refs remain diagnostic only.</figcaption>
 </figure>

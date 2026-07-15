@@ -15,7 +15,8 @@ import { createSharedAgent, runLoopScenario, useLoopScenarioAimock, describeForA
  *
  * Regression classes:
  * - Declined `requireApproval` tool is recorded as `output-denied` (not executed), with the
- *   not-approved reason on its approval metadata, and emits no tool-result (issue #17218)
+ *   not-approved reason on its approval metadata, while public streams retain one compatible
+ *   denial tool-result (issue #17218)
  * - Agent can retry the declined tool in a subsequent turn
  * - Second approval succeeds and tool executes with correct arguments
  * - Shared storage preserves thread context across decline/retry cycles
@@ -216,14 +217,21 @@ describeForAllEngines(
       for await (const chunk of declineResult.fullStream) {
         declineChunks.push(chunk);
       }
-      // A declined tool no longer emits a tool-result chunk: it is persisted as `output-denied`
-      // with the not-approved reason on its approval metadata (issue #17218). So it must NOT
-      // surface as a live tool-result...
+      // Persisted history uses the approval-specific `output-denied` state, while the public
+      // stream/toolResults contract retains one denial result for compatibility (issue #17218).
       const toolResults = await declineResult.toolResults;
       const sensResult = toolResults?.find((r: any) => r.payload.toolName === 'sensitive-op');
-      expect(sensResult).toBeUndefined();
+      expect(sensResult?.payload.result).toBe('Tool call was not approved by the user');
+      expect(
+        declineChunks.filter(
+          chunk =>
+            chunk.type === 'tool-result' &&
+            chunk.payload.toolName === 'sensitive-op' &&
+            chunk.payload.result === 'Tool call was not approved by the user',
+        ),
+      ).toHaveLength(1);
 
-      // ...and the recalled invocation must carry the decline as `output-denied` + the reason.
+      // The recalled invocation must still carry the decline as `output-denied` + the reason.
       const { messages } = await sharedMemory.recall({ threadId, resourceId });
       const declined = messages
         .flatMap((m: any) => m.content?.parts ?? [])

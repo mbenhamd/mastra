@@ -943,6 +943,12 @@ describe('Harness: tool suspension and resumption', () => {
     events.length = 0;
 
     const hold = deferred();
+    vi.spyOn(registeredAgent, 'subscribeToThread').mockResolvedValue({
+      stream: (async function* () {})() as any,
+      unsubscribe: vi.fn(),
+      abort: vi.fn(),
+      activeRunId: () => null,
+    });
     vi.spyOn(registeredAgent, 'resumeStream').mockResolvedValue({
       fullStream: (async function* () {
         yield { type: 'start', runId: 'retargeted-active-run' };
@@ -1017,17 +1023,16 @@ describe('Harness: tool suspension and resumption', () => {
         await new Promise(() => {});
       })(),
     } as any);
-    const sendSignalSpy = vi.spyOn(registeredAgent, 'sendSignal').mockReturnValue({
-      accepted: true,
+    const queueMessageSpy = vi.spyOn(registeredAgent, 'queueMessage').mockReturnValue({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'follow-up-run' }),
       runId: 'follow-up-run',
       signal: {} as any,
     });
-    let activeRunId: string | null = suspendedRunId;
     const subscribeSpy = vi.spyOn(registeredAgent, 'subscribeToThread').mockResolvedValue({
       stream: (async function* () {})() as any,
       unsubscribe: vi.fn(),
       abort: vi.fn(),
-      activeRunId: () => activeRunId,
+      activeRunId: () => suspendedRunId,
     });
 
     const resume = harness.respondToToolSuspension({ resumeData: { confirmed: true } });
@@ -1039,11 +1044,7 @@ describe('Harness: tool suspension and resumption', () => {
     harness.abort();
 
     await waitFor(() => subscribeSpy.mock.calls.length > 0);
-    await new Promise(resolve => setTimeout(resolve, 0));
-    expect(sendSignalSpy).not.toHaveBeenCalled();
-
-    activeRunId = null;
-    await waitForWithTimers(() => sendSignalSpy.mock.calls.length === 1);
+    await waitForWithTimers(() => queueMessageSpy.mock.calls.length === 1);
     expect(harness.getFollowUpCount()).toBe(0);
     await resume;
     expect((harness as any).resumingSuspensionRunIds.size).toBe(0);
@@ -1101,8 +1102,8 @@ describe('Harness: tool suspension and resumption', () => {
       })(),
     } as any);
     const abortRunStreamSpy = vi.spyOn(registeredAgent, 'abortRunStream').mockReturnValue(true);
-    const sendSignalSpy = vi.spyOn(registeredAgent, 'sendSignal').mockReturnValue({
-      accepted: true,
+    const queueMessageSpy = vi.spyOn(registeredAgent, 'queueMessage').mockReturnValue({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'follow-up-run' }),
       runId: 'follow-up-run',
       signal: {} as any,
     });
@@ -1119,10 +1120,10 @@ describe('Harness: tool suspension and resumption', () => {
     await harness.followUp({ content: 'continue after abort' });
     harness.abort();
 
-    await waitFor(() => sendSignalSpy.mock.calls.length === 1);
+    await waitFor(() => queueMessageSpy.mock.calls.length === 1);
     expect(abortRunStreamSpy).toHaveBeenCalledWith(suspendedRunId);
-    expect(abortRunStreamSpy.mock.invocationCallOrder[0]).toBeLessThan(sendSignalSpy.mock.invocationCallOrder[0]!);
-    expect(sendSignalSpy.mock.calls[0]?.[1]).toMatchObject({ ifIdle: expect.any(Object) });
+    expect(abortRunStreamSpy.mock.invocationCallOrder[0]).toBeLessThan(queueMessageSpy.mock.invocationCallOrder[0]!);
+    expect(queueMessageSpy.mock.calls[0]?.[1]).toMatchObject({ ifIdle: expect.any(Object) });
 
     await resume;
     expect((harness as any).resumingSuspensionRunIds.size).toBe(0);
@@ -1776,6 +1777,12 @@ describe('Harness: tool suspension and resumption', () => {
     const resumeStarted = deferred();
     const admit = deferred();
     const hold = deferred();
+    vi.spyOn(registeredAgent, 'subscribeToThread').mockResolvedValue({
+      stream: (async function* () {})() as any,
+      unsubscribe: vi.fn(),
+      abort: vi.fn(),
+      activeRunId: () => null,
+    });
     vi.spyOn(registeredAgent, 'resumeStream').mockImplementation(async () => {
       resumeStarted.resolve();
       await admit.promise;

@@ -1464,12 +1464,6 @@ export class Mastra<
       if (pubsubModes.includes('pull')) {
         defaultWorkers.push(new OrchestrationWorker());
       }
-      // Scheduler needs storage to read schedules from. Without it the worker
-      // would crash on startup (`deps.storage.getStore` on undefined). Match the
-      // pre-worker scheduler behavior: silently skip when storage isn't configured.
-      if (config?.storage) {
-        defaultWorkers.push(new SchedulerWorker(config?.scheduler));
-      }
       if (config?.backgroundTasks?.enabled) {
         defaultWorkers.push(new BackgroundTaskWorker(config.backgroundTasks));
       }

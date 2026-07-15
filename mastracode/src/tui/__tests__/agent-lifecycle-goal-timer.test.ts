@@ -62,7 +62,7 @@ describe('agent lifecycle goal timing', () => {
   it('stops active goal timing when an agent completes normally', () => {
     const state = createState({
       pendingTaskToolIds: new Set(),
-      session: { followUps: { count: vi.fn(() => 0) } },
+      harness: { getFollowUpCount: vi.fn(() => 0) },
     } as unknown as Partial<TUIState>);
 
     const ctx = {

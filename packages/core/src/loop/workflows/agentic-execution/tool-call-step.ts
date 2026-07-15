@@ -523,16 +523,16 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           resumeDataFromArgs = resumeDataFromInput;
         }
 
-        const resumeData = resumeDataFromArgs !== undefined ? resumeDataFromArgs : workflowResumeData;
+        let resumeData = resumeDataFromArgs !== undefined ? resumeDataFromArgs : workflowResumeData;
 
-        const isResumeToolCall = resumeDataFromArgs !== undefined;
+        let isResumeToolCall = resumeDataFromArgs !== undefined;
         const isAgentTool = inputData.toolName?.startsWith('agent-');
         const isWorkflowTool = inputData.toolName?.startsWith('workflow-');
         const suspendedToolCallId =
           isResumeToolCall && typeof args?.suspendedToolCallId === 'string' && args.suspendedToolCallId.length > 0
             ? args.suspendedToolCallId
             : undefined;
-        if (suspendedToolCallId !== undefined) {
+        if (args && typeof args === 'object' && Object.hasOwn(args, 'suspendedToolCallId')) {
           const { suspendedToolCallId: _suspendedToolCallId, ...argsWithoutCallId } = args;
           args = argsWithoutCallId;
         }
@@ -540,7 +540,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           isResumeToolCall && typeof args?.suspendedToolRunId === 'string' && args.suspendedToolRunId.length > 0
             ? args.suspendedToolRunId
             : undefined;
-        if (suppliedSuspendedToolRunId !== undefined) {
+        if (args && typeof args === 'object' && Object.hasOwn(args, 'suspendedToolRunId')) {
           const { suspendedToolRunId: _suspendedToolRunId, ...argsWithoutRunId } = args;
           args = argsWithoutRunId;
         }
@@ -685,6 +685,23 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const hasAuthoritativeResumeEnvelope = authoritativeResumeEnvelope !== undefined;
         const authoritativeIdentityMatches =
           hasAuthoritativeResumeEnvelope && matchesExpectedResumeIdentity(authoritativeResumeEnvelope);
+        // Some providers materialize optional workflow/agent-tool control fields
+        // as null on a fresh call. Null is also a valid resumed tool payload, so
+        // normalize it only when no durable or caller-supplied resume identity
+        // exists. Non-null values and calls naming a suspended run/call remain
+        // fail-closed below.
+        const isEvidenceFreeNullResumePlaceholder =
+          isResumeToolCall &&
+          resumeDataFromArgs === null &&
+          workflowResumeData === undefined &&
+          suspendedToolCallId === undefined &&
+          suppliedSuspendedToolRunId === undefined &&
+          !hasAuthoritativeResumeEnvelope &&
+          storedResumeMetadata === undefined;
+        if (isEvidenceFreeNullResumePlaceholder) {
+          resumeData = undefined;
+          isResumeToolCall = false;
+        }
         const authoritativeResumeType = authoritativeIdentityMatches
           ? (authoritativeResumeEnvelope as { type?: unknown }).type
           : undefined;
@@ -815,7 +832,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // defers entirely to the tool's own approval config.
         const toolPermissionPolicy = (
           requestContext.get('__mastra_toolPermissionPolicy') as
-            ((toolName: string) => 'allow' | 'ask' | 'deny') | undefined
+            | ((toolName: string) => 'allow' | 'ask' | 'deny')
+            | undefined
         )?.(inputData.toolName);
         if (toolPermissionPolicy === 'deny') {
           // §O4 — surface WHY a tool was blocked (action-time deny is otherwise
@@ -1181,7 +1199,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             if (suspendedToolRunId) break;
             const suspendedTools = message.content.metadata?.suspendedTools as Record<string, any> | undefined;
             const pendingToolApprovals = message.content.metadata?.pendingToolApprovals as
-              Record<string, any> | undefined;
+              | Record<string, any>
+              | undefined;
             const pendingOrSuspendedTools =
               suspendedTools || pendingToolApprovals
                 ? { ...(pendingToolApprovals ?? {}), ...(suspendedTools ?? {}) }

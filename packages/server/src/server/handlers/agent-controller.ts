@@ -61,6 +61,11 @@ function getAgentControllerOrThrow(
   return controller;
 }
 
+/** @internal Stable, injective identity for a resource/scope session pair. */
+export function createAgentControllerSessionId(resourceId: string, scope?: string): string {
+  return `agent-controller-session:v1:${JSON.stringify([resourceId, scope ?? null])}`;
+}
+
 async function getSession(
   controller: AgentController<any>,
   resourceId: string,
@@ -68,10 +73,10 @@ async function getSession(
 ): Promise<Session<any>> {
   await controller.init();
   const { tags, scope } = options ?? {};
-  // Scoped sessions are independent sessions over the same resource (e.g. one
-  // per git worktree), so qualify the stable session id with the scope to keep
-  // their identities distinct as well.
-  const id = scope ? `${resourceId}::${scope}` : resourceId;
+  // Encode the tuple rather than joining it with a delimiter: resource and
+  // scope are user-controlled strings, so delimiter-shaped values must remain
+  // distinct session identities.
+  const id = createAgentControllerSessionId(resourceId, scope);
   return controller.createSession({ resourceId, id, ownerId: controller.id, tags, scope });
 }
 

@@ -6,8 +6,8 @@ function formatDateWithLocal(date: Date): string {
 
 export async function handleThreadCommand(ctx: SlashCommandContext): Promise<void> {
   const { state } = ctx;
-  const currentThreadId = state.session.thread.getId();
-  const currentResourceId = state.session.identity.getResourceId();
+  const currentThreadId = state.harness.getCurrentThreadId();
+  const currentResourceId = state.harness.getResourceId();
   const isPendingNewThread = state.pendingNewThread;
 
   if (!currentThreadId) {
@@ -21,7 +21,7 @@ export async function handleThreadCommand(ctx: SlashCommandContext): Promise<voi
     return;
   }
 
-  const threads = await state.session.thread.list({ allResources: true });
+  const threads = await state.harness.listThreads({ allResources: true });
   const thread = threads.find(t => t.id === currentThreadId);
 
   const cloneMetadata =

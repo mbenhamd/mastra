@@ -276,11 +276,12 @@ describe('Agent FGA checks', () => {
     });
 
     it('should still run local calls without a user when no FGA provider is configured', async () => {
-      const mastra = createMockMastra();
       const model = createMockModel();
 
+      // An unattached agent uses the native ephemeral Mastra runtime, which has
+      // no FGA provider and exercises the local-call boundary without a partial
+      // Mastra test double that cannot own internal workflow registrations.
       const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
-      (agent as any).__registerMastra(mastra);
 
       await agent.generate('test');
 
@@ -456,15 +457,14 @@ describe('Agent FGA checks', () => {
     });
 
     it('should still run local calls without a user when no FGA provider is configured', async () => {
-      const mastra = createMockMastra();
-
+      // Keep this on the native ephemeral runtime for the same reason as the
+      // generate() coverage above: successful execution owns internal workflows.
       const agent = new Agent({
         id: 'test-agent',
         name: 'test-agent',
         instructions: 'test',
         model: createMockModel(),
       });
-      (agent as any).__registerMastra(mastra);
 
       await agent.stream('test');
     });
@@ -1465,9 +1465,13 @@ describe('Agent FGA checks', () => {
       });
 
       expect(fgaProvider.require).toHaveBeenCalledTimes(1);
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should authorize merged resumeStreamUntilIdle options when caller memory overrides defaults', async () => {
@@ -1607,9 +1611,13 @@ describe('Agent FGA checks', () => {
         id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
       });
 
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should reject callers whose resource does not own the suspended generate run', async () => {

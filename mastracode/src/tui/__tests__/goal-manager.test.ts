@@ -34,12 +34,12 @@ function makeRecord(overrides: Record<string, unknown> = {}) {
 
 function createState(agent?: FakeAgent, threadId: string | undefined = 'parent-thread'): TUIState {
   return {
-    session: {
-      identity: { getResourceId: vi.fn(() => 'resource-1') },
-      thread: { getId: vi.fn(() => threadId), setSetting: vi.fn().mockResolvedValue(undefined) },
-    },
     harness: {
-      getCurrentAgent: vi.fn(() => agent),
+      getCurrentMode: vi.fn(() => ({ agent })),
+      getCurrentThreadId: vi.fn(() => threadId),
+      getResourceId: vi.fn(() => 'resource-1'),
+      getState: vi.fn(() => ({})),
+      setThreadSetting: vi.fn().mockResolvedValue(undefined),
     },
   } as unknown as TUIState;
 }
@@ -232,6 +232,6 @@ describe('GoalManager adapter', () => {
         pausedReason: 'Judge evaluation was interrupted.',
       }),
     );
-    expect(state.session.thread.setSetting).toHaveBeenCalledWith({ key: 'goal', value: undefined });
+    expect(state.harness.setThreadSetting).toHaveBeenCalledWith({ key: 'goal', value: undefined });
   });
 });

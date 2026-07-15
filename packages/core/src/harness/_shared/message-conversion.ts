@@ -7,7 +7,7 @@
  *
  * No `this`-coupling, no harness state — pure function over an input row.
  */
-import { mastraDBMessageToSignal } from '../../agent/signals';
+import { mastraDBMessageToSignal, signalContentsToParts, signalContentsToText } from '../../agent/signals';
 import type { MastraDBMessage } from '../../agent/types';
 import type { HarnessMessage, HarnessMessageContent } from '../types';
 
@@ -56,37 +56,18 @@ function getRecordValue(value: unknown): Record<string, unknown> | undefined {
 }
 
 function signalContentsToHarnessContent(contents: unknown): HarnessMessageContent[] {
-  if (typeof contents === 'string') return [{ type: 'text', text: contents }];
-  if (Array.isArray(contents)) return contents.flatMap(signalContentsToHarnessContent);
-  if (!contents || typeof contents !== 'object') return [];
-
-  const content = (contents as { content?: unknown }).content;
-  if (typeof content === 'string') return [{ type: 'text', text: content }];
-  if (Array.isArray(content)) {
-    return content.flatMap((part): HarnessMessageContent[] => {
-      const record = getRecordValue(part);
-      if (!record) return [];
-      if (record.type === 'text' && typeof record.text === 'string') {
-        return [{ type: 'text', text: record.text }];
-      }
-      if (record.type === 'file' && typeof record.data === 'string' && typeof record.mediaType === 'string') {
-        if (record.mediaType.startsWith('image/')) {
-          return [{ type: 'image', data: record.data, mimeType: record.mediaType }];
-        }
-        return [
-          {
-            type: 'file',
-            data: record.data,
-            mediaType: record.mediaType,
-            filename: typeof record.filename === 'string' ? record.filename : undefined,
-          },
-        ];
-      }
-      return [];
-    });
-  }
-
-  return [];
+  return signalContentsToParts(contents).map((part): HarnessMessageContent => {
+    if (part.type === 'text') return { type: 'text', text: part.text };
+    if (part.mediaType.startsWith('image/')) {
+      return { type: 'image', data: part.data, mimeType: part.mediaType };
+    }
+    return {
+      type: 'file',
+      data: part.data,
+      mediaType: part.mediaType,
+      filename: part.filename,
+    };
+  });
 }
 
 function toSystemReminderContent(
@@ -94,8 +75,8 @@ function toSystemReminderContent(
 ): Extract<HarnessMessageContent, { type: 'system_reminder' }> | undefined {
   const attributes = getRecordValue(payload.attributes);
   const metadata = getRecordValue(payload.metadata);
-  const message = getStringValue(payload.contents) ?? getStringValue(payload.message);
-  if (message === undefined) return undefined;
+  const message = signalContentsToText(payload.contents) || getStringValue(payload.message);
+  if (!message) return undefined;
 
   return {
     type: 'system_reminder',
@@ -139,6 +120,89 @@ function toUserSignalMessage(payload: Record<string, unknown>): HarnessMessage |
     role: 'user',
     content,
     createdAt: new Date(getStringValue(payload.createdAt) ?? Date.now()),
+  };
+}
+
+function toStateSignalContent(
+  payload: Record<string, unknown>,
+): Extract<HarnessMessageContent, { type: 'state_signal' }> {
+  const stateMetadata = getRecordValue(getRecordValue(payload.metadata)?.state);
+  const stateId = getStringValue(stateMetadata?.id) ?? getStringValue(payload.tagName) ?? 'state';
+
+  return {
+    type: 'state_signal',
+    id: getStringValue(payload.id),
+    stateId,
+    mode: stateMetadata?.mode === 'delta' ? 'delta' : 'snapshot',
+    cacheKey: getStringValue(stateMetadata?.cacheKey),
+    version: typeof stateMetadata?.version === 'number' ? stateMetadata.version : undefined,
+    message: signalContentsToText(payload.contents),
+  };
+}
+
+function toNotificationSummaryContent(
+  payload: Record<string, unknown>,
+): Extract<HarnessMessageContent, { type: 'notification_summary' }> {
+  const metadataSummary = getRecordValue(getRecordValue(payload.metadata)?.notificationSummary);
+  const bySource = getRecordValue(metadataSummary?.bySource) ?? {};
+  const byPriority = getRecordValue(metadataSummary?.byPriority) ?? {};
+  const notificationIds = Array.isArray(metadataSummary?.notificationIds)
+    ? metadataSummary.notificationIds.filter((id): id is string => typeof id === 'string')
+    : [];
+  const pending = typeof metadataSummary?.pending === 'number' ? metadataSummary.pending : undefined;
+
+  return {
+    type: 'notification_summary',
+    id: getStringValue(payload.id),
+    message: signalContentsToText(payload.contents),
+    pending: pending ?? notificationIds.length,
+    bySource: Object.fromEntries(
+      Object.entries(bySource).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
+    ),
+    byPriority: Object.fromEntries(
+      Object.entries(byPriority).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
+    ),
+    notificationIds,
+  };
+}
+
+function toReactiveSignalContent(
+  payload: Record<string, unknown>,
+): Extract<HarnessMessageContent, { type: 'reactive_signal' }> | undefined {
+  const tagName = getStringValue(payload.tagName);
+  if (!tagName) return undefined;
+
+  return {
+    type: 'reactive_signal',
+    id: getStringValue(payload.id),
+    tagName,
+    message: signalContentsToText(payload.contents),
+    attributes: getRecordValue(payload.attributes),
+    metadata: getRecordValue(payload.metadata),
+  };
+}
+
+function toNotificationContent(
+  payload: Record<string, unknown>,
+): Extract<HarnessMessageContent, { type: 'notification' }> | undefined {
+  const attributes = getRecordValue(payload.attributes) ?? {};
+  const metadata = getRecordValue(payload.metadata) ?? {};
+  const notificationMetadata = getRecordValue(metadata.notification);
+  const message = signalContentsToText(payload.contents);
+  if (!message) return undefined;
+
+  return {
+    type: 'notification',
+    id: getStringValue(payload.id),
+    notificationId: getStringValue(attributes.id) ?? getStringValue(notificationMetadata?.recordId),
+    message,
+    source: getStringValue(attributes.source) ?? getStringValue(notificationMetadata?.source),
+    kind:
+      getStringValue(attributes.kind) ?? getStringValue(attributes.type) ?? getStringValue(notificationMetadata?.kind),
+    priority: getStringValue(attributes.priority) ?? getStringValue(notificationMetadata?.priority),
+    status: getStringValue(attributes.status) ?? getStringValue(notificationMetadata?.status),
+    attributes,
+    metadata,
   };
 }
 
@@ -197,28 +261,26 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
   if (msg.role === 'signal') {
     const signal = mastraDBMessageToSignal(msg as MastraDBMessage);
 
-    // Upstream signals normalization (#merge): new rows store type 'user'
-    // (tagName 'user') / 'reactive' (tagName 'system-reminder'); legacy rows
-    // stored 'user-message' / 'system-reminder' verbatim. Match BOTH generations
-    // (mastraDBMessageToSignal returns the raw stored type).
-    if (signal.type === 'user-message' || signal.type === 'user') {
+    if (signal.type === 'user') {
       const signalContent = signalContentsToHarnessContent(signal.contents);
       if (signalContent.length > 0) {
         return { id: msg.id, role: 'user', content: signalContent, createdAt: msg.createdAt };
       }
     }
 
-    // 'reactive' is broader than reminders: only rows whose tagName is the
-    // reminder tag (or absent — normalizeSignalType defaults reactive rows to
-    // 'system-reminder') render as reminders. Custom reactive rows (e.g.
-    // GitHub subscribe/unsubscribe control signals) fall through unchanged.
-    if (
-      signal.type === 'system-reminder' ||
-      (signal.type === 'reactive' && (signal.tagName ?? 'system-reminder') === 'system-reminder')
-    ) {
-      // `msg.role === 'signal'` rows parsed through `mastraDBMessageToSignal`
-      // must not fall through to the parts loop; return a user message even
-      // when `toSystemReminderContent` cannot build a reminder payload.
+    if (signal.type === 'state') {
+      content.push(
+        toStateSignalContent({
+          id: signal.id,
+          tagName: signal.tagName,
+          contents: signal.contents,
+          metadata: signal.metadata,
+        }),
+      );
+      return { id: msg.id, role: 'user', content, createdAt: msg.createdAt };
+    }
+
+    if (signal.type === 'reactive' && signal.tagName === 'system-reminder') {
       const reminder = toSystemReminderContent({
         type: signal.type,
         contents: signal.contents,
@@ -229,6 +291,41 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
         content.push(reminder);
       }
 
+      return { id: msg.id, role: 'user', content, createdAt: msg.createdAt };
+    }
+
+    if (signal.type === 'notification' && signal.tagName === 'notification-summary') {
+      content.push(
+        toNotificationSummaryContent({
+          id: signal.id,
+          contents: signal.contents,
+          attributes: signal.attributes,
+          metadata: signal.metadata,
+        }),
+      );
+      return { id: msg.id, role: 'user', content, createdAt: msg.createdAt };
+    }
+
+    if (signal.type === 'notification' && signal.tagName === 'notification') {
+      const notification = toNotificationContent({
+        id: signal.id,
+        contents: signal.contents,
+        attributes: signal.attributes,
+        metadata: signal.metadata,
+      });
+      if (notification) content.push(notification);
+      return { id: msg.id, role: 'user', content, createdAt: msg.createdAt };
+    }
+
+    if (signal.type === 'reactive') {
+      const reactive = toReactiveSignalContent({
+        id: signal.id,
+        tagName: signal.tagName,
+        contents: signal.contents,
+        attributes: signal.attributes,
+        metadata: signal.metadata,
+      });
+      if (reactive) content.push(reactive);
       return { id: msg.id, role: 'user', content, createdAt: msg.createdAt };
     }
   }
@@ -311,6 +408,24 @@ export function convertStoredMessageToHarnessMessage(msg: StoredMessageRow): Har
           tokensAttempted: (data.tokensAttempted as number) ?? 0,
           operationType: (data.operationType as 'observation' | 'reflection') ?? 'observation',
         });
+        break;
+      }
+      case 'data-signal': {
+        const data = (part as { data?: Record<string, unknown> }).data ?? {};
+        if (data.type === 'state') {
+          content.push(toStateSignalContent(data));
+        } else if (data.type === 'reactive' && data.tagName === 'system-reminder') {
+          const reminder = toSystemReminderContent(data);
+          if (reminder) content.push(reminder);
+        } else if (data.type === 'notification' && data.tagName === 'notification-summary') {
+          content.push(toNotificationSummaryContent(data));
+        } else if (data.type === 'notification' && data.tagName === 'notification') {
+          const notification = toNotificationContent(data);
+          if (notification) content.push(notification);
+        } else if (data.type === 'reactive') {
+          const reactive = toReactiveSignalContent(data);
+          if (reactive) content.push(reactive);
+        }
         break;
       }
       case 'data-user-message': {

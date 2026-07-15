@@ -7,7 +7,7 @@ the one-pending-interaction-per-run slot invariant. The PapersFlow fork instead
 persists a **single** `pendingResume` field discriminated by `kind`
 (`'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' |
 'sandbox-access'`). This is a deliberate, owner-ratified divergence with two
-concrete advantages: (1) a single field makes the slot invariant *structural* —
+concrete advantages: (1) a single field makes the slot invariant _structural_ —
 two simultaneous pendings for one run are unrepresentable rather than merely
 forbidden by every read/write path; and (2) it carries the fork's
 `'sandbox-access'` interaction kind (filesystem/sandbox approval), which has no

@@ -5,14 +5,14 @@ const MASTRA_REPO = 'mastra-ai/mastra';
 const MASTRA_LABEL = 'mastracode';
 
 export async function handleReportIssueCommand(ctx: SlashCommandContext, args: string[]): Promise<void> {
-  if (!ctx.state.session.model.hasSelection()) {
+  if (!ctx.harness.hasModelSelected()) {
     ctx.showInfo('No model selected. Use /models to select a model, or /login to authenticate.');
     return;
   }
 
   // Ensure thread exists
   if (ctx.state.pendingNewThread) {
-    await ctx.state.session.thread.create();
+    await ctx.harness.createThread();
     ctx.state.pendingNewThread = false;
   }
 

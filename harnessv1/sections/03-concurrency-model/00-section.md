@@ -44,7 +44,7 @@ Idle thread: Enqueues for the next standalone turn at an idle boundary
 
 Active run on this thread: **Holds until idle**, then sends as a fresh turn
 
-Returns: `Promise<AgentResult>` resolved when *this* item's turn completes
+Returns: `Promise<AgentResult>` resolved when _this_ item's turn completes
 
 **`useSkill(name, opts)`**
 
@@ -55,7 +55,6 @@ Active run on this thread: Throws `HarnessBusyError` unless this is an exact
 untyped duplicate admission
 
 Returns: Typed or untyped result
-
 
 Orientation diagram (summary only; the rules below remain authoritative):
 
@@ -118,8 +117,9 @@ Orientation diagram (summary only; the rules below remain authoritative):
   <path d="M 600 236 C 660 225, 690 195, 720 188" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-concurrency)"/>
   <path d="M 600 321 C 660 300, 690 215, 720 200" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah-concurrency)"/>
 
-  <text x="450" y="345" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">3 — Concurrency primitive routing</text>
+<text x="450" y="345" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">3 — Concurrency primitive routing</text>
 </svg>
+
 <figcaption>Orientation summary of how the session owner admits signal, queue, sync output, and skill operations; the table and prose above remain authoritative for busy semantics and error mapping.</figcaption>
 </figure>
 
@@ -159,13 +159,13 @@ implementation cannot provide that per-signal terminal metadata, Harness v1
 cannot expose independent `Promise<AgentResult>` semantics for concurrent
 `signal()` fan-in on top of it.
 
-Per-turn overrides on a `signal()` that drains into an *already-active* run are
+Per-turn overrides on a `signal()` that drains into an _already-active_ run are
 rejected at admission because the run's surface and run-scoped approval-bypass
 policy are committed at start time and a signal cannot mutate them mid-flight.
 Overrides on a `signal()` that lands while idle apply normally to the new run.
 §4.3 owns the exact override fields, error class, and table.
 
-**`queue` is busy-independent.** It is *never* rejected for the reasons that
+**`queue` is busy-independent.** It is _never_ rejected for the reasons that
 would cause a `sync` operation to throw `HarnessBusyError` (run in flight,
 pending approval/question/plan, non-empty queue) — busy state is precisely what
 `queue` is for. Admission can still fail for non-busy reasons such as invalid
@@ -199,14 +199,15 @@ full turn each — they do not merge with concurrent `signal` inputs. §5.1 and
 At public operation admission, `HarnessBusyError` no longer fires from
 interactive `signal()`. It fires from the explicit fail-fast
 forms:
+
 - `signal({ sync: true, output })` — typed structured output needs a clean turn
-boundary, so this form skips signals and calls `agent.generate()` directly with
-a fresh `runId`. Throws if the thread is busy.
+  boundary, so this form skips signals and calls `agent.generate()` directly with
+  a fresh `runId`. Throws if the thread is busy.
 - `useSkill(...)` — skill execution needs a committed turn boundary. Untyped
-calls first resolve an exact duplicate `admissionId`, when present, then
-otherwise fail fast if the thread is busy before delegating the expanded prompt
-to `signal(...)`. Typed calls with `output` share the direct
-sync-generate path and are non-retry-safe in v1.
+  calls first resolve an exact duplicate `admissionId`, when present, then
+  otherwise fail fast if the thread is busy before delegating the expanded prompt
+  to `signal(...)`. Typed calls with `output` share the direct
+  sync-generate path and are non-retry-safe in v1.
 
 The same error class is also used inside tool execution for the run-scoped
 pending-interaction slot: a second `registerQuestion`,
@@ -227,15 +228,16 @@ calls `session.signal()` for the new content. There is no `session.steer()`, no
 `session.abort()`, no `session.clearQueue()` in v1.
 
 **When to use which:**
+
 - `signal` — the default. Interactive UI, multi-user fan-in, "send this
-whenever the agent can pick it up." Busy-independent; accepted once admission
-succeeds.
+  whenever the agent can pick it up." Busy-independent; accepted once admission
+  succeeds.
 - `queue` — scripted multi-step flows where you specifically want sequential,
-isolated turns ("first refactor X, then add tests, then run the suite"). Or
-programmatic agents that need predictable per-prompt boundaries. Niche by
-comparison to `signal`.
+  isolated turns ("first refactor X, then add tests, then run the suite"). Or
+  programmatic agents that need predictable per-prompt boundaries. Niche by
+  comparison to `signal`.
 - `signal({ sync: true, output })` — headless typed extraction on a clean turn
-boundary.
+  boundary.
 - `useSkill` — invoke a parameterised, named prompt template.
 
 Channel ingress is another caller of these same primitives. After the channel

@@ -883,7 +883,12 @@ describe.each([
       const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
       await vi.waitFor(
         async () => {
-          expect((await workflowsStore.listWorkflowRuns({})).runs).toHaveLength(0);
+          const remainingRuns = (await workflowsStore.listWorkflowRuns({})).runs.map(run => ({
+            workflowName: run.workflowName,
+            runId: run.runId,
+            status: run.snapshot.status,
+          }));
+          expect(remainingRuns).toEqual([]);
         },
         { timeout: 10000 },
       );

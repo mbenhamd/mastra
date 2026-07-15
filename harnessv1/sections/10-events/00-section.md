@@ -78,6 +78,7 @@ buffering/replay rules, and subagent attribution):
     <rect style="fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 5 5; rx: 12;" x="40" y="464" width="960" height="58" />
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="60" y="486">Events are observer notifications, not durable integration history.</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="60" y="506">Missing or replayed events never alter admission, idempotency, retries, receipts, or delivery guarantees — recovery reads storage rows.</text>
+
   </svg>
   <figcaption>One Harness event adapter projects supported source activity into the closed HarnessEventV1 union; session-scoped events are buffered for SSE replay while harness-scoped events stay live-only.</figcaption>
 </figure>
@@ -86,17 +87,17 @@ Events are how the harness reports what's happening to subscribers. They fan out
 two ways:
 
 - **Session-scoped** — emitted on a specific session and delivered to every
-subscriber of that session (`session.subscribe(...)`). All turn-level activity
-flows here. A live fan-out copy is also delivered to the owning harness's
-`harness.subscribe(...)` subscribers, with `sessionId` set.
+  subscriber of that session (`session.subscribe(...)`). All turn-level activity
+  flows here. A live fan-out copy is also delivered to the owning harness's
+  `harness.subscribe(...)` subscribers, with `sessionId` set.
 - **Harness-scoped** — emitted at the harness level for things that don't belong
-to any one session (intervals, process shutdown, storage errors, malformed or
-unbound channel ingress). Delivered to harness subscribers
-(`harness.subscribe(...)`). Pure harness events such as `harness_shutdown` are
-not replayed through per-session SSE. Session-lifecycle events that name a
-session, such as create/close/evict/hydrate, are session-scoped observer events
-for the affected session and also live fan-out to harness subscribers; storage
-state and result records are the source of truth.
+  to any one session (intervals, process shutdown, storage errors, malformed or
+  unbound channel ingress). Delivered to harness subscribers
+  (`harness.subscribe(...)`). Pure harness events such as `harness_shutdown` are
+  not replayed through per-session SSE. Session-lifecycle events that name a
+  session, such as create/close/evict/hydrate, are session-scoped observer events
+  for the affected session and also live fan-out to harness subscribers; storage
+  state and result records are the source of truth.
 
 Both surfaces use the same listener shape: `(event: HarnessEventV1) => void`,
 returning an unsubscribe function.

@@ -48,9 +48,9 @@ describe('Session.setThreadSetting (§4.2d)', () => {
     const ops = createHarnessOperatorThreadController(harness);
     const thread = await ops.create({ resourceId: 'u1', title: 't' });
     const session = await harness.session({ resourceId: 'u1', threadId: thread.id });
-    await expect(
-      session.setThreadSetting({ key: 'fn', value: (() => 0) as never }),
-    ).rejects.toThrow(HarnessValidationError);
+    await expect(session.setThreadSetting({ key: 'fn', value: (() => 0) as never })).rejects.toThrow(
+      HarnessValidationError,
+    );
     // Nothing was written (validation rejects before the storage read-merge-write).
     const settings = await ops.getSettings({ resourceId: 'u1', threadId: thread.id });
     expect(settings.app).toBeUndefined();

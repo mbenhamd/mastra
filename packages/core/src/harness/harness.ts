@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { Agent } from '../agent';
-import { createSignal } from '../agent/signals';
+import { createSignal, signalContentsToParts, signalContentsToText } from '../agent/signals';
 import type { AgentSignalContents, AgentSignalInput } from '../agent/signals';
 import type {
   AgentThreadSubscription,
@@ -122,37 +122,18 @@ function getRecordValue(value: unknown): Record<string, unknown> | undefined {
 }
 
 function signalContentsToHarnessContent(contents: unknown): HarnessMessageContent[] {
-  if (typeof contents === 'string') return [{ type: 'text', text: contents }];
-  if (Array.isArray(contents)) return contents.flatMap(signalContentsToHarnessContent);
-  if (!contents || typeof contents !== 'object') return [];
-
-  const content = (contents as { content?: unknown }).content;
-  if (typeof content === 'string') return [{ type: 'text', text: content }];
-  if (Array.isArray(content)) {
-    return content.flatMap((part): HarnessMessageContent[] => {
-      const record = getRecordValue(part);
-      if (!record) return [];
-      if (record.type === 'text' && typeof record.text === 'string') {
-        return [{ type: 'text', text: record.text }];
-      }
-      if (record.type === 'file' && typeof record.data === 'string' && typeof record.mediaType === 'string') {
-        if (record.mediaType.startsWith('image/')) {
-          return [{ type: 'image', data: record.data, mimeType: record.mediaType }];
-        }
-        return [
-          {
-            type: 'file',
-            data: record.data,
-            mediaType: record.mediaType,
-            filename: typeof record.filename === 'string' ? record.filename : undefined,
-          },
-        ];
-      }
-      return [];
-    });
-  }
-
-  return [];
+  return signalContentsToParts(contents).map((part): HarnessMessageContent => {
+    if (part.type === 'text') return { type: 'text', text: part.text };
+    if (part.mediaType.startsWith('image/')) {
+      return { type: 'image', data: part.data, mimeType: part.mediaType };
+    }
+    return {
+      type: 'file',
+      data: part.data,
+      mediaType: part.mediaType,
+      filename: part.filename,
+    };
+  });
 }
 
 function toSystemReminderContent(
@@ -214,15 +195,6 @@ function toUserSignalMessage(payload: Record<string, unknown>): HarnessMessage |
     content,
     createdAt: new Date(getStringValue(payload.createdAt) ?? Date.now()),
   };
-}
-
-function signalContentsToText(contents: unknown): string {
-  if (typeof contents === 'string') return contents;
-  if (!Array.isArray(contents)) return '';
-  return contents
-    .filter((part): part is { type: 'text'; text: string } => getRecordValue(part)?.type === 'text')
-    .map(part => part.text)
-    .join('\n');
 }
 
 function toStateSignalContent(
@@ -1840,12 +1812,36 @@ export class Harness<TState = {}> {
       if (!next) return;
       this.dispatchingFollowUp = true;
       try {
-        await this.sendMessage({
-          content: next.content,
-          requestContext: next.requestContext,
-          tracingContext: options?.tracingContext,
-          tracingOptions: options?.tracingOptions,
-        });
+        if (this.currentThreadId) {
+          await this.ensureCurrentAgentThreadSubscription();
+        }
+        if (this.agentThreadSubscription && this.currentThreadId) {
+          const streamOptions = await this.buildAgentMessageStreamOptions({
+            requestContext: next.requestContext,
+            tracingContext: options?.tracingContext,
+            tracingOptions: options?.tracingOptions,
+          });
+          const result = this.getCurrentAgent().queueMessage(this.createMessageInput({ content: next.content }), {
+            resourceId: this.resourceId,
+            threadId: this.currentThreadId,
+            ifIdle: { streamOptions: streamOptions as any },
+          });
+          const accepted = await result.accepted;
+          const runId = 'runId' in accepted ? accepted.runId : undefined;
+          this.emit({ type: 'follow_up_queued', count: this.followUpQueue.length, runId });
+        } else {
+          this.emit({ type: 'follow_up_queued', count: this.followUpQueue.length });
+          await this.sendMessage({
+            content: next.content,
+            requestContext: next.requestContext,
+            tracingContext: options?.tracingContext,
+            tracingOptions: options?.tracingOptions,
+          });
+        }
+      } catch (error) {
+        this.followUpQueue.unshift(next);
+        this.emit({ type: 'follow_up_queued', count: this.followUpQueue.length });
+        throw error;
       } finally {
         this.dispatchingFollowUp = false;
       }
@@ -2197,7 +2193,7 @@ export class Harness<TState = {}> {
       ]);
       if (!wasActive) {
         await new Promise(resolve => setTimeout(resolve, 0));
-        await this.waitForCurrentThreadStreamIdle();
+        await this.waitForCurrentThreadStreamIdle({ allowSuspended: true });
         if (!emittedAgentEnd && !this.pendingSuspensionRunId) {
           this.emit({ type: 'agent_end', reason: 'complete' });
         }
@@ -3212,8 +3208,23 @@ export class Harness<TState = {}> {
    * to avoid the new signal being queued onto the dying run, which would then
    * be drained with the previous run's already-aborted abortSignal.
    */
-  private async waitForCurrentThreadStreamIdle(): Promise<void> {
+  private async waitForCurrentThreadStreamIdle({
+    allowSuspended = false,
+  }: { allowSuspended?: boolean } = {}): Promise<void> {
     while (this.isCurrentThreadStreamActive() || this.currentRunId !== null) {
+      // A suspended run remains the thread's blocking run by design so a later
+      // resume can reattach to it. The originating message turn is nevertheless
+      // settled once Harness has consumed the suspension chunk and closed its
+      // current stream state. Callers waiting for abort cleanup still require
+      // true runtime idleness and therefore keep the default false behavior.
+      if (
+        allowSuspended &&
+        this.currentRunId === null &&
+        this.pendingSuspensionRunId !== null &&
+        this.agentThreadSubscription?.activeRunId() === this.pendingSuspensionRunId
+      ) {
+        return;
+      }
       await new Promise(resolve => setTimeout(resolve, 0));
     }
   }

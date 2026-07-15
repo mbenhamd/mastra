@@ -319,6 +319,8 @@ Use this tool when:
           tools: mergedTools,
           workspace,
           mastra,
+          inputProcessors: definition.inputProcessors,
+          outputProcessors: definition.outputProcessors,
         });
 
         // Only resolve workspace tool names when an allowlist is configured,

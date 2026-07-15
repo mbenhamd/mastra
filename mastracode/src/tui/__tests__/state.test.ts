@@ -41,20 +41,15 @@ vi.mock('../../utils/project.js', async importOriginal => {
 
 import { createTUIState } from '../state.js';
 
-function createSession() {
+function createHarness() {
   return {
-    mode: { resolve: vi.fn(() => ({ id: 'build', metadata: { color: '#7c3aed' } })) },
+    getCurrentMode: vi.fn(() => ({ id: 'build', color: '#7c3aed' })),
   };
-}
-
-function createHarness(session: ReturnType<typeof createSession>) {
-  return { session };
 }
 
 describe('createTUIState', () => {
   it('initializes the shared TUI runtime defaults used by chat handlers', () => {
-    const session = createSession();
-    const harness = createHarness(session);
+    const harness = createHarness();
     const hookManager = {};
     const analytics = {};
     const authStorage = {};
@@ -63,7 +58,6 @@ describe('createTUIState', () => {
 
     const state = createTUIState({
       harness: harness as never,
-      session: session as never,
       hookManager: hookManager as never,
       analytics: analytics as never,
       authStorage: authStorage as never,
@@ -133,6 +127,6 @@ describe('createTUIState', () => {
     expect(state.projectInfo).toEqual({ rootPath: '/tmp/mastra-code-project', gitBranch: 'main' });
 
     expect(state.editor.getModeColor?.()).toBe('#7c3aed');
-    expect(harness.session.mode.resolve).toHaveBeenCalled();
+    expect(harness.getCurrentMode).toHaveBeenCalled();
   });
 });

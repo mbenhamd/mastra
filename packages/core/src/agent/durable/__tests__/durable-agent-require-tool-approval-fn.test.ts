@@ -91,6 +91,9 @@ describe('DurableAgent function-form requireToolApproval', () => {
     // In-process registry preserves the closure verbatim.
     const entry = globalRunRegistry.get(prep.runId);
     expect(entry?.requireToolApproval).toBe(policy);
+
+    durableAgent.runRegistry.cleanup(prep.runId);
+    globalRunRegistry.delete(prep.runId);
   });
 
   it('evaluates function policy per tool call with real toolName/args', async () => {
@@ -124,11 +127,11 @@ describe('DurableAgent function-form requireToolApproval', () => {
     // Gate only `writeTool` — `readTool` should run without approval.
     const policy = vi.fn(({ toolName }: { toolName: string }) => toolName === 'writeTool');
 
-    const prep = await durableAgent.prepare('Run both tools', { requireToolApproval: policy });
-    const events = collectPubsubEvents(pubsub, prep.runId);
+    const runId = 'per-call-approval-policy-run';
+    const events = collectPubsubEvents(pubsub, runId);
 
     const { cleanup } = await durableAgent.stream('Run both tools', {
-      runId: prep.runId,
+      runId,
       requireToolApproval: policy,
     });
 
@@ -180,11 +183,11 @@ describe('DurableAgent function-form requireToolApproval', () => {
       throw new Error('boom');
     });
 
-    const prep = await durableAgent.prepare('Run it', { requireToolApproval: policy });
-    const events = collectPubsubEvents(pubsub, prep.runId);
+    const runId = 'throwing-approval-policy-run';
+    const events = collectPubsubEvents(pubsub, runId);
 
     const { cleanup } = await durableAgent.stream('Run it', {
-      runId: prep.runId,
+      runId,
       requireToolApproval: policy,
     });
 

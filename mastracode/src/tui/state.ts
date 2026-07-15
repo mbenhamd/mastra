@@ -6,11 +6,12 @@
  */
 import { Container, TUI, ProcessTerminal } from '@earendil-works/pi-tui';
 import type { CombinedAutocompleteProvider, Component, Terminal, Text } from '@earendil-works/pi-tui';
-import type { Harness, HarnessMessage, Session } from '@mastra/core/harness';
+import type { HarnessMessage } from '@mastra/core/harness';
 import type { SkillMetadata, Workspace } from '@mastra/core/workspace';
 import type { GithubSignals } from '@mastra/github-signals';
 import type { MastraCodeAnalytics } from '../analytics.js';
 import type { AuthStorage } from '../auth/storage.js';
+import type { MastraCodeHarnessRuntime } from '../harness/index.js';
 import type { HookManager } from '../hooks/index.js';
 import type { McpManager } from '../mcp/manager.js';
 import type { OnboardingInlineComponent } from '../onboarding/onboarding-inline.js';
@@ -90,10 +91,7 @@ export function getGithubPrSubscriptionsFromMetadata(
 
 export interface MastraTUIOptions {
   /** The harness instance to control */
-  harness: Harness<any>;
-
-  /** The session created from the harness that all work runs through */
-  session: Session<any>;
+  harness: MastraCodeHarnessRuntime<any>;
 
   /** Hook manager for session lifecycle hooks */
   hookManager?: HookManager;
@@ -142,8 +140,7 @@ export interface MastraTUIOptions {
 
 export interface TUIState {
   // ── Core dependencies (set once) ──────────────────────────────────────
-  harness: Harness<any>;
-  session: Session<any>;
+  harness: MastraCodeHarnessRuntime<any>;
   options: MastraTUIOptions;
   hookManager?: HookManager;
   analytics?: MastraCodeAnalytics;
@@ -312,7 +309,6 @@ export function createTUIState(options: MastraTUIOptions): TUIState {
   const result: TUIState = {
     // Core dependencies
     harness: options.harness,
-    session: options.session,
     options,
     hookManager: options.hookManager,
     analytics: options.analytics,
@@ -390,8 +386,7 @@ export function createTUIState(options: MastraTUIOptions): TUIState {
     if (result.activeGoalJudge) {
       return mastra.blue;
     }
-    const color = result.session.mode.resolve()?.metadata?.color;
-    return typeof color === 'string' ? color : undefined;
+    return options.harness.getCurrentMode()?.color;
   };
   return result;
 }

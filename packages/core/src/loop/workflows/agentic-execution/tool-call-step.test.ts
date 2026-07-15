@@ -532,6 +532,50 @@ describe('createToolCallStep tool approval workflow', () => {
     vi.restoreAllMocks();
   });
 
+  it('normalizes evidence-free null resume placeholders on a fresh tool call', async () => {
+    const resultValue = { success: true };
+    tools['test-tool'].requireApproval = false;
+    tools['test-tool'].execute.mockResolvedValue(resultValue);
+    const freshCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    });
+    const inputData = {
+      ...makeInputData(),
+      args: {
+        param: 'test',
+        resumeData: null,
+        suspendedToolCallId: null,
+        suspendedToolRunId: null,
+      },
+    };
+
+    const result = await freshCallStep.execute(makeExecuteParams({ inputData }));
+
+    expect(tools['test-tool'].execute).toHaveBeenCalledWith(
+      { param: 'test' },
+      expect.objectContaining({ resumeData: undefined }),
+    );
+    expect(result).toEqual({ ...inputData, result: resultValue });
+  });
+
+  it('rejects a null resume payload that names an unverified suspended run', async () => {
+    tools['test-tool'].requireApproval = false;
+    const inputData = {
+      ...makeInputData(),
+      args: { param: 'test', resumeData: null, suspendedToolRunId: 'unverified-run' },
+    };
+
+    const result = await toolCallStep.execute(makeExecuteParams({ inputData }));
+
+    expect(result.error).toBeInstanceOf(Error);
+    expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
+    expectNoToolExecution();
+  });
+
   it('should enqueue approval message and prevent execution when approval is required', async () => {
     const inputData = makeInputData();
 

@@ -62,6 +62,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.1; fill: none; marker-end: url(#ah-event-union);" d="M495 93 C425 175 390 235 385 289" />
     <path style="stroke: #334155; stroke-width: 2.1; fill: none; marker-end: url(#ah-event-union);" d="M545 93 C570 175 570 235 565 289" />
     <path style="stroke: #334155; stroke-width: 2.1; fill: none; marker-end: url(#ah-event-union);" d="M595 93 C690 175 740 235 745 289" />
+
   </svg>
   <figcaption>Only operation events settle admitted work; lifecycle and live turn events remain observability signals unless the operation family says otherwise.</figcaption>
 </figure>
@@ -85,14 +86,26 @@ type LifecycleEvent =
   // `modeId`/`modelId` carry the bootstrap mode/model resolved at creation so a
   // subscriber joining at `session_created` knows the active mode/model without
   // a follow-up read.
-  | { type: 'session_created'; sessionId: string; resourceId: string; threadId: string; parentSessionId?: string; modeId: string; modelId: string }
+  | {
+      type: 'session_created';
+      sessionId: string;
+      resourceId: string;
+      threadId: string;
+      parentSessionId?: string;
+      modeId: string;
+      modelId: string;
+    }
   | { type: 'session_closing'; sessionId: string; closingAt: number; closeDeadlineAt: number }
-  | { type: 'session_closed';  sessionId: string; reason: 'requested' }
+  | { type: 'session_closed'; sessionId: string; reason: 'requested' }
   // `reason` is a diagnostic for why the live instance left the cache; the
   // durable record stays and re-hydrates on next access (`session_hydrated`).
-  | { type: 'session_evicted'; sessionId: string; reason: 'idle' | 'pressure' | 'pinned_timeout' | 'shutdown' | 'lease_lost' }  // dropped from live cache; record stays
-  | { type: 'session_hydrated'; sessionId: string }                 // re-loaded from storage on next access
-  | { type: 'harness_shutdown' };                                   // process shutdown; sessions persist
+  | {
+      type: 'session_evicted';
+      sessionId: string;
+      reason: 'idle' | 'pressure' | 'pinned_timeout' | 'shutdown' | 'lease_lost';
+    } // dropped from live cache; record stays
+  | { type: 'session_hydrated'; sessionId: string } // re-loaded from storage on next access
+  | { type: 'harness_shutdown' }; // process shutdown; sessions persist
 
 // State (session-scoped)
 type StateEvent =
@@ -100,7 +113,7 @@ type StateEvent =
   | { type: 'state_changed'; state: Record<string, JsonValue>; changedKeys: string[] }
   // `previousModeId`/`previousModelId` carry the prior value so display/audit
   // projections can render the transition without tracking prior state.
-  | { type: 'mode_changed';  modeId: string; previousModeId: string }
+  | { type: 'mode_changed'; modeId: string; previousModeId: string }
   | { type: 'model_changed'; modelId: string; previousModelId: string }
   | { type: 'token_usage_changed'; usage: TokenUsage }
   // Permission mutations (§4.2e). Emitted only after the owning session's
@@ -113,22 +126,28 @@ type StateEvent =
   // these events.
   | { type: 'permission_granted'; category?: ToolCategory; toolName?: string }
   | { type: 'permission_revoked'; category?: ToolCategory; toolName?: string }
-  | { type: 'permission_policy_changed'; category?: ToolCategory; toolName?: string; oldPolicy: PermissionPolicy; newPolicy: PermissionPolicy };
+  | {
+      type: 'permission_policy_changed';
+      category?: ToolCategory;
+      toolName?: string;
+      oldPolicy: PermissionPolicy;
+      newPolicy: PermissionPolicy;
+    };
 
 // Turn (session-scoped)
 type TurnEvent =
-  | { type: 'agent_start';   runId: string; overrides?: PersistedRunOverrides }
-  | { type: 'text_delta';    runId: string; signalId?: string; delta: string }
+  | { type: 'agent_start'; runId: string; overrides?: PersistedRunOverrides }
+  | { type: 'text_delta'; runId: string; signalId?: string; delta: string }
   // Streaming reasoning/thinking text. Mirrors `text_delta`; emitted only when
   // the model streams reasoning chunks (additive + opt-in — a non-reasoning
   // model emits none). PapersFlow fork extension: upstream v1 left reasoning out
   // of the built-in union, but the fork's chat UI renders a live thinking block,
   // so reasoning is a first-class delta here rather than display-state-only.
   | { type: 'reasoning_delta'; runId: string; signalId?: string; delta: string }
-  | { type: 'agent_end';     runId: string; finishReason: string; usage: TokenUsage }
+  | { type: 'agent_end'; runId: string; finishReason: string; usage: TokenUsage }
   // Diagnostic/run-surface error. `signalId` may attribute where the runtime
   // noticed the error, but promise settlement still uses OperationEvent below.
-  | { type: 'error';         runId?: string; signalId?: string; error: HarnessEventError };
+  | { type: 'error'; runId?: string; signalId?: string; error: HarnessEventError };
 
 // Operation results (session-scoped). These are the promise/SDK settlement
 // boundary for admitted work. They are not run lifecycle events: one run can
@@ -137,17 +156,31 @@ type TurnEvent =
 // operation identified by `signalId` / `queuedItemId`, not to every output the
 // enclosing run may have produced for other signals.
 type OperationEvent =
-  | { type: 'signal_completed';  runId: string; signalId: string; admissionId?: string; result: AgentResult }
-  | { type: 'signal_failed';     runId?: string; signalId: string; admissionId?: string; error: HarnessEventError }
-  | { type: 'queue_completed';   runId: string; queuedItemId: string; signalId: string; admissionId?: string; result: AgentResult }
-  | { type: 'queue_failed';      runId?: string; queuedItemId: string; signalId?: string; admissionId?: string; error: HarnessEventError };
+  | { type: 'signal_completed'; runId: string; signalId: string; admissionId?: string; result: AgentResult }
+  | { type: 'signal_failed'; runId?: string; signalId: string; admissionId?: string; error: HarnessEventError }
+  | {
+      type: 'queue_completed';
+      runId: string;
+      queuedItemId: string;
+      signalId: string;
+      admissionId?: string;
+      result: AgentResult;
+    }
+  | {
+      type: 'queue_failed';
+      runId?: string;
+      queuedItemId: string;
+      signalId?: string;
+      admissionId?: string;
+      error: HarnessEventError;
+    };
 
 // Tool calls (session-scoped). Public event payloads are JSON-safe
 // projections; raw non-JSON tool objects remain inside the owning runtime or
 // app storage and do not cross the subscriber/SSE boundary.
 type ToolEvent =
-  | { type: 'tool_start';    runId: string; toolCallId: string; toolName: string; input: JsonValue }
-  | { type: 'tool_end';      runId: string; toolCallId: string; toolName: string; output: JsonValue; isError: boolean };
+  | { type: 'tool_start'; runId: string; toolCallId: string; toolName: string; input: JsonValue }
+  | { type: 'tool_end'; runId: string; toolCallId: string; toolName: string; output: JsonValue; isError: boolean };
 
 // Subagent activity (session-scoped — emitted on the *parent* session's subscriber).
 // `subagentSessionId` is the child session's ID and is stable across the subagent's
@@ -155,12 +188,68 @@ type ToolEvent =
 // up the parent → child mapping at `subagent_start` and address the child session
 // directly for response routing (see §10.6 and §13.2).
 type SubagentEvent =
-  | { type: 'subagent_start';      toolCallId: string; subagentSessionId: string; agentType: string; task: string; modelId: string; parentId?: string; depth: number }
-  | { type: 'subagent_text_delta'; toolCallId: string; subagentSessionId: string; agentType: string; delta: string; parentId?: string; depth: number }
-  | { type: 'subagent_reasoning_delta'; toolCallId: string; subagentSessionId: string; agentType: string; delta: string; parentId?: string; depth: number }
-  | { type: 'subagent_tool_start'; toolCallId: string; subagentSessionId: string; agentType: string; innerToolCallId: string; toolName: string; input: JsonValue; parentId?: string; depth: number }
-  | { type: 'subagent_tool_end';   toolCallId: string; subagentSessionId: string; agentType: string; innerToolCallId: string; toolName: string; output: JsonValue; isError: boolean; parentId?: string; depth: number }
-  | { type: 'subagent_end';        toolCallId: string; subagentSessionId: string; agentType: string; output: JsonValue; isError: boolean; durationMs: number; parentId?: string; depth: number };
+  | {
+      type: 'subagent_start';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      task: string;
+      modelId: string;
+      parentId?: string;
+      depth: number;
+    }
+  | {
+      type: 'subagent_text_delta';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      delta: string;
+      parentId?: string;
+      depth: number;
+    }
+  | {
+      type: 'subagent_reasoning_delta';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      delta: string;
+      parentId?: string;
+      depth: number;
+    }
+  | {
+      type: 'subagent_tool_start';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      innerToolCallId: string;
+      toolName: string;
+      input: JsonValue;
+      parentId?: string;
+      depth: number;
+    }
+  | {
+      type: 'subagent_tool_end';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      innerToolCallId: string;
+      toolName: string;
+      output: JsonValue;
+      isError: boolean;
+      parentId?: string;
+      depth: number;
+    }
+  | {
+      type: 'subagent_end';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      output: JsonValue;
+      isError: boolean;
+      durationMs: number;
+      parentId?: string;
+      depth: number;
+    };
 
 // Suspension — tool / question / plan needs user input (session-scoped).
 //
@@ -174,14 +263,45 @@ type SubagentEvent =
 //
 // When `source: 'parent'`, both subagent fields are absent.
 type SuspensionEvent =
-  | ({ type: 'tool_approval_required';  runId: string; itemId: string; requestedAt: number; toolCallId: string; toolName: string; toolCategory?: string; approvalReasons: ToolApprovalReasonSource[]; input: JsonValue }
-      & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
-  | ({ type: 'tool_suspension_required'; runId: string; itemId: string; requestedAt: number; toolCallId: string; toolName: string; suspendData: JsonValue }
-      & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
-  | ({ type: 'question_pending';        runId: string; itemId: string; requestedAt: number; toolCallId: string; question: string; options?: { label: string; description?: string }[]; selectionMode?: 'single_select' | 'multi_select' }
-      & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
-  | ({ type: 'plan_approval_required';  runId: string; itemId: string; requestedAt: number; toolCallId: string; title: string; plan: string }
-      & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }));
+  | ({
+      type: 'tool_approval_required';
+      runId: string;
+      itemId: string;
+      requestedAt: number;
+      toolCallId: string;
+      toolName: string;
+      toolCategory?: string;
+      approvalReasons: ToolApprovalReasonSource[];
+      input: JsonValue;
+    } & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
+  | ({
+      type: 'tool_suspension_required';
+      runId: string;
+      itemId: string;
+      requestedAt: number;
+      toolCallId: string;
+      toolName: string;
+      suspendData: JsonValue;
+    } & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
+  | ({
+      type: 'question_pending';
+      runId: string;
+      itemId: string;
+      requestedAt: number;
+      toolCallId: string;
+      question: string;
+      options?: { label: string; description?: string }[];
+      selectionMode?: 'single_select' | 'multi_select';
+    } & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }))
+  | ({
+      type: 'plan_approval_required';
+      runId: string;
+      itemId: string;
+      requestedAt: number;
+      toolCallId: string;
+      title: string;
+      plan: string;
+    } & ({ source: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }));
 
 // Client SDKs project these live notifications into the §13.4
 // `PendingInboxItem` view model. This event union remains the authoritative live
@@ -199,7 +319,7 @@ type SuspensionEvent =
 // Attachments (session-scoped)
 type AttachmentEvent =
   | { type: 'attachment_uploaded'; attachmentId: string; name: string; mimeType: string; bytes: number }
-  | { type: 'attachment_deleted';  attachmentId: string };
+  | { type: 'attachment_deleted'; attachmentId: string };
 
 // Harness v1 does not define a generic workspace file mutation event. Provider
 // filesystem audit, if present, remains provider-owned inspection data; tools
@@ -211,43 +331,132 @@ type AttachmentEvent =
 // projections of Channel* ledger rows, not the durable recovery/dispatch
 // substrate.
 type ChannelEvent =
-  | { type: 'channel_ingress_received'; harnessName: string; channelId: string; inboxItemId: string; externalMessageId: string; bindingId?: string }
-  | { type: 'channel_ingress_admitted'; harnessName: string; channelId: string; inboxItemId: string; bindingId: string; delivery: 'signal' | 'queue'; runId?: string; signalId?: string; queuedItemId?: string }
-  | { type: 'channel_ingress_failed'; harnessName: string; channelId: string; inboxItemId?: string; externalMessageId?: string; error: HarnessEventError }
-  | { type: 'channel_outbox_enqueued'; harnessName: string; channelId: string; outboxItemId: string; bindingId: string; kind: ChannelOutboxItem['kind'] }
-  | { type: 'channel_outbox_sent'; harnessName: string; channelId: string; outboxItemId: string; bindingId: string; providerMessageId?: string }
-  | { type: 'channel_outbox_failed'; harnessName: string; channelId: string; outboxItemId: string; bindingId: string; attempts: number; dead: boolean; error: HarnessEventError }
-  | { type: 'channel_action_received'; harnessName: string; channelId: string; actionReceiptId: string; actionTokenId: string; actionId: string; itemId: string }
-  | { type: 'channel_action_accepted'; harnessName: string; channelId: string; actionReceiptId: string; actionTokenId: string; actionId: string; itemId: string; responseId: string }
-  | { type: 'channel_action_applied'; harnessName: string; channelId: string; actionReceiptId: string; actionTokenId: string; actionId: string; itemId: string }
-  | { type: 'channel_action_conflict'; harnessName: string; channelId: string; actionReceiptId: string; actionTokenId: string; actionId: string; itemId: string; conflictReason?: ChannelActionReceipt['conflictReason'] }
-  | { type: 'channel_action_failed'; harnessName: string; channelId: string; actionReceiptId?: string; actionTokenId?: string; actionId?: string; itemId?: string; error: HarnessEventError };
+  | {
+      type: 'channel_ingress_received';
+      harnessName: string;
+      channelId: string;
+      inboxItemId: string;
+      externalMessageId: string;
+      bindingId?: string;
+    }
+  | {
+      type: 'channel_ingress_admitted';
+      harnessName: string;
+      channelId: string;
+      inboxItemId: string;
+      bindingId: string;
+      delivery: 'signal' | 'queue';
+      runId?: string;
+      signalId?: string;
+      queuedItemId?: string;
+    }
+  | {
+      type: 'channel_ingress_failed';
+      harnessName: string;
+      channelId: string;
+      inboxItemId?: string;
+      externalMessageId?: string;
+      error: HarnessEventError;
+    }
+  | {
+      type: 'channel_outbox_enqueued';
+      harnessName: string;
+      channelId: string;
+      outboxItemId: string;
+      bindingId: string;
+      kind: ChannelOutboxItem['kind'];
+    }
+  | {
+      type: 'channel_outbox_sent';
+      harnessName: string;
+      channelId: string;
+      outboxItemId: string;
+      bindingId: string;
+      providerMessageId?: string;
+    }
+  | {
+      type: 'channel_outbox_failed';
+      harnessName: string;
+      channelId: string;
+      outboxItemId: string;
+      bindingId: string;
+      attempts: number;
+      dead: boolean;
+      error: HarnessEventError;
+    }
+  | {
+      type: 'channel_action_received';
+      harnessName: string;
+      channelId: string;
+      actionReceiptId: string;
+      actionTokenId: string;
+      actionId: string;
+      itemId: string;
+    }
+  | {
+      type: 'channel_action_accepted';
+      harnessName: string;
+      channelId: string;
+      actionReceiptId: string;
+      actionTokenId: string;
+      actionId: string;
+      itemId: string;
+      responseId: string;
+    }
+  | {
+      type: 'channel_action_applied';
+      harnessName: string;
+      channelId: string;
+      actionReceiptId: string;
+      actionTokenId: string;
+      actionId: string;
+      itemId: string;
+    }
+  | {
+      type: 'channel_action_conflict';
+      harnessName: string;
+      channelId: string;
+      actionReceiptId: string;
+      actionTokenId: string;
+      actionId: string;
+      itemId: string;
+      conflictReason?: ChannelActionReceipt['conflictReason'];
+    }
+  | {
+      type: 'channel_action_failed';
+      harnessName: string;
+      channelId: string;
+      actionReceiptId?: string;
+      actionTokenId?: string;
+      actionId?: string;
+      itemId?: string;
+      error: HarnessEventError;
+    };
 
 // Goals (session-scoped). See §4.7.
 type GoalEvent =
-  | { type: 'goal_set';      goal: GoalState }
-  | { type: 'goal_judged';   goalId: string; decision: GoalJudgeDecision; turnsUsed: number; maxTurns: number }
-  | { type: 'goal_done';     goalId: string; reason: string; turnsUsed: number }
-  | { type: 'goal_waiting';  goalId: string; reason: string; turnsUsed: number }
-  | { type: 'goal_paused';   goalId: string; reason: 'requested' | 'budget_exhausted' | 'judge_failed' }
-  | { type: 'goal_resumed';  goalId: string }
-  | { type: 'goal_cleared';  goalId: string };
+  | { type: 'goal_set'; goal: GoalState }
+  | { type: 'goal_judged'; goalId: string; decision: GoalJudgeDecision; turnsUsed: number; maxTurns: number }
+  | { type: 'goal_done'; goalId: string; reason: string; turnsUsed: number }
+  | { type: 'goal_waiting'; goalId: string; reason: string; turnsUsed: number }
+  | { type: 'goal_paused'; goalId: string; reason: 'requested' | 'budget_exhausted' | 'judge_failed' }
+  | { type: 'goal_resumed'; goalId: string }
+  | { type: 'goal_cleared'; goalId: string };
 
 // Storage failures (session-scoped or harness-scoped depending on origin).
 // `operation` and `subject` use the same taxonomy as `HarnessStorageError`.
-type StorageErrorEvent =
-  | {
-      type: 'storage_error';
-      operation: HarnessStorageOperation;
-      retryable: boolean;
-      error: Extract<HarnessEventError, { code: 'harness.storage' }>;
-      sessionId?: string;
-      resourceId?: string;
-      threadId?: string;
-      harnessName?: string;
-      channelId?: string;
-      subject?: HarnessStorageSubject;
-    };
+type StorageErrorEvent = {
+  type: 'storage_error';
+  operation: HarnessStorageOperation;
+  retryable: boolean;
+  error: Extract<HarnessEventError, { code: 'harness.storage' }>;
+  sessionId?: string;
+  resourceId?: string;
+  threadId?: string;
+  harnessName?: string;
+  channelId?: string;
+  subject?: HarnessStorageSubject;
+};
 
 // Tool-emitted custom events. Tool authors provide only `type` and optional
 // `payload`; the harness fills event identity and, for parent-surfaced subagent
@@ -259,10 +468,7 @@ type CustomEvent = {
   resourceId: string;
   threadId: string;
   payload?: JsonValue;
-} & (
-  | { source?: 'parent' }
-  | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string }
-);
+} & ({ source?: 'parent' } | { source: 'subagent'; subagentToolCallId: string; subagentSessionId: string });
 ```
 
 `display_state_changed` is not a v1 built-in event and does not travel over the

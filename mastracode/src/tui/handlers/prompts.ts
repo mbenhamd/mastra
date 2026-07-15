@@ -84,19 +84,19 @@ export async function handleAskQuestion(
               tui: state.ui,
               onSubmit: answer => {
                 state.activeInlineQuestion = undefined;
-                state.session.respondToToolSuspension({ toolCallId, resumeData: answer });
+                state.harness.respondToToolSuspension({ toolCallId, resumeData: answer });
                 resolve();
                 processNextInlineQuestion(state);
               },
               onSubmitMulti: answers => {
                 state.activeInlineQuestion = undefined;
-                state.session.respondToToolSuspension({ toolCallId, resumeData: answers });
+                state.harness.respondToToolSuspension({ toolCallId, resumeData: answers });
                 resolve();
                 processNextInlineQuestion(state);
               },
               onCancel: () => {
                 state.activeInlineQuestion = undefined;
-                state.session.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
+                state.harness.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
                 resolve();
                 processNextInlineQuestion(state);
               },
@@ -113,19 +113,19 @@ export async function handleAskQuestion(
                 multiline: true,
                 onSubmit: answer => {
                   state.activeInlineQuestion = undefined;
-                  state.session.respondToToolSuspension({ toolCallId, resumeData: answer });
+                  state.harness.respondToToolSuspension({ toolCallId, resumeData: answer });
                   resolve();
                   processNextInlineQuestion(state);
                 },
                 onSubmitMulti: answers => {
                   state.activeInlineQuestion = undefined;
-                  state.session.respondToToolSuspension({ toolCallId, resumeData: answers });
+                  state.harness.respondToToolSuspension({ toolCallId, resumeData: answers });
                   resolve();
                   processNextInlineQuestion(state);
                 },
                 onCancel: () => {
                   state.activeInlineQuestion = undefined;
-                  state.session.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
+                  state.harness.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
                   resolve();
                   processNextInlineQuestion(state);
                 },
@@ -148,7 +148,7 @@ export async function handleAskQuestion(
         } catch {
           // Don't let ask_user errors crash the process — skip the question
           state.activeInlineQuestion = undefined;
-          state.session.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
+          state.harness.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
           resolve();
           processNextInlineQuestion(state);
         }
@@ -170,17 +170,17 @@ export async function handleAskQuestion(
         tui: state.ui,
         onSubmit: answer => {
           state.ui.hideOverlay();
-          state.session.respondToToolSuspension({ toolCallId, resumeData: answer });
+          state.harness.respondToToolSuspension({ toolCallId, resumeData: answer });
           resolve();
         },
         onSubmitMulti: answers => {
           state.ui.hideOverlay();
-          state.session.respondToToolSuspension({ toolCallId, resumeData: answers });
+          state.harness.respondToToolSuspension({ toolCallId, resumeData: answers });
           resolve();
         },
         onCancel: () => {
           state.ui.hideOverlay();
-          state.session.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
+          state.harness.respondToToolSuspension({ toolCallId, resumeData: '(skipped)' });
           resolve();
         },
       });
@@ -201,7 +201,7 @@ export async function handleAskQuestion(
  */
 export async function handleSandboxAccessRequest(
   ctx: EventHandlerContext,
-  toolCallId: string,
+  questionId: string,
   requestedPath: string,
   reason: string,
   responseKind?: 'question' | 'sandbox-access',
@@ -346,7 +346,7 @@ export async function handleToolSuspension(
  */
 async function approvePlan(ctx: EventHandlerContext, toolCallId: string, title: string, plan: string): Promise<void> {
   const { state } = ctx;
-  await state.session.state.set({
+  await state.harness.setState({
     activePlan: {
       title,
       plan,
@@ -356,9 +356,9 @@ async function approvePlan(ctx: EventHandlerContext, toolCallId: string, title: 
   savePlanToDisk({
     title,
     plan,
-    resourceId: state.session.identity.getResourceId(),
+    resourceId: state.harness.getResourceId(),
   }).catch(() => {});
-  await state.session.respondToToolSuspension({
+  await state.harness.respondToToolSuspension({
     toolCallId,
     resumeData: { action: 'approved' },
   });
@@ -406,7 +406,7 @@ export async function handlePlanApproval(
       onReject: async (feedback?: string) => {
         state.activeInlinePlanApproval = undefined;
         state.ui.setFocus(state.editor);
-        await state.session.respondToToolSuspension({
+        await state.harness.respondToToolSuspension({
           toolCallId,
           resumeData: { action: 'rejected', feedback },
         });

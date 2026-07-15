@@ -202,7 +202,7 @@ describe('handleGoalCommand', () => {
     const sendSignal = vi.fn(() => ({ accepted: Promise.resolve({ accepted: true, runId: 'run-1' }) }));
     const showInfo = vi.fn();
     const ctx = {
-      state: createMockState({ session: { sendSignal }, extra: { goalManager } }),
+      state: createMockState({ harness: { sendSignal }, extra: { goalManager } }),
       showInfo,
       showError: vi.fn(),
       updateStatusLine: vi.fn(),
@@ -278,7 +278,11 @@ describe('handleGoalCommand', () => {
     const sendSignal = vi.fn(() => ({ accepted: Promise.resolve({ accepted: true, runId: 'run-1' }) }));
     const ctx = {
       state: createMockState({
-        session: { thread: { getId: vi.fn(() => currentThreadId), create: createThread }, sendSignal },
+        harness: {
+          getCurrentThreadId: vi.fn(() => currentThreadId),
+          createThread,
+          sendSignal,
+        },
         extra: { pendingNewThread: true, goalManager },
       }),
       addUserMessage: vi.fn(),
@@ -326,7 +330,7 @@ describe('handleGoalCommand', () => {
     const ctx = {
       state: createMockState({
         threadId: 'thread-1',
-        session: { sendSignal },
+        harness: { sendSignal },
         extra: { pendingNewThread: false, goalManager },
       }),
       addUserMessage: vi.fn(),
@@ -396,7 +400,7 @@ describe('handleGoalCommand', () => {
     const ctx = {
       state: createMockState({
         threadId: 'thread-1',
-        session: { sendSignal },
+        harness: { sendSignal },
         extra: { pendingNewThread: false, goalManager },
       }),
       addUserMessage: vi.fn(),
@@ -425,7 +429,7 @@ describe('handleGoalCommand', () => {
     const ctx = {
       state: createMockState({
         threadId: 'thread-1',
-        session: { sendMessage },
+        harness: { sendMessage },
         extra: { pendingNewThread: false, goalManager },
       }),
       addUserMessage: vi.fn(),
@@ -534,7 +538,7 @@ describe('handleGoalCommand', () => {
     const sendSignal = vi.fn();
     const showInfo = vi.fn();
     const ctx = {
-      state: createMockState({ session: { sendSignal }, extra: { goalManager } }),
+      state: createMockState({ harness: { sendSignal }, extra: { goalManager } }),
       showInfo,
       updateStatusLine: vi.fn(),
     } as any;
@@ -554,7 +558,11 @@ describe('handleGoalCommand', () => {
     };
     const abort = vi.fn();
     const state = createMockState({
-      session: { abort, run: { isRunning: vi.fn(() => false) }, suspensions: { hasPending: vi.fn(() => false) } },
+      harness: {
+        abort,
+        isRunning: vi.fn(() => false),
+        getDisplayState: vi.fn(() => ({ pendingSuspension: null })),
+      },
       extra: {
         goalManager,
         planStartedGoalId: 'plan-goal-123',
@@ -586,7 +594,11 @@ describe('handleGoalCommand', () => {
     };
     const abort = vi.fn();
     const state = createMockState({
-      session: { abort, run: { isRunning: vi.fn(() => true) }, suspensions: { hasPending: vi.fn(() => false) } },
+      harness: {
+        abort,
+        isRunning: vi.fn(() => true),
+        getDisplayState: vi.fn(() => ({ pendingSuspension: null })),
+      },
       extra: {
         goalManager,
         planStartedGoalId: undefined,
@@ -630,8 +642,11 @@ describe('handleGoalCommand', () => {
     const sendSignal = vi.fn().mockResolvedValue({ accepted: Promise.resolve() });
     const state = createMockState({
       threadId: 'thread-1',
-      session: { model: { get: vi.fn(() => '__GATEWAY_OPENAI_MODEL__') }, sendSignal },
-      harness: { listAvailableModels: vi.fn().mockResolvedValue([{ id: '__GATEWAY_OPENAI_MODEL__' }]) },
+      harness: {
+        getCurrentModelId: vi.fn(() => '__GATEWAY_OPENAI_MODEL__'),
+        listAvailableModels: vi.fn().mockResolvedValue([{ id: '__GATEWAY_OPENAI_MODEL__' }]),
+        sendSignal,
+      },
       extra: { goalManager, planStartedGoalId: 'plan-goal-xyz' },
     }) as any;
     const showInfo = vi.fn();

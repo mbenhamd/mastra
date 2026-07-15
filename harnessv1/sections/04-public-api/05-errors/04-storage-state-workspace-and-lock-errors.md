@@ -109,7 +109,7 @@ class HarnessSessionCorruptError extends Error {
 // `HarnessStorageError`.
 class HarnessStateSerializationError extends Error {
   readonly sessionId: string;
-  readonly path: string;          // dotted path into `state`, or `$` for root
+  readonly path: string; // dotted path into `state`, or `$` for root
 }
 
 // Remote state PATCH — see §13.2. Thrown before durable state commit when the
@@ -124,8 +124,8 @@ class HarnessStateConflictError extends Error {
 
 // Workspace provider — see §2.7, §9.
 class HarnessConfigError extends Error {
-  readonly field: string;         // e.g. 'workspace.provider'
-  readonly reason: string;        // e.g. 'provider "X" is not resumable'
+  readonly field: string; // e.g. 'workspace.provider'
+  readonly reason: string; // e.g. 'provider "X" is not resumable'
 }
 
 class HarnessWorkspaceProviderMismatchError extends Error {
@@ -136,8 +136,8 @@ class HarnessWorkspaceProviderMismatchError extends Error {
 
 class HarnessWorkspaceLostError extends Error {
   readonly sessionId: string;
-  readonly providerId?: string;   // present for per-session providers when known
-  readonly resourceId?: string;   // present for per-resource/external workspace loss
+  readonly providerId?: string; // present for per-session providers when known
+  readonly resourceId?: string; // present for per-resource/external workspace loss
   readonly generation?: string;
   readonly reason:
     | 'restart'
@@ -158,8 +158,8 @@ class HarnessResourceWorkspaceInUseError extends Error {
 class HarnessSessionLockedError extends Error {
   readonly sessionId: string;
   readonly currentOwnerId: string;
-  readonly expiresAt: number;     // epoch ms — advisory only; storage time and
-                                  // competing claimants decide whether a later
-                                  // retry can acquire the lease.
+  readonly expiresAt: number; // epoch ms — advisory only; storage time and
+  // competing claimants decide whether a later
+  // retry can acquire the lease.
 }
 ```

@@ -3,7 +3,6 @@ import { coreFeatures } from '@mastra/core/features';
 import { MastraReactProvider } from '@mastra/react';
 import { CalendarClockIcon } from 'lucide-react';
 import { useMemo } from 'react';
-import type { RouteObject } from 'react-router';
 import { createBrowserRouter, RouterProvider, Outlet, useNavigate, redirect } from 'react-router';
 import type { LoaderFunctionArgs, RouteObject } from 'react-router';
 import { AgentBuilderRootLayout } from './domains/agent-builder/layouts/agent-builder-root-layout';

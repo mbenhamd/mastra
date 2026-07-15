@@ -23,7 +23,7 @@ import { createDurableToolCallStep } from './tool-call';
 
 vi.mock('../../utils/resolve-runtime', () => ({
   resolveTool: vi.fn().mockReturnValue(undefined),
-  toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  toolApprovalRequirement: vi.fn().mockResolvedValue({ required: false, reasons: [] }),
   rebuildRunToolsFromMastra: vi.fn(),
 }));
 
@@ -33,6 +33,7 @@ vi.mock('../../stream-adapter', () => ({
 }));
 
 const RUN_ID = 'run-xproc-workspace-1';
+const RUNTIME_BINDING_ID = 'binding-xproc-workspace-1';
 
 function mockPubsub() {
   return { publish: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(), flush: vi.fn() };
@@ -41,6 +42,7 @@ function mockPubsub() {
 function makeInitData() {
   return {
     runId: RUN_ID,
+    runtimeBindingId: RUNTIME_BINDING_ID,
     agentId: 'greeter',
     options: { requireToolApproval: false },
     state: { threadId: 'thread-1', resourceId: 'user-1', memoryConfig: undefined, threadExists: false },
@@ -110,6 +112,7 @@ describe('durable tool-call cross-process workspace tool resolution', () => {
   it('does not call the Mastra rebuild when the tool already resolves from the run registry', async () => {
     const executeMock = vi.fn().mockResolvedValue({ ok: true });
     globalRunRegistry.set(RUN_ID, {
+      runtimeBindingId: RUNTIME_BINDING_ID,
       tools: { skill: { id: 'skill', execute: executeMock } as any },
       model: {} as any,
     } as any);
