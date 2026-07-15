@@ -43,8 +43,19 @@ jobs:
       - name: Checkout PR branch
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify checked out PR head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "$actual_head" != "$HEAD_SHA" ]]; then
+            echo "Checked out $actual_head instead of admitted PR head $HEAD_SHA." >&2
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -60,8 +71,8 @@ jobs:
           # and goes stale as the base branch advances, so validator and policy
           # upgrades on the protected base never reach already-open PRs.
           # Resolve the CURRENT protected-base tip instead: it is exactly as
-          # trusted (same protected ref) and strictly fresher, and it matches
-          # the merge commit this workflow actually checks out.
+          # trusted (same protected ref) and strictly fresher. PR code itself
+          # remains pinned to the event's exact head SHA above.
           git fetch --no-tags origin "${BASE_REF}"
           echo "sha=$(git rev-parse "origin/${BASE_REF}")" >> "$GITHUB_OUTPUT"
 
@@ -109,7 +120,8 @@ jobs:
         env:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
-          if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' ]]; then
+          if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' || \
+            "$VALIDATION_LANE" == 'pf2009-upstream-sync' ]]; then
             # Nested workspace manifests are part of the reconciled source
             # tree, not part of the exact pre-install allowlist. Suppress all
             # lifecycle scripts; validation executes only the explicit commands
@@ -119,12 +131,14 @@ jobs:
             pnpm install --frozen-lockfile
           fi
 
-      - name: Exercise PF-558 admission policy
+      - name: Exercise upstream-sync admission policies
         env:
           BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
           policy_script="${RUNNER_TEMP}/pf558-policy-self-test.bash"
@@ -140,6 +154,21 @@ jobs:
             exit 1
           fi
           /bin/bash "$policy_script" --self-test-pf558-upstream-sync
+
+          pf2009_policy_script="${RUNNER_TEMP}/pf2009-policy-self-test.bash"
+          if grep -Fq -- '--self-test-pf2009-upstream-sync' "$policy_script"; then
+            cp "$policy_script" "$pf2009_policy_script"
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$PR_NUMBER" == '278' && \
+            "$HEAD_REF" == 'ci/pf-2009-upstream-sync-validation' && \
+            "$BASE_REF" == 'main' ]]; then
+            echo 'Bootstrapping the PF-2009 policy fixtures from this same-repository policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf2009_policy_script"
+          else
+            echo 'The trusted base does not contain the PF-2009 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$pf2009_policy_script" --self-test-pf2009-upstream-sync
 
       - name: Start Redis test service
         run: |
@@ -165,7 +194,14 @@ jobs:
           VALIDATION_LANE: ${{ steps.install-policy.outputs.lane }}
         run: |
           script_path=".github/scripts/run-papersflow-fork-pr-validation.bash"
-          if /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}"; then
+          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '278' && \
+            "${HEAD_REF}" == 'ci/pf-2009-upstream-sync-validation' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the PF-2009 validator from this exact same-repository policy branch.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}"; then
             /usr/bin/git show "${BASE_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" ]]; then
@@ -176,9 +212,16 @@ jobs:
             echo "The trusted base commit does not contain the fork validator." >&2
             exit 1
           fi
-          if [[ "$VALIDATION_LANE" == 'pf558-upstream-sync' ]]; then
-            /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
-              --validate-pf558-upstream-sync
-          else
-            /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
-          fi
+          case "$VALIDATION_LANE" in
+            pf558-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf558-upstream-sync
+              ;;
+            pf2009-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf2009-upstream-sync
+              ;;
+            *)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+              ;;
+          esac
