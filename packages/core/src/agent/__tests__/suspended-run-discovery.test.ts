@@ -1022,7 +1022,57 @@ describe.each([
   });
 
   describe('agent resume fail-closed boundaries', () => {
-    it('waits for an in-flight pending snapshot to become suspended', async () => {
+    it.each(['pending', 'paused'] as const)(
+      'rejects a foreign-resource %s row before polling for stream and generate',
+      async status => {
+        const storage = new InMemoryStore();
+        const suspended = await suspendRun(
+          createSuspendedSetup({ storage }).agent,
+          'thread-owner-b',
+          'resource-owner-b',
+        );
+        const fgaProvider = createFGAProvider();
+        const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false, fgaProvider });
+        const workflows = (await storage.getStore('workflows'))!;
+        const persisted = await workflows.getWorkflowRunById({
+          workflowName: 'agentic-loop',
+          runId: suspended.runId,
+        });
+        const getWorkflowRunById = vi.spyOn(workflows, 'getWorkflowRunById');
+        const loadWorkflowSnapshot = vi.spyOn(workflows, 'loadWorkflowSnapshot');
+        const requestContext = new RequestContext([
+          ['user', { id: 'user-a' }],
+          [MASTRA_RESOURCE_ID_KEY, 'resource-owner-a'],
+          [MASTRA_THREAD_ID_KEY, 'thread-owner-a'],
+        ]);
+        const options = {
+          runId: suspended.runId,
+          toolCallId: suspended.toolCallId,
+          requestContext,
+          memory: { thread: 'thread-owner-a', resource: 'resource-owner-a' },
+        };
+
+        const resumeCalls = [
+          () => restarted.agent.resumeStream({ approved: true }, options),
+          () => restarted.agent.resumeGenerate({ approved: true }, options),
+        ];
+        for (const resume of resumeCalls) {
+          getWorkflowRunById.mockResolvedValueOnce({
+            ...persisted!,
+            snapshot: { ...(persisted!.snapshot as WorkflowRunState), status, context: {} },
+          });
+
+          await expect(resume()).rejects.toMatchObject({
+            id: 'AGENT_RESUME_OWNER_MISMATCH',
+          });
+        }
+
+        expect(loadWorkflowSnapshot).not.toHaveBeenCalled();
+        expect(mockFindUser).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['pending', 'paused'] as const)('waits for an in-flight %s snapshot to become suspended', async status => {
       const storage = new InMemoryStore();
       const suspended = await suspendRun(
         createSuspendedSetup({ storage }).agent,
@@ -1034,7 +1084,7 @@ describe.each([
       const persisted = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: suspended.runId });
       vi.spyOn(workflows, 'getWorkflowRunById').mockResolvedValueOnce({
         ...persisted!,
-        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'pending' },
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status, context: {} },
       });
 
       const output = await restarted.agent.resumeStream(
@@ -1047,6 +1097,47 @@ describe.each([
       );
       await output.consumeStream();
       await vi.waitFor(() => expect(mockFindUser).toHaveBeenCalledOnce());
+    });
+
+    it('stops polling when an in-flight row reaches a terminal status', async () => {
+      const storage = new InMemoryStore();
+      const suspended = await suspendRun(
+        createSuspendedSetup({ storage }).agent,
+        'thread-terminal-poll',
+        'resource-terminal-poll',
+      );
+      const restarted = createSuspendedSetup({ storage, toolCallOnFirstCall: false });
+      const workflows = (await storage.getStore('workflows'))!;
+      const persisted = await workflows.getWorkflowRunById({
+        workflowName: 'agentic-loop',
+        runId: suspended.runId,
+      });
+      const pending = {
+        ...persisted!,
+        snapshot: { ...(persisted!.snapshot as WorkflowRunState), status: 'pending', context: {} },
+      };
+      const terminal = { ...(persisted!.snapshot as WorkflowRunState), status: 'success' } as WorkflowRunState;
+      const getWorkflowRunById = vi.spyOn(workflows, 'getWorkflowRunById');
+      const loadWorkflowSnapshot = vi.spyOn(workflows, 'loadWorkflowSnapshot').mockResolvedValue(terminal);
+      const options = {
+        runId: suspended.runId,
+        toolCallId: suspended.toolCallId,
+        memory: { thread: 'thread-terminal-poll', resource: 'resource-terminal-poll' },
+      };
+
+      const resumeCalls = [
+        () => restarted.agent.resumeStream({ approved: true }, options),
+        () => restarted.agent.resumeGenerate({ approved: true }, options),
+      ];
+      for (const resume of resumeCalls) {
+        getWorkflowRunById.mockResolvedValueOnce(pending);
+        await expect(resume()).rejects.toMatchObject({
+          id: 'AGENT_RESUME_RUN_NOT_SUSPENDED',
+        });
+      }
+
+      expect(loadWorkflowSnapshot).toHaveBeenCalledTimes(2);
+      expect(mockFindUser).not.toHaveBeenCalled();
     });
 
     it('rejects a running snapshot instead of applying approval to a later suspension', async () => {

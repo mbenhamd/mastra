@@ -6747,15 +6747,16 @@ export class Agent<
     method,
     workflowName = 'agentic-loop',
     waitForToolCallId,
-    pollForSuspendedSnapshot = true,
-    allowPendingSnapshot = false,
+    rowOwnership,
   }: {
     runId: string;
     method: string;
     workflowName?: string;
     waitForToolCallId?: string;
-    pollForSuspendedSnapshot?: boolean;
-    allowPendingSnapshot?: boolean;
+    rowOwnership?: {
+      requestContext?: RequestContext;
+      options?: AgentExecutionOptionsBase<any>;
+    };
   }) {
     const effectiveMastra = this.#mastra ?? (await this.#getOrCreateEphemeralMastra());
     const workflowsStore = await effectiveMastra?.getStorage()?.getStore('workflows');
@@ -6763,15 +6764,29 @@ export class Agent<
     if (typeof workflowsStore?.getWorkflowRunById === 'function') {
       workflowRun = await workflowsStore.getWorkflowRunById({ workflowName, runId });
     }
+    const workflowRunResourceId = typeof workflowRun?.resourceId === 'string' ? workflowRun.resourceId : undefined;
     const workflowRunSnapshot =
       workflowRun?.snapshot && typeof workflowRun.snapshot === 'object' ? workflowRun.snapshot : undefined;
     const workflowRunStatus = (workflowRunSnapshot as { status?: unknown } | undefined)?.status;
     const shouldPoll =
-      pollForSuspendedSnapshot &&
-      (!workflowRunSnapshot ||
-        workflowRunStatus === 'pending' ||
-        workflowRunStatus === 'paused' ||
-        waitForToolCallId !== undefined);
+      !workflowRunSnapshot ||
+      workflowRunStatus === 'pending' ||
+      workflowRunStatus === 'paused' ||
+      waitForToolCallId !== undefined;
+    if (workflowRun && shouldPoll && rowOwnership) {
+      // A pending/paused row may not yet contain the suspended-step metadata
+      // needed for full snapshot verification. Its storage-owned resource id is
+      // still sufficient to reject a foreign or unauthenticated caller before
+      // entering the bounded snapshot poll. Ready suspended snapshots retain
+      // the stronger embedded-vs-row integrity error precedence below.
+      this.#assertAgenticLoopResumeOwnership({
+        method,
+        runId,
+        runResourceId: workflowRunResourceId,
+        requestContext: rowOwnership.requestContext,
+        options: rowOwnership.options,
+      });
+    }
     const existingSnapshot = shouldPoll
       ? await waitForSuspendedSnapshot(workflowsStore, workflowName, runId, snapshot => {
           if (waitForToolCallId === undefined) return true;
@@ -6800,10 +6815,7 @@ export class Agent<
       });
     }
     const snapshotStatus = (existingSnapshot as { status?: unknown }).status;
-    if (
-      snapshotStatus !== 'suspended' &&
-      !(allowPendingSnapshot && (snapshotStatus === 'pending' || snapshotStatus === 'paused'))
-    ) {
+    if (snapshotStatus !== 'suspended') {
       throw new MastraError({
         id: 'AGENT_RESUME_RUN_NOT_SUSPENDED',
         domain: ErrorDomain.AGENT,
@@ -6818,7 +6830,7 @@ export class Agent<
     }
 
     return {
-      resourceId: typeof workflowRun?.resourceId === 'string' ? workflowRun.resourceId : undefined,
+      resourceId: workflowRunResourceId,
       snapshot: existingSnapshot,
     };
   }
@@ -9856,8 +9868,12 @@ export class Agent<
     let { resourceId: runResourceId, snapshot: existingSnapshot } = await this.#loadAgenticLoopSnapshotOrThrow({
       runId,
       method: 'resumeStream',
-      pollForSuspendedSnapshot: false,
-      allowPendingSnapshot: true,
+      rowOwnership: {
+        requestContext: requestContextToUse ?? defaultOptions?.requestContext,
+        options: {
+          memory: streamOptionsWithPubSub?.memory ?? defaultOptions?.memory,
+        },
+      },
     });
     defaultOptions ??= (await this.getDefaultOptions({
       requestContext: requestContextToUse,
@@ -9898,13 +9914,12 @@ export class Agent<
       requestContext: ownershipOptions.requestContext,
       options: ownershipOptions,
     });
-    const initialSnapshotStatus = (existingSnapshot as { status?: unknown }).status;
     const targetIsNotYetSuspended =
       requestedToolCallId !== undefined &&
       !this.#getAgenticLoopSuspendedToolCalls(existingSnapshot).toolCalls.some(
         toolCall => toolCall.toolCallId === requestedToolCallId,
       );
-    if (initialSnapshotStatus === 'pending' || initialSnapshotStatus === 'paused' || targetIsNotYetSuspended) {
+    if (targetIsNotYetSuspended) {
       const refreshedRun = await this.#loadAgenticLoopSnapshotOrThrow({
         runId,
         method: 'resumeStream',
@@ -10314,8 +10329,12 @@ export class Agent<
     let { resourceId: runResourceId, snapshot: existingSnapshot } = await this.#loadAgenticLoopSnapshotOrThrow({
       runId,
       method: 'resumeGenerate',
-      pollForSuspendedSnapshot: false,
-      allowPendingSnapshot: true,
+      rowOwnership: {
+        requestContext: requestContextToUse ?? defaultOptions?.requestContext,
+        options: {
+          memory: options?.memory ?? defaultOptions?.memory,
+        },
+      },
     });
 
     defaultOptions ??= (await this.getDefaultOptions({
@@ -10346,13 +10365,12 @@ export class Agent<
       requestContext: mergedOptions.requestContext,
       options: mergedOptions,
     });
-    const initialSnapshotStatus = (existingSnapshot as { status?: unknown }).status;
     const targetIsNotYetSuspended =
       requestedToolCallId !== undefined &&
       !this.#getAgenticLoopSuspendedToolCalls(existingSnapshot).toolCalls.some(
         toolCall => toolCall.toolCallId === requestedToolCallId,
       );
-    if (initialSnapshotStatus === 'pending' || initialSnapshotStatus === 'paused' || targetIsNotYetSuspended) {
+    if (targetIsNotYetSuspended) {
       const refreshedRun = await this.#loadAgenticLoopSnapshotOrThrow({
         runId,
         method: 'resumeGenerate',
