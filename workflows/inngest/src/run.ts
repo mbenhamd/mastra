@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import type { ActorSignal } from '@mastra/core/auth/ee';
 import { getErrorFromUnknown } from '@mastra/core/error';
@@ -7,7 +8,12 @@ import type { TracingContext, TracingOptions } from '@mastra/core/observability'
 import type { RequestContext } from '@mastra/core/request-context';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { WorkflowRunOutput, ChunkFrom } from '@mastra/core/stream';
-import { createTimeTravelExecutionParams, Run, hydrateSerializedStepErrors } from '@mastra/core/workflows';
+import {
+  createTimeTravelExecutionParams,
+  Run,
+  hydrateSerializedStepErrors,
+  publishWorkflowLifecycleEvent,
+} from '@mastra/core/workflows';
 import type {
   ExecutionEngine,
   ExecutionGraph,
@@ -35,6 +41,29 @@ export function unwrapWorkflowRealtimeData(data: any): any {
     'createdAt' in data &&
     'data' in data;
   return isPubSubEnvelope ? data.data : data;
+}
+
+function inngestWorkflowDispatchId(params: {
+  kind: 'start' | 'resume' | 'time-travel' | 'cancel';
+  workflowId: string;
+  runId: string;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+}): string {
+  const digest = createHash('sha256')
+    .update('mastra.inngest.workflow-dispatch.v1\0', 'utf8')
+    .update(
+      JSON.stringify([
+        params.kind,
+        params.workflowId,
+        params.runId,
+        params.executionGeneration,
+        params.lifecycleResumeAttempt,
+      ]),
+      'utf8',
+    )
+    .digest('hex');
+  return `miwd:v1:${digest}`;
 }
 
 export class InngestRun<
@@ -262,30 +291,101 @@ export class InngestRun<
 
   async cancel() {
     const storage = this.#mastra?.getStorage();
-
-    await this.inngest.send({
-      name: `cancel.workflow.${this.workflowId}`,
-      data: {
-        runId: this.runId,
-      },
-    });
-
     const workflowsStore = await storage?.getStore('workflows');
-    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+    const snapshotBeforeDispatch = await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.workflowId,
       runId: this.runId,
     });
-    if (snapshot) {
-      await workflowsStore?.persistWorkflowSnapshot({
+    if (
+      snapshotBeforeDispatch &&
+      (snapshotBeforeDispatch.status === 'success' ||
+        snapshotBeforeDispatch.status === 'failed' ||
+        snapshotBeforeDispatch.status === 'canceled' ||
+        snapshotBeforeDispatch.status === 'tripwire' ||
+        snapshotBeforeDispatch.status === 'bailed')
+    ) {
+      this.workflowRunStatus = snapshotBeforeDispatch.status;
+      return;
+    }
+
+    // Reserve pending-run identity so cancellation before start still emits on
+    // the same canonical topic a later handle would resolve from storage.
+    const identity = await this.getLifecycleExecutionIdentity();
+
+    const resumeAttempt = snapshotBeforeDispatch?.lifecycleResumeAttempt ?? 0;
+    await this.inngest.send({
+      id: inngestWorkflowDispatchId({
+        kind: 'cancel',
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration: identity.executionGeneration,
+        lifecycleResumeAttempt: resumeAttempt,
+      }),
+      name: `cancel.workflow.${this.workflowId}`,
+      data: {
+        runId: this.runId,
+        executionGeneration: identity.executionGeneration,
+        lifecycleResumeAttempt: resumeAttempt,
+      },
+    });
+
+    // Sending the cancellation is an external await. Reload afterwards so a
+    // concurrently completed execution cannot be overwritten with the stale
+    // pre-send snapshot.
+    const snapshotAfterDispatch = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    });
+    if (
+      snapshotAfterDispatch &&
+      (snapshotAfterDispatch.status === 'success' ||
+        snapshotAfterDispatch.status === 'failed' ||
+        snapshotAfterDispatch.status === 'canceled' ||
+        snapshotAfterDispatch.status === 'tripwire' ||
+        snapshotAfterDispatch.status === 'bailed')
+    ) {
+      this.workflowRunStatus = snapshotAfterDispatch.status;
+      return;
+    }
+    if (
+      snapshotAfterDispatch &&
+      (snapshotAfterDispatch.executionGeneration !== identity.executionGeneration ||
+        (snapshotAfterDispatch.lifecycleResumeAttempt ?? 0) !== resumeAttempt)
+    ) {
+      return;
+    }
+
+    this.abortController.abort();
+    this.workflowRunStatus = 'canceled';
+
+    if (snapshotAfterDispatch) {
+      await workflowsStore?.updateWorkflowState({
         workflowName: this.workflowId,
         runId: this.runId,
-        resourceId: this.resourceId,
-        snapshot: {
-          ...snapshot,
-          status: 'canceled' as any,
-          value: snapshot.value,
+        opts: {
+          status: 'canceled',
         },
       });
+    }
+
+    try {
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.pubsub,
+        workflowId: identity.workflowId,
+        runId: identity.runId,
+        executionGeneration: identity.executionGeneration,
+        event: { type: 'workflow.canceled', resumeAttempt },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.pubsub,
+        workflowId: identity.workflowId,
+        runId: identity.runId,
+        executionGeneration: identity.executionGeneration,
+        event: { type: 'workflow.finished', resumeAttempt, status: 'canceled' },
+      });
+    } catch {
+      // Match core cancellation semantics: lifecycle publication is best-effort
+      // and must not prevent the durable cancellation state from being stored.
     }
   }
 
@@ -360,6 +460,9 @@ export class InngestRun<
       runId: this.runId,
     })) as InngestWorkflowRunState | null | undefined;
     const disableScorers = this.getDurableDisableScorers(previousSnapshot);
+    const lifecycleExecution = this.startLifecycleExecution();
+    await this.assertLifecycleExecutionAdmission(lifecycleExecution);
+    this.workflowRunStatus = 'running';
 
     await workflowsStore?.persistWorkflowSnapshot({
       workflowName: this.workflowId,
@@ -377,6 +480,7 @@ export class InngestRun<
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        ...lifecycleExecution,
         ...(disableScorers !== undefined
           ? {
               runOptions: {
@@ -389,6 +493,13 @@ export class InngestRun<
 
     try {
       const eventOutput = await this.inngest.send({
+        id: inngestWorkflowDispatchId({
+          kind: 'start',
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+        }),
         name: `workflow.${this.workflowId}`,
         data: {
           inputData: inputDataToUse,
@@ -402,6 +513,7 @@ export class InngestRun<
           actor,
           perStep,
           disableScorers,
+          ...lifecycleExecution,
         },
       });
 
@@ -431,6 +543,7 @@ export class InngestRun<
           console.error('Failed to rollback snapshot during start error recovery:', rollbackError);
         }
       }
+      this.workflowRunStatus = previousSnapshot?.status ?? 'pending';
       throw error;
     }
   }
@@ -504,7 +617,6 @@ export class InngestRun<
       actor,
       perStep,
     });
-
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
 
@@ -518,6 +630,7 @@ export class InngestRun<
     if (result.status !== 'suspended') {
       this.cleanup?.();
     }
+    this.workflowRunStatus = result.status;
     return result;
   }
 
@@ -578,6 +691,9 @@ export class InngestRun<
     if (!snapshot) {
       throw new NonRetriableError(`Cannot resume run ${this.runId}: snapshot not found`);
     }
+    if (snapshot.status !== 'suspended') {
+      throw new NonRetriableError(`Cannot resume run ${this.runId}: workflow run is not suspended`);
+    }
 
     // Support label-based resume: look up step from resumeLabels
     const snapshotResumeLabel = params.label ? snapshot.resumeLabels?.[params.label] : undefined;
@@ -597,6 +713,7 @@ export class InngestRun<
     const suspendedStep = this.workflowSteps[steps?.[0] ?? ''];
 
     const resumeDataToUse = await this._validateResumeData(params.resumeData, suspendedStep);
+    const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
 
     // Merge persisted requestContext from snapshot with any new values from params
     const persistedRequestContext = (snapshot as any)?.requestContext ?? {};
@@ -616,11 +733,20 @@ export class InngestRun<
         result: undefined,
         error: undefined,
         timestamp: Date.now(),
+        ...lifecycleExecution,
       } as any,
     });
+    this.workflowRunStatus = 'running';
 
     try {
       const eventOutput = await this.inngest.send({
+        id: inngestWorkflowDispatchId({
+          kind: 'resume',
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+        }),
         name: `workflow.${this.workflowId}`,
         data: {
           inputData: resumeDataToUse,
@@ -644,14 +770,13 @@ export class InngestRun<
           actor: params.actor,
           perStep: params.perStep,
           disableScorers,
+          ...lifecycleExecution,
         },
       });
-
       const eventId = eventOutput.ids[0];
       if (!eventId) {
         throw new Error('Event ID is not set');
       }
-
       return { eventId };
     } catch (err) {
       // Rollback: restore the original snapshot so the run isn't stuck in 'running'.
@@ -667,6 +792,7 @@ export class InngestRun<
       } catch (rollbackErr) {
         console.error('Failed to rollback snapshot during resume error recovery:', rollbackErr);
       }
+      this.workflowRunStatus = snapshot.status;
       throw err;
     }
   }
@@ -687,6 +813,7 @@ export class InngestRun<
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
     this.hydrateFailedResult(result);
+    this.workflowRunStatus = result.status;
     return result;
   }
 
@@ -854,6 +981,7 @@ export class InngestRun<
       initialState: params.initialState,
       perStep: params.perStep,
     });
+    const lifecycleExecution = this.beginLifecycleExecution();
 
     // Save previous snapshot for rollback if send fails
     const previousSnapshot = snapshotForRollback;
@@ -877,6 +1005,7 @@ export class InngestRun<
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        ...lifecycleExecution,
         ...(disableScorers !== undefined
           ? {
               runOptions: {
@@ -886,10 +1015,18 @@ export class InngestRun<
           : {}),
       } as InngestWorkflowRunState,
     });
+    this.workflowRunStatus = 'running';
 
     let eventId: string;
     try {
       const eventOutput = await this.inngest.send({
+        id: inngestWorkflowDispatchId({
+          kind: 'time-travel',
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+        }),
         name: `workflow.${this.workflowId}`,
         data: {
           initialState: timeTravelData.state,
@@ -903,14 +1040,14 @@ export class InngestRun<
           actor: params.actor,
           perStep: params.perStep,
           disableScorers,
+          ...lifecycleExecution,
         },
       });
-
-      const dispatchedEventId = eventOutput.ids[0];
-      if (!dispatchedEventId) {
+      const sentEventId = eventOutput.ids[0];
+      if (!sentEventId) {
         throw new Error('Event ID is not set');
       }
-      eventId = dispatchedEventId;
+      eventId = sentEventId;
     } catch (err) {
       // Rollback: restore the previous snapshot so the run isn't stuck in 'running'.
       // The rollback itself can fail (e.g. transient storage error); log it but
@@ -927,11 +1064,13 @@ export class InngestRun<
           console.error('Failed to rollback snapshot during time-travel error recovery:', rollbackErr);
         }
       }
+      this.workflowRunStatus = previousSnapshot?.status ?? 'pending';
       throw err;
     }
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
     this.hydrateFailedResult(result);
+    this.workflowRunStatus = result.status;
 
     // Only include state when explicitly requested, matching core engine behavior
     if (!params.outputOptions?.includeState) {

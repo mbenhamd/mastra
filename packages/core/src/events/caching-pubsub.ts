@@ -83,7 +83,8 @@ export class CachingPubSub extends PubSub {
 
   constructor(
     private readonly inner: PubSub,
-    private readonly cache: MastraServerCache,
+    /** Cache backing retained history. Exposed so sibling transport decorators can share one exact log. */
+    readonly cache: MastraServerCache,
     options: CachingPubSubOptions = {},
   ) {
     super();
@@ -433,6 +434,7 @@ export class CachingPubSub extends PubSub {
     let nextCursor = offset;
     let expectedLogGeneration = options?.logGeneration;
     let terminalError: Error | undefined;
+    let terminalQueued = false;
     let deliveryChain = Promise.resolve();
     const pending = new Map<number, PendingDelivery[]>();
 
@@ -518,43 +520,83 @@ export class CachingPubSub extends PubSub {
     };
 
     const drainRetained = async () => {
-      const { result, range } = await rangeFor(nextCursor - 1);
-      rejectUnavailableCursor(range);
+      if (terminalError) throw terminalError;
+      // One drain catches up to one fixed retained head. Newer publishes are
+      // buffered by the live subscription and schedule a later drain, so a
+      // continuously written topic cannot keep bootstrap open forever.
+      let targetNextCursor: number | undefined;
+      while (true) {
+        const { result, range } = await rangeFor(nextCursor - 1);
+        rejectUnavailableCursor(range);
+        targetNextCursor ??= range.nextCursor;
 
-      const entries = [...result.entries].sort((left, right) => left.cursor - right.cursor);
-      for (const entry of entries) {
-        if (entry.cursor < nextCursor) continue;
-        if (entry.cursor !== nextCursor) {
-          throw new IndexedReplayIntegrityError(
-            'cursor-gap',
-            `Indexed replay log has a cursor gap: expected ${nextCursor}, received ${entry.cursor}`,
-          );
+        const entries = [...result.entries]
+          .filter(entry => entry.cursor < targetNextCursor!)
+          .sort((left, right) => left.cursor - right.cursor);
+        const cursorBeforePage = nextCursor;
+        for (const entry of entries) {
+          if (entry.cursor < nextCursor) continue;
+          if (entry.cursor !== nextCursor) {
+            throw new IndexedReplayIntegrityError(
+              'cursor-gap',
+              `Indexed replay log has a cursor gap: expected ${nextCursor}, received ${entry.cursor}`,
+            );
+          }
+
+          const canonical = this.retainedEvent({
+            ...entry.value,
+            index: entry.cursor,
+            logGeneration: range.logGeneration,
+          });
+          const deliveries = pending.get(entry.cursor) ?? [];
+          pending.delete(entry.cursor);
+          try {
+            await deliverCanonical(canonical, deliveries);
+          } catch (error) {
+            if (deliveries.length > 0) pending.set(entry.cursor, deliveries);
+            throw error;
+          }
+          nextCursor += 1;
+          await acknowledgeCommitted();
         }
 
-        const canonical = this.retainedEvent({
-          ...entry.value,
-          index: entry.cursor,
-          logGeneration: range.logGeneration,
-        });
-        const deliveries = pending.get(entry.cursor) ?? [];
-        pending.delete(entry.cursor);
-        try {
-          await deliverCanonical(canonical, deliveries);
-        } catch (error) {
-          if (deliveries.length > 0) pending.set(entry.cursor, deliveries);
-          throw error;
-        }
-        nextCursor += 1;
+        // Live duplicates can arrive after their retained counterpart commits.
+        // Validate the generation above before acknowledging them: a lower
+        // cursor from a recreated log is not an old duplicate.
         await acknowledgeCommitted();
-      }
 
-      // Live duplicates can arrive after their retained counterpart commits.
-      // Validate the generation above before acknowledging them: a lower
-      // cursor from a recreated log is not an old duplicate.
-      await acknowledgeCommitted();
+        // A backend may page retained reads to stay under transaction limits.
+        // The fixed target is the first page's full log head, not merely the
+        // end of that page.
+        if (nextCursor < targetNextCursor) {
+          if (nextCursor === cursorBeforePage) {
+            throw new IndexedReplayIntegrityError(
+              'cursor-gap',
+              `Indexed replay log did not return retained cursor ${nextCursor} before head ${targetNextCursor}`,
+            );
+          }
+          continue;
+        }
 
-      const lowestPending = Math.min(...pending.keys());
-      if (Number.isFinite(lowestPending) && lowestPending >= nextCursor && range.nextCursor <= nextCursor) {
+        const lowestPending = Math.min(...pending.keys());
+        if (!Number.isFinite(lowestPending) || lowestPending < nextCursor) return;
+
+        // During initial bootstrap, the mandatory post-bootstrap drain below
+        // owns live events that arrived beyond the captured head.
+        if (bootstrapping) return;
+
+        // A live publish can append while this drain is awaiting the previous
+        // callback. Re-read before declaring the live cursor absent: the range
+        // above is a valid but stale snapshot from before that append.
+        const { range: refreshedRange } = await rangeFor(nextCursor - 1);
+        rejectUnavailableCursor(refreshedRange);
+        if (refreshedRange.nextCursor > nextCursor) {
+          // Catch up only far enough to reconcile the lowest live delivery;
+          // do not chase an independently moving retained head.
+          targetNextCursor = Math.min(refreshedRange.nextCursor, lowestPending + 1);
+          if (targetNextCursor > nextCursor) continue;
+        }
+
         throw new IndexedReplayIntegrityError(
           'live-event-not-retained',
           `Live indexed event ${lowestPending} is absent from retained history at cursor ${nextCursor}`,
@@ -570,51 +612,68 @@ export class CachingPubSub extends PubSub {
       if (terminalError) return;
       terminalError = error;
       try {
-        await options?.onError?.(error);
-      } catch (observerError) {
-        this.logError(`[CachingPubSub] Indexed replay error observer failed for ${topic}`, observerError);
-      }
-      // A generation or integrity fence cannot recover within this
-      // subscription. Stop it so later broker messages do not fail forever.
-      void this.inner.unsubscribe(topic, wrappedCb).catch(unsubscribeError => {
+        // A generation or integrity fence cannot recover within this
+        // subscription. Stop broker delivery before notifying the observer so
+        // a slow onError handler cannot leave a poison record redelivering.
+        await this.inner.unsubscribe(topic, wrappedCb);
+      } catch (unsubscribeError) {
         this.logError(
           `[CachingPubSub] Failed to stop terminal indexed replay subscription for ${topic}`,
           unsubscribeError,
         );
-      });
+      }
+      // The subscription is stopped. Remove its public drain handles before
+      // invoking onError so an observer may safely call flush()/unwatch()
+      // without waiting on the delivery chain that is currently awaiting it.
+      this.callbackMap.delete(cb);
+      this.subscriptionDrains.delete(cb);
+      try {
+        await options?.onError?.(error);
+      } catch (observerError) {
+        this.logError(`[CachingPubSub] Indexed replay error observer failed for ${topic}`, observerError);
+      }
     };
 
     const enqueueDrain = (reportActiveFailure = false) => {
       const delivery = deliveryChain.then(drainRetained);
-      deliveryChain = delivery.catch(() => {});
-      if (!reportActiveFailure) return delivery;
-      return delivery.catch(async error => {
-        if (isTerminalReplayError(error)) {
-          await reportTerminalError(error);
-        }
-        throw error;
-      });
+      const reportedDelivery = reportActiveFailure
+        ? delivery.catch(async error => {
+            if (isTerminalReplayError(error)) {
+              await reportTerminalError(error);
+            }
+            throw error;
+          })
+        : delivery;
+      // Flush/unsubscribe must wait through terminal broker teardown and the
+      // onError observer, not merely the raw retained read.
+      deliveryChain = reportedDelivery.catch(() => {});
+      return reportedDelivery;
     };
 
     wrappedCb = (event, ack, nack) => {
-      if (terminalError) {
+      if (terminalError || terminalQueued) {
+        const terminalDrain = deliveryChain;
         const failure = async () => {
           await nack?.();
-          throw terminalError;
+          await terminalDrain;
+          throw terminalError ?? new Error(`Indexed replay subscription for ${topic} is stopping`);
         };
         return failure();
       }
       if (!Number.isSafeInteger(event.index) || event.index! < 0) {
-        const failure = async () => {
-          await nack?.();
-          const error = new IndexedReplayIntegrityError(
-            'invalid-live-cursor',
-            `Exact indexed replay received an event without a valid cursor: ${event.id}`,
-          );
+        terminalQueued = true;
+        const error = new IndexedReplayIntegrityError(
+          'invalid-live-cursor',
+          `Exact indexed replay received an event without a valid cursor: ${event.id}`,
+        );
+        const negativeAck = Promise.resolve().then(() => nack?.());
+        const failure = deliveryChain.then(async () => {
+          await negativeAck;
           await reportTerminalError(error);
           throw error;
-        };
-        return failure();
+        });
+        deliveryChain = failure.catch(() => {});
+        return failure;
       }
 
       const deliveries = pending.get(event.index!) ?? [];
@@ -631,7 +690,7 @@ export class CachingPubSub extends PubSub {
       await this.inner.subscribe(topic, wrappedCb);
       await drainRetained();
       bootstrapping = false;
-      await enqueueDrain();
+      if (pending.size > 0) await enqueueDrain();
     } catch (error) {
       this.callbackMap.delete(cb);
       this.subscriptionDrains.delete(cb);
@@ -657,18 +716,67 @@ export class CachingPubSub extends PubSub {
    */
   async getHistory(topic: string, offset: number = 0): Promise<Event[]> {
     if (this.indexedLog && this.indexedLogRetention) {
-      const result = await this.indexedLog.readIndexedLogEntries<Event>(
-        this.getIndexedLogKey(topic),
-        offset - 1,
-        this.indexedLogRetention,
-      );
-      return result.entries.map(entry =>
-        this.retainedEvent({
-          ...entry.value,
-          index: entry.cursor,
+      const history: Event[] = [];
+      let afterCursor = offset - 1;
+      let logGeneration: string | undefined;
+      let firstPage = true;
+      let targetNextCursor: number | undefined;
+
+      while (true) {
+        const result = await this.indexedLog.readIndexedLogEntries<Event>(
+          this.getIndexedLogKey(topic),
+          afterCursor,
+          this.indexedLogRetention,
+        );
+        const range: IndexedReplayRange = {
+          ...this.indexedReplay!,
           logGeneration: result.logGeneration,
-        }),
-      );
+          firstCursor: result.firstCursor,
+          nextCursor: result.nextCursor,
+        };
+        if (logGeneration !== undefined && logGeneration !== result.logGeneration) {
+          throw new IndexedReplayCursorError('generation-mismatch', afterCursor + 1, range, logGeneration);
+        }
+        logGeneration ??= result.logGeneration;
+        targetNextCursor ??= result.nextCursor;
+
+        // Historical reads are best effort at their initial offset, matching
+        // the legacy behavior of returning the retained suffix. Once paging
+        // starts, however, retention must not skip a page under this reader.
+        if (afterCursor < result.firstCursor - 1) {
+          if (!firstPage) throw new IndexedReplayCursorError('cursor-too-old', afterCursor + 1, range);
+          afterCursor = result.firstCursor - 1;
+        }
+        firstPage = false;
+
+        const entries = [...result.entries]
+          .filter(entry => entry.cursor > afterCursor && entry.cursor < targetNextCursor!)
+          .sort((left, right) => left.cursor - right.cursor);
+        for (const entry of entries) {
+          if (entry.cursor !== afterCursor + 1) {
+            throw new IndexedReplayIntegrityError(
+              'cursor-gap',
+              `Indexed replay log has a cursor gap: expected ${afterCursor + 1}, received ${entry.cursor}`,
+            );
+          }
+          history.push(
+            this.retainedEvent({
+              ...entry.value,
+              index: entry.cursor,
+              logGeneration: result.logGeneration,
+            }),
+          );
+          afterCursor = entry.cursor;
+        }
+
+        if (afterCursor + 1 >= targetNextCursor) return history;
+        if (entries.length === 0) {
+          throw new IndexedReplayIntegrityError(
+            'cursor-gap',
+            `Indexed replay log did not return retained cursor ${afterCursor + 1} before head ${targetNextCursor}`,
+          );
+        }
+      }
     }
     const cacheKey = this.getCacheKey(topic);
     const events = await this.cache.listFromTo(cacheKey, offset);
@@ -694,7 +802,20 @@ export class CachingPubSub extends PubSub {
    * Flush any pending operations on the inner PubSub.
    */
   async flush(): Promise<void> {
-    await this.inner.flush();
+    while (true) {
+      await this.inner.flush();
+      const before = new Map([...this.subscriptionDrains].map(([callback, drain]) => [callback, drain()]));
+      await Promise.all(before.values());
+
+      // A callback can nack while the first inner flush is already complete.
+      // Give the broker a second chance to materialize that redelivery, then
+      // compare the exact subscription-chain promises to find a stable point.
+      await this.inner.flush();
+      const after = new Map([...this.subscriptionDrains].map(([callback, drain]) => [callback, drain()]));
+      if (before.size === after.size && [...before].every(([callback, delivery]) => after.get(callback) === delivery)) {
+        return;
+      }
+    }
   }
 
   /**

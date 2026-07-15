@@ -227,6 +227,56 @@ describe.sequential('GoogleCloudPubSub group support', () => {
       expect(collectedB.map(event => event.type)).toEqual(['run-b']);
     });
 
+    it('clears one logical lifecycle subscription without deleting the shared broker topic', async () => {
+      const pubsub = createPubSub();
+      const suffix = `${Date.now()}-${topicCounter++}`;
+      const topicA = `workflow.lifecycle.v1.workflow-${suffix}.run-a.generation-a`;
+      const topicB = `workflow.lifecycle.v1.workflow-${suffix}.run-b.generation-b`;
+      const callback = () => {};
+      const raw = new PubSubClient({ projectId: 'pubsub-test', apiEndpoint: EMULATOR_HOST });
+
+      try {
+        await pubsub.subscribe(topicA, callback);
+        await pubsub.subscribe(topicB, callback);
+        const subscriptionA = raw.subscription(pubsub.getSubscriptionName('workflow.lifecycle.v1', undefined, topicA));
+        const subscriptionB = raw.subscription(pubsub.getSubscriptionName('workflow.lifecycle.v1', undefined, topicB));
+
+        await expect(subscriptionA.exists()).resolves.toEqual([true]);
+        await expect(subscriptionB.exists()).resolves.toEqual([true]);
+
+        await pubsub.clearTopic(topicA);
+
+        await expect(subscriptionA.exists()).resolves.toEqual([false]);
+        await expect(subscriptionB.exists()).resolves.toEqual([true]);
+        await expect(raw.topic('workflow.lifecycle.v1').exists()).resolves.toEqual([true]);
+
+        await pubsub.clearTopic(topicB);
+      } finally {
+        await raw.close();
+      }
+    });
+
+    it('deletes an ungrouped lifecycle subscription after its final watcher unsubscribes', async () => {
+      const pubsub = createPubSub();
+      const suffix = `${Date.now()}-${topicCounter++}`;
+      const topic = `workflow.lifecycle.v1.workflow-${suffix}.run-a.generation-a`;
+      const callback = () => {};
+      const raw = new PubSubClient({ projectId: 'pubsub-test', apiEndpoint: EMULATOR_HOST });
+
+      try {
+        await pubsub.subscribe(topic, callback);
+        const subscription = raw.subscription(pubsub.getSubscriptionName('workflow.lifecycle.v1', undefined, topic));
+        await expect(subscription.exists()).resolves.toEqual([true]);
+
+        await pubsub.unsubscribe(topic, callback);
+
+        await expect(subscription.exists()).resolves.toEqual([false]);
+        await expect(raw.topic('workflow.lifecycle.v1').exists()).resolves.toEqual([true]);
+      } finally {
+        await raw.close();
+      }
+    });
+
     it('nacks an async callback rejection and redelivers the same logical event', async () => {
       const pubsub = createPubSub();
       const runId = `run-reject-${Date.now()}-${topicCounter++}`;
@@ -310,6 +360,47 @@ describe.sequential('GoogleCloudPubSub group support', () => {
       const types = collected.map(e => e.type);
       expect(types).toContain('task-0');
       expect(types).toContain('task-3');
+    });
+
+    it('delivers each message to only one grouped callback on the same instance', async () => {
+      const pubsub = createPubSub();
+      const publisher = createPubSub();
+      const topic = uniqueTopic();
+      const collected1: Event[] = [];
+      const collected2: Event[] = [];
+      const delivered: Event[] = [];
+
+      await pubsub.subscribe(
+        topic,
+        (event, ack) => {
+          collected1.push(event);
+          delivered.push(event);
+          void ack?.();
+        },
+        { group: 'same-instance-workers' },
+      );
+      await pubsub.subscribe(
+        topic,
+        (event, ack) => {
+          collected2.push(event);
+          delivered.push(event);
+          void ack?.();
+        },
+        { group: 'same-instance-workers' },
+      );
+
+      const messageCount = 6;
+      for (let i = 0; i < messageCount; i++) {
+        await publisher.publish(topic, makeEvent({ type: `task-${i}` }));
+      }
+
+      await waitForMessages(messageCount, delivered, 10_000);
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      expect(delivered).toHaveLength(messageCount);
+      expect(new Set(delivered.map(event => event.id)).size).toBe(messageCount);
+      expect(collected1).not.toHaveLength(0);
+      expect(collected2).not.toHaveLength(0);
     });
 
     it('group and fan-out subscriptions on same topic use different subscription names', async () => {

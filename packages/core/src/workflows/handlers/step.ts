@@ -143,16 +143,21 @@ export async function executeStep(
       step,
     });
 
+  const isTimeTravelResume = timeTravel?.stepResults[step.id]?.status === 'suspended';
+  const isExplicitResume = resume?.steps[0] === step.id;
+  let isResume = false;
   let resumeDataToUse: unknown;
-  if (timeTravelResumeData && !timeTravelResumeValidationError) {
+  if (isTimeTravelResume && !timeTravelResumeValidationError) {
     resumeDataToUse = timeTravelResumeData;
-  } else if (timeTravelResumeData && timeTravelResumeValidationError) {
+    isResume = true;
+  } else if (isTimeTravelResume && timeTravelResumeValidationError) {
     engine.getLogger().warn('Time travel resume data validation failed', {
       stepId: step.id,
       error: timeTravelResumeValidationError.message,
     });
-  } else if (resume?.steps[0] === step.id) {
+  } else if (isExplicitResume) {
     resumeDataToUse = resume?.resumePayload;
+    isResume = true;
   }
 
   // Extract suspend data if this step was previously suspended
@@ -177,12 +182,12 @@ export async function executeStep(
     suspendDataToUse = userSuspendData;
   }
 
-  const startTime = resumeDataToUse ? undefined : Date.now();
-  const resumeTime = resumeDataToUse ? Date.now() : undefined;
+  const startTime = isResume ? undefined : Date.now();
+  const resumeTime = isResume ? Date.now() : undefined;
 
   const stepInfo = {
     ...stepResults[step.id],
-    ...(resumeDataToUse ? { resumePayload: resumeDataToUse } : { payload: inputData }),
+    ...(isResume ? { resumePayload: resumeDataToUse } : { payload: inputData }),
     ...(startTime ? { startedAt: startTime } : {}),
     ...(resumeTime ? { resumedAt: resumeTime } : {}),
     status: 'running',
@@ -224,7 +229,7 @@ export async function executeStep(
     workflowId,
     runId,
     executionGeneration,
-    event: resumeDataToUse
+    event: isResume
       ? {
           type: 'step.resumed',
           stepId: step.id,
@@ -309,6 +314,42 @@ export async function executeStep(
       }
 
       const stepResult = { ...stepInfo, ...workflowResult } as StepResult<any, any, any, any>;
+      const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
+        workflowId,
+        runId,
+        executionGeneration,
+      });
+      if (authoritativeDisposition) {
+        delete executionContext.activeStepsPath[step.id];
+        const canceledStepResult = {
+          ...stepResult,
+          status: 'canceled',
+          endedAt: Date.now(),
+        } as unknown as StepResult<any, any, any, any>;
+        return {
+          result: canceledStepResult,
+          stepResults: { [step.id]: canceledStepResult },
+          mutableContext: engine.buildMutableContext(executionContext),
+          requestContext: engine.serializeRequestContext(requestContext),
+        };
+      }
+      const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
+      await engine.wrapDurableOperation(emitOperationId, async () => {
+        await emitStepResultEvents({
+          stepId: step.id,
+          stepCallId,
+          stepAttempt: lifecycleStepState.stepAttempt,
+          workflowId,
+          executionGeneration,
+          execResults: stepResult,
+          pubsub,
+          runId,
+          // Inngest's nested-workflow hook already emits the legacy result
+          // stream inside its own durable operation. Add only the canonical
+          // lifecycle transitions here.
+          emitLegacy: false,
+        });
+      });
       return {
         result: stepResult,
         stepResults: { [step.id]: stepResult },
@@ -333,21 +374,20 @@ export async function executeStep(
 
   const retries = step.retries ?? executionContext.retryConfig.attempts ?? 0;
   const delay = executionContext.retryConfig.delay ?? 0;
-  let executionInvocation = 0;
+  const initialStepAttempt = lifecycleStepState.stepAttempt;
 
   // Use executeStepWithRetry to handle retry logic
   // Default engine: internal retry loop
   // Inngest engine: throws RetryAfterError for external retry handling
   const stepRetryResult = await engine.executeStepWithRetry(
     `workflow.${workflowId}.step.${step.id}`,
-    async () => {
+    async retryCount => {
       if (validationError) {
         throw validationError;
       }
 
-      const retryCount = engine.getOrGenerateRetryCount(step.id);
-      if (executionInvocation > 0) {
-        lifecycleStepState.stepAttempt += 1;
+      lifecycleStepState.stepAttempt = initialStepAttempt + retryCount;
+      if (retryCount > 0) {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
@@ -361,7 +401,6 @@ export async function executeStep(
           },
         });
       }
-      executionInvocation += 1;
 
       let timeTravelSteps: string[] = [];
       if (timeTravel && timeTravel.steps.length > 0) {
@@ -510,16 +549,30 @@ export async function executeStep(
 
       const nestedWflowStepPaused = isNestedWorkflowStep && perStep;
 
-      return { output, suspended, bailed, contextMutations, nestedWflowStepPaused };
+      return {
+        output,
+        suspended,
+        bailed,
+        contextMutations,
+        nestedWflowStepPaused,
+        lifecycleStepAttempt: lifecycleStepState.stepAttempt,
+      };
     },
     { retries, delay, stepSpan, workflowId, runId },
   );
 
   // Check if step execution failed
   if (!stepRetryResult.ok) {
-    execResults = stepRetryResult.error;
+    const { retryCount: finalRetryCount = 0, ...failure } = stepRetryResult.error;
+    lifecycleStepState.stepAttempt = initialStepAttempt + finalRetryCount;
+    execResults = failure;
   } else {
     const { result: durableResult } = stepRetryResult;
+
+    // Inngest restores the durable operation result without re-running the
+    // retry loop. Retain its final attempt number so persisted snapshots and
+    // later resumes agree with the lifecycle events already published.
+    lifecycleStepState.stepAttempt = durableResult.lifecycleStepAttempt;
 
     // Apply context mutations from the durable operation result
     // For Default: these were already applied during execution, this is a no-op
@@ -572,24 +625,38 @@ export async function executeStep(
     execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
   }
 
-  const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
-  const lifecycleResultEmission = engine.wrapDurableOperation(emitOperationId, async () => {
-    await emitStepResultEvents({
-      stepId: step.id,
-      stepCallId,
-      stepAttempt: lifecycleStepState.stepAttempt,
-      workflowId,
-      executionGeneration,
-      execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
-      pubsub,
-      runId,
-      emitLegacy: !skipEmits,
-    });
+  const authoritativeDisposition = await engine.getAuthoritativeExecutionDisposition({
+    workflowId,
+    runId,
+    executionGeneration,
   });
-  if (deferLifecycleResult) {
-    deferLifecycleResult(lifecycleResultEmission);
-  } else {
-    await lifecycleResultEmission;
+  if (authoritativeDisposition) {
+    // The durable terminal owner has already emitted its workflow terminal.
+    // Convert the local result to a stop signal, but suppress this worker's
+    // delayed step terminal so nothing is appended after workflow.finished.
+    execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
+  }
+
+  if (!authoritativeDisposition) {
+    const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
+    const lifecycleResultEmission = engine.wrapDurableOperation(emitOperationId, async () => {
+      await emitStepResultEvents({
+        stepId: step.id,
+        stepCallId,
+        stepAttempt: lifecycleStepState.stepAttempt,
+        workflowId,
+        executionGeneration,
+        execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
+        pubsub,
+        runId,
+        emitLegacy: !skipEmits,
+      });
+    });
+    if (deferLifecycleResult) {
+      deferLifecycleResult(lifecycleResultEmission);
+    } else {
+      await lifecycleResultEmission;
+    }
   }
 
   if (execResults.status != 'failed') {
@@ -717,6 +784,7 @@ export async function emitStepResultEvents(params: {
     runId,
     emitLegacy = true,
   } = params;
+  const lifecycleStatus = (execResults as any).status === 'bailed' ? ('success' as const) : execResults.status;
   const payloadBase = stepCallId
     ? { id: stepId, stepCallId, ...(stepAttempt === undefined ? {} : { stepAttempt }) }
     : { id: stepId };
@@ -762,23 +830,23 @@ export async function emitStepResultEvents(params: {
     }
     if (stepCallId && stepAttempt && workflowId && executionGeneration) {
       const identity = { stepId, stepCallId, stepAttempt };
-      if (execResults.status === 'success') {
+      if (lifecycleStatus === 'success') {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
           runId,
           executionGeneration,
-          event: { type: 'step.completed', ...identity, output: execResults.output },
+          event: { type: 'step.completed', ...identity, output: (execResults as any).output },
         });
-      } else if (execResults.status === 'failed') {
+      } else if (lifecycleStatus === 'failed') {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
           runId,
           executionGeneration,
-          event: { type: 'step.failed', ...identity, error: execResults.error },
+          event: { type: 'step.failed', ...identity, error: (execResults as any).error },
         });
-      } else if (execResults.status === 'canceled') {
+      } else if (lifecycleStatus === 'canceled') {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
@@ -788,13 +856,13 @@ export async function emitStepResultEvents(params: {
         });
       }
 
-      if (execResults.status === 'success' || execResults.status === 'failed' || execResults.status === 'canceled') {
+      if (lifecycleStatus === 'success' || lifecycleStatus === 'failed' || lifecycleStatus === 'canceled') {
         await publishWorkflowLifecycleEvent({
           pubsub,
           workflowId,
           runId,
           executionGeneration,
-          event: { type: 'step.finished', ...identity, status: execResults.status },
+          event: { type: 'step.finished', ...identity, status: lifecycleStatus },
         });
       }
     }

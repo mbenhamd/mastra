@@ -11,9 +11,12 @@ import { createWorkflow as createEventedWorkflow } from './evented';
 import {
   createWorkflowExecutionGeneration,
   getOrCreateWorkflowStepLifecycleState,
+  getWorkflowLifecycleEventId,
   getWorkflowLifecycleSemanticKey,
   getWorkflowLifecycleTopic,
+  mergeWorkflowStepLifecycleStates,
   parseWorkflowLifecycleRecord,
+  publishWorkflowLifecycleEvent,
 } from './lifecycle-events';
 import type { WorkflowLifecycleEvent, WorkflowLifecycleRecord, WorkflowLifecycleRecordError } from './lifecycle-events';
 import { createStep } from './workflow';
@@ -36,6 +39,70 @@ function stepEvents(records: Array<{ record: WorkflowLifecycleRecord }>) {
 }
 
 describe('canonical workflow lifecycle model', () => {
+  it('clears a terminal lifecycle topic only after its advertised replay retention and minimum reconnect window', async () => {
+    class RetainedPubSub extends EventEmitterPubSub {
+      override get indexedReplay() {
+        return { scope: 'process' as const, retentionMs: 100, maxEvents: 10 };
+      }
+
+      override clearTopic = vi.fn(async (_topic: string) => {});
+    }
+
+    vi.useFakeTimers();
+    try {
+      const pubsub = new RetainedPubSub();
+      await publishWorkflowLifecycleEvent({
+        pubsub,
+        workflowId: 'cleanup-workflow',
+        runId: 'cleanup-run',
+        executionGeneration: 'cleanup-generation',
+        event: { type: 'workflow.finished', resumeAttempt: 0, status: 'success' },
+      });
+      const cleanupTopic = getWorkflowLifecycleTopic({
+        workflowId: 'cleanup-workflow',
+        runId: 'cleanup-run',
+        executionGeneration: 'cleanup-generation',
+      });
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(pubsub.clearTopic).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(pubsub.clearTopic).toHaveBeenCalledWith(cleanupTopic);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears terminal topics on transports without indexed replay after the reconnect backstop', async () => {
+    class PersistentPubSub extends EventEmitterPubSub {
+      override clearTopic = vi.fn(async (_topic: string) => {});
+    }
+
+    vi.useFakeTimers();
+    try {
+      const pubsub = new PersistentPubSub();
+      await publishWorkflowLifecycleEvent({
+        pubsub,
+        workflowId: 'plain-cleanup-workflow',
+        runId: 'plain-cleanup-run',
+        executionGeneration: 'plain-cleanup-generation',
+        event: { type: 'workflow.finished', resumeAttempt: 0, status: 'success' },
+      });
+      const cleanupTopic = getWorkflowLifecycleTopic({
+        workflowId: 'plain-cleanup-workflow',
+        runId: 'plain-cleanup-run',
+        executionGeneration: 'plain-cleanup-generation',
+      });
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(pubsub.clearTopic).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(pubsub.clearTopic).toHaveBeenCalledWith(cleanupTopic);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('scopes topics by workflow, run, and execution generation', () => {
     const sharedRun = 'shared.run/1';
     const first = getWorkflowLifecycleTopic({
@@ -56,6 +123,36 @@ describe('canonical workflow lifecycle model', () => {
 
     expect(new Set([first, secondWorkflow, secondGeneration]).size).toBe(3);
     expect(first).not.toContain('workflow.alpha');
+  });
+
+  it('clones broker step state and preserves the highest persisted attempt', () => {
+    const incoming = {
+      coordinate: { stepCallId: 'stable-call', stepAttempt: 1 },
+      incomingOnly: { stepCallId: 'incoming-call', stepAttempt: 1 },
+    };
+    const persisted = {
+      coordinate: { stepCallId: 'stable-call', stepAttempt: 3 },
+      persistedOnly: { stepCallId: 'persisted-call', stepAttempt: 2 },
+    };
+
+    const merged = mergeWorkflowStepLifecycleStates(incoming, persisted);
+    expect(merged).toEqual({
+      coordinate: { stepCallId: 'stable-call', stepAttempt: 3 },
+      incomingOnly: { stepCallId: 'incoming-call', stepAttempt: 1 },
+      persistedOnly: { stepCallId: 'persisted-call', stepAttempt: 2 },
+    });
+    merged.coordinate!.stepAttempt = 4;
+    expect(incoming.coordinate.stepAttempt).toBe(1);
+    expect(persisted.coordinate.stepAttempt).toBe(3);
+  });
+
+  it('rejects conflicting step-call identity for one lifecycle coordinate', () => {
+    expect(() =>
+      mergeWorkflowStepLifecycleStates(
+        { coordinate: { stepCallId: 'incoming', stepAttempt: 1 } },
+        { coordinate: { stepCallId: 'persisted', stepAttempt: 1 } },
+      ),
+    ).toThrow('conflicting step-call identity');
   });
 
   it('reserves one pre-start execution identity and reuses it for the run', async () => {
@@ -125,6 +222,8 @@ describe('canonical workflow lifecycle model', () => {
 
     expect(getWorkflowLifecycleSemanticKey(republished)).toBe(getWorkflowLifecycleSemanticKey(record));
     expect(getWorkflowLifecycleSemanticKey(nextCycle)).not.toBe(getWorkflowLifecycleSemanticKey(record));
+    expect(getWorkflowLifecycleEventId(republished)).toBe(getWorkflowLifecycleEventId(record));
+    expect(getWorkflowLifecycleEventId(nextCycle)).not.toBe(getWorkflowLifecycleEventId(record));
   });
 
   it('keeps one call id across attempts and isolates parallel/foreach coordinates', () => {
@@ -382,6 +481,51 @@ describe('canonical workflow lifecycle model', () => {
     );
   });
 
+  it('emits step.resumed for a valid falsy resume payload', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const publish = vi.spyOn(pubsub, 'publish');
+    let invocation = 0;
+    const approval = createStep({
+      id: 'falsy-approval',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ approved: z.boolean() }),
+      suspendSchema: z.object({}),
+      resumeSchema: z.boolean(),
+      execute: async ({ resumeData, suspend }) => {
+        invocation += 1;
+        if (invocation === 1) {
+          await suspend({});
+          return { approved: true };
+        }
+        return { approved: resumeData };
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'default-falsy-resume',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ approved: z.boolean() }),
+      steps: [approval],
+    })
+      .then(approval)
+      .commit();
+    new Mastra({ logger: false, storage: new MockStore(), workflows: { defaultFalsyResume: workflow } });
+    const run = await workflow.createRun({ runId: 'default-falsy-resume-run', pubsub });
+
+    await expect(run.start({ inputData: {} })).resolves.toMatchObject({ status: 'suspended' });
+    await expect(run.resume({ step: 'falsy-approval', resumeData: false })).resolves.toMatchObject({
+      status: 'success',
+      result: { approved: false },
+    });
+
+    const resumed = stepEvents(lifecycleRecords(publish)).find(event => event.type === 'step.resumed');
+    expect(resumed).toMatchObject({
+      type: 'step.resumed',
+      stepId: 'falsy-approval',
+      stepAttempt: 2,
+      resumeData: false,
+    });
+  });
+
   it('maps AbortSignal cancellation to step.canceled and workflow.canceled terminal events', async () => {
     const pubsub = new EventEmitterPubSub();
     const publish = vi.spyOn(pubsub, 'publish');
@@ -419,6 +563,70 @@ describe('canonical workflow lifecycle model', () => {
     expect(events).toContainEqual(expect.objectContaining({ type: 'step.canceled', stepId: 'blocking' }));
     expect(events).toContainEqual(expect.objectContaining({ type: 'workflow.canceled' }));
     expect(events.at(-1)).toMatchObject({ type: 'workflow.finished', status: 'canceled' });
+  });
+
+  it('reserves canonical identity when a default-engine run is canceled before start', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const publish = vi.spyOn(pubsub, 'publish');
+    const step = createStep({
+      id: 'never-started-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const workflow = createWorkflow({
+      id: 'default-cancel-before-start',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      steps: [step],
+    })
+      .then(step)
+      .commit();
+    const run = await workflow.createRun({ runId: 'default-pending-cancel', pubsub });
+
+    await run.cancel();
+
+    const identity = await run.getLifecycleExecutionIdentity();
+    const records = lifecycleRecords(publish);
+    expect(records.map(item => item.record.event.type)).toEqual(['workflow.canceled', 'workflow.finished']);
+    expect(records.every(item => item.topic === identity.topic)).toBe(true);
+    expect(run.workflowRunStatus).toBe('canceled');
+  });
+
+  it('persists cancellation before best-effort lifecycle publication', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const publish = vi.spyOn(pubsub, 'publish');
+    const storage = new MockStore();
+    const approval = createStep({
+      id: 'cancel-publication-approval',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ suspend }) => {
+        await suspend({});
+        return {};
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'cancel-publication-failure',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      steps: [approval],
+    })
+      .then(approval)
+      .commit();
+    new Mastra({ logger: false, storage, workflows: { cancelPublicationFailure: workflow } });
+    const run = await workflow.createRun({ runId: 'cancel-publication-failure-run', pubsub });
+    await expect(run.start({ inputData: {} })).resolves.toMatchObject({ status: 'suspended' });
+    publish.mockRejectedValue(new Error('transport unavailable'));
+
+    await expect(run.cancel()).resolves.toBeUndefined();
+
+    const workflowsStore = await storage.getStore('workflows');
+    const snapshot = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: run.runId,
+    });
+    expect(snapshot?.status).toBe('canceled');
   });
 
   it('isolates two workflows that intentionally use the same run id', async () => {

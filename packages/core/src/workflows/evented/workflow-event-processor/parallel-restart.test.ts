@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createRestartExecutionParams } from '../../utils';
-import { processWorkflowParallel } from './parallel';
+import { processWorkflowConditional, processWorkflowParallel } from './parallel';
 
 function makeParallelStep(ids: string[]) {
   return {
@@ -13,6 +13,9 @@ function makeArgs(overrides: Record<string, any> = {}) {
   return {
     workflowId: 'workflow',
     runId: 'run-1',
+    executionGeneration: 'parallel-execution-generation',
+    lifecycleResumeAttempt: 0,
+    lifecycleStepStates: {},
     executionPath: [0, 0],
     stepResults: {},
     activeStepsPath: {},
@@ -267,5 +270,54 @@ describe('processWorkflowParallel restart branch routing', () => {
     const perStep = recorder();
     await processWorkflowParallel(makeArgs({ executionPath: [0], perStep: true }), { pubsub: perStep.pubsub, step });
     expect(runPaths(perStep.published)).toEqual([[0, 0]]);
+  });
+
+  it('persists every branch attempt together before publishing the fan-out', async () => {
+    const { published, pubsub } = recorder();
+    const updateWorkflowState = vi.fn(async () => undefined);
+
+    await processWorkflowParallel(makeArgs({ executionPath: [0] }), {
+      pubsub,
+      workflowsStore: { updateWorkflowState } as any,
+      step: makeParallelStep(['A', 'B']),
+    });
+
+    expect(updateWorkflowState).toHaveBeenCalledTimes(1);
+    const persistedStates = updateWorkflowState.mock.calls[0]![0].opts.lifecycleStepStates;
+    expect(Object.values(persistedStates)).toHaveLength(2);
+    expect(Object.values(persistedStates)).toEqual([
+      expect.objectContaining({ stepAttempt: 1 }),
+      expect.objectContaining({ stepAttempt: 1 }),
+    ]);
+    expect(new Set(Object.values(persistedStates).map((state: any) => state.stepCallId)).size).toBe(2);
+
+    expect(published).toHaveLength(2);
+    for (const event of published) {
+      expect(event.data.lifecycleStepAttemptReserved).toBe(true);
+      expect(event.data.lifecycleStepStates).toEqual(persistedStates);
+    }
+  });
+
+  it('carries lifecycle lineage on a skipped conditional branch without storage', async () => {
+    const { published, pubsub } = recorder();
+    const step = {
+      type: 'conditional' as const,
+      steps: makeParallelStep(['selected', 'skipped']).steps,
+      conditions: [],
+    } as any;
+
+    await processWorkflowConditional(makeArgs({ executionPath: [0] }), {
+      pubsub,
+      step,
+      stepExecutor: { evaluateConditions: vi.fn(async () => [0]) } as any,
+    });
+
+    const skipped = published.find(event => event.type === 'workflow.step.end');
+    expect(skipped.data).toMatchObject({
+      executionGeneration: 'parallel-execution-generation',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+      prevResult: { status: 'skipped' },
+    });
   });
 });

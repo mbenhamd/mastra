@@ -193,6 +193,18 @@ describe('RedisServerCache', () => {
   });
 
   describe('atomic indexed log', () => {
+    it('keeps ordinary cache operations available when a custom client has no eval capability', async () => {
+      delete mockClient.eval;
+      mockClient.set.mockResolvedValue('OK');
+
+      await cache.set('ordinary-key', { value: true });
+
+      expect(mockClient.set).toHaveBeenCalledWith('mastra:cache:ordinary-key', '{"value":true}', 'EX', 300);
+      await expect(
+        cache.appendIndexedLogEntry('events', { id: 'event-0' }, { maxAgeMs: 60_000, maxEntries: 10 }),
+      ).rejects.toThrow(/require a client eval implementation or RedisServerCacheOptions\.evalScript adapter/);
+    });
+
     it('advertises durable scope and decodes an atomic append response', async () => {
       mockClient.eval.mockResolvedValue(['4', '1767225600000', '{"id":"event-4"}', 'generation-a']);
 

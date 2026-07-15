@@ -107,6 +107,12 @@ export class GoogleCloudPubSub extends PubSub {
   private activeSubscriptions: Record<string, Subscription> = {};
   private activeCbs: Record<string, Map<string, Set<EventCallback>>> = {};
   private deliveryAttempts: Record<string, Map<string, number>> = {};
+  // Grouped subscriptions share one broker subscription. When multiple
+  // callbacks are registered on this instance, select one callback per
+  // message so the in-process behavior preserves competing-consumer
+  // semantics instead of accidentally becoming fan-out.
+  private groupedSubscriptionKeys = new Set<string>();
+  private groupDeliveryOffsets: Record<string, number> = {};
   // `localOnly` publishes never touch Google Cloud — they are delivered to
   // same-process subscribers only. Tracks live callbacks per logical topic so
   // normalized workflow broker topics never leak one run into another.
@@ -118,6 +124,11 @@ export class GoogleCloudPubSub extends PubSub {
   // Tracks the actual anonymous message listener registered on each subscription,
   // so we can remove it cleanly on the final unsubscribe.
   private messageListeners: Record<string, (message: Message) => void> = {};
+  // Retain deterministic subscription coordinates after local unsubscribe so
+  // terminal clearTopic can delete broker resources instead of merely closing
+  // the local stream. Lifecycle logical topics share one physical topic, so
+  // only subscriptions may be deleted here.
+  private knownSubscriptionGroups = new Map<string, Set<string | undefined>>();
 
   constructor(config: ClientConfig) {
     super();
@@ -165,6 +176,14 @@ export class GoogleCloudPubSub extends PubSub {
         const [sub] = await this.pubsub.topic(topicName).createSubscription(subscriptionName, {
           enableMessageOrdering: true,
           enableExactlyOnceDelivery: topicName === 'workflows' || !!group,
+          ...(isLifecycleTopic(logicalTopic)
+            ? {
+                // A crashed watcher cannot run unsubscribe cleanup. Bound its
+                // generation-scoped filtered subscription to the shortest GCP
+                // inactivity TTL so orphaned exact-watch resources expire.
+                expirationPolicy: { ttl: { seconds: 86_400 } },
+              }
+            : {}),
           ...(logicalTopic !== topicName
             ? {
                 // Pub/Sub filter expressions are limited to 256 bytes. Hash
@@ -263,9 +282,13 @@ export class GoogleCloudPubSub extends PubSub {
     const physicalTopic = brokerTopicName(logicalTopic);
 
     const group = options?.group;
+    const knownGroups = this.knownSubscriptionGroups.get(logicalTopic) ?? new Set<string | undefined>();
+    knownGroups.add(group);
+    this.knownSubscriptionGroups.set(logicalTopic, knownGroups);
     // Use a composite key when group is set so grouped and non-grouped subscriptions
     // on the same topic don't collide
     const subscriptionKey = group ? `${logicalTopic}:${group}` : logicalTopic;
+    if (group) this.groupedSubscriptionKeys.add(subscriptionKey);
 
     // Register callback for `localOnly` delivery. Local delivery bypasses Google
     // Cloud entirely so live class instances on the payload (e.g. Date, Map,
@@ -347,15 +370,69 @@ export class GoogleCloudPubSub extends PubSub {
           if (subscription) {
             if (listener) subscription.removeListener('message', listener);
             await subscription.close();
+            if (isLifecycleTopic(logicalTopic) && !this.groupedSubscriptionKeys.has(subscriptionKey)) {
+              try {
+                await subscription.delete();
+              } catch (error) {
+                if ((error as { code?: number } | undefined)?.code !== 5) {
+                  console.error(`Failed to delete lifecycle subscription ${subscription.name}`, error);
+                }
+              }
+            }
           }
           delete this.activeSubscriptions[subscriptionKey];
           delete this.activeCbs[subscriptionKey];
           delete this.deliveryAttempts[subscriptionKey];
           delete this.messageListeners[subscriptionKey];
+          this.groupedSubscriptionKeys.delete(subscriptionKey);
+          delete this.groupDeliveryOffsets[subscriptionKey];
         }
         return;
       }
     }
+  }
+
+  override async clearTopic(topic: string): Promise<void> {
+    const logicalTopic = topic;
+    const physicalTopic = brokerTopicName(logicalTopic);
+    const groups = this.knownSubscriptionGroups.get(logicalTopic) ?? new Set<string | undefined>([undefined]);
+
+    for (const group of groups) {
+      const subscriptionKey = group ? `${logicalTopic}:${group}` : logicalTopic;
+      try {
+        await this.inFlightInit[subscriptionKey];
+      } catch {
+        // Initialization already failed; deterministic deletion below is still
+        // safe and may remove a resource created by a competing process.
+      }
+
+      const subscriptionName = this.getSubscriptionName(physicalTopic, group, logicalTopic);
+      const subscription = this.activeSubscriptions[subscriptionKey] ?? this.pubsub.subscription(subscriptionName);
+      const listener = this.messageListeners[subscriptionKey];
+      try {
+        if (listener) subscription.removeListener('message', listener);
+        subscription.removeAllListeners();
+        await subscription.close().catch(() => {});
+        await subscription.delete();
+      } catch (error) {
+        // NOT_FOUND means cleanup already won elsewhere. Honor PubSub's
+        // best-effort clear contract for every other broker failure as well.
+        if ((error as { code?: number } | undefined)?.code !== 5) {
+          console.error(`Failed to clear Google Cloud Pub/Sub subscription ${subscriptionName}`, error);
+        }
+      }
+
+      delete this.activeSubscriptions[subscriptionKey];
+      delete this.activeCbs[subscriptionKey];
+      delete this.deliveryAttempts[subscriptionKey];
+      delete this.messageListeners[subscriptionKey];
+      delete this.inFlightInit[subscriptionKey];
+      this.groupedSubscriptionKeys.delete(subscriptionKey);
+      delete this.groupDeliveryOffsets[subscriptionKey];
+    }
+
+    this.localCallbacks.delete(logicalTopic);
+    this.knownSubscriptionGroups.delete(logicalTopic);
   }
 
   async flush(): Promise<void> {
@@ -414,7 +491,14 @@ export class GoogleCloudPubSub extends PubSub {
       Number.isSafeInteger(message.deliveryAttempt) && message.deliveryAttempt >= 1 ? message.deliveryAttempt : 0;
     event.deliveryAttempt = Math.max(observedAttempt, brokerAttempt, event.deliveryAttempt ?? 1);
 
-    const callbacks = [...(callbacksByTopic?.get(logicalTopic) ?? [])];
+    const registeredCallbacks = [...(callbacksByTopic?.get(logicalTopic) ?? [])];
+    const callbacks =
+      this.groupedSubscriptionKeys.has(subscriptionKey) && registeredCallbacks.length > 0
+        ? [registeredCallbacks[(this.groupDeliveryOffsets[subscriptionKey] ?? 0) % registeredCallbacks.length]!]
+        : registeredCallbacks;
+    if (this.groupedSubscriptionKeys.has(subscriptionKey) && registeredCallbacks.length > 0) {
+      this.groupDeliveryOffsets[subscriptionKey] = (this.groupDeliveryOffsets[subscriptionKey] ?? 0) + 1;
+    }
     if (callbacks.length === 0) {
       await this.ackMessage(subscriptionKey, message);
       attempts.delete(event.id);

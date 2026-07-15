@@ -310,6 +310,15 @@ describe('RedisStreamsPubSub', () => {
       await expect(ps.publish(topic, makeEvent({ type: 'workflow.lifecycle' }))).rejects.toThrow(
         'missing replay identity',
       );
+      for (const logGeneration of [42, {}, '']) {
+        await expect(
+          ps.publish(topic, {
+            ...makeEvent({ type: 'workflow.lifecycle' }),
+            index: 0,
+            logGeneration,
+          } as any),
+        ).rejects.toThrow('missing replay identity');
+      }
     });
   });
 

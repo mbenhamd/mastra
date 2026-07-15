@@ -2,7 +2,11 @@ import { DurableAgentDefaults } from '@mastra/core/agent/durable';
 import { Inngest } from 'inngest';
 import { describe, expect, it } from 'vitest';
 
-import { createInngestDurableAgenticWorkflow } from './create-inngest-agentic-workflow';
+import {
+  createInngestDurableAgenticWorkflow,
+  createInngestDurableAgenticWorkflowIds,
+  InngestDurableStepIds,
+} from './create-inngest-agentic-workflow';
 
 /**
  * Regression coverage for #19317: the Inngest durable engine must honor
@@ -29,6 +33,47 @@ function findForeachEntry(steps: any[]): any {
   }
   return undefined;
 }
+
+describe('createInngestDurableAgenticWorkflow ownership IDs', () => {
+  const inngest = new Inngest({ id: 'inngest-agentic-workflow-id-tests' });
+
+  it('retains the historical shared IDs for direct factory callers', () => {
+    const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+    const functionIds = workflow.getFunctions().map((fn: any) => fn.id());
+
+    expect(workflow.id).toBe(InngestDurableStepIds.AGENTIC_LOOP);
+    expect(functionIds).toEqual(
+      expect.arrayContaining([
+        `workflow.${InngestDurableStepIds.AGENTIC_LOOP}`,
+        `workflow.${InngestDurableStepIds.AGENTIC_EXECUTION}`,
+      ]),
+    );
+  });
+
+  it('derives deterministic collision-safe IDs from the public durable-agent ID', () => {
+    const first = createInngestDurableAgenticWorkflowIds('owner-agent');
+    const repeated = createInngestDurableAgenticWorkflowIds('owner-agent');
+    const other = createInngestDurableAgenticWorkflowIds('other-agent');
+
+    expect(first).toEqual(repeated);
+    expect(first).not.toEqual(other);
+    expect(first.AGENTIC_LOOP).toMatch(/^inngest:durable-agentic-loop:[a-f0-9]{32}$/);
+    expect(first.AGENTIC_EXECUTION).toMatch(/^inngest:durable-agentic-execution:[a-f0-9]{32}$/);
+    expect(() => createInngestDurableAgenticWorkflowIds('')).toThrow(/non-empty agent ID/);
+  });
+
+  it('applies the owner namespace to both parent and nested function IDs', () => {
+    const workflowIds = createInngestDurableAgenticWorkflowIds('nested-owner');
+    const workflow = createInngestDurableAgenticWorkflow({ inngest, workflowIds }) as any;
+    const functionIds = workflow.getFunctions().map((fn: any) => fn.id());
+
+    expect(workflow.id).toBe(workflowIds.AGENTIC_LOOP);
+    expect(functionIds).toEqual(
+      expect.arrayContaining([`workflow.${workflowIds.AGENTIC_LOOP}`, `workflow.${workflowIds.AGENTIC_EXECUTION}`]),
+    );
+    expect(functionIds).toHaveLength(2);
+  });
+});
 
 describe('createInngestDurableAgenticWorkflow tool-call concurrency', () => {
   const inngest = new Inngest({ id: 'inngest-agentic-workflow-concurrency-tests' });

@@ -2,14 +2,18 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import { IndexedReplayCursorError, IndexedReplayIntegrityError } from '../events/pubsub';
 import type { PubSub } from '../events/pubsub';
 import type { Event, EventCallback } from '../events/types';
+import {
+  getWorkflowLifecycleEventId,
+  getWorkflowLifecycleTopic,
+  parseWorkflowLifecycleRecord,
+  WorkflowLifecycleRecordError,
+} from './lifecycle-events';
 import type {
-  WorkflowLifecycleEvent,
-  WorkflowLifecycleEventCallback,
-  WorkflowLifecycleWatchOptions,
-  WorkflowStreamEvent,
-} from './types';
-
-const workflowEventTopic = (runId: string) => `workflow.events.v2.${runId}`;
+  WorkflowExecutionGeneration,
+  WorkflowLifecycleEnvelope,
+  WorkflowLifecycleRecord,
+} from './lifecycle-events';
+import type { WorkflowLifecycleEventCallback, WorkflowLifecycleWatchOptions } from './types';
 
 function replayOffset(afterCursor: number | undefined): number {
   if (afterCursor === undefined) {
@@ -29,41 +33,76 @@ function replayOffset(afterCursor: number | undefined): number {
   return afterCursor + 1;
 }
 
-function lifecycleEvent(params: { workflowId: string; runId: string; event: Event }): WorkflowLifecycleEvent {
-  const { workflowId, runId, event } = params;
+function lifecycleEnvelope(params: {
+  workflowId: string;
+  runId: string;
+  executionGeneration: WorkflowExecutionGeneration;
+  event: Event;
+}): WorkflowLifecycleEnvelope {
+  const { workflowId, runId, executionGeneration, event } = params;
   if (!Number.isSafeInteger(event.index) || event.index! < 0) {
-    throw new MastraError({
-      id: 'WORKFLOW_LIFECYCLE_EVENT_MISSING_CURSOR',
-      domain: ErrorDomain.MASTRA_WORKFLOW,
-      category: ErrorCategory.SYSTEM,
-      text: 'Workflow lifecycle event is missing a valid indexed replay cursor',
-      details: { workflowId, runId, eventId: event.id },
-    });
+    throw new IndexedReplayIntegrityError(
+      'malformed-retained-event',
+      'Workflow lifecycle event is missing a valid indexed replay cursor',
+    );
   }
   if (typeof event.logGeneration !== 'string' || event.logGeneration.length === 0) {
-    throw new MastraError({
-      id: 'WORKFLOW_LIFECYCLE_EVENT_MISSING_LOG_GENERATION',
-      domain: ErrorDomain.MASTRA_WORKFLOW,
-      category: ErrorCategory.SYSTEM,
-      text: 'Workflow lifecycle event is missing its retained-log generation',
-      details: { workflowId, runId, eventId: event.id, cursor: event.index! },
-    });
+    throw new IndexedReplayIntegrityError(
+      'malformed-retained-event',
+      'Workflow lifecycle event is missing its retained-log generation',
+    );
+  }
+
+  if (
+    event.type !== 'workflow.lifecycle' ||
+    event.runId !== runId ||
+    typeof event.id !== 'string' ||
+    event.id.length === 0 ||
+    !(event.createdAt instanceof Date) ||
+    Number.isNaN(event.createdAt.getTime()) ||
+    (event.deliveryAttempt !== undefined && (!Number.isSafeInteger(event.deliveryAttempt) || event.deliveryAttempt < 1))
+  ) {
+    throw new IndexedReplayIntegrityError(
+      'malformed-retained-event',
+      'Workflow lifecycle delivery has an invalid transport envelope',
+    );
+  }
+
+  let record: WorkflowLifecycleRecord;
+  try {
+    record = parseWorkflowLifecycleRecord(event.data, { workflowId, runId, executionGeneration });
+  } catch (error) {
+    if (error instanceof WorkflowLifecycleRecordError) {
+      throw new IndexedReplayIntegrityError(
+        error.reason === 'identity-mismatch' ? 'identity-mismatch' : 'malformed-retained-event',
+        error.message,
+      );
+    }
+    throw error;
+  }
+  const expectedEventId = getWorkflowLifecycleEventId(record);
+  if (event.id !== expectedEventId) {
+    throw new IndexedReplayIntegrityError(
+      'identity-mismatch',
+      `Workflow lifecycle event identity mismatch: expected ${expectedEventId}, received ${event.id}`,
+    );
   }
 
   return {
+    ...record,
     eventId: event.id,
     cursor: event.index!,
     createdAt: event.createdAt,
     deliveryAttempt: event.deliveryAttempt ?? 1,
     logGeneration: event.logGeneration,
-    workflowId,
-    runId,
-    event: event.data as WorkflowStreamEvent,
   };
 }
 
-function lifecycleReplayError(error: unknown, context: { workflowId: string; runId: string }): Error {
-  const { workflowId, runId } = context;
+function lifecycleReplayError(
+  error: unknown,
+  context: { workflowId: string; runId: string; executionGeneration: WorkflowExecutionGeneration },
+): Error {
+  const { workflowId, runId, executionGeneration } = context;
   if (error instanceof IndexedReplayCursorError) {
     return new MastraError({
       id:
@@ -78,6 +117,7 @@ function lifecycleReplayError(error: unknown, context: { workflowId: string; run
       details: {
         workflowId,
         runId,
+        executionGeneration,
         requestedCursor: error.requestedCursor,
         ...(error.requestedLogGeneration === undefined ? {} : { requestedLogGeneration: error.requestedLogGeneration }),
         logGeneration: error.range.logGeneration,
@@ -95,7 +135,7 @@ function lifecycleReplayError(error: unknown, context: { workflowId: string; run
       domain: ErrorDomain.MASTRA_WORKFLOW,
       category: ErrorCategory.SYSTEM,
       text: error.message,
-      details: { workflowId, runId, reason: error.reason },
+      details: { workflowId, runId, executionGeneration, reason: error.reason },
     });
   }
   if (error instanceof Error) return error;
@@ -104,7 +144,7 @@ function lifecycleReplayError(error: unknown, context: { workflowId: string; run
     domain: ErrorDomain.MASTRA_WORKFLOW,
     category: ErrorCategory.SYSTEM,
     text: 'Workflow lifecycle replay failed with a non-Error value',
-    details: { workflowId, runId },
+    details: { workflowId, runId, executionGeneration },
   });
 }
 
@@ -127,10 +167,11 @@ export async function watchWorkflowLifecycleEvents(params: {
   pubsub: PubSub;
   workflowId: string;
   runId: string;
+  executionGeneration: WorkflowExecutionGeneration;
   callback: WorkflowLifecycleEventCallback;
   options?: WorkflowLifecycleWatchOptions;
 }): Promise<() => Promise<void>> {
-  const { pubsub, workflowId, runId, callback, options } = params;
+  const { pubsub, workflowId, runId, executionGeneration, callback, options } = params;
   const offset = replayOffset(options?.afterCursor);
 
   if (options?.afterCursor !== undefined && !options.afterLogGeneration) {
@@ -167,7 +208,7 @@ export async function watchWorkflowLifecycleEvents(params: {
     });
   }
 
-  const topic = workflowEventTopic(runId);
+  const topic = getWorkflowLifecycleTopic({ workflowId, runId, executionGeneration });
   const replayRange = await pubsub.getIndexedReplayRange(topic);
   if (!replayRange) {
     throw new MastraError({
@@ -181,16 +222,8 @@ export async function watchWorkflowLifecycleEvents(params: {
   let deliveryChain = Promise.resolve();
 
   const deliver = async (event: Event, ack?: () => Promise<void>, nack?: () => Promise<void>): Promise<void> => {
-    // The topic is run-scoped. A mismatched event is malformed for this
-    // subscription, but acknowledging it prevents one poison message from
-    // blocking every valid event that follows.
-    if (event.runId !== runId) {
-      await ack?.();
-      return;
-    }
-
     try {
-      await callback(lifecycleEvent({ workflowId, runId, event }));
+      await callback(lifecycleEnvelope({ workflowId, runId, executionGeneration, event }));
       await ack?.();
     } catch (error) {
       if (nack) {
@@ -213,11 +246,11 @@ export async function watchWorkflowLifecycleEvents(params: {
     await pubsub.subscribeFromOffset(topic, offset, watchCallback, {
       logGeneration: options?.afterLogGeneration ?? replayRange.logGeneration,
       onError: async error => {
-        await options?.onError?.(lifecycleReplayError(error, { workflowId, runId }));
+        await options?.onError?.(lifecycleReplayError(error, { workflowId, runId, executionGeneration }));
       },
     });
   } catch (error) {
-    throw lifecycleReplayError(error, { workflowId, runId });
+    throw lifecycleReplayError(error, { workflowId, runId, executionGeneration });
   }
 
   return async () => {

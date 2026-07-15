@@ -137,6 +137,9 @@ describe('evented loop iterationCount', () => {
       },
       workflowId: 'wf',
       runId: 'run-suspended',
+      executionGeneration: 'loop-generation:run-suspended',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
       executionPath: [0],
       stepResults: { body: { status: 'success', metadata: { iterationCount: 2 } } },
       activeStepsPath: {},
@@ -190,6 +193,9 @@ describe('evented loop iterationCount', () => {
       },
       workflowId: 'wf',
       runId: 'run-nested-suspended',
+      executionGeneration: 'loop-generation:run-nested-suspended',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
       executionPath: [0],
       stepResults: { body: { status: 'success', metadata: { iterationCount: 2, prior: 'kept' } } },
       activeStepsPath: {},
@@ -215,5 +221,81 @@ describe('evented loop iterationCount', () => {
     const suspendEvent = published.find(event => event.type === 'workflow.suspend');
     expect(suspendEvent.data.stepResults.body.metadata).toEqual(storedBodyResult.metadata);
     expect(suspendEvent.data.prevResult.metadata).toEqual(storedBodyResult.metadata);
+  });
+
+  it('retains one semantic step attempt across broker redelivery', async () => {
+    const published: any[] = [];
+    const mastra = {
+      pubsub: {
+        publish: async (_topic: string, event: any) => {
+          published.push(event);
+        },
+      },
+      getStorage: () => undefined,
+      getLogger: () => undefined,
+    } as unknown as Mastra;
+    const stepExecutionStrategy = {
+      executeStep: async () => ({ status: 'success' as const, output: { ok: true } }),
+    } as any;
+
+    class ExposedProcessor extends WorkflowEventProcessor {
+      runStep(args: any) {
+        return this.processWorkflowStepRun(args);
+      }
+    }
+
+    const lifecycleStepStates = {};
+    const baseArgs = {
+      workflow: {
+        id: 'wf',
+        stepGraph: [{ type: 'step', step: { id: 'serial-step', execute: async () => ({ ok: true }) } }],
+        retryConfig: { attempts: 0 },
+        options: { validateInputs: false },
+      },
+      workflowId: 'wf',
+      runId: 'redelivered-run',
+      executionGeneration: 'redelivered-generation',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates,
+      executionPath: [0],
+      stepResults: {},
+      activeStepsPath: {},
+      resumeSteps: [],
+      prevResult: { status: 'success', output: {} },
+      requestContext: {},
+    };
+    const processor = new ExposedProcessor({ mastra, stepExecutionStrategy });
+
+    await processor.runStep({
+      ...baseArgs,
+      lifecycleIncomingStepStates: {},
+      lifecycleAttemptBaselineCaptured: true,
+    });
+    await processor.runStep({
+      ...baseArgs,
+      lifecycleIncomingStepStates: {},
+      lifecycleAttemptBaselineCaptured: true,
+    });
+
+    const started = published
+      .filter(event => event.type === 'workflow.lifecycle' && event.data.event.type === 'step.started')
+      .map(event => ({ id: event.id, attempt: event.data.event.stepAttempt }));
+    expect(started).toEqual([
+      { id: started[0]?.id, attempt: 1 },
+      { id: started[0]?.id, attempt: 1 },
+    ]);
+
+    const retryBaseline = structuredClone(lifecycleStepStates);
+    await processor.runStep({
+      ...baseArgs,
+      retryCount: 1,
+      lifecycleIncomingStepStates: retryBaseline,
+      lifecycleAttemptBaselineCaptured: true,
+    });
+    const retrying = published.find(
+      event => event.type === 'workflow.lifecycle' && event.data.event.type === 'step.retrying',
+    );
+    expect(retrying.data.event.stepAttempt).toBe(2);
+    expect(retrying.id).not.toBe(started[0]?.id);
   });
 });

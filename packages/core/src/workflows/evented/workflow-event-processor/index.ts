@@ -18,8 +18,9 @@ import type {
 } from '../../../workflows/types';
 import type { Workflow } from '../../../workflows/workflow';
 import {
-  createWorkflowExecutionGeneration,
   getOrCreateWorkflowStepLifecycleState,
+  getWorkflowLifecycleTopic,
+  mergeWorkflowStepLifecycleStates,
   publishWorkflowLifecycleEvent,
   requireWorkflowExecutionGeneration,
 } from '../../lifecycle-events';
@@ -93,12 +94,22 @@ export type ProcessorArgs = {
   executionGeneration?: string;
   lifecycleResumeAttempt?: number;
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  /** The fan-out producer durably reserved this branch attempt before dispatch. */
+  lifecycleStepAttemptReserved?: boolean;
+  /** Producer-side attempt baselines captured before dispatch mutates durable state. */
+  lifecycleIncomingStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  lifecycleAttemptBaselineCaptured?: boolean;
+  /** Complete logical suspension set for a multi-branch transition. */
+  suspendedStepIds?: string[];
   lifecycleStartKind?: 'start' | 'resume';
 };
 
 export type ParentWorkflow = {
   workflowId: string;
   runId: string;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+  lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
   executionPath: number[];
   resume: boolean;
   stepResults: Record<string, StepResult<any, any, any, any>>;
@@ -121,6 +132,17 @@ export type ParentWorkflow = {
   shouldPersistSnapshot?: boolean;
 };
 
+function parentWorkflowLifecycleExecution(parentWorkflow: ParentWorkflow) {
+  return {
+    executionGeneration: requireWorkflowExecutionGeneration(
+      parentWorkflow.executionGeneration,
+      `Nested parent workflow ${parentWorkflow.workflowId}/${parentWorkflow.runId}`,
+    ),
+    lifecycleResumeAttempt: parentWorkflow.lifecycleResumeAttempt,
+    lifecycleStepStates: parentWorkflow.lifecycleStepStates,
+  };
+}
+
 function resolveWorkflowStepPath(workflow: Workflow, executionPath: number[] | undefined) {
   if (!Array.isArray(executionPath) || executionPath.length === 0) return undefined;
 
@@ -134,6 +156,136 @@ function resolveWorkflowStepPath(workflow: Workflow, executionPath: number[] | u
 
   if (entry?.type !== 'step' && entry?.type !== 'loop' && entry?.type !== 'foreach') return undefined;
   return entry;
+}
+
+function pathsEqual(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/**
+ * Recover one already-reserved active attempt from durable lifecycle state.
+ *
+ * Cancellation cleanup must still work after a deployment removes the
+ * workflow definition. In that case the persisted coordinate is the only
+ * authority available, so accept it only when the coordinate is canonical,
+ * its deterministic call id matches, and exactly one retained attempt matches
+ * the active step/path.
+ */
+function resolvePersistedActiveStepLifecycleIdentity(params: {
+  workflow?: Workflow;
+  workflowId: string;
+  runId: string;
+  executionGeneration: string;
+  activeStepId: unknown;
+  executionPath: unknown;
+  lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
+  stepResult: unknown;
+}): { stepId: string; stepCallId: string; stepAttempt: number } | undefined {
+  let stepId: string;
+  let executionPath: number[];
+  try {
+    stepId = canonicalPlannerStructuralString(params.activeStepId, 'activeStepId', 512);
+    executionPath = canonicalPlannerPath(params.executionPath, `activeStepsPath.${stepId}`);
+  } catch {
+    return undefined;
+  }
+
+  let registeredEntry: StepFlowEntry | undefined;
+  if (params.workflow) {
+    registeredEntry = params.workflow.stepGraph[executionPath[0]!];
+    if (registeredEntry?.type === 'parallel' || registeredEntry?.type === 'conditional') {
+      if (executionPath.length !== 2) return undefined;
+      registeredEntry = registeredEntry.steps[executionPath[1]!];
+    } else if (registeredEntry?.type === 'foreach') {
+      if (executionPath.length !== 2) return undefined;
+    } else if (executionPath.length !== 1) {
+      return undefined;
+    }
+    if (!registeredEntry || !isExecutableStep(registeredEntry) || registeredEntry.step.id !== stepId) return undefined;
+  }
+
+  const rawIterationCount =
+    params.stepResult !== null && typeof params.stepResult === 'object'
+      ? (params.stepResult as { metadata?: { iterationCount?: unknown } }).metadata?.iterationCount
+      : undefined;
+  let currentIterationCount: number | undefined;
+  if (rawIterationCount !== undefined) {
+    try {
+      currentIterationCount = canonicalPlannerInteger(rawIterationCount, `context.${stepId}.metadata.iterationCount`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  const matches: Array<{ stepId: string; stepCallId: string; stepAttempt: number }> = [];
+  for (const [coordinateKey, retainedState] of Object.entries(params.lifecycleStepStates)) {
+    // Canonical coordinates are short JSON tuples. Bound parsing so corrupt
+    // persisted state cannot turn terminal cleanup into unbounded work.
+    if (coordinateKey.length > 4_096) continue;
+
+    let coordinate: unknown;
+    try {
+      coordinate = JSON.parse(coordinateKey);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(coordinate) || coordinate.length !== 4) continue;
+
+    let coordinateStepId: string;
+    let coordinatePath: number[];
+    let foreachIndex: number | undefined;
+    let iterationCount: number | undefined;
+    try {
+      coordinateStepId = canonicalPlannerStructuralString(coordinate[0], 'lifecycleStepCoordinate.stepId', 512);
+      coordinatePath = canonicalPlannerPath(coordinate[1], 'lifecycleStepCoordinate.executionPath');
+      foreachIndex =
+        coordinate[2] === null
+          ? undefined
+          : canonicalPlannerInteger(coordinate[2], 'lifecycleStepCoordinate.foreachIndex');
+      iterationCount =
+        coordinate[3] === null
+          ? undefined
+          : canonicalPlannerInteger(coordinate[3], 'lifecycleStepCoordinate.iterationCount');
+    } catch {
+      continue;
+    }
+    if (coordinateStepId !== stepId || !pathsEqual(coordinatePath, executionPath)) continue;
+    if (foreachIndex !== undefined && foreachIndex !== executionPath[1]) continue;
+
+    if (registeredEntry) {
+      const expectedForeachIndex = registeredEntry.type === 'foreach' ? executionPath[1] : undefined;
+      const expectedIterationCount =
+        registeredEntry.type === 'loop' ? (currentIterationCount ?? 0) : currentIterationCount;
+      if (foreachIndex !== expectedForeachIndex || iterationCount !== expectedIterationCount) continue;
+    } else if (currentIterationCount !== undefined && iterationCount !== currentIterationCount) {
+      continue;
+    }
+
+    const expectedStates: Record<string, { stepCallId: string; stepAttempt: number }> = {};
+    const expected = getOrCreateWorkflowStepLifecycleState({
+      workflowId: params.workflowId,
+      runId: params.runId,
+      executionGeneration: params.executionGeneration,
+      stepId,
+      executionPath,
+      foreachIndex,
+      iterationCount,
+      states: expectedStates,
+    });
+    if (
+      expected.key !== coordinateKey ||
+      retainedState === null ||
+      typeof retainedState !== 'object' ||
+      retainedState.stepCallId !== expected.state.stepCallId ||
+      !Number.isSafeInteger(retainedState.stepAttempt) ||
+      retainedState.stepAttempt < 1
+    ) {
+      continue;
+    }
+    matches.push({ stepId, stepCallId: retainedState.stepCallId, stepAttempt: retainedState.stepAttempt });
+  }
+
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 type NestedWorkflowRunCoordinate = {
@@ -243,6 +395,38 @@ export function resolveNestedWorkflowDispatchRunId(
     : canonicalPlannerStructuralString(input.ownedRunId, 'ownedRunId', 512);
 }
 
+/** @internal Stable lineage for one child dispatch within a parent execution. */
+export function createNestedWorkflowExecutionGeneration(
+  input: NestedWorkflowRunCoordinate & {
+    parentExecutionGeneration: string;
+    nestedRunId: string;
+  },
+): string {
+  const coordinate = materializeNestedWorkflowRunCoordinate(input);
+  const parentExecutionGeneration = requireWorkflowExecutionGeneration(
+    input.parentExecutionGeneration,
+    `Nested workflow ${coordinate.nestedWorkflowId}/${input.nestedRunId}`,
+  );
+  const nestedRunId = canonicalPlannerStructuralString(input.nestedRunId, 'nestedRunId', 512);
+  const digest = createHash('sha256')
+    .update('mastra.evented.nested-workflow-execution.v1\0', 'utf8')
+    .update(
+      JSON.stringify([
+        coordinate.parentWorkflowId,
+        coordinate.parentRunId,
+        parentExecutionGeneration,
+        coordinate.nestedWorkflowId,
+        coordinate.stepId,
+        coordinate.executionPath,
+        coordinate.loopIteration ?? null,
+        nestedRunId,
+      ]),
+      'utf8',
+    )
+    .digest('hex');
+  return `wfeg:v1:${digest}`;
+}
+
 export class WorkflowEventProcessor extends EventProcessor {
   /**
    * Maximum number of source-event deliveries that may enter workflow
@@ -279,8 +463,9 @@ export class WorkflowEventProcessor extends EventProcessor {
   private readonly topicCleanupDelayMs: number;
   private static readonly DEFAULT_TOPIC_CLEANUP_DELAY_MS = 30_000;
 
-  // Pending per-run topic cleanup timers, so a run restarted in this process
-  // (timeTravel/restart reuse the runId) cancels its own pending deletion.
+  // Pending per-execution topic cleanup timers. Workflow id and execution
+  // generation are both part of the key because run ids are not globally
+  // unique and an older generation retains its own exact lifecycle log.
   private readonly pendingTopicCleanups = new Map<string, ReturnType<typeof setTimeout>>();
 
   // Statuses under which a run is still (or again) writing to its watch
@@ -329,32 +514,42 @@ export class WorkflowEventProcessor extends EventProcessor {
    * by a different worker process — and skip deletion while the run is
    * active again.
    */
-  private scheduleRunTopicCleanup(workflowId: string, runId: string): void {
+  private scheduleRunTopicCleanup(workflowId: string, runId: string, executionGeneration: string): void {
     if (this.topicCleanupDelayMs <= 0) return;
-    this.cancelRunTopicCleanup(runId);
+    const cleanupKey = this.runTopicCleanupKey(workflowId, runId, executionGeneration);
+    this.cancelRunTopicCleanup(workflowId, runId, executionGeneration);
     // Event processors may be constructed before their owning Mastra instance
     // is registered. Resolve the transport capability here, when the terminal
     // event is actually processed, rather than capturing a possibly absent or
     // stale pubsub during construction.
     const cleanupDelayMs = Math.max(this.topicCleanupDelayMs, this.mastra?.pubsub.indexedReplay?.retentionMs ?? 0);
     const timer = setTimeout(() => {
-      this.pendingTopicCleanups.delete(runId);
-      void this.clearRunTopicUnlessActive(workflowId, runId);
+      this.pendingTopicCleanups.delete(cleanupKey);
+      void this.clearRunTopicUnlessActive(workflowId, runId, executionGeneration);
     }, cleanupDelayMs);
     // Don't let a pending cleanup timer keep a short-lived process alive.
     timer.unref?.();
-    this.pendingTopicCleanups.set(runId, timer);
+    this.pendingTopicCleanups.set(cleanupKey, timer);
   }
 
-  private cancelRunTopicCleanup(runId: string): void {
-    const timer = this.pendingTopicCleanups.get(runId);
+  private runTopicCleanupKey(workflowId: string, runId: string, executionGeneration: string): string {
+    return JSON.stringify([workflowId, runId, executionGeneration]);
+  }
+
+  private cancelRunTopicCleanup(workflowId: string, runId: string, executionGeneration: string): void {
+    const cleanupKey = this.runTopicCleanupKey(workflowId, runId, executionGeneration);
+    const timer = this.pendingTopicCleanups.get(cleanupKey);
     if (timer !== undefined) {
       clearTimeout(timer);
-      this.pendingTopicCleanups.delete(runId);
+      this.pendingTopicCleanups.delete(cleanupKey);
     }
   }
 
-  private async clearRunTopicUnlessActive(workflowId: string, runId: string): Promise<void> {
+  private async clearRunTopicUnlessActive(
+    workflowId: string,
+    runId: string,
+    executionGeneration: string,
+  ): Promise<void> {
     try {
       // Without a storage backend there is no way to observe a cross-process
       // restart, so we delete unconditionally — the in-process timer
@@ -370,12 +565,25 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (workflowsStore) {
         const snapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
         const status = typeof snapshot === 'string' ? undefined : snapshot?.status;
+        const currentExecutionGeneration = typeof snapshot === 'string' ? undefined : snapshot?.executionGeneration;
+        // An older generation never owns deletion of the runId-scoped watch
+        // topic after a newer execution has taken over, even if that newer
+        // execution has already become terminal. Its own retention timer owns
+        // shared-topic cleanup. The old generation may still clear its exact,
+        // generation-scoped lifecycle log after its retention horizon.
+        if (currentExecutionGeneration && currentExecutionGeneration !== executionGeneration) {
+          await this.mastra.pubsub.clearTopic(getWorkflowLifecycleTopic({ workflowId, runId, executionGeneration }));
+          return;
+        }
         // Run was restarted (possibly by another worker process) after the
         // terminal end that scheduled this cleanup: it is writing to its
         // topic again, and its own terminal end will reschedule deletion.
         if (status && WorkflowEventProcessor.ACTIVE_RUN_STATUSES.has(status)) return;
       }
-      await this.mastra.pubsub.clearTopic(`workflow.events.v2.${runId}`);
+      await Promise.all([
+        this.mastra.pubsub.clearTopic(`workflow.events.v2.${runId}`),
+        this.mastra.pubsub.clearTopic(getWorkflowLifecycleTopic({ workflowId, runId, executionGeneration })),
+      ]);
     } catch (err) {
       this.mastra.getLogger()?.warn('Failed to clear workflow events topic', { workflowId, runId, error: err });
     }
@@ -583,6 +791,55 @@ export class WorkflowEventProcessor extends EventProcessor {
       this.mastra.getLogger()?.warn('Canceling workflow without loaded state', { workflowId, runId });
     }
 
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      args.executionGeneration,
+      `Evented workflow cancellation ${workflowId}/${runId}`,
+    );
+    const lifecycleStepStates = mergeWorkflowStepLifecycleStates(
+      args.lifecycleStepStates,
+      currentState?.executionGeneration === executionGeneration ? currentState.lifecycleStepStates : undefined,
+    );
+    const activeStepsPath = currentState?.activeStepsPath ?? args.activeStepsPath;
+    // A cancel event may be processed by a different worker than the one
+    // running the step. Close each active coordinate represented by the
+    // persisted activeStepsPath when cancellation observes it. Admission vs.
+    // cancel linearization and multiple concurrent foreach coordinates for one
+    // step id require the storage-atomic PF-2013 contract; this legacy map
+    // cannot prove either invariant. The executing worker may publish the same
+    // semantic events after observing its abort, and deterministic IDs make
+    // that at-least-once duplicate idempotent for consumers.
+    const persistedLifecycleStepStates =
+      currentState?.executionGeneration === executionGeneration
+        ? (currentState.lifecycleStepStates ?? lifecycleStepStates)
+        : lifecycleStepStates;
+    for (const [activeStepId, executionPath] of Object.entries(activeStepsPath ?? {})) {
+      const identity = resolvePersistedActiveStepLifecycleIdentity({
+        workflow: args.workflow,
+        workflowId,
+        runId,
+        executionGeneration,
+        activeStepId,
+        executionPath,
+        lifecycleStepStates: persistedLifecycleStepStates,
+        stepResult: currentState?.context?.[activeStepId],
+      });
+      if (!identity) continue;
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.canceled', ...identity },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.finished', ...identity, status: 'canceled' },
+      });
+    }
+
     //call end workflow with status of canceled to indicate the workflow was canceled
     await this.endWorkflow(
       {
@@ -590,6 +847,8 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         prevResult,
         ...args,
+        executionGeneration,
+        lifecycleStepStates,
       },
       'canceled',
     );
@@ -973,7 +1232,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     // cancel any terminal-topic cleanup before the first new watch event is
     // published. Delaying this until after durable parent admission keeps a
     // rejected stale child start from leaving cleanup state behind.
-    this.cancelRunTopicCleanup(runId);
+    this.cancelRunTopicCleanup(workflowId, runId, executionGeneration);
 
     // Announce the run only after durable nested admission succeeds. A stale
     // child start rejected by a terminal parent must remain invisible to
@@ -1078,6 +1337,31 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // Check shouldPersistSnapshot option - default to true if not specified
     const finalStatus = perStep && status === 'success' ? 'paused' : status;
+    const authoritativeState = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: workflowId,
+      runId,
+    });
+    if (
+      authoritativeState &&
+      ((authoritativeState.executionGeneration !== undefined &&
+        authoritativeState.executionGeneration !== executionGeneration) ||
+        WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(authoritativeState.status))
+    ) {
+      // A different generation or an already-terminal transition owns this
+      // run now. Do not let a delayed step/end delivery replace that outcome
+      // or publish a contradictory lifecycle terminal. This is a final
+      // read-fence; storage-level compare-and-set remains the cross-process
+      // ownership boundary tracked separately.
+      this.mastra.getLogger()?.debug?.('Evented workflow finish lost durable terminal ownership', {
+        workflowId,
+        runId,
+        requestedStatus: finalStatus,
+        currentStatus: authoritativeState.status,
+        currentExecutionGeneration: authoritativeState.executionGeneration,
+        incomingExecutionGeneration: executionGeneration,
+      });
+      return;
+    }
     const finalState = resolveCurrentState({ stepResults, state });
     const exactFinalStateEnabled = workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
     const shouldPersist =
@@ -1207,7 +1491,11 @@ export class WorkflowEventProcessor extends EventProcessor {
     // terminal even when `perStep` is true, so it still needs cleanup.
     const isPausedPerStepEnd = perStep && (prevResult?.status === 'success' || prevResult?.status === 'paused');
     if (!isPausedPerStepEnd) {
-      this.scheduleRunTopicCleanup(workflowId, runId);
+      this.scheduleRunTopicCleanup(
+        workflowId,
+        runId,
+        requireWorkflowExecutionGeneration(args.executionGeneration, `Evented workflow cleanup ${workflowId}/${runId}`),
+      );
     }
 
     // handle nested workflow
@@ -1220,6 +1508,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           {
             workflow: parentWorkflow as unknown as Workflow,
             workflowId: parentWorkflow.workflowId,
+            ...parentWorkflowLifecycleExecution(parentWorkflow),
             prevResult,
             runId: parentWorkflow.runId,
             executionPath: parentWorkflow.executionPath,
@@ -1246,6 +1535,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           data: {
             workflowId: parentWorkflow.workflowId,
             runId: parentWorkflow.runId,
+            ...parentWorkflowLifecycleExecution(parentWorkflow),
             executionPath: parentWorkflow.executionPath,
             resumeSteps,
             stepResults: parentWorkflow.stepResults,
@@ -1336,6 +1626,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         data: {
           workflowId: parentWorkflow.workflowId,
           runId: parentWorkflow.runId,
+          ...parentWorkflowLifecycleExecution(parentWorkflow),
           executionPath: parentWorkflow.executionPath,
           resumeSteps,
           stepResults: parentWorkflow.stepResults,
@@ -1368,6 +1659,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     const suspendedStepId = workflow && executionPath ? getStep(workflow, executionPath)?.id : undefined;
+    const suspendedStepIds = args.suspendedStepIds ?? (suspendedStepId ? [suspendedStepId] : []);
     await publishWorkflowLifecycleEvent({
       pubsub: this.mastra.pubsub,
       workflowId: args.workflowId,
@@ -1379,7 +1671,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       event: {
         type: 'workflow.suspended',
         resumeAttempt: args.lifecycleResumeAttempt ?? 0,
-        suspendedStepIds: suspendedStepId ? [suspendedStepId] : [],
+        suspendedStepIds,
       },
     });
 
@@ -1457,7 +1749,11 @@ export class WorkflowEventProcessor extends EventProcessor {
     // cleanup only after the terminal snapshot update (or nested-row delete)
     // completes, so a short test delay or slow store can't make the timer read
     // the previous active status and incorrectly skip deletion.
-    this.scheduleRunTopicCleanup(workflowId, runId);
+    this.scheduleRunTopicCleanup(
+      workflowId,
+      runId,
+      requireWorkflowExecutionGeneration(args.executionGeneration, `Evented workflow cleanup ${workflowId}/${runId}`),
+    );
 
     // handle nested workflow
     if (parentWorkflow) {
@@ -1467,6 +1763,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         data: {
           workflowId: parentWorkflow.workflowId,
           runId: parentWorkflow.runId,
+          ...parentWorkflowLifecycleExecution(parentWorkflow),
           executionPath: parentWorkflow.executionPath,
           resumeSteps,
           stepResults: parentWorkflow.stepResults,
@@ -1549,12 +1846,16 @@ export class WorkflowEventProcessor extends EventProcessor {
     executionGeneration: suppliedExecutionGeneration,
     lifecycleResumeAttempt = 0,
     lifecycleStepStates = {},
+    lifecycleStepAttemptReserved = false,
+    lifecycleIncomingStepStates,
+    lifecycleAttemptBaselineCaptured = false,
   }: ProcessorArgs) {
     const executionGeneration = requireWorkflowExecutionGeneration(
       suppliedExecutionGeneration,
       `Evented workflow step ${workflowId}/${runId}`,
     );
     const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const streamFormat = this.runFormats.get(runId);
     // Get current state from stepResults.__state or from passed state
     const currentState = resolveCurrentState({ stepResults, state });
@@ -1664,6 +1965,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         },
         {
           pubsub: this.mastra.pubsub,
+          workflowsStore,
           step,
         },
       );
@@ -1690,6 +1992,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         },
         {
           pubsub: this.mastra.pubsub,
+          workflowsStore,
           stepExecutor: this.stepExecutor,
           step,
         },
@@ -1805,26 +2108,51 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     activeStepsPath[step.step.id] = executionPath;
 
-    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
-    const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
+    const { key: lifecycleStepKey, state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
       workflowId,
       runId,
       executionGeneration,
       stepId: step.step.id,
       executionPath,
       foreachIndex: step.type === 'foreach' ? executionPath[1] : forEachIndex,
-      iterationCount: stepResults[step.step.id]?.metadata?.iterationCount,
+      iterationCount:
+        step.type === 'loop'
+          ? (stepResults[step.step.id]?.metadata?.iterationCount ?? 0)
+          : stepResults[step.step.id]?.metadata?.iterationCount,
       states: lifecycleStepStates,
     });
-    lifecycleStepState.stepAttempt += 1;
+    // Every producer carries the attempt baseline that existed before this
+    // semantic step dispatch. The first delivery advances N -> N+1. A broker
+    // redelivery sees durable N+1 while still carrying N, so it reuses the
+    // same lifecycle identity even when the transport exposes no delivery
+    // ordinal. Explicit retry/resume producers carry the current N+1 baseline
+    // and therefore reserve the next semantic attempt normally.
+    const incomingStepAttempt = lifecycleAttemptBaselineCaptured
+      ? (lifecycleIncomingStepStates?.[lifecycleStepKey]?.stepAttempt ?? 0)
+      : undefined;
+    const retainedRedeliveryAttempt =
+      incomingStepAttempt !== undefined && lifecycleStepState.stepAttempt > incomingStepAttempt;
+    if (lifecycleStepAttemptReserved) {
+      if (lifecycleStepState.stepAttempt < 1) {
+        throw new Error(`Workflow lifecycle attempt for ${step.step.id} was marked reserved without an ordinal`);
+      }
+    } else if (!retainedRedeliveryAttempt) {
+      lifecycleStepState.stepAttempt += 1;
+    }
+
+    // Make the executing coordinate visible before entering user code. A
+    // cancellation handled by another worker can then close the same durable
+    // step attempt instead of finishing only the workflow. Persist even when
+    // this delivery reuses a previously reserved attempt: the broker payload's
+    // active path is not itself authoritative durable state.
     await workflowsStore?.updateWorkflowState({
       workflowName: workflowId,
       runId,
       opts: {
-        status: 'running',
         executionGeneration,
         lifecycleResumeAttempt,
         lifecycleStepStates,
+        activeStepsPath,
       },
     });
 
@@ -2036,6 +2364,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               stepId: step.step.id,
               workflowId,
               runId,
+              ...lifecycleExecution,
               stepGraph,
               executionPath,
               resumeSteps,
@@ -2156,6 +2485,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               stepId: step.step.id,
               workflowId,
               runId,
+              ...lifecycleExecution,
               stepGraph,
               executionPath,
               resumeSteps,
@@ -2209,7 +2539,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         const nestedPrevStep = getStep(nestedWorkflow, timeTravelParams.executionPath);
         const nestedPrevResult = timeTravelParams.stepResults[nestedPrevStep?.id ?? 'input'];
         const nestedLifecycleExecution = {
-          executionGeneration: createWorkflowExecutionGeneration(),
+          executionGeneration: createNestedWorkflowExecutionGeneration({
+            ...nestedRunCoordinate,
+            parentExecutionGeneration: executionGeneration,
+            nestedRunId,
+          }),
           lifecycleResumeAttempt: 0,
           lifecycleStepStates: {},
         };
@@ -2224,6 +2558,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               stepId: step.step.id,
               workflowId,
               runId,
+              ...lifecycleExecution,
               stepGraph,
               executionPath,
               resumeSteps,
@@ -2266,7 +2601,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         const nestedPrevStep = getStep(nestedWorkflow, snapshot.activePaths);
         const nestedPrevResult = restartParams.stepResults[nestedPrevStep?.id ?? 'input'];
         const nestedLifecycleExecution = {
-          executionGeneration: createWorkflowExecutionGeneration(),
+          executionGeneration: createNestedWorkflowExecutionGeneration({
+            ...nestedRunCoordinate,
+            parentExecutionGeneration: executionGeneration,
+            nestedRunId,
+          }),
           lifecycleResumeAttempt: 0,
           lifecycleStepStates: {},
         };
@@ -2281,6 +2620,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               stepId: step.step.id,
               workflowId,
               runId,
+              ...lifecycleExecution,
               stepGraph,
               executionPath,
               resumeSteps,
@@ -2325,7 +2665,11 @@ export class WorkflowEventProcessor extends EventProcessor {
           workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
         const parentRun = await workflowsStore?.getWorkflowRunById({ runId, workflowName: workflow.id });
         const nestedLifecycleExecution = {
-          executionGeneration: createWorkflowExecutionGeneration(),
+          executionGeneration: createNestedWorkflowExecutionGeneration({
+            ...nestedRunCoordinate,
+            parentExecutionGeneration: executionGeneration,
+            nestedRunId,
+          }),
           lifecycleResumeAttempt: 0,
           lifecycleStepStates: {},
         };
@@ -2376,6 +2720,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               workflowId,
               stepGraph,
               runId,
+              ...lifecycleExecution,
               executionPath,
               resumeSteps,
               stepResults,
@@ -2443,15 +2788,17 @@ export class WorkflowEventProcessor extends EventProcessor {
         step: step.step,
       });
 
+    const isTimeTravelResume = timeTravel?.stepResults[step.step.id]?.status === 'suspended';
+    const isExplicitResume = resumeSteps?.[0] === step.step.id;
     let resumeDataToUse;
-    if (timeTravelResumeData && !timeTravelResumeValidationError) {
+    if (isTimeTravelResume && !timeTravelResumeValidationError) {
       resumeDataToUse = timeTravelResumeData;
-    } else if (timeTravelResumeData && timeTravelResumeValidationError) {
+    } else if (isTimeTravelResume && timeTravelResumeValidationError) {
       this.mastra.getLogger()?.warn('Time travel resume data validation failed', {
         stepId: step.step.id,
         error: timeTravelResumeValidationError.message,
       });
-    } else if (resumeSteps?.length > 0 && resumeSteps?.[0] === step.step.id) {
+    } else if (isExplicitResume) {
       resumeDataToUse = resumeData;
     }
 
@@ -2502,6 +2849,34 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
     }
     requestContext = Object.fromEntries(rc.entries());
+
+    const authoritativeStateAfterExecution = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: workflowId,
+      runId,
+    });
+    if (
+      authoritativeStateAfterExecution &&
+      ((authoritativeStateAfterExecution.executionGeneration !== undefined &&
+        authoritativeStateAfterExecution.executionGeneration !== executionGeneration) ||
+        WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(authoritativeStateAfterExecution.status))
+    ) {
+      // User code can outlive a remote cancellation because abort delivery is
+      // cooperative and may be owned by another process. Re-read the durable
+      // tuple after the await and suppress every non-authoritative completion
+      // event. A cancel worker that observed this persisted coordinate closes
+      // it; PF-2013 owns atomic admission/cancel ordering and concurrent
+      // same-step foreach coordinates.
+      this.mastra.getLogger()?.debug?.('Evented workflow step completion lost durable terminal ownership', {
+        workflowId,
+        runId,
+        stepId: step.step.id,
+        currentStatus: authoritativeStateAfterExecution.status,
+        currentExecutionGeneration: authoritativeStateAfterExecution.executionGeneration,
+        incomingExecutionGeneration: executionGeneration,
+      });
+      this.cleanupRun(runId);
+      return;
+    }
 
     if (abortController?.signal?.aborted) {
       // Extract updated state from step result
@@ -2554,6 +2929,25 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // @ts-expect-error - bailed status not in type
     if (stepResult.status === 'bailed') {
+      const bailedIdentity = {
+        stepId: step.step.id,
+        stepCallId: lifecycleStepState.stepCallId,
+        stepAttempt: lifecycleStepState.stepAttempt,
+      };
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.completed', ...bailedIdentity, output: (stepResult as any).output },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.finished', ...bailedIdentity, status: 'success' },
+      });
       // @ts-expect-error - bailed status not in type
       stepResult.status = 'success';
 
@@ -2912,6 +3306,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           restart,
           state: currentState,
           outputOptions,
+          suspendedStepIds: Object.keys(suspendedPaths),
         },
       });
       return;
@@ -3017,7 +3412,10 @@ export class WorkflowEventProcessor extends EventProcessor {
         stepId: step.step.id,
         executionPath,
         foreachIndex: step.type === 'foreach' ? executionPath[1] : forEachIndex,
-        iterationCount: stepResults[step.step.id]?.metadata?.iterationCount,
+        iterationCount:
+          step.type === 'loop'
+            ? (stepResults[step.step.id]?.metadata?.iterationCount ?? 0)
+            : stepResults[step.step.id]?.metadata?.iterationCount,
         states: lifecycleStepStates,
       });
       if (lifecycleStepState.stepAttempt < 1) lifecycleStepState.stepAttempt = 1;
@@ -3050,13 +3448,13 @@ export class WorkflowEventProcessor extends EventProcessor {
           executionGeneration,
           event: { type: 'step.finished', ...identity, status: 'failed' },
         });
-      } else if (prevResult.status === 'success') {
+      } else if (prevResult.status === 'success' || (prevResult as any).status === 'bailed') {
         await publishWorkflowLifecycleEvent({
           pubsub: this.mastra.pubsub,
           workflowId,
           runId,
           executionGeneration,
-          event: { type: 'step.completed', ...identity, output: prevResult.output },
+          event: { type: 'step.completed', ...identity, output: (prevResult as any).output },
         });
         await publishWorkflowLifecycleEvent({
           pubsub: this.mastra.pubsub,
@@ -3838,7 +4236,7 @@ export class WorkflowEventProcessor extends EventProcessor {
    *   should acknowledge the event without redelivery.
    */
   async handle(event: Event): Promise<{ ok: true } | { ok: false; retry: boolean }> {
-    const data = event.data as { workflowId?: unknown; runId?: unknown } | undefined;
+    const data = event.data as { workflowId?: unknown; runId?: unknown; executionGeneration?: unknown } | undefined;
     const workflowId = typeof data?.workflowId === 'string' ? data.workflowId : undefined;
     const runId = typeof data?.runId === 'string' ? data.runId : undefined;
     const internalEventGeneration =
@@ -3848,6 +4246,15 @@ export class WorkflowEventProcessor extends EventProcessor {
     let terminalEventHandled = false;
     const deliveryAttempt = this.#getDeliveryAttempt(event);
     try {
+      if (typeof data?.executionGeneration !== 'string' || data.executionGeneration.length === 0) {
+        this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: dropping event without execution generation', {
+          type: event.type,
+          runId: event.runId,
+          deliveryAttempt,
+        });
+        return { ok: false, retry: false };
+      }
+
       // Once the transport-owned source budget is exhausted, later deliveries
       // may retry terminal failure publication only. This remains true when a
       // different worker or a new process receives the event because the broker
@@ -3976,6 +4383,26 @@ export class WorkflowEventProcessor extends EventProcessor {
       return { ok: false, retry: true };
     }
 
+    if (!workflowData.executionGeneration) {
+      this.mastra.getLogger()?.error('WorkflowEventProcessor.handle: dropping terminal event without generation', {
+        type: event.type,
+        runId: event.runId,
+        deliveryAttempt,
+      });
+      return { ok: false, retry: false };
+    }
+
+    if (currentState?.executionGeneration && currentState.executionGeneration !== workflowData.executionGeneration) {
+      this.mastra.getLogger()?.debug?.('WorkflowEventProcessor.handle: skipping stale terminal generation', {
+        type: event.type,
+        runId: event.runId,
+        deliveryAttempt,
+        currentExecutionGeneration: currentState.executionGeneration,
+        incomingExecutionGeneration: workflowData.executionGeneration,
+      });
+      return { ok: false, retry: false };
+    }
+
     // A delayed exhausted delivery must not overwrite a run that completed,
     // failed, or was canceled through a newer event.
     if (currentState && !WorkflowEventProcessor.TERMINALIZABLE_RUN_STATUSES.has(currentState.status)) {
@@ -3989,15 +4416,19 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     try {
+      const executionGeneration = requireWorkflowExecutionGeneration(
+        workflowData.executionGeneration,
+        `Evented workflow terminal failure ${workflowData.workflowId}/${workflowData.runId}`,
+      );
       await this.errorWorkflow(
         {
           ...workflowData,
-          executionGeneration: requireWorkflowExecutionGeneration(
-            workflowData.executionGeneration ?? currentState?.executionGeneration,
-            `Evented workflow terminal failure ${workflowData.workflowId}/${workflowData.runId}`,
-          ),
+          executionGeneration,
           lifecycleResumeAttempt: workflowData.lifecycleResumeAttempt ?? currentState?.lifecycleResumeAttempt ?? 0,
-          lifecycleStepStates: workflowData.lifecycleStepStates ?? currentState?.lifecycleStepStates ?? {},
+          lifecycleStepStates: mergeWorkflowStepLifecycleStates(
+            workflowData.lifecycleStepStates,
+            currentState?.executionGeneration === executionGeneration ? currentState.lifecycleStepStates : undefined,
+          ),
         },
         error,
       );
@@ -4041,15 +4472,44 @@ export class WorkflowEventProcessor extends EventProcessor {
       workflowId: incomingWorkflowData.workflowId,
       runId: incomingWorkflowData.runId,
     });
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      incomingWorkflowData.executionGeneration,
+      `Evented workflow dispatch ${incomingWorkflowData.workflowId}/${incomingWorkflowData.runId}`,
+    );
+    if (currentState?.executionGeneration && currentState.executionGeneration !== executionGeneration) {
+      this.mastra.getLogger()?.debug?.('WorkflowEventProcessor.handle: skipping stale execution generation', {
+        type,
+        runId: incomingWorkflowData.runId,
+        currentExecutionGeneration: currentState.executionGeneration,
+        incomingExecutionGeneration: executionGeneration,
+      });
+      return false;
+    }
     const workflowData: Omit<ProcessorArgs, 'workflow'> = {
       ...incomingWorkflowData,
-      executionGeneration: requireWorkflowExecutionGeneration(
-        incomingWorkflowData.executionGeneration ?? currentState?.executionGeneration,
-        `Evented workflow dispatch ${incomingWorkflowData.workflowId}/${incomingWorkflowData.runId}`,
+      executionGeneration,
+      lifecycleIncomingStepStates: mergeWorkflowStepLifecycleStates(
+        incomingWorkflowData.lifecycleStepStates,
+        undefined,
       ),
+      lifecycleAttemptBaselineCaptured: true,
       lifecycleResumeAttempt: incomingWorkflowData.lifecycleResumeAttempt ?? currentState?.lifecycleResumeAttempt ?? 0,
-      lifecycleStepStates: incomingWorkflowData.lifecycleStepStates ?? currentState?.lifecycleStepStates ?? {},
+      lifecycleStepStates: mergeWorkflowStepLifecycleStates(
+        incomingWorkflowData.lifecycleStepStates,
+        currentState?.executionGeneration === executionGeneration ? currentState.lifecycleStepStates : undefined,
+      ),
     };
+
+    // Cancellation is monotonic. A delayed or duplicated cancel delivery must
+    // never rewrite a success/failure outcome (or emit a contradictory
+    // terminal lifecycle event) after the run has already completed.
+    if (
+      type === 'workflow.cancel' &&
+      currentState &&
+      WorkflowEventProcessor.TERMINAL_CHILD_RUN_STATUSES.has(currentState.status)
+    ) {
+      return false;
+    }
 
     if (currentState?.status === 'canceled' && type !== 'workflow.end' && type !== 'workflow.cancel') {
       return false;

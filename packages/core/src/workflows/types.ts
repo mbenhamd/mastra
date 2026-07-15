@@ -16,40 +16,19 @@ import type { ChunkType, WorkflowStreamEvent } from '../stream/types';
 import type { Tool, ToolExecutionContext } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
+import type { WorkflowExecutionGeneration, WorkflowLifecycleEnvelope } from './lifecycle-events';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
 import type { WorkflowTerminalRecoveryEnvelopeV1 } from './terminal-recovery/types';
 
 export type OutputWriter<TChunk = any> = (chunk: TChunk, options?: { messageId?: string }) => Promise<void>;
 
-/**
- * A workflow stream event together with the durable delivery identity needed
- * by projectors and other restartable consumers.
- *
- * `event` deliberately remains the existing {@link WorkflowStreamEvent}; the
- * lifecycle envelope adds transport identity without changing the stream
- * event contract consumed by existing `watch()` callers.
- */
-export type WorkflowLifecycleEvent = {
-  /** Stable identity shared by live delivery and replay. */
-  eventId: string;
-  /** Zero-based position within this run's workflow event topic. */
-  cursor: number;
-  /** Time the event was first published. */
-  createdAt: Date;
-  /** Delivery count for this event, starting at one. */
-  deliveryAttempt: number;
-  /** Retained-log generation used to reject cursor reuse after expiry/reset. */
-  logGeneration: string;
-  workflowId: string;
-  runId: string;
-  event: WorkflowStreamEvent;
-};
-
-export type WorkflowLifecycleEventCallback = (event: WorkflowLifecycleEvent) => void | Promise<void>;
+export type WorkflowLifecycleEventCallback = (event: WorkflowLifecycleEnvelope) => void | Promise<void>;
 export type WorkflowLifecycleErrorCallback = (error: Error) => void | Promise<void>;
 
 export type WorkflowLifecycleWatchOptions = {
+  /** Exact execution lineage to reconnect after a restart or time-travel takeover. */
+  executionGeneration?: WorkflowExecutionGeneration;
   /**
    * Resume strictly after this committed cursor. Omit to replay from the
    * beginning of retained history.

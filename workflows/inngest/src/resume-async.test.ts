@@ -76,6 +76,9 @@ describe('InngestRun.resumeAsync()', () => {
         resumeLabels: {},
         waitingPaths: {},
         timestamp: Date.now(),
+        executionGeneration: 'resume-async-execution',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
       },
     });
 
@@ -112,24 +115,28 @@ describe('InngestRun.resumeAsync()', () => {
     expect(sentEvent.data.runId).toBe(run.runId);
     expect(sentEvent.data.resume.steps).toEqual(['step1']);
     expect(sentEvent.data.resume.resumePayload).toEqual({ resumed: 'world' });
+    expect(sentEvent.data.executionGeneration).toBe('resume-async-execution');
+    expect(sentEvent.data.lifecycleResumeAttempt).toBe(1);
+    expect(sentEvent.data.lifecycleStepStates).toEqual({});
   });
 
   it('updates the snapshot to running before sending the event', async () => {
     const { run, workflowsStore } = await createSuspendedRun();
 
-    let statusAtSendTime: string | undefined;
+    let snapshotAtSendTime: Awaited<ReturnType<typeof workflowsStore.loadWorkflowSnapshot>>;
     sendMock.mockImplementation(async () => {
-      const snap = await workflowsStore.loadWorkflowSnapshot({
+      snapshotAtSendTime = await workflowsStore.loadWorkflowSnapshot({
         workflowName: 'resume-async-wf',
         runId: run.runId,
       });
-      statusAtSendTime = snap?.status;
       return { ids: ['evt_123'] };
     });
 
     await run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' } });
 
-    expect(statusAtSendTime).toBe('running');
+    expect(snapshotAtSendTime?.status).toBe('running');
+    expect(snapshotAtSendTime?.executionGeneration).toBe('resume-async-execution');
+    expect(snapshotAtSendTime?.lifecycleResumeAttempt).toBe(1);
   });
 
   it('rolls back the snapshot to suspended when event send fails', async () => {
@@ -146,21 +153,24 @@ describe('InngestRun.resumeAsync()', () => {
       runId: run.runId,
     });
     expect(snap?.status).toBe('suspended');
+    expect(snap?.executionGeneration).toBe('resume-async-execution');
+    expect(snap?.lifecycleResumeAttempt).toBe(0);
   });
 
-  it('rolls back the snapshot to suspended when event dispatch returns no id', async () => {
+  it('rolls back the snapshot when Inngest accepts no event id', async () => {
     const { run, workflowsStore } = await createSuspendedRun();
-
     sendMock.mockResolvedValueOnce({ ids: [] });
 
     await expect(run.resumeAsync({ step: 'step1', resumeData: { resumed: 'world' } })).rejects.toThrow(
       'Event ID is not set',
     );
 
-    const snap = await workflowsStore.loadWorkflowSnapshot({
+    const snapshot = await workflowsStore.loadWorkflowSnapshot({
       workflowName: 'resume-async-wf',
       runId: run.runId,
     });
-    expect(snap?.status).toBe('suspended');
+    expect(snapshot?.status).toBe('suspended');
+    expect(snapshot?.executionGeneration).toBe('resume-async-execution');
+    expect(snapshot?.lifecycleResumeAttempt).toBe(0);
   });
 });

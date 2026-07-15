@@ -1,4 +1,5 @@
 import type { Event } from '@mastra/core/events';
+import { getWorkflowLifecycleTopic } from '@mastra/core/workflows';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InngestPubSub } from './pubsub';
 import { InngestRun, unwrapWorkflowRealtimeData } from './run';
@@ -9,13 +10,13 @@ const realtimeMocks = vi.hoisted(() => ({
   subscribe: vi.fn(),
 }));
 
-function createFixture() {
+function createFixture(workflowId = 'workflow-id') {
   const publish = vi.fn(async () => {});
   const inngest = { realtime: { publish } } as any;
   return {
     inngest,
     publish,
-    pubsub: new InngestPubSub(inngest, 'workflow-id', realtimeMocks.subscribe as any),
+    pubsub: new InngestPubSub(inngest, workflowId, realtimeMocks.subscribe as any),
   };
 }
 
@@ -31,9 +32,11 @@ describe('InngestPubSub', () => {
   });
 
   it('routes canonical lifecycle topics by full execution identity and preserves the replay envelope', async () => {
-    const { pubsub, publish } = createFixture();
-    const topic = 'workflow.lifecycle.v1.workflow-id.run-1.execution-1';
-    const otherTopic = 'workflow.lifecycle.v1.workflow-id.run-1.execution-2';
+    const workflowId = 'workflow.id/review';
+    const runId = 'run.1/review';
+    const { pubsub, publish } = createFixture(workflowId);
+    const topic = getWorkflowLifecycleTopic({ workflowId, runId, executionGeneration: 'execution.1/review' });
+    const otherTopic = getWorkflowLifecycleTopic({ workflowId, runId, executionGeneration: 'execution.2/review' });
     const createdAt = new Date('2026-07-15T10:00:00.000Z');
     const received: Event[] = [];
 
@@ -43,8 +46,8 @@ describe('InngestPubSub', () => {
     await pubsub.subscribe(otherTopic, () => {});
     await pubsub.publish(topic, {
       type: 'workflow-start',
-      runId: 'run-1',
-      data: { payload: { runId: 'run-1' } },
+      runId,
+      data: { payload: { runId } },
       id: 'lifecycle-event-id',
       createdAt,
       index: 14,
@@ -68,6 +71,7 @@ describe('InngestPubSub', () => {
         createdAt,
         index: 14,
         logGeneration: 'log-generation-1',
+        runId,
       }),
     );
 
@@ -170,6 +174,45 @@ describe('InngestPubSub', () => {
     consoleError.mockRestore();
   });
 
+  it('shares one realtime connection when subscribers race on the same topic', async () => {
+    const { pubsub } = createFixture();
+    let resolveStream: ((stream: { cancel: typeof realtimeMocks.cancel }) => void) | undefined;
+    realtimeMocks.subscribe.mockImplementationOnce(
+      async (_options: unknown, handler: (message: any) => Promise<void> | void) => {
+        realtimeMocks.handlers.push(handler);
+        return new Promise<{ cancel: typeof realtimeMocks.cancel }>(resolve => {
+          resolveStream = resolve;
+        });
+      },
+    );
+    const first = vi.fn();
+    const second = vi.fn();
+
+    const firstSubscription = pubsub.subscribe('workflow.events.v2.run-1', first);
+    const secondSubscription = pubsub.subscribe('workflow.events.v2.run-1', second);
+
+    expect(realtimeMocks.subscribe).toHaveBeenCalledTimes(1);
+    resolveStream?.({ cancel: realtimeMocks.cancel });
+    await Promise.all([firstSubscription, secondSubscription]);
+
+    await realtimeMocks.handlers[0]!({
+      data: {
+        type: 'watch',
+        runId: 'run-1',
+        data: {},
+        id: 'raced-event',
+        createdAt: '2026-07-15T10:00:00.000Z',
+      },
+    });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    await pubsub.unsubscribe('workflow.events.v2.run-1', first);
+    expect(realtimeMocks.cancel).not.toHaveBeenCalled();
+    await pubsub.unsubscribe('workflow.events.v2.run-1', second);
+    expect(realtimeMocks.cancel).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps local-only delivery in-process and preserves the caller envelope', async () => {
     const { pubsub, publish } = createFixture();
     const topic = 'agent.stream.run-1';
@@ -222,7 +265,7 @@ describe('InngestPubSub', () => {
         executionEngine: {} as any,
         executionGraph: {} as any,
         serializedStepGraph: [],
-        mastra: {} as any,
+        mastra: { getStorage: () => undefined } as any,
         workflowSteps: {},
         workflowEngineType: 'inngest' as any,
         pubsub: replayPubsub,
@@ -241,14 +284,15 @@ describe('InngestPubSub', () => {
       }),
     ).toEqual(innerEvent);
 
+    const lifecycleIdentity = await run.getLifecycleExecutionIdentity();
     const stopLifecycle = await run.watchLifecycle(vi.fn());
     expect(subscribeFromOffset).toHaveBeenCalledWith(
-      'workflow.events.v2.run-1',
+      lifecycleIdentity.topic,
       0,
       expect.any(Function),
       expect.objectContaining({ logGeneration: 'generation-a' }),
     );
     await stopLifecycle();
-    expect(unsubscribe).toHaveBeenCalledWith('workflow.events.v2.run-1', expect.any(Function));
+    expect(unsubscribe).toHaveBeenCalledWith(lifecycleIdentity.topic, expect.any(Function));
   });
 });

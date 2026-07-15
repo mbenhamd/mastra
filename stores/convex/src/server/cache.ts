@@ -7,6 +7,10 @@ import type { CacheRequest, CacheResponse } from '../cache/types';
 const CACHE_TABLE = 'mastra_cache';
 const CACHE_LIST_TABLE = 'mastra_cache_list_items';
 const CACHE_MUTATION_BATCH_SIZE = 25;
+// Convex mutations have a 16 MiB read limit while a single cached value can be
+// comparatively large. Page exact replay conservatively; CachingPubSub drains
+// pages until the returned global nextCursor is reached.
+const INDEXED_LOG_READ_PAGE_SIZE = 10;
 
 type CacheKind = 'value' | 'list' | 'counter' | 'indexed-log' | 'deleted';
 type CacheDoc = {
@@ -471,7 +475,7 @@ export async function handleCacheOperation(ctx: MutationCtx<any>, request: Cache
       const query = ctx.db.query(CACHE_LIST_TABLE).withIndex('by_key_index', (q: any) => {
         return q.eq('key', request.key).gte('index', request.afterCursor + 1);
       });
-      const entries = (await query.collect()) as CacheListItem[];
+      const entries = (await query.take(INDEXED_LOG_READ_PAGE_SIZE)) as CacheListItem[];
       const first = (await ctx.db
         .query(CACHE_LIST_TABLE)
         .withIndex('by_key_index', (q: any) => q.eq('key', request.key))

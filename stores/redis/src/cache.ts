@@ -17,7 +17,8 @@ export interface RedisClient {
   expire(key: string, seconds: number): Promise<number | boolean>;
   scan(cursor: string | number, ...args: unknown[]): Promise<[string | number, string[]]>;
   incr(key: string): Promise<number>;
-  eval(script: string, ...args: unknown[]): Promise<unknown>;
+  /** Required only when atomic indexed-log methods are used. */
+  eval?(script: string, ...args: unknown[]): Promise<unknown>;
 }
 
 export interface RedisServerCacheOptions {
@@ -67,6 +68,11 @@ const defaultEvalScript = (
   keys: string[],
   arguments_: string[],
 ): Promise<unknown> => {
+  if (typeof client.eval !== 'function') {
+    throw new TypeError(
+      'Redis indexed logs require a client eval implementation or RedisServerCacheOptions.evalScript adapter',
+    );
+  }
   return client.eval(script, keys.length, ...keys, ...arguments_);
 };
 
@@ -401,7 +407,12 @@ export const upstashPreset: Pick<RedisServerCacheOptions, 'setWithExpiry' | 'sca
   setWithExpiry: (client, key, value, seconds) => client.set(key, value, { ex: seconds } as any),
   scanKeys: (client, cursor, pattern, count) =>
     client.scan(cursor, { match: pattern, count } as any) as Promise<[string | number, string[]]>,
-  evalScript: (client, script, keys, arguments_) => client.eval(script, keys, arguments_),
+  evalScript: (client, script, keys, arguments_) => {
+    if (typeof client.eval !== 'function') {
+      throw new TypeError('The Upstash Redis indexed-log preset requires a client eval implementation');
+    }
+    return client.eval(script, keys, arguments_);
+  },
 };
 
 // node-redis v4+ exposes Redis multi-word commands as camelCase only

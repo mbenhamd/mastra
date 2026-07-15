@@ -91,6 +91,45 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     this.lastPersistedStatusByRun.delete(runId);
   }
 
+  async getAuthoritativeExecutionDisposition(params: {
+    workflowId: string;
+    runId: string;
+    executionGeneration: string;
+  }): Promise<WorkflowRunStatus | 'superseded' | undefined> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: params.workflowId,
+      runId: params.runId,
+    });
+    if (!snapshot) return undefined;
+    if (snapshot.executionGeneration !== params.executionGeneration) return 'superseded';
+    if (
+      snapshot.status === 'success' ||
+      snapshot.status === 'failed' ||
+      snapshot.status === 'canceled' ||
+      snapshot.status === 'tripwire' ||
+      snapshot.status === 'bailed'
+    ) {
+      // executeEntry persists this execution's own step result before control
+      // returns here. Do not mistake that local write for an independently
+      // settled owner: doing so skips bail normalization, workflow callbacks,
+      // and the canonical workflow terminal sequence. A remote terminal write
+      // remains distinguishable because it did not update this engine-local
+      // persisted-status marker.
+      if (this.getLastPersistedStatus(params.runId) === snapshot.status) return undefined;
+      return snapshot.status;
+    }
+    return undefined;
+  }
+
+  private async isAuthoritativelyCanceled(params: {
+    workflowId: string;
+    runId: string;
+    executionGeneration: string;
+  }): Promise<boolean> {
+    return (await this.getAuthoritativeExecutionDisposition(params)) === 'canceled';
+  }
+
   /**
    * Get or generate the retry count for a step.
    * If the step id is not in the map, it will be added and the retry count will be 0.
@@ -425,7 +464,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    */
   async executeStepWithRetry<T>(
     stepId: string,
-    runStep: () => Promise<T>,
+    runStep: (retryCount: number) => Promise<T>,
     params: {
       retries: number;
       delay: number;
@@ -445,6 +484,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           error: Error;
           endedAt: number;
           tripwire?: StepTripwireInfo;
+          retryCount?: number;
         };
       }
   > {
@@ -453,7 +493,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         await new Promise(resolve => setTimeout(resolve, params.delay));
       }
       try {
-        const result = await this.wrapDurableOperation(stepId, runStep);
+        const result = await this.wrapDurableOperation(stepId, () => runStep(i));
         return { ok: true, result };
       } catch (e) {
         const isNonRetryable = e instanceof MastraNonRetryableError;
@@ -489,6 +529,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
               status: 'failed',
               error: errorInstance,
               endedAt: Date.now(),
+              retryCount: i,
               ...(isNonRetryable && { nonRetryable: true as const }),
               // Preserve TripWire data as plain object for proper serialization
               tripwire:
@@ -897,13 +938,49 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
       }
 
+      const authoritativeDisposition = await this.getAuthoritativeExecutionDisposition({
+        workflowId,
+        runId,
+        executionGeneration,
+      });
+      if (authoritativeDisposition) {
+        // A terminal transition (or a newer generation) completed while user
+        // code was still awaiting. The owner already published its terminal
+        // lifecycle sequence, so return the durable outcome without appending
+        // duplicate step/workflow events after workflow.finished.
+        const authoritativeStatus = authoritativeDisposition === 'superseded' ? 'canceled' : authoritativeDisposition;
+        const authoritativeResult = (await this.fmtReturnValue(
+          params.pubsub,
+          stepResults,
+          { ...lastOutput.result, status: authoritativeStatus },
+          undefined,
+          stepExecutionPath,
+        )) as any;
+        if (authoritativeStatus === 'failed' || authoritativeStatus === 'tripwire') {
+          workflowSpan?.error({
+            error: authoritativeResult.error ?? new Error(`Workflow ended with status ${authoritativeStatus}`),
+            attributes: { status: authoritativeStatus },
+          });
+        } else {
+          workflowSpan?.end({
+            output: authoritativeResult.result,
+            attributes: { status: authoritativeStatus },
+          });
+        }
+        this.clearLastPersistedStatus(runId);
+        return {
+          ...authoritativeResult,
+          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+        };
+      }
+
       // if step result is not success, stop and return
       if (lastOutput.result.status !== 'success') {
         if (lastOutput.result.status === 'bailed') {
           lastOutput.result.status = 'success';
         }
 
-        const result = (await this.fmtReturnValue(
+        let result = (await this.fmtReturnValue(
           params.pubsub,
           stepResults,
           lastOutput.result,
@@ -934,6 +1011,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           requestContext: currentRequestContext,
           tracingContext: persistTracingContext,
         });
+
+        if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+          result = { ...result, status: 'canceled', result: undefined, error: undefined };
+          lastOutput.result.status = 'canceled';
+        }
 
         if (result.error) {
           workflowSpan?.error({
@@ -1079,7 +1161,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     }
 
     // after all steps are successful, return result
-    const result = (await this.fmtReturnValue(
+    let result = (await this.fmtReturnValue(
       params.pubsub,
       stepResults,
       lastOutput.result,
@@ -1098,6 +1180,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       error: result.error,
       requestContext: currentRequestContext,
     });
+
+    if (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })) {
+      result = { ...result, status: 'canceled', result: undefined, error: undefined };
+    }
 
     workflowSpan?.end({
       output: result.result,
@@ -1120,6 +1206,16 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       state: lastState,
       stepExecutionPath,
     });
+
+    if (result.status === 'canceled') {
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+      });
+    }
 
     await publishWorkflowLifecycleEvent({
       pubsub: params.pubsub,

@@ -2,12 +2,84 @@ import { isProxy } from 'node:util/types';
 import type { StepFlowEntry } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
+import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
+import {
+  getOrCreateWorkflowStepLifecycleState,
+  mergeWorkflowStepLifecycleStates,
+  requireWorkflowExecutionGeneration,
+} from '../../lifecycle-events';
 import { resolveCurrentState } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import type { ProcessorArgs } from '.';
 
 function pathsEqual(left: readonly number[], right: readonly number[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+async function reserveBranchLifecycleAttempts({
+  workflowsStore,
+  workflowId,
+  runId,
+  executionGeneration: suppliedExecutionGeneration,
+  lifecycleResumeAttempt = 0,
+  lifecycleStepStates,
+  branches,
+}: {
+  workflowsStore?: WorkflowsStorage;
+  workflowId: string;
+  runId: string;
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  branches: Array<{ stepId: string; executionPath: number[] }>;
+}): Promise<{
+  executionGeneration?: string;
+  lifecycleResumeAttempt: number;
+  lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
+  lifecycleStepAttemptReserved: boolean;
+}> {
+  const states = mergeWorkflowStepLifecycleStates(lifecycleStepStates, undefined);
+  if (!workflowsStore || branches.length === 0) {
+    return {
+      executionGeneration: suppliedExecutionGeneration,
+      lifecycleResumeAttempt,
+      lifecycleStepStates: states,
+      lifecycleStepAttemptReserved: false,
+    };
+  }
+
+  const executionGeneration = requireWorkflowExecutionGeneration(
+    suppliedExecutionGeneration,
+    `Evented workflow branch reservation ${workflowId}/${runId}`,
+  );
+  for (const branch of branches) {
+    const { state } = getOrCreateWorkflowStepLifecycleState({
+      workflowId,
+      runId,
+      executionGeneration,
+      stepId: branch.stepId,
+      executionPath: branch.executionPath,
+      states,
+    });
+    state.stepAttempt += 1;
+  }
+
+  await workflowsStore.updateWorkflowState({
+    workflowName: workflowId,
+    runId,
+    opts: {
+      executionGeneration,
+      lifecycleResumeAttempt,
+      lifecycleStepStates: states,
+    },
+  });
+
+  return {
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates: states,
+    lifecycleStepAttemptReserved: true,
+  };
 }
 
 function readParallelRestartPath(value: unknown, maxLength: number): number[] | undefined {
@@ -117,12 +189,17 @@ export async function processWorkflowParallel(
     perStep,
     state,
     outputOptions,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
   }: ProcessorArgs,
   {
     pubsub,
+    workflowsStore,
     step,
   }: {
     pubsub: PubSub;
+    workflowsStore?: WorkflowsStorage;
     step: Extract<StepFlowEntry, { type: 'parallel' }>;
   },
 ) {
@@ -160,19 +237,38 @@ export async function processWorkflowParallel(
     }
   }
 
+  const branches = step.steps.flatMap((nestedStep, idx) => {
+    if (!pathsToRun.has(nestedStep.step.id)) return [];
+    return [
+      {
+        nestedStep,
+        executionPath: restart ? restartContainerPath!.concat([idx]) : executionPath.concat([idx]),
+      },
+    ];
+  });
+  const lifecycleReservation = await reserveBranchLifecycleAttempts({
+    workflowsStore,
+    workflowId,
+    runId,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
+    branches: branches.map(({ nestedStep, executionPath }) => ({ stepId: nestedStep.step.id, executionPath })),
+  });
+
   await Promise.all(
     // Keep the original branch index when only a subset is restarted. Filtering
     // first would renumber B/C to 0/1 and route persisted coordinates to the
     // wrong graph branch. This translates official fix d5c11e3ba5045969caa7272a7bd1fd141c93ab6c.
-    step.steps?.map(async (nestedStep, idx) => {
-      if (!pathsToRun.has(nestedStep.step.id)) return;
+    branches.map(async ({ executionPath: branchExecutionPath }) => {
       return pubsub.publish('workflows', {
         type: 'workflow.step.run',
         runId,
         data: {
+          ...lifecycleReservation,
           workflowId,
           runId,
-          executionPath: restart ? restartContainerPath!.concat([idx]) : executionPath.concat([idx]),
+          executionPath: branchExecutionPath,
           resumeSteps,
           stepResults,
           prevResult,
@@ -208,13 +304,18 @@ export async function processWorkflowConditional(
     perStep,
     state,
     outputOptions,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
   }: ProcessorArgs,
   {
     pubsub,
+    workflowsStore,
     stepExecutor,
     step,
   }: {
     pubsub: PubSub;
+    workflowsStore?: WorkflowsStorage;
     stepExecutor: StepExecutor;
     step: Extract<StepFlowEntry, { type: 'conditional' }>;
   },
@@ -250,14 +351,25 @@ export async function processWorkflowConditional(
 
   if (onlyStepToRun) {
     const stepIndex = step.steps.findIndex(step => step.step.id === onlyStepToRun.step.id);
+    const branchExecutionPath = executionPath.concat([stepIndex]);
+    const lifecycleReservation = await reserveBranchLifecycleAttempts({
+      workflowsStore,
+      workflowId,
+      runId,
+      executionGeneration,
+      lifecycleResumeAttempt,
+      lifecycleStepStates,
+      branches: [{ stepId: onlyStepToRun.step.id, executionPath: branchExecutionPath }],
+    });
     activeStepsPath[onlyStepToRun.step.id] = executionPath.concat([stepIndex]);
     await pubsub.publish('workflows', {
       type: 'workflow.step.run',
       runId,
       data: {
+        ...lifecycleReservation,
         workflowId,
         runId,
-        executionPath: executionPath.concat([stepIndex]),
+        executionPath: branchExecutionPath,
         resumeSteps,
         stepResults,
         timeTravel,
@@ -273,6 +385,25 @@ export async function processWorkflowConditional(
       },
     });
   } else {
+    const selectedBranches = step.steps.flatMap((branch, idx) =>
+      truthyIdxs[idx] && branch?.type === 'step'
+        ? [{ stepId: branch.step.id, executionPath: executionPath.concat([idx]) }]
+        : [],
+    );
+    const lifecycleReservation = await reserveBranchLifecycleAttempts({
+      workflowsStore,
+      workflowId,
+      runId,
+      executionGeneration,
+      lifecycleResumeAttempt,
+      lifecycleStepStates,
+      branches: selectedBranches,
+    });
+    const lifecycleExecution = {
+      executionGeneration: lifecycleReservation.executionGeneration,
+      lifecycleResumeAttempt: lifecycleReservation.lifecycleResumeAttempt,
+      lifecycleStepStates: lifecycleReservation.lifecycleStepStates,
+    };
     await Promise.all(
       step.steps.map(async (step, idx) => {
         if (truthyIdxs[idx]) {
@@ -283,6 +414,7 @@ export async function processWorkflowConditional(
             type: 'workflow.step.run',
             runId,
             data: {
+              ...lifecycleReservation,
               workflowId,
               runId,
               executionPath: executionPath.concat([idx]),
@@ -305,6 +437,7 @@ export async function processWorkflowConditional(
             type: 'workflow.step.end',
             runId,
             data: {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath: executionPath.concat([idx]),

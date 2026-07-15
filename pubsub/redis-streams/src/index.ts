@@ -40,7 +40,10 @@ function isLifecycleTopic(topic: string): boolean {
 function assertLifecycleReplayIdentity(topic: string, event: Event): void {
   if (
     isLifecycleTopic(topic) &&
-    (!Number.isSafeInteger(event.index) || event.index! < 0 || !event.logGeneration || event.logGeneration.length === 0)
+    (!Number.isSafeInteger(event.index) ||
+      event.index! < 0 ||
+      typeof event.logGeneration !== 'string' ||
+      event.logGeneration.length === 0)
   ) {
     throw new TypeError('Workflow lifecycle event payload is missing replay identity');
   }

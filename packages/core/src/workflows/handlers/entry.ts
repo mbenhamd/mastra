@@ -206,6 +206,18 @@ export async function persistStepUpdate(
     };
 
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
+    const authoritativeSnapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+    if (
+      authoritativeSnapshot &&
+      (authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration ||
+        authoritativeSnapshot.status === 'success' ||
+        authoritativeSnapshot.status === 'failed' ||
+        authoritativeSnapshot.status === 'canceled' ||
+        authoritativeSnapshot.status === 'tripwire' ||
+        authoritativeSnapshot.status === 'bailed')
+    ) {
+      return;
+    }
     const snapshotToPersist = engine.options?.pruneSnapshot
       ? engine.options.pruneSnapshot({ snapshot, workflowStatus })
       : snapshot;

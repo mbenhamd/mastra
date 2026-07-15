@@ -21,6 +21,10 @@ export type IndexedLogAppendResult<T> = IndexedLogEntry<T> & {
 };
 
 export type IndexedLogReadResult<T> = {
+  /**
+   * Contiguous entries after the requested cursor. Implementations may return
+   * a bounded page; callers continue until they reach `nextCursor`.
+   */
   entries: IndexedLogEntry<T>[];
   /**
    * Changes whenever a deleted or fully expired log is recreated. An empty

@@ -32,6 +32,9 @@ export async function processWorkflowWaitForEvent(
     type: 'workflow.step.run',
     runId: workflowData.runId,
     data: {
+      executionGeneration: workflowData.executionGeneration,
+      lifecycleResumeAttempt: workflowData.lifecycleResumeAttempt,
+      lifecycleStepStates: workflowData.lifecycleStepStates,
       workflowId: workflowData.workflowId,
       runId: workflowData.runId,
       executionPath,
@@ -51,6 +54,9 @@ export async function processWorkflowSleep(
   {
     workflowId,
     runId,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
     executionPath,
     stepResults,
     activeStepsPath,
@@ -135,6 +141,9 @@ export async function processWorkflowSleep(
         type: 'workflow.step.run',
         runId,
         data: {
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates,
           workflowId,
           runId,
           executionPath: executionPath.slice(0, -1).concat([executionPath[executionPath.length - 1]! + 1]),
@@ -159,6 +168,9 @@ export async function processWorkflowSleepUntil(
   {
     workflowId,
     runId,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
     executionPath,
     stepResults,
     activeStepsPath,
@@ -244,6 +256,9 @@ export async function processWorkflowSleepUntil(
         type: 'workflow.step.run',
         runId,
         data: {
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates,
           workflowId,
           runId,
           executionPath: executionPath.slice(0, -1).concat([executionPath[executionPath.length - 1]! + 1]),

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   createDurableBackgroundTaskCheckStep,
   createDurableLLMExecutionStep,
@@ -58,6 +59,12 @@ export interface InngestDurableAgenticWorkflowOptions {
   inngest: Inngest;
   /** Maximum number of agentic loop iterations */
   maxSteps?: number;
+  /**
+   * Workflow IDs used by the parent agentic loop and its nested execution
+   * workflow. Direct factory callers retain the historical shared IDs when
+   * this option is omitted.
+   */
+  workflowIds?: InngestDurableAgenticWorkflowIds;
 }
 
 /**
@@ -103,8 +110,41 @@ export const InngestDurableStepIds = {
   AGENTIC_LOOP: `${INNGEST_ENGINE_PREFIX}:${DurableStepIds.AGENTIC_LOOP}`,
 } as const;
 
+export interface InngestDurableAgenticWorkflowIds {
+  AGENTIC_EXECUTION: string;
+  AGENTIC_LOOP: string;
+}
+
+/**
+ * Derive collision-safe workflow IDs for one public durable-agent ID.
+ *
+ * Both IDs must share the same owner suffix: the loop is registered as an
+ * Inngest function while the execution workflow is recursively exposed as a
+ * nested function. Changing only the parent would leave nested functions from
+ * different durable agents aliased to the same Inngest function ID.
+ *
+ * The hash input and width are a persisted routing contract. Do not change
+ * them without an explicit migration for in-flight Inngest events and stored
+ * workflow snapshots.
+ */
+export function createInngestDurableAgenticWorkflowIds(agentId: string): InngestDurableAgenticWorkflowIds {
+  if (!agentId) {
+    throw new TypeError('Inngest durable-agent workflow IDs require a non-empty agent ID');
+  }
+
+  const ownerHash = createHash('sha256')
+    .update(`mastra:inngest:durable-agent:v1\0${agentId}`)
+    .digest('hex')
+    .slice(0, 32);
+
+  return {
+    AGENTIC_EXECUTION: `${InngestDurableStepIds.AGENTIC_EXECUTION}:${ownerHash}`,
+    AGENTIC_LOOP: `${InngestDurableStepIds.AGENTIC_LOOP}:${ownerHash}`,
+  };
+}
+
 export function createInngestDurableAgenticWorkflow(options: InngestDurableAgenticWorkflowOptions) {
-  const { inngest, maxSteps = DurableAgentDefaults.MAX_STEPS } = options;
+  const { inngest, maxSteps = DurableAgentDefaults.MAX_STEPS, workflowIds = InngestDurableStepIds } = options;
   const { createWorkflow } = init(inngest);
 
   // Create the LLM execution step - tools and model are resolved from Mastra at runtime
@@ -121,7 +161,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
 
   // Create the single iteration workflow (LLM -> Tool Calls -> Mapping)
   const singleIterationWorkflow = createWorkflow({
-    id: InngestDurableStepIds.AGENTIC_EXECUTION,
+    id: workflowIds.AGENTIC_EXECUTION,
     inputSchema: iterationStateSchema,
     outputSchema: iterationStateSchema,
     options: {
@@ -312,7 +352,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
   // Create the main agentic loop workflow with dowhile
   return (
     createWorkflow({
-      id: InngestDurableStepIds.AGENTIC_LOOP,
+      id: workflowIds.AGENTIC_LOOP,
       inputSchema: durableAgenticInputSchema,
       outputSchema: durableAgenticOutputSchema,
       options: {

@@ -107,7 +107,7 @@ export class StepExecutor extends MastraBase {
       payload: (typeof params.foreachIdx === 'number' ? params.input : inputData) ?? {},
     };
 
-    if (params.resumeData) {
+    if (params.resumeData !== undefined) {
       stepInfo.resumePayload = params.resumeData;
       stepInfo.resumedAt = Date.now();
       // Strip __workflow_meta from suspendPayload when step is resumed

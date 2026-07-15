@@ -23,7 +23,10 @@ export type WorkflowLifecycleExecutionIdentity = {
 export type WorkflowStepLifecycleIdentity = {
   stepId: string;
   stepCallId: string;
-  /** One-based count of actual executions of this step call. */
+  /**
+   * One-based semantic execution attempt for this step call. Broker
+   * redelivery retains the same ordinal and lifecycle identity.
+   */
   stepAttempt: number;
 };
 
@@ -158,6 +161,74 @@ export type WorkflowStepLifecycleState = {
 
 export type WorkflowStepLifecycleStateMap = Record<string, WorkflowStepLifecycleState>;
 
+const lifecycleCleanupTimers = new WeakMap<PubSub, Map<string, ReturnType<typeof setTimeout>>>();
+const MIN_WORKFLOW_LIFECYCLE_CLEANUP_DELAY_MS = 30_000;
+
+function scheduleWorkflowLifecycleTopicCleanup(pubsub: PubSub, topic: string): void {
+  // Exact-replay transports advertise how long reconnects remain valid. Plain
+  // persistent transports do not, but still need a bounded cleanup backstop.
+  // Keep every terminal topic available for at least a short reconnect window.
+  const retentionMs = Math.max(
+    MIN_WORKFLOW_LIFECYCLE_CLEANUP_DELAY_MS,
+    pubsub.indexedReplay?.retentionMs ?? MIN_WORKFLOW_LIFECYCLE_CLEANUP_DELAY_MS,
+  );
+
+  let timers = lifecycleCleanupTimers.get(pubsub);
+  if (!timers) {
+    timers = new Map();
+    lifecycleCleanupTimers.set(pubsub, timers);
+  }
+  const existing = timers.get(topic);
+  if (existing) clearTimeout(existing);
+
+  const deadline = Date.now() + retentionMs;
+  const arm = () => {
+    const remaining = deadline - Date.now();
+    if (remaining > 0) {
+      const timer = setTimeout(arm, Math.min(remaining, 2_147_483_647));
+      timer.unref?.();
+      timers!.set(topic, timer);
+      return;
+    }
+    timers!.delete(topic);
+    if (timers!.size === 0) lifecycleCleanupTimers.delete(pubsub);
+    void pubsub.clearTopic(topic);
+  };
+  arm();
+}
+
+/**
+ * Reconcile broker-carried step state with the authoritative persisted state.
+ *
+ * Broker payloads are cloned so dispatch cannot mutate an event object that a
+ * transport may redeliver by reference. For the same execution generation,
+ * persisted attempts are monotonic and conflicting deterministic call ids are
+ * rejected instead of silently replacing projection identity.
+ */
+export function mergeWorkflowStepLifecycleStates(
+  incoming: WorkflowStepLifecycleStateMap | undefined,
+  persisted: WorkflowStepLifecycleStateMap | undefined,
+): WorkflowStepLifecycleStateMap {
+  const merged: WorkflowStepLifecycleStateMap = {};
+
+  for (const [key, state] of Object.entries(persisted ?? {})) {
+    merged[key] = { ...state };
+  }
+  for (const [key, state] of Object.entries(incoming ?? {})) {
+    const retained = merged[key];
+    if (!retained) {
+      merged[key] = { ...state };
+      continue;
+    }
+    if (retained.stepCallId !== state.stepCallId) {
+      throw new Error(`Workflow lifecycle state ${key} has conflicting step-call identity`);
+    }
+    retained.stepAttempt = Math.max(retained.stepAttempt, state.stepAttempt);
+  }
+
+  return merged;
+}
+
 export function createWorkflowExecutionGeneration(): WorkflowExecutionGeneration {
   return randomUUID();
 }
@@ -214,8 +285,9 @@ function lifecycleCoordinateKey(params: {
  * Resolve stable step-call identity for one execution coordinate.
  *
  * The digest is deterministic so broker redelivery and process restart do not
- * mint a different call id. The mutable state map retains the one-based actual
- * attempt count across retry and suspend/resume transitions.
+ * mint a different call id. The mutable state map retains the one-based
+ * semantic attempt count across retry and suspend/resume transitions; broker
+ * redelivery of that attempt does not mint a second lifecycle identity.
  */
 export function getOrCreateWorkflowStepLifecycleState(params: {
   workflowId: string;
@@ -260,11 +332,15 @@ export async function publishWorkflowLifecycleEvent<TEvent extends WorkflowLifec
     executionGeneration: params.executionGeneration,
     event: params.event,
   };
-  await params.pubsub.publish(getWorkflowLifecycleTopic(params), {
+  const id = getWorkflowLifecycleEventId(record);
+  const topic = getWorkflowLifecycleTopic(params);
+  await params.pubsub.publish(topic, {
     type: 'workflow.lifecycle',
+    id,
     runId: params.runId,
     data: record,
   });
+  if (params.event.type === 'workflow.finished') scheduleWorkflowLifecycleTopicCleanup(params.pubsub, topic);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -338,9 +414,17 @@ export function isWorkflowLifecycleEvent(value: unknown): value is WorkflowLifec
 /** Stable projector key across transport redelivery and transition republish. */
 export function getWorkflowLifecycleSemanticKey(record: WorkflowLifecycleRecord): string {
   const base = JSON.stringify([record.workflowId, record.runId, record.executionGeneration]);
+  const outcome = 'status' in record.event ? `:${record.event.status}` : '';
   return 'stepCallId' in record.event
-    ? `${base}:${record.event.type}:${record.event.stepCallId}:${record.event.stepAttempt}`
-    : `${base}:${record.event.type}:${record.event.resumeAttempt}`;
+    ? `${base}:${record.event.type}:${record.event.stepCallId}:${record.event.stepAttempt}${outcome}`
+    : `${base}:${record.event.type}:${record.event.resumeAttempt}${outcome}`;
+}
+
+/** Stable transport identity for one semantic lifecycle transition. */
+export function getWorkflowLifecycleEventId(record: WorkflowLifecycleRecord): string {
+  const digest = createHash('sha256').update('mastra.workflow.lifecycle-event.v1\0', 'utf8');
+  digest.update(getWorkflowLifecycleSemanticKey(record), 'utf8');
+  return `wfle:v1:${digest.digest('hex')}`;
 }
 
 export class WorkflowLifecycleRecordError extends Error {

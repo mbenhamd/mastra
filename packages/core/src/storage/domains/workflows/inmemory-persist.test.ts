@@ -74,4 +74,37 @@ describe('WorkflowsInMemory persistWorkflowSnapshot', () => {
       timestamp: Date.now(),
     });
   });
+
+  it('preserves status when applying a metadata-only state patch', async () => {
+    const store = new InMemoryStore();
+    const workflows = (await store.getStore('workflows'))!;
+    const workflowName = 'metadata-only-patch';
+    const runId = 'run-suspended';
+    await workflows.persistWorkflowSnapshot({
+      workflowName,
+      runId,
+      snapshot: makeSnapshot(runId, 'suspended'),
+    });
+
+    await workflows.updateWorkflowState({
+      workflowName,
+      runId,
+      opts: {
+        executionGeneration: 'wfeg:test',
+        lifecycleResumeAttempt: 1,
+        lifecycleStepStates: {
+          step: { stepCallId: 'wfsc:test', stepAttempt: 2 },
+        },
+      },
+    });
+
+    await expect(workflows.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+      status: 'suspended',
+      executionGeneration: 'wfeg:test',
+      lifecycleResumeAttempt: 1,
+      lifecycleStepStates: {
+        step: { stepCallId: 'wfsc:test', stepAttempt: 2 },
+      },
+    });
+  });
 });

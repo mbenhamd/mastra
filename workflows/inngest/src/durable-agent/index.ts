@@ -57,5 +57,7 @@ export {
 // Workflow factory (internal, used by createInngestAgent)
 export {
   createInngestDurableAgenticWorkflow,
+  createInngestDurableAgenticWorkflowIds,
   type InngestDurableAgenticWorkflowOptions,
+  type InngestDurableAgenticWorkflowIds,
 } from './create-inngest-agentic-workflow';

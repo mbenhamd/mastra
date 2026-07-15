@@ -19,6 +19,9 @@ function makeStartEvent(workflowId: string, runId: string, deliveryAttempt?: num
     data: {
       workflowId,
       runId,
+      executionGeneration: `retry-budget-generation:${workflowId}:${runId}`,
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
       executionPath: [0],
       stepResults: {},
       prevResult: { status: 'success', output: {} },
@@ -55,7 +58,13 @@ async function persistRun(
   await workflowsStore?.persistWorkflowSnapshot({
     workflowName: workflowId,
     runId,
-    snapshot: { ...createEmptyWorkflowSnapshot(runId), status },
+    snapshot: {
+      ...createEmptyWorkflowSnapshot(runId),
+      status,
+      executionGeneration: `retry-budget-generation:${workflowId}:${runId}`,
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+    },
   });
 }
 

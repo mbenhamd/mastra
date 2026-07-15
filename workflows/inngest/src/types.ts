@@ -1,3 +1,4 @@
+import type { PubSub } from '@mastra/core/events';
 import type { InferPublicSchemaInput, PublicSchema } from '@mastra/core/schema';
 import type {
   CreateWorkflowParams,
@@ -24,6 +25,8 @@ export type InngestFlowCronConfig<TInputData, TInitialState> = {
   initialState?: TInitialState;
 };
 
+export type InngestWorkflowPubSubFactory = (defaultPubsub: PubSub) => PubSub;
+
 // Union type for Inngest workflows with flow control
 export type InngestWorkflowConfig<
   TWorkflowId extends string,
@@ -36,7 +39,16 @@ export type InngestWorkflowConfig<
 > = Omit<WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>, 'inputSchema'> & {
   inputSchema: PublicSchema<TInput, TRawInput>;
 } & InngestFlowControlConfig &
-  InngestFlowCronConfig<TRawInput, TState>;
+  InngestFlowCronConfig<TRawInput, TState> & {
+    /**
+     * Configure the transport used by both run handles and remote Inngest
+     * function replicas. Plain transports are automatically wrapped with exact
+     * indexed replay. A returned `CachingPubSub` must already advertise
+     * `indexedReplay`; otherwise configuration fails closed instead of adding a
+     * second cache wrapper with ambiguous ownership.
+     */
+    pubsubFactory?: InngestWorkflowPubSubFactory;
+  };
 
 /**
  * Inngest-specific durable run options stored alongside the native workflow snapshot.
@@ -61,7 +73,16 @@ export type CreateInngestWorkflowParams<
   TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
 > = CreateWorkflowParams<TWorkflowId, TStateSchema, TInputSchema, TOutputSchema, TSteps, TRequestContextSchema> &
   InngestFlowControlConfig &
-  InngestFlowCronConfig<InferPublicSchemaInput<TInputSchema>, InferSchemaOutput<TStateSchema>>;
+  InngestFlowCronConfig<InferPublicSchemaInput<TInputSchema>, InferSchemaOutput<TStateSchema>> & {
+    /**
+     * Configure the transport used by both run handles and remote Inngest
+     * function replicas. Plain transports are automatically wrapped with exact
+     * indexed replay. A returned `CachingPubSub` must already advertise
+     * `indexedReplay`; otherwise configuration fails closed instead of adding a
+     * second cache wrapper with ambiguous ownership.
+     */
+    pubsubFactory?: InngestWorkflowPubSubFactory;
+  };
 
 // Compile-time compatibility assertion
 export type _AssertInngestCompatibility =

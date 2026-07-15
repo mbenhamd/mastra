@@ -95,18 +95,27 @@ function lifecycleChannel(topic: string): string {
  * @returns { runId, topicType } or null if not a recognized format
  */
 function parseTopic(topic: string, workflowId: string): TopicRoute | null {
-  const lifecyclePrefix = `workflow.lifecycle.v1.${workflowId}.`;
+  const lifecyclePrefix = 'workflow.lifecycle.v1.';
   if (topic.startsWith(lifecyclePrefix)) {
-    const runAndGeneration = topic.slice(lifecyclePrefix.length);
-    const separator = runAndGeneration.lastIndexOf('.');
-    if (separator > 0 && separator < runAndGeneration.length - 1) {
-      return {
-        runId: runAndGeneration.slice(0, separator),
-        topicType: 'lifecycle',
-        channel: lifecycleChannel(topic),
-        inngestTopic: 'lifecycle',
-        requireReplayIdentity: true,
-      };
+    const segments = topic.slice(lifecyclePrefix.length).split('.');
+    if (segments.length === 3 && segments.every(Boolean)) {
+      try {
+        const [encodedWorkflowId, encodedRunId, encodedExecutionGeneration] = segments as [string, string, string];
+        const decodedWorkflowId = decodeURIComponent(encodedWorkflowId);
+        const runId = decodeURIComponent(encodedRunId);
+        const executionGeneration = decodeURIComponent(encodedExecutionGeneration);
+        if (decodedWorkflowId === workflowId && runId.length > 0 && executionGeneration.length > 0) {
+          return {
+            runId,
+            topicType: 'lifecycle',
+            channel: lifecycleChannel(topic),
+            inngestTopic: 'lifecycle',
+            requireReplayIdentity: true,
+          };
+        }
+      } catch {
+        // Malformed URI encoding is not a canonical lifecycle topic.
+      }
     }
   }
 
@@ -161,8 +170,9 @@ export class InngestPubSub extends PubSub {
   private subscriptions: Map<
     string,
     {
-      unsubscribe: () => void;
+      unsubscribe?: () => void;
       callbacks: Set<EventCallback>;
+      ready: Promise<void>;
     }
   > = new Map();
 
@@ -244,51 +254,71 @@ export class InngestPubSub extends PubSub {
 
     const { runId, inngestTopic, channel, requireReplayIdentity } = parsed;
 
-    // Check if we already have a subscription for this topic
-    if (this.subscriptions.has(topic)) {
-      this.subscriptions.get(topic)!.callbacks.add(cb);
+    // Register the topic before awaiting the websocket. Concurrent subscribers
+    // then share one initialization promise instead of opening two streams and
+    // leaking whichever stream loses the final Map write.
+    const existing = this.subscriptions.get(topic);
+    if (existing) {
+      existing.callbacks.add(cb);
+      await existing.ready;
       return;
     }
 
     const callbacks = new Set<EventCallback>([cb]);
+    const subscription = {
+      callbacks,
+      ready: Promise.resolve(),
+    } as {
+      unsubscribe?: () => void;
+      callbacks: Set<EventCallback>;
+      ready: Promise<void>;
+    };
+    this.subscriptions.set(topic, subscription);
 
     // Await the subscribe call to ensure the WebSocket connection is established
     // before we consider the subscription "ready". This prevents race conditions
     // where the workflow triggers before the subscription can receive events.
-    const stream = await this.realtimeSubscribe(
-      {
-        channel,
-        topics: [inngestTopic],
-        app: this.inngest,
-      },
-      async (message: any) => {
-        const event = this.toEvent(message, requireReplayIdentity);
-        if (event.runId !== runId) {
-          throw new TypeError(`Inngest event runId ${event.runId} does not match topic runId ${runId}`);
-        }
-
-        // Inngest Realtime does not expose per-message ack/nack handles. Await
-        // every callback and contain rejection here so async subscriber errors
-        // never become unhandled rejections in the websocket listener.
-        const results = await Promise.allSettled([...callbacks].map(callback => callback(event)));
-        for (const result of results) {
-          if (result.status === 'rejected') {
-            console.error('InngestPubSub subscriber error:', result.reason);
+    subscription.ready = (async () => {
+      const stream = await this.realtimeSubscribe(
+        {
+          channel,
+          topics: [inngestTopic],
+          app: this.inngest,
+        },
+        async (message: any) => {
+          const event = this.toEvent(message, requireReplayIdentity);
+          if (event.runId !== runId) {
+            throw new TypeError(`Inngest event runId ${event.runId} does not match topic runId ${runId}`);
           }
-        }
-      },
-    );
 
-    this.subscriptions.set(topic, {
-      unsubscribe: () => {
+          // Inngest Realtime does not expose per-message ack/nack handles. Await
+          // every callback and contain rejection here so async subscriber errors
+          // never become unhandled rejections in the websocket listener.
+          const results = await Promise.allSettled([...callbacks].map(callback => callback(event)));
+          for (const result of results) {
+            if (result.status === 'rejected') {
+              console.error('InngestPubSub subscriber error:', result.reason);
+            }
+          }
+        },
+      );
+      subscription.unsubscribe = () => {
         try {
           void stream.cancel();
         } catch (err) {
           console.error('InngestPubSub unsubscribe error:', err);
         }
-      },
-      callbacks,
-    });
+      };
+    })();
+
+    try {
+      await subscription.ready;
+    } catch (error) {
+      if (this.subscriptions.get(topic) === subscription) {
+        this.subscriptions.delete(topic);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -305,8 +335,12 @@ export class InngestPubSub extends PubSub {
 
     // If no more callbacks, cancel the subscription
     if (sub.callbacks.size === 0) {
-      sub.unsubscribe();
       this.subscriptions.delete(topic);
+      try {
+        await sub.ready;
+      } finally {
+        sub.unsubscribe?.();
+      }
     }
   }
 
@@ -321,10 +355,12 @@ export class InngestPubSub extends PubSub {
    * Clean up all subscriptions during graceful shutdown.
    */
   async close(): Promise<void> {
-    for (const [, sub] of this.subscriptions) {
-      sub.unsubscribe();
-    }
+    const subscriptions = [...this.subscriptions.values()];
     this.subscriptions.clear();
+    await Promise.allSettled(subscriptions.map(sub => sub.ready));
+    for (const sub of subscriptions) {
+      sub.unsubscribe?.();
+    }
   }
 
   private toEvent(message: unknown, requireReplayIdentity: boolean): Event {

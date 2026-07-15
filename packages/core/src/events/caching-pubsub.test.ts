@@ -571,12 +571,12 @@ describe('CachingPubSub', () => {
   });
 
   describe('flush', () => {
-    it('should delegate flush to inner pubsub', async () => {
+    it('flushes the inner transport twice to confirm a stable drain boundary', async () => {
       const flushSpy = vi.spyOn(innerPubsub, 'flush');
 
       await cachingPubsub.flush();
 
-      expect(flushSpy).toHaveBeenCalledTimes(1);
+      expect(flushSpy).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -1148,6 +1148,129 @@ describe('CachingPubSub exact indexed replay', () => {
     ]);
   });
 
+  it('re-reads retention after a live append races an in-flight callback', async () => {
+    const exact = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), { indexedReplay });
+    const received: number[] = [];
+    const activeError = vi.fn();
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+
+    await exact.subscribeFromOffset(
+      'append-during-callback-topic',
+      0,
+      async event => {
+        received.push(event.index!);
+        if (event.index === 0) await firstBlocked;
+      },
+      { onError: activeError },
+    );
+
+    await exact.publish('append-during-callback-topic', { type: 'zero', runId: 'run', data: {} });
+    await vi.waitFor(() => expect(received).toEqual([0]));
+    await exact.publish('append-during-callback-topic', { type: 'one', runId: 'run', data: {} });
+    releaseFirst();
+
+    await vi.waitFor(() => expect(received).toEqual([0, 1]));
+    expect(activeError).not.toHaveBeenCalled();
+  });
+
+  it('drains bounded backend pages through the retained log head', async () => {
+    const cache = new InMemoryServerCache();
+    const readPage = cache.readIndexedLogEntries.bind(cache);
+    vi.spyOn(cache, 'readIndexedLogEntries').mockImplementation(async (...args: any[]) => {
+      const result = await (readPage as any)(...args);
+      return { ...result, entries: result.entries.slice(0, 3) };
+    });
+    const exact = new CachingPubSub(new EventEmitterPubSub(), cache, { indexedReplay });
+    for (let index = 0; index < 11; index++) {
+      await exact.publish('paged-retention-topic', { type: `event-${index}`, runId: 'run', data: {} });
+    }
+
+    const history = await exact.getHistory('paged-retention-topic');
+    expect(history.map(event => event.index)).toEqual(Array.from({ length: 11 }, (_, index) => index));
+    expect(cache.readIndexedLogEntries).toHaveBeenCalledTimes(4);
+    vi.mocked(cache.readIndexedLogEntries).mockClear();
+
+    const cursors: number[] = [];
+    await exact.subscribeFromOffset('paged-retention-topic', 0, event => {
+      cursors.push(event.index!);
+    });
+
+    expect(cursors).toEqual(Array.from({ length: 11 }, (_, index) => index));
+    expect(cache.readIndexedLogEntries).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not chase a moving retained head while reading paged history', async () => {
+    const cache = new InMemoryServerCache();
+    const exact = new CachingPubSub(new EventEmitterPubSub(), cache, { indexedReplay });
+    const topic = 'moving-history-head-topic';
+    for (let index = 0; index < 5; index++) {
+      await exact.publish(topic, { type: `event-${index}`, runId: 'run', data: {} });
+    }
+    const readPage = cache.readIndexedLogEntries.bind(cache);
+    let appended = 0;
+    vi.spyOn(cache, 'readIndexedLogEntries').mockImplementation(async (...args: any[]) => {
+      if (appended >= 10) throw new Error('history chased a continuously moving head');
+      const result = await (readPage as any)(...args);
+      await cache.appendIndexedLogEntry(
+        args[0],
+        {
+          type: `late-${appended}`,
+          id: `late-history-${appended}`,
+          runId: 'run',
+          createdAt: new Date('2026-07-15T00:00:00.000Z'),
+          data: {},
+        },
+        args[2],
+      );
+      appended += 1;
+      return { ...result, entries: result.entries.slice(0, 2) };
+    });
+
+    const history = await exact.getHistory(topic);
+
+    expect(history.map(event => event.index)).toEqual([0, 1, 2, 3, 4]);
+    expect(appended).toBe(3);
+  });
+
+  it('does not chase a moving retained head during paged subscription bootstrap', async () => {
+    const cache = new InMemoryServerCache();
+    const exact = new CachingPubSub(new EventEmitterPubSub(), cache, { indexedReplay });
+    const topic = 'moving-bootstrap-head-topic';
+    for (let index = 0; index < 5; index++) {
+      await exact.publish(topic, { type: `event-${index}`, runId: 'run', data: {} });
+    }
+    const readPage = cache.readIndexedLogEntries.bind(cache);
+    let appended = 0;
+    vi.spyOn(cache, 'readIndexedLogEntries').mockImplementation(async (...args: any[]) => {
+      if (appended >= 10) throw new Error('bootstrap chased a continuously moving head');
+      const result = await (readPage as any)(...args);
+      await cache.appendIndexedLogEntry(
+        args[0],
+        {
+          type: `late-${appended}`,
+          id: `late-bootstrap-${appended}`,
+          runId: 'run',
+          createdAt: new Date('2026-07-15T00:00:00.000Z'),
+          data: {},
+        },
+        args[2],
+      );
+      appended += 1;
+      return { ...result, entries: result.entries.slice(0, 2) };
+    });
+    const received: number[] = [];
+
+    await exact.subscribeFromOffset(topic, 0, event => {
+      received.push(event.index!);
+    });
+
+    expect(received).toEqual([0, 1, 2, 3, 4]);
+    expect(appended).toBe(3);
+  });
+
   it('fills a live reorder gap from retained history without prematurely acknowledging the lower cursor', async () => {
     const inner = new ManualPubSub();
     const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
@@ -1215,6 +1338,98 @@ describe('CachingPubSub exact indexed replay', () => {
     ]);
     expect(acknowledgeLive).toHaveBeenCalledTimes(1);
     expect(negativeAcknowledgeLive).not.toHaveBeenCalled();
+  });
+
+  it('does not flush while an exact lifecycle callback is still in flight', async () => {
+    const inner = new ManualPubSub();
+    const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
+    let release!: () => void;
+    let markStarted!: () => void;
+    const blocked = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const started = new Promise<void>(resolve => {
+      markStarted = resolve;
+    });
+    await exact.subscribeFromOffset('flush-boundary-topic', 0, async (_event, ack) => {
+      markStarted();
+      await blocked;
+      await ack?.();
+    });
+    await exact.publish('flush-boundary-topic', { type: 'blocked', runId: 'run', data: {} });
+    const delivery = inner.deliver(
+      inner.published[0]!,
+      vi.fn(async () => {}),
+    );
+    await started;
+
+    let flushed = false;
+    const flush = exact.flush().then(() => {
+      flushed = true;
+    });
+    await Promise.resolve();
+    expect(flushed).toBe(false);
+
+    release();
+    await Promise.all([delivery, flush]);
+    expect(flushed).toBe(true);
+  });
+
+  it('flushes a nack redelivery scheduled after the first inner flush', async () => {
+    class RedeliveringPubSub extends ManualPubSub {
+      private pendingRedeliveries: Array<() => Promise<void>> = [];
+
+      scheduleRedelivery(event: Event, ack: () => Promise<void>): () => Promise<void> {
+        return async () => {
+          this.pendingRedeliveries.push(() =>
+            this.deliver({ ...event, deliveryAttempt: (event.deliveryAttempt ?? 1) + 1 }, ack, async () => {}),
+          );
+        };
+      }
+
+      override async flush(): Promise<void> {
+        while (this.pendingRedeliveries.length > 0) {
+          const pending = this.pendingRedeliveries.splice(0);
+          await Promise.all(pending.map(redeliver => redeliver()));
+        }
+      }
+    }
+
+    const inner = new RedeliveringPubSub();
+    const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
+    let releaseFirst!: () => void;
+    let markFirstEntered!: () => void;
+    const firstBlocked = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    const firstEntered = new Promise<void>(resolve => {
+      markFirstEntered = resolve;
+    });
+    const attempts: number[] = [];
+    const redeliveryAck = vi.fn(async () => {});
+    await exact.subscribeFromOffset('flush-redelivery-topic', 0, async (event, ack, nack) => {
+      attempts.push(event.deliveryAttempt ?? 1);
+      if ((event.deliveryAttempt ?? 1) === 1) {
+        markFirstEntered();
+        await firstBlocked;
+        await nack?.();
+        return;
+      }
+      await ack?.();
+    });
+    await exact.publish('flush-redelivery-topic', { type: 'retry-me', runId: 'run', data: {} });
+    const retained = inner.published[0]!;
+    const firstDelivery = inner
+      .deliver(retained, async () => {}, inner.scheduleRedelivery(retained, redeliveryAck))
+      .catch(() => {});
+    await firstEntered;
+
+    const flush = exact.flush();
+    releaseFirst();
+    await Promise.all([firstDelivery, flush]);
+
+    expect(attempts).toEqual([1, 2]);
+    expect(redeliveryAck).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed before live publish when atomic retention fails', async () => {

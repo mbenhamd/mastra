@@ -9,11 +9,21 @@ import { WorkflowEventProcessor } from '.';
 
 class TestWorkflowEventProcessor extends WorkflowEventProcessor {
   propagateSuspend(args: ProcessorArgs) {
-    return this.processWorkflowSuspend(args);
+    return this.processWorkflowSuspend({
+      executionGeneration: `resume-label-generation:${args.workflowId}:${args.runId}`,
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+      ...args,
+    });
   }
 
   aggregateBranches(args: any) {
-    return this.aggregateBranchResults(args);
+    return this.aggregateBranchResults({
+      executionGeneration: `resume-label-generation:${args.workflowId}:${args.runId}`,
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+      ...args,
+    });
   }
 }
 
@@ -56,6 +66,9 @@ function createArgs(resumeLabels?: Record<string, { stepId: string; foreachIndex
     parentWorkflow: {
       workflowId: 'outer-workflow',
       runId: 'outer-run',
+      executionGeneration: 'outer-execution-generation',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
       executionPath: [1],
       resume: false,
       stepResults: {},
@@ -70,6 +83,30 @@ function createArgs(resumeLabels?: Record<string, { stepId: string; foreachIndex
 }
 
 describe('WorkflowEventProcessor nested resume-label propagation', () => {
+  it('publishes the complete multi-branch suspension set', async () => {
+    const { processor, publish } = createProcessor();
+
+    await processor.propagateSuspend({
+      ...createArgs(),
+      parentWorkflow: undefined,
+      suspendedStepIds: ['approval-a', 'approval-b'],
+    });
+
+    expect(publish).toHaveBeenCalledWith(
+      expect.stringMatching(/^workflow\.lifecycle\.v1\./),
+      expect.objectContaining({
+        type: 'workflow.lifecycle',
+        data: expect.objectContaining({
+          event: {
+            type: 'workflow.suspended',
+            resumeAttempt: 0,
+            suspendedStepIds: ['approval-a', 'approval-b'],
+          },
+        }),
+      }),
+    );
+  });
+
   it('maps every nested label to the parent workflow step without storage', async () => {
     const { processor, publish } = createProcessor();
 
