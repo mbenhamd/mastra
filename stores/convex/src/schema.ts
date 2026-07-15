@@ -429,9 +429,17 @@ export function defineMastraNativeVectorTable({
 export const mastraCacheTable = defineTable({
   key: v.string(),
   keyPrefix: v.string(),
-  kind: v.union(v.literal('value'), v.literal('list'), v.literal('counter'), v.literal('deleted')),
+  kind: v.union(
+    v.literal('value'),
+    v.literal('list'),
+    v.literal('counter'),
+    v.literal('indexed-log'),
+    v.literal('deleted'),
+  ),
   value: v.optional(v.string()),
   counter: v.optional(v.number()),
+  retainedCount: v.optional(v.number()),
+  logGeneration: v.optional(v.string()),
   expiresAt: v.union(v.number(), v.null()),
 })
   .index('by_key', ['key'])
@@ -445,6 +453,7 @@ export const mastraCacheListItemsTable = defineTable({
   key: v.string(),
   keyPrefix: v.string(),
   index: v.number(),
+  storedAt: v.optional(v.number()),
   value: v.string(),
 })
   .index('by_key_prefix', ['keyPrefix'])

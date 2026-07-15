@@ -169,9 +169,106 @@ describe.sequential('GoogleCloudPubSub group support', () => {
         await raw.close();
       }
     });
+
+    it('preserves caller-assigned identity, timestamp, and cursor across the broker', async () => {
+      const pubsub = createPubSub();
+      const topic = uniqueTopic();
+      const collected: Event[] = [];
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await pubsub.subscribe(topic, (event, ack) => {
+        collected.push(event);
+        void ack?.();
+      });
+      await pubsub.publish(topic, {
+        ...makeEvent({ type: 'identified' }),
+        id: 'stable-event-id',
+        createdAt,
+        index: 12,
+      });
+
+      await waitForMessages(1, collected, 5000);
+      expect(collected[0]).toMatchObject({ id: 'stable-event-id', createdAt, index: 12 });
+    });
+
+    it('rejects lifecycle publishes without complete replay identity', async () => {
+      const pubsub = createPubSub();
+      const topic = 'workflow.lifecycle.v1.research-workflow.run-1.execution-1';
+
+      await expect(pubsub.publish(topic, makeEvent({ type: 'workflow-start', runId: 'run-1' }))).rejects.toThrow(
+        'missing replay identity',
+      );
+    });
+
+    it('isolates logical workflow run topics that share one normalized broker topic', async () => {
+      const pubsub = createPubSub();
+      const runA = `run-a-${Date.now()}-${topicCounter++}`;
+      const runB = `run-b-${Date.now()}-${topicCounter++}`;
+      const topicA = `workflow.events.v2.${runA}`;
+      const topicB = `workflow.events.v2.${runB}`;
+      const collectedA: Event[] = [];
+      const collectedB: Event[] = [];
+
+      await pubsub.subscribe(topicA, (event, ack) => {
+        collectedA.push(event);
+        void ack?.();
+      });
+      await pubsub.subscribe(topicB, (event, ack) => {
+        collectedB.push(event);
+        void ack?.();
+      });
+
+      await pubsub.publish(topicA, makeEvent({ type: 'run-a', runId: runA }));
+      await pubsub.publish(topicB, makeEvent({ type: 'run-b', runId: runB }));
+
+      await Promise.all([waitForMessages(1, collectedA, 5000), waitForMessages(1, collectedB, 5000)]);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(collectedA.map(event => event.type)).toEqual(['run-a']);
+      expect(collectedB.map(event => event.type)).toEqual(['run-b']);
+    });
+
+    it('nacks an async callback rejection and redelivers the same logical event', async () => {
+      const pubsub = createPubSub();
+      const runId = `run-reject-${Date.now()}-${topicCounter++}`;
+      const topic = `workflow.events.v2.${runId}`;
+      const collected: Event[] = [];
+
+      await pubsub.subscribe(topic, async (event, ack) => {
+        collected.push(event);
+        if (collected.length === 1) {
+          throw new Error('retry this delivery');
+        }
+        await ack?.();
+      });
+      await pubsub.publish(topic, {
+        ...makeEvent({ type: 'async-retry', runId }),
+        id: 'stable-retry-id',
+        createdAt: new Date('2026-07-15T10:00:00.000Z'),
+        index: 18,
+      });
+
+      await waitForMessages(2, collected, 10_000);
+      expect(collected).toHaveLength(2);
+      expect(collected.map(event => event.id)).toEqual(['stable-retry-id', 'stable-retry-id']);
+      expect(collected.map(event => event.index)).toEqual([18, 18]);
+      expect(collected[1]!.deliveryAttempt).toBeGreaterThanOrEqual(2);
+    });
   });
 
   describe('group (competing consumers)', () => {
+    it('keeps hashed lifecycle subscription resources within Google naming limits', () => {
+      const pubsub = createPubSub();
+      const logicalTopic = `workflow.lifecycle.v1.${'workflow-'.repeat(20)}run.execution`;
+      const subscriptionName = pubsub.getSubscriptionName(
+        'workflow.lifecycle.v1',
+        `workers/${'long-group-'.repeat(40)}`,
+        logicalTopic,
+      );
+
+      expect(subscriptionName.length).toBeLessThanOrEqual(255);
+      expect(subscriptionName).toMatch(/^[A-Za-z][A-Za-z0-9\-._~+%]*$/);
+    });
+
     it('delivers each message exactly once via shared group subscription', async () => {
       // In a single process, two PubSub instances sharing a group subscription
       // means both register callbacks on the same underlying subscription.
@@ -283,6 +380,61 @@ describe.sequential('GoogleCloudPubSub group support', () => {
       expect(collected.length).toBe(1);
       expect(collected[0]!.type).toBe('unique-msg');
     });
+
+    it('keeps two logical runs isolated across instances in the same group', async () => {
+      const runAConsumer = createPubSub();
+      const runBConsumer = createPubSub();
+      const publisher = createPubSub();
+      const runA = `group-run-a-${Date.now()}-${topicCounter++}`;
+      const runB = `group-run-b-${Date.now()}-${topicCounter++}`;
+      const topicA = `workflow.lifecycle.v1.research-workflow.${runA}.execution-a`;
+      const topicB = `workflow.lifecycle.v1.research-workflow.${runB}.execution-b`;
+      const collectedA: Event[] = [];
+      const collectedB: Event[] = [];
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await runAConsumer.subscribe(
+        topicA,
+        (event, ack) => {
+          collectedA.push(event);
+          void ack?.();
+        },
+        { group: 'logical-run-workers' },
+      );
+      await runBConsumer.subscribe(
+        topicB,
+        (event, ack) => {
+          collectedB.push(event);
+          void ack?.();
+        },
+        { group: 'logical-run-workers' },
+      );
+
+      await publisher.publish(topicA, {
+        ...makeEvent({ type: 'run-a-only', runId: runA }),
+        id: 'lifecycle-a',
+        createdAt,
+        index: 4,
+        logGeneration: 'log-a',
+      });
+      await publisher.publish(topicB, {
+        ...makeEvent({ type: 'run-b-only', runId: runB }),
+        id: 'lifecycle-b',
+        createdAt,
+        index: 9,
+        logGeneration: 'log-b',
+      });
+
+      await Promise.all([waitForMessages(1, collectedA, 10_000), waitForMessages(1, collectedB, 10_000)]);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(collectedA.map(event => event.type)).toEqual(['run-a-only']);
+      expect(collectedB.map(event => event.type)).toEqual(['run-b-only']);
+      expect(collectedA[0]).toMatchObject({ id: 'lifecycle-a', createdAt, index: 4, logGeneration: 'log-a' });
+      expect(collectedB[0]).toMatchObject({ id: 'lifecycle-b', createdAt, index: 9, logGeneration: 'log-b' });
+      expect(runAConsumer.getSubscriptionName('workflow.lifecycle.v1', 'logical-run-workers', topicA)).not.toBe(
+        runBConsumer.getSubscriptionName('workflow.lifecycle.v1', 'logical-run-workers', topicB),
+      );
+    });
   });
 
   describe('localOnly publish', () => {
@@ -312,6 +464,30 @@ describe.sequential('GoogleCloudPubSub group support', () => {
       const delivered = collected[0]!.data.holder as Holder;
       expect(delivered).toBe(holder);
       expect(delivered.describe()).toBe('holder(alpha)');
+    });
+
+    it('preserves caller-assigned identity for local-only delivery', async () => {
+      const pubsub = createPubSub();
+      const topic = uniqueTopic();
+      const collected: Event[] = [];
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await pubsub.subscribe(topic, event => {
+        collected.push(event);
+      });
+      await pubsub.publish(
+        topic,
+        {
+          ...makeEvent({ type: 'local-identified' }),
+          id: 'stable-local-id',
+          createdAt,
+          index: 4,
+        },
+        { localOnly: true },
+      );
+
+      await waitForMessages(1, collected, 1000);
+      expect(collected[0]).toMatchObject({ id: 'stable-local-id', createdAt, index: 4 });
     });
 
     it('does not leak local-only events to other instances sharing the same topic', async () => {

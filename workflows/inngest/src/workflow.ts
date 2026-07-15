@@ -224,6 +224,8 @@ export class InngestWorkflow<
       runId: runIdToUse,
     })) as InngestWorkflowRunState | null | undefined;
     const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
+    const defaultPubsub = new InngestPubSub(this.inngest, this.id);
+    const pubsub = this.#pubsubFactory?.(defaultPubsub) ?? defaultPubsub;
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
@@ -245,6 +247,7 @@ export class InngestWorkflow<
         stateSchema: this.stateSchema,
         requestContextSchema: this.requestContextSchema,
         disableScorers: persistedDisableScorers ?? options?.disableScorers,
+        pubsub,
       },
       this.inngest,
     );

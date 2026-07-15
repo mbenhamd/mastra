@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { InMemoryServerCache } from '../../../cache/inmemory';
+import { CachingPubSub } from '../../../events/caching-pubsub';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import type { PubSub } from '../../../events/pubsub';
 import { Mastra } from '../../../mastra';
 import { MockStore } from '../../../storage/mock';
 import { WorkflowEventProcessor } from './index';
@@ -25,8 +28,7 @@ async function persistRunStatus(mastra: Mastra, status: string) {
   });
 }
 
-function setup(topicCleanupDelayMs?: number) {
-  const pubsub = new EventEmitterPubSub();
+function setup(topicCleanupDelayMs?: number, pubsub: PubSub = new EventEmitterPubSub()) {
   const mastra = new Mastra({
     logger: false,
     storage: new MockStore(),
@@ -117,6 +119,26 @@ describe('WorkflowEventProcessor per-run topic cleanup', () => {
     expect(clearTopicSpy).not.toHaveBeenCalled();
 
     await mastra.shutdown();
+  });
+
+  it('does not clear exact replay history before its declared retention horizon', async () => {
+    vi.useFakeTimers();
+    try {
+      const pubsub = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+        indexedReplay: { retentionMs: 100, maxEvents: 100 },
+      });
+      const { mastra, processor, clearTopicSpy } = setup(10, pubsub);
+
+      await processor.callProcessWorkflowEnd({ ...baseArgs });
+      await vi.advanceTimersByTimeAsync(99);
+      expect(clearTopicSpy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(clearTopicSpy).toHaveBeenCalledWith('workflow.events.v2.run-1');
+      await mastra.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('skips deletion when the run is active again at fire time (cross-process restart)', async () => {

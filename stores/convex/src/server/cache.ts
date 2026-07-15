@@ -8,7 +8,7 @@ const CACHE_TABLE = 'mastra_cache';
 const CACHE_LIST_TABLE = 'mastra_cache_list_items';
 const CACHE_MUTATION_BATCH_SIZE = 25;
 
-type CacheKind = 'value' | 'list' | 'counter' | 'deleted';
+type CacheKind = 'value' | 'list' | 'counter' | 'indexed-log' | 'deleted';
 type CacheDoc = {
   _id: GenericId<string>;
   key: string;
@@ -16,6 +16,8 @@ type CacheDoc = {
   kind: CacheKind;
   value?: string;
   counter?: number;
+  retainedCount?: number;
+  logGeneration?: string;
   expiresAt: number | null;
 };
 type CacheListItem = {
@@ -23,6 +25,7 @@ type CacheListItem = {
   key: string;
   keyPrefix: string;
   index: number;
+  storedAt?: number;
   value: string;
 };
 type DeleteBatchResult = {
@@ -40,6 +43,23 @@ function decodeValue(value: string): unknown {
 
 function isExpired(doc: { expiresAt: number | null }, now: number): boolean {
   return doc.expiresAt !== null && doc.expiresAt <= now;
+}
+
+function isIndexedLogRetention(value: unknown): value is { maxAgeMs: number; maxEntries: number } {
+  if (typeof value !== 'object' || value === null) return false;
+  const retention = value as { maxAgeMs?: unknown; maxEntries?: unknown };
+  return (
+    typeof retention.maxAgeMs === 'number' &&
+    Number.isSafeInteger(retention.maxAgeMs) &&
+    retention.maxAgeMs > 0 &&
+    typeof retention.maxEntries === 'number' &&
+    Number.isSafeInteger(retention.maxEntries) &&
+    retention.maxEntries > 0
+  );
+}
+
+function hasValidProposedLogGeneration(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
 }
 
 function normalizeListRange(from: number, to: number, length: number): { from: number; to: number } | null {
@@ -129,7 +149,7 @@ async function clearPrefix(ctx: MutationCtx<any>, keyPrefix: string): Promise<bo
 
   if (docs.length > 0) {
     for (const doc of docs.slice(0, CACHE_MUTATION_BATCH_SIZE) as CacheDoc[]) {
-      if (doc.kind === 'list' || doc.kind === 'deleted') {
+      if (doc.kind === 'list' || doc.kind === 'indexed-log' || doc.kind === 'deleted') {
         const cleanup = await deleteCacheKey(ctx, doc.key);
         return cleanup.hasMore || docs.length > 1 || orphanListItems.length > 0;
       }
@@ -150,6 +170,59 @@ async function clearPrefix(ctx: MutationCtx<any>, keyPrefix: string): Promise<bo
   }
 
   return listItems.length > CACHE_MUTATION_BATCH_SIZE;
+}
+
+async function pruneIndexedLog(
+  ctx: MutationCtx<any>,
+  doc: CacheDoc,
+  retention: { maxAgeMs: number; maxEntries: number },
+  now: number,
+  reserveEntries: number,
+): Promise<{ doc: CacheDoc; hasMore: boolean }> {
+  const items = (await ctx.db
+    .query(CACHE_LIST_TABLE)
+    .withIndex('by_key_index', (q: any) => q.eq('key', doc.key))
+    .take(CACHE_MUTATION_BATCH_SIZE + 1)) as CacheListItem[];
+  const retainedCount = doc.retainedCount ?? items.length;
+  const targetCount = Math.max(retention.maxEntries - reserveEntries, 0);
+  const cutoff = now - retention.maxAgeMs;
+  let expiredCount = 0;
+  while (expiredCount < items.length && (items[expiredCount]!.storedAt ?? 0) <= cutoff) {
+    expiredCount += 1;
+  }
+  const overflowCount = Math.max(retainedCount - targetCount, 0);
+  const deleteCount = Math.min(Math.max(expiredCount, overflowCount), CACHE_MUTATION_BATCH_SIZE, items.length);
+
+  for (const item of items.slice(0, deleteCount)) {
+    await ctx.db.delete(item._id);
+  }
+
+  const nextRetainedCount = Math.max(retainedCount - deleteCount, 0);
+  if (nextRetainedCount !== retainedCount) {
+    await ctx.db.patch(doc._id, { retainedCount: nextRetainedCount });
+  }
+  const nextDoc = { ...doc, retainedCount: nextRetainedCount };
+  const nextItem = items[deleteCount];
+  const hasMore =
+    nextRetainedCount > targetCount ||
+    (nextItem !== undefined && (nextItem.storedAt ?? 0) <= cutoff) ||
+    (deleteCount === CACHE_MUTATION_BATCH_SIZE && nextRetainedCount > 0);
+  return { doc: nextDoc, hasMore };
+}
+
+async function isIndexedLogFullyExpired(
+  ctx: MutationCtx<any>,
+  doc: CacheDoc,
+  retention: { maxAgeMs: number },
+  now: number,
+): Promise<boolean> {
+  if ((doc.retainedCount ?? 0) === 0) return false;
+  const newest = (await ctx.db
+    .query(CACHE_LIST_TABLE)
+    .withIndex('by_key_index', (q: any) => q.eq('key', doc.key))
+    .order('desc')
+    .first()) as CacheListItem | null;
+  return newest !== null && (newest.storedAt ?? 0) <= now - retention.maxAgeMs;
 }
 
 export async function handleCacheOperation(ctx: MutationCtx<any>, request: CacheRequest): Promise<CacheResponse> {
@@ -276,6 +349,146 @@ export async function handleCacheOperation(ctx: MutationCtx<any>, request: Cache
       });
 
       return { ok: true, result: nextCounter };
+    }
+
+    case 'appendIndexedLog': {
+      if (!isIndexedLogRetention(request.retention)) {
+        return { ok: false, error: 'Indexed log retention requires positive safe-integer limits' };
+      }
+      if (!hasValidProposedLogGeneration(request.proposedLogGeneration)) {
+        return { ok: false, error: 'Indexed log proposedLogGeneration must be a non-empty string' };
+      }
+      let existing = await findCacheDoc(ctx, request.key);
+      if (existing && (isExpired(existing, now) || existing.kind === 'deleted')) {
+        const cleanup = await deleteCacheKey(ctx, request.key);
+        if (cleanup.hasMore) return { ok: true, hasMore: true };
+        existing = null;
+      }
+      if (existing && existing.kind !== 'indexed-log') {
+        return { ok: false, error: `${request.key} exists but is not an indexed log` };
+      }
+
+      if (existing && (await isIndexedLogFullyExpired(ctx, existing, request.retention, now))) {
+        const cleanup = await deleteCacheKey(ctx, request.key);
+        if (cleanup.hasMore) return { ok: true, hasMore: true };
+        existing = null;
+      }
+
+      if (existing) {
+        const pruned = await pruneIndexedLog(ctx, existing, request.retention, now, 1);
+        if (pruned.hasMore) return { ok: true, hasMore: true };
+        existing = pruned.doc;
+      }
+
+      const cursor = existing?.counter ?? 0;
+      if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor >= Number.MAX_SAFE_INTEGER) {
+        return { ok: false, error: `${request.key} indexed log cursor exceeded the safe integer range` };
+      }
+      const expiresAt = now + request.retention.maxAgeMs;
+      const logGeneration = existing?.logGeneration ?? request.proposedLogGeneration;
+      await writeCacheDoc(ctx, request.key, existing, {
+        kind: 'indexed-log',
+        keyPrefix: request.keyPrefix,
+        counter: cursor + 1,
+        retainedCount: (existing?.retainedCount ?? 0) + 1,
+        logGeneration,
+        expiresAt,
+      });
+      await ctx.db.insert(CACHE_LIST_TABLE, {
+        key: request.key,
+        keyPrefix: request.keyPrefix,
+        index: cursor,
+        storedAt: now,
+        value: encodeValue(request.value),
+      });
+      return { ok: true, result: { cursor, storedAt: now, value: request.value, logGeneration } };
+    }
+
+    case 'readIndexedLog': {
+      if (!isIndexedLogRetention(request.retention)) {
+        return { ok: false, error: 'Indexed log retention requires positive safe-integer limits' };
+      }
+      if (!hasValidProposedLogGeneration(request.proposedLogGeneration)) {
+        return { ok: false, error: 'Indexed log proposedLogGeneration must be a non-empty string' };
+      }
+      if (!Number.isSafeInteger(request.afterCursor)) {
+        return { ok: false, error: 'Indexed log afterCursor must be a safe integer' };
+      }
+      const { doc, hasMore: cleanupHasMore } = await getLiveCacheDoc(ctx, request.key, now);
+      if (cleanupHasMore) return { ok: true, hasMore: true };
+      if (!doc) {
+        await writeCacheDoc(ctx, request.key, null, {
+          kind: 'indexed-log',
+          keyPrefix: request.keyPrefix,
+          counter: 0,
+          retainedCount: 0,
+          logGeneration: request.proposedLogGeneration,
+          expiresAt: null,
+        });
+        return {
+          ok: true,
+          result: {
+            entries: [],
+            logGeneration: request.proposedLogGeneration,
+            firstCursor: 0,
+            nextCursor: 0,
+          },
+        };
+      }
+      if (doc.kind !== 'indexed-log') {
+        return { ok: false, error: `${request.key} exists but is not an indexed log` };
+      }
+
+      if (await isIndexedLogFullyExpired(ctx, doc, request.retention, now)) {
+        const cleanup = await deleteCacheKey(ctx, request.key);
+        if (cleanup.hasMore) return { ok: true, hasMore: true };
+        await writeCacheDoc(ctx, request.key, null, {
+          kind: 'indexed-log',
+          keyPrefix: request.keyPrefix,
+          counter: 0,
+          retainedCount: 0,
+          logGeneration: request.proposedLogGeneration,
+          expiresAt: null,
+        });
+        return {
+          ok: true,
+          result: {
+            entries: [],
+            logGeneration: request.proposedLogGeneration,
+            firstCursor: 0,
+            nextCursor: 0,
+          },
+        };
+      }
+
+      const pruned = await pruneIndexedLog(ctx, doc, request.retention, now, 0);
+      if (pruned.hasMore) return { ok: true, hasMore: true };
+      const nextCursor = pruned.doc.counter ?? 0;
+      const logGeneration = pruned.doc.logGeneration ?? request.proposedLogGeneration;
+      if (!pruned.doc.logGeneration) {
+        await ctx.db.patch(pruned.doc._id, { logGeneration });
+      }
+      const query = ctx.db.query(CACHE_LIST_TABLE).withIndex('by_key_index', (q: any) => {
+        return q.eq('key', request.key).gte('index', request.afterCursor + 1);
+      });
+      const entries = (await query.collect()) as CacheListItem[];
+      const first = (await ctx.db
+        .query(CACHE_LIST_TABLE)
+        .withIndex('by_key_index', (q: any) => q.eq('key', request.key))
+        .first()) as CacheListItem | null;
+      return {
+        ok: true,
+        result: {
+          entries: entries.map(item => ({
+            cursor: item.index,
+            storedAt: item.storedAt ?? 0,
+            value: decodeValue(item.value),
+          })),
+          logGeneration,
+          firstCursor: first?.index ?? nextCursor,
+          nextCursor,
+        },
+      };
     }
   }
 

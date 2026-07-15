@@ -95,9 +95,12 @@ import type {
   OutputWriter,
   StepMetadata,
   WorkflowRunStartOptions,
+  WorkflowLifecycleEventCallback,
+  WorkflowLifecycleWatchOptions,
   ForeachOptions,
 } from './types';
 import { cleanStepResult, createRestartExecutionParams, createTimeTravelExecutionParams } from './utils';
+import { watchWorkflowLifecycleEvents } from './workflow-lifecycle';
 
 // Options that can be passed when wrapping an agent with createStep
 // These work for both stream() (v2) and streamLegacy() (v1) methods
@@ -3954,6 +3957,27 @@ export class Run<
    */
   async watchAsync(cb: (event: WorkflowStreamEvent) => void): Promise<() => void> {
     return this.watch(cb);
+  }
+
+  /**
+   * Watch this run as a replayable lifecycle stream.
+   *
+   * Unlike `watch()`, each delivery retains its stable event identity and
+   * cursor. The callback may be async; successful completion acknowledges the
+   * delivery, while rejection negatively acknowledges it when supported by
+   * the configured transport.
+   */
+  async watchLifecycle(
+    cb: WorkflowLifecycleEventCallback,
+    options?: WorkflowLifecycleWatchOptions,
+  ): Promise<() => Promise<void>> {
+    return watchWorkflowLifecycleEvents({
+      pubsub: this.pubsub,
+      workflowId: this.workflowId,
+      runId: this.runId,
+      callback: cb,
+      options,
+    });
   }
 
   async resume<TResume>(

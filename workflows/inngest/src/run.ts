@@ -1,6 +1,7 @@
 import { ReadableStream } from 'node:stream/web';
 import type { ActorSignal } from '@mastra/core/auth/ee';
 import { getErrorFromUnknown } from '@mastra/core/error';
+import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import type { TracingContext, TracingOptions } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
@@ -24,6 +25,17 @@ import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
 import type { InngestEngineType, InngestWorkflowRunState } from './types';
+
+export function unwrapWorkflowRealtimeData(data: any): any {
+  const isPubSubEnvelope =
+    data &&
+    typeof data === 'object' &&
+    typeof data.id === 'string' &&
+    typeof data.runId === 'string' &&
+    'createdAt' in data &&
+    'data' in data;
+  return isPubSubEnvelope ? data.data : data;
+}
 
 export class InngestRun<
   TEngineType = InngestEngineType,
@@ -66,6 +78,7 @@ export class InngestRun<
       stateSchema?: StandardSchemaWithJSON<TState>;
       requestContextSchema?: StandardSchemaWithJSON<TRequestContext>;
       disableScorers?: boolean;
+      pubsub: PubSub;
     },
     inngest: Inngest,
   ) {
@@ -133,7 +146,7 @@ export class InngestRun<
             async (message: any) => {
               if (resolved) return;
 
-              const event = message.data;
+              const event = unwrapWorkflowRealtimeData(message.data);
 
               if (event?.type === 'workflow-finish') {
                 // Got the finish event - load snapshot and resolve
@@ -938,7 +951,7 @@ export class InngestRun<
       },
       (message: any) => {
         if (active) {
-          cb(message.data);
+          cb(unwrapWorkflowRealtimeData(message.data));
         }
       },
     );

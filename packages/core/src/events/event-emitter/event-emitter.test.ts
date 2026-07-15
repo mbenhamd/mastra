@@ -60,6 +60,25 @@ describe('EventEmitterPubSub', () => {
       expect(cb1).toHaveBeenCalledTimes(1);
       expect(cb2).not.toHaveBeenCalled();
     });
+
+    it('isolates and reports synchronous and asynchronous subscriber failures', async () => {
+      const logger = { error: vi.fn() };
+      pubsub = new EventEmitterPubSub(undefined, { logger: logger as any });
+      const healthy = vi.fn();
+
+      await pubsub.subscribe('topic-a', () => {
+        throw new Error('sync failure');
+      });
+      await pubsub.subscribe('topic-a', async () => {
+        throw new Error('async failure');
+      });
+      await pubsub.subscribe('topic-a', healthy);
+
+      await pubsub.publish('topic-a', makeEvent());
+
+      expect(healthy).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(logger.error).toHaveBeenCalledTimes(2));
+    });
   });
 
   describe('group (competing consumers)', () => {

@@ -94,6 +94,36 @@ describe('UnixSocketPubSub', () => {
     expect(clientCb.mock.calls[0]![0].type).toBe('from-client');
   });
 
+  it('preserves caller-assigned identity across the broker boundary', async () => {
+    const path = await socketPath();
+    const broker = new UnixSocketPubSub(path);
+    const client = new UnixSocketPubSub(path);
+    pubsubs.push(broker, client);
+
+    const received: Event[] = [];
+    await client.subscribe('identity-topic', event => {
+      received.push(event);
+    });
+
+    const createdAt = new Date('2026-07-15T10:00:00.000Z');
+    const identifiedEvent: Event = {
+      ...makeEvent({ type: 'identified' }),
+      id: 'stable-event-id',
+      createdAt,
+      index: 5,
+      logGeneration: 'log-generation-1',
+    };
+    await broker.publish('identity-topic', identifiedEvent);
+
+    await waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0]).toMatchObject({
+      id: 'stable-event-id',
+      createdAt,
+      index: 5,
+      logGeneration: 'log-generation-1',
+    });
+  });
+
   it('_localOnly events stay entirely within the publishing instance', async () => {
     const path = await socketPath();
     const broker = new UnixSocketPubSub(path);
@@ -563,6 +593,33 @@ describe('UnixSocketPubSub', () => {
       // on each redelivery so consumers can see how many times they've seen
       // the same logical event.
       expect(attempts).toEqual([1, 2, 3]);
+    });
+
+    it('redelivers an async callback rejection with stable identity and a bumped attempt', async () => {
+      const path = await socketPath();
+      const pubsub = new UnixSocketPubSub(path);
+      pubsubs.push(pubsub);
+
+      const received: Event[] = [];
+      await pubsub.subscribe('topic-a', async event => {
+        received.push(event);
+        if (received.length === 1) {
+          throw new Error('retry this event');
+        }
+      });
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+      await pubsub.publish('topic-a', {
+        ...makeEvent({ type: 'rejected' }),
+        id: 'stable-event-id',
+        createdAt,
+        index: 11,
+      });
+
+      await waitFor(() => expect(received).toHaveLength(2));
+      expect(received).toMatchObject([
+        { id: 'stable-event-id', createdAt, index: 11, deliveryAttempt: 1 },
+        { id: 'stable-event-id', createdAt, index: 11, deliveryAttempt: 2 },
+      ]);
     });
 
     it('caps local redeliveries so a permanently-nacking subscriber does not loop forever', async () => {

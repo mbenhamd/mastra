@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { InMemoryServerCache } from '../cache/inmemory';
 import { CachingPubSub, withCaching } from './caching-pubsub';
 import { EventEmitterPubSub } from './event-emitter';
+import type { IndexedReplayCursorError, IndexedReplayIntegrityError } from './pubsub';
 import { isLeaseProvider, PubSub } from './pubsub';
-import type { Event, EventCallback } from './types';
+import type { Event, EventCallback, PublishEvent } from './types';
 
 describe('CachingPubSub', () => {
   let cache: InMemoryServerCache;
@@ -51,8 +52,6 @@ describe('CachingPubSub', () => {
           type: 'test',
           runId: 'run-1',
         }),
-        expect.any(Function),
-        expect.any(Function),
       );
     });
 
@@ -120,6 +119,73 @@ describe('CachingPubSub', () => {
       expect(receivedEvents[1].index).toBe(1);
     });
 
+    it('preserves the same event identity in live delivery and retained history', async () => {
+      const topic = 'stable-identity-topic';
+      const liveEvents: Event[] = [];
+
+      await cachingPubsub.subscribe(topic, event => {
+        liveEvents.push(event);
+      });
+      await cachingPubsub.publish(topic, { type: 'first', runId: 'run-1', data: {} });
+
+      const history = await cachingPubsub.getHistory(topic);
+      expect(liveEvents).toHaveLength(1);
+      expect(history).toHaveLength(1);
+      expect(liveEvents[0]!.id).toBe(history[0]!.id);
+      expect(liveEvents[0]!.createdAt).toEqual(history[0]!.createdAt);
+    });
+
+    it('preserves upstream identity while assigning its own topic cursor', async () => {
+      const topic = 'upstream-identity-topic';
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await cachingPubsub.publish(topic, {
+        type: 'first',
+        runId: 'run-1',
+        data: {},
+        id: 'upstream-event-id',
+        createdAt,
+        index: 999,
+      });
+
+      const history = await cachingPubsub.getHistory(topic);
+      expect(history[0]).toMatchObject({ id: 'upstream-event-id', createdAt, index: 0 });
+    });
+
+    it('restores Date identity from JSON-backed retained history', async () => {
+      const createdAt = '2026-07-15T10:00:00.000Z';
+      await cache.listPush('pubsub:serialized-history-topic', {
+        type: 'first',
+        runId: 'run-1',
+        data: {},
+        id: 'serialized-event-id',
+        createdAt,
+        index: 0,
+      });
+
+      const history = await cachingPubsub.getHistory('serialized-history-topic');
+      expect(history[0]).toMatchObject({ id: 'serialized-event-id', index: 0 });
+      expect(history[0]!.createdAt).toEqual(new Date(createdAt));
+    });
+
+    it('rejects malformed retained event shape and createdAt values', async () => {
+      await cache.listPush('pubsub:malformed-shape-topic', { createdAt: new Date().toISOString() });
+      await cache.listPush('pubsub:malformed-date-topic', {
+        type: 'invalid-date',
+        id: 'invalid-date-id',
+        runId: 'run-1',
+        data: {},
+        createdAt: 'not-a-date',
+      });
+
+      await expect(cachingPubsub.getHistory('malformed-shape-topic')).rejects.toMatchObject<
+        Partial<IndexedReplayIntegrityError>
+      >({ reason: 'malformed-retained-event' });
+      await expect(cachingPubsub.getHistory('malformed-date-topic')).rejects.toMatchObject<
+        Partial<IndexedReplayIntegrityError>
+      >({ reason: 'malformed-retained-event' });
+    });
+
     it('should recover index from cache after restart', async () => {
       const topic = 'recovery-topic';
 
@@ -179,11 +245,7 @@ describe('CachingPubSub', () => {
 
       // Should only receive the live event, not the cached one
       expect(callback).toHaveBeenCalledTimes(1);
-      expect(callback).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'live' }),
-        expect.any(Function),
-        expect.any(Function),
-      );
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({ type: 'live' }));
     });
 
     it('forwards options (including batch) verbatim to the inner PubSub', async () => {
@@ -648,11 +710,7 @@ describe('CachingPubSub', () => {
 
       // Live subscriber should still receive the event even though cache failed
       expect(callback).toHaveBeenCalledTimes(1);
-      expect(callback).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'test', data: { hello: 'world' } }),
-        expect.any(Function),
-        expect.any(Function),
-      );
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({ type: 'test', data: { hello: 'world' } }));
     });
 
     it('should still deliver to live subscribers when cache.increment fails', async () => {
@@ -840,6 +898,9 @@ describe('CachingPubSub', () => {
 
       // Events must arrive in index order, no duplicates
       expect(received).toEqual([0, 1, 2]);
+      // The live backlog copies were suppressed at the replay boundary and
+      // must still be acknowledged so the broker does not redeliver them.
+      expect(pullInner.getAckedIndices()).toEqual([0, 1, 2]);
     });
 
     it('honors offset on live path for pull-mode transports', async () => {
@@ -859,6 +920,9 @@ describe('CachingPubSub', () => {
 
       // Only events with index >= 3 should be delivered
       expect(received).toEqual([3, 4]);
+      // Both skipped pre-offset deliveries and the replay/live duplicates are
+      // acknowledged even though only the requested suffix reaches the user.
+      expect(pullInner.getAckedIndices()).toEqual([0, 1, 2, 3, 4]);
     });
 
     it('delivers events published during getHistory bootstrap without duplication', async () => {
@@ -1014,5 +1078,282 @@ describe('CachingPubSub', () => {
       expect(received).toEqual([0, 1]);
       expect(ackedByConsumer).toEqual([1, 1]);
     });
+  });
+});
+
+describe('CachingPubSub exact indexed replay', () => {
+  const indexedReplay = { retentionMs: 60_000, maxEvents: 100 };
+
+  class ManualPubSub extends PubSub {
+    callback?: EventCallback;
+    published: Event[] = [];
+
+    async publish(_topic: string, event: PublishEvent): Promise<void> {
+      this.published.push(event as Event);
+    }
+
+    async subscribe(_topic: string, callback: EventCallback): Promise<void> {
+      this.callback = callback;
+    }
+
+    async unsubscribe(_topic: string, callback: EventCallback): Promise<void> {
+      if (this.callback === callback) this.callback = undefined;
+    }
+
+    async flush(): Promise<void> {}
+
+    async deliver(delivered: Event, ack?: () => Promise<void>, nack?: () => Promise<void>): Promise<void> {
+      await this.callback?.(delivered, ack, nack);
+    }
+  }
+
+  it('does not advertise exact replay for the legacy increment-plus-list cache path', async () => {
+    const legacy = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache());
+
+    expect(legacy.supportsIndexedReplay).toBe(false);
+    expect(legacy.indexedReplay).toBeUndefined();
+
+    await legacy.publish('legacy-topic', { type: 'legacy', runId: 'run', data: {} });
+    expect(await legacy.getHistory('legacy-topic')).toHaveLength(1);
+  });
+
+  it('assigns and retains concurrent cursors in one atomic order', async () => {
+    const cache = new InMemoryServerCache();
+    const listPush = vi.spyOn(cache, 'listPush');
+    const exact = new CachingPubSub(new EventEmitterPubSub(), cache, { indexedReplay });
+
+    await Promise.all(
+      Array.from({ length: 50 }, (_, index) =>
+        exact.publish('concurrent-topic', { type: `event-${index}`, runId: 'run', data: { index } }),
+      ),
+    );
+
+    const history = await exact.getHistory('concurrent-topic');
+    expect(history.map(event => event.index)).toEqual(Array.from({ length: 50 }, (_, index) => index));
+    expect(new Set(history.map(event => event.id))).toHaveLength(50);
+    expect(listPush).not.toHaveBeenCalled();
+  });
+
+  it('retains localOnly events only when exact replay is process-scoped', async () => {
+    const exact = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), { indexedReplay });
+
+    await exact.publish(
+      'local-exact-topic',
+      { type: 'local', runId: 'run', data: { nonSerializable: () => 'same-process' } },
+      { localOnly: true },
+    );
+
+    await expect(exact.getHistory('local-exact-topic')).resolves.toMatchObject([
+      { type: 'local', index: 0, data: { nonSerializable: expect.any(Function) } },
+    ]);
+  });
+
+  it('fills a live reorder gap from retained history without prematurely acknowledging the lower cursor', async () => {
+    const inner = new ManualPubSub();
+    const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
+    const received: number[] = [];
+    let releaseZero!: () => void;
+    const holdZero = new Promise<void>(resolve => {
+      releaseZero = resolve;
+    });
+
+    await exact.subscribeFromOffset('reordered-topic', 0, async (event, ack) => {
+      received.push(event.index!);
+      if (event.index === 0) await holdZero;
+      await ack?.();
+    });
+    await exact.publish('reordered-topic', { type: 'zero', runId: 'run', data: {} });
+    await exact.publish('reordered-topic', { type: 'one', runId: 'run', data: {} });
+
+    const [zero, one] = inner.published;
+    const ackZero = vi.fn(async () => {});
+    const ackOne = vi.fn(async () => {});
+    const deliverOne = inner.deliver(
+      one!,
+      ackOne,
+      vi.fn(async () => {}),
+    );
+    await vi.waitFor(() => expect(received).toEqual([0]));
+
+    const deliverZero = inner.deliver(
+      zero!,
+      ackZero,
+      vi.fn(async () => {}),
+    );
+    expect(ackZero).not.toHaveBeenCalled();
+    expect(ackOne).not.toHaveBeenCalled();
+
+    releaseZero();
+    await Promise.all([deliverOne, deliverZero]);
+
+    expect(received).toEqual([0, 1]);
+    expect(ackZero).toHaveBeenCalledTimes(1);
+    expect(ackOne).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses callback resolution as the commit boundary for cache-only replay and explicit ack for live delivery', async () => {
+    const inner = new ManualPubSub();
+    const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
+    await exact.publish('ack-contract-topic', { type: 'replayed', runId: 'run', data: {} });
+
+    const deliveries: Array<{ type: string; hasAck: boolean; hasNack: boolean }> = [];
+    await exact.subscribeFromOffset('ack-contract-topic', 0, async (event, ack, nack) => {
+      deliveries.push({ type: event.type, hasAck: Boolean(ack), hasNack: Boolean(nack) });
+      await ack?.();
+    });
+
+    expect(deliveries).toEqual([{ type: 'replayed', hasAck: false, hasNack: false }]);
+
+    await exact.publish('ack-contract-topic', { type: 'live', runId: 'run', data: {} });
+    const acknowledgeLive = vi.fn(async () => {});
+    const negativeAcknowledgeLive = vi.fn(async () => {});
+    await inner.deliver(inner.published[1]!, acknowledgeLive, negativeAcknowledgeLive);
+
+    expect(deliveries).toEqual([
+      { type: 'replayed', hasAck: false, hasNack: false },
+      { type: 'live', hasAck: true, hasNack: true },
+    ]);
+    expect(acknowledgeLive).toHaveBeenCalledTimes(1);
+    expect(negativeAcknowledgeLive).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before live publish when atomic retention fails', async () => {
+    const cache = new InMemoryServerCache();
+    vi.spyOn(cache, 'appendIndexedLogEntry').mockRejectedValueOnce(new Error('indexed store unavailable'));
+    const inner = new ManualPubSub();
+    const exact = new CachingPubSub(inner, cache, { indexedReplay });
+
+    await expect(
+      exact.publish('failed-append-topic', { type: 'not-live-only', runId: 'run', data: {} }),
+    ).rejects.toThrow('indexed store unavailable');
+
+    expect(inner.published).toEqual([]);
+    expect(await exact.getHistory('failed-append-topic')).toEqual([]);
+  });
+
+  it('reports the retained floor and rejects a cursor older than bounded history', async () => {
+    const exact = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+      indexedReplay: { retentionMs: 60_000, maxEvents: 2 },
+    });
+    await exact.publish('bounded-topic', { type: 'zero', runId: 'run', data: {} });
+    await exact.publish('bounded-topic', { type: 'one', runId: 'run', data: {} });
+    await exact.publish('bounded-topic', { type: 'two', runId: 'run', data: {} });
+
+    await expect(exact.getIndexedReplayRange('bounded-topic')).resolves.toMatchObject({
+      scope: 'process',
+      retentionMs: 60_000,
+      maxEvents: 2,
+      firstCursor: 1,
+      nextCursor: 3,
+    });
+    await expect(exact.subscribeFromOffset('bounded-topic', 0, () => {})).rejects.toMatchObject<
+      Partial<IndexedReplayCursorError>
+    >({
+      reason: 'cursor-too-old',
+      requestedCursor: 0,
+    });
+
+    const retained: number[] = [];
+    await exact.subscribeFromOffset('bounded-topic', 1, event => {
+      retained.push(event.index!);
+    });
+    expect(retained).toEqual([1, 2]);
+  });
+
+  it('changes log generation after full retention expiry and rejects the old generation', async () => {
+    vi.useFakeTimers();
+    try {
+      const exact = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+        indexedReplay: { retentionMs: 10, maxEvents: 10 },
+      });
+      await exact.publish('expired-topic', { type: 'zero', runId: 'run', data: {} });
+      const beforeExpiry = (await exact.getIndexedReplayRange('expired-topic'))!;
+
+      await vi.advanceTimersByTimeAsync(11);
+      const afterExpiry = (await exact.getIndexedReplayRange('expired-topic'))!;
+
+      expect(afterExpiry.logGeneration).not.toBe(beforeExpiry.logGeneration);
+      expect(afterExpiry).toMatchObject({ firstCursor: 0, nextCursor: 0 });
+      await expect(
+        exact.subscribeFromOffset('expired-topic', 1, () => {}, {
+          logGeneration: beforeExpiry.logGeneration,
+        }),
+      ).rejects.toMatchObject<Partial<IndexedReplayCursorError>>({
+        reason: 'generation-mismatch',
+        requestedLogGeneration: beforeExpiry.logGeneration,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an empty generation stable while waiting beyond event retention', async () => {
+    vi.useFakeTimers();
+    try {
+      const exact = new CachingPubSub(new EventEmitterPubSub(), new InMemoryServerCache(), {
+        indexedReplay: { retentionMs: 10, maxEvents: 10 },
+      });
+      const beforeWaiting = (await exact.getIndexedReplayRange('future-topic'))!;
+
+      await vi.advanceTimersByTimeAsync(100);
+      const afterWaiting = (await exact.getIndexedReplayRange('future-topic'))!;
+      await exact.publish('future-topic', { type: 'first', runId: 'run', data: {} });
+      const afterFirstAppend = (await exact.getIndexedReplayRange('future-topic'))!;
+
+      expect(afterWaiting.logGeneration).toBe(beforeWaiting.logGeneration);
+      expect(afterFirstAppend.logGeneration).toBe(beforeWaiting.logGeneration);
+      expect(afterFirstAppend).toMatchObject({ firstCursor: 0, nextCursor: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not mistake a recreated log cursor for an old live duplicate', async () => {
+    const inner = new ManualPubSub();
+    const exact = new CachingPubSub(inner, new InMemoryServerCache(), { indexedReplay });
+    const received: string[] = [];
+    const activeError = vi.fn(async () => {});
+
+    await exact.subscribeFromOffset(
+      'recreated-topic',
+      0,
+      async (event, ack) => {
+        received.push(event.type);
+        await ack?.();
+      },
+      { onError: activeError },
+    );
+    await exact.publish('recreated-topic', { type: 'old-generation', runId: 'run', data: {} });
+
+    const acknowledgeOld = vi.fn(async () => {});
+    await inner.deliver(
+      inner.published[0]!,
+      acknowledgeOld,
+      vi.fn(async () => {}),
+    );
+    expect(received).toEqual(['old-generation']);
+    expect(acknowledgeOld).toHaveBeenCalledTimes(1);
+
+    await exact.clearTopic('recreated-topic');
+    await exact.publish('recreated-topic', { type: 'new-generation', runId: 'run', data: {} });
+
+    const acknowledgeNew = vi.fn(async () => {});
+    await expect(
+      inner.deliver(
+        inner.published[1]!,
+        acknowledgeNew,
+        vi.fn(async () => {}),
+      ),
+    ).rejects.toMatchObject<Partial<IndexedReplayCursorError>>({ reason: 'generation-mismatch' });
+    expect(received).toEqual(['old-generation']);
+    expect(acknowledgeNew).not.toHaveBeenCalled();
+    expect(activeError).toHaveBeenCalledTimes(1);
+    expect(activeError).toHaveBeenCalledWith(expect.objectContaining({ reason: 'generation-mismatch' }));
+
+    // Terminal replay errors unsubscribe the stale watcher, so it cannot
+    // fail/log forever on every event in the recreated generation.
+    await exact.publish('recreated-topic', { type: 'new-generation-second', runId: 'run', data: {} });
+    await inner.deliver(inner.published[2]!);
+    expect(activeError).toHaveBeenCalledTimes(1);
   });
 });

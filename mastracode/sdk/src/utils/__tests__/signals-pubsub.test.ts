@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => {
 
   class MockUnixSocketPubSub {
     readonly socketPath: string;
-    readonly published: Array<{ topic: string; event: unknown }> = [];
+    readonly published: Array<{ topic: string; event: unknown; options?: { localOnly?: boolean } }> = [];
     readonly subscriptions: string[] = [];
     closed = false;
 
@@ -17,8 +17,8 @@ const mocks = vi.hoisted(() => {
       instances.push(this);
     }
 
-    async publish(topic: string, event: unknown): Promise<void> {
-      this.published.push({ topic, event });
+    async publish(topic: string, event: unknown, options?: { localOnly?: boolean }): Promise<void> {
+      this.published.push({ topic, event, options });
     }
 
     async subscribe(topic: string): Promise<void> {
@@ -172,6 +172,32 @@ describe('SignalsPubSub', () => {
     expect(mocks.instances).toHaveLength(2);
     expect(mocks.instances[0]?.socketPath).toBe(`/tmp/mc/${resourceId}/workflows.sock`);
     expect(mocks.instances[1]?.socketPath).toBe(`/tmp/mc/${resourceId}/workflows-finish.sock`);
+  });
+
+  it('forwards caller-assigned identity, cursor, and publish options unchanged', async () => {
+    const { createSignalsPubSub } = await import('../signals-pubsub.js');
+    const resourceId = '11111111-1111-4111-8111-111111111111';
+    const createdAt = new Date('2026-07-15T10:00:00.000Z');
+    const identifiedEvent = {
+      ...event,
+      id: 'stable-event-id',
+      createdAt,
+      index: 6,
+      logGeneration: 'log-generation-1',
+    };
+
+    const pubsub = createSignalsPubSub(resourceId);
+    await pubsub.publish('workflow.lifecycle.v1.workflow-id.run-id.execution-1', identifiedEvent, {
+      localOnly: true,
+    });
+
+    expect(mocks.instances[0]?.published).toEqual([
+      {
+        topic: 'workflow.lifecycle.v1.workflow-id.run-id.execution-1',
+        event: identifiedEvent,
+        options: { localOnly: true },
+      },
+    ]);
   });
 
   it('hashes long socket paths that would exceed macOS sun_path limit', async () => {

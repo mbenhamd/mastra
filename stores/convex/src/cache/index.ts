@@ -1,4 +1,10 @@
 import { MastraServerCache } from '@mastra/core/cache';
+import type {
+  AtomicIndexedLogCache,
+  IndexedLogAppendResult,
+  IndexedLogReadResult,
+  IndexedLogRetention,
+} from '@mastra/core/cache';
 
 import { ConvexCacheClient } from './client';
 import type { ConvexCacheClientConfig } from './client';
@@ -23,7 +29,9 @@ const isClientConfig = (
   config: ConvexServerCacheConfig,
 ): config is ConvexServerCacheConfig & { client: ConvexCacheClient } => 'client' in config;
 
-export class ConvexServerCache extends MastraServerCache {
+export class ConvexServerCache extends MastraServerCache implements AtomicIndexedLogCache {
+  readonly indexedLogScope = 'durable' as const;
+
   private readonly client: ConvexCacheClient;
   private readonly keyPrefix: string;
   private readonly ttlMs: number;
@@ -120,6 +128,56 @@ export class ConvexServerCache extends MastraServerCache {
       keyPrefix: this.keyPrefix,
       expiresAt: this.getExpiresAt(),
     }));
+  }
+
+  async appendIndexedLogEntry<T>(
+    key: string,
+    value: T,
+    retention: IndexedLogRetention,
+  ): Promise<IndexedLogAppendResult<T>> {
+    this.assertIndexedLogRetention(retention);
+    const proposedLogGeneration = crypto.randomUUID();
+    return this.callUntilSettled(() => ({
+      op: 'appendIndexedLog',
+      key: this.getKey(key),
+      keyPrefix: this.keyPrefix,
+      value,
+      retention,
+      proposedLogGeneration,
+    }));
+  }
+
+  async readIndexedLogEntries<T>(
+    key: string,
+    afterCursor: number,
+    retention: IndexedLogRetention,
+  ): Promise<IndexedLogReadResult<T>> {
+    this.assertIndexedLogRetention(retention);
+    if (!Number.isSafeInteger(afterCursor)) {
+      throw new TypeError('Convex indexed log afterCursor must be a safe integer');
+    }
+    const proposedLogGeneration = crypto.randomUUID();
+    return this.callUntilSettled(() => ({
+      op: 'readIndexedLog',
+      key: this.getKey(key),
+      keyPrefix: this.keyPrefix,
+      afterCursor,
+      retention,
+      proposedLogGeneration,
+    }));
+  }
+
+  async deleteIndexedLog(key: string): Promise<void> {
+    await this.delete(key);
+  }
+
+  private assertIndexedLogRetention(retention: IndexedLogRetention): void {
+    if (!Number.isSafeInteger(retention.maxAgeMs) || retention.maxAgeMs <= 0) {
+      throw new TypeError('Convex indexed log maxAgeMs must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(retention.maxEntries) || retention.maxEntries <= 0) {
+      throw new TypeError('Convex indexed log maxEntries must be a positive safe integer');
+    }
   }
 }
 

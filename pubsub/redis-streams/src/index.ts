@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { PubSub } from '@mastra/core/events';
-import type { Event, EventCallback, LeaseProvider, PubSubDeliveryMode, SubscribeOptions } from '@mastra/core/events';
+import type {
+  Event,
+  EventCallback,
+  LeaseProvider,
+  PublishEvent,
+  PubSubDeliveryMode,
+  SubscribeOptions,
+} from '@mastra/core/events';
 import { createClient } from 'redis';
 import type { RedisClientOptions, RedisClientType } from 'redis';
 
@@ -16,6 +23,27 @@ function errorText(err: unknown): string {
     parts.push(...(err as { replies: unknown[] }).replies.map(r => String(r)));
   }
   return parts.join('; ');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function optionalSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+}
+
+function isLifecycleTopic(topic: string): boolean {
+  return /^workflow\.lifecycle\.v1\..+$/.test(topic);
+}
+
+function assertLifecycleReplayIdentity(topic: string, event: Event): void {
+  if (
+    isLifecycleTopic(topic) &&
+    (!Number.isSafeInteger(event.index) || event.index! < 0 || !event.logGeneration || event.logGeneration.length === 0)
+  ) {
+    throw new TypeError('Workflow lifecycle event payload is missing replay identity');
+  }
 }
 
 /**
@@ -197,11 +225,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
     return `${this.#keyPrefix}:${topic}`;
   }
 
-  async publish(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    options?: { localOnly?: boolean },
-  ): Promise<void> {
+  async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     if (this.#closed) throw new Error('RedisStreamsPubSub: cannot publish on closed client');
 
     // `localOnly` events stay entirely within the publishing process. They are
@@ -211,24 +235,24 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
     if (options?.localOnly) {
       const localEvent: Event = {
         ...event,
-        id: randomUUID(),
-        createdAt: new Date(),
+        id: event.id ?? randomUUID(),
+        createdAt: event.createdAt ?? new Date(),
         deliveryAttempt: event.deliveryAttempt ?? 1,
       };
+      assertLifecycleReplayIdentity(topic, localEvent);
       this.#deliverLocal(topic, localEvent);
       return;
     }
 
     await this.#ensureWriterConnected();
 
-    const id = randomUUID();
-    const createdAt = new Date();
     const payload: Event = {
       ...event,
-      id,
-      createdAt,
+      id: event.id ?? randomUUID(),
+      createdAt: event.createdAt ?? new Date(),
       deliveryAttempt: event.deliveryAttempt ?? 1,
     };
+    assertLifecycleReplayIdentity(topic, payload);
     const xaddOptions: { TRIM?: { strategy: 'MAXLEN'; strategyModifier: '~'; threshold: number } } = {};
     if (this.#maxStreamLength > 0) {
       xaddOptions.TRIM = {
@@ -382,7 +406,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async #advanceReclaimedMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
     let event: Event;
     try {
-      event = this.#parseEvent(fields);
+      event = this.#parseEvent(fields, isLifecycleTopic(sub.topic));
     } catch {
       // Reuse the normal malformed-payload path, which logs and acknowledges
       // the poison entry without invoking user code.
@@ -422,17 +446,53 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
     await this.#deliverMessage(sub, streamId, reclaimedFields);
   }
 
-  #parseEvent(fields: Record<string, string>): Event {
+  #parseEvent(fields: Record<string, string>, requireReplayIdentity: boolean): Event {
     const parsed: unknown = JSON.parse(fields.event ?? '{}');
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (!isRecord(parsed)) {
       throw new TypeError('event payload must be an object');
     }
-
-    const event = parsed as Event;
-    if (typeof event.createdAt === 'string') {
-      event.createdAt = new Date(event.createdAt);
+    const record = parsed;
+    if (
+      typeof record.type !== 'string' ||
+      record.type.length === 0 ||
+      typeof record.id !== 'string' ||
+      record.id.length === 0 ||
+      typeof record.runId !== 'string' ||
+      record.runId.length === 0 ||
+      typeof record.createdAt !== 'string' ||
+      !('data' in record)
+    ) {
+      throw new TypeError('event payload is missing canonical identity fields');
     }
-    return event;
+    const createdAt = new Date(record.createdAt);
+    if (Number.isNaN(createdAt.getTime())) {
+      throw new TypeError('event payload has an invalid createdAt value');
+    }
+    const index = optionalSafeInteger(record.index);
+    const deliveryAttempt = optionalSafeInteger(record.deliveryAttempt);
+    if (record.index !== undefined && (index === undefined || index < 0)) {
+      throw new TypeError('event payload has an invalid cursor');
+    }
+    if (record.deliveryAttempt !== undefined && (deliveryAttempt === undefined || deliveryAttempt < 1)) {
+      throw new TypeError('event payload has an invalid delivery attempt');
+    }
+    const logGeneration = record.logGeneration;
+    if (logGeneration !== undefined && (typeof logGeneration !== 'string' || logGeneration.length === 0)) {
+      throw new TypeError('event payload has an invalid log generation');
+    }
+    if (requireReplayIdentity && (index === undefined || typeof logGeneration !== 'string')) {
+      throw new TypeError('Workflow lifecycle event payload is missing replay identity');
+    }
+    return {
+      type: record.type,
+      id: record.id,
+      runId: record.runId,
+      data: record.data,
+      createdAt,
+      ...(typeof index === 'number' ? { index } : {}),
+      ...(typeof logGeneration === 'string' ? { logGeneration } : {}),
+      ...(typeof deliveryAttempt === 'number' ? { deliveryAttempt } : {}),
+    };
   }
 
   async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
@@ -739,7 +799,7 @@ export class RedisStreamsPubSub extends PubSub implements LeaseProvider {
   async #deliverMessage(sub: Subscription, streamId: string, fields: Record<string, string>): Promise<void> {
     let event: Event;
     try {
-      event = this.#parseEvent(fields);
+      event = this.#parseEvent(fields, isLifecycleTopic(sub.topic));
     } catch (err) {
       this.#logger?.debug?.('redis-streams: malformed payload, dropping', {
         topic: sub.topic,

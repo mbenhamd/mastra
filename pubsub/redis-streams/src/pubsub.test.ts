@@ -212,6 +212,39 @@ describe('RedisStreamsPubSub', () => {
       expect(seenAttempts[1]).toBe(2);
     });
 
+    it('keeps caller identity and cursor stable across nack redelivery', async () => {
+      const ps = createPubSub();
+      const topic = `t-${randomUUID()}`;
+      const seen: Event[] = [];
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await ps.subscribe(
+        topic,
+        async (event, ack, nack) => {
+          seen.push(event);
+          if (seen.length === 1) {
+            await nack?.();
+          } else {
+            await ack?.();
+          }
+        },
+        { group: `identity-retry-${randomUUID()}` },
+      );
+      await ps.publish(topic, {
+        ...makeEvent({ type: 'identified-retry' }),
+        id: 'stable-event-id',
+        createdAt,
+        index: 17,
+        logGeneration: 'log-generation-1',
+      });
+
+      await waitFor(() => seen.length === 2, { timeoutMs: 8000 });
+      expect(seen).toMatchObject([
+        { id: 'stable-event-id', createdAt, index: 17, logGeneration: 'log-generation-1', deliveryAttempt: 1 },
+        { id: 'stable-event-id', createdAt, index: 17, logGeneration: 'log-generation-1', deliveryAttempt: 2 },
+      ]);
+    });
+
     it('flush waits for in-flight publishes', async () => {
       const ps = createPubSub();
       const topic = `t-${randomUUID()}`;
@@ -242,6 +275,41 @@ describe('RedisStreamsPubSub', () => {
 
       await waitFor(() => cap.calls.length === 1);
       expect(cap.calls[0]!.event.type).toBe('across-instance');
+    });
+
+    it('preserves caller-assigned identity, timestamp, and cursor across instances', async () => {
+      const producer = createPubSub();
+      const consumer = createPubSub();
+      const topic = `t-${randomUUID()}`;
+      const cap = captureCalls();
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await consumer.subscribe(topic, cap.cbAutoAck, { group: `identity-${randomUUID()}` });
+      await producer.publish(topic, {
+        ...makeEvent({ type: 'identified' }),
+        id: 'stable-event-id',
+        createdAt,
+        index: 23,
+        logGeneration: 'log-generation-1',
+      });
+
+      await waitFor(() => cap.calls.length === 1);
+      expect(cap.calls[0]!.event).toMatchObject({
+        id: 'stable-event-id',
+        createdAt,
+        index: 23,
+        logGeneration: 'log-generation-1',
+        deliveryAttempt: 1,
+      });
+    });
+
+    it('requires complete replay identity on canonical lifecycle topics', async () => {
+      const ps = createPubSub();
+      const topic = 'workflow.lifecycle.v1.workflow-id.run-id.execution-1';
+
+      await expect(ps.publish(topic, makeEvent({ type: 'workflow.lifecycle' }))).rejects.toThrow(
+        'missing replay identity',
+      );
     });
   });
 
@@ -802,6 +870,28 @@ describe('RedisStreamsPubSub', () => {
       const delivered = a.calls[0]!.event.data.holder as Holder;
       expect(delivered).toBe(holder);
       expect(delivered.describe()).toBe('holder(alpha)');
+    });
+
+    it('preserves caller-assigned identity for local-only delivery', async () => {
+      const ps = createPubSub();
+      const topic = `t-${randomUUID()}`;
+      const a = captureCalls();
+      const createdAt = new Date('2026-07-15T10:00:00.000Z');
+
+      await ps.subscribe(topic, a.cbAutoAck);
+      await ps.publish(
+        topic,
+        {
+          ...makeEvent({ type: 'local-identified' }),
+          id: 'stable-local-id',
+          createdAt,
+          index: 9,
+        },
+        { localOnly: true },
+      );
+
+      await waitFor(() => a.calls.length === 1);
+      expect(a.calls[0]!.event).toMatchObject({ id: 'stable-local-id', createdAt, index: 9 });
     });
 
     it('does not leak local-only events to other processes', async () => {

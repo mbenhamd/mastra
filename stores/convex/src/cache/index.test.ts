@@ -123,6 +123,75 @@ describe('ConvexServerCache', () => {
       },
     ]);
   });
+
+  it('exposes durable atomic indexed-log operations with stable retry identity', async () => {
+    client.rawResponses = [
+      { result: undefined, hasMore: true },
+      {
+        result: {
+          cursor: 4,
+          storedAt: Date.now(),
+          value: { id: 'event-4' },
+          logGeneration: 'generation-a',
+        },
+      },
+    ];
+
+    await expect(
+      cache.appendIndexedLogEntry('events', { id: 'event-4' }, { maxAgeMs: 60_000, maxEntries: 10 }),
+    ).resolves.toEqual({
+      cursor: 4,
+      storedAt: Date.now(),
+      value: { id: 'event-4' },
+      logGeneration: 'generation-a',
+    });
+
+    expect(cache.indexedLogScope).toBe('durable');
+    expect(client.calls).toHaveLength(2);
+    expect(client.calls[0]).toEqual({
+      op: 'appendIndexedLog',
+      key: 'mastra:cache:events',
+      keyPrefix: 'mastra:cache:',
+      value: { id: 'event-4' },
+      retention: { maxAgeMs: 60_000, maxEntries: 10 },
+      proposedLogGeneration: expect.any(String),
+    });
+    expect(client.calls[1]).toEqual(client.calls[0]);
+  });
+
+  it('decodes indexed-log replay ranges and deletes the complete log', async () => {
+    client.rawResponses = [
+      {
+        result: {
+          entries: [{ cursor: 3, storedAt: Date.now(), value: { id: 'event-3' } }],
+          logGeneration: 'generation-a',
+          firstCursor: 3,
+          nextCursor: 4,
+        },
+      },
+      { result: undefined },
+    ];
+
+    await expect(
+      cache.readIndexedLogEntries<{ id: string }>('events', 2, { maxAgeMs: 60_000, maxEntries: 10 }),
+    ).resolves.toEqual({
+      entries: [{ cursor: 3, storedAt: Date.now(), value: { id: 'event-3' } }],
+      logGeneration: 'generation-a',
+      firstCursor: 3,
+      nextCursor: 4,
+    });
+    await cache.deleteIndexedLog('events');
+
+    expect(client.calls[0]).toEqual({
+      op: 'readIndexedLog',
+      key: 'mastra:cache:events',
+      keyPrefix: 'mastra:cache:',
+      afterCursor: 2,
+      retention: { maxAgeMs: 60_000, maxEntries: 10 },
+      proposedLogGeneration: expect.any(String),
+    });
+    expect(client.calls[1]).toEqual({ op: 'delete', key: 'mastra:cache:events' });
+  });
 });
 
 describe('ConvexCacheClient', () => {

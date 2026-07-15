@@ -261,10 +261,10 @@ export class WorkflowEventProcessor extends EventProcessor {
   private runFormats: Map<string, 'legacy' | 'vnext' | undefined> = new Map();
 
   // How long after a run reaches a terminal state before its
-  // `workflow.events.v2.<runId>` topic is cleared from the pubsub. The
-  // terminal `workflow-finish` watch event is published to that same topic,
-  // so deletion must lag long enough for attached watchers/streams to drain
-  // it. Mirrors DurableAgent's cleanupTimeoutMs default. 0 disables cleanup.
+  // `workflow.events.v2.<runId>` topic is cleared from the pubsub. Exact
+  // indexed replay extends this delay to its declared retention horizon so a
+  // terminal timer cannot erase history before a restartable subscriber's
+  // advertised window closes. 0 explicitly disables timer-based cleanup.
   private readonly topicCleanupDelayMs: number;
   private static readonly DEFAULT_TOPIC_CLEANUP_DELAY_MS = 30_000;
 
@@ -321,10 +321,15 @@ export class WorkflowEventProcessor extends EventProcessor {
   private scheduleRunTopicCleanup(workflowId: string, runId: string): void {
     if (this.topicCleanupDelayMs <= 0) return;
     this.cancelRunTopicCleanup(runId);
+    // Event processors may be constructed before their owning Mastra instance
+    // is registered. Resolve the transport capability here, when the terminal
+    // event is actually processed, rather than capturing a possibly absent or
+    // stale pubsub during construction.
+    const cleanupDelayMs = Math.max(this.topicCleanupDelayMs, this.mastra?.pubsub.indexedReplay?.retentionMs ?? 0);
     const timer = setTimeout(() => {
       this.pendingTopicCleanups.delete(runId);
       void this.clearRunTopicUnlessActive(workflowId, runId);
-    }, this.topicCleanupDelayMs);
+    }, cleanupDelayMs);
     // Don't let a pending cleanup timer keep a short-lived process alive.
     timer.unref?.();
     this.pendingTopicCleanups.set(runId, timer);

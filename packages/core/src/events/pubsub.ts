@@ -1,4 +1,5 @@
-import type { Event, EventCallback, SubscribeOptions } from './types';
+import type { IndexedLogScope } from '../cache/base';
+import type { Event, EventCallback, PublishEvent, SubscribeOptions } from './types';
 
 /**
  * Delivery model for a PubSub implementation.
@@ -16,12 +17,73 @@ import type { Event, EventCallback, SubscribeOptions } from './types';
  */
 export type PubSubDeliveryMode = 'pull' | 'push';
 
+export type IndexedReplayCapability = {
+  /** Whether retained history survives the process that created it. */
+  scope: IndexedLogScope;
+  /** Maximum configured age of retained events. */
+  retentionMs: number;
+  /** Maximum configured events retained per topic. */
+  maxEvents: number;
+};
+
+export type IndexedReplayRange = IndexedReplayCapability & {
+  /** Changes when retained state is deleted or expires completely. */
+  logGeneration: string;
+  /** Earliest cursor still available. Equals nextCursor when history is empty. */
+  firstCursor: number;
+  /** Cursor that the next publish will receive. */
+  nextCursor: number;
+};
+
+export class IndexedReplayCursorError extends Error {
+  readonly name = 'IndexedReplayCursorError';
+
+  constructor(
+    readonly reason: 'cursor-too-old' | 'cursor-ahead' | 'generation-mismatch',
+    readonly requestedCursor: number,
+    readonly range: IndexedReplayRange,
+    readonly requestedLogGeneration?: string,
+  ) {
+    super(
+      reason === 'generation-mismatch'
+        ? `Indexed replay log generation ${requestedLogGeneration} does not match current generation ${range.logGeneration}`
+        : reason === 'cursor-too-old'
+          ? `Indexed replay cursor ${requestedCursor} is older than retained cursor ${range.firstCursor}`
+          : `Indexed replay cursor ${requestedCursor} is ahead of next cursor ${range.nextCursor}`,
+    );
+  }
+}
+
+export class IndexedReplayIntegrityError extends Error {
+  readonly name = 'IndexedReplayIntegrityError';
+
+  constructor(
+    readonly reason:
+      | 'cursor-gap'
+      | 'identity-mismatch'
+      | 'invalid-live-cursor'
+      | 'live-event-not-retained'
+      | 'malformed-retained-event',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export type IndexedReplaySubscribeOptions = {
+  /** Expected retained-log generation from the previously committed event. */
+  logGeneration?: string;
+  /**
+   * Receives terminal replay failures that occur after subscription setup has
+   * completed (for example retention expiry or log recreation). The replay
+   * subscription stops before invoking this callback and never acknowledges
+   * the ambiguous delivery.
+   */
+  onError?: (error: Error) => void | Promise<void>;
+};
+
 export abstract class PubSub {
-  abstract publish(
-    topic: string,
-    event: Omit<Event, 'id' | 'createdAt'>,
-    options?: { localOnly?: boolean },
-  ): Promise<void>;
+  abstract publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void>;
   abstract subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions): Promise<void>;
   abstract unsubscribe(topic: string, cb: EventCallback): Promise<void>;
   /**
@@ -82,6 +144,21 @@ export abstract class PubSub {
     return false;
   }
 
+  /** Exact indexed replay metadata, or undefined for best-effort replay. */
+  get indexedReplay(): IndexedReplayCapability | undefined {
+    return undefined;
+  }
+
+  /** Whether this implementation can replay an exact retained cursor range. */
+  get supportsIndexedReplay(): boolean {
+    return this.indexedReplay !== undefined;
+  }
+
+  /** Return the currently retained exact cursor range for a topic. */
+  getIndexedReplayRange(_topic: string): Promise<IndexedReplayRange | undefined> {
+    return Promise.resolve(undefined);
+  }
+
   /**
    * Get historical events for a topic.
    * Default implementation returns empty array (no history support).
@@ -118,7 +195,12 @@ export abstract class PubSub {
    * @param offset - Start replaying from this index (0-based)
    * @param cb - Callback invoked for each event
    */
-  subscribeFromOffset(topic: string, _offset: number, cb: EventCallback): Promise<void> {
+  subscribeFromOffset(
+    topic: string,
+    _offset: number,
+    cb: EventCallback,
+    _options?: IndexedReplaySubscribeOptions,
+  ): Promise<void> {
     return this.subscribeWithReplay(topic, cb);
   }
 }

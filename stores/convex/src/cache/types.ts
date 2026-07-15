@@ -40,6 +40,22 @@ export type CacheRequest =
       key: string;
       keyPrefix: string;
       expiresAt: number | null;
+    }
+  | {
+      op: 'appendIndexedLog';
+      key: string;
+      keyPrefix: string;
+      value: unknown;
+      retention: { maxAgeMs: number; maxEntries: number };
+      proposedLogGeneration: string;
+    }
+  | {
+      op: 'readIndexedLog';
+      key: string;
+      keyPrefix: string;
+      afterCursor: number;
+      retention: { maxAgeMs: number; maxEntries: number };
+      proposedLogGeneration: string;
     };
 
 export type CacheResponse =

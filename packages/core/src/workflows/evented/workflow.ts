@@ -73,6 +73,8 @@ import type {
   StepMetadata,
   CreateWorkflowParams,
   InferSchemaOutput,
+  WorkflowLifecycleEventCallback,
+  WorkflowLifecycleWatchOptions,
 } from '../../workflows/types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
 import { validateCron } from '../scheduler/cron';
@@ -81,6 +83,7 @@ import { forwardAgentStreamChunk } from '../stream-utils';
 import type { StreamChunkWriter } from '../stream-utils';
 import { Workflow, Run } from '../workflow';
 import type { AgentStepOptions, RunWithRawInput } from '../workflow';
+import { watchWorkflowLifecycleEvents } from '../workflow-lifecycle';
 import { EventedExecutionEngine } from './execution-engine';
 import { isEventedForeachSuspensionResult } from './foreach-suspension';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
@@ -2455,6 +2458,29 @@ export class EventedRun<
     return async () => {
       await this.mastra?.pubsub.unsubscribe(`workflow.events.v2.${this.runId}`, watchCb).catch(() => {});
     };
+  }
+
+  override async watchLifecycle(
+    cb: WorkflowLifecycleEventCallback,
+    options?: WorkflowLifecycleWatchOptions,
+  ): Promise<() => Promise<void>> {
+    if (!this.mastra?.pubsub) {
+      throw new MastraError({
+        id: 'WORKFLOW_LIFECYCLE_PUBSUB_REQUIRED',
+        domain: ErrorDomain.MASTRA_WORKFLOW,
+        category: ErrorCategory.USER,
+        text: 'A Mastra instance with PubSub is required to watch an evented workflow lifecycle',
+        details: { workflowId: this.workflowId, runId: this.runId },
+      });
+    }
+
+    return watchWorkflowLifecycleEvents({
+      pubsub: this.mastra.pubsub,
+      workflowId: this.workflowId,
+      runId: this.runId,
+      callback: cb,
+      options,
+    });
   }
 
   async cancel() {

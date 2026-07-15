@@ -23,6 +23,54 @@ import type { WorkflowTerminalRecoveryEnvelopeV1 } from './terminal-recovery/typ
 export type OutputWriter<TChunk = any> = (chunk: TChunk, options?: { messageId?: string }) => Promise<void>;
 
 /**
+ * A workflow stream event together with the durable delivery identity needed
+ * by projectors and other restartable consumers.
+ *
+ * `event` deliberately remains the existing {@link WorkflowStreamEvent}; the
+ * lifecycle envelope adds transport identity without changing the stream
+ * event contract consumed by existing `watch()` callers.
+ */
+export type WorkflowLifecycleEvent = {
+  /** Stable identity shared by live delivery and replay. */
+  eventId: string;
+  /** Zero-based position within this run's workflow event topic. */
+  cursor: number;
+  /** Time the event was first published. */
+  createdAt: Date;
+  /** Delivery count for this event, starting at one. */
+  deliveryAttempt: number;
+  /** Retained-log generation used to reject cursor reuse after expiry/reset. */
+  logGeneration: string;
+  workflowId: string;
+  runId: string;
+  event: WorkflowStreamEvent;
+};
+
+export type WorkflowLifecycleEventCallback = (event: WorkflowLifecycleEvent) => void | Promise<void>;
+export type WorkflowLifecycleErrorCallback = (error: Error) => void | Promise<void>;
+
+export type WorkflowLifecycleWatchOptions = {
+  /**
+   * Resume strictly after this committed cursor. Omit to replay from the
+   * beginning of retained history.
+   */
+  afterCursor?: number;
+  /** Log generation returned with the event at `afterCursor`. */
+  afterLogGeneration?: string;
+  /**
+   * Allow exact replay whose retained log only lives in the current process.
+   * Intended for local development and tests. Durable replay is required by
+   * default so restartable consumers never silently depend on process memory.
+   */
+  allowProcessLocalReplay?: boolean;
+  /**
+   * Receives terminal replay failures that happen after setup, such as the
+   * retained log expiring or being cleared while this watcher is active.
+   */
+  onError?: WorkflowLifecycleErrorCallback;
+};
+
+/**
  * Options for `Run.start()` beyond the generic `inputData`/`initialState`/`requestContext` fields.
  */
 export type WorkflowRunStartOptions = {
