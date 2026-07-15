@@ -19,12 +19,35 @@ type HarnessMessageContent =
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_call'; id: string; name: string; args: JsonValue }
   | { type: 'tool_result'; id: string; name: string; result: JsonValue; isError: boolean }
-  | { type: 'system_reminder'; message: string; reminderType?: string; path?: string; precedesMessageId?: string; gapText?: string; gapMs?: number; timestamp?: string }
+  | {
+      type: 'system_reminder';
+      message: string;
+      reminderType?: string;
+      path?: string;
+      precedesMessageId?: string;
+      gapText?: string;
+      gapMs?: number;
+      timestamp?: string;
+    }
   | { type: 'image'; data: string; mimeType: string }
   | { type: 'file'; data: string; mediaType: string; filename?: string }
   | { type: 'om_observation_start'; tokensToObserve: number; operationType?: 'observation' | 'reflection' }
-  | { type: 'om_observation_end'; tokensObserved: number; observationTokens: number; durationMs: number; operationType?: 'observation' | 'reflection'; observations?: string; currentTask?: string; suggestedResponse?: string }
-  | { type: 'om_observation_failed'; error: string; tokensAttempted?: number; operationType?: 'observation' | 'reflection' }
+  | {
+      type: 'om_observation_end';
+      tokensObserved: number;
+      observationTokens: number;
+      durationMs: number;
+      operationType?: 'observation' | 'reflection';
+      observations?: string;
+      currentTask?: string;
+      suggestedResponse?: string;
+    }
+  | {
+      type: 'om_observation_failed';
+      error: string;
+      tokensAttempted?: number;
+      operationType?: 'observation' | 'reflection';
+    }
   | { type: 'om_thread_title_updated'; threadId: string; oldTitle?: string; newTitle: string };
 
 // Operation-scoped terminal success result for non-stream `signal(...)`,
@@ -84,5 +107,4 @@ interface AgentStream {
   readonly signalId: string;
   readonly textStream: AsyncIterable<string>;
 }
-
 ```

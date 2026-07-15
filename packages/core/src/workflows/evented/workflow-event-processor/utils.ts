@@ -40,7 +40,11 @@ export function getNestedWorkflow(
   // Internal workflows (registered via `Mastra.__registerInternalWorkflow`)
   // aren't visible to `Mastra.getWorkflow` — it only sees the public registry.
   // Prefer the internal registry first so nested-workflow resolution works
-  // for callers like the bg-tasks `__background-task` workflow.
+  // for callers like the bg-tasks `__background-task` workflow. When `runId`
+  // is set we hand it to the registry so concurrent invocations sharing the
+  // same workflow id (e.g. parent + sub-agent each owning their own
+  // `agentic-loop` instance with distinct closures) resolve to the right
+  // closure-bound instance instead of whichever one happened to register last.
   workflow =
     workflow ??
     (mastra.__hasInternalWorkflow(workflowId, runId)

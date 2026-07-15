@@ -96,56 +96,57 @@ contracts):
 
     <rect style="fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 5 5; rx: 12;" x="40" y="514" width="960" height="34" />
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="60" y="536">Per-row enqueue snapshots the resolved operationKind, optional operationName, and deliverySemantics; later runtime changes do not re-decide existing rows.</text>
+
   </svg>
   <figcaption>Each channel record wires identity, provider bridge capabilities, ingress policy, and worker recovery; the outbox snapshot rule and verified-envelope flow are the two cross-cutting paths declared in this section.</figcaption>
 </figure>
 
 ```ts
 interface HarnessChannelConfig {
-  providerId?: string;                              // Defaults to this record's channelId.
-                                                    // This is the Mastra channels registration key,
-                                                    // not the provider's platform/type id.
-                                                    // Required for Mastra Server-mounted channels.
-                                                    // Provider-less bridges are local/test-only and
-                                                    // are not exposed as external webhook routes.
-  platform?: string;                                // Defaults to the provider's platform/id
+  providerId?: string; // Defaults to this record's channelId.
+  // This is the Mastra channels registration key,
+  // not the provider's platform/type id.
+  // Required for Mastra Server-mounted channels.
+  // Provider-less bridges are local/test-only and
+  // are not exposed as external webhook routes.
+  platform?: string; // Defaults to the provider's platform/id
   bridge: HarnessChannelBridge;
   ingress: ChannelIngressPolicy;
   inbox?: {
-    maxAttempts?: number;                            // Default: 10
-    claimTtlMs?: number;                             // Default: 30_000
-    claimRenewMs?: number;                           // Default: claimTtlMs / 3
-    maxClockSkewMs?: number;                         // Required when adapter time is not storage-authoritative
-    batchSize?: number;                              // Default: 50
-    retryBackoffMs?: (attempt: number) => number;    // Default: exponential with jitter
+    maxAttempts?: number; // Default: 10
+    claimTtlMs?: number; // Default: 30_000
+    claimRenewMs?: number; // Default: claimTtlMs / 3
+    maxClockSkewMs?: number; // Required when adapter time is not storage-authoritative
+    batchSize?: number; // Default: 50
+    retryBackoffMs?: (attempt: number) => number; // Default: exponential with jitter
   };
   actions?: {
-    maxAttempts?: number;                            // Default: 10
-    claimTtlMs?: number;                             // Default: 30_000
-    claimRenewMs?: number;                           // Default: claimTtlMs / 3
-    maxClockSkewMs?: number;                         // Required when adapter time is not storage-authoritative
-    batchSize?: number;                              // Default: 50
-    retryBackoffMs?: (attempt: number) => number;    // Default: exponential with jitter
+    maxAttempts?: number; // Default: 10
+    claimTtlMs?: number; // Default: 30_000
+    claimRenewMs?: number; // Default: claimTtlMs / 3
+    maxClockSkewMs?: number; // Required when adapter time is not storage-authoritative
+    batchSize?: number; // Default: 50
+    retryBackoffMs?: (attempt: number) => number; // Default: exponential with jitter
   };
   outbox?: {
-    maxAttempts?: number;                            // Default: 10
+    maxAttempts?: number; // Default: 10
     // `claimTtlMs`, `claimRenewMs`, and `maxClockSkewMs` mirror the §9.1
     // `backgroundTasks` defaults so operators learn one timing dialect across
     // the claim/renew/retry/cleanup substrate; see §14.4 prior-art citation of
     // `packages/core/src/background-tasks/manager.ts`. Channel-specific
     // overrides are reserved for cases where channel delivery semantics
     // require tighter timing.
-    claimTtlMs?: number;                             // Default: 30_000
-    claimRenewMs?: number;                           // Default: claimTtlMs / 3
-    maxClockSkewMs?: number;                         // Required when adapter time is not storage-authoritative
-    batchSize?: number;                              // Default: 50
-    pollIntervalMs?: number;                         // Default: 1_000 for built-in workers
-    retryBackoffMs?: (attempt: number) => number;    // Default: exponential with jitter
+    claimTtlMs?: number; // Default: 30_000
+    claimRenewMs?: number; // Default: claimTtlMs / 3
+    maxClockSkewMs?: number; // Required when adapter time is not storage-authoritative
+    batchSize?: number; // Default: 50
+    pollIntervalMs?: number; // Default: 1_000 for built-in workers
+    retryBackoffMs?: (attempt: number) => number; // Default: exponential with jitter
   };
 }
 
 interface ChannelIngressPolicy {
-  defaultDelivery?: 'signal' | 'queue';              // Default: 'signal'
+  defaultDelivery?: 'signal' | 'queue'; // Default: 'signal'
   // Declarative gates checked before `resolveResource`. They constrain which
   // conversation shapes may create or reuse bindings; they do not by
   // themselves derive Harness identity from platform payload fields.
@@ -254,7 +255,10 @@ interface HarnessChannelBridge {
   // authoritatively proved the operation was not delivered; transient,
   // unsupported, or ambiguous lookup results must fail instead of being
   // collapsed into false.
-  reconcileDelivery?(item: ChannelOutboxItem, ctx: HarnessChannelDeliveryContext): Promise<{
+  reconcileDelivery?(
+    item: ChannelOutboxItem,
+    ctx: HarnessChannelDeliveryContext,
+  ): Promise<{
     delivered: boolean;
     providerMessageId?: string;
     providerReceipt?: ChannelProviderDeliveryReceipt;
@@ -264,7 +268,10 @@ interface HarnessChannelBridge {
   // thread handle from durable target IDs, but must not require a live
   // AgentStream, SDK Thread instance, webhook request/response, or process-local
   // handler closure.
-  sendProviderOperation(item: ChannelOutboxItem, ctx: HarnessChannelDeliveryContext): Promise<{
+  sendProviderOperation(
+    item: ChannelOutboxItem,
+    ctx: HarnessChannelDeliveryContext,
+  ): Promise<{
     providerMessageId?: string;
     providerReceipt?: ChannelProviderDeliveryReceipt;
   }>;
@@ -304,7 +311,7 @@ interface ChannelIngressEnvelope {
   actor?: ChannelRequestContext['actor'];
   files?: FileAttachment[];
   receivedAt: number;
-  raw?: unknown;                     // bridge-boundary data only; never persisted or hashed
+  raw?: unknown; // bridge-boundary data only; never persisted or hashed
 }
 
 // Bridges must return canonical, provider-verified external identifiers
@@ -316,14 +323,13 @@ interface ChannelIngressEnvelope {
 // before hashing, binding lookup, or storage uniqueness checks.
 
 interface ChannelActionEnvelope {
-  actionId: string;                  // provider retry/idempotency ID
-  token: string;                     // provider-visible token string or opaque handle
+  actionId: string; // provider retry/idempotency ID
+  token: string; // provider-visible token string or opaque handle
   // Candidate provider response. The bridge validates or normalizes this to
   // `JsonValue` before computing `responseHash` or writing a durable
   // `ChannelActionReceipt`; `raw` remains bridge-boundary data only.
   response: unknown;
   actor?: ChannelRequestContext['actor']; // provider-verified actor who performed the action
-  raw?: unknown;                     // bridge-boundary data only; never persisted or hashed
+  raw?: unknown; // bridge-boundary data only; never persisted or hashed
 }
-
 ```

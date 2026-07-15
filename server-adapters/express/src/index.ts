@@ -554,6 +554,7 @@ export class MastraServer extends MastraServerBase<Application, Request, Respons
           getHeader: (name: string) => req.get(name),
           requestBody: params.body,
           requestPathParams: params.urlParams,
+          request: toWebRequest(req),
         };
 
         // Check route permission requirement (EE feature)

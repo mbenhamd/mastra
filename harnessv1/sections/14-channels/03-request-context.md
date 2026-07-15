@@ -4,25 +4,23 @@ Channel metadata is attached to the turn as `requestContext.channel` and is
 exposed to tools on `HarnessRequestContext.channel` (§6.1).
 
 ```ts
-type ChannelRequestContext =
-  | InboundChannelRequestContext
-  | BindingBackedChannelRequestContext;
+type ChannelRequestContext = InboundChannelRequestContext | BindingBackedChannelRequestContext;
 
 interface BaseChannelRequestContext {
   harnessName: string;
-  channelId: string;                 // registered Harness channel key
-  providerId: string;                // registered Mastra ChannelProvider key
-  platform: string;                  // e.g. 'slack', 'discord', 'teams'
+  channelId: string; // registered Harness channel key
+  providerId: string; // registered Mastra ChannelProvider key
+  platform: string; // e.g. 'slack', 'discord', 'teams'
   conversationKind?: 'dm' | 'group-dm' | 'channel' | 'thread';
   trigger?: 'message' | 'mention' | 'subscribed-message' | 'command';
-  externalTenantId?: string;         // workspace / guild / org, if the platform has one
-  externalChannelId?: string;        // platform room/channel/DM identifier
-  externalThreadId: string;          // platform thread/conversation identifier
+  externalTenantId?: string; // workspace / guild / org, if the platform has one
+  externalChannelId?: string; // platform room/channel/DM identifier
+  externalThreadId: string; // platform thread/conversation identifier
   replyToMessageId?: string;
   actor?: {
     externalUserId: string;
     displayName?: string;
-    linkedResourceId?: string;       // set only after app-level identity linking
+    linkedResourceId?: string; // set only after app-level identity linking
   };
   capabilities?: {
     markdown?: boolean;
@@ -35,13 +33,13 @@ interface BaseChannelRequestContext {
 
 interface InboundChannelRequestContext extends BaseChannelRequestContext {
   origin: 'inbound';
-  bindingId?: string;                // present once the provider event resolves a ChannelBinding
-  externalMessageId: string;         // inbound platform message/event ID
+  bindingId?: string; // present once the provider event resolves a ChannelBinding
+  externalMessageId: string; // inbound platform message/event ID
 }
 
 interface BindingBackedChannelRequestContext extends BaseChannelRequestContext {
   origin: 'scheduled' | 'proactive';
-  bindingId: string;                 // active ChannelBinding used for delivery/replies
+  bindingId: string; // active ChannelBinding used for delivery/replies
   externalMessageId?: never;
 }
 ```

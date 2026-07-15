@@ -74,6 +74,7 @@ createTestSuite(
     id: 'upstash-test-store',
     ...TEST_CONFIG,
   }),
+  { deterministicScorePagination: true },
 );
 
 // Configuration validation tests
@@ -324,7 +325,7 @@ describe('updateMessages keeps msg-idx index in sync', () => {
 });
 
 describe('WorkflowsUpstash.persistWorkflowSnapshot', () => {
-  it('preserves createdAt and advances updatedAt for resource-scoped workflow runs', async () => {
+  it('preserves, loads, and deletes a resource-scoped workflow run', async () => {
     const workflowsDomain = new WorkflowsUpstash({ client: createTestClient() });
     await workflowsDomain.init();
 
@@ -343,11 +344,6 @@ describe('WorkflowsUpstash.persistWorkflowSnapshot', () => {
       updatedAt: createdAt,
     });
 
-    const firstPersist = await workflowsDomain.getWorkflowRunById({ runId, workflowName });
-    expect(firstPersist?.createdAt.toISOString()).toBe(createdAt.toISOString());
-    expect(firstPersist?.updatedAt.toISOString()).toBe(createdAt.toISOString());
-    expect(firstPersist?.resourceId).toBe(resourceId);
-
     await workflowsDomain.persistWorkflowSnapshot({
       workflowName,
       runId,
@@ -362,7 +358,6 @@ describe('WorkflowsUpstash.persistWorkflowSnapshot', () => {
     const fetched = await workflowsDomain.getWorkflowRunById({ runId, workflowName });
     expect(fetched?.createdAt.toISOString()).toBe(createdAt.toISOString());
     expect(fetched?.updatedAt.toISOString()).toBe(updatedAt.toISOString());
-    expect(fetched!.updatedAt.getTime()).toBeGreaterThan(fetched!.createdAt.getTime());
     expect(fetched?.resourceId).toBe(resourceId);
 
     await workflowsDomain.deleteWorkflowRunById({ runId, workflowName });

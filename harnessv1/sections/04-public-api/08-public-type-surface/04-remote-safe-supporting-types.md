@@ -4,8 +4,7 @@
 // Remote-safe skill reads cannot expose local schema implementation objects.
 // In-process callers that need raw PublicSchema objects narrow to Session and
 // read HarnessSkill; portable callers handle this descriptor shape.
-interface RemoteSafeSkillDescriptor
-  extends Omit<HarnessSkill, 'argsSchema' | 'outputSchema'> {
+interface RemoteSafeSkillDescriptor extends Omit<HarnessSkill, 'argsSchema' | 'outputSchema'> {
   argsSchema?: WireSchemaDescriptor;
   outputSchema?: WireSchemaDescriptor;
 }
@@ -19,10 +18,7 @@ interface RemoteSignalOptions<S extends PublicSchema | undefined = undefined> {
   type?: 'user-message' | 'system-reminder' | string;
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   files?: FileAttachment[];
   attributes?: Record<string, JsonValue>;
   metadata?: Record<string, JsonValue>;
@@ -39,10 +35,7 @@ interface RemoteSignalOptions<S extends PublicSchema | undefined = undefined> {
 interface RemoteQueueOptions {
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   files?: FileAttachment[];
   admissionId?: string;
   requestContext?: RequestContextInput;
@@ -120,5 +113,4 @@ interface RemoteSafeObservationalMemory {
   getRecord(): Promise<ObservationalMemorySnapshot | null>;
   loadProgress(): Promise<void>;
 }
-
 ```

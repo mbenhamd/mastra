@@ -1,9 +1,9 @@
 ### 2.5 Modes, Models, Skills
 
 Modes, models, and skills are the three orthogonal selectors a Harness run
-composes. Mode picks *which configured agent* (and therefore which
-instructions and base tool surface) handles the turn; model picks *which
-LLM* drives that agent; skill picks *a specific parameterised prompt* to
+composes. Mode picks _which configured agent_ (and therefore which
+instructions and base tool surface) handles the turn; model picks _which
+LLM_ drives that agent; skill picks _a specific parameterised prompt_ to
 hand the agent. They live on different lifetimes and have different sources
 of truth, which the rest of the spec relies on when declaring durability,
 override scope, and per-turn admission rules.

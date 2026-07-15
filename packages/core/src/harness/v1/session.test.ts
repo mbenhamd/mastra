@@ -16,9 +16,9 @@ import type { SessionRecord } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
+import { setupHarness } from './__test-utils__/setup';
 import { Harness } from './harness';
 import { Session } from './session';
-import { setupHarness } from './__test-utils__/setup';
 
 function makeAgent(name = 'test-agent') {
   return new Agent({

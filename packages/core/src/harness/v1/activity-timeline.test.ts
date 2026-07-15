@@ -6,15 +6,10 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { HarnessMessage } from '../types';
+import type { AgentControllerMessage as HarnessMessage } from '../../agent-controller/types';
 
-import {
-  ACTIVITY_TIMELINE_DEFAULT_LIMIT,
-  buildActivityTimeline
-  
-  
-} from './activity-timeline';
-import type {ActivityTimelineSessionInput, BuildActivityTimelineInput} from './activity-timeline';
+import { ACTIVITY_TIMELINE_DEFAULT_LIMIT, buildActivityTimeline } from './activity-timeline';
+import type { ActivityTimelineSessionInput, BuildActivityTimelineInput } from './activity-timeline';
 
 function msg(id: string, role: HarnessMessage['role'], at: number, content: HarnessMessage['content']): HarnessMessage {
   return { id, role, content, createdAt: new Date(at) };
@@ -67,7 +62,9 @@ describe('buildActivityTimeline — entry building', () => {
 
   it('truncates long text summaries and never leaks the full body', () => {
     const long = 'a'.repeat(1000);
-    const tl = buildActivityTimeline(input([addressed({ messages: [msg('m1', 'user', 1, [{ type: 'text', text: long }])] })]));
+    const tl = buildActivityTimeline(
+      input([addressed({ messages: [msg('m1', 'user', 1, [{ type: 'text', text: long }])] })]),
+    );
     const entry = tl.entries[0]!;
     expect(entry.summary!.length).toBeLessThan(long.length);
     expect(entry.summary!.endsWith('…')).toBe(true);
@@ -77,7 +74,13 @@ describe('buildActivityTimeline — entry building', () => {
     const tl = buildActivityTimeline(
       input([
         addressed({
-          goal: { id: 'g1', objective: 'ship it', status: 'active', createdAt: 50, lastDecision: { decision: 'continue', reason: 'not done', judgedAt: 150 } },
+          goal: {
+            id: 'g1',
+            objective: 'ship it',
+            status: 'active',
+            createdAt: 50,
+            lastDecision: { decision: 'continue', reason: 'not done', judgedAt: 150 },
+          },
           pendingInbox: [{ itemId: 'p1', kind: 'tool-approval', requestedAt: 120, toolName: 'rm', runId: 'r1' }],
         }),
       ]),
@@ -133,18 +136,41 @@ describe('buildActivityTimeline — cursor validation (before any scan)', () => 
 
   it('rejects a cursor issued for a different session', () => {
     const other = buildActivityTimeline(
-      { addressedSessionId: 'OTHER', addressedThreadId: 't1', generatedAt: 1, sessions: [{ sessionId: 'OTHER', threadId: 't1', depth: 0, messages: [msg('m1', 'user', 1, [{ type: 'text', text: 'x' }]), msg('m2', 'user', 2, [{ type: 'text', text: 'y' }])] }] },
+      {
+        addressedSessionId: 'OTHER',
+        addressedThreadId: 't1',
+        generatedAt: 1,
+        sessions: [
+          {
+            sessionId: 'OTHER',
+            threadId: 't1',
+            depth: 0,
+            messages: [
+              msg('m1', 'user', 1, [{ type: 'text', text: 'x' }]),
+              msg('m2', 'user', 2, [{ type: 'text', text: 'y' }]),
+            ],
+          },
+        ],
+      },
       { limit: 1 },
     );
-    expect(() => buildActivityTimeline(input([addressed()]), { cursor: other.nextCursor })).toThrow(/different session/);
+    expect(() => buildActivityTimeline(input([addressed()]), { cursor: other.nextCursor })).toThrow(
+      /different session/,
+    );
   });
 
   it('rejects a cursor issued for a different includeDescendants scope', () => {
-    const messages = [msg('m1', 'user', 1, [{ type: 'text', text: 'x' }]), msg('m2', 'user', 2, [{ type: 'text', text: 'y' }])];
+    const messages = [
+      msg('m1', 'user', 1, [{ type: 'text', text: 'x' }]),
+      msg('m2', 'user', 2, [{ type: 'text', text: 'y' }]),
+    ];
     const withDesc = buildActivityTimeline(input([addressed({ messages })]), { limit: 1, includeDescendants: true });
-    expect(() => buildActivityTimeline(input([addressed({ messages })]), { cursor: withDesc.nextCursor, includeDescendants: false })).toThrow(
-      /includeDescendants/,
-    );
+    expect(() =>
+      buildActivityTimeline(input([addressed({ messages })]), {
+        cursor: withDesc.nextCursor,
+        includeDescendants: false,
+      }),
+    ).toThrow(/includeDescendants/);
   });
 
   it('rejects a non-positive-integer limit', () => {

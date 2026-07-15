@@ -22,9 +22,11 @@ import { escapeUnescapedControlCharsInJsonStrings } from '../../stream/base/outp
 import { MastraAgentNetworkStream } from '../../stream/MastraAgentNetworkStream';
 import { resolveToolRequiresApproval } from '../../tools/approval';
 import type { IdGeneratorContext } from '../../types';
+import { createWorkflow } from '../../workflows/create';
 import type { Step, SuspendOptions } from '../../workflows/step';
-import { createStep, createWorkflow } from '../../workflows/workflow';
+import { createStep } from '../../workflows/workflow';
 import { PRIMITIVE_TYPES } from '../types';
+import { pruneAgentLoopSnapshot } from '../workflows/prune-snapshot';
 
 /**
  * Convert a schema (PublicSchema) to JSON Schema.
@@ -2062,6 +2064,9 @@ export async function createNetworkLoop({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Agent-loop snapshots are pure resume artifacts — strip everything a
+      // resume never reads before persisting.
+      pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — the workflow exists to coordinate
       // routing and primitive execution, but only the user-facing
@@ -2656,6 +2661,7 @@ export async function networkLoop<OUTPUT = undefined>({
     outputSchema: validationStep.outputSchema,
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.
       tracingPolicy: {
@@ -2693,6 +2699,7 @@ export async function networkLoop<OUTPUT = undefined>({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.
       tracingPolicy: {

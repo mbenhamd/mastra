@@ -139,11 +139,7 @@ interface SessionListItem {
   pendingInbox: SessionPendingInboxSummary;
   durableWork: DurableWorkListSummary;
   goal?: SessionGoalSummary;
-  channelBinding?: Pick<
-    SessionChannelBindingSummary,
-    'bindingId' | 'channelId' | 'providerId' | 'platform' | 'status'
-  >;
+  channelBinding?: Pick<SessionChannelBindingSummary, 'bindingId' | 'channelId' | 'providerId' | 'platform' | 'status'>;
   lastError?: { code: HarnessRowErrorCode; message: string };
 }
-
 ```

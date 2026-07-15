@@ -69,7 +69,8 @@ authoritative):
   <path d="M 710 132 C 650 110, 640 82, 710 72" fill="none" stroke="#f97316" stroke-width="1.3" stroke-dasharray="4 2" marker-end="url(#ah-session-api)"/>
   <text x="650" y="103" text-anchor="middle" font-size="9" font-weight="600" fill="#9a3412" font-family="Inter, sans-serif">resume</text>
 
-  <text x="450" y="348" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">4.2 — Session API families</text>
+<text x="450" y="348" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">4.2 — Session API families</text>
 </svg>
+
 <figcaption>Method families on the Session API; the subsection signatures below remain authoritative for parameters, errors, and operation-scoped event behavior.</figcaption>
 </figure>

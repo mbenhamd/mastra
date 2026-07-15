@@ -66,6 +66,7 @@ resume idempotency rules):
 
     <path style="stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#ah-action-flow);" d="M361 530 L116 530" />
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="125" y="522">9. ACK provider</text>
+
   </svg>
   <figcaption>Channel actions are first-response-wins: token identity gates duplicates, audience policy gates first use, the receipt becomes accepted on session resume start and applied only after the run resume completes under the same responseId.</figcaption>
 </figure>

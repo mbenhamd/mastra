@@ -37,7 +37,10 @@ describe('createHarnessOperatorThreadController(harness).setSettings()', () => {
 
     // §10.2: thread settings changes emit no public event — behavior is read
     // back via getSettings (the operator/internal boundary).
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({
       existing: 'keep-me',
       observationThreshold: 5,
@@ -59,7 +62,10 @@ describe('createHarnessOperatorThreadController(harness).setSettings()', () => {
       patch: { stale: undefined },
     });
 
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({ kept: 1 });
   });
 
@@ -78,7 +84,10 @@ describe('createHarnessOperatorThreadController(harness).setSettings()', () => {
     });
 
     // `same` is unchanged; `other` advances to 'b'.
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({ same: 'value', other: 'b' });
   });
 
@@ -96,7 +105,10 @@ describe('createHarnessOperatorThreadController(harness).setSettings()', () => {
       patch: { a: 1, missing: undefined },
     });
 
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({ a: 1 });
   });
 
@@ -114,7 +126,10 @@ describe('createHarnessOperatorThreadController(harness).setSettings()', () => {
       patch: { keepA: 'A-prime' },
     });
 
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({ keepA: 'A-prime', keepB: 'B' });
   });
 
@@ -146,7 +161,10 @@ describe('createHarnessOperatorThreadController(harness).getSettings() / getSett
   it('returns an empty object when the thread has no metadata', async () => {
     const { harness } = setupHarness();
     const thread = await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', title: 't' });
-    const settings = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const settings = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(settings).toEqual({});
   });
 
@@ -158,7 +176,10 @@ describe('createHarnessOperatorThreadController(harness).getSettings() / getSett
       metadata: { a: 1 },
     });
 
-    const snapshot = await createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: thread.id });
+    const snapshot = await createHarnessOperatorThreadController(harness).getSettings({
+      resourceId: 'r1',
+      threadId: thread.id,
+    });
     expect(snapshot).toEqual({ a: 1 });
     expect(Object.isFrozen(snapshot)).toBe(true);
 
@@ -180,21 +201,33 @@ describe('createHarnessOperatorThreadController(harness).getSettings() / getSett
       metadata: { knownKey: 'hello' },
     });
 
-    await expect(createHarnessOperatorThreadController(harness).getSetting({ resourceId: 'r1', threadId: thread.id, key: 'knownKey' })).resolves.toBe(
-      'hello',
-    );
     await expect(
-      createHarnessOperatorThreadController(harness).getSetting({ resourceId: 'r1', threadId: thread.id, key: 'missing' }),
+      createHarnessOperatorThreadController(harness).getSetting({
+        resourceId: 'r1',
+        threadId: thread.id,
+        key: 'knownKey',
+      }),
+    ).resolves.toBe('hello');
+    await expect(
+      createHarnessOperatorThreadController(harness).getSetting({
+        resourceId: 'r1',
+        threadId: thread.id,
+        key: 'missing',
+      }),
     ).resolves.toBeUndefined();
   });
 
   it('throws HarnessThreadNotFoundError on a missing thread', async () => {
     const { harness } = setupHarness();
-    await expect(createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: 'no-such-thread' })).rejects.toBeInstanceOf(
-      HarnessThreadNotFoundError,
-    );
     await expect(
-      createHarnessOperatorThreadController(harness).getSetting({ resourceId: 'r1', threadId: 'no-such-thread', key: 'x' }),
+      createHarnessOperatorThreadController(harness).getSettings({ resourceId: 'r1', threadId: 'no-such-thread' }),
+    ).rejects.toBeInstanceOf(HarnessThreadNotFoundError);
+    await expect(
+      createHarnessOperatorThreadController(harness).getSetting({
+        resourceId: 'r1',
+        threadId: 'no-such-thread',
+        key: 'x',
+      }),
     ).rejects.toBeInstanceOf(HarnessThreadNotFoundError);
   });
 });

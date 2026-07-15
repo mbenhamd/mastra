@@ -35,18 +35,18 @@ the current actor is recorded in `requestContext.channel.actor` and never
 retargets the binding resource.
 
 - provider-owned OAuth/provisioning routes may stay provider routes, while
-Harness bridge routes or provider callbacks must identify
-`(harnessName, channelId)` before ingress;
+  Harness bridge routes or provider callbacks must identify
+  `(harnessName, channelId)` before ingress;
 - provider-owned event/action routes that restore an existing installation must
-restore a Harness owner or a separately configured non-Harness live owner, never both;
+  restore a Harness owner or a separately configured non-Harness live owner, never both;
 - provider webhook verification and normalization stay adapter/provider
-concerns, but the registry route context is authoritative for `harnessName`,
-`channelId`, and `providerId`;
+  concerns, but the registry route context is authoritative for `harnessName`,
+  `channelId`, and `providerId`;
 - platform thread/user IDs are resolved into `ChannelBinding` before session
-admission;
+  admission;
 - prompt-time channel metadata is carried through `requestContext.channel`;
 - text, files, cards, edits, reactions, and errors are emitted through durable
-outbox dispatch;
+  outbox dispatch;
 - approval actions answer Harness inbox items.
 
 Init must fence these modes. A provider/installation/thread target that is bound

@@ -333,13 +333,10 @@ describe('Agent client-side tools', () => {
 
     (global.fetch as any).mockResolvedValueOnce(sseResponse([{ type: 'finish', payload: { reason: 'stop' } }]));
 
-    await agent.resumeStreamUntilIdle(
-      { approved: true },
-      {
-        runId: 'run-1',
-        messages: seedMessages,
-      } as any,
-    );
+    await agent.resumeStreamUntilIdle({ approved: true }, {
+      runId: 'run-1',
+      messages: seedMessages,
+    } as any);
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect((global.fetch as any).mock.calls[0][0]).toBe(

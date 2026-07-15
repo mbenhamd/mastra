@@ -107,17 +107,6 @@ describe('workflowSnapshotToStream', () => {
     expect(chunks).toHaveLength(3); // start, workflow-data, finish
   });
 
-  it('preserves workflow-level final result output', async () => {
-    const run = createWorkflowRun({
-      result: { summary: 'complete', count: 2 },
-    });
-    const stream = workflowSnapshotToStream(run);
-    const chunks = await collectStream(stream);
-
-    const workflowPart = chunks.find(c => c.type === 'data-workflow');
-    expect(workflowPart.data.output).toEqual({ summary: 'complete', count: 2 });
-  });
-
   it('preserves forEach array step outputs and suspended status', async () => {
     const run = createWorkflowRun({
       steps: {

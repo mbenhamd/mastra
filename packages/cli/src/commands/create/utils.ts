@@ -24,6 +24,8 @@ export const MASTRA_GITIGNORE_ENTRIES = [
   '.env',
   '*.db',
   '*.db-*',
+  '*.duckdb',
+  '*.duckdb.wal',
   '.netlify',
   '.vercel',
 ] as const;
@@ -262,6 +264,9 @@ export const createMastraProject = async ({
         'pnpm-workspace.yaml',
         `packages:
   - '.'
+minimumReleaseAgeExclude:
+  - mastra
+  - "@mastra/*"
 allowBuilds:
   esbuild: true
   sharp: true

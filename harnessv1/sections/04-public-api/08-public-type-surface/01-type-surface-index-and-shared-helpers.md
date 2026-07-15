@@ -42,10 +42,11 @@ type Awaitable<T> = T | Promise<T>;
 // Recursive read-only view for plain JSON-compatible session state. The runtime
 // guarantee is stronger than this type alias: returned state snapshots must not
 // share mutable references with canonical session state.
-type ReadonlyState<T> =
-  T extends readonly (infer U)[] ? readonly ReadonlyState<U>[] :
-  T extends object ? { readonly [K in keyof T]: ReadonlyState<T[K]> } :
-  T;
+type ReadonlyState<T> = T extends readonly (infer U)[]
+  ? readonly ReadonlyState<U>[]
+  : T extends object
+    ? { readonly [K in keyof T]: ReadonlyState<T[K]> }
+    : T;
 
 // Bound view over the narrow Harness v1 storage domain plus composed
 // source-specific domain extensions. §5.2 owns the `HarnessStorageDomain`
@@ -100,5 +101,4 @@ interface ModelAuthStatus {
 // promise rejections are implementation-observed delivery failures; they do
 // not roll back the event or any storage transition that produced it.
 type HarnessListener = (event: HarnessEventV1) => void | Promise<void>;
-
 ```

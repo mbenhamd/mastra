@@ -1,11 +1,7 @@
 ### 4.5c Abort Errors
 
 ```ts
-type HarnessAbortReason =
-  | 'agent_aborted'
-  | 'parent_aborted'
-  | 'session_closed'
-  | 'process_restart';
+type HarnessAbortReason = 'agent_aborted' | 'parent_aborted' | 'session_closed' | 'process_restart';
 
 class HarnessAbortedError extends Error {
   readonly sessionId: string;
@@ -14,5 +10,4 @@ class HarnessAbortedError extends Error {
   // Absent for the other reasons.
   readonly parentSessionId?: string;
 }
-
 ```

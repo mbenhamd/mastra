@@ -86,7 +86,11 @@ function makeAssistantWithToolCall(
 describe('Session.listMessages', () => {
   it('returns [] when the thread has no messages', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-empty', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-empty',
+      title: 't',
+    });
 
     const session = await harness.session({ resourceId: 'r1', threadId: 'thread-empty' });
     const messages = await session.listMessages();
@@ -95,7 +99,11 @@ describe('Session.listMessages', () => {
 
   it('maps text content into the HarnessMessage partition', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-text', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-text',
+      title: 't',
+    });
     await seedMessages(harness, [
       makeUserMessage('m1', 'thread-text', 'r1', 'hello', new Date('2026-05-10T00:00:00Z')),
     ]);
@@ -113,7 +121,11 @@ describe('Session.listMessages', () => {
 
   it('splits a tool-invocation into separate tool_call + tool_result parts', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-tools', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-tools',
+      title: 't',
+    });
     await seedMessages(harness, [
       makeAssistantWithToolCall(
         'm1',
@@ -141,7 +153,11 @@ describe('Session.listMessages', () => {
 
   it('returns messages oldest-first', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-order', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-order',
+      title: 't',
+    });
     await seedMessages(harness, [
       makeUserMessage('m1', 'thread-order', 'r1', 'first', new Date('2026-05-10T00:00:00Z')),
       makeUserMessage('m2', 'thread-order', 'r1', 'second', new Date('2026-05-10T00:00:10Z')),
@@ -155,7 +171,11 @@ describe('Session.listMessages', () => {
 
   it('limit caps to the most recent N messages, still oldest-first', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-limit', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-limit',
+      title: 't',
+    });
     await seedMessages(harness, [
       makeUserMessage('m1', 'thread-limit', 'r1', 'first', new Date('2026-05-10T00:00:00Z')),
       makeUserMessage('m2', 'thread-limit', 'r1', 'second', new Date('2026-05-10T00:00:10Z')),
@@ -170,7 +190,11 @@ describe('Session.listMessages', () => {
 
   it('filters messages by the session resource when thread ids overlap', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-shared', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-shared',
+      title: 't',
+    });
     await seedMessages(harness, [
       makeUserMessage('m-r1', 'thread-shared', 'r1', 'visible', new Date('2026-05-10T00:00:00Z')),
       makeUserMessage('m-r2', 'thread-shared', 'r2', 'hidden', new Date('2026-05-10T00:00:10Z')),
@@ -184,7 +208,11 @@ describe('Session.listMessages', () => {
 
   it('limit === 0 returns []', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-zero', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-zero',
+      title: 't',
+    });
     await seedMessages(harness, [makeUserMessage('m1', 'thread-zero', 'r1', 'hi', new Date('2026-05-10T00:00:00Z'))]);
 
     const session = await harness.session({ resourceId: 'r1', threadId: 'thread-zero' });
@@ -193,7 +221,11 @@ describe('Session.listMessages', () => {
 
   it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid limit (%s)', async (bad: number) => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-bad', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-bad',
+      title: 't',
+    });
     const session = await harness.session({ resourceId: 'r1', threadId: 'thread-bad' });
 
     await expect(session.listMessages({ limit: bad })).rejects.toBeInstanceOf(HarnessValidationError);
@@ -201,7 +233,11 @@ describe('Session.listMessages', () => {
 
   it('throws once the session is closed', async () => {
     const { harness } = setupHarness();
-    await createHarnessOperatorThreadController(harness).create({ resourceId: 'r1', threadId: 'thread-closed', title: 't' });
+    await createHarnessOperatorThreadController(harness).create({
+      resourceId: 'r1',
+      threadId: 'thread-closed',
+      title: 't',
+    });
     const session = await harness.session({ resourceId: 'r1', threadId: 'thread-closed' });
     await session.close();
 

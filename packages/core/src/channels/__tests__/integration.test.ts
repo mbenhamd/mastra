@@ -211,9 +211,8 @@ describe('Mastra Channel Integration', () => {
     it('logs an error instead of swallowing the rejection when channel initialization fails', async () => {
       const logger = new ConsoleLogger({ level: 'error' });
       const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
-      // Force initialization to fail. Registration fires channel init as a
-      // background promise; previously that rejection was swallowed by an
-      // un-awaited `void initialize()`, leaving the channel silently dead.
+      // Force readiness initialization to fail. Mastra.init() owns channel
+      // startup and must both surface and log that failure.
       const initSpy = vi
         .spyOn(AgentChannels.prototype, 'initialize')
         .mockRejectedValue(new Error('channel init failed'));
@@ -223,11 +222,11 @@ describe('Mastra Channel Integration', () => {
           channels: { adapters: { discord: createMockAdapter('discord') } },
         });
 
-        new Mastra({ logger, agents: { 'bot-1': agent }, storage: new InMemoryStore() });
+        const mastra = new Mastra({ logger, agents: { 'bot-1': agent }, storage: new InMemoryStore() });
 
-        await vi.waitFor(() => expect(errorSpy).toHaveBeenCalled());
+        await expect(mastra.init()).rejects.toThrow('channel init failed');
         expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining('Failed to initialize channels for agent bot-1'),
+          expect.stringContaining('Failed to initialize agent channels "bot-1"'),
           expect.any(Error),
         );
       } finally {

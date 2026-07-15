@@ -747,7 +747,8 @@ describe('Harness v1 plan-task E2E — PT8 concurrent per-session isolation', ()
         const hasAlpha = promptStr.includes('alpha');
         const hasBeta = promptStr.includes('beta');
         // Self-validating: every call must carry EXACTLY one session key.
-        if (hasAlpha === hasBeta) throw new Error(`PT8 prompt must contain exactly one key, got: ${promptStr.slice(0, 200)}`);
+        if (hasAlpha === hasBeta)
+          throw new Error(`PT8 prompt must contain exactly one key, got: ${promptStr.slice(0, 200)}`);
         const key = hasAlpha ? 'alpha' : 'beta';
         const firstTurn = !keyOrder.includes(key);
 
@@ -762,7 +763,9 @@ describe('Harness v1 plan-task E2E — PT8 concurrent per-session isolation', ()
           // loudly if the runtime serialized us and the partner never arrives).
           await Promise.race([
             barrier,
-            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('PT8 barrier timed out — turns did not overlap (serialized?)')), 2000)),
+            new Promise<void>((_, reject) =>
+              setTimeout(() => reject(new Error('PT8 barrier timed out — turns did not overlap (serialized?)')), 2000),
+            ),
           ]);
           return {
             rawCall: { rawPrompt: null, rawSettings: {} },
@@ -802,7 +805,8 @@ describe('Harness v1 plan-task E2E — PT8 concurrent per-session isolation', ()
       // Custom events are isolated too — neither stream references the other's task.
       const aTaskIds = new Set<string>(aPage.tasks.map((t: any) => t.taskId));
       const bTaskIds = new Set<string>(bPage.tasks.map((t: any) => t.taskId));
-      const customs = (evs: HarnessEvent[]) => evs.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
+      const customs = (evs: HarnessEvent[]) =>
+        evs.filter(e => e.type === ('papersflow.plan_task.updated' as any)) as any[];
       const aCustoms = customs(aEvents);
       const bCustoms = customs(bEvents);
       expect(aCustoms.length).toBeGreaterThan(0);
@@ -828,11 +832,29 @@ describe('Harness v1 plan-task E2E — PT9 rejected mutation surfaces isError, t
     const model = new MockLanguageModelV2({
       doStream: async () => {
         call++;
-        if (call === 1) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt9-add', 'task_add', JSON.stringify({ content: 'Root' })) };
+        if (call === 1)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('pt9-add', 'task_add', JSON.stringify({ content: 'Root' })),
+          };
         // Illegal: make the task its own parent → cycle → must be REJECTED (isError),
         // not throw and abort the turn.
-        if (call === 2) return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: toolCallStream('pt9-cycle', 'task_reparent', JSON.stringify({ taskId: rootId, newParentTaskId: rootId })) };
-        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['Recovered after rejection.']) };
+        if (call === 2)
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream(
+              'pt9-cycle',
+              'task_reparent',
+              JSON.stringify({ taskId: rootId, newParentTaskId: rootId }),
+            ),
+          };
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: textStream(['Recovered after rejection.']),
+        };
       },
     });
     const agent = new Agent({ id: 'default', name: 'default', instructions: 'plan', model });
@@ -842,7 +864,8 @@ describe('Harness v1 plan-task E2E — PT9 rejected mutation surfaces isError, t
       const events: HarnessEvent[] = [];
       session.subscribe(e => {
         events.push(e);
-        if (e.type === 'tool_end' && (e as any).toolName === 'task_add' && (e as any).output?.taskId) rootId = (e as any).output.taskId;
+        if (e.type === 'tool_end' && (e as any).toolName === 'task_add' && (e as any).output?.taskId)
+          rootId = (e as any).output.taskId;
       });
 
       const result = (await session.message({ content: 'add then illegally reparent' })) as any;

@@ -254,7 +254,6 @@ operator diagnostics, not storage rows (§13.2)
 SDK normalization: SDK/controller UIs may render these projections but must not
 settle promises, claim rows, or infer missed SSE events from them (§13.4)
 
-
 DTOs used by only one route family may remain inline in §13.2 when that is the
 clearest owner; DTOs referenced across route families or SDK/non-JS boundaries
 belong in §13.3's shared declarations.
@@ -318,6 +317,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-wire-flow);" d="M610 307 L610 389" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-wire-flow);" d="M500 426 L476 426" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-wire-flow);" d="M255 426 C120 395 95 250 118 153" />
+
   </svg>
   <figcaption>The wire protocol enters through server auth and validation, crosses the route handler into the Session API, then returns either bounded responses or live SSE events with explicit reconciliation paths.</figcaption>
 </figure>

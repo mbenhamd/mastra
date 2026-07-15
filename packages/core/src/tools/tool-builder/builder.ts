@@ -78,6 +78,26 @@ function resolveToolFGAResourceId(tool: ToolToConvert, options: ToolOptions): st
       : getStandaloneToolFGAResourceId(options.name);
 }
 
+function cloneInvocationOptionsWithRequestContext(
+  execOptions: MastraToolInvocationOptions,
+  requestContext: RequestContext | undefined,
+): MastraToolInvocationOptions {
+  // Preserve accessors without evaluating them. MCP intentionally exposes
+  // deprecated top-level context fields as throwing getters, so object spread
+  // would fail before the tool can use the canonical nested `mcp` context.
+  const invocationOptions: MastraToolInvocationOptions = Object.create(
+    Object.getPrototypeOf(execOptions),
+    Object.getOwnPropertyDescriptors(execOptions),
+  );
+  Object.defineProperty(invocationOptions, 'requestContext', {
+    configurable: true,
+    enumerable: true,
+    value: requestContext,
+    writable: true,
+  });
+  return invocationOptions;
+}
+
 /**
  * Detect Zod v4 schemas. Zod v3 stores the type name as `_def.typeName`
  * (e.g. "ZodObject"); Zod v4 stores it as `_def.type` (e.g. "object"). We
@@ -583,6 +603,11 @@ export class CoreToolBuilder extends MastraBase {
             mastra: wrappedMastra,
             memory: options.memory,
             runId: options.runId,
+            // [PF-1874] The outer wrapper already computed the authoritative
+            // per-call context (build entries first, execution application keys
+            // override, infrastructure keys stay build-authoritative) and passed
+            // it through as `execOptions.requestContext`, so use it directly to
+            // preserve both identity and the documented per-call precedence.
             requestContext: execOptions.requestContext ?? options.requestContext ?? new RequestContext(),
             actor: execOptions.actor,
             // Workspace for file operations and command execution
@@ -645,7 +670,7 @@ export class CoreToolBuilder extends MastraBase {
                 resumeData,
                 threadId,
                 resourceId,
-                outputWriter: execOptions.outputWriter,
+                outputWriter: options.outputWriter || execOptions.outputWriter,
                 flushMessages: execOptions.flushMessages,
               },
             };
@@ -798,30 +823,35 @@ export class CoreToolBuilder extends MastraBase {
       try {
         logger.debug(start, { ...logData, ...rest, model: logModelObject, args });
 
+        // When a tool is being resumed (resumeData present in execOptions), skip input
+        // validation. The original args were already validated during the initial
+        // execution, and during resume the tool's execute function checks resumeData
+        // and returns early without using the input args.
+        const isResuming = !!execOptions?.resumeData;
+
         // Validate input parameters if schema exists
         // Use the processed schema for validation if available, otherwise fall back to original
         const parameters = this.getParameters();
-        const { data, error } = validateToolInput(parameters, args, options.name);
-        //suspendedToolRunId is only required when resumeData is provided
-        const suspendedToolRunIdErrToIgnore =
-          error?.message?.includes('suspendedToolRunId: Required') && !(args as Record<string, unknown>)?.resumeData;
-        if (error && !suspendedToolRunIdErrToIgnore) {
-          logger.warn('Tool input validation failed', { ...logData, validationError: error.message });
-          toolSpan?.end({ output: error, attributes: { success: false } });
-          return error;
+        if (!isResuming) {
+          const { data, error } = validateToolInput(parameters, args, options.name);
+          //suspendedToolRunId is only required when resumeData is provided
+          const suspendedToolRunIdErrToIgnore =
+            error?.message?.includes('suspendedToolRunId: Required') && !(args as Record<string, unknown>)?.resumeData;
+          if (error && !suspendedToolRunIdErrToIgnore) {
+            logger.warn('Tool input validation failed', { ...logData, validationError: error.message });
+            toolSpan?.end({ output: error, attributes: { success: false } });
+            return error;
+          }
+          // Use validated/transformed data
+          args = data;
         }
-        // Use validated/transformed data
-        args = data;
 
         // there is a small delay in stream output so we add an immediate to ensure the stream is ready
         return await new Promise((resolve, reject) => {
           setImmediate(async () => {
             try {
-              const result = await execFunction(
-                args,
-                { ...execOptions!, requestContext: toolRequestContext },
-                toolSpan,
-              );
+              const invocationOptions = cloneInvocationOptionsWithRequestContext(execOptions!, toolRequestContext);
+              const result = await execFunction(args, invocationOptions, toolSpan);
               resolve(result);
             } catch (err) {
               reject(err);

@@ -1,5 +1,8 @@
-import { Badge, Button, Icon, cn } from '@mastra/playground-ui';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
 import { useCopyToClipboard } from '@mastra/playground-ui/hooks/use-copy-to-clipboard';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { CheckIcon, ChevronUpIcon, CopyIcon, TerminalSquare } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DataMessagePart } from '../tool-card';
@@ -105,7 +108,7 @@ const TerminalBlock = ({ command, content, maxHeight = '20rem', onCopy, isCopied
         <div className="px-3 py-2 bg-surface3 border-b border-border1 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-neutral6 text-xs shrink-0">$</span>
-            <code className="text-xs text-neutral-300 font-mono truncate">{command}</code>
+            <code className="text-xs text-neutral5 font-mono truncate">{command}</code>
           </div>
           {onCopy && (
             <Button variant="default" size="icon-sm" tooltip="Copy output" onClick={onCopy} className="shrink-0">

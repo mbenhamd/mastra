@@ -89,7 +89,7 @@ export type LLMTestMode = 'auto' | 'update' | 'replay' | 'live' | 'record';
  */
 function isUpdateMode(): boolean {
   if (process.env.UPDATE_RECORDINGS === 'true') return true;
-  return process.argv.includes('--update-recordings');
+  return process.argv.includes('--update-recordings') || process.argv.includes('-U');
 }
 
 /**
@@ -168,6 +168,8 @@ export interface LLMRecording {
 type ReplayRecording = LLMRecording & {
   /** Additional exact-match hashes derived at replay time for backward compatibility. */
   lookupHashes?: string[];
+  /** Full Vitest name for recordings stored in per-test suite files. */
+  testName?: string;
 };
 
 /**
@@ -190,6 +192,24 @@ export interface RecordingMeta {
   createdAt: string;
   /** ISO timestamp when recording was last updated */
   updatedAt?: string;
+}
+
+function getCurrentVitestTestName(): string | undefined {
+  const state = (globalThis as Record<string, unknown>).__vitest_worker__ as
+    | { currentTestName?: string; current?: { fullTestName?: string } }
+    | undefined;
+  return state?.current?.fullTestName ?? state?.currentTestName;
+}
+
+function getSplitRecordingPaths(recordingsDir: string, name: string): string[] {
+  const splitRecordingDir = path.join(recordingsDir, name);
+  if (!fs.existsSync(splitRecordingDir)) return [];
+
+  return fs
+    .readdirSync(splitRecordingDir, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+    .map(entry => path.join(splitRecordingDir, entry.name))
+    .sort();
 }
 
 /**
@@ -739,7 +759,6 @@ function prepareReplayRecordings(
 export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInstance {
   const recordingsDir = options.recordingsDir || DEFAULT_RECORDINGS_DIR;
   const recordingPath = path.join(recordingsDir, `${options.name}.json`);
-  const recordingExists = fs.existsSync(recordingPath);
 
   // Determine mode
   let mode = options.mode ?? getLLMTestMode();
@@ -749,23 +768,40 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
     mode = 'record';
   }
 
+  // Newer suites keep one recording file per test under a suite directory so
+  // parallel updates do not rewrite a shared monolith. Replay those files as a
+  // single deterministic collection. Record/update mode retains the legacy
+  // monolithic write path until recording can be partitioned by the active test.
+  const splitRecordingPaths =
+    mode !== 'record' && mode !== 'update' ? getSplitRecordingPaths(recordingsDir, options.name) : [];
+  const recordingPaths =
+    splitRecordingPaths.length > 0 ? splitRecordingPaths : fs.existsSync(recordingPath) ? [recordingPath] : [];
+  const recordingExists = recordingPaths.length > 0;
+
   // Load existing recordings / metadata before any mutations (backward compatible)
   // In record/update modes a corrupted file should not block re-recording.
   let savedRecordings: ReplayRecording[] = [];
   let existingMeta: RecordingMeta | undefined;
   if (recordingExists) {
     const willRecord = mode === 'record' || mode === 'update';
-    try {
-      const file = loadRecordingFile(recordingPath, options.name);
-      existingMeta = file.meta;
-      savedRecordings = prepareReplayRecordings(file.recordings, options.transformRequest);
-    } catch (err) {
-      if (!willRecord) {
-        throw err;
+    for (const sourcePath of recordingPaths) {
+      try {
+        const file = loadRecordingFile(sourcePath, options.name);
+        existingMeta ??= file.meta;
+        savedRecordings.push(
+          ...prepareReplayRecordings(file.recordings, options.transformRequest).map(recording => ({
+            ...recording,
+            ...(file.meta.testName ? { testName: file.meta.testName } : {}),
+          })),
+        );
+      } catch (err) {
+        if (!willRecord) {
+          throw err;
+        }
+        console.warn(
+          `[llm-recorder] Failed to parse existing recording for "${options.name}", starting fresh: ${err instanceof Error ? err.message : err}`,
+        );
       }
-      console.warn(
-        `[llm-recorder] Failed to parse existing recording for "${options.name}", starting fresh: ${err instanceof Error ? err.message : err}`,
-      );
     }
   }
 
@@ -974,7 +1010,13 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
           console.log(`[llm-recorder]   Available hashes: ${savedRecordings.map(r => r.hash).join(', ')}`);
         }
 
-        const recording = findRecording(savedRecordings, hash, url, body, fuzzyUsedHashes);
+        const currentTestName = getCurrentVitestTestName();
+        const hasTestScopedRecordings = savedRecordings.some(recording => recording.testName !== undefined);
+        const replayRecordings =
+          currentTestName && hasTestScopedRecordings
+            ? savedRecordings.filter(recording => recording.testName === currentTestName)
+            : savedRecordings;
+        const recording = findRecording(replayRecordings, hash, url, body, fuzzyUsedHashes);
 
         if (!recording) {
           console.error(`[llm-recorder] No recording found for: ${url}${model ? ` (model: ${model})` : ''}`);
@@ -1086,10 +1128,6 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         | { filepath?: string }
         | undefined;
 
-      const vitestState = (globalThis as Record<string, unknown>).__vitest_worker__ as
-        | { currentTestName?: string; current?: { fullTestName?: string } }
-        | undefined;
-
       const firstRequestBody = recordings[0]?.request.body as Record<string, unknown> | undefined;
       const inferredModel = typeof firstRequestBody?.model === 'string' ? firstRequestBody.model : undefined;
 
@@ -1098,7 +1136,7 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
       const meta: RecordingMeta = {
         name: options.name,
         testFile: rawTestFile ? relativizeTestFile(rawTestFile) : undefined,
-        testName: vitestState?.current?.fullTestName ?? vitestState?.currentTestName ?? existingMeta?.testName,
+        testName: getCurrentVitestTestName() ?? existingMeta?.testName,
         provider: options.metaContext?.provider ?? existingMeta?.provider,
         model: options.metaContext?.model ?? inferredModel ?? existingMeta?.model,
         createdAt: existingMeta?.createdAt ?? now,
@@ -1262,7 +1300,7 @@ export async function withLLMRecording<T>(
  */
 export function hasLLMRecording(name: string, recordingsDir?: string): boolean {
   const dir = recordingsDir || DEFAULT_RECORDINGS_DIR;
-  return fs.existsSync(path.join(dir, `${name}.json`));
+  return fs.existsSync(path.join(dir, `${name}.json`)) || getSplitRecordingPaths(dir, name).length > 0;
 }
 
 /**
@@ -1271,8 +1309,12 @@ export function hasLLMRecording(name: string, recordingsDir?: string): boolean {
 export function deleteLLMRecording(name: string, recordingsDir?: string): void {
   const dir = recordingsDir || DEFAULT_RECORDINGS_DIR;
   const recordingPath = path.join(dir, `${name}.json`);
+  const splitRecordingDir = path.join(dir, name);
   if (fs.existsSync(recordingPath)) {
     fs.unlinkSync(recordingPath);
+  }
+  if (fs.existsSync(splitRecordingDir)) {
+    fs.rmSync(splitRecordingDir, { recursive: true, force: true });
   }
 }
 
@@ -1284,10 +1326,16 @@ export function listLLMRecordings(recordingsDir?: string): string[] {
   if (!fs.existsSync(dir)) {
     return [];
   }
-  return fs
-    .readdirSync(dir)
-    .filter(f => f.endsWith('.json'))
-    .map(f => f.replace('.json', ''));
+  const recordings = fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      return [entry.name.replace(/\.json$/, '')];
+    }
+    if (entry.isDirectory() && getSplitRecordingPaths(dir, entry.name).length > 0) {
+      return [entry.name];
+    }
+    return [];
+  });
+  return [...new Set(recordings)].sort();
 }
 
 /**

@@ -75,7 +75,8 @@ The lifecycle at a glance, harness at the center:
   <path d="M 625 235 C 625 185, 525 170, 480 170" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ah-overview)"/>
   <text x="580" y="185" text-anchor="middle" font-size="9" font-weight="600" fill="#475569" font-family="Inter, sans-serif">re-enter</text>
 
-  <text x="450" y="330" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.1 — Architecture overview</text>
+<text x="450" y="330" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8" font-family="Inter, sans-serif" style="text-transform: uppercase; letter-spacing: 0.08em;">1.1 — Architecture overview</text>
 </svg>
+
 <figcaption>Lifecycle at a glance with the harness at the center; §§1.2–1.5 own the per-arrow ingress, hydration, dispatch, and recovery contracts.</figcaption>
 </figure>

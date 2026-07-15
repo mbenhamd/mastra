@@ -1,12 +1,12 @@
 ### 2.2 Thread vs Session
 
-| | Thread | Session |
-|---|---|---|
-| What | Durable transcript/history behind the room | Active or reopenable per-conversation runtime + persisted runtime state |
-| Storage | Shared `MemoryStorage` history rows, scoped by the Harness storage view | Narrow Harness session records plus composed source-specific domain rows |
-| Lifetime | Until explicitly deleted with the owning conversation | Until explicitly deleted; `close` only makes it non-live/reopenable |
-| Cardinality | One per conversation inside a Harness namespace | At most one current owner per `(harnessName, resourceId, threadId)` across Active, Closing, and Closed reopenable records |
-| In memory? | Loaded on demand | Hydrated on demand; auto-evicted when idle |
+|             | Thread                                                                  | Session                                                                                                                   |
+| ----------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| What        | Durable transcript/history behind the room                              | Active or reopenable per-conversation runtime + persisted runtime state                                                   |
+| Storage     | Shared `MemoryStorage` history rows, scoped by the Harness storage view | Narrow Harness session records plus composed source-specific domain rows                                                  |
+| Lifetime    | Until explicitly deleted with the owning conversation                   | Until explicitly deleted; `close` only makes it non-live/reopenable                                                       |
+| Cardinality | One per conversation inside a Harness namespace                         | At most one current owner per `(harnessName, resourceId, threadId)` across Active, Closing, and Closed reopenable records |
+| In memory?  | Loaded on demand                                                        | Hydrated on demand; auto-evicted when idle                                                                                |
 
 A thread is the message history. A session is the live conversation that
 operates on it. Closing a session does not delete the thread or create a new
@@ -29,17 +29,17 @@ session.
 Common cases all route to that same active session:
 
 - The same human on a laptop and a phone, both attached to the conversation.
-Each device gets a client connection or `RemoteSession` view over the same
-active `sessionId`; both read and write through the same queue and run admission
-boundary, with immediate input admitted through `Session.signal(...)` and
-sequential work admitted through `queue(...)`.
+  Each device gets a client connection or `RemoteSession` view over the same
+  active `sessionId`; both read and write through the same queue and run admission
+  boundary, with immediate input admitted through `Session.signal(...)` and
+  sequential work admitted through `queue(...)`.
 - A long-running conversation rehydrated by a different server process on each
-request. Ownership may move after lease release/expiry, but only one process
-owns the active session at a time.
+  request. Ownership may move after lease release/expiry, but only one process
+  owns the active session at a time.
 - Operator tooling resuming a thread programmatically alongside the original
-user's live session. The operator either attaches to the active session under
-the normal lease policy or uses explicit operator/admin tooling; it does not
-create a second active owner for the same thread.
+  user's live session. The operator either attaches to the active session under
+  the normal lease policy or uses explicit operator/admin tooling; it does not
+  create a second active owner for the same thread.
 
 Multiple session records for one thread are not the normal lifecycle model.
 Clone creates a new usable session/conversation with the copied durable state

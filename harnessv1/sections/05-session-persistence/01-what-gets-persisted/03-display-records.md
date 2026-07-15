@@ -263,5 +263,4 @@ interface HarnessDisplayTaskSnapshotV1 {
 // Harness must not treat memory state as the proof boundary for queue,
 // channel, wakeup, approval, or goal decisions — those decisions are owned
 // by the durable Harness storage records listed above.
-
 ```

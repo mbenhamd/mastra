@@ -107,7 +107,9 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       status: statusEnum.optional().describe('Initial status; defaults to pending.'),
       blockedBy: z.array(z.string()).optional().describe('Task ids this task depends on.'),
     }),
-    outputSchema: z.object({ ...planTaskViewShape, ...errorShape }).partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
+    outputSchema: z
+      .object({ ...planTaskViewShape, ...errorShape })
+      .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async input => {
       try {
         return await session._planTaskAdd(input);
@@ -121,7 +123,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
     id: TASK_DECOMPOSE_TOOL_ID,
     description:
       'Decompose a parent task into multiple child tasks in one atomic step. The parent becomes a ' +
-      "derived-status node whose status rolls up from its children. Returns the created children.",
+      'derived-status node whose status rolls up from its children. Returns the created children.',
     inputSchema: z.object({
       parentTaskId: z.string().describe('Existing task to decompose.'),
       children: z
@@ -176,7 +178,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
   const taskUpdate = createTool({
     id: TASK_UPDATE_TOOL_ID,
     description:
-      'Update a task\'s status, content, priority, activeForm, or blockedBy dependencies. Setting ' +
+      "Update a task's status, content, priority, activeForm, or blockedBy dependencies. Setting " +
       'status to in_progress is rejected if another task in the same root is already in progress. ' +
       'Setting blockedBy is rejected if it would create a dependency cycle.',
     inputSchema: z.object({
@@ -187,7 +189,9 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       activeForm: z.string().optional(),
       blockedBy: z.array(z.string()).optional(),
     }),
-    outputSchema: z.object({ ...planTaskViewShape, ...errorShape }).partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
+    outputSchema: z
+      .object({ ...planTaskViewShape, ...errorShape })
+      .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async input => {
       const { taskId, ...patch } = input;
       try {
@@ -204,7 +208,9 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       'Mark a task completed. Triggers status rollup on its ancestors (a parent whose children are all ' +
       'completed becomes completed).',
     inputSchema: z.object({ taskId: z.string() }),
-    outputSchema: z.object({ ...planTaskViewShape, ...errorShape }).partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
+    outputSchema: z
+      .object({ ...planTaskViewShape, ...errorShape })
+      .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async input => {
       try {
         return await session._planTaskComplete(input.taskId);
@@ -344,9 +350,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           for (const item of input.tasks) {
             const existingId = byContent.get(item.content);
             if (existingId !== undefined) {
-              out.push(
-                await session._planTaskUpdate(existingId, { status: item.status, activeForm: item.activeForm }),
-              );
+              out.push(await session._planTaskUpdate(existingId, { status: item.status, activeForm: item.activeForm }));
             } else {
               const added = await session._planTaskAdd({
                 content: item.content,

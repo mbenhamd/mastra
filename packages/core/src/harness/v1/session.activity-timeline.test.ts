@@ -124,7 +124,10 @@ describe('Session.getActivityTimeline() — session wiring (§5.1b.4)', () => {
       // The next page reads with an inclusive dateRange lower bound from the cursor.
       listSpy.mockClear();
       const second = await session.getActivityTimeline({ cursor: first.nextCursor, limit: 5 });
-      const args2 = listSpy.mock.calls[0]![0] as { perPage?: number | false; filter?: { dateRange?: { start?: Date } } };
+      const args2 = listSpy.mock.calls[0]![0] as {
+        perPage?: number | false;
+        filter?: { dateRange?: { start?: Date } };
+      };
       expect(args2.perPage).toBe(6);
       expect(args2.filter?.dateRange?.start).toBeInstanceOf(Date);
       expect(second.entries.map(e => e.summary)).toEqual(['msg-5', 'msg-6', 'msg-7', 'msg-8', 'msg-9']);

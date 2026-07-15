@@ -195,14 +195,22 @@ describe('HarnessLibSQL attachments', () => {
       completedAt,
       durationMs: 10,
       usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
-      toolRollup: { count: 1, errors: 0, totalDurationMs: 4, maxDurationMs: 4, perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } } },
+      toolRollup: {
+        count: 1,
+        errors: 0,
+        totalDurationMs: 4,
+        maxDurationMs: 4,
+        perTool: { lookup: { count: 1, errors: 0, totalDurationMs: 4 } },
+      },
       createdAt: completedAt,
       ...over,
     });
 
     const saved = await storage.saveRunSummary({ summary: mk('rs-1', 100) as any });
     expect(saved.durationMs).toBe(10);
-    const again = await storage.saveRunSummary({ summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any });
+    const again = await storage.saveRunSummary({
+      summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any,
+    });
     expect(again.durationMs).toBe(10);
     expect(again.status).toBe('completed');
 
@@ -231,7 +239,12 @@ describe('HarnessLibSQL attachments', () => {
     let cursorC: number | undefined;
     let cursorR: string | undefined;
     for (let i = 0; i < 10; i++) {
-      const p = await storage.listRunSummaries({ sessionId: 'session-rs', limit: 1, beforeCompletedAt: cursorC, beforeRunId: cursorR });
+      const p = await storage.listRunSummaries({
+        sessionId: 'session-rs',
+        limit: 1,
+        beforeCompletedAt: cursorC,
+        beforeRunId: cursorR,
+      });
       seen.push(...p.summaries.map(s => s.runId));
       if (p.nextBeforeCompletedAt === undefined) break;
       cursorC = p.nextBeforeCompletedAt;
@@ -4284,7 +4297,13 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     const after = await storage.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 });
     expect(after.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
     // The updated link also hydrates through a subtree read (not just list).
-    const afterSub = await storage.loadPlanTaskSubtree({ harnessName: 'default', sessionId, rootTaskId: 'd1', depth: 0, limit: 10 });
+    const afterSub = await storage.loadPlanTaskSubtree({
+      harnessName: 'default',
+      sessionId,
+      rootTaskId: 'd1',
+      depth: 0,
+      limit: 10,
+    });
     expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
   });
 });

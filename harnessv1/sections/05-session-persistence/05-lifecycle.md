@@ -13,22 +13,22 @@ session record exposes one of three public lifecycle statuses:
 - **Active (live or resumable).** `closingAt: undefined`, `closedAt: undefined`.
   May or may not be live in memory.
 - **Closing.** `closingAt: <timestamp>`, `closedAt: undefined`. `closeSession`
-has committed the bounded close marker and is terminating live work. The record
-still occupies the active `(harnessName, resourceId, threadId)` key, but it is
-no longer admissible for new work: `signal`, `queue`, `useSkill`, inbox
-responses, resume calls, descendant creation, `setState`,
-mode/model/goal/permission/thread-setting mutations, attachment writes, and
-tool-context durable writes reject with `HarnessSessionClosingError`. Read
-routes, state snapshots, retained result lookups, event subscriptions, and
-idempotent `closeSession` / `deleteSession` repair paths remain available.
+  has committed the bounded close marker and is terminating live work. The record
+  still occupies the active `(harnessName, resourceId, threadId)` key, but it is
+  no longer admissible for new work: `signal`, `queue`, `useSkill`, inbox
+  responses, resume calls, descendant creation, `setState`,
+  mode/model/goal/permission/thread-setting mutations, attachment writes, and
+  tool-context durable writes reject with `HarnessSessionClosingError`. Read
+  routes, state snapshots, retained result lookups, event subscriptions, and
+  idempotent `closeSession` / `deleteSession` repair paths remain available.
 - **Closed (reopenable).** `closedAt: <timestamp>`. The room is no longer live,
-does not admit new work, and has no active lease, but the same durable session
-record remains the reopen target. `harness.session({ sessionId })` and
-`harness.session({ threadId, resourceId })` may reopen it after proving the same
-thread/resource authority instead of creating a new conversation. Operation
-result lookup routes may still read retained terminal result/tombstone evidence
-for tenant-verified closed records so SDK promises can settle after an SSE
-disconnect.
+  does not admit new work, and has no active lease, but the same durable session
+  record remains the reopen target. `harness.session({ sessionId })` and
+  `harness.session({ threadId, resourceId })` may reopen it after proving the same
+  thread/resource authority instead of creating a new conversation. Operation
+  result lookup routes may still read retained terminal result/tombstone evidence
+  for tenant-verified closed records so SDK promises can settle after an SSE
+  disconnect.
 - **Deleted / hidden** is the terminal removal outcome, not a
   `SessionLifecycleStatus` value: the `SessionRecord` is physically gone or
   hidden behind the internal staged-delete behavior described below, and
@@ -88,17 +88,17 @@ must not be returned by owner lookup or treated as reopen targets.
 Detailed transition mechanics:
 
 - `session.close()` (or an explicit server/local-runtime/operator close helper
-when you only have the ID plus its owning resource) — cross-checks `harnessName` and
-`resourceId` when supplied and returns tenant-safe not-found on mismatch before
-close, force-delete, or closed-record handling. Close is a bounded two-phase
-transition over the target session and **all active descendant subagent
-sessions** — live or persisted-only — walked recursively via
-`listChildSessions(...)` under the parent's `sessionId` in the same Harness
-namespace (paging through `nextCursor` when present). The descendant walk uses
-the §5.2 `(createdAt ASC, sessionId ASC)` child-session order. During close and
-non-force delete, `includeClosed: true` pages must continue to expose a child
-whose `closedAt` committed earlier in the same cascade, while force-deleted or
-tenant-hidden rows are skipped without retargeting.
+  when you only have the ID plus its owning resource) — cross-checks `harnessName` and
+  `resourceId` when supplied and returns tenant-safe not-found on mismatch before
+  close, force-delete, or closed-record handling. Close is a bounded two-phase
+  transition over the target session and **all active descendant subagent
+  sessions** — live or persisted-only — walked recursively via
+  `listChildSessions(...)` under the parent's `sessionId` in the same Harness
+  namespace (paging through `nextCursor` when present). The descendant walk uses
+  the §5.2 `(createdAt ASC, sessionId ASC)` child-session order. During close and
+  non-force delete, `includeClosed: true` pages must continue to expose a child
+  whose `closedAt` committed earlier in the same cascade, while force-deleted or
+  tenant-hidden rows are skipped without retargeting.
 
   **Enter closing.** The close owner first writes `closingAt` and
   `closeDeadlineAt = closingAt + sessions.closeTimeoutMs` under the parent/root
@@ -167,16 +167,17 @@ tenant-hidden rows are skipped without retargeting.
   close target has committed. Delete/force-delete uses the delete lifecycle
   below. ID-only close is reserved for single-tenant local code and explicit
   operator/admin tooling.
+
 - `session.delete()` / the explicit server/local-runtime/operator delete helper
-and the explicit operator force-delete path delete the session and the durable
-conversation/artifacts it
-owns after applying a delete fence and dependent-ledger cleanup. The harness
-first loads the target inside its bound `harnessName`, cross-checks `resourceId`,
-and routes child-session deletes through the parent/root lease policy in §5.8.
-If the row is corrupt, resource-scoped force delete is allowed only when storage
-can still prove the row's `harnessName` and `resourceId` from an index or
-immutable header; otherwise the resource-scoped call fails closed and only
-explicit ID-only operator tooling may remove the unscopable row.
+  and the explicit operator force-delete path delete the session and the durable
+  conversation/artifacts it
+  owns after applying a delete fence and dependent-ledger cleanup. The harness
+  first loads the target inside its bound `harnessName`, cross-checks `resourceId`,
+  and routes child-session deletes through the parent/root lease policy in §5.8.
+  If the row is corrupt, resource-scoped force delete is allowed only when storage
+  can still prove the row's `harnessName` and `resourceId` from an index or
+  immutable header; otherwise the resource-scoped call fails closed and only
+  explicit ID-only operator tooling may remove the unscopable row.
 
   **Guarded delete** (`deleteSession`) is the ordinary closed-record delete.
   The target and every descendant returned by
@@ -267,19 +268,20 @@ explicit ID-only operator tooling may remove the unscopable row.
   Descendant session rows whose history lives on a different child thread are
   reached through `listChildSessions(...)` and cleaned according to the same
   owner checks. Resource-scoped OM survives deleting one conversation.
+
 - Thread deletion is a lower-level destructive storage/operator path, not the
-normal app lifecycle API. When exposed, it must be implemented as the same
-session-first delete cascade: resolve the owning session(s), apply the §5.5
-delete fence and dependent-ledger cleanup, then remove the thread record,
-messages, and thread-scoped observational-memory rows scoped exactly to the
-deleted `(harnessName, resourceId, threadId)` when the configured memory store
-can represent that scope. Resource-scoped OM is not deleted by deleting one
-thread. Child subagent sessions whose `threadId` differs from the parent are
-reached through `listChildSessions(...)`, not only by matching the deleted thread
-ID.
+  normal app lifecycle API. When exposed, it must be implemented as the same
+  session-first delete cascade: resolve the owning session(s), apply the §5.5
+  delete fence and dependent-ledger cleanup, then remove the thread record,
+  messages, and thread-scoped observational-memory rows scoped exactly to the
+  deleted `(harnessName, resourceId, threadId)` when the configured memory store
+  can represent that scope. Resource-scoped OM is not deleted by deleting one
+  thread. Child subagent sessions whose `threadId` differs from the parent are
+  reached through `listChildSessions(...)`, not only by matching the deleted thread
+  ID.
 - Non-lifecycle residency behavior: idle eviction moves between "active in
-memory" and "active in storage only," never touches `closingAt`, `closedAt`, or
-a delete marker.
+  memory" and "active in storage only," never touches `closingAt`, `closedAt`, or
+  a delete marker.
 
 **Closed records and reopen.** A thread can outlive the live residency of its
 session, but close does not rotate the conversation identity. After

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import { MessageList } from '../../agent/message-list';
+import { isCreatedAgentSignal } from '../../agent/signals';
 import { extractSignalContents, setupHarness } from './__test-utils__';
 import {
   HarnessAttachmentInUseError,
@@ -298,7 +299,7 @@ describe('Harness.attachments', () => {
     ).rejects.toBeInstanceOf(HarnessAttachmentInUseError);
   });
 
-  it('dispatches a queued turn with attachments as a structured user message carrying the file part', async () => {
+  it('dispatches a queued turn with attachments as a native user signal carrying the file part', async () => {
     // §13.7/§14.2: a direct `queue({ content, attachments })` turn forwards the
     // attachment bytes to the model as file/image parts (not just the dedup
     // identity). The non-channel analogue of the channel signal-delivery dispatch
@@ -316,13 +317,15 @@ describe('Harness.attachments', () => {
     await session.queue({ content: 'see attached', attachments: [result] });
 
     expect(agent.streamCalls).toHaveLength(1);
-    const dispatched = extractSignalContents(agent.streamCalls[0]?.messages) as {
-      role?: string;
-      content?: Array<{ type: string; mediaType?: string; filename?: string }>;
-    };
-    expect(dispatched.role).toBe('user');
-    expect(dispatched.content?.some(p => p.type === 'text')).toBe(true);
-    expect(dispatched.content?.some(p => p.type === 'file' && p.filename === 'note.txt')).toBe(true);
+    const dispatched = agent.streamCalls[0]?.messages;
+    expect(isCreatedAgentSignal(dispatched)).toBe(true);
+    if (!isCreatedAgentSignal(dispatched)) throw new Error('expected queued attachment dispatch to be a signal');
+    const promptMessage = dispatched.toLLMMessage();
+    expect(promptMessage.role).toBe('user');
+    expect(Array.isArray(promptMessage.content)).toBe(true);
+    const parts = promptMessage.content as Array<{ type: string; mediaType?: string; filename?: string }>;
+    expect(parts.some(part => part.type === 'text')).toBe(true);
+    expect(parts.some(part => part.type === 'file' && part.filename === 'note.txt')).toBe(true);
   });
 
   it('dispatches an image/png attachment whose bytes survive a real MessageList conversion', async () => {
@@ -349,12 +352,14 @@ describe('Harness.attachments', () => {
     await session.queue({ content: 'look at this image', attachments: [result] });
 
     expect(agent.streamCalls).toHaveLength(1);
-    const dispatched = extractSignalContents(agent.streamCalls[0]?.messages);
+    const dispatched = agent.streamCalls[0]?.messages;
+    expect(isCreatedAgentSignal(dispatched)).toBe(true);
+    if (!isCreatedAgentSignal(dispatched)) throw new Error('expected queued image dispatch to be a signal');
 
-    // Route the dispatched contents through the real MessageList -> LLM prompt
-    // conversion (the path `signalToLLMMessage` feeds for user-message signals).
+    // Route the persisted signal through the real MessageList -> LLM prompt
+    // conversion used when a signal row is reconstructed for the model.
     const list = new MessageList();
-    list.add(dispatched as Parameters<MessageList['add']>[0], 'input');
+    list.add(dispatched.toDBMessage(), 'input');
     const prompt = await list.get.all.aiV5.llmPrompt();
 
     const filePart = prompt

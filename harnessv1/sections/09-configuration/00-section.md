@@ -67,6 +67,7 @@ remains authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-config);" d="M170 229 L170 484" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-config);" d="M820 229 C690 260 540 230 452 229" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-config);" d="M280 367 C330 320 370 270 402 230" />
+
   </svg>
   <figcaption>Configuration groups runtime choices, durable storage policy, session behavior, channel and wakeup bridges, attachment handling, workspace providers, and live event helpers.</figcaption>
 </figure>

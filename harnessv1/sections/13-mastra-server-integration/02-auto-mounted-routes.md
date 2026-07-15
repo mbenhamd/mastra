@@ -84,6 +84,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-route-families);" d="M450 97 C340 190 305 270 298 334" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-route-families);" d="M540 97 L555 334" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-route-families);" d="M630 97 C760 195 812 270 815 334" />
+
   </svg>
   <figcaption>Client-facing routes stay inside the authenticated Harness/resource scope; operator routes are a separate protected surface, not alternate client APIs.</figcaption>
 </figure>
@@ -670,7 +671,6 @@ receipt contract, where the claim holder answers the owning session's inbox item
 with `itemId` and `responseId`. This route never calls agent approval or resume
 APIs directly.
 
-
 Optional operator/internal routes are not public client APIs. A deployment
 mounts them only when it explicitly enables that operator surface and protects
 it with operator authentication, authorization, audit logging, and rate
@@ -697,7 +697,6 @@ Optional operator diagnostic access to unscoped or cross-resource
 background-task list/get/event observation for one Harness namespace. It is not
 an ordinary client read route; deployments expose it only under explicit
 operator authentication, authorization, audit logging, and rate limiting.
-
 
 Harness v1 exposes no public `getKnownResourceIds()` method and no
 client-facing auto-mounted resource-enumeration route. If a deployment exposes
@@ -970,7 +969,6 @@ background-task diagnostics.
 Minimum principal rule: Deployment operator auth scope plus explicit operator
 authorization, audit logging, and rate limiting. Operator routes do not use the
 per-resource client boundary as their only guard.
-
 
 This matrix resolves the Harness v1 route contract; it does not require a new
 Mastra auth API. Current Mastra route metadata such as explicit permissions and

@@ -110,6 +110,7 @@ Orientation diagram (boundary map only; the tables below remain authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-recovery-boundaries);" d="M925 275 L925 324" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-recovery-boundaries);" d="M925 395 L925 444" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-recovery-boundaries);" d="M925 515 L925 549" />
+
   </svg>
   <figcaption>Inbound recovery re-enters session admission through accepted durable records; outbound recovery remains the dispatch path from outbox to provider.</figcaption>
 </figure>

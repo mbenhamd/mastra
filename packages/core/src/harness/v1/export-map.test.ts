@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import * as legacyHarnessEntry from '../index';
+import * as agentControllerCompatibilityEntry from '../index';
 import * as harnessV1Entry from './index';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -13,7 +13,7 @@ const packageJson = JSON.parse(readFileSync(resolve(packageRoot, 'package.json')
 };
 
 describe('Harness v1 — §15 package export acceptance', () => {
-  it('maps @mastra/core/harness/v1 to v1 dist targets without replacing the legacy harness entry', () => {
+  it('maps @mastra/core/harness/v1 without replacing the upstream AgentController compatibility entry', () => {
     expect(packageJson.exports['./harness/v1']).toEqual({
       import: {
         types: './dist/harness/v1/index.d.ts',
@@ -38,6 +38,6 @@ describe('Harness v1 — §15 package export acceptance', () => {
     expect(harnessV1Entry.Harness).toBeDefined();
     expect(harnessV1Entry.Session).toBeDefined();
     expect(harnessV1Entry.formatHarnessEventId).toBeTypeOf('function');
-    expect(harnessV1Entry.Harness).not.toBe(legacyHarnessEntry.Harness);
+    expect(harnessV1Entry.Harness).not.toBe(agentControllerCompatibilityEntry.Harness);
   });
 });

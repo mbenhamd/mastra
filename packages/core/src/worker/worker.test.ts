@@ -408,10 +408,13 @@ describe('HarnessChannelOutboxWorker', () => {
   });
 
   it('auto-registers on Mastra only when Harness channel bindings exist', () => {
+    const channelBinding = sampleChannelBinding();
     const channelHarness = {
       __registerMastra: vi.fn(),
+      _listRunnableAgentIds: () => [],
+      _previewChannelBindings: () => [channelBinding],
       _internalGetSessionStorage: () => undefined,
-      listChannelBindings: () => [sampleChannelBinding()],
+      listChannelBindings: () => [channelBinding],
       channels: { dispatchOutbox: vi.fn() },
       shutdown: vi.fn(),
     };
@@ -425,6 +428,8 @@ describe('HarnessChannelOutboxWorker', () => {
 
     const noChannelHarness = {
       __registerMastra: vi.fn(),
+      _listRunnableAgentIds: () => [],
+      _previewChannelBindings: () => [],
       _internalGetSessionStorage: () => undefined,
       listChannelBindings: () => [],
       channels: { dispatchOutbox: vi.fn() },

@@ -81,9 +81,9 @@ class HarnessSessionDeletedError extends Error {
   readonly resourceId?: string;
   readonly threadId?: string;
   readonly cause?:
-    | 'cascade'        // descendant deleted as part of an ancestor delete
-    | 'force'          // operator/owner ran force delete
-    | 'tenant_delete'  // tenant-wide cleanup
+    | 'cascade' // descendant deleted as part of an ancestor delete
+    | 'force' // operator/owner ran force delete
+    | 'tenant_delete' // tenant-wide cleanup
     | 'thread_delete'; // lower-level thread delete cascade per §5.5
 }
 

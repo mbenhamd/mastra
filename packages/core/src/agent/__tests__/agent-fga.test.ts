@@ -8,6 +8,8 @@ import { z } from 'zod';
 
 import { FGADeniedError } from '../../auth/ee/fga-check';
 import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
+import { EventEmitterPubSub } from '../../events';
+import { Mastra } from '../../mastra';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '../../request-context';
 import { Agent } from '../agent';
 
@@ -228,12 +230,42 @@ describe('Agent FGA checks', () => {
       expect(model.doGenerateCalls).toHaveLength(0);
     });
 
-    it('should not call FGA check when no FGA provider configured', async () => {
-      const mastra = createMockMastra();
+    it('should bypass membership resolution for a tenant-scoped trusted actor', async () => {
+      const fgaProvider = createMockFGAProvider(true);
       const model = createMockModel();
 
       const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
-      (agent as any).__registerMastra(mastra);
+      const mastra = new Mastra({
+        agents: { testAgent: agent },
+        logger: false,
+        pubsub: new EventEmitterPubSub(),
+        server: { fga: fgaProvider },
+      });
+      await mastra.startWorkers();
+
+      const requestContext = new RequestContext();
+      requestContext.set('organizationId', 'org-1');
+
+      try {
+        await agent.generate('test', {
+          requestContext: requestContext as any,
+          actor: { actorKind: 'system', sourceWorkflow: 'nightly-workflow' },
+        });
+      } finally {
+        await mastra.stopWorkers();
+      }
+
+      expect(fgaProvider.require).not.toHaveBeenCalled();
+      expect(model.doGenerateCalls).toHaveLength(1);
+    });
+
+    it('should not call FGA check when no FGA provider configured', async () => {
+      const model = createMockModel();
+
+      // No Mastra is registered, so the agent runs on its ephemeral Mastra,
+      // which has no FGA provider — exercising the "FGA not configured" path
+      // while still giving the evented loop the pubsub/workers it needs.
+      const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
 
       const requestContext = new RequestContext();
       requestContext.set('user', { id: 'user-1' });
@@ -244,11 +276,12 @@ describe('Agent FGA checks', () => {
     });
 
     it('should still run local calls without a user when no FGA provider is configured', async () => {
-      const mastra = createMockMastra();
       const model = createMockModel();
 
+      // An unattached agent uses the native ephemeral Mastra runtime, which has
+      // no FGA provider and exercises the local-call boundary without a partial
+      // Mastra test double that cannot own internal workflow registrations.
       const agent = new Agent({ id: 'test-agent', name: 'test-agent', instructions: 'test', model });
-      (agent as any).__registerMastra(mastra);
 
       await agent.generate('test');
 
@@ -424,15 +457,14 @@ describe('Agent FGA checks', () => {
     });
 
     it('should still run local calls without a user when no FGA provider is configured', async () => {
-      const mastra = createMockMastra();
-
+      // Keep this on the native ephemeral runtime for the same reason as the
+      // generate() coverage above: successful execution owns internal workflows.
       const agent = new Agent({
         id: 'test-agent',
         name: 'test-agent',
         instructions: 'test',
         model: createMockModel(),
       });
-      (agent as any).__registerMastra(mastra);
 
       await agent.stream('test');
     });
@@ -1433,9 +1465,13 @@ describe('Agent FGA checks', () => {
       });
 
       expect(fgaProvider.require).toHaveBeenCalledTimes(1);
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should authorize merged resumeStreamUntilIdle options when caller memory overrides defaults', async () => {
@@ -1575,9 +1611,13 @@ describe('Agent FGA checks', () => {
         id: 'AGENT_RESUME_NO_SNAPSHOT_FOUND',
       });
 
-      expectAgentExecutionRequire(fgaProvider, { id: 'default-user', organizationMembershipId: 'default-om' }, {
-        runId: 'missing-run-id',
-      });
+      expectAgentExecutionRequire(
+        fgaProvider,
+        { id: 'default-user', organizationMembershipId: 'default-om' },
+        {
+          runId: 'missing-run-id',
+        },
+      );
     });
 
     it('should reject callers whose resource does not own the suspended generate run', async () => {

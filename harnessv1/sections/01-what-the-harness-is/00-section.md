@@ -43,41 +43,41 @@ Two roles, cleanly split:
 A useful mental model:
 
 > Think of the Harness as the building for the agent architecture. The
-front desk knows which agents, modes, models, tools, memory providers,
-workspaces, channels, storage backends, workers, and runtime policies are
-available. The building coordinates conversations; it is not itself one
-conversation.
+> front desk knows which agents, modes, models, tools, memory providers,
+> workspaces, channels, storage backends, workers, and runtime policies are
+> available. The building coordinates conversations; it is not itself one
+> conversation.
 >
 > A Session is one active room in that building. It represents a live or
-reopenable conversation runtime: current run state, queue, pending decisions,
-channel binding, memory/context, runtime settings, and any execution ownership
-needed to continue work.
+> reopenable conversation runtime: current run state, queue, pending decisions,
+> channel binding, memory/context, runtime settings, and any execution ownership
+> needed to continue work.
 >
 > A Thread is the durable conversation record behind the room. It stores the
-transcript/history and backs persistence, audit, replay, and memory/history
-substrates. Normal app lifecycle stays session-first.
+> transcript/history and backs persistence, audit, replay, and memory/history
+> substrates. Normal app lifecycle stays session-first.
 >
 > Memory is the room notebook. It gives the agent recall, grounding, working
-facts, summaries, and observational learning. It helps the room think, but it
-is not the source of truth for what work exists, what must recover, or what has
-already been delivered.
+> facts, summaries, and observational learning. It helps the room think, but it
+> is not the source of truth for what work exists, what must recover, or what has
+> already been delivered.
 >
 > Storage is the building logbook. Queue items, wakeups, channel inbox/actions,
-outbox items, session state, attachments/artifacts, leases/claims, and delivery
-evidence are written there before restart-sensitive execution or
-provider-visible delivery.
+> outbox items, session state, attachments/artifacts, leases/claims, and delivery
+> evidence are written there before restart-sensitive execution or
+> provider-visible delivery.
 >
 > Workers are Harness/server recovery loops in the building. They read the
-logbook, claim specific recoverable work rows when needed, renew ownership while
-doing that work, re-enter through the Harness front desk to reopen rooms, rebuild
-the notebook and runtime services, and continue after a crash. If ownership goes
-stale or the same room/runtime surface cannot be rebuilt safely, they stop
-instead of guessing.
+> logbook, claim specific recoverable work rows when needed, renew ownership while
+> doing that work, re-enter through the Harness front desk to reopen rooms, rebuild
+> the notebook and runtime services, and continue after a crash. If ownership goes
+> stale or the same room/runtime surface cannot be rebuilt safely, they stop
+> instead of guessing.
 >
 > Live streams, callbacks, heartbeat timers, sockets, pubsub, and live channel
-adapter paths are the lights, intercoms, and whiteboards in the room. They make
-the room responsive while it is open and can fan out updates across processes,
-but they are not the durable architecture.
+> adapter paths are the lights, intercoms, and whiteboards in the room. They make
+> the room responsive while it is open and can fan out updates across processes,
+> but they are not the durable architecture.
 
 **Memory is advisory context, not a source of durability truth.** The Harness
 rebuilds working memory and observational memory from Harness-owned persisted

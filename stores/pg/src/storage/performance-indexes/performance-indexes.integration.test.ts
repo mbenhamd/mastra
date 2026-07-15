@@ -4,8 +4,7 @@ import { PgDB } from '../db';
 import { PostgresStore } from '../index';
 import { PostgresPerformanceTest } from './performance-test';
 
-const describePgPerfIntegration =
-  process.env.MASTRA_RUN_PG_PERF_INTEGRATION === 'true' ? describe : describe.skip;
+const describePgPerfIntegration = process.env.MASTRA_RUN_PG_PERF_INTEGRATION === 'true' ? describe : describe.skip;
 
 // Integration tests that require a real database connection
 describePgPerfIntegration('PostgresStore Performance Indexes Integration', () => {

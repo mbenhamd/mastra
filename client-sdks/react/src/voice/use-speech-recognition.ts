@@ -222,14 +222,15 @@ const useMastraSpeechToText = ({
   };
 
   const stop = () => {
-    const recorder = recorderRef.current;
     startInFlightRef.current = false;
+    const recorder = recorderRef.current;
     if (recorder) {
       recorder.stop();
     } else {
+      // No recorder means microphone setup is still pending. Invalidate that
+      // setup so its eventual recorder cannot start or transcribe.
       sessionRef.current += 1;
     }
-    recorderRef.current = null;
     setState(prev => ({ ...prev, isListening: false }));
   };
 

@@ -4,13 +4,13 @@ Each session keeps a ring buffer of recent events (`sessions.eventBufferSize`,
 default 1000; see §9). The buffer feeds two consumers:
 
 - **`session.subscribe(...)` after the fact.** If the session is currently in a
-turn when a new subscriber attaches, the subscriber sees future events only — no
-automatic backfill. Callers that need to recover from a missed window should use
-`session.listMessages(...)` for content and the SSE replay path for live event
-continuation.
+  turn when a new subscriber attaches, the subscriber sees future events only — no
+  automatic backfill. Callers that need to recover from a missed window should use
+  `session.listMessages(...)` for content and the SSE replay path for live event
+  continuation.
 - **SSE replay over the wire.** The Mastra Server adapter (§13) honours
-`Last-Event-ID` on the SSE endpoint. The server replays buffer entries newer
-than `Last-Event-ID`, then live-tails. See the replay rules below.
+  `Last-Event-ID` on the SSE endpoint. The server replays buffer entries newer
+  than `Last-Event-ID`, then live-tails. See the replay rules below.
 
 The local `harness.subscribe(...)` control-plane stream is not backed by a
 merged replay buffer. A late harness subscriber sees future harness-scoped
@@ -38,14 +38,14 @@ JavaScript's safe integer range is malformed.
 `Last-Event-ID: harness-v1:<epoch>:<seq>`:
 
 - If the epoch matches the current Session instance and `seq` is within the
-buffer, the server replays entries newer than the supplied ID and live-tails.
+  buffer, the server replays entries newer than the supplied ID and live-tails.
 - If the epoch matches but `seq` is older than the buffer's oldest entry, the
-buffer has overflowed; the server returns `412 Precondition Failed`.
+  buffer has overflowed; the server returns `412 Precondition Failed`.
 - If the epoch does not match the current Session instance, the prior epoch's
-buffer is gone (eviction or process restart). The server returns
-`412 Precondition Failed`.
+  buffer is gone (eviction or process restart). The server returns
+  `412 Precondition Failed`.
 - If `Last-Event-ID` is malformed or absent, the server starts the SSE stream
-from the live tail with no replay.
+  from the live tail with no replay.
 
 In every `412` case the client is expected to refetch the session snapshot via
 `GET /sessions/:sessionId` and resubscribe. That route returns the

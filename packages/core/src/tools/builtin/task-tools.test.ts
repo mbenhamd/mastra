@@ -27,7 +27,11 @@ const THREAD_ID = 'thread-1';
  */
 function createToolContext(
   initialTasks: TaskInput[] = [],
-  options: { memory?: boolean; onEvent?: (event: { type: 'task_updated'; tasks: TaskItemSnapshot[] }) => void } = {},
+  options: {
+    memory?: boolean;
+    onEvent?: (event: { type: 'task_updated'; tasks: TaskItemSnapshot[] }) => void;
+    bridge?: 'harness' | 'controller';
+  } = {},
 ) {
   const memory = options.memory ?? true;
   const requestContext = new RequestContext();
@@ -36,7 +40,7 @@ function createToolContext(
     void store.setState({ threadId: THREAD_ID, type: TASK_STATE_TYPE, value: assignTaskIds(initialTasks) });
   }
   if (options.onEvent) {
-    requestContext.set('harness', { emitEvent: options.onEvent });
+    requestContext.set(options.bridge ?? 'harness', { emitEvent: options.onEvent });
   }
 
   const mastra = {
@@ -143,6 +147,21 @@ describe('taskWriteTool', () => {
   it('emits a task_updated event to the harness display bridge when present', async () => {
     const onEvent = vi.fn();
     const ctx = createToolContext([], { onEvent });
+    await (taskWriteTool as any).execute(
+      { tasks: [{ content: 'Write tests', status: 'pending', activeForm: 'Writing tests' }] },
+      ctx,
+    );
+
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent.mock.calls[0]![0]).toEqual({
+      type: 'task_updated',
+      tasks: [{ id: 'task_write_tests', content: 'Write tests', status: 'pending', activeForm: 'Writing tests' }],
+    });
+  });
+
+  it('emits a task_updated event to the controller display bridge when present', async () => {
+    const onEvent = vi.fn();
+    const ctx = createToolContext([], { onEvent, bridge: 'controller' });
     await (taskWriteTool as any).execute(
       { tasks: [{ content: 'Write tests', status: 'pending', activeForm: 'Writing tests' }] },
       ctx,

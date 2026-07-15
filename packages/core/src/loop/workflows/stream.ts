@@ -11,7 +11,9 @@ import { RequestContext } from '../../request-context';
 import { safeClose, safeEnqueue } from '../../stream/base';
 import type { ChunkType } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
+import { hydrateRunScopeFromInternal } from '../hydrate-run-scope';
 import type { LoopRun } from '../types';
+import { AGENTIC_EXECUTION_WORKFLOW_ID } from './agentic-execution';
 import { createAgenticLoopWorkflow } from './agentic-loop';
 
 export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
@@ -201,45 +203,121 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
         ...rest,
       });
 
+      // Register as internal so the evented engine's event processor can
+      // resolve `agentic-loop` by id via __hasInternalWorkflow/getWorkflowById.
+      // Scope by runId so concurrent/nested agent invocations (parent + sub-agent
+      // each owning their own agentic-loop instance with distinct controller and
+      // agentId closures) don't clobber each other in the global id-keyed registry.
+      // __registerInternalWorkflow also calls __registerMastra under the hood.
+      // The returned registration generation guards the unregister below against
+      // clearing a newer registration for the same runId.
       const agenticLoopWorkflowRegistration = rest.mastra?.__registerInternalWorkflow(agenticLoopWorkflow, runId);
-
-      const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
-      const initialData = {
-        messageId: messageId!,
-        messages: {
-          all: messageList.get.all.aiV5.model(),
-          user: messageList.get.input.aiV5.model(),
-          nonUser: [],
-        },
-        output: {
-          steps: [],
-          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        },
-        metadata: {},
-        stepResult: {
-          reason: 'undefined',
-          warnings: [],
-          isContinued: true,
-          totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        },
-        ...(toolSurfaceFence ? { toolSurfaceFence: [...toolSurfaceFence.allowedNames] } : {}),
-      };
-
-      if (!resumeContext) {
-        safeEnqueue(controller, {
-          type: 'start',
-          runId,
-          from: ChunkFrom.AGENT,
-          payload: {
-            id: agentId,
-            messageId,
-          },
-        });
+      if (rest.mastra) {
+        // Hydrate the RunScope from the bootstrap `_internal` bag. Done right
+        // after registration so the scope is the single source of truth for
+        // non-serializable state by the time any step runs. The scope's
+        // refcount is owned by the internal-workflow registration above —
+        // no separate release needed here.
+        hydrateRunScopeFromInternal(rest.mastra, runId, _internal);
       }
 
+      // Once the run reaches a terminal state its snapshot rows are no longer
+      // needed for resume. Delete both the agentic-loop row and the nested
+      // execution workflow's row (persisted under the same runId) — otherwise
+      // the nested row leaks as a stale "pending"/"suspended" record in
+      // workflow snapshot storage for every completed agent run.
+      // Best-effort: a cleanup failure must never turn a finished run into a
+      // stream error (a stale row is preferable to a broken stream).
+      const deleteRunSnapshots = async () => {
+        const workflowsStore = await rest.mastra?.getStorage()?.getStore('workflows');
+        const executionRunIds = new Set([runId]);
+        try {
+          const storedLoopRun = await workflowsStore?.getWorkflowRunById({
+            runId,
+            workflowName: agenticLoopWorkflow.id,
+          });
+          const rawSnapshot = storedLoopRun?.snapshot;
+          const snapshot =
+            typeof rawSnapshot === 'string'
+              ? (JSON.parse(rawSnapshot) as Record<string, any>)
+              : (rawSnapshot as Record<string, any> | undefined);
+          const executionStep = snapshot?.context?.[AGENTIC_EXECUTION_WORKFLOW_ID];
+          const nestedRunId =
+            executionStep?.metadata?.nestedRunId ??
+            executionStep?.suspendPayload?.__workflow_meta?.runId ??
+            snapshot?.result?.suspendPayload?.__workflow_meta?.runId;
+          if (typeof nestedRunId === 'string' && nestedRunId.length > 0) {
+            executionRunIds.add(nestedRunId);
+          }
+        } catch (error) {
+          rest.logger?.warn('Failed to resolve nested agent workflow snapshot during terminal cleanup', {
+            runId,
+            error,
+          });
+        }
+
+        try {
+          await agenticLoopWorkflow.deleteWorkflowRunById(runId);
+        } catch (error) {
+          rest.logger?.warn('Failed to delete agentic-loop snapshot after terminal state', { runId, error });
+        }
+        for (const executionRunId of executionRunIds) {
+          try {
+            await workflowsStore?.deleteWorkflowRunById({
+              runId: executionRunId,
+              workflowName: AGENTIC_EXECUTION_WORKFLOW_ID,
+            });
+          } catch (error) {
+            rest.logger?.warn('Failed to delete nested agent execution snapshot after terminal state', {
+              runId,
+              executionRunId,
+              error,
+            });
+          }
+        }
+      };
+
+      // Keep the run-scoped registration alive only when the run suspends — a
+      // later resume on the same runId must still resolve this instance. Every
+      // other exit (success, failure, or a throw before completion) must drop
+      // it via the `finally` below, otherwise a stale workflow holding the old
+      // stream/controller closures leaks under this runId.
       let keepRegisteredForResume = false;
-      let executionResult;
       try {
+        const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
+        const initialData = {
+          messageId: messageId!,
+          messages: {
+            all: messageList.get.all.aiV5.model(),
+            user: messageList.get.input.aiV5.model(),
+            nonUser: [],
+          },
+          output: {
+            steps: [],
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          metadata: {},
+          stepResult: {
+            reason: 'undefined',
+            warnings: [],
+            isContinued: true,
+            totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          ...(toolSurfaceFence ? { toolSurfaceFence: [...toolSurfaceFence.allowedNames] } : {}),
+        };
+
+        if (!resumeContext) {
+          safeEnqueue(controller, {
+            type: 'start',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: {
+              id: agentId,
+              messageId,
+            },
+          });
+        }
+
         const run = await agenticLoopWorkflow.createRun({
           runId,
           resourceId: _internal?.resourceId,
@@ -258,71 +336,74 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           requestContext.delete('__mastra_requireToolApproval');
         }
 
-        executionResult = resumeContext
+        const executionResult = resumeContext
           ? await run.resume({
               resumeData: resumeContext.resumeData,
               ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
               requestContext,
+              actor: rest.actor,
               label: toolCallId,
             })
           : await run.start({
               inputData: initialData,
               ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
               requestContext,
+              actor: rest.actor,
             });
-        keepRegisteredForResume = executionResult.status === 'suspended';
+
+        if (executionResult.status !== 'success') {
+          if (executionResult.status === 'failed') {
+            const error = getErrorFromUnknown(executionResult.error, {
+              fallbackMessage: 'Unknown error in agent workflow stream',
+            });
+
+            safeEnqueue(controller, {
+              type: 'error',
+              runId,
+              from: ChunkFrom.AGENT,
+              payload: { error },
+            });
+
+            if (rest.options?.onError) {
+              await rest.options?.onError?.({ error });
+            }
+          }
+
+          if (executionResult.status !== 'suspended') {
+            await deleteRunSnapshots();
+          } else {
+            keepRegisteredForResume = true;
+          }
+
+          safeClose(controller);
+          return;
+        }
+
+        await deleteRunSnapshots();
+
+        // Always emit finish chunk, even for abort (tripwire) cases
+        // This ensures the stream properly completes and all promises are resolved
+        // The tripwire/abort status is communicated through the stepResult.reason
+        safeEnqueue(controller, {
+          type: 'finish',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            ...executionResult.result,
+            stepResult: {
+              ...executionResult.result.stepResult,
+              // @ts-expect-error - runtime reason can be 'tripwire' | 'retry' from processors, but zod schema infers as string
+              reason: executionResult.result.stepResult.reason,
+            },
+          },
+        });
+
+        safeClose(controller);
       } finally {
         if (!keepRegisteredForResume) {
           rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId, agenticLoopWorkflowRegistration);
         }
       }
-
-      if (executionResult.status !== 'success') {
-        if (executionResult.status === 'failed') {
-          const error = getErrorFromUnknown(executionResult.error, {
-            fallbackMessage: 'Unknown error in agent workflow stream',
-          });
-
-          safeEnqueue(controller, {
-            type: 'error',
-            runId,
-            from: ChunkFrom.AGENT,
-            payload: { error },
-          });
-
-          if (rest.options?.onError) {
-            await rest.options?.onError?.({ error });
-          }
-        }
-
-        if (executionResult.status !== 'suspended') {
-          await agenticLoopWorkflow.deleteWorkflowRunById(runId);
-        }
-
-        safeClose(controller);
-        return;
-      }
-
-      await agenticLoopWorkflow.deleteWorkflowRunById(runId);
-
-      // Always emit finish chunk, even for abort (tripwire) cases
-      // This ensures the stream properly completes and all promises are resolved
-      // The tripwire/abort status is communicated through the stepResult.reason
-      safeEnqueue(controller, {
-        type: 'finish',
-        runId,
-        from: ChunkFrom.AGENT,
-        payload: {
-          ...executionResult.result,
-          stepResult: {
-            ...executionResult.result.stepResult,
-            // @ts-expect-error - runtime reason can be 'tripwire' | 'retry' from processors, but zod schema infers as string
-            reason: executionResult.result.stepResult.reason,
-          },
-        },
-      });
-
-      safeClose(controller);
     },
   });
 }

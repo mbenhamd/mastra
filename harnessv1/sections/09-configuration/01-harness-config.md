@@ -80,6 +80,7 @@ remains authoritative for required vs optional fields, defaults, and types):
 
     <rect style="fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 5 5; rx: 12;" x="40" y="478" width="960" height="34" />
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="60" y="500">Validation, missing required fields, and configuration drift surface through §9.5 validation; per-feature owners (§4.7 goals, §2.7 workspace, §14 channels) govern semantics.</text>
+
   </svg>
   <figcaption>HarnessConfig groups required wiring, an opaque runtime contract generation, per-session lifecycle policy, channels, per-feature config, durable workers, hooks, and pagination/state defaults under one registered harness name.</figcaption>
 </figure>
@@ -95,29 +96,29 @@ interface ListLimitConfig {
 
 interface HarnessConfig<TState = Record<string, unknown>> {
   // Required
-  agents: Record<string, Agent>;                      // Session-facing view of Mastra-registered agents keyed by ID.
-                                                      //   Harness does not become a second root registry:
-                                                      //   these entries must be the same Agent instances or
-                                                      //   stable references registered through Mastra. Harness
-                                                      //   may choose which registered agent a session/mode uses,
-                                                      //   but provider/tool/workflow/channel ownership stays
-                                                      //   with Mastra's root registries.
-  modes: HarnessMode[];                               // Available modes
-  resolveModel: (modelId: string) => LanguageModel;   // Model resolver
-  storage: HarnessStorage;                            // Bound HarnessStorage view (§4.8/§5.2): session durability and a scoped composition facade over canonical MemoryStorage, ChannelsStorage, BackgroundTasksStorage, scheduler/wakeup, pubsub/replay, and blob owners.
-                                                      //   Ordinary Mastra registration resolves this from the configured
-                                                      //   storage adapter/domain composition (for example `getStore('harness')`
-                                                      //   plus channel/background/blob domain extensions) and binds it to the
-                                                      //   registered `harnessName`; callers must not construct a parallel
-                                                      //   standalone storage facade that bypasses Mastra's storage-domain owner.
-                                                      //   Sharing one physical adapter across multiple harnesses is valid only
-                                                      //   when the adapter enforces that namespace for session/thread/message
-                                                      //   rows, tombstones, attachments, channel rows, and wakeups. It composes
-                                                      //   with ChannelsStorage for provider installation/config and channel
-                                                      //   bridge ledgers, BackgroundTasksStorage for reconstructable task
-                                                      //   execution, WorkflowScheduler for schedule definitions, PubSub/cache
-                                                      //   for replay where possible, and BlobStore for bytes; it must not mirror
-                                                      //   those domains into second canonical stores.
+  agents: Record<string, Agent>; // Session-facing view of Mastra-registered agents keyed by ID.
+  //   Harness does not become a second root registry:
+  //   these entries must be the same Agent instances or
+  //   stable references registered through Mastra. Harness
+  //   may choose which registered agent a session/mode uses,
+  //   but provider/tool/workflow/channel ownership stays
+  //   with Mastra's root registries.
+  modes: HarnessMode[]; // Available modes
+  resolveModel: (modelId: string) => LanguageModel; // Model resolver
+  storage: HarnessStorage; // Bound HarnessStorage view (§4.8/§5.2): session durability and a scoped composition facade over canonical MemoryStorage, ChannelsStorage, BackgroundTasksStorage, scheduler/wakeup, pubsub/replay, and blob owners.
+  //   Ordinary Mastra registration resolves this from the configured
+  //   storage adapter/domain composition (for example `getStore('harness')`
+  //   plus channel/background/blob domain extensions) and binds it to the
+  //   registered `harnessName`; callers must not construct a parallel
+  //   standalone storage facade that bypasses Mastra's storage-domain owner.
+  //   Sharing one physical adapter across multiple harnesses is valid only
+  //   when the adapter enforces that namespace for session/thread/message
+  //   rows, tombstones, attachments, channel rows, and wakeups. It composes
+  //   with ChannelsStorage for provider installation/config and channel
+  //   bridge ledgers, BackgroundTasksStorage for reconstructable task
+  //   execution, WorkflowScheduler for schedule definitions, PubSub/cache
+  //   for replay where possible, and BlobStore for bytes; it must not mirror
+  //   those domains into second canonical stores.
 
   // Opaque operator-managed contract generation for the configured runtime
   // surface: agents and their prompts/tools, mode-to-agent bindings, model
@@ -133,43 +134,43 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   runtimeCompatibilityGeneration?: string;
 
   // Sessions
-  defaultResourceId?: string;                         // Optional local/in-process default tenant.
-                                                      //   When omitted, `getDefaultResourceId()` returns
-                                                      //   `undefined`; server routes never use this value
-                                                      //   to identify clients, because they derive
-                                                      //   `resourceId` from auth (§13.2).
-  defaultModelId?: string;                            // Immutable default used only to bootstrap
-                                                      //   a SessionRecord with no selected model.
-                                                      //   Existing SessionRecord.modelId wins
-                                                      //   until session.switchModel(...) commits.
-                                                      //   Harness v1 exposes no mutable default
-                                                      //   model API or distributed config
-                                                      //   propagation surface.
+  defaultResourceId?: string; // Optional local/in-process default tenant.
+  //   When omitted, `getDefaultResourceId()` returns
+  //   `undefined`; server routes never use this value
+  //   to identify clients, because they derive
+  //   `resourceId` from auth (§13.2).
+  defaultModelId?: string; // Immutable default used only to bootstrap
+  //   a SessionRecord with no selected model.
+  //   Existing SessionRecord.modelId wins
+  //   until session.switchModel(...) commits.
+  //   Harness v1 exposes no mutable default
+  //   model API or distributed config
+  //   propagation surface.
   sessions?: {
-    maxLive?: number;                                 // Cap on hydrated sessions. Default: Infinity (no cap).
-    idleTimeoutMs?: number;                           // Auto-evict after this idle period. Default: 2 * 60 * 60 * 1000 (2 hours).
-                                                      //   Sessions with a pending approval/suspension/question/plan
-                                                      //   are exempt from this check — see §5.4.
-    flushDebounceMs?: number;                         // Debounce window for writing dirty state. Default: 500
-    maxFlushFailures?: number;                        // Consecutive debounced-flush failures tolerated
-                                                      //   before the session goes into storage-error mode.
-                                                      //   Default: 5. See §5.7.
-    closeTimeoutMs?: number;                          // Maximum time `closeSession` waits for live work
-                                                      //   across the whole session/subagent subtree after
-                                                      //   committing `closingAt`. Default: 30_000.
-    eventBufferSize?: number;                         // Per-session ring buffer size for event replay
-                                                      //   on SSE reconnect (`Last-Event-ID`).
-                                                      //   Default: 1000. See §13.3.
-    admissionReceiptRetentionMs?: number;             // How long full terminal admission/result evidence remains
-                                                      //   available before it may compact to an
-                                                      //   `OperationAdmissionTombstone`. Default: 24 hours.
-    admissionTombstoneRetentionMs?: number;           // How long compact signal/queue admission tombstones remain
-                                                      //   available for duplicate admission conflict checks and
-                                                      //   `expired` result lookup. Must be greater than or equal
-                                                      //   to `admissionReceiptRetentionMs`. Default: 7 days.
-    inboxResponseReceiptRetentionMs?: number;          // How long inbox response receipts remain available
-                                                      //   for exact retry de-dupe after the pending item is
-                                                      //   consumed. Default: 24 hours.
+    maxLive?: number; // Cap on hydrated sessions. Default: Infinity (no cap).
+    idleTimeoutMs?: number; // Auto-evict after this idle period. Default: 2 * 60 * 60 * 1000 (2 hours).
+    //   Sessions with a pending approval/suspension/question/plan
+    //   are exempt from this check — see §5.4.
+    flushDebounceMs?: number; // Debounce window for writing dirty state. Default: 500
+    maxFlushFailures?: number; // Consecutive debounced-flush failures tolerated
+    //   before the session goes into storage-error mode.
+    //   Default: 5. See §5.7.
+    closeTimeoutMs?: number; // Maximum time `closeSession` waits for live work
+    //   across the whole session/subagent subtree after
+    //   committing `closingAt`. Default: 30_000.
+    eventBufferSize?: number; // Per-session ring buffer size for event replay
+    //   on SSE reconnect (`Last-Event-ID`).
+    //   Default: 1000. See §13.3.
+    admissionReceiptRetentionMs?: number; // How long full terminal admission/result evidence remains
+    //   available before it may compact to an
+    //   `OperationAdmissionTombstone`. Default: 24 hours.
+    admissionTombstoneRetentionMs?: number; // How long compact signal/queue admission tombstones remain
+    //   available for duplicate admission conflict checks and
+    //   `expired` result lookup. Must be greater than or equal
+    //   to `admissionReceiptRetentionMs`. Default: 7 days.
+    inboxResponseReceiptRetentionMs?: number; // How long inbox response receipts remain available
+    //   for exact retry de-dupe after the pending item is
+    //   consumed. Default: 24 hours.
 
     // Terminal source-specific rows such as channel inbox/action/outbox rows,
     // action tokens, wakeup items, and reconstructable background-task rows
@@ -178,52 +179,52 @@ interface HarnessConfig<TState = Record<string, unknown>> {
     // (§15.3); while retained, terminal rows stay excluded from worker claim
     // scans and point duplicate reads return their stored terminal state.
 
-    maxSubagentDepth?: number;                        // Finite non-negative integer cap on
-                                                      //   descendant depth across the
-                                                      //   persisted `parentSessionId` chain.
-                                                      //   Default: 1 (direct children allowed).
-                                                      //   0 disables new child session creation
-                                                      //   through the built-in `subagent` tool,
-                                                      //   direct local resolution, and wire
-                                                      //   routes before mutation. Existing
-                                                      //   valid descendants stay addressable
-                                                      //   after a later cap decrease but cannot
-                                                      //   spawn further descendants beyond the
-                                                      //   current cap. See §8 and §13.2.
+    maxSubagentDepth?: number; // Finite non-negative integer cap on
+    //   descendant depth across the
+    //   persisted `parentSessionId` chain.
+    //   Default: 1 (direct children allowed).
+    //   0 disables new child session creation
+    //   through the built-in `subagent` tool,
+    //   direct local resolution, and wire
+    //   routes before mutation. Existing
+    //   valid descendants stay addressable
+    //   after a later cap decrease but cannot
+    //   spawn further descendants beyond the
+    //   current cap. See §8 and §13.2.
 
-    maxQueueDepth?: number;                           // Cap on the active session/thread
-                                                      //   `SessionRecord.pendingQueue` length.
-                                                      //   When at the cap, `session.queue(...)` rejects
-                                                      //   with `HarnessQueueFullError` *before* mutating
-                                                      //   storage. The capacity check + durable append
-                                                      //   are atomic under the active session's write lease
-                                                      //   (§5.8). Default: Infinity (unbounded).
-                                                      //   Cap deliberately does *not* trigger
-                                                      //   `HarnessBusyError` — busy state is what queue
-                                                      //   exists for. See §3 and §5.7.
+    maxQueueDepth?: number; // Cap on the active session/thread
+    //   `SessionRecord.pendingQueue` length.
+    //   When at the cap, `session.queue(...)` rejects
+    //   with `HarnessQueueFullError` *before* mutating
+    //   storage. The capacity check + durable append
+    //   are atomic under the active session's write lease
+    //   (§5.8). Default: Infinity (unbounded).
+    //   Cap deliberately does *not* trigger
+    //   `HarnessBusyError` — busy state is what queue
+    //   exists for. See §3 and §5.7.
 
     // Write-concurrency — see §5.8.
-    lockMode?: 'fail' | 'wait' | 'steal';             // Behavior when another instance owns the lease.
-                                                      //   Default: 'fail'. 'wait' is recommended for
-                                                      //   browser/SSE deployments. 'steal' is reserved
-                                                      //   for operator tools and tests; it is
-                                                      //   operator-only and must write a storage-owned
-                                                      //   operator audit record before the version bump
-                                                      //   commits. Not selectable by
-                                                      //   `RemoteSession`, channel ingress, recovery
-                                                      //   workers, or background tasks (§5.8).
-    lockTtlMs?: number;                               // Lease TTL. The owner renews on every flush
-                                                      //   and on a `lockRenewMs` interval. After TTL
-                                                      //   without renewal the lease is reclaimable.
-                                                      //   Default: 30_000.
-    lockRenewMs?: number;                             // Keep-alive interval for lease renewal even
-                                                      //   when no flush has happened. Default: 10_000.
-    lockWaitMs?: number;                              // Maximum time `harness.session(...)` blocks
-                                                      //   when `lockMode = 'wait'` before throwing
-                                                      //   `HarnessSessionLockedError`. Default: 5_000.
-    maxClockSkewMs?: number;                         // Required when adapter time is not
-                                                      //   storage-authoritative for session lease
-                                                      //   expiry comparisons. See §5.2 and §5.8.
+    lockMode?: 'fail' | 'wait' | 'steal'; // Behavior when another instance owns the lease.
+    //   Default: 'fail'. 'wait' is recommended for
+    //   browser/SSE deployments. 'steal' is reserved
+    //   for operator tools and tests; it is
+    //   operator-only and must write a storage-owned
+    //   operator audit record before the version bump
+    //   commits. Not selectable by
+    //   `RemoteSession`, channel ingress, recovery
+    //   workers, or background tasks (§5.8).
+    lockTtlMs?: number; // Lease TTL. The owner renews on every flush
+    //   and on a `lockRenewMs` interval. After TTL
+    //   without renewal the lease is reclaimable.
+    //   Default: 30_000.
+    lockRenewMs?: number; // Keep-alive interval for lease renewal even
+    //   when no flush has happened. Default: 10_000.
+    lockWaitMs?: number; // Maximum time `harness.session(...)` blocks
+    //   when `lockMode = 'wait'` before throwing
+    //   `HarnessSessionLockedError`. Default: 5_000.
+    maxClockSkewMs?: number; // Required when adapter time is not
+    //   storage-authoritative for session lease
+    //   expiry comparisons. See §5.2 and §5.8.
   };
 
   // Read/list pagination. Route-specific values override the top-level
@@ -245,7 +246,7 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   };
 
   // Skills
-  skills?: HarnessSkill[];                            // Code-registered skills (precedence over workspace-resolved skills)
+  skills?: HarnessSkill[]; // Code-registered skills (precedence over workspace-resolved skills)
 
   // Subagents — code-registered spawnable definitions for the built-in
   // `subagent` tool. The array supplies the `agentType` catalog and
@@ -256,31 +257,31 @@ interface HarnessConfig<TState = Record<string, unknown>> {
 
   // File attachments
   files?: {
-    maxInlineBytes?: number;                          // Inline attachments larger than this are rejected.
-                                                      //   Default: 10 * 1024 * 1024 (10 MiB).
-    maxUrlBytes?: number;                             // URL ingestion aborts once streamed stored bytes exceed this.
-                                                      //   Default: 50 * 1024 * 1024 (50 MiB).
-    urlFetchTimeoutMs?: number;                       // End-to-end URL ingestion timeout. Default: 30_000.
-    maxUrlRedirects?: number;                         // Redirect hop cap for URL ingestion. Default: 5.
-    stagedAttachmentRetentionMs?: number;             // Minimum time an unreferenced staged attachment
-                                                      //   (pre-uploaded or copied during failed URL
-                                                      //   ingestion) remains eligible for client retry before
-                                                      //   adapter/deployment garbage collection. Default: 24 hours.
-                                                      //   Attachments with any durable reference returned by
-                                                      //   §5.2 listAttachmentReferences(...) are not removed by
-                                                      //   this timer.
-    allowPrivateNetworkUrls?: boolean;                // Default false. When false, URL ingestion rejects
-                                                      //   loopback, link-local, private, multicast, reserved,
-                                                      //   and cloud metadata-service targets at every DNS
-                                                      //   resolution and redirect hop.
-    allowedUrlMimeTypes?: string[];                   // Optional allow-list of MIME types or type/* patterns
-                                                      //   for URL-ingested attachments. Even when omitted,
-                                                      //   declared, response, and sniffed MIME evidence must
-                                                      //   remain compatible before admission.
-                                                      //   Larger files must be pre-uploaded via the wire
-                                                      //   protocol's file route or supplied as `kind: 'url'`
-                                                      //   that the server can ingest into managed attachment
-                                                      //   storage before durable admission (see §13).
+    maxInlineBytes?: number; // Inline attachments larger than this are rejected.
+    //   Default: 10 * 1024 * 1024 (10 MiB).
+    maxUrlBytes?: number; // URL ingestion aborts once streamed stored bytes exceed this.
+    //   Default: 50 * 1024 * 1024 (50 MiB).
+    urlFetchTimeoutMs?: number; // End-to-end URL ingestion timeout. Default: 30_000.
+    maxUrlRedirects?: number; // Redirect hop cap for URL ingestion. Default: 5.
+    stagedAttachmentRetentionMs?: number; // Minimum time an unreferenced staged attachment
+    //   (pre-uploaded or copied during failed URL
+    //   ingestion) remains eligible for client retry before
+    //   adapter/deployment garbage collection. Default: 24 hours.
+    //   Attachments with any durable reference returned by
+    //   §5.2 listAttachmentReferences(...) are not removed by
+    //   this timer.
+    allowPrivateNetworkUrls?: boolean; // Default false. When false, URL ingestion rejects
+    //   loopback, link-local, private, multicast, reserved,
+    //   and cloud metadata-service targets at every DNS
+    //   resolution and redirect hop.
+    allowedUrlMimeTypes?: string[]; // Optional allow-list of MIME types or type/* patterns
+    //   for URL-ingested attachments. Even when omitted,
+    //   declared, response, and sniffed MIME evidence must
+    //   remain compatible before admission.
+    //   Larger files must be pre-uploaded via the wire
+    //   protocol's file route or supplied as `kind: 'url'`
+    //   that the server can ingest into managed attachment
+    //   storage before durable admission (see §13).
   };
 
   // Channels — per-harness bridges over Mastra-level channel providers. The
@@ -291,10 +292,10 @@ interface HarnessConfig<TState = Record<string, unknown>> {
 
   // Goals — see §4.7
   goals?: {
-    defaultJudgeModel?: string;                       // Used when `setGoal({ judgeModel })` omits the field.
-                                                      //   No default — `setGoal` throws if the goal has no
-                                                      //   judge model and no default is configured.
-    defaultMaxTurns?: number;                         // Default: 50
+    defaultJudgeModel?: string; // Used when `setGoal({ judgeModel })` omits the field.
+    //   No default — `setGoal` throws if the goal has no
+    //   judge model and no default is configured.
+    defaultMaxTurns?: number; // Default: 50
   };
 
   // Workspace — see §2.7 for ownership models and the provider contract.
@@ -314,7 +315,7 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   observationalMemory?: ObservationalMemoryConfig;
 
   // Tooling
-  tools?: ToolsetInput;                               // Available tools
+  tools?: ToolsetInput; // Available tools
   // Authoritative tool -> category mapping. The function form is primary:
   // categorization is a function of tool identity, and adapters may need to
   // inspect tool metadata, configured groups, or naming conventions rather
@@ -329,10 +330,10 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   // create-time bootstrap only; after the SessionRecord exists, the session's
   // own permissionRules/sessionGrants are canonical.
   initialPermissionRules?: PermissionRules;
-  defaultPermissionPolicy?: PermissionPolicy;         // Default approval behavior
+  defaultPermissionPolicy?: PermissionPolicy; // Default approval behavior
 
   // Lifecycle hooks
-  heartbeatHandlers?: HeartbeatHandler[];             // Registered at init via `registerHeartbeat`
+  heartbeatHandlers?: HeartbeatHandler[]; // Registered at init via `registerHeartbeat`
 
   // Reconstructable background task workers — see §5.1, §5.2, §5.7, §15.
   // This registry is required only for rows whose durability is
@@ -345,33 +346,32 @@ interface HarnessConfig<TState = Record<string, unknown>> {
   backgroundTasks?: {
     executors?: Record<string, BackgroundTaskExecutorRegistration>;
     completionPolicies?: Record<string, BackgroundTaskCompletionPolicyRegistration>;
-    maxAttempts?: number;                             // Default: 10
-    claimTtlMs?: number;                              // Default: 30_000
-    claimRenewMs?: number;                            // Default: claimTtlMs / 3
-    maxClockSkewMs?: number;                          // Required when adapter time is not storage-authoritative
-    batchSize?: number;                               // Default: 50
-    pollIntervalMs?: number;                          // Default: 1_000 for built-in workers
-    retryBackoffMs?: (attempt: number) => number;      // Default: exponential with jitter
+    maxAttempts?: number; // Default: 10
+    claimTtlMs?: number; // Default: 30_000
+    claimRenewMs?: number; // Default: claimTtlMs / 3
+    maxClockSkewMs?: number; // Required when adapter time is not storage-authoritative
+    batchSize?: number; // Default: 50
+    pollIntervalMs?: number; // Default: 1_000 for built-in workers
+    retryBackoffMs?: (attempt: number) => number; // Default: exponential with jitter
   };
 
   // Durable scheduled/proactive work — see §5.1, §5.2, §14.6, §15.
   // This config controls workers that claim `HarnessWakeupItem` rows. It does
   // not make `heartbeatHandlers` durable.
   wakeups?: {
-    maxAttempts?: number;                              // Default: 10
-    claimTtlMs?: number;                               // Default: 30_000
-    claimRenewMs?: number;                             // Default: claimTtlMs / 3
-    maxClockSkewMs?: number;                           // Required when adapter time is not storage-authoritative
-    batchSize?: number;                                // Default: 50
-    pollIntervalMs?: number;                           // Default: 1_000 for built-in workers
-    retryBackoffMs?: (attempt: number) => number;      // Default: exponential with jitter
+    maxAttempts?: number; // Default: 10
+    claimTtlMs?: number; // Default: 30_000
+    claimRenewMs?: number; // Default: claimTtlMs / 3
+    maxClockSkewMs?: number; // Required when adapter time is not storage-authoritative
+    batchSize?: number; // Default: 50
+    pollIntervalMs?: number; // Default: 1_000 for built-in workers
+    retryBackoffMs?: (attempt: number) => number; // Default: exponential with jitter
     missedFirePolicy?: 'coalesce' | 'backfill' | 'skip'; // Default: 'coalesce'
   };
 
   // State
   initialState?: TState;
 }
-
 ```
 
 `runtimeCompatibilityGeneration` is Harness-owned. Mastra core registries carry

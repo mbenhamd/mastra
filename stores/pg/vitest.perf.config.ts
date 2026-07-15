@@ -3,10 +3,7 @@ import { defineConfig } from 'vitest/config';
 const includePgPerfIntegration = process.env.MASTRA_RUN_PG_PERF_INTEGRATION === 'true';
 const includePgVectorPerf = process.env.MASTRA_RUN_PG_VECTOR_PERF === 'true';
 
-const include = [
-  'src/**/performance-indexes/*.test.ts',
-  'src/storage/domains/memory/row-number-performance.test.ts',
-];
+const include = ['src/**/performance-indexes/*.test.ts', 'src/storage/domains/memory/row-number-performance.test.ts'];
 if (includePgVectorPerf) {
   include.push('src/vector/vector.performance.test.ts');
 }

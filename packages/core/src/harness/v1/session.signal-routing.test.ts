@@ -35,7 +35,9 @@ describe('Session.message() signal routing', () => {
     // not the raw string.
     const messages = call.messages as { __isCreatedSignal?: boolean; type?: string; contents?: unknown };
     expect(messages.__isCreatedSignal).toBe(true);
-    expect(messages.type).toBe('user-message');
+    // The public legacy spelling is normalized at the Agent boundary to the
+    // canonical signal type carried into stream execution.
+    expect(messages.type).toBe('user');
     expect(messages.contents).toBe('hi');
 
     // The options carry the runtime-allocated runId; the result mirrors it.

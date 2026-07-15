@@ -1,6 +1,5 @@
 ### 5.1g Inbox Response Receipt Rules
 
-
 `inboxResponseReceipts` are keyed by `responseId` for retry lookup and each
 receipt is logically unique for the `(itemId, responseId)` pair. Lookup by
 `responseId` alone returns the matching receipt; a caller producing the same

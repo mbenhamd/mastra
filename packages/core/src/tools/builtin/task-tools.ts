@@ -11,7 +11,8 @@ import { createTool } from '../tool';
 //
 // The four task tools (`task_write`, `task_update`, `task_complete`,
 // `task_check`) manage a structured task list for an agent run. They are
-// agent-agnostic: they do not depend on the Harness. The task list is persisted
+// agent-agnostic: they do not depend on the Harness or the AgentController.
+// The task list is persisted
 // through the agent **state-signal** lane (see `task-state-processor.ts`), which
 // is cache-aware (the snapshot supersedes by cacheKey instead of accumulating)
 // and OM-aware (re-emitted when observational-memory truncation drops it).
@@ -361,9 +362,21 @@ interface HarnessDisplayBridge {
   emitEvent?: (event: { type: 'task_updated'; tasks: TaskItemSnapshot[] }) => void;
 }
 
+/**
+ * Optional AgentController display bridge. When the run carries a AgentController request
+ * context, emit a `task_updated` event so the AgentController can update its display
+ * state and any pinned task UI. This is display-only — the task list itself
+ * lives in the `threadState` store + state-signal lane, not in AgentController state.
+ */
+interface AgentControllerDisplayBridge {
+  emitEvent?: (event: { type: 'task_updated'; tasks: TaskItemSnapshot[] }) => void;
+}
+
 function emitTaskDisplayUpdate(requestContext: RequestContext | undefined, tasks: TaskItemSnapshot[]): void {
   const harnessCtx = requestContext?.get('harness') as HarnessDisplayBridge | undefined;
   harnessCtx?.emitEvent?.({ type: 'task_updated', tasks });
+  const controllerCtx = requestContext?.get('controller') as AgentControllerDisplayBridge | undefined;
+  controllerCtx?.emitEvent?.({ type: 'task_updated', tasks });
 }
 
 function noMemoryResult(): TaskToolResult {
@@ -393,7 +406,7 @@ async function readTaskStore(context: TaskToolContext): Promise<TaskItemSnapshot
 /**
  * Apply a mutation to the current task list: read from the store, mutate,
  * persist back to the store, surface the list to the state processor via
- * `RequestContext`, and emit the Harness display update.
+ * `RequestContext`, and emit the Harness/AgentController display update.
  */
 async function applyTaskMutation(
   context: TaskToolContext,

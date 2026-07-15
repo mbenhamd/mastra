@@ -7,15 +7,15 @@ apply this model in detail.
 
 ### Entities
 
-| Entity | Role | Product callers | Must not own |
-|--------|------|-----------------|--------------|
-| **Harness** | Building / front desk for sessions: mode policy, runtime references, storage views, workers, and session routing over Mastra-registered agents, tools, memory, workspaces, channels, pubsub, and background-task infrastructure. Coordinates conversations; **not** one conversation and not a second Mastra root registry. | `HarnessConfig`, `init`/`shutdown`, concrete `harness.session(...)`, catalogs, cross-session subscribe | Per-conversation lifecycle as the default path (`switchThread`, `currentThreadId`, thread-first singleton state); provider/channel/task registries already owned by Mastra |
-| **Session** | One active **room**: live or reopenable runtime — run, queue, pending decisions, channel binding, memory/context attachment, settings, execution ownership. | `create/open`, `close`, `delete`, `rename`, `clone`, `session.signal()`, `session.queue()`, inbox responses, state/mode/model | Durable transcript as the only identity; blanket exclusive locks on read/subscribe/admitted signals |
-| **Thread** | Durable **conversation record** behind the room: transcript/history, audit, replay substrate. | Indirect via session; low-level history/import only when explicit | Normal app lifecycle through thread-first Harness methods |
-| **Memory** | Room **notebook**: recall, grounding, working facts, summaries, observational learning. | OM/processor config, message history via shared `MemoryStorage` view | What work exists, what must recover, or what was delivered (**Storage** owns that) |
-| **Storage** | Building **logbook**: session rows, queue/receipts/tombstones, leases/claims, accepted-signal evidence, attachment metadata, and source-specific durable work rows such as wakeups or channel inbox/action/outbox. Write **before** restart-sensitive execution or provider-visible delivery. | A narrow Harness storage domain plus source-owned domain extensions; not app lifecycle | Live UX projection as source of truth; duplicating MemoryStorage, ChannelsStorage, BackgroundTasksStorage, scheduler, PubSub, or BlobStore authorities |
-| **Workers** | Recovery **loops**: claim logbook rows, renew ownership, reopen rooms via Harness front desk, rebuild notebook/runtime; **stop** if stale or unsafe to rebuild. | Registered in `HarnessConfig`; not a second public conversation API | Guessing across stale ownership; blocking multi-client read/signal |
-| **Live layer** | Lights / intercoms / whiteboards: streams, callbacks, heartbeat timers, sockets, pubsub, legacy `AgentChannels` live path. | Optimization while room is open | Durability, admission evidence, recovery keys |
+| Entity         | Role                                                                                                                                                                                                                                                                                                                        | Product callers                                                                                                               | Must not own                                                                                                                                                               |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Harness**    | Building / front desk for sessions: mode policy, runtime references, storage views, workers, and session routing over Mastra-registered agents, tools, memory, workspaces, channels, pubsub, and background-task infrastructure. Coordinates conversations; **not** one conversation and not a second Mastra root registry. | `HarnessConfig`, `init`/`shutdown`, concrete `harness.session(...)`, catalogs, cross-session subscribe                        | Per-conversation lifecycle as the default path (`switchThread`, `currentThreadId`, thread-first singleton state); provider/channel/task registries already owned by Mastra |
+| **Session**    | One active **room**: live or reopenable runtime — run, queue, pending decisions, channel binding, memory/context attachment, settings, execution ownership.                                                                                                                                                                 | `create/open`, `close`, `delete`, `rename`, `clone`, `session.signal()`, `session.queue()`, inbox responses, state/mode/model | Durable transcript as the only identity; blanket exclusive locks on read/subscribe/admitted signals                                                                        |
+| **Thread**     | Durable **conversation record** behind the room: transcript/history, audit, replay substrate.                                                                                                                                                                                                                               | Indirect via session; low-level history/import only when explicit                                                             | Normal app lifecycle through thread-first Harness methods                                                                                                                  |
+| **Memory**     | Room **notebook**: recall, grounding, working facts, summaries, observational learning.                                                                                                                                                                                                                                     | OM/processor config, message history via shared `MemoryStorage` view                                                          | What work exists, what must recover, or what was delivered (**Storage** owns that)                                                                                         |
+| **Storage**    | Building **logbook**: session rows, queue/receipts/tombstones, leases/claims, accepted-signal evidence, attachment metadata, and source-specific durable work rows such as wakeups or channel inbox/action/outbox. Write **before** restart-sensitive execution or provider-visible delivery.                               | A narrow Harness storage domain plus source-owned domain extensions; not app lifecycle                                        | Live UX projection as source of truth; duplicating MemoryStorage, ChannelsStorage, BackgroundTasksStorage, scheduler, PubSub, or BlobStore authorities                     |
+| **Workers**    | Recovery **loops**: claim logbook rows, renew ownership, reopen rooms via Harness front desk, rebuild notebook/runtime; **stop** if stale or unsafe to rebuild.                                                                                                                                                             | Registered in `HarnessConfig`; not a second public conversation API                                                           | Guessing across stale ownership; blocking multi-client read/signal                                                                                                         |
+| **Live layer** | Lights / intercoms / whiteboards: streams, callbacks, heartbeat timers, sockets, pubsub, legacy `AgentChannels` live path.                                                                                                                                                                                                  | Optimization while room is open                                                                                               | Durability, admission evidence, recovery keys                                                                                                                              |
 
 ### Architecture rules
 
@@ -55,23 +55,23 @@ apply this model in detail.
 
 ### Section map (entity ownership)
 
-| Section | Primary entities |
-|---------|------------------|
-| §1 What the Harness is | Harness, Session, Storage, Workers (orientation) |
-| §2 Core concepts | Harness, Session, Thread, Memory, Resource, Workspace |
-| §3 Concurrency model | Session, Storage (admission/lease) |
-| §4 Public API | Harness, Session; Thread helpers at Harness only for non-product paths |
-| §5 Session persistence | Storage, Session, Thread, Memory |
-| §6 Tool authoring | Session (via `HarnessRequestContext`) |
-| §7 Sandbox commands | Harness config policy only |
-| §8 Subagent guarantees | Session, Harness |
-| §9 Configuration | Harness, Storage, Memory, Workers, Live layer (heartbeat hooks) |
-| §10 Events | Session, Harness; Live layer as non-durable input |
-| §11 Migration | All entities; cutover order in §11.1 |
-| §12 Usage examples | Illustrative only — defer to §0 and owning sections |
-| §13 Server integration | Harness front desk projecting Session/Storage/Events |
-| §14 Channels | Harness control plane, Storage logbook, Session admission |
-| §15 Verification | Cross-cutting claim checks on Storage, Session, Workers |
+| Section                | Primary entities                                                       |
+| ---------------------- | ---------------------------------------------------------------------- |
+| §1 What the Harness is | Harness, Session, Storage, Workers (orientation)                       |
+| §2 Core concepts       | Harness, Session, Thread, Memory, Resource, Workspace                  |
+| §3 Concurrency model   | Session, Storage (admission/lease)                                     |
+| §4 Public API          | Harness, Session; Thread helpers at Harness only for non-product paths |
+| §5 Session persistence | Storage, Session, Thread, Memory                                       |
+| §6 Tool authoring      | Session (via `HarnessRequestContext`)                                  |
+| §7 Sandbox commands    | Harness config policy only                                             |
+| §8 Subagent guarantees | Session, Harness                                                       |
+| §9 Configuration       | Harness, Storage, Memory, Workers, Live layer (heartbeat hooks)        |
+| §10 Events             | Session, Harness; Live layer as non-durable input                      |
+| §11 Migration          | All entities; cutover order in §11.1                                   |
+| §12 Usage examples     | Illustrative only — defer to §0 and owning sections                    |
+| §13 Server integration | Harness front desk projecting Session/Storage/Events                   |
+| §14 Channels           | Harness control plane, Storage logbook, Session admission              |
+| §15 Verification       | Cross-cutting claim checks on Storage, Session, Workers                |
 
 ### Implementation cutover order
 

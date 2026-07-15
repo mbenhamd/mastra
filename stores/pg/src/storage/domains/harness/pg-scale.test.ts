@@ -98,7 +98,7 @@ function summarize(label: string, samplesMs: number[]): { p50: number; p99: numb
   const p99 = percentile(sorted, 99);
   const max = sorted[sorted.length - 1] ?? NaN;
   const mean = sorted.reduce((a, b) => a + b, 0) / (sorted.length || 1);
-  // eslint-disable-next-line no-console
+
   console.log(
     `[pg-scale] ${label}: n=${samplesMs.length} p50=${p50.toFixed(2)}ms p99=${p99.toFixed(2)}ms ` +
       `max=${max.toFixed(2)}ms mean=${mean.toFixed(2)}ms`,
@@ -172,16 +172,17 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
       await Promise.all(
         wave.map(async id => {
           const t0 = performance.now();
-          await h.saveSession(
-            createSampleSessionRecord({ id, threadId: `t-${id}`, harnessName: HARNESS_NS }),
-            { harnessName: HARNESS_NS, ownerId: 'owner-1', ifVersion: 0 },
-          );
+          await h.saveSession(createSampleSessionRecord({ id, threadId: `t-${id}`, harnessName: HARNESS_NS }), {
+            harnessName: HARNESS_NS,
+            ownerId: 'owner-1',
+            ifVersion: 0,
+          });
           saveSamples.push(performance.now() - t0);
         }),
       );
     }
     const saveWallSec = (performance.now() - tSaveStart) / 1000;
-    // eslint-disable-next-line no-console
+
     console.log(
       `[pg-scale] axis1 saveSession: ${SESSION_COUNT} inserts in ${saveWallSec.toFixed(2)}s ` +
         `= ${(SESSION_COUNT / saveWallSec).toFixed(0)} sessions/sec`,
@@ -210,7 +211,7 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
     }
     const eventWallSec = (performance.now() - tEventStart) / 1000;
     const eventsPerSec = totalEvents / eventWallSec;
-    // eslint-disable-next-line no-console
+
     console.log(
       `[pg-scale] axis1 appendSessionEvent: ${totalEvents} events in ${eventWallSec.toFixed(2)}s ` +
         `= ${eventsPerSec.toFixed(0)} events/sec`,
@@ -342,10 +343,8 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
       });
     }
 
-    // eslint-disable-next-line no-console
     console.log('[pg-scale] axis2 LEDGER GROWTH CURVE (unbounded-ledger concern):');
     for (const c of curve) {
-      // eslint-disable-next-line no-console
       console.log(
         `[pg-scale]   rows=${c.rows.toString().padStart(6)} ` +
           `replay p50=${c.replayMsP50.toFixed(2)}ms p99=${c.replayMsP99.toFixed(2)}ms | ` +
@@ -382,7 +381,7 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
     const last = curve[curve.length - 1]!;
     const replayGrowth = last.replayMsP50 / Math.max(first.replayMsP50, 0.01);
     const tailGrowth = last.tailMsP50 / Math.max(first.tailMsP50, 0.01);
-    // eslint-disable-next-line no-console
+
     console.log(
       `[pg-scale] axis2 FINDING — replay-state is O(rows) (full-partition aggregate): ` +
         `p50 x${replayGrowth.toFixed(2)} across 50x rows; tail-read is O(1) (bounded range scan): ` +
@@ -481,7 +480,10 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
       // CORRECTNESS: the renewal renews the WHOLE subtree (root + all descendants).
       expect(renewedDescendants).toBe(nodeCount - 1);
 
-      const renew = summarize(`axis3 renewSubtree depth=${shape.depth} width=${shape.width} (n=${nodeCount})`, renewSamples);
+      const renew = summarize(
+        `axis3 renewSubtree depth=${shape.depth} width=${shape.width} (n=${nodeCount})`,
+        renewSamples,
+      );
 
       // close-subtree: walk the same CTE to enumerate the subtree, then close
       // every node (saveSession with closedAt). We measure the enumerate+close
@@ -517,7 +519,7 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
         );
       }
       const closeMs = performance.now() - tClose;
-      // eslint-disable-next-line no-console
+
       console.log(
         `[pg-scale] axis3 close-subtree depth=${shape.depth} width=${shape.width} (n=${nodeCount}): ${closeMs.toFixed(2)}ms`,
       );
@@ -539,10 +541,8 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
       });
     }
 
-    // eslint-disable-next-line no-console
     console.log('[pg-scale] axis3 SUBTREE-CTE CURVE (recursive-CTE scaling concern):');
     for (const c of curve) {
-      // eslint-disable-next-line no-console
       console.log(
         `[pg-scale]   depth=${c.depth.toString().padStart(2)} width=${c.width.toString().padStart(2)} ` +
           `nodes=${c.nodeCount.toString().padStart(4)} ` +
@@ -619,7 +619,7 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
 
     const wallSec = (performance.now() - tStart) / 1000;
     const conflictRate = totalConflicts / totalAttempts;
-    // eslint-disable-next-line no-console
+
     console.log(
       `[pg-scale] axis4 sustained CAS: ${ROUNDS} rounds x ${WRITER_COUNT} writers = ${totalAttempts} attempts in ` +
         `${wallSec.toFixed(2)}s | commits=${ROUNDS} conflicts=${totalConflicts} ` +
@@ -675,7 +675,13 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
         const next = { ...state, count: state.count + i }; // mutate so it's a real write
         const t0 = performance.now();
         const res = await h.saveSession(
-          createSampleSessionRecord({ id: sessionId, threadId: `t-${sessionId}`, harnessName: HARNESS_NS, state: next, version }),
+          createSampleSessionRecord({
+            id: sessionId,
+            threadId: `t-${sessionId}`,
+            harnessName: HARNESS_NS,
+            state: next,
+            version,
+          }),
           { harnessName: HARNESS_NS, ownerId: 'owner-jsonb', ifVersion: version },
         );
         saveSamples.push(performance.now() - t0);
@@ -702,10 +708,8 @@ describe('HarnessPG PG-at-scale (REAL Postgres) — load / retention / locking c
       });
     }
 
-    // eslint-disable-next-line no-console
     console.log('[pg-scale] axis5 LARGE-JSONB CURVE (re-serialize-on-write cost):');
     for (const c of curve) {
-      // eslint-disable-next-line no-console
       console.log(
         `[pg-scale]   blob≈${c.approxKB.toFixed(0)}KB (actual ${c.actualKB.toFixed(0)}KB) ` +
           `save p50=${c.saveMsP50.toFixed(2)}ms p99=${c.saveMsP99.toFixed(2)}ms`,

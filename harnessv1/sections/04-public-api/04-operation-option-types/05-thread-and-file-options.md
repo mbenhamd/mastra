@@ -85,6 +85,6 @@ type FileAttachment =
       kind: 'ref';
       name: string;
       mimeType: string;
-      attachmentId: string;            // reference to a previously-stored attachment
+      attachmentId: string; // reference to a previously-stored attachment
     };
 ```

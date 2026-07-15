@@ -9,44 +9,44 @@ workspace tool contract.
 The canonical mapping is:
 
 - `Session.getWorkspace()` / `resolveWorkspace()` return the current core
-`Workspace` instance resolved by the harness's ownership model. `RemoteSession`
-omits direct workspace access (§13.5); remote clients interact with
-workspace-backed behavior through server-side tools, events, attachments, and
-any product-specific wire-safe projections. Those projections are read-model or
-product surfaces; they do not override the first-class output artifact deferral
-(§11.5, §15.3).
+  `Workspace` instance resolved by the harness's ownership model. `RemoteSession`
+  omits direct workspace access (§13.5); remote clients interact with
+  workspace-backed behavior through server-side tools, events, attachments, and
+  any product-specific wire-safe projections. Those projections are read-model or
+  product surfaces; they do not override the first-class output artifact deferral
+  (§11.5, §15.3).
 - `workspace.filesystem`, when statically present, is the current core
-`WorkspaceFilesystem` interface. Workspaces that use a core filesystem resolver
-keep that behavior: the harness and built-in tools pass the current request
-context through the core workspace APIs instead of treating `.filesystem` as a
-separate Harness field. Optional provider capabilities such as
-`WorkspaceFilesystemAudit` stay provider-owned diagnostics/inspection surfaces;
-Harness v1 does not treat filesystem audit history as a memory source.
+  `WorkspaceFilesystem` interface. Workspaces that use a core filesystem resolver
+  keep that behavior: the harness and built-in tools pass the current request
+  context through the core workspace APIs instead of treating `.filesystem` as a
+  separate Harness field. Optional provider capabilities such as
+  `WorkspaceFilesystemAudit` stay provider-owned diagnostics/inspection surfaces;
+  Harness v1 does not treat filesystem audit history as a memory source.
 - Workspace-discovered skills use the current core workspace skill
-source/resolver behavior, not a Harness-only filesystem scanner. Harness owns
-session-level skill precedence, caching, refresh, and remote exposure (§4.6);
-core Workspace owns path, glob, source, and provider-specific discovery
-semantics.
+  source/resolver behavior, not a Harness-only filesystem scanner. Harness owns
+  session-level skill precedence, caching, refresh, and remote exposure (§4.6);
+  core Workspace owns path, glob, source, and provider-specific discovery
+  semantics.
 - Built-in workspace tools reuse the current core workspace tool family
-(`createWorkspaceTools(...)`, standalone workspace tools, and helpers). Harness
-may wrap those tools only to inject session identity, request context, canonical
-approval/tenant policy gates, workspace loss handling, and durability gating; it
-must not introduce divergent file, sandbox, search, process, or LSP semantics.
-Lazy `per-session` provisioning uses the stable wrapper contract below instead
-of deriving the model-visible tool surface from a live `Workspace`.
+  (`createWorkspaceTools(...)`, standalone workspace tools, and helpers). Harness
+  may wrap those tools only to inject session identity, request context, canonical
+  approval/tenant policy gates, workspace loss handling, and durability gating; it
+  must not introduce divergent file, sandbox, search, process, or LSP semantics.
+  Lazy `per-session` provisioning uses the stable wrapper contract below instead
+  of deriving the model-visible tool surface from a live `Workspace`.
 - Current Mastra workspace registry and server workspace handlers are
-implementation material for Studio/operator inspection, not the public Harness
-remote contract. Harness-owned workspace inspection must be a
-session/resource-scoped or operator-scoped projection and must not expose raw
-`Workspace` handles or cross-resource workspace IDs to `RemoteSession` clients
-(§13.5).
+  implementation material for Studio/operator inspection, not the public Harness
+  remote contract. Harness-owned workspace inspection must be a
+  session/resource-scoped or operator-scoped projection and must not expose raw
+  `Workspace` handles or cross-resource workspace IDs to `RemoteSession` clients
+  (§13.5).
 - Configured or registered workspace definitions are separate from per-session
-resume state. Core workspace configuration owns
-filesystem/sandbox/browser/search/skill/tool wiring; the Harness
-`WorkspaceProvider.providerId` is a Harness-level provider identity, not
-`Workspace.id` and not the filesystem/sandbox provider string.
-`SessionRecord.workspace` owns only materialized per-session provider identity,
-opaque state, optional generation, and loss metadata.
+  resume state. Core workspace configuration owns
+  filesystem/sandbox/browser/search/skill/tool wiring; the Harness
+  `WorkspaceProvider.providerId` is a Harness-level provider identity, not
+  `Workspace.id` and not the filesystem/sandbox provider string.
+  `SessionRecord.workspace` owns only materialized per-session provider identity,
+  opaque state, optional generation, and loss metadata.
 
 This section owns Harness workspace ownership, durability, and recovery; it does
 not duplicate the core `Workspace`, `WorkspaceFilesystem`, `WorkspaceSkills`,
@@ -104,6 +104,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-workspace-ownership);" d="M250 218 L320 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-workspace-ownership);" d="M675 218 L585 299" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-workspace-ownership);" d="M725 218 L820 299" />
+
   </svg>
   <figcaption>Harness resolves a core Workspace by ownership model; only per-session durable providers persist resumable workspace state in the session record.</figcaption>
 </figure>
@@ -146,7 +147,6 @@ session's reopen semantics
 
 Used by: Devin-style autonomous tasks
 
-
 The ownership model is a property of the harness, not the session. Sessions
 can't override it; they get whatever workspace the harness's config dictates for
 their context.
@@ -164,6 +164,7 @@ deployment-owned runtime APIs; product code and tools resolve workspace through
 the owning session.
 
 Lifecycle:
+
 - `shared` — torn down on `harness.shutdown()`.
 - `per-resource` — torn down through an explicit workspace-admin/operator
   boundary after proving no active session for the resource can still use it.
@@ -267,7 +268,6 @@ closed with `HarnessWorkspaceLostError(lostReason)` before reading `state` or
 calling `provider.resume(...)`. See §5.1a.02 and §5.7c for the authoritative
 rule.
 
-
 `shared` and `per-resource` shapes are `external` because their state is owned
 outside the session record. `per-resource` teardown checks persisted active
 sessions for the resource before destroying anything; an evicted-but-active
@@ -285,38 +285,38 @@ just to probe it — `kind: 'per-session'` configs use the **`WorkspaceProvider`
 shape rather than a bare factory. A provider declares three things up front:
 
 - **`providerId`** — a stable Harness provider identifier (`'e2b'`, `'daytona'`,
-`'modal'`, `'local'`, …) that is written into
-`SessionRecord.workspace.providerId` and matched on rehydration for durable
-workspace records. This is the configured `WorkspaceProvider` identity, not the
-core `Workspace.id` and not the filesystem/sandbox provider string. For
-`durability: 'durable'`, the harness refuses to rehydrate a record whose stored
-`providerId` doesn't match the configured provider, surfacing
-`HarnessWorkspaceProviderMismatchError` rather than handing a record to the
-wrong implementation. For `durability: 'ephemeral'`, the stored durability
-marker wins first: restart/eviction loss surfaces `HarnessWorkspaceLostError`,
-and `providerId` is only diagnostic loss-reporting identity.
+  `'modal'`, `'local'`, …) that is written into
+  `SessionRecord.workspace.providerId` and matched on rehydration for durable
+  workspace records. This is the configured `WorkspaceProvider` identity, not the
+  core `Workspace.id` and not the filesystem/sandbox provider string. For
+  `durability: 'durable'`, the harness refuses to rehydrate a record whose stored
+  `providerId` doesn't match the configured provider, surfacing
+  `HarnessWorkspaceProviderMismatchError` rather than handing a record to the
+  wrong implementation. For `durability: 'ephemeral'`, the stored durability
+  marker wins first: restart/eviction loss surfaces `HarnessWorkspaceLostError`,
+  and `providerId` is only diagnostic loss-reporting identity.
 - **`resumable: boolean`** — the static durability declaration for `per-session`
-workspaces. `true` means durable: `resume({ state, ... })` is required and
-existing active sessions recover only through that method. `false` means
-ephemeral: the provider may be used within one process lifetime, but any
-existing active session whose materialised workspace cannot be proven current
-after restart/eviction fails closed instead of creating a replacement workspace.
+  workspaces. `true` means durable: `resume({ state, ... })` is required and
+  existing active sessions recover only through that method. `false` means
+  ephemeral: the provider may be used within one process lifetime, but any
+  existing active session whose materialised workspace cannot be proven current
+  after restart/eviction fails closed instead of creating a replacement workspace.
 - **A lifecycle pair — `create({...})` and (when resumable)
-`resume({ state, ... })`.** `create` is called the first time a session needs a
-workspace (or eagerly at session creation, if `eager: true`); it returns a live
-`Workspace`. For `resumable: true`, the harness passes `onStateChange(update)`
-in the create/resume context (§9). The provider calls and awaits that hook after
-initial create state is known and after every later durable provider-state
-change inside the workspace (for example, a sandbox-id rotation). The hook is a
-recovery-state commit barrier: it resolves only after the fresh opaque provider
-state and optional generation token are written into `SessionRecord.workspace`
-under the owning session lease. If it rejects, the provider must not treat the
-new state as safely recoverable or continue workspace-dependent work that relies
-on it. After a server restart, the harness calls
-`provider.resume({ state, ... })` with the stored blob and gets a live
-`Workspace` back. If the provider reports a generation token, the harness stores
-it with the workspace state and passes it back on resume so provider-side
-sandbox replacement can be fenced.
+  `resume({ state, ... })`.** `create` is called the first time a session needs a
+  workspace (or eagerly at session creation, if `eager: true`); it returns a live
+  `Workspace`. For `resumable: true`, the harness passes `onStateChange(update)`
+  in the create/resume context (§9). The provider calls and awaits that hook after
+  initial create state is known and after every later durable provider-state
+  change inside the workspace (for example, a sandbox-id rotation). The hook is a
+  recovery-state commit barrier: it resolves only after the fresh opaque provider
+  state and optional generation token are written into `SessionRecord.workspace`
+  under the owning session lease. If it rejects, the provider must not treat the
+  new state as safely recoverable or continue workspace-dependent work that relies
+  on it. After a server restart, the harness calls
+  `provider.resume({ state, ... })` with the stored blob and gets a live
+  `Workspace` back. If the provider reports a generation token, the harness stores
+  it with the workspace state and passes it back on resume so provider-side
+  sandbox replacement can be fenced.
 
 The factory-function shorthand (a bare `(ctx) => Workspace`) is
 **explicitly ephemeral**: it resolves to a `WorkspaceProvider` with

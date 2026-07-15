@@ -463,6 +463,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       abortSignal: ctx.state.abortSignal,
       routePrefix: prefix,
       serverRoutes: this.getServerRoutes(),
+      request: toWebRequest(ctx),
     };
 
     // Check route permission requirement (EE feature)

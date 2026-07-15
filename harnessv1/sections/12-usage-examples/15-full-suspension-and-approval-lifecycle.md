@@ -19,7 +19,7 @@ const session = await harness.session({
 });
 
 // One subscriber drives all interrupt UX.
-session.subscribe(async (event) => {
+session.subscribe(async event => {
   switch (event.type) {
     case 'tool_approval_required': {
       // Model wants to call a tool whose category resolves to 'ask'.

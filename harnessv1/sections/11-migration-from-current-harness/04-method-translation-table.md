@@ -76,7 +76,7 @@ v1 `Harness` + `Session` : `session.switchModel({ model })`.
 
 **`harness.switchModel({ modelId, scope: 'global' })`**
 
-v1 `Harness` + `Session` : *removed* — use `session.switchModel(...)` for
+v1 `Harness` + `Session` : _removed_ — use `session.switchModel(...)` for
 session-level changes. Future session bootstrap defaults come from
 `HarnessConfig.defaultModelId`; see §9.
 
@@ -113,12 +113,12 @@ v1 `Harness` + `Session` :
 
 **`harness.abort()`**
 
-v1 `Harness` + `Session` : *removed* — cancellation
+v1 `Harness` + `Session` : _removed_ — cancellation
 is not a session concern; see §3.
 
 **`harness.steer(...)`**
 
-v1 `Harness` + `Session` : *removed* — use
+v1 `Harness` + `Session` : _removed_ — use
 `session.signal(...)` for new content. Abort-first behavior remains an
 agent-layer concern; see §3.
 
@@ -178,7 +178,7 @@ only as §11.2 bootstrap/import input.
 
 **`harness.getWorkspace()`**
 
-v1 `Harness` + `Session` : *removed* from the public Harness class. Runtime
+v1 `Harness` + `Session` : _removed_ from the public Harness class. Runtime
 callers use `session.getWorkspace()` / `session.resolveWorkspace()` through the
 owning session resolver (§2.7/§4.2). Out-of-session scripts that need a shared
 workspace use a deployment-owned admin/runtime API, not a product Harness
@@ -186,7 +186,7 @@ method.
 
 **`harness.resolveWorkspace()`**
 
-v1 `Harness` + `Session` : *removed* from the public Harness class.
+v1 `Harness` + `Session` : _removed_ from the public Harness class.
 `per-resource` and `per-session` workspaces are resolved from a `Session` or
 `HarnessRequestContext`, not from a global harness cache. Shared workspace
 materialization outside a session is deployment/admin infrastructure, not a
@@ -194,7 +194,7 @@ portable Harness lifecycle method.
 
 **`harness.destroyWorkspace()`**
 
-v1 `Harness` + `Session` : *removed* from the public Harness class. Shared
+v1 `Harness` + `Session` : _removed_ from the public Harness class. Shared
 workspace teardown is part of `harness.shutdown()`, per-session workspace
 teardown follows `session.close()` / the explicit close helper, and
 per-resource teardown belongs to an explicit workspace-admin/operator boundary
@@ -309,7 +309,7 @@ paragraph below for the v1-tightened validation, lifecycle, and tick rules.
 
 **`harness.removeHeartbeat({ id })`**
 
-v1 `Harness` + `Session` : *removed* — await the async unsubscribe function
+v1 `Harness` + `Session` : _removed_ — await the async unsubscribe function
 returned by `registerHeartbeat(...)` instead.
 
 **`harness.stopHeartbeats()`**
@@ -319,36 +319,36 @@ tightened per the paragraph below.
 
 **`harness.getModelName()`**
 
-v1 `Harness` + `Session` : *removed* — no v1
+v1 `Harness` + `Session` : _removed_ — no v1
 equivalent. `session.getCurrentModelId()` returns an opaque model ID;
 applications that need display labels own that catalog and may consult advisory
 `harness.listAvailableModels()` when the ID appears there (§4.1, §9).
 
 **`harness.getFullModelId()`**
 
-v1 `Harness` + `Session` : *removed* — use
+v1 `Harness` + `Session` : _removed_ — use
 `session.getCurrentModelId()` (§4.2).
 
 **`harness.getResolvedObserverModel()`**
 
-v1 `Harness` + `Session` : *removed* — trivial
+v1 `Harness` + `Session` : _removed_ — trivial
 composition
 
 **`harness.getSession()`**
 
-v1 `Harness` + `Session` : *removed* — name collides
+v1 `Harness` + `Session` : _removed_ — name collides
 with new `Session`
 
 **`harness.selectOrCreateThread()`**
 
-v1 `Harness` + `Session` : *removed*. Core Harness does not pick the latest
+v1 `Harness` + `Session` : _removed_. Core Harness does not pick the latest
 thread or session from a `resourceId` alone. Product controllers implement
 continue/latest selection by reading session list models, then opening the chosen
 `sessionId` or `(threadId, resourceId)` through `harness.session(...)`.
 
 **`harness.setResourceId(...)`**
 
-v1 `Harness` + `Session` : *removed* — set at session
+v1 `Harness` + `Session` : _removed_ — set at session
 creation
 
 #### MastraCode transition boundaries

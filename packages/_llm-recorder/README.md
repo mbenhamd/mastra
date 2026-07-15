@@ -162,12 +162,12 @@ LLM_TEST_MODE=replay pnpm test
 
 ### Recording Management
 
-| Export                           | Description                                |
-| -------------------------------- | ------------------------------------------ |
-| `hasLLMRecording(name, dir?)`    | Check if a recording file exists           |
-| `deleteLLMRecording(name, dir?)` | Delete a recording file                    |
-| `listLLMRecordings(dir?)`        | List all recording files                   |
-| `getLLMRecordingsDir(dir?)`      | Get the absolute recordings directory path |
+| Export                           | Description                                        |
+| -------------------------------- | -------------------------------------------------- |
+| `hasLLMRecording(name, dir?)`    | Check if a monolithic or per-test recording exists |
+| `deleteLLMRecording(name, dir?)` | Delete a monolithic or per-test recording          |
+| `listLLMRecordings(dir?)`        | List all monolithic and per-test recordings        |
+| `getLLMRecordingsDir(dir?)`      | Get the absolute recordings directory path         |
 
 ### Contract Validation
 

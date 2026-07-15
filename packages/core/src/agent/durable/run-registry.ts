@@ -21,10 +21,26 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
   ttl: 10 * 60 * 1000,
   updateAgeOnGet: true,
   dispose: entry => {
-    entry.cleanup?.();
+    entry?.cleanup?.();
   },
   noDisposeOnSet: true,
 });
+
+/**
+ * End a run's root spans (MODEL_GENERATION then AGENT_RUN) with an error so the trace
+ * still exports — stores persist only span-end events. After a resume the fresh resume
+ * spans are the active root, so prefer them. Ending an already-ended span is a no-op,
+ * so the duplicate error paths (workflow failure + emitError) are safe. Never throws.
+ */
+export function endRunSpansWithError(runId: string, error: Error): void {
+  try {
+    const entry = globalRunRegistry.get(runId);
+    (entry?.resumeModelSpan ?? entry?.modelSpan)?.error({ error, endSpan: true });
+    (entry?.resumeAgentSpan ?? entry?.agentSpan)?.error({ error, endSpan: true });
+  } catch {
+    // Span bookkeeping must never break error reporting.
+  }
+}
 
 /**
  * Read a run entry only when it is the exact entry captured by the durable
@@ -35,6 +51,11 @@ export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: strin
   const entry = globalRunRegistry.get(runId);
   if (
     entry &&
+    // Placeholder entries are cross-process carriers (e.g. the abort
+    // controller seeded by @mastra/inngest resume()). They hold no usable
+    // runtime dependencies — consumers rebuild from the Mastra instance — so
+    // a binding check would only break legitimate cross-process resumes.
+    entry.isPlaceholder !== true &&
     (entry.runtimeBindingId !== runtimeBindingId ||
       // Inputs persisted before runtime bindings existed may reconstruct after
       // a process restart, but must never attach to a newly registered run that

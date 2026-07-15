@@ -225,7 +225,9 @@ describe('workspace ownership is decoupled from mode (§4.2e / §2.7)', () => {
 
   it('per-resource: switchMode keeps the SAME workspace instance', async () => {
     const harness = new Harness(
-      baseConfig({ workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('per-res')) } }),
+      baseConfig({
+        workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('per-res')) },
+      }),
     );
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
@@ -241,7 +243,9 @@ describe('workspace ownership is decoupled from mode (§4.2e / §2.7)', () => {
 
   it('two sessions for the SAME resource share one per-resource workspace regardless of their modes', async () => {
     const harness = new Harness(
-      baseConfig({ workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('shared-res')) } }),
+      baseConfig({
+        workspace: { kind: 'per-resource' as const, provider: nonDurableProvider(() => makeWorkspace('shared-res')) },
+      }),
     );
     // Same resource, genuinely different modes.
     const sA = await harness.session({ resourceId: 'shared', threadId: { fresh: true } });

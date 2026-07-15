@@ -75,6 +75,7 @@ observational memory, workspace, goal, and token-usage semantics):
     <rect style="fill: #ecfeff; stroke: #06b6d4; stroke-width: 2; rx: 14;" x="40" y="500" width="960" height="50" />
     <text style="font: 600 14px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="60" y="522">Two gates apply this same decision path</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="60" y="540">pre-exposure: filter the final tool surface before the model call · pre-action: re-evaluate immediately before local execute / resume</text>
+
   </svg>
   <figcaption>The permission gate reads the owning SessionRecord at decision time, composes effective policy and reasons from session, defaults, and tool-owned approval, and produces deny, pendingApproval, or allow; the same decision drives the pre-exposure and pre-action gates.</figcaption>
 </figure>

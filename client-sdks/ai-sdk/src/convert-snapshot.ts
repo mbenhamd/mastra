@@ -37,7 +37,7 @@ export function workflowSnapshotToStream(
           runId,
           status,
           includeOutputs: true,
-          output: workflowRun.result ?? null,
+          output: null,
         }),
       );
 

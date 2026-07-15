@@ -125,6 +125,25 @@ describe('workflow terminal graph fingerprint', () => {
     expect(createWorkflowTerminalGraphFingerprint(original)).toBe(createWorkflowTerminalGraphFingerprint(stored));
   });
 
+  it('is stable across reconstructed implicit mapping step IDs while retaining explicit IDs', () => {
+    const schema = z.object({ value: z.number() });
+    const mapping = async ({ inputData }: { inputData: { value: number } }) => ({ value: inputData.value + 1 });
+    const build = (id?: string) =>
+      createWorkflow({ id: 'mapped-workflow', inputSchema: schema, outputSchema: schema })
+        .map(mapping as never, id === undefined ? undefined : { id })
+        .commit();
+
+    const first = build();
+    const rebuilt = build();
+    expect(first.serializedStepGraph[0]).not.toEqual(rebuilt.serializedStepGraph[0]);
+    expect(createWorkflowTerminalGraphFingerprint(first.serializedStepGraph)).toBe(
+      createWorkflowTerminalGraphFingerprint(rebuilt.serializedStepGraph),
+    );
+    expect(createWorkflowTerminalGraphFingerprint(build('explicit-map-a').serializedStepGraph)).not.toBe(
+      createWorkflowTerminalGraphFingerprint(build('explicit-map-b').serializedStepGraph),
+    );
+  });
+
   it('treats explicit undefined optional step fields like JSON-omitted fields', () => {
     const original = graph();
     const conditional = original[3];

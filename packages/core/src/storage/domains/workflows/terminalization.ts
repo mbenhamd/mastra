@@ -535,8 +535,8 @@ export function validateWorkflowNestedRunInitialSnapshot(
     'initialChildSnapshot.snapshot',
   ) as unknown as WorkflowRunState;
   const inspection = validateWorkflowRunSnapshotShape(snapshot, nestedRunId, 'Initial nested workflow snapshot');
-  if (inspection.status !== 'running') {
-    throw new TypeError('Initial nested workflow snapshot must be a valid running child snapshot');
+  if (inspection.status !== 'pending' && inspection.status !== 'running') {
+    throw new TypeError('Initial nested workflow snapshot must be a valid pending or running child snapshot');
   }
   if (inspection.graphFingerprint !== expectedChildGraphFingerprint) {
     throw new TypeError('Initial nested workflow snapshot graph does not match the expected child graph');

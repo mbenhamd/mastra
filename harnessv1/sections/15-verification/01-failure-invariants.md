@@ -660,7 +660,6 @@ Promise: Channel outbox/action receipts are v1's provider-visible receipt model.
 Other non-read external effects need source-specific lookup-before-execute
 receipts before Harness can claim no duplicate provider side effects.
 
-
 Exactly-once is claimed only at Harness admission/receipt boundaries where a
 unique key and stable hash are stored before the downstream side effect.
 External

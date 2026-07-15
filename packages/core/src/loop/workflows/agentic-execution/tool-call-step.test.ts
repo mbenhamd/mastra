@@ -17,6 +17,7 @@ import { createToolCallStep } from './tool-call-step';
 vi.mock('../../../workflows/workflow', () => ({
   createStep: (config: unknown) => config,
   Workflow: class {},
+  Run: class {},
 }));
 
 // Shared helpers used by multiple describe blocks
@@ -367,7 +368,84 @@ describe('createToolCallStep tool execution error handling', () => {
 
     expect(result).toHaveProperty('error');
     expect(result).not.toHaveProperty('result');
-    expect(result.error).toBeInstanceOf(Error);
+    // The step output crosses the evented engine's pubsub boundary where Error instances
+    // would serialize to `{}`, so the step returns a plain {name,message,stack} shape that
+    // the consumer (`llm-mapping-step`) reifies back into an Error via `deserializeToolError`.
+    expect(result.error).toMatchObject({
+      name: 'Error',
+      message: expect.stringContaining('External API error: 503 Service Unavailable'),
+    });
+  });
+});
+
+describe('createToolCallStep FGA checks', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it('should bypass membership resolution for a tenant-scoped trusted actor', async () => {
+    const controller = { enqueue: vi.fn() };
+    const suspend = vi.fn();
+    const streamState = { serialize: vi.fn().mockReturnValue('serialized-state') };
+    const messageList = createMessageList();
+    const toolResult = { ok: true };
+    const tools = {
+      'system-tool': {
+        execute: vi.fn().mockResolvedValue(toolResult),
+      },
+    };
+    const fgaProvider = {
+      require: vi.fn().mockResolvedValue(undefined),
+      check: vi.fn(),
+      filterAccessible: vi.fn(),
+    };
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
+
+    const toolCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      runId: 'system-run-id',
+      streamState,
+      mastra: {
+        getServer: () => ({ fga: fgaProvider }),
+      },
+      actor: { actorKind: 'system', sourceWorkflow: 'nightly-workflow' },
+    } as any);
+
+    const result = await toolCallStep.execute(
+      makeBaseExecuteParams(suspend, {
+        requestContext,
+        writer: new ToolStream({
+          prefix: 'tool',
+          callId: 'system-call-id',
+          name: 'system-tool',
+          runId: 'system-run-id',
+        }),
+        inputData: {
+          toolCallId: 'system-call-id',
+          toolName: 'system-tool',
+          args: { value: 'test' },
+        },
+      }),
+    );
+
+    expect(fgaProvider.require).not.toHaveBeenCalled();
+    expect(tools['system-tool'].execute).toHaveBeenCalledWith(
+      { value: 'test' },
+      expect.objectContaining({
+        toolCallId: 'system-call-id',
+        actor: { actorKind: 'system', sourceWorkflow: 'nightly-workflow' },
+      }),
+    );
+    expect(result).toEqual({
+      result: toolResult,
+      toolCallId: 'system-call-id',
+      toolName: 'system-tool',
+      args: { value: 'test' },
+    });
   });
 });
 
@@ -452,6 +530,50 @@ describe('createToolCallStep tool approval workflow', () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.restoreAllMocks();
+  });
+
+  it('normalizes evidence-free null resume placeholders on a fresh tool call', async () => {
+    const resultValue = { success: true };
+    tools['test-tool'].requireApproval = false;
+    tools['test-tool'].execute.mockResolvedValue(resultValue);
+    const freshCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    });
+    const inputData = {
+      ...makeInputData(),
+      args: {
+        param: 'test',
+        resumeData: null,
+        suspendedToolCallId: null,
+        suspendedToolRunId: null,
+      },
+    };
+
+    const result = await freshCallStep.execute(makeExecuteParams({ inputData }));
+
+    expect(tools['test-tool'].execute).toHaveBeenCalledWith(
+      { param: 'test' },
+      expect.objectContaining({ resumeData: undefined }),
+    );
+    expect(result).toEqual({ ...inputData, result: resultValue });
+  });
+
+  it('rejects a null resume payload that names an unverified suspended run', async () => {
+    tools['test-tool'].requireApproval = false;
+    const inputData = {
+      ...makeInputData(),
+      args: { param: 'test', resumeData: null, suspendedToolRunId: 'unverified-run' },
+    };
+
+    const result = await toolCallStep.execute(makeExecuteParams({ inputData }));
+
+    expect(result.error).toBeInstanceOf(Error);
+    expect(result.error.message).toBe('Tool resume evidence did not match the suspended tool call');
+    expectNoToolExecution();
   });
 
   it('should enqueue approval message and prevent execution when approval is required', async () => {
@@ -1068,6 +1190,8 @@ describe('createToolCallStep tool approval workflow', () => {
 
     const result = await toolCallStep.execute(makeExecuteParams({ inputData, resumeData }));
 
+    // A declined approval returns the decision (not a `result` string) so it persists as
+    // `output-denied` with the approval object; the reason carries the existing message.
     expect(result).toEqual({
       ...inputData,
       approval: {
@@ -1302,8 +1426,10 @@ describe('createToolCallStep tool approval workflow', () => {
       makeExecuteParams({ inputData, resumeData: { approved: true }, suspendData: makeSuspendData() }),
     );
 
+    // Upstream #17836: errors are reified to serialization-safe plain objects
+    // before persisting; the approval provenance (fork PF-1703) must survive.
     expect(result).toEqual({
-      error,
+      error: { message: error.message, name: 'Error', stack: expect.any(String) },
       approval: {
         id: inputData.toolCallId,
         approved: true,

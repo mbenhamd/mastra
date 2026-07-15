@@ -55,7 +55,7 @@ function getDataDescriptors(value: unknown, field: string): Record<PropertyKey, 
     proxyError: `${field} must not be a proxy`,
     prototypeError: `${field} must be a plain object`,
     fieldsError: `${field} contains symbol, accessor, or non-enumerable fields`,
-    maxKeys: 7,
+    maxKeys: 8,
     maxKeysError: `${field} contains too many fields`,
   });
 }
@@ -157,7 +157,7 @@ function normalizeStep(
   const descriptors = getDataDescriptors(value, field);
   validateKeys(
     descriptors,
-    ['id', 'description', 'metadata', 'component', 'serializedStepFlow', 'mapConfig', 'canSuspend'],
+    ['id', 'description', 'metadata', 'component', 'serializedStepFlow', 'mapConfig', 'generatedId', 'canSuspend'],
     ['id'],
     field,
   );
@@ -174,11 +174,22 @@ function normalizeStep(
     mapConfigValue === undefined
       ? ''
       : hashSource('mastra.workflow-terminal-parent-graph.map-config.v1', mapConfigValue, `${field}.mapConfig`, state);
+  const generatedId = descriptors.generatedId?.value;
+  if (generatedId !== undefined && typeof generatedId !== 'boolean') {
+    throw new TypeError(`${field}.generatedId must be boolean`);
+  }
+  if (generatedId === true && (mapConfigValue === undefined || !id.startsWith('mapping_'))) {
+    throw new TypeError(`${field}.generatedId is only valid for implicit mapping steps`);
+  }
+  // Implicit mapping steps are addressed by graph position and executable map
+  // configuration. Their UUID is process-local construction noise and changes
+  // when the same workflow is rebuilt after a restart.
+  const fingerprintId = generatedId === true ? '@generated-mapping-step' : id;
   const canSuspend = descriptors.canSuspend?.value;
   if (canSuspend !== undefined && typeof canSuspend !== 'boolean') {
     throw new TypeError(`${field}.canSuspend must be boolean`);
   }
-  append(state, parts, 'step', id, component, mapConfig, canSuspend === undefined ? '' : String(canSuspend));
+  append(state, parts, 'step', fingerprintId, component, mapConfig, canSuspend === undefined ? '' : String(canSuspend));
   const nested = descriptors.serializedStepFlow?.value;
   if (nested === undefined) {
     append(state, parts, 'nested', '0');

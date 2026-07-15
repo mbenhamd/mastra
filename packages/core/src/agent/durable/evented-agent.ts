@@ -10,10 +10,12 @@
  * 3. Events are streamed via pubsub as the workflow executes
  */
 
+import { createObservabilityContext } from '../../observability';
 import type { ToolsInput } from '../types';
 
 import { DurableAgent } from './durable-agent';
 import type { DurableAgentConfig } from './durable-agent';
+import { globalRunRegistry } from './run-registry';
 import type { DurableAgenticWorkflowInput } from './types';
 
 /**
@@ -80,13 +82,19 @@ export class EventedAgent<
   protected override async executeWorkflow(runId: string, workflowInput: DurableAgenticWorkflowInput): Promise<void> {
     try {
       const workflow = this.getWorkflow();
-      const requestContext = this.runRegistryInternal.get(runId)?.requestContext;
       const run = await workflow.createRun({
         runId,
         pubsub: this.pubsubInternal,
       });
-      // Fire and forget - use startAsync for non-blocking execution
-      await run.startAsync({ inputData: workflowInput, requestContext });
+      // Fire and forget - use startAsync for non-blocking execution.
+      // Pass the caller's requestContext (so config selectors pick the same observability
+      // instance the root spans were created with) and parent the run under the AGENT_RUN span.
+      const entry = globalRunRegistry.get(runId);
+      await run.startAsync({
+        inputData: workflowInput,
+        requestContext: entry?.requestContext,
+        ...createObservabilityContext({ currentSpan: entry?.agentSpan }),
+      });
     } catch (error) {
       await this.emitError(runId, error instanceof Error ? error : new Error(String(error)));
     }

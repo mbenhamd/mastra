@@ -96,6 +96,7 @@ authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-sdk-flow);" d="M510 307 L574 307" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-sdk-flow);" d="M255 424 L319 424" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-sdk-flow);" d="M415 390 L415 145" />
+
   </svg>
   <figcaption>The client SDK composes route calls, admission metadata, live or lookup settlement, snapshot ETags, and local schema references without making them separate runtime concepts.</figcaption>
 </figure>

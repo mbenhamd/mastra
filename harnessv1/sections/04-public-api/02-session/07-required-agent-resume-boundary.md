@@ -30,7 +30,10 @@ interface AgentResumeSupportInput {
 
 type AgentResumeSupport =
   | { supported: true }
-  | { supported: false; reason: 'resume_attempt_id_unsupported' | 'pending_kind_unsupported' | 'resume_method_unsupported' };
+  | {
+      supported: false;
+      reason: 'resume_attempt_id_unsupported' | 'pending_kind_unsupported' | 'resume_method_unsupported';
+    };
 
 interface AgentResumeInput {
   harnessName: string;
@@ -43,7 +46,7 @@ interface AgentResumeInput {
   pendingRequestedAt: number;
   responseId: string;
   responseHash: string;
-  resumeAttemptId: string;          // always equal to responseId in v1
+  resumeAttemptId: string; // always equal to responseId in v1
   resumeData: JsonValue;
   requestContext?: PersistedRequestContextInput;
 }
@@ -60,7 +63,14 @@ interface AgentResumeResultLookup {
 type AgentResumeResult =
   | { status: 'accepted'; runId: string; resumeAttemptId: string; duplicate: boolean }
   | { status: 'applied'; runId: string; resumeAttemptId: string; duplicate: boolean; result: AgentResult }
-  | { status: 'failed'; runId: string; resumeAttemptId: string; duplicate: boolean; retryable: boolean; error: { code: string; message: string } };
+  | {
+      status: 'failed';
+      runId: string;
+      resumeAttemptId: string;
+      duplicate: boolean;
+      retryable: boolean;
+      error: { code: string; message: string };
+    };
 ```
 
 `resumeAttemptId` is the idempotency key for applying a response to a suspended

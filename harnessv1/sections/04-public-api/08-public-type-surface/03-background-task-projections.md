@@ -38,5 +38,4 @@ interface BackgroundTask {
   result?: JsonValue;
   error?: { code?: string; message: string };
 }
-
 ```

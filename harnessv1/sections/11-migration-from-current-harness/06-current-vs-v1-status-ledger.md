@@ -29,14 +29,18 @@ records (§5.1, §5.2) stay with their owning sections and are not re-exported
 through the runtime entry; clients reach them via the §13.3 wire surface or
 §5.2 `HarnessStorageDomain` instead.
 
-#### Current main source snapshot
+#### Historical pre-AgentController source snapshot
 
-This ledger still classifies spec names against pre-v1 Mastra collision risk. It
-is not a compatibility promise and it must not claim that target v1 surfaces are
-already shipped on `main`. Entity vocabulary and cutover order:
-[§0 Mental model](../../00-mental-model.md). Duplicate traps: §11.6e.
+This ledger classifies spec names against the pre-v1, pre-AgentController Mastra
+snapshot captured by the upstream-sync branch's first parent. Its
+`Current code:` labels and source paths are historical migration evidence, not a
+description of the merged tree and not a compatibility promise. The merged
+tree uses `@mastra/core/agent-controller` as the canonical controller API and
+exports the fork's durable runtime explicitly from `@mastra/core/harness/v1`.
+Entity vocabulary and cutover order: [§0 Mental model](../../00-mental-model.md).
+Duplicate traps: §11.6e.
 
-Current-source surfaces present on Mastra `main`:
+Historical surfaces present in that pre-v1 snapshot:
 
 - Current `Harness` exists at `packages/core/src/harness/harness.ts:211` and is
   a singleton, thread-first runtime. Its live state includes
@@ -95,7 +99,7 @@ Current-source surfaces present on Mastra `main`:
   accepted signal id with text/echo matching as fallback UI cleanup, and
   resource switching all operate through current Harness thread APIs.
 
-Target v1 surfaces not present on current `main`:
+Target v1 surfaces absent from that historical snapshot:
 
 - Harness `Session` class and `RemoteSession` / `RemoteSafeSession` SDK surface.
 - Session resolver, `SessionRecord`, session lease/CAS storage primitives,
@@ -110,9 +114,10 @@ Target v1 surfaces not present on current `main`:
 - Harness channel durable inbox/action/outbox rows, wakeup workers tied to
   session ownership, and session-scoped channel diagnostics.
 
-The implementation direction is therefore a clean replacement at the v1 cutover:
-current signal mechanics are implementation input for the agent boundary, but the
-session-first API, storage, route, SDK, and recovery contracts remain v1 work.
+The implementation direction was therefore a clean replacement at the v1
+cutover: historical signal mechanics were implementation input for the agent
+boundary, while the session-first API, storage, route, SDK, and recovery
+contracts belonged to Harness v1.
 
 #### Implementation composition checklist
 
@@ -152,13 +157,13 @@ subsystem:
   legacy `display_state_changed` as durability or keep raw component/runtime
   handles in storage.
 
-#### Migration-sensitive current MastraCode surfaces
+#### Historical migration-sensitive MastraCode surfaces
 
-The following current MastraCode surfaces need explicit rewrite before the v1
-cutover. This subsection owns the migration-sensitive behavior inventory; §15.2
-turns these rules into focused tests and should not restate alternate product
-semantics. They are listed here because they are easy to miss when reading only
-the core Harness files:
+The following MastraCode surfaces in the historical snapshot required explicit
+rewrite before the v1 cutover. This subsection owns the migration-sensitive
+behavior inventory; §15.2 turns these rules into focused tests and should not
+restate alternate product semantics. They are listed here because they are easy
+to miss when reading only the historical core Harness files:
 
 - `createMastraCode(...)` must stop treating the constructed Harness as one
   mutable current-thread singleton. Startup must create/open a v1 `Session`, pass
@@ -479,7 +484,7 @@ and as the v1 name when the spec section is the source of truth.
 
 #### 11.6d Implementation precursors without exact-name overlap
 
-§11.6a is scoped to *exact-name* identifier overlap with current Mastra
+§11.6a is scoped to _exact-name_ identifier overlap with current Mastra
 `../packages/{core,server,memory,mcp,deployer,cli}/src`. The rows below name
 current-code surfaces that materially **inform** a v1-declared family but ship
 under a different identifier — they are hallucination-risk in the other
@@ -709,21 +714,21 @@ durable row.
 
 Maintenance rule: when a new top-level `class`, `interface`, or `type` is
 added to a non-example `sections/` file, add it to the appropriate §11.6c
-section bucket; when a current-code shape is renamed, removed, or gains a
-matching v1 export, update §11.6a or §11.6b; when a v1 family is materially
-informed by current-code scaffolding under a different identifier, add or
-update a §11.6d precursor row. When referencing a child section, use the
+section bucket; when the historical baseline classification changes, update
+§11.6a or §11.6b; when a v1 family is materially informed by historical
+scaffolding under a different identifier, add or update a §11.6d precursor
+row. When referencing a child section, use the
 heading-letter form (e.g. `§5.1b.2`, `§13.3d`), not the file-ordinal form
 (`§5.1.6`, `§13.3.4`). File ordinals are filesystem state, not section
-identity. Every `Current code:` line anchor must be re-verified against
-`../packages/**/src` on each spec pass; cross-package anchors
+identity. Every `Current code:` line anchor must be re-verified against the
+documented historical snapshot on each spec pass; cross-package anchors
 (`../packages/memory`, `../packages/core/src/background-tasks`,
 `../packages/core/src/tools`, `../packages/core/src/storage/domains/**`) drift
 silently when the spec author edits only the harness file, so a grep pass
-  against the source HEAD is part of every §11.6 update. Counts are intentionally
-  not hand-maintained in prose because they drift when section snippets or
-  package-local type aliases change; rerun the inventory before using this ledger
-  as a migration checklist. Duplicate-cutover traps: §11.6e.
+against the source HEAD is part of every §11.6 update. Counts are intentionally
+not hand-maintained in prose because they drift when section snippets or
+package-local type aliases change; rerun the inventory before using this ledger
+as a migration checklist. Duplicate-cutover traps: §11.6e.
 
 #### 11.6e Implementation traps by entity
 
@@ -731,28 +736,28 @@ This table indexes cutover mistakes that create **parallel implementations** whe
 the [§0 Mental model](../../00-mental-model.md) is ignored. It does not add new
 semantics; owning sections remain authoritative.
 
-| Entity | Trap (today on `main`) | v1 owner | Canonical pointer |
-|--------|------------------------|----------|-------------------|
-| **Harness** | Thread-first lifecycle (`createThread`, `switchThread`, `sendMessage`, `followUp`, `steer`) on the singleton | `harness.session()` + `Session.*` | §11.4, §4.1 |
-| **Harness** | `harness.memory.*` duplicates top-level thread methods | Remove from product path; session-first lifecycle | §11.4, `harness.ts` |
-| **Harness** | `harness.threads.*` used as normal app lifecycle | No `harness.threads` product surface; `/operator/threads*` remains only for import/history tooling outside the public Harness class | §4.1, §13.2, §0 |
-| **Storage** | `admissionId`/`admissionHash` redefined in §3/§13/§15 | Canonical hash: §4.4b; canonical rows: §5.1d | §4.4, §5.1d |
-| **Harness** | `POST /agents/.../signals` kept as product path alongside §13 | `/harness/...` projects `Session.signal` admission | §13, §11.6 |
-| **Harness** | Process-local harness fields as config/runtime state | `HarnessConfig` = composition; room state in `SessionRecord` | §9.1, §5.1a.1 |
-| **Session** | `HarnessSession` snapshot from `getSession()` treated as the room | `Session` class + `SessionRecord` | §11.6b |
-| **Session** | `Harness.sendSignal` owns admission/receipts | `Session.signal` + `AgentSignalBoundary` post-accept | §4.2f |
-| **Session** | Process-local queue and pending resolvers | `SessionRecord.pendingQueue`, durable pending inbox | §5.1 |
-| **Session** | `display_state_changed` as public durability | Persisted display snapshots; §10 union excludes legacy display event | §10.2, §5.1a.2 |
-| **Thread** | `--thread`, `/thread`, `switchThread` as lifecycle | Product commands resolving to `harness.session(...)` first | §11.6 migration-sensitive |
-| **Memory** | OM/thread-metadata bootstrap without `SessionRecord` | `SessionRecord.observationalMemory` | §11.6 |
-| **Memory** | Message append mistaken for signal admission | `Session.signal` is not a generic thread write | §4.2, §0 |
-| **Storage** | `threadLock` blocks read/subscribe/signal | Leases for recovery-sensitive work only | §5.8, §11.6 |
-| **Storage** | `SignalsPubSub` loss = data loss | Storage admission/result + §10 replay | §11.6 |
-| **Storage** | Second background-task store | Extend `BackgroundTasksStorage` with §5.2d `claim*`/`renew*` | §11.6d |
-| **Storage** | `registerHeartbeat` as restart-safe scheduling | `HarnessWakeupItem` rows | §11.5 |
-| **Storage** | `ChannelsStorage` provider install/config rows treated as harness inbox/outbox | Keep provider config canonical; add §14 bridge ledgers as channel-domain extensions | §14.7, §11.6d |
-| **Workers** | `BackgroundTaskWorker` substituted for harness wakeup recovery | Harness workers claim logbook rows | §15.2 preamble |
-| **Workers** | Second worker framework beside `packages/core/src/worker/` | Claim semantics on Storage rows | §0 cutover |
-| **Live layer** | `AgentChannels` + harness bridge on same binding | §14.7 init fence | §14.7 |
-| **Live layer** | Stream/pubsub IDs as replay cursors | §10.5 session epoch + buffer | §10.5 |
-| **Live layer** | MCP/HTTP session IDs as recovery keys | Process-local diagnostics only | §11.5 |
+| Entity         | Trap (today on `main`)                                                                                       | v1 owner                                                                                                                            | Canonical pointer         |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| **Harness**    | Thread-first lifecycle (`createThread`, `switchThread`, `sendMessage`, `followUp`, `steer`) on the singleton | `harness.session()` + `Session.*`                                                                                                   | §11.4, §4.1               |
+| **Harness**    | `harness.memory.*` duplicates top-level thread methods                                                       | Remove from product path; session-first lifecycle                                                                                   | §11.4, `harness.ts`       |
+| **Harness**    | `harness.threads.*` used as normal app lifecycle                                                             | No `harness.threads` product surface; `/operator/threads*` remains only for import/history tooling outside the public Harness class | §4.1, §13.2, §0           |
+| **Storage**    | `admissionId`/`admissionHash` redefined in §3/§13/§15                                                        | Canonical hash: §4.4b; canonical rows: §5.1d                                                                                        | §4.4, §5.1d               |
+| **Harness**    | `POST /agents/.../signals` kept as product path alongside §13                                                | `/harness/...` projects `Session.signal` admission                                                                                  | §13, §11.6                |
+| **Harness**    | Process-local harness fields as config/runtime state                                                         | `HarnessConfig` = composition; room state in `SessionRecord`                                                                        | §9.1, §5.1a.1             |
+| **Session**    | `HarnessSession` snapshot from `getSession()` treated as the room                                            | `Session` class + `SessionRecord`                                                                                                   | §11.6b                    |
+| **Session**    | `Harness.sendSignal` owns admission/receipts                                                                 | `Session.signal` + `AgentSignalBoundary` post-accept                                                                                | §4.2f                     |
+| **Session**    | Process-local queue and pending resolvers                                                                    | `SessionRecord.pendingQueue`, durable pending inbox                                                                                 | §5.1                      |
+| **Session**    | `display_state_changed` as public durability                                                                 | Persisted display snapshots; §10 union excludes legacy display event                                                                | §10.2, §5.1a.2            |
+| **Thread**     | `--thread`, `/thread`, `switchThread` as lifecycle                                                           | Product commands resolving to `harness.session(...)` first                                                                          | §11.6 migration-sensitive |
+| **Memory**     | OM/thread-metadata bootstrap without `SessionRecord`                                                         | `SessionRecord.observationalMemory`                                                                                                 | §11.6                     |
+| **Memory**     | Message append mistaken for signal admission                                                                 | `Session.signal` is not a generic thread write                                                                                      | §4.2, §0                  |
+| **Storage**    | `threadLock` blocks read/subscribe/signal                                                                    | Leases for recovery-sensitive work only                                                                                             | §5.8, §11.6               |
+| **Storage**    | `SignalsPubSub` loss = data loss                                                                             | Storage admission/result + §10 replay                                                                                               | §11.6                     |
+| **Storage**    | Second background-task store                                                                                 | Extend `BackgroundTasksStorage` with §5.2d `claim*`/`renew*`                                                                        | §11.6d                    |
+| **Storage**    | `registerHeartbeat` as restart-safe scheduling                                                               | `HarnessWakeupItem` rows                                                                                                            | §11.5                     |
+| **Storage**    | `ChannelsStorage` provider install/config rows treated as harness inbox/outbox                               | Keep provider config canonical; add §14 bridge ledgers as channel-domain extensions                                                 | §14.7, §11.6d             |
+| **Workers**    | `BackgroundTaskWorker` substituted for harness wakeup recovery                                               | Harness workers claim logbook rows                                                                                                  | §15.2 preamble            |
+| **Workers**    | Second worker framework beside `packages/core/src/worker/`                                                   | Claim semantics on Storage rows                                                                                                     | §0 cutover                |
+| **Live layer** | `AgentChannels` + harness bridge on same binding                                                             | §14.7 init fence                                                                                                                    | §14.7                     |
+| **Live layer** | Stream/pubsub IDs as replay cursors                                                                          | §10.5 session epoch + buffer                                                                                                        | §10.5                     |
+| **Live layer** | MCP/HTTP session IDs as recovery keys                                                                        | Process-local diagnostics only                                                                                                      | §11.5                     |

@@ -34,6 +34,22 @@ describe('Nested workflow admission materialization', () => {
     recoveryAncestry: [],
   });
 
+  it.each(['pending', 'running'] as const)('accepts a canonical %s initial child snapshot', status => {
+    const snapshot = { ...createEmptyWorkflowSnapshot('child-run'), status };
+
+    expect(validateWorkflowNestedRunInitialSnapshot({ snapshot }, 'child-run', expectedChildGraphFingerprint)).toEqual({
+      snapshot,
+    });
+  });
+
+  it.each(['success', 'failed', 'suspended'] as const)('rejects a %s initial child snapshot', status => {
+    const snapshot = { ...createEmptyWorkflowSnapshot('child-run'), status };
+
+    expect(() =>
+      validateWorkflowNestedRunInitialSnapshot({ snapshot }, 'child-run', expectedChildGraphFingerprint),
+    ).toThrow('Initial nested workflow snapshot must be a valid pending or running child snapshot');
+  });
+
   it('rejects an accessor admission identity without executing or alternating it', () => {
     const admission = input();
     let reads = 0;

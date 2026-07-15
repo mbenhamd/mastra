@@ -48,6 +48,7 @@ async function driveLoop(loopType: 'dountil' | 'dowhile', condition: (n: number)
       return condition(iterationCount);
     },
   } as any;
+  const mastra = { getStorage: () => undefined } as unknown as Mastra;
 
   const step = makeLoopStep(loopType, condition);
   const bodyResult = { status: 'success' as const, output: { n: 1 }, startedAt: 1, endedAt: 2, payload: {} };
@@ -68,7 +69,7 @@ async function driveLoop(loopType: 'dountil' | 'dowhile', condition: (n: number)
         prevResult: bodyResult,
         requestContext: {},
       } as any,
-      { pubsub, stepExecutor, step, stepResult: bodyResult },
+      { pubsub, mastra, stepExecutor, step, stepResult: bodyResult },
     );
 
     if (published.some(e => e.type === 'workflow.step.end')) {

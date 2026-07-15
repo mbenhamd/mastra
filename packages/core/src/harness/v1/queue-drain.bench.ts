@@ -22,8 +22,9 @@
 import type { LanguageModelV2StreamPart } from '@ai-sdk/provider-v5';
 import { afterAll, beforeAll, bench, describe } from 'vitest';
 
-import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent';
+// eslint-disable-next-line no-restricted-imports -- bench harness drives the shared mock model
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { InMemoryStore } from '../../storage';
 
 import { Harness } from './harness';

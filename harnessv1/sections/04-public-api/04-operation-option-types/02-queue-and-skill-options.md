@@ -10,10 +10,7 @@ interface QueueOptions extends Omit<HarnessOverrides, 'addTools'> {
   type?: string;
   contents:
     | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'file'; attachmentId: string; mediaType: string; name?: string }
-      >;
+    | Array<{ type: 'text'; text: string } | { type: 'file'; attachmentId: string; mediaType: string; name?: string }>;
   files?: FileAttachment[];
   // JSON-safe operation annotations persisted with the queued item and copied
   // to the drained signal. These are caller/application metadata, not mutable
@@ -56,9 +53,9 @@ interface QueueOptions extends Omit<HarnessOverrides, 'addTools'> {
 // corresponding verification invariants.
 
 interface UseSkillOptions<S extends PublicSchema | undefined = undefined> extends HarnessOverrides {
-  args?: Record<string, unknown>;   // injected into the skill prompt
+  args?: Record<string, unknown>; // injected into the skill prompt
   files?: FileAttachment[];
-  output?: S;                       // typed result
+  output?: S; // typed result
   // Optional caller-supplied idempotency key for untyped skill invocations from
   // retrying transports. Valid only when `output` is absent; typed skill output
   // shares the sync-generate path and rejects `admissionId` in v1.
@@ -67,7 +64,6 @@ interface UseSkillOptions<S extends PublicSchema | undefined = undefined> extend
   tracingContext?: TracingContext;
   tracingOptions?: TracingOptions;
 }
-
 ```
 
 Core Harness v1 queue rows are signal-shaped work: serializable type, contents,

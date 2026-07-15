@@ -73,6 +73,7 @@ remain authoritative for arguments, return shapes, and per-method invariants):
     <text style="font: 600 15px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #0f172a;" x="520" y="450" text-anchor="middle">Shared claim pattern</text>
     <text style="font: 500 13px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #475569;" x="520" y="472" text-anchor="middle">idempotent createOrLoad/enqueue · claim with TTL · renew while delivering · terminal update under claim fence</text>
     <text style="font: 500 12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; fill: #64748b;" x="520" y="490" text-anchor="middle">retry, claim renewal, clock-skew, batch size, and dead-letter thresholds come from §9 channel/wakeup config</text>
+
   </svg>
   <figcaption>Declarative storage methods configure routing and prompt anchors; worker methods share the claim-renew-update pattern that recovers in-flight inbox, outbox, action receipt, and wakeup work.</figcaption>
 </figure>

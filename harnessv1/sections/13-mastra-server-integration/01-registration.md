@@ -48,6 +48,7 @@ remain authoritative):
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-registration);" d="M715 164 L715 254" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-registration);" d="M825 124 C860 140 890 158 907 181" />
     <path style="stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#ah-registration);" d="M825 294 L879 335" />
+
   </svg>
   <figcaption>Registration is an awaited boot boundary: routes and callbacks are exposed only after harness, storage, provider, and route ownership checks succeed.</figcaption>
 </figure>
@@ -60,8 +61,12 @@ const codingHarness = new Harness(codingConfig);
 const supportHarness = new Harness(supportConfig);
 
 const mastra = new Mastra({
-  agents: { /* ... */ },
-  workflows: { /* ... */ },
+  agents: {
+    /* ... */
+  },
+  workflows: {
+    /* ... */
+  },
   harness: {
     coding: codingHarness,
     support: supportHarness,
@@ -101,7 +106,9 @@ deployment may register X harnesses and Y channel providers:
 
 ```ts
 const mastra = new Mastra({
-  agents: { /* ... */ },
+  agents: {
+    /* ... */
+  },
   channels: {
     slack: slackProvider,
     discord: discordProvider,
@@ -131,17 +138,17 @@ startup step before accepting Harness channel webhooks. Conceptually, during
 
 - registered harnesses (`harnessName -> Harness`);
 - registered channel providers (`providerId -> ChannelProvider`), where
-`providerId` is the Mastra `channels` registration key, not the provider's
-platform/type ID;
+  `providerId` is the Mastra `channels` registration key, not the provider's
+  platform/type ID;
 - each harness's channel bridge config
-(`harnessName + channelId -> HarnessChannelConfig`);
+  (`harnessName + channelId -> HarnessChannelConfig`);
 - server route ownership for Harness channel routes, provider-owned routes, and
-legacy `AgentChannels` routes;
+  legacy `AgentChannels` routes;
   - trusted provider callback bindings for provider-owned routes, loaded through
     the §5.2 storage adapter methods and validated at init;
 - a lazy binding namespace for persisted `ChannelBinding` records, keyed by
-`(harnessName, channelId, bindingId | platform + external ids)` and validated
-against the row's stored `providerId`.
+  `(harnessName, channelId, bindingId | platform + external ids)` and validated
+  against the row's stored `providerId`.
 
 After `mastra.init()`, the `HarnessChannelRegistry` is the single merged
 router for the route table described below. `ChannelProvider.getRoutes()`
@@ -160,25 +167,25 @@ harness-managed, provider-owned, and legacy `AgentChannels` routes.
 Validation happens at init:
 
 - every `HarnessConfig.channels[channelId]` must refer to a Mastra-level
-provider (`channels[providerId ?? channelId]`), unless the harness config
-supplies a fully self-contained adapter for local tests;
+  provider (`channels[providerId ?? channelId]`), unless the harness config
+  supplies a fully self-contained adapter for local tests;
 - if two registered harnesses share the same physical storage adapter or
-database namespace, that adapter must declare and enforce Harness namespaces for
-Harness-domain ledgers and the shared MemoryStorage thread/message view (§5.2).
-Adapters that only expose an unscoped global `threadId` / `sessionId` keyspace
-are allowed only when the physical namespace is used by a single registered
-Harness; otherwise boot fails with `HarnessConfigError`;
+  database namespace, that adapter must declare and enforce Harness namespaces for
+  Harness-domain ledgers and the shared MemoryStorage thread/message view (§5.2).
+  Adapters that only expose an unscoped global `threadId` / `sessionId` keyspace
+  are allowed only when the physical namespace is used by a single registered
+  Harness; otherwise boot fails with `HarnessConfigError`;
 - every mounted route has a unique normalized `(method, path)` across Harness
-routes, provider routes, legacy `AgentChannels` routes, and custom `apiRoutes`.
-Shadowing is an init error; route registration order is not a
-conflict-resolution mechanism;
+  routes, provider routes, legacy `AgentChannels` routes, and custom `apiRoutes`.
+  Shadowing is an init error; route registration order is not a
+  conflict-resolution mechanism;
 - every Harness channel route is unique by `(harnessName, channelId)`;
 - local-test adapters that do not resolve to a Mastra-level provider are not
-auto-mounted on Mastra Server and cannot receive externally reachable provider
-callbacks;
+  auto-mounted on Mastra Server and cannot receive externally reachable provider
+  callbacks;
 - every externally mounted channel adapter must verify inbound and action
-callbacks for its provider; omitting `verifyInbound` / `verifyAction` is valid
-only for local/test adapters that are never exposed as webhook routes;
+  callbacks for its provider; omitting `verifyInbound` / `verifyAction` is valid
+  only for local/test adapters that are never exposed as webhook routes;
   - a channel provider can be shared by multiple harnesses, but provider ID
     alone never chooses the Harness target. The direct inbound route or a
     trusted provider callback binding must identify exactly one
@@ -193,15 +200,15 @@ only for local/test adapters that are never exposed as webhook routes;
     adapter normalization; the raw provider payload is never used as a replacement
     target selector;
 - a harness-bound provider/installation/thread target must not also be mounted
-through legacy `AgentChannels` webhook routes, channel action handlers, or
-injected channel tools that call the live `agent.stream(...)` /
-`agent.approveToolCall(...)` / `agent.resumeStream(...)` / platform-post path.
-Overlap is an init error unless the live route uses a separate installation or
-route namespace whose ownership cannot collide with the harness-bound channel;
+  through legacy `AgentChannels` webhook routes, channel action handlers, or
+  injected channel tools that call the live `agent.stream(...)` /
+  `agent.approveToolCall(...)` / `agent.resumeStream(...)` / platform-post path.
+  Overlap is an init error unless the live route uses a separate installation or
+  route namespace whose ownership cannot collide with the harness-bound channel;
 - a persisted binding whose `harnessName` or `channelId` is no longer registered
-is left in storage. It is marked `undeliverable` when loaded for ingress/outbox
-dispatch until the deployment restores the missing component or an operator
-migrates/deletes the binding.
+  is left in storage. It is marked `undeliverable` when loaded for ingress/outbox
+  dispatch until the deployment restores the missing component or an operator
+  migrates/deletes the binding.
 
 The registry owns the server-level route fan-out:
 

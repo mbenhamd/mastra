@@ -703,12 +703,10 @@ describe('clampPlanTaskCheckLimit', () => {
     }
     let lastLimit = -1;
     const origLoad = storage.loadPlanTaskSubtree.bind(storage);
-    (storage as unknown as { loadPlanTaskSubtree: typeof storage.loadPlanTaskSubtree }).loadPlanTaskSubtree = (
-      args => {
-        lastLimit = args.limit;
-        return origLoad(args);
-      }
-    ) as typeof storage.loadPlanTaskSubtree;
+    (storage as unknown as { loadPlanTaskSubtree: typeof storage.loadPlanTaskSubtree }).loadPlanTaskSubtree = (args => {
+      lastLimit = args.limit;
+      return origLoad(args);
+    }) as typeof storage.loadPlanTaskSubtree;
 
     const res = await planTaskCheck(port, { rootTaskId: root.taskId, limit: 10_000_000 });
     expect(lastLimit).toBe(PLAN_TASK_CHECK_MAX_LIMIT);

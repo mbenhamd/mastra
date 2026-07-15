@@ -78,9 +78,13 @@ function buildAgentWithProcessor(idGenerator?: () => string) {
 }
 
 describe('agent processor-workflow storage noise (issue #17137 follow-up to #17344)', () => {
-  it('skips the guaranteed-miss storage read for the internal processor workflow', async () => {
-    // Processor workflows generate a fresh run ID and intentionally never
-    // persist snapshots. Their createRun lookup can therefore never succeed.
+  it('does not read storage (getWorkflowRunById) for the internal processor workflow on generate', async () => {
+    // #19015 short-circuits createRun's storage existence read for transient workflows
+    // (shouldPersistSnapshot: () => false) that mint a fresh runId. The internal
+    // processor workflow is exactly that, so its createRun no longer calls
+    // getWorkflowRunById at all. This strictly subsumes the original #17137/#17344
+    // no-noise goal: a lookup that never runs can never hit the "storage is not
+    // initialized" branch.
     const seen: Array<{ id: string; hasStorage: boolean }> = [];
     const original = (Workflow.prototype as unknown as { getWorkflowRunById: (...a: unknown[]) => unknown })
       .getWorkflowRunById;

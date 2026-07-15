@@ -421,13 +421,17 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
     await mastra.shutdown();
   });
 
-  it('publishes terminal failure without a state guard when workflow storage is not configured', async () => {
+  it('publishes terminal failure without a state guard when workflow storage is unavailable', async () => {
     const pubsub = new FailingTerminalPubSub();
     const mastra = new Mastra({
       logger: false,
       workflows: { wf: makeWorkflow('wf') } as any,
       pubsub,
     });
+    // Mastra now supplies an in-memory store by default. Stub the defensive
+    // no-storage boundary explicitly instead of relying on the old constructor
+    // behavior where an omitted storage option left getStorage() undefined.
+    vi.spyOn(mastra, 'getStorage').mockReturnValue(undefined);
     AlwaysThrowsProcessor.dispatchCalls = 0;
 
     const processor = new AlwaysThrowsProcessor({ mastra });
