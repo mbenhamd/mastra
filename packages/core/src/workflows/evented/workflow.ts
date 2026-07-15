@@ -82,6 +82,7 @@ import type { StreamChunkWriter } from '../stream-utils';
 import { Workflow, Run } from '../workflow';
 import type { AgentStepOptions, RunWithRawInput } from '../workflow';
 import { EventedExecutionEngine } from './execution-engine';
+import { isEventedForeachSuspensionResult } from './foreach-suspension';
 import { isTripwireChunk, createTripWireFromChunk, getTextDeltaFromChunk } from './helpers';
 import type { TripwireChunk } from './helpers';
 import { assertEventedResumeLabelName, normalizeEventedResumeLabels } from './resume-label';
@@ -2266,7 +2267,7 @@ export class EventedRun<
       (snapshotResumeLabel?.foreachIndex !== undefined &&
         Array.isArray(snapshotForEachResult?.output) &&
         snapshotResumeLabel.foreachIndex < snapshotForEachResult.output.length &&
-        snapshotForEachResult.output[snapshotResumeLabel.foreachIndex]?.status === 'suspended');
+        isEventedForeachSuspensionResult(snapshotForEachResult.output[snapshotResumeLabel.foreachIndex]));
     const isValidSnapshotResumeLabel =
       snapshotResumeLabel !== null &&
       typeof snapshotResumeLabel === 'object' &&

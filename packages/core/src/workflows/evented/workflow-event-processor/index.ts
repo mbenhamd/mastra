@@ -25,11 +25,23 @@ import {
 } from '../../terminal-continuation/planning-view';
 import { materializeWorkflowTerminalRecoveryAncestry } from '../../terminal-recovery';
 import type { WorkflowTerminalRecoveryAncestryV1 } from '../../terminal-recovery';
-import { createRestartExecutionParams, createTimeTravelExecutionParams, validateStepResumeData } from '../../utils';
+import {
+  createRestartExecutionParams,
+  createTimeTravelExecutionParams,
+  resolveForeachConcurrency,
+  validateStepResumeData,
+} from '../../utils';
 import { resolveCurrentState } from '../helpers';
 import { createEventedResumeLabels, mergeEventedResumeLabels, normalizeEventedResumeLabels } from '../resume-label';
 import { StepExecutor } from '../step-executor';
 import { EventedWorkflow } from '../workflow';
+import {
+  aggregateEventedForeachSuspensions,
+  assertValidEventedForeachSuspensionResults,
+  isEventedForeachSuspensionResult,
+  restoreEventedForeachSuspensionPayloads,
+  stripEventedForeachStreamStateForPropagation,
+} from './foreach-suspension';
 import { processWorkflowForEach, processWorkflowLoop } from './loop';
 import { processWorkflowConditional, processWorkflowParallel } from './parallel';
 import { processWorkflowSleep, processWorkflowSleepUntil, processWorkflowWaitForEvent } from './sleep';
@@ -1206,6 +1218,10 @@ export class WorkflowEventProcessor extends EventProcessor {
         return this.errorWorkflow(args, getErrorFromUnknown(error));
       }
 
+      const nestedMeta = prevResult.suspendPayload?.__workflow_meta ?? {};
+      const { foreachOutput: nestedForeachOutput, ...nestedMetaWithoutForeachOutput } = nestedMeta;
+      const propagatedForeachOutput = stripEventedForeachStreamStateForPropagation(nestedForeachOutput);
+
       await this.mastra.pubsub.publish('workflows', {
         type: 'workflow.step.end',
         runId: parentWorkflow.runId, // Use parent's runId for event routing
@@ -1221,7 +1237,8 @@ export class WorkflowEventProcessor extends EventProcessor {
               ...prevResult.suspendPayload,
               __workflow_meta: {
                 // keep resumeLabels / foreachIndex etc. — only the runId and path change as we propagate up
-                ...(prevResult.suspendPayload?.__workflow_meta ?? {}),
+                ...nestedMetaWithoutForeachOutput,
+                ...(propagatedForeachOutput ? { foreachOutput: propagatedForeachOutput } : {}),
                 resumeLabels: Object.keys(resumeLabels).length > 0 ? resumeLabels : undefined,
                 runId: runId,
                 path: propagatedPath,
@@ -1742,7 +1759,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           (nestedResumeLabel?.foreachIndex !== undefined &&
             Array.isArray(nestedForEachResult?.output) &&
             nestedResumeLabel.foreachIndex < nestedForEachResult.output.length &&
-            nestedForEachResult.output[nestedResumeLabel.foreachIndex]?.status === 'suspended');
+            isEventedForeachSuspensionResult(nestedForEachResult.output[nestedResumeLabel.foreachIndex]));
         const isValidNestedExecutionPath =
           Array.isArray(nestedExecutionPath) &&
           nestedExecutionPath.every(index => Number.isInteger(index) && index >= 0) &&
@@ -2581,6 +2598,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           // parallel/conditional suspension to its parent workflow.
           prevResult: {
             status: 'suspended',
+            suspendedAt: Date.now(),
             suspendPayload: {
               __workflow_meta: {
                 resumeLabels,
@@ -2801,18 +2819,48 @@ export class WorkflowEventProcessor extends EventProcessor {
         const foreachResult = stepResults[step.step.id] as any;
         const iterationResults = foreachResult?.output ?? [];
         const targetLen = foreachResult?.payload?.length ?? 0;
+        let durableIterationResults: unknown[];
+
+        try {
+          assertValidEventedForeachSuspensionResults(iterationResults);
+          durableIterationResults = restoreEventedForeachSuspensionPayloads(
+            iterationResults,
+            foreachResult?.suspendPayload?.__workflow_meta?.foreachOutput,
+            [currentIdx],
+          );
+        } catch (error) {
+          return this.errorWorkflow(
+            {
+              workflowId,
+              runId,
+              executionPath,
+              resumeSteps,
+              stepResults,
+              prevResult,
+              activeStepsPath,
+              requestContext,
+              timeTravel,
+              restart,
+              parentWorkflow,
+              perStep,
+              state: currentState,
+              outputOptions,
+              forEachIndex,
+              nestedRunId,
+            },
+            getErrorFromUnknown(error),
+          );
+        }
 
         // Count iterations by status - pending iterations appear as null in stepResults after
         // storage merge (pending markers are converted to null by the storage layer).
         const pendingCount = iterationResults.filter((r: any) => r === null).length;
-        const suspendedCount = iterationResults.filter(
-          (r: any) => r && typeof r === 'object' && r.status === 'suspended',
-        ).length;
+        const suspendedCount = iterationResults.filter(isEventedForeachSuspensionResult).length;
         const iterationsStarted = iterationResults.length;
 
         // Emit per-iteration progress event
         const completedCount = iterationResults.filter(
-          (r: any) => r !== null && !(typeof r === 'object' && r.status === 'suspended'),
+          (r: any) => r !== null && !isEventedForeachSuspensionResult(r),
         ).length;
         const iterationStatus =
           prevResult.status === 'suspended'
@@ -2845,7 +2893,11 @@ export class WorkflowEventProcessor extends EventProcessor {
 
         // Check if there are more iterations to start before deciding to suspend
         // This handles partial concurrency: don't suspend until all iterations have been started
-        if (iterationsStarted < targetLen) {
+        const foreachConcurrency = resolveForeachConcurrency(step.opts, {
+          inputData: foreachResult.payload,
+          getInitData: () => (stepResults as any)?.input,
+        });
+        if (iterationsStarted < targetLen && suspendedCount < foreachConcurrency) {
           // More iterations need to be started - call processWorkflowForEach to continue
           await processWorkflowForEach(
             {
@@ -2877,31 +2929,16 @@ export class WorkflowEventProcessor extends EventProcessor {
 
         if (suspendedCount > 0) {
           // Some iterations are suspended - emit workflow suspend
-          // Build aggregated suspend metadata from all suspended iterations
-          let collectedResumeLabels = createEventedResumeLabels();
           // suspendedPaths maps stepId -> executionPath, using the step ID (not stepId[index])
           const suspendedPaths: Record<string, number[]> = {
             [step.step.id]: [executionPath[0]!],
           };
 
-          // Capture the first suspended iteration's full suspendPayload so
-          // non-__workflow_meta keys (e.g. __streamState stashed by the agent
-          // loop) survive aggregation.
-          let firstSuspendedIterationPayload: Record<string, unknown> | undefined;
+          // Materialize all per-iteration payloads for targeted resume while
+          // retaining the first suspension as the user-facing step payload.
+          let suspension: ReturnType<typeof aggregateEventedForeachSuspensions>;
           try {
-            for (let i = 0; i < iterationResults.length; i++) {
-              const iterResult = iterationResults[i];
-              if (iterResult && typeof iterResult === 'object' && iterResult.status === 'suspended') {
-                collectedResumeLabels = mergeEventedResumeLabels(
-                  collectedResumeLabels,
-                  iterResult.suspendPayload?.__workflow_meta?.resumeLabels,
-                  target => ({ ...target, foreachIndex: i }),
-                );
-                if (firstSuspendedIterationPayload === undefined) {
-                  firstSuspendedIterationPayload = iterResult.suspendPayload;
-                }
-              }
-            }
+            suspension = aggregateEventedForeachSuspensions(durableIterationResults);
           } catch (error) {
             return this.errorWorkflow(
               {
@@ -2925,6 +2962,9 @@ export class WorkflowEventProcessor extends EventProcessor {
               getErrorFromUnknown(error),
             );
           }
+          if (!suspension) return;
+
+          const aggregateExecutionPath = [executionPath[0]!, suspension.firstSuspendedIndex];
 
           // Create the aggregated foreach step suspend result.
           // Preserve non-__workflow_meta keys (e.g. __streamState stashed by the agent loop's
@@ -2939,10 +2979,12 @@ export class WorkflowEventProcessor extends EventProcessor {
             suspendedAt: Date.now(),
             startedAt: foreachResult.startedAt,
             suspendPayload: {
-              ...firstSuspendedIterationPayload,
+              ...suspension.firstSuspendPayload,
               __workflow_meta: {
-                path: executionPath,
-                resumeLabels: collectedResumeLabels,
+                ...(suspension.firstSuspendPayload?.__workflow_meta ?? {}),
+                foreachIndex: suspension.firstSuspendedIndex,
+                resumeLabels: suspension.resumeLabels,
+                foreachOutput: suspension.foreachOutput,
               },
             },
           };
@@ -2981,8 +3023,8 @@ export class WorkflowEventProcessor extends EventProcessor {
                 status: 'suspended',
                 result: foreachSuspendResult,
                 suspendedPaths,
-                resumeLabels: collectedResumeLabels,
-                activePaths: executionPath,
+                resumeLabels: suspension.resumeLabels,
+                activePaths: aggregateExecutionPath,
                 activeStepsPath,
                 ...(suspendTracingContext ? { tracingContext: suspendTracingContext } : {}),
               },

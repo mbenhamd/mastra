@@ -1,5 +1,5 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
@@ -186,12 +186,31 @@ function buildSupervisorAgent(storage: InMemoryStore = new InMemoryStore()) {
   return mastra.getAgent('supervisor');
 }
 
-// NOTE: default engine only. The evented engine (MASTRA_EVENTED_EXECUTION) has a
-// separate pre-existing run-lifecycle bug with parallel delegations: resuming the
-// first suspended iteration completes the outer run and deletes its snapshot,
-// permanently orphaning the sibling. Its foreach aggregation does not persist
-// per-iteration suspend payloads, so the pending check cannot see the parked sibling.
-describe('parallel sub-agent delegation (suspend/resume)', () => {
+function findForeachOutput(value: unknown): Record<string, any> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, any>;
+  const foreachOutput = record.__workflow_meta?.foreachOutput;
+  if (foreachOutput && typeof foreachOutput === 'object') return foreachOutput;
+
+  for (const child of Object.values(record)) {
+    const nested = findForeachOutput(child);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+describe.each([
+  { engine: 'default', evented: false },
+  { engine: 'evented', evented: true },
+])('parallel sub-agent delegation (suspend/resume, $engine engine)', ({ evented }) => {
+  beforeAll(() => {
+    vi.stubEnv('MASTRA_EVENTED_EXECUTION', evented ? 'true' : 'false');
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('emits two distinct approval requests, one per order', async () => {
     processedOrders.length = 0;
     const supervisor = buildSupervisorAgent();
@@ -297,7 +316,9 @@ describe('parallel sub-agent delegation (suspend/resume)', () => {
 
   it('approving both parallel delegations one at a time processes BOTH orders', async () => {
     processedOrders.length = 0;
-    const supervisor = buildSupervisorAgent();
+    const storage = new InMemoryStore();
+    const supervisor = buildSupervisorAgent(storage);
+    const workflowsStore = (await storage.getStore('workflows'))!;
 
     const stream = await supervisor.stream('Process both orders in parallel.', {
       maxSteps: 6,
@@ -308,19 +329,53 @@ describe('parallel sub-agent delegation (suspend/resume)', () => {
     const runId = stream.runId;
     expect(approvals.length).toBe(2);
 
+    const initialRun = await workflowsStore.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
+    expect((initialRun?.snapshot as any)?.status).toBe('suspended');
+    const initialForeachOutput = findForeachOutput(initialRun?.snapshot);
+    expect(Object.keys(initialForeachOutput ?? {})).toEqual(['0', '1']);
+    expect(initialForeachOutput?.['0']?.suspendPayload).toMatchObject({
+      requireToolApproval: { toolCallId: 'sup-tc-A' },
+      suspendedToolCallId: `tc-${ORDER_A}`,
+      suspendedToolRunId: expect.any(String),
+    });
+    expect(initialForeachOutput?.['1']?.suspendPayload).toMatchObject({
+      requireToolApproval: { toolCallId: 'sup-tc-B' },
+      suspendedToolCallId: `tc-${ORDER_B}`,
+      suspendedToolRunId: expect.any(String),
+    });
+    const siblingRunId = initialForeachOutput?.['1']?.suspendPayload?.suspendedToolRunId;
+    expect(initialForeachOutput?.['0']?.suspendPayload?.suspendedToolRunId).not.toBe(siblingRunId);
+
     // Approve each pending tool call by id, one at a time.
     const resumeErrors: string[] = [];
-    for (const a of approvals) {
+    for (const [index, a] of approvals.entries()) {
       const resumed = await supervisor.approveToolCall({ runId, toolCallId: a.toolCallId });
       for await (const chunk of resumed.fullStream) {
         if (chunk.type === 'tool-error') resumeErrors.push(JSON.stringify((chunk as any).payload ?? chunk));
+      }
+
+      if (index === 0) {
+        const [{ toolCalls }] = (await supervisor.listSuspendedRuns()).runs;
+        expect(toolCalls.map(toolCall => toolCall.toolCallId)).toEqual(['sup-tc-B']);
+
+        const midpointRun = await workflowsStore.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
+        expect((midpointRun?.snapshot as any)?.status).toBe('suspended');
+        const midpointForeachOutput = findForeachOutput(midpointRun?.snapshot);
+        expect(Object.keys(midpointForeachOutput ?? {})).toEqual(evented ? ['1'] : ['0', '1']);
+        expect(midpointForeachOutput?.['1']?.suspendPayload).toMatchObject({
+          requireToolApproval: { toolCallId: 'sup-tc-B' },
+          suspendedToolCallId: `tc-${ORDER_B}`,
+          suspendedToolRunId: siblingRunId,
+        });
       }
     }
 
     // Both orders must execute; neither approval should fail to resume.
     expect(resumeErrors).toEqual([]);
     expect(processedOrders.slice().sort()).toEqual([ORDER_A, ORDER_B].sort());
-  });
+    await expect(workflowsStore.getWorkflowRunById({ workflowName: 'agentic-loop', runId })).resolves.toBeNull();
+    expect((await workflowsStore.listWorkflowRuns({})).runs).toEqual([]);
+  }, 30_000);
 
   it('resuming from a cold reload (no live workflow run) still processes BOTH orders', async () => {
     // Page-refresh scenario: the run that emitted the approvals is gone. Resume happens on a

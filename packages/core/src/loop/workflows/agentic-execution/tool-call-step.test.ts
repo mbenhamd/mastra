@@ -1520,6 +1520,41 @@ describe('createToolCallStep tool approval workflow', () => {
     );
   });
 
+  it('keeps user toolCallId payloads separate from delegated suspension coordinates', async () => {
+    const inputData = {
+      ...makeInputData(),
+      toolName: 'agent-delegate',
+    };
+    tools['agent-delegate'] = tools['test-tool'];
+    tools['test-tool'].requireApproval = false;
+    const workflowSuspend = vi.fn();
+    toolCallStep = createToolCallStep({
+      tools,
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    });
+    tools['test-tool'].execute.mockImplementation(async (_args, context) => {
+      await context.suspend(
+        { toolCallId: 'payload-child-call' },
+        { runId: 'child-run', suspendedToolCallId: 'option-child-call', isAgentSuspend: true },
+      );
+      return { success: true };
+    });
+
+    const result = await toolCallStep.execute(makeExecuteParams({ inputData, suspend: workflowSuspend }));
+
+    expect(result).not.toHaveProperty('error');
+    expect(workflowSuspend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCallSuspended: { toolCallId: 'payload-child-call' },
+        suspendedToolCallId: 'option-child-call',
+      }),
+      { resumeLabel: inputData.toolCallId },
+    );
+  });
+
   it('persists the delegated resume label when a resumed tool requests execution approval', async () => {
     const inputData = {
       ...makeInputData(),

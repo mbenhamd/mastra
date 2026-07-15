@@ -1027,6 +1027,10 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             return sqm && tid ? () => sqm.flushMessages(messageList, tid, mcfg) : undefined;
           })(),
           suspend: async (suspendPayload: any, options?: SuspendOptions) => {
+            const delegatedSuspendedToolCallId =
+              isAgentTool && typeof options?.suspendedToolCallId === 'string' && options.suspendedToolCallId.length > 0
+                ? options.suspendedToolCallId
+                : undefined;
             if (options?.requireToolApproval) {
               const approvalChunk = await transformChunk(
                 {
@@ -1112,6 +1116,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   // leaving its run id unrecoverable on resume (AGENT_RESUME_NO_SNAPSHOT_FOUND).
                   // The foreach snapshot is collision-free, so it is the reliable source here.
                   suspendedToolRunId: options.runId,
+                  ...(delegatedSuspendedToolCallId ? { suspendedToolCallId: delegatedSuspendedToolCallId } : {}),
                 },
                 {
                   resumeLabel: metadataToolCallId,
@@ -1168,6 +1173,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolCallId: metadataToolCallId,
                   toolName: inputData.toolName,
                   resumeLabel: options?.resumeLabel,
+                  ...(delegatedSuspendedToolCallId ? { suspendedToolCallId: delegatedSuspendedToolCallId } : {}),
                 },
                 {
                   resumeLabel: metadataToolCallId,
@@ -1247,6 +1253,16 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
           if (suspendedToolRunId) {
             args.suspendedToolRunId = suspendedToolRunId;
+          }
+
+          // Agent delegation resumes need both coordinates of the child
+          // suspension. The run id selects the child agentic-loop snapshot;
+          // this label selects the exact tool call inside that snapshot. It is
+          // durable per foreach iteration, unlike shared message metadata.
+          const childToolCallId =
+            (suspendData as any)?.suspendedToolCallId ?? (suspendData as any)?.toolCallSuspended?.toolCallId;
+          if (isAgentTool && typeof childToolCallId === 'string' && childToolCallId.length > 0) {
+            args.suspendedToolCallId = childToolCallId;
           }
         }
 
