@@ -10,7 +10,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { TestIntegration } from '../../integration/openapi-toolset.mock';
 import { Mastra } from '../../mastra';
-import { RequestContext } from '../../request-context';
+import { ToolSearchProcessor } from '../../processors/processors/tool-search';
+import { MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
@@ -1541,6 +1542,93 @@ describe('evented agent tool hooks', () => {
   });
 });
 
+describe('processor-provided agent tool hooks', () => {
+  it('runs hooks exactly once for a ToolSearch meta-tool and dynamically loaded tool', async () => {
+    const weatherExecute = vi.fn(async ({ location }: { location: string }) => ({ location, conditions: 'sunny' }));
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const weatherTool = createTool({
+      id: 'weather',
+      description: 'Get current weather for a location',
+      inputSchema: z.object({ location: z.string() }),
+      execute: weatherExecute,
+    });
+    const toolSearch = new ToolSearchProcessor({
+      tools: { weather: weatherTool },
+      search: { topK: 5, minScore: 0 },
+    });
+    let modelCall = 0;
+    const model = new MockLanguageModelV2({
+      doGenerate: async options => {
+        modelCall++;
+        const visibleTools = (options.tools ?? []).map(tool => tool.name);
+        if (modelCall === 1) {
+          expect(visibleTools).toContain('load_tool');
+          expect(visibleTools).not.toContain('weather');
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: 'load-weather',
+                toolName: 'load_tool',
+                input: JSON.stringify({ toolName: 'weather' }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        if (modelCall === 2) {
+          expect(visibleTools).toContain('weather');
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: 'use-weather',
+                toolName: 'weather',
+                input: JSON.stringify({ location: 'Berlin' }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'hooked-tool-search-agent',
+      name: 'hooked-tool-search-agent',
+      instructions: 'Load and call the weather tool.',
+      model,
+      inputProcessors: [toolSearch],
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'hooked-tool-search-thread');
+
+    const result = await agent.generate('What is the weather?', {
+      requestContext,
+      maxSteps: 3,
+    });
+
+    expect(result.text).toBe('done');
+    expect(weatherExecute).toHaveBeenCalledOnce();
+    expect(beforeToolCall.mock.calls.map(([context]) => context.toolName)).toEqual(['load_tool', 'weather']);
+    expect(afterToolCall.mock.calls.map(([context]) => context.toolName)).toEqual(['load_tool', 'weather']);
+  });
+});
+
 describe('requireApproval property preservation', () => {
   it('should preserve requireApproval property from tools passed via toolsets', async () => {
     const mockModel = new MockLanguageModelV2({
@@ -1921,6 +2009,49 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     const subAgentTool = tools['agent-subAgent'];
     expect(subAgentTool).toBeDefined();
     expect(subAgentTool.description).toContain('subAgent');
+  });
+
+  it('runs hooks exactly once around a generated sub-agent tool', async () => {
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        content: [{ type: 'text', text: 'delegated result' }],
+        warnings: [],
+      }),
+    });
+    const subAgent = new Agent({
+      id: 'hooked-sub-agent',
+      name: 'Hooked Sub Agent',
+      instructions: 'Return a delegated result.',
+      model,
+    });
+    const parentAgent = new Agent({
+      id: 'hooked-parent-agent',
+      name: 'Hooked Parent Agent',
+      instructions: 'Delegate work.',
+      model,
+      agents: { subAgent },
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const tools = await parentAgent['convertTools']({
+      requestContext: new RequestContext(),
+      methodType: 'generate',
+    });
+
+    const result = await tools['agent-subAgent']!.execute?.({ prompt: 'Do the delegated work.' }, {
+      toolCallId: 'sub-agent-hook-call',
+      messages: [],
+    } as any);
+
+    expect(result).toEqual(expect.objectContaining({ text: 'delegated result' }));
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-subAgent' }));
+    expect(afterToolCall).toHaveBeenCalledOnce();
+    expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-subAgent' }));
   });
 
   it('reuses sub-agent tool schemas across conversions', async () => {
