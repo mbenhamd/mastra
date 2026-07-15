@@ -21,6 +21,25 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Harness',
+      collapsed: true,
+      items: [
+        {
+          type: 'doc',
+          id: 'harness/harness-class',
+          label: 'Harness Class',
+          customProps: { tags: ['alpha'] },
+        },
+        {
+          type: 'doc',
+          id: 'harness/session',
+          label: 'Session Class',
+          customProps: { tags: ['alpha'] },
+        },
+      ],
+    },
+    {
+      type: 'category',
       label: 'AgentController',
       collapsed: true,
       items: [
@@ -398,6 +417,7 @@ const sidebars = {
         { type: 'doc', id: 'memory/cloneThread', label: '.cloneThread()' },
         { type: 'doc', id: 'memory/createThread', label: '.createThread()' },
         { type: 'doc', id: 'memory/deleteMessages', label: '.deleteMessages()' },
+        { type: 'doc', id: 'memory/deleteResource', label: '.deleteResource()' },
         { type: 'doc', id: 'memory/getThreadById', label: '.getThreadById()' },
         { type: 'doc', id: 'memory/listThreads', label: '.listThreads()' },
         { type: 'doc', id: 'memory/recall', label: '.recall()' },
