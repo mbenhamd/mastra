@@ -177,6 +177,7 @@ run_pf558_admission_self_tests() (
     (
       cd "$fixture_repo"
       env \
+        GITHUB_OUTPUT= \
         BASE_SHA="$base_sha" HEAD_SHA="$head_sha" PR_NUMBER=266 \
         HEAD_REPOSITORY=mbenhamd/mastra HEAD_REF=feature/pf-558-upstream-sync-20260714 BASE_REF=main \
         PAPERSFLOW_PF558_MERGE_COMMIT="$merge_commit" \
