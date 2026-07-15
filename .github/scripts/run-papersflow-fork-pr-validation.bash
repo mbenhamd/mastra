@@ -26,6 +26,30 @@ pf558_config() {
     PF558_LOCKFILE_SHA256 PF558_PI_TUI_PATCH_SHA256
 }
 
+pf2009_config() {
+  PF2009_PR_NUMBER="${PAPERSFLOW_PF2009_PR_NUMBER:-277}"
+  PF2009_HEAD_REPOSITORY="${PAPERSFLOW_PF2009_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF2009_HEAD_REF="${PAPERSFLOW_PF2009_HEAD_REF:-feature/pf-2009-upstream-refresh-20260715}"
+  PF2009_BASE_REF="${PAPERSFLOW_PF2009_BASE_REF:-main}"
+  PF2009_PRIMARY_MERGE_COMMIT="${PAPERSFLOW_PF2009_PRIMARY_MERGE_COMMIT:-5cf253ed58e7bd0eddf128093bf6999081e45590}"
+  PF2009_FORK_PARENT="${PAPERSFLOW_PF2009_FORK_PARENT:-000ead5619e49859586467f849c4efddd1d6196b}"
+  PF2009_PRIMARY_UPSTREAM_PARENT="${PAPERSFLOW_PF2009_PRIMARY_UPSTREAM_PARENT:-bd2f1d274d05e60e2366f005ea0d94d5cea0d5ff}"
+  PF2009_LATEST_MERGE_COMMIT="${PAPERSFLOW_PF2009_LATEST_MERGE_COMMIT:-b98829919f9e8564964c6bad1581c10e607f57df}"
+  PF2009_LATEST_FIRST_PARENT="${PAPERSFLOW_PF2009_LATEST_FIRST_PARENT:-5cf253ed58e7bd0eddf128093bf6999081e45590}"
+  PF2009_LATEST_UPSTREAM_PARENT="${PAPERSFLOW_PF2009_LATEST_UPSTREAM_PARENT:-f87fe3411ac8685c77af68ece96a026ac6dff7b5}"
+  PF2009_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF2009_PACKAGE_JSON_SHA256:-48d931b08963ccd0f2b141f2ede020e44658b0bc43d4286fec192079ae651a3f}"
+  PF2009_SERVER_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF2009_SERVER_PACKAGE_JSON_SHA256:-2c4af475beaa7c27eb598a2d10b5ee470e81302861e0a81236ffae14079be224}"
+  PF2009_WORKSPACE_SHA256="${PAPERSFLOW_PF2009_WORKSPACE_SHA256:-768f91f814be021bfe09b79ec178d0e8a676ad07f0a5e6d5257da5de5d4b82f0}"
+  PF2009_LOCKFILE_SHA256="${PAPERSFLOW_PF2009_LOCKFILE_SHA256:-175c451edf808b31b397e5730951bc63eafb147d0b78ce56c6ae534f705b166c}"
+  PF2009_DEPENDENCY_GRAPH_SHA256="${PAPERSFLOW_PF2009_DEPENDENCY_GRAPH_SHA256:-6e0e838e04ea7e301dd1dd475e54c57452f69a5d367d34877600319ea89f3ee5}"
+  readonly \
+    PF2009_PR_NUMBER PF2009_HEAD_REPOSITORY PF2009_HEAD_REF PF2009_BASE_REF \
+    PF2009_PRIMARY_MERGE_COMMIT PF2009_FORK_PARENT PF2009_PRIMARY_UPSTREAM_PARENT \
+    PF2009_LATEST_MERGE_COMMIT PF2009_LATEST_FIRST_PARENT PF2009_LATEST_UPSTREAM_PARENT \
+    PF2009_PACKAGE_JSON_SHA256 PF2009_SERVER_PACKAGE_JSON_SHA256 PF2009_WORKSPACE_SHA256 \
+    PF2009_LOCKFILE_SHA256 PF2009_DEPENDENCY_GRAPH_SHA256
+}
+
 git_blob_sha256() {
   local revision="$1"
   local path="$2"
@@ -36,6 +60,28 @@ git_regular_file_at_revision() {
   local revision="$1"
   local path="$2"
   git ls-tree "$revision" -- "$path" | grep -Eq '^100(644|755) blob '
+}
+
+git_dependency_graph_sha256() {
+  local revision="$1" entry path
+  git ls-tree -r -z --full-tree "$revision" |
+    while IFS= read -r -d '' entry; do
+      path="${entry#*$'\t'}"
+      case "$path" in
+        .npmrc | */.npmrc | \
+          .pnpmfile.cjs | */.pnpmfile.cjs | \
+          pnpmfile.cjs | */pnpmfile.cjs | \
+          pnpm-workspace.yaml | */pnpm-workspace.yaml | \
+          package.json | */package.json | \
+          pnpm-lock.yaml | */pnpm-lock.yaml | \
+          patches/* | */patches/*)
+          printf '%s\0' "$entry"
+          ;;
+      esac
+    done |
+    LC_ALL=C sort -z |
+    sha256sum |
+    awk '{print $1}'
 }
 
 emit_validation_lane() {
@@ -64,16 +110,77 @@ classify_install_lane() (
     return
   fi
 
-  pf558_config
   : "${PR_NUMBER:?PR_NUMBER is required for a dependency-graph exception}"
   : "${HEAD_REPOSITORY:?HEAD_REPOSITORY is required for a dependency-graph exception}"
   : "${HEAD_REF:?HEAD_REF is required for a dependency-graph exception}"
   : "${BASE_REF:?BASE_REF is required for a dependency-graph exception}"
 
+  pf2009_config
+  if [[ "$PR_NUMBER" == "$PF2009_PR_NUMBER" && \
+    "$HEAD_REPOSITORY" == "$PF2009_HEAD_REPOSITORY" && \
+    "$HEAD_REF" == "$PF2009_HEAD_REF" && "$BASE_REF" == "$PF2009_BASE_REF" ]]; then
+    local expected_changes merge_topology actual_dependency_graph_hash
+    expected_changes="$(mktemp)"
+    trap 'rm -f "$manifest_changes" "$expected_changes"' EXIT
+    printf '%s\n' package.json packages/server/package.json | sort > "$expected_changes"
+    if ! cmp -s "$expected_changes" "$manifest_changes"; then
+      echo 'PF-2009 changed dependency-graph paths outside the exact reviewed set:' >&2
+      diff -u "$expected_changes" "$manifest_changes" >&2 || true
+      return 1
+    fi
+
+    merge_topology="$(git rev-list --parents -n 1 "$PF2009_PRIMARY_MERGE_COMMIT")"
+    if [[ "$merge_topology" != "$PF2009_PRIMARY_MERGE_COMMIT $PF2009_FORK_PARENT $PF2009_PRIMARY_UPSTREAM_PARENT" ]] || \
+      ! git merge-base --is-ancestor "$PF2009_PRIMARY_MERGE_COMMIT" "$HEAD_SHA"; then
+      echo 'PF-2009 no longer contains the reviewed primary upstream merge topology.' >&2
+      return 1
+    fi
+    merge_topology="$(git rev-list --parents -n 1 "$PF2009_LATEST_MERGE_COMMIT")"
+    if [[ "$merge_topology" != "$PF2009_LATEST_MERGE_COMMIT $PF2009_LATEST_FIRST_PARENT $PF2009_LATEST_UPSTREAM_PARENT" ]] || \
+      ! git merge-base --is-ancestor "$PF2009_LATEST_MERGE_COMMIT" "$HEAD_SHA"; then
+      echo 'PF-2009 no longer contains the reviewed latest-upstream merge topology.' >&2
+      return 1
+    fi
+
+    local path expected_hash actual_hash
+    while IFS=$'\t' read -r path expected_hash; do
+      if ! git_regular_file_at_revision "$HEAD_SHA" "$path"; then
+        echo "PF-2009 approved dependency file is not a regular blob: $path" >&2
+        return 1
+      fi
+      actual_hash="$(git_blob_sha256 "$HEAD_SHA" "$path")"
+      if [[ "$actual_hash" != "$expected_hash" ]]; then
+        echo "PF-2009 approved dependency file hash changed: $path" >&2
+        echo "expected: $expected_hash" >&2
+        echo "actual:   $actual_hash" >&2
+        return 1
+      fi
+    done <<EOF
+package.json	$PF2009_PACKAGE_JSON_SHA256
+packages/server/package.json	$PF2009_SERVER_PACKAGE_JSON_SHA256
+pnpm-workspace.yaml	$PF2009_WORKSPACE_SHA256
+pnpm-lock.yaml	$PF2009_LOCKFILE_SHA256
+EOF
+
+    actual_dependency_graph_hash="$(git_dependency_graph_sha256 "$HEAD_SHA")"
+    if [[ "$actual_dependency_graph_hash" != "$PF2009_DEPENDENCY_GRAPH_SHA256" ]]; then
+      echo 'PF-2009 dependency-graph tree hash changed.' >&2
+      echo "expected: $PF2009_DEPENDENCY_GRAPH_SHA256" >&2
+      echo "actual:   $actual_dependency_graph_hash" >&2
+      return 1
+    fi
+
+    echo 'PF-2009 exact dependency-graph exception accepted from trusted base policy.'
+    emit_validation_lane pf2009-upstream-sync
+    return
+  fi
+
+  pf558_config
+
   if [[ "$PR_NUMBER" != "$PF558_PR_NUMBER" || \
     "$HEAD_REPOSITORY" != "$PF558_HEAD_REPOSITORY" || \
     "$HEAD_REF" != "$PF558_HEAD_REF" || "$BASE_REF" != "$PF558_BASE_REF" ]]; then
-    echo 'Dependency-graph changes do not match the reviewed PF-558 upstream-sync lane.' >&2
+    echo 'Dependency-graph changes do not match a reviewed upstream-sync lane.' >&2
     cat "$manifest_changes" >&2
     return 1
   fi
@@ -256,9 +363,169 @@ run_pf558_admission_self_tests() (
     echo 'Wrong PR metadata unexpectedly passed PF-558 admission.' >&2
     return 1
   fi
-  grep -Fq 'do not match the reviewed PF-558' "$output"
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
 
   echo 'PF-558 upstream-sync admission fixtures passed.'
+)
+
+run_pf2009_admission_self_tests() (
+  local script_path test_root fixture_repo base_sha fork_parent primary_upstream_parent
+  local primary_merge_commit latest_upstream_parent latest_merge_commit head_sha output
+  local package_hash server_hash workspace_hash lockfile_hash dependency_graph_hash weird_dir
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf2009_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-2009 admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf2009_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo/packages/server" "$fixture_repo/packages/nested" "$fixture_repo/patches"
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-2009 admission fixture'
+  printf '{"name":"fixture"}\n' > "$fixture_repo/package.json"
+  printf '{"name":"server"}\n' > "$fixture_repo/packages/server/package.json"
+  printf '{"name":"nested"}\n' > "$fixture_repo/packages/nested/package.json"
+  printf 'packages:\n  - packages/*\n' > "$fixture_repo/pnpm-workspace.yaml"
+  printf 'lockfileVersion: 9.0\n' > "$fixture_repo/pnpm-lock.yaml"
+  printf 'approved patch\n' > "$fixture_repo/patches/existing.patch"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m base
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  fork_parent="$base_sha"
+
+  git -C "$fixture_repo" switch -q -c upstream
+  printf 'upstream runtime\n' > "$fixture_repo/upstream.txt"
+  git -C "$fixture_repo" add upstream.txt
+  git -C "$fixture_repo" commit -q -m upstream
+  primary_upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" switch -q main
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'primary upstream merge'
+  primary_merge_commit="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  git -C "$fixture_repo" switch -q upstream
+  printf 'latest docs\n' > "$fixture_repo/latest.txt"
+  git -C "$fixture_repo" add latest.txt
+  git -C "$fixture_repo" commit -q -m 'latest upstream'
+  latest_upstream_parent="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" switch -q main
+  git -C "$fixture_repo" merge -q --no-ff upstream -m 'latest upstream merge'
+  latest_merge_commit="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  printf '{"name":"approved"}\n' > "$fixture_repo/package.json"
+  printf '{"name":"approved-server"}\n' > "$fixture_repo/packages/server/package.json"
+  printf '{"name":"approved-nested"}\n' > "$fixture_repo/packages/nested/package.json"
+  printf 'lockfileVersion: 9.0\nsettings:\n  autoInstallPeers: false\n' > "$fixture_repo/pnpm-lock.yaml"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m approved
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  package_hash="$(sha256sum "$fixture_repo/package.json" | awk '{print $1}')"
+  server_hash="$(sha256sum "$fixture_repo/packages/server/package.json" | awk '{print $1}')"
+  workspace_hash="$(sha256sum "$fixture_repo/pnpm-workspace.yaml" | awk '{print $1}')"
+  lockfile_hash="$(sha256sum "$fixture_repo/pnpm-lock.yaml" | awk '{print $1}')"
+  dependency_graph_hash="$(cd "$fixture_repo" && git_dependency_graph_sha256 "$head_sha")"
+
+  run_fixture_admission() {
+    local fixture_output="$1"
+    shift
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$base_sha" HEAD_SHA="$head_sha" PR_NUMBER=277 \
+        HEAD_REPOSITORY=mbenhamd/mastra \
+        HEAD_REF=feature/pf-2009-upstream-refresh-20260715 BASE_REF=main \
+        PAPERSFLOW_PF2009_PRIMARY_MERGE_COMMIT="$primary_merge_commit" \
+        PAPERSFLOW_PF2009_FORK_PARENT="$fork_parent" \
+        PAPERSFLOW_PF2009_PRIMARY_UPSTREAM_PARENT="$primary_upstream_parent" \
+        PAPERSFLOW_PF2009_LATEST_MERGE_COMMIT="$latest_merge_commit" \
+        PAPERSFLOW_PF2009_LATEST_FIRST_PARENT="$primary_merge_commit" \
+        PAPERSFLOW_PF2009_LATEST_UPSTREAM_PARENT="$latest_upstream_parent" \
+        PAPERSFLOW_PF2009_PACKAGE_JSON_SHA256="$package_hash" \
+        PAPERSFLOW_PF2009_SERVER_PACKAGE_JSON_SHA256="$server_hash" \
+        PAPERSFLOW_PF2009_WORKSPACE_SHA256="$workspace_hash" \
+        PAPERSFLOW_PF2009_LOCKFILE_SHA256="$lockfile_hash" \
+        PAPERSFLOW_PF2009_DEPENDENCY_GRAPH_SHA256="$dependency_graph_hash" \
+        "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$output"
+  grep -Fxq 'lane=pf2009-upstream-sync' "$output"
+
+  printf '{"name":"tampered"}\n' > "$fixture_repo/package.json"
+  git -C "$fixture_repo" commit -q -am tampered
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-2009 manifest unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'approved dependency file hash changed: package.json' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  printf '{"name":"tampered-nested"}\n' > "$fixture_repo/packages/nested/package.json"
+  git -C "$fixture_repo" commit -q -am 'tamper nested manifest'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered-graph.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-2009 dependency graph unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'dependency-graph tree hash changed' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  weird_dir="$fixture_repo/packages/"$'weird\nname'
+  mkdir -p "$weird_dir"
+  printf '{"name":"tampered-unusual-path"}\n' > "$weird_dir/package.json"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m 'tamper unusual dependency path'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered-unusual-path.log"
+  if run_fixture_admission "$output"; then
+    echo 'Unusual-path PF-2009 dependency tampering unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'dependency-graph tree hash changed' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  printf 'unreviewed\n' > "$fixture_repo/patches/unreviewed.patch"
+  git -C "$fixture_repo" add patches/unreviewed.patch
+  git -C "$fixture_repo" commit -q -m 'unreviewed dependency path'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/unreviewed.log"
+  if run_fixture_admission "$output"; then
+    echo 'Unreviewed PF-2009 dependency path unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'outside the exact reviewed set' "$output"
+
+  git -C "$fixture_repo" reset -q --hard HEAD^
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/wrong-topology.log"
+  if run_fixture_admission "$output" PAPERSFLOW_PF2009_LATEST_UPSTREAM_PARENT="$fork_parent"; then
+    echo 'Wrong PF-2009 latest-upstream parent unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'latest-upstream merge topology' "$output"
+
+  output="$test_root/wrong-pr.log"
+  if run_fixture_admission "$output" PR_NUMBER=999; then
+    echo 'Wrong PR metadata unexpectedly passed PF-2009 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  echo 'PF-2009 upstream-sync admission fixtures passed.'
 )
 
 case "${1:-}" in
@@ -268,6 +535,10 @@ case "${1:-}" in
     ;;
   --self-test-pf558-upstream-sync)
     run_pf558_admission_self_tests
+    exit
+    ;;
+  --self-test-pf2009-upstream-sync)
+    run_pf2009_admission_self_tests
     exit
     ;;
 esac
@@ -1467,15 +1738,17 @@ TEST
   trap - EXIT
 )
 
-run_pf558_upstream_sync_validation() {
+run_upstream_sync_validation() {
+  local expected_lane="${1:?validation lane is required}"
+  local issue_key="${2:?issue key is required}"
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
 
   local admission_output merge_base_sha path
   admission_output="$(mktemp)"
   GITHUB_OUTPUT="$admission_output" classify_install_lane
-  if ! grep -Fxq 'lane=pf558-upstream-sync' "$admission_output"; then
-    echo 'PF-558 dedicated validation ran without exact admission.' >&2
+  if ! grep -Fxq "lane=$expected_lane" "$admission_output"; then
+    echo "$issue_key dedicated validation ran without exact admission." >&2
     rm -f "$admission_output"
     return 1
   fi
@@ -1489,7 +1762,7 @@ run_pf558_upstream_sync_validation() {
   # files in the proposed tree.
   while IFS= read -r path; do
     if ! git_regular_file_at_revision "$HEAD_SHA" "$path"; then
-      echo "PF-558 removed or replaced a required Harness/AgentController boundary: $path" >&2
+      echo "$issue_key removed or replaced a required Harness/AgentController boundary: $path" >&2
       return 1
     fi
   done <<'EOF'
@@ -1542,7 +1815,7 @@ EOF
     client-sdks/client-js/src/route-types.generated.ts \
     packages/cli/src/commands/api/route-metadata.generated.ts \
     packages/core/src/auth/ee/interfaces/permissions.generated.ts; then
-    echo 'PF-558 generated route or permission artifacts are stale.' >&2
+    echo "$issue_key generated route or permission artifacts are stale." >&2
     return 1
   fi
 
@@ -1572,7 +1845,15 @@ EOF
   fi
   run_with_validation_budget 60 node scripts/affected-tests.mjs --self-test-symbol-exports
 
-  echo 'PF-558 dedicated upstream-sync validation passed.'
+  echo "$issue_key dedicated upstream-sync validation passed."
+}
+
+run_pf558_upstream_sync_validation() {
+  run_upstream_sync_validation pf558-upstream-sync PF-558
+}
+
+run_pf2009_upstream_sync_validation() {
+  run_upstream_sync_validation pf2009-upstream-sync PF-2009
 }
 
 case "${1:-}" in
@@ -1586,6 +1867,10 @@ case "${1:-}" in
     ;;
   --validate-pf558-upstream-sync)
     run_pf558_upstream_sync_validation
+    exit
+    ;;
+  --validate-pf2009-upstream-sync)
+    run_pf2009_upstream_sync_validation
     exit
     ;;
   '') ;;
@@ -1702,6 +1987,7 @@ while IFS= read -r file; do
       .github/workflows/lint.yml | \
       .github/workflows/mastracode-e2e.yml | \
       .github/workflows/papersflow-fork-pr.yml | \
+      .github/workflows/prebuild.yml | \
       pnpm-lock.yaml | \
       scripts/commonjs-tsc-fixer.js | \
       scripts/commonjs-tsc-fixer.test.ts | \
