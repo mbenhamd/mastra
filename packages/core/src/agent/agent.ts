@@ -89,14 +89,9 @@ import type { FullOutput, MastraModelOutput } from '../stream/base/output';
 import { createTool } from '../tools';
 import { normalizeToolPayloadTransformPolicy } from '../tools/payload-transform';
 import type { ToolToConvert } from '../tools/tool-builder/builder';
+import { unwrapToolsFromHooks, wrapToolsWithHooks } from '../tools/tool-hooks';
 import { isMastraTool, isProviderTool } from '../tools/toolchecks';
-import type {
-  CoreTool,
-  MastraToolInvocationOptions,
-  McpMetadata,
-  ToolHooks,
-  ToolPayloadTransformPolicy,
-} from '../tools/types';
+import type { CoreTool, McpMetadata, ToolHooks, ToolPayloadTransformPolicy } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import { makeCoreTool, createMastraProxy, ensureToolProperties, deepMerge } from '../utils';
 import type { ToolOptions } from '../utils';
@@ -4235,6 +4230,7 @@ export class Agent<
       autoResumeSuspendedTools?: boolean;
       backgroundTaskEnabled?: boolean;
       providerOptions?: ProviderOptions;
+      hooks?: ToolHooks;
     },
   ): Promise<{
     messageList: MessageList;
@@ -4260,6 +4256,7 @@ export class Agent<
       autoResumeSuspendedTools,
       backgroundTaskEnabled,
       providerOptions,
+      hooks,
       ...rest
     } = args;
     const observabilityContext = resolveObservabilityContext(rest);
@@ -4293,7 +4290,7 @@ export class Agent<
           // Cast needed: legacy v1 models return LanguageModelV1 which doesn't satisfy MastraLanguageModel.
           // OM's processInputStep doesn't use the model parameter, so this is safe.
           model: model as MastraLanguageModel,
-          tools,
+          tools: tools ? unwrapToolsFromHooks(tools) : tools,
           providerOptions: processInputProviderOptions,
           retryCount: 0,
         });
@@ -4382,6 +4379,12 @@ export class Agent<
         toolSurfaceFence,
         this.logger,
       ) as typeof nextTools;
+    }
+    if (nextTools) {
+      nextTools = wrapToolsWithHooks(nextTools, this.resolveToolHooks(hooks), {
+        agentId: this.id,
+        agentName: this.name,
+      });
     }
 
     return {
@@ -6410,7 +6413,7 @@ export class Agent<
       stampChannelToolFence(requestContext, reservedChannelToolNames);
       enforceChannelToolFence(formattedTools, reservedChannelToolNames, logger);
     }
-    return this.wrapToolsWithHooks(formattedTools, this.resolveToolHooks(hooks), { agentId, agentName });
+    return wrapToolsWithHooks(formattedTools, this.resolveToolHooks(hooks), { agentId, agentName });
   }
 
   /**
@@ -6430,57 +6433,6 @@ export class Agent<
     if (!runHooks) return this.#hooks;
 
     return deepMerge(this.#hooks as Record<string, unknown>, runHooks as Record<string, unknown>) as ToolHooks;
-  }
-
-  private wrapToolsWithHooks(
-    tools: Record<string, CoreTool>,
-    hooks?: ToolHooks,
-    metadata: { agentId: string; agentName: string } = { agentId: this.id, agentName: this.name },
-  ): Record<string, CoreTool> {
-    if (!hooks?.beforeToolCall && !hooks?.afterToolCall) return tools;
-
-    return Object.fromEntries(
-      Object.entries(tools).map(([toolName, tool]) => [
-        toolName,
-        this.wrapToolWithHooks(toolName, tool, hooks, metadata),
-      ]),
-    );
-  }
-
-  private wrapToolWithHooks(
-    toolName: string,
-    tool: CoreTool,
-    hooks: ToolHooks,
-    metadata: { agentId: string; agentName: string },
-  ): CoreTool {
-    if (typeof tool.execute !== 'function') return tool;
-
-    return {
-      ...tool,
-      execute: async (input: unknown, context: MastraToolInvocationOptions) => {
-        const hookContext = {
-          toolName,
-          input,
-          context,
-          metadata,
-        };
-        const beforeResult = await hooks.beforeToolCall?.(hookContext);
-        if (beforeResult?.proceed === false) {
-          return beforeResult.output;
-        }
-
-        let output: unknown;
-        try {
-          output = await tool.execute!(input, context);
-        } catch (error) {
-          await hooks.afterToolCall?.({ ...hookContext, output, error });
-          throw error;
-        }
-
-        await hooks.afterToolCall?.({ ...hookContext, output });
-        return output;
-      },
-    };
   }
 
   /**
@@ -7639,6 +7591,7 @@ export class Agent<
           ? Boolean((this as unknown as { _agentNetworkAppend: unknown })._agentNetworkAppend)
           : undefined,
       convertTools: this.convertTools.bind(this),
+      resolveToolHooks: (runHooks?: ToolHooks) => this.resolveToolHooks(runHooks),
       getMemoryMessages: this.getMemoryMessages.bind(this),
       runInputProcessors: this.__runInputProcessors.bind(this),
       executeOnFinish: this.#executeOnFinish.bind(this),

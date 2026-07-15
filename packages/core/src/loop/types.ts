@@ -40,7 +40,7 @@ import type {
   StreamChunkType,
   StreamTransportRef,
 } from '../stream/types';
-import type { RequireToolApproval, ToolPayloadTransformPolicy } from '../tools';
+import type { RequireToolApproval, ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { MastraIdGenerator } from '../types';
 import type { OutputWriter } from '../workflows/types';
 import type { Workspace } from '../workspace/workspace';
@@ -119,6 +119,8 @@ export type StreamInternal = {
   // Transform policy for display/transcript tool payloads.
   /** @deprecated Use `runScope.get(TOOL_PAYLOAD_TRANSFORM_KEY)` from `loop/run-scope-keys`. */
   toolPayloadTransform?: ToolPayloadTransformPolicy;
+  /** @deprecated Use `runScope.get(TOOL_HOOKS_KEY)` from `loop/run-scope-keys`. */
+  toolHooks?: ToolHooks;
   // Manager-level background task config
   /** @deprecated Use `runScope.get(BACKGROUND_TASK_MANAGER_CONFIG_KEY)` from `loop/run-scope-keys`. */
   backgroundTaskManagerConfig?: BackgroundTaskManagerConfig;

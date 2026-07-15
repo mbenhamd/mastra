@@ -27,6 +27,7 @@ import {
   SKIP_BG_TASK_WAIT_KEY,
   THREAD_EXISTS_KEY,
   THREAD_ID_KEY,
+  TOOL_HOOKS_KEY,
   TOOL_PAYLOAD_TRANSFORM_KEY,
   TRANSPORT_REF_KEY,
 } from './run-scope-keys';
@@ -63,4 +64,5 @@ export function hydrateRunScopeFromInternal(mastra: Mastra, runId: string, inter
   if (internal.drainPendingSignals) scope.set(DRAIN_PENDING_SIGNALS_KEY, internal.drainPendingSignals);
   if (internal.initialSignalEchoes) scope.set(INITIAL_SIGNAL_ECHOES_KEY, internal.initialSignalEchoes);
   if (internal.toolPayloadTransform) scope.set(TOOL_PAYLOAD_TRANSFORM_KEY, internal.toolPayloadTransform);
+  if (internal.toolHooks) scope.set(TOOL_HOOKS_KEY, internal.toolHooks);
 }

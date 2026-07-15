@@ -21,7 +21,7 @@ import type { AgentBackgroundConfig, BackgroundTaskManager, BackgroundTaskManage
 import { createRunScopeKey } from '../mastra/run-scope';
 import type { MastraMemory, MemoryConfigInternal } from '../memory';
 import type { StreamTransportRef } from '../stream/types';
-import type { ToolPayloadTransformPolicy } from '../tools';
+import type { ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { Workspace } from '../workspace/workspace';
 
 // --- Identity / clock injectors --------------------------------------------
@@ -68,3 +68,7 @@ export const INITIAL_SIGNAL_ECHOES_KEY = createRunScopeKey<CreatedAgentSignal[]>
 // --- Tool payload transform ------------------------------------------------
 
 export const TOOL_PAYLOAD_TRANSFORM_KEY = createRunScopeKey<ToolPayloadTransformPolicy>('loop:toolPayloadTransform');
+
+// --- Agent tool hooks ------------------------------------------------------
+
+export const TOOL_HOOKS_KEY = createRunScopeKey<ToolHooks>('loop:toolHooks');

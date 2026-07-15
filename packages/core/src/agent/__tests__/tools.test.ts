@@ -227,9 +227,153 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       ]);
     });
 
+    it('runs effective hooks exactly once for a processor-added tool', async () => {
+      const execute = vi.fn(async () => ({ message: 'dynamic' }));
+      const configuredBefore = vi.fn();
+      const runBefore = vi.fn();
+      const afterToolCall = vi.fn();
+      const dynamicTool = createTool({
+        id: 'testTool',
+        description: 'Processor-added test tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        inputProcessors: [
+          {
+            id: 'add-test-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, testTool: dynamicTool } }),
+          },
+        ],
+        hooks: {
+          beforeToolCall: configuredBefore,
+          afterToolCall,
+        },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', {
+          toolChoice: 'required',
+          hooks: { beforeToolCall: runBefore },
+          maxSteps: 1,
+        });
+      } else {
+        await agentOne.generate('Call testTool', { hooks: { beforeToolCall: runBefore }, maxSteps: 1 });
+      }
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(configuredBefore).not.toHaveBeenCalled();
+      expect(runBefore).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
+    it('runs hooks exactly once around a processor-replaced tool executor', async () => {
+      const initialExecute = vi.fn(async () => ({ message: 'initial' }));
+      const replacementExecute = vi.fn(async () => ({ message: 'replacement' }));
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const initialTool = createTool({
+        id: 'testTool',
+        description: 'Initial test tool',
+        inputSchema: z.object({}),
+        execute: initialExecute,
+      });
+      const replacementTool = createTool({
+        id: 'testTool',
+        description: 'Replacement test tool',
+        inputSchema: z.object({}),
+        execute: replacementExecute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        tools: { testTool: initialTool },
+        inputProcessors: [
+          {
+            id: 'replace-test-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, testTool: replacementTool } }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
+      } else {
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
+      }
+
+      expect(initialExecute).not.toHaveBeenCalled();
+      expect(replacementExecute).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
+    it('runs hooks exactly once when a processor decorates an existing executor', async () => {
+      const execute = vi.fn(async () => ({ message: 'decorated' }));
+      const decorate = vi.fn();
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const initialTool = createTool({
+        id: 'testTool',
+        description: 'Initial test tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        tools: { testTool: initialTool },
+        inputProcessors: [
+          {
+            id: 'decorate-test-tool',
+            processInputStep: ({ tools }) => ({
+              tools: {
+                ...tools,
+                testTool: {
+                  ...tools.testTool!,
+                  execute: async (input: any, context: any) => {
+                    decorate();
+                    return tools.testTool!.execute!(input, context);
+                  },
+                },
+              },
+            }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
+      } else {
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
+      }
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(decorate).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
     it('uses per-execution hooks through the public generate path', async () => {
       const configBeforeToolCall = vi.fn();
       const runBeforeToolCall = vi.fn(() => ({ proceed: false as const, output: { message: 'blocked' } }));
+      const runAfterToolCall = vi.fn();
       const execute = vi.fn(async () => ({ message: 'executed' }));
       const testTool = createTool({
         id: 'testTool',
@@ -259,21 +403,27 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
           toolChoice: 'required',
           hooks: {
             beforeToolCall: runBeforeToolCall,
+            afterToolCall: runAfterToolCall,
           },
+          maxSteps: 1,
         });
         toolResult = response.toolResults.find((result: any) => result.toolName === 'testTool');
       } else {
         const response = await agentOne.generate('Call testTool', {
           hooks: {
             beforeToolCall: runBeforeToolCall,
+            afterToolCall: runAfterToolCall,
           },
+          maxSteps: 1,
         });
         toolResult = response.toolResults.find((result: any) => result.payload.toolName === 'testTool')?.payload;
       }
 
       expect(toolResult?.result?.message).toBe('blocked');
       expect(configBeforeToolCall).not.toHaveBeenCalled();
+      expect(runBeforeToolCall).toHaveBeenCalledOnce();
       expect(runBeforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'testTool', input: {} }));
+      expect(runAfterToolCall).not.toHaveBeenCalled();
       expect(execute).not.toHaveBeenCalled();
     });
 
@@ -304,9 +454,9 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       const agentOne = mastra.getAgent('testAgent');
 
       if (version === 'v1') {
-        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required' }).catch(() => undefined);
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 }).catch(() => undefined);
       } else {
-        await agentOne.generate('Call testTool').catch(() => undefined);
+        await agentOne.generate('Call testTool', { maxSteps: 1 }).catch(() => undefined);
       }
 
       expect(afterToolCall).toHaveBeenCalledWith(
@@ -317,6 +467,7 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
           error: expect.any(Error),
         }),
       );
+      expect(afterToolCall).toHaveBeenCalledOnce();
     });
 
     it('should call findUserTool with parameters', async () => {
@@ -1334,6 +1485,61 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
 toolsTest('v1');
 toolsTest('v2');
 toolsTest('v3');
+
+describe('evented agent tool hooks', () => {
+  it('runs hooks exactly once for a processor-added tool', async () => {
+    vi.stubEnv('MASTRA_EVENTED_EXECUTION', 'true');
+    try {
+      const execute = vi.fn(async () => ({ message: 'dynamic' }));
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const dynamicTool = createTool({
+        id: 'dynamicTool',
+        description: 'Processor-added evented tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const model = new MockLanguageModelV2({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'tool-calls',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [
+            {
+              type: 'tool-call',
+              toolCallId: 'dynamic-call',
+              toolName: 'dynamicTool',
+              input: '{}',
+            },
+          ],
+          warnings: [],
+        }),
+      });
+      const agent = new Agent({
+        id: 'evented-hook-agent',
+        name: 'Evented hook agent',
+        instructions: 'Call dynamicTool.',
+        model,
+        inputProcessors: [
+          {
+            id: 'add-dynamic-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, dynamicTool } }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      new Mastra({ agents: { agent }, logger: false });
+
+      await agent.generate('Call dynamicTool.', { maxSteps: 1 });
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
 
 describe('requireApproval property preservation', () => {
   it('should preserve requireApproval property from tools passed via toolsets', async () => {

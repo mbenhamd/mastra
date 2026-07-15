@@ -37,6 +37,7 @@ import {
   STEP_WORKSPACE_KEY,
   THREAD_EXISTS_KEY,
   THREAD_ID_KEY,
+  TOOL_HOOKS_KEY,
   TOOL_PAYLOAD_TRANSFORM_KEY,
   TRANSPORT_REF_KEY,
 } from './run-scope-keys';
@@ -81,6 +82,7 @@ describe('hydrateRunScopeFromInternal', () => {
     const drainPendingSignals = (() => []) as StreamInternal['drainPendingSignals'];
     const initialSignalEchoes = [{ tag: 'echo' }] as any;
     const toolPayloadTransform = { tag: 'toolPayloadTransform' } as any;
+    const toolHooks = { beforeToolCall: () => undefined };
 
     const internal: StreamInternal = {
       now,
@@ -100,6 +102,7 @@ describe('hydrateRunScopeFromInternal', () => {
       drainPendingSignals,
       initialSignalEchoes,
       toolPayloadTransform,
+      toolHooks,
     };
 
     hydrateRunScopeFromInternal(mastra, 'run-1', internal);
@@ -122,6 +125,7 @@ describe('hydrateRunScopeFromInternal', () => {
     expect(scope.get(DRAIN_PENDING_SIGNALS_KEY)).toBe(drainPendingSignals);
     expect(scope.get(INITIAL_SIGNAL_ECHOES_KEY)).toBe(initialSignalEchoes);
     expect(scope.get(TOOL_PAYLOAD_TRANSFORM_KEY)).toBe(toolPayloadTransform);
+    expect(scope.get(TOOL_HOOKS_KEY)).toBe(toolHooks);
 
     mastra.__releaseRunScope('run-1');
   });

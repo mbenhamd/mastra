@@ -248,6 +248,8 @@ describe('Supervisor Pattern Integration Tests', () => {
   describe('Delegation hooks with sub-agent tools', () => {
     it('should trigger onDelegationStart when delegating to a sub-agent', async () => {
       const onDelegationStart = vi.fn(() => ({ proceed: true }));
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
       const subAgent = makeSubAgent('research-agent', 'Dolphins are marine mammals.');
 
       const supervisorAgent = new Agent({
@@ -257,6 +259,7 @@ describe('Supervisor Pattern Integration Tests', () => {
         model: makeSupervisorModel('researchAgent', 'research dolphins'),
         agents: { researchAgent: subAgent },
         memory: new MockMemory(),
+        hooks: { beforeToolCall, afterToolCall },
       });
 
       await supervisorAgent.generate('Research dolphins', {
@@ -271,6 +274,10 @@ describe('Supervisor Pattern Integration Tests', () => {
           prompt: 'research dolphins',
         }),
       );
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
+      expect(afterToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
     });
 
     it('should trigger onDelegationComplete with the sub-agent result', async () => {

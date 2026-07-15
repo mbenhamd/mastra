@@ -147,6 +147,7 @@ export interface AgentLegacyCapabilities {
       autoResumeSuspendedTools?: boolean;
       backgroundTaskEnabled?: boolean;
       providerOptions?: ProviderOptions;
+      hooks?: ToolHooks;
     },
   ): Promise<{
     messageList: MessageList;
@@ -358,6 +359,7 @@ export class AgentLegacyHandler {
               runId,
               threadId,
               resourceId,
+              hooks,
             });
             if (inputStepResult.tools) {
               convertedTools = inputStepResult.tools;
@@ -465,6 +467,7 @@ export class AgentLegacyHandler {
             runId,
             threadId,
             resourceId,
+            hooks,
           });
           if (inputStepResult.tools) {
             convertedTools = inputStepResult.tools;

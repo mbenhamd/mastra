@@ -8,6 +8,7 @@ import type {
   OutputProcessorOrWorkflow,
 } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
+import type { ToolHooks } from '../../../tools';
 import type { Agent } from '../../agent';
 import type { AgentExecuteOnFinishOptions } from '../../types';
 
@@ -21,6 +22,7 @@ export type AgentCapabilities = {
   mastra?: Mastra;
   _agentNetworkAppend?: boolean;
   convertTools: Agent['convertTools'];
+  resolveToolHooks: (runHooks?: ToolHooks) => ToolHooks | undefined;
   runInputProcessors: Agent['__runInputProcessors'];
   executeOnFinish: (args: AgentExecuteOnFinishOptions) => Promise<void>;
   outputProcessors?:
