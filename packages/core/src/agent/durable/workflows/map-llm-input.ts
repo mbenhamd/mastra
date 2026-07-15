@@ -1,8 +1,6 @@
 import type { DurableAgenticWorkflowInput } from '../types';
 
-export function mapDurableIterationToLLMInput(
-  state: DurableAgenticWorkflowInput & { iterationCount?: number },
-) {
+export function mapDurableIterationToLLMInput(state: DurableAgenticWorkflowInput & { iterationCount?: number }) {
   return {
     runId: state.runId,
     runtimeBindingId: state.runtimeBindingId,
