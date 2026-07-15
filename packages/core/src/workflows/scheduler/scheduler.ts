@@ -2,6 +2,7 @@ import { MastraBase } from '../../base';
 import type { PubSub } from '../../events/pubsub';
 import { RegisteredLogger } from '../../logger/constants';
 import type { Schedule, ScheduleTrigger, SchedulesStorage } from '../../storage/domains/schedules/base';
+import { createWorkflowExecutionGeneration } from '../lifecycle-events';
 import { computeNextFireAt } from './cron';
 import type { SchedulerConfig } from './types';
 
@@ -355,6 +356,9 @@ export class Scheduler extends MastraBase {
           data: {
             workflowId,
             runId: claimId,
+            executionGeneration: createWorkflowExecutionGeneration(),
+            lifecycleResumeAttempt: 0,
+            lifecycleStepStates: {},
             prevResult: { status: 'success', output: inputData ?? {} },
             requestContext: requestContext ?? {},
             initialState: initialState ?? {},

@@ -1820,6 +1820,7 @@ export class EventedRun<
 
     const inputDataToUse = await this._validateInput(inputData ?? ({} as TInput));
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    const lifecycleExecution = this.startLifecycleExecution();
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     // Always persist the initial run record regardless of shouldPersistSnapshot.
@@ -1827,6 +1828,7 @@ export class EventedRun<
     // aggregation (aggregateBranchResults reads stepResults via storage).
     const initialRunSnapshot: WorkflowRunState = {
       runId: this.runId,
+      ...lifecycleExecution,
       serializedStepGraph: this.serializedStepGraph,
       status: 'running',
       value: {},
@@ -1843,9 +1845,12 @@ export class EventedRun<
       workflowName: this.workflowId,
       runId: this.runId,
       resourceId: this.resourceId,
-      snapshot: this.executionEngine.options?.pruneSnapshot
-        ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
-        : initialRunSnapshot,
+      snapshot: {
+        ...(this.executionEngine.options?.pruneSnapshot
+          ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
+          : initialRunSnapshot),
+        ...lifecycleExecution,
+      },
     });
 
     if (!this.mastra?.pubsub) {
@@ -1880,6 +1885,7 @@ export class EventedRun<
       result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         resourceId: this.resourceId,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
@@ -1942,6 +1948,7 @@ export class EventedRun<
 
     const inputDataToUse = await this._validateInput(inputData ?? ({} as TInput));
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    const lifecycleExecution = this.startLifecycleExecution();
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     // Always persist the initial run record regardless of shouldPersistSnapshot.
@@ -1949,6 +1956,7 @@ export class EventedRun<
     // aggregation (aggregateBranchResults reads stepResults via storage).
     const initialRunSnapshot: WorkflowRunState = {
       runId: this.runId,
+      ...lifecycleExecution,
       serializedStepGraph: this.serializedStepGraph,
       status: 'running',
       value: {},
@@ -1965,9 +1973,12 @@ export class EventedRun<
       workflowName: this.workflowId,
       runId: this.runId,
       resourceId: this.resourceId,
-      snapshot: this.executionEngine.options?.pruneSnapshot
-        ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
-        : initialRunSnapshot,
+      snapshot: {
+        ...(this.executionEngine.options?.pruneSnapshot
+          ? this.executionEngine.options.pruneSnapshot({ snapshot: initialRunSnapshot, workflowStatus: 'running' })
+          : initialRunSnapshot),
+        ...lifecycleExecution,
+      },
     });
 
     if (!this.mastra?.pubsub) {
@@ -1981,6 +1992,7 @@ export class EventedRun<
       data: {
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         prevResult: { status: 'success', output: inputDataToUse },
         requestContext: requestContext.toJSON(),
         initialState: initialStateToUse,
@@ -2390,11 +2402,13 @@ export class EventedRun<
 
     // Extract state from snapshot - could be in context.__state or in value
     const resumeState = (snapshot?.context as any)?.__state ?? snapshot?.value ?? {};
+    const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
 
     const executionResultPromise = this.executionEngine
       .execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        ...lifecycleExecution,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
         input: snapshot?.context?.input as TInput,

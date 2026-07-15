@@ -4,6 +4,7 @@ import type { Event } from '../../events/types';
 import type { Mastra } from '../../mastra';
 import { ExecutionEngine } from '../../workflows/execution-engine';
 import type { ExecutionEngineOptions, ExecutionGraph } from '../../workflows/execution-engine';
+import { requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import type {
   SerializedStepFlowEntry,
   StepResult,
@@ -60,6 +61,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
   async execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
     resourceId?: string;
     graph: ExecutionGraph;
     serializedStepGraph: SerializedStepFlowEntry[];
@@ -93,6 +97,12 @@ export class EventedExecutionEngine extends ExecutionEngine {
     if (!pubsub) {
       throw new Error('No Pubsub adapter configured on the Mastra instance');
     }
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      params.executionGeneration,
+      `Evented workflow engine ${params.workflowId}/${params.runId}`,
+    );
+    const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
+    const lifecycleStepStates = params.lifecycleStepStates;
 
     // Set up promise that will resolve when workflow finishes
     // CRITICAL: Must subscribe BEFORE publishing events to avoid race condition
@@ -104,7 +114,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
     });
 
     const finishCb = async (event: Event, ack?: () => Promise<void>) => {
-      if (event.runId !== params.runId) {
+      if (event.runId !== params.runId || event.data?.workflowId !== params.workflowId) {
         await ack?.();
         return;
       }
@@ -146,6 +156,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
           data: {
             workflowId: params.workflowId,
             runId: params.runId,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
             executionPath: params.resume.resumePath,
             stepResults: params.resume.stepResults,
             resumeSteps: params.resume.steps,
@@ -173,6 +186,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
           data: {
             workflowId: params.workflowId,
             runId: params.runId,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
             executionPath: params.timeTravel.executionPath,
             stepResults: params.timeTravel.stepResults,
             timeTravel: params.timeTravel,
@@ -192,6 +208,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
           data: {
             workflowId: params.workflowId,
             runId: params.runId,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
             executionPath: params.restart.activePaths,
             stepResults: params.restart.stepResults,
             restart: params.restart,
@@ -209,6 +228,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
           data: {
             workflowId: params.workflowId,
             runId: params.runId,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
             prevResult: { status: 'success', output: params.input },
             requestContext: params.requestContext.toJSON(),
             format: params.format,

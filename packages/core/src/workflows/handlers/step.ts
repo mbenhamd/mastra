@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
 import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
@@ -18,6 +17,11 @@ import { ToolStream } from '../../tools/stream';
 import type { DynamicArgument } from '../../types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
+import {
+  getOrCreateWorkflowStepLifecycleState,
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+} from '../lifecycle-events';
 import type { Step, SuspendOptions } from '../step';
 import { getStepResult } from '../step';
 import type {
@@ -65,6 +69,8 @@ export interface ExecuteStepParams extends ObservabilityContext {
   serializedStepGraph: SerializedStepFlowEntry[];
   iterationCount?: number;
   perStep?: boolean;
+  /** @internal Let foreach release its queue slot before awaiting canonical result delivery. */
+  deferLifecycleResult?: (emission: Promise<void>) => void;
 }
 
 export async function executeStep(
@@ -92,11 +98,29 @@ export async function executeStep(
     serializedStepGraph,
     iterationCount,
     perStep,
+    deferLifecycleResult,
     ...rest
   } = params;
   const observabilityContext = resolveObservabilityContext(rest);
 
-  const stepCallId = randomUUID();
+  const executionGeneration = requireWorkflowExecutionGeneration(
+    executionContext.executionGeneration,
+    `Workflow step ${workflowId}/${runId}/${step.id}`,
+  );
+  const lifecycleStepStates = executionContext.lifecycleStepStates ?? {};
+  executionContext.executionGeneration = executionGeneration;
+  executionContext.lifecycleStepStates = lifecycleStepStates;
+  const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
+    workflowId,
+    runId,
+    executionGeneration,
+    stepId: step.id,
+    executionPath: executionContext.executionPath,
+    foreachIndex: executionContext.foreachIndex,
+    iterationCount,
+    states: lifecycleStepStates,
+  });
+  const stepCallId = lifecycleStepState.stepCallId;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
     prevOutput,
@@ -184,6 +208,7 @@ export async function executeStep(
   });
 
   const operationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.running_ev`;
+  lifecycleStepState.stepAttempt += 1;
   await engine.onStepExecutionStart({
     step,
     inputData,
@@ -193,6 +218,27 @@ export async function executeStep(
     stepInfo,
     operationId,
     skipEmits,
+  });
+  await publishWorkflowLifecycleEvent({
+    pubsub,
+    workflowId,
+    runId,
+    executionGeneration,
+    event: resumeDataToUse
+      ? {
+          type: 'step.resumed',
+          stepId: step.id,
+          stepCallId,
+          stepAttempt: lifecycleStepState.stepAttempt,
+          resumeData: resumeDataToUse,
+        }
+      : {
+          type: 'step.started',
+          stepId: step.id,
+          stepCallId,
+          stepAttempt: lifecycleStepState.stepAttempt,
+          input: inputData,
+        },
   });
 
   await engine.persistStepUpdate({
@@ -287,6 +333,7 @@ export async function executeStep(
 
   const retries = step.retries ?? executionContext.retryConfig.attempts ?? 0;
   const delay = executionContext.retryConfig.delay ?? 0;
+  let executionInvocation = 0;
 
   // Use executeStepWithRetry to handle retry logic
   // Default engine: internal retry loop
@@ -299,6 +346,22 @@ export async function executeStep(
       }
 
       const retryCount = engine.getOrGenerateRetryCount(step.id);
+      if (executionInvocation > 0) {
+        lifecycleStepState.stepAttempt += 1;
+        await publishWorkflowLifecycleEvent({
+          pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: {
+            type: 'step.retrying',
+            stepId: step.id,
+            stepCallId,
+            stepAttempt: lifecycleStepState.stepAttempt,
+          },
+        });
+      }
+      executionInvocation += 1;
 
       let timeTravelSteps: string[] = [];
       if (timeTravel && timeTravel.steps.length > 0) {
@@ -505,17 +568,28 @@ export async function executeStep(
 
   delete executionContext.activeStepsPath[step.id];
 
-  if (!skipEmits) {
-    const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
-    await engine.wrapDurableOperation(emitOperationId, async () => {
-      await emitStepResultEvents({
-        stepId: step.id,
-        stepCallId,
-        execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
-        pubsub,
-        runId,
-      });
+  if (abortController.signal.aborted) {
+    execResults = { ...execResults, status: 'canceled', endedAt: Date.now() };
+  }
+
+  const emitOperationId = `workflow.${workflowId}.run.${runId}.step.${step.id}.emit_result`;
+  const lifecycleResultEmission = engine.wrapDurableOperation(emitOperationId, async () => {
+    await emitStepResultEvents({
+      stepId: step.id,
+      stepCallId,
+      stepAttempt: lifecycleStepState.stepAttempt,
+      workflowId,
+      executionGeneration,
+      execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
+      pubsub,
+      runId,
+      emitLegacy: !skipEmits,
     });
+  });
+  if (deferLifecycleResult) {
+    deferLifecycleResult(lifecycleResultEmission);
+  } else {
+    await lifecycleResultEmission;
   }
 
   if (execResults.status != 'failed') {
@@ -621,29 +695,108 @@ export async function runScorersForStep(params: RunScorersParams): Promise<void>
 export async function emitStepResultEvents(params: {
   stepId: string;
   stepCallId?: string;
-  execResults: StepResult<any, any, any, any>;
+  stepAttempt?: number;
+  workflowId?: string;
+  executionGeneration?: string;
+  execResults:
+    | StepResult<any, any, any, any>
+    | { status: 'canceled'; output?: unknown; error?: unknown; suspendPayload?: unknown };
   pubsub: PubSub;
   runId: string;
+  /** Preserve historical watch suppression while still emitting canonical lifecycle events. */
+  emitLegacy?: boolean;
 }): Promise<void> {
-  const { stepId, stepCallId, execResults, pubsub, runId } = params;
-  const payloadBase = stepCallId ? { id: stepId, stepCallId } : { id: stepId };
+  const {
+    stepId,
+    stepCallId,
+    stepAttempt,
+    workflowId,
+    executionGeneration,
+    execResults,
+    pubsub,
+    runId,
+    emitLegacy = true,
+  } = params;
+  const payloadBase = stepCallId
+    ? { id: stepId, stepCallId, ...(stepAttempt === undefined ? {} : { stepAttempt }) }
+    : { id: stepId };
 
   if (execResults.status === 'suspended') {
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: { type: 'workflow-step-suspended', payload: { ...payloadBase, ...execResults } },
-    });
+    if (emitLegacy) {
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: { type: 'workflow-step-suspended', payload: { ...payloadBase, ...execResults } },
+      });
+    }
+    if (stepCallId && stepAttempt && workflowId && executionGeneration) {
+      await publishWorkflowLifecycleEvent({
+        pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'step.suspended',
+          stepId,
+          stepCallId,
+          stepAttempt,
+          suspendPayload: execResults.suspendPayload,
+        },
+      });
+    }
   } else {
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: { type: 'workflow-step-result', payload: { ...payloadBase, ...execResults } },
-    });
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
-      type: 'watch',
-      runId,
-      data: { type: 'workflow-step-finish', payload: { ...payloadBase, metadata: {} } },
-    });
+    if (emitLegacy) {
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: { type: 'workflow-step-result', payload: { ...payloadBase, ...execResults } },
+      });
+      await pubsub.publish(`workflow.events.v2.${runId}`, {
+        type: 'watch',
+        runId,
+        data: {
+          type: 'workflow-step-finish',
+          payload: { ...payloadBase, status: execResults.status, metadata: {} },
+        },
+      });
+    }
+    if (stepCallId && stepAttempt && workflowId && executionGeneration) {
+      const identity = { stepId, stepCallId, stepAttempt };
+      if (execResults.status === 'success') {
+        await publishWorkflowLifecycleEvent({
+          pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.completed', ...identity, output: execResults.output },
+        });
+      } else if (execResults.status === 'failed') {
+        await publishWorkflowLifecycleEvent({
+          pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.failed', ...identity, error: execResults.error },
+        });
+      } else if (execResults.status === 'canceled') {
+        await publishWorkflowLifecycleEvent({
+          pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.canceled', ...identity },
+        });
+      }
+
+      if (execResults.status === 'success' || execResults.status === 'failed' || execResults.status === 'canceled') {
+        await publishWorkflowLifecycleEvent({
+          pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.finished', ...identity, status: execResults.status },
+        });
+      }
+    }
   }
 }

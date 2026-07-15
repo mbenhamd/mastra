@@ -599,6 +599,15 @@ export interface WorkflowRunState {
   resumeLabels: Record<string, WorkflowResumeLabel>;
   waitingPaths: Record<string, number[]>;
   timestamp: number;
+  /**
+   * Opaque execution lineage identity. It is stable across suspend/resume and
+   * changes for restart and time-travel executions.
+   */
+  executionGeneration?: string;
+  /** Zero-based durable resume cycle within the execution generation. */
+  lifecycleResumeAttempt?: number;
+  /** Stable step-call identities and one-based attempt counts by execution coordinate. */
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
@@ -1195,6 +1204,9 @@ export type SubsetOf<TStepState, TState> =
 export type ExecutionContext = {
   workflowId: string;
   runId: string;
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   executionPath: number[];
   stepExecutionPath?: string[];
   activeStepsPath: Record<string, number[]>;

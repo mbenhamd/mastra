@@ -27,6 +27,7 @@ import type { ExecuteSleepParams, ExecuteSleepUntilParams } from './handlers/sle
 import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepUntilHandler } from './handlers/sleep';
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
+import { publishWorkflowLifecycleEvent, requireWorkflowExecutionGeneration } from './lifecycle-events';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
 import type {
   FormattedWorkflowResult,
@@ -712,6 +713,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -766,11 +770,27 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       timeTravel,
       perStep,
     } = params;
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      params.executionGeneration,
+      `Default workflow engine ${params.workflowId}/${params.runId}`,
+    );
+    const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
+    const lifecycleStepStates = params.lifecycleStepStates;
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
     //clear retryCounts
     this.retryCounts.clear();
+
+    await publishWorkflowLifecycleEvent({
+      pubsub: params.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: params.resume
+        ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData: params.resume.resumePayload }
+        : { type: 'workflow.started', resumeAttempt: lifecycleResumeAttempt, input },
+    });
 
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
@@ -781,6 +801,25 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       });
 
       workflowSpan?.error({ error: empty_graph_error });
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: empty_graph_error },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: params.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: lifecycleResumeAttempt,
+          status: 'failed',
+          error: empty_graph_error,
+        },
+      });
       throw empty_graph_error;
     }
 
@@ -811,6 +850,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const executionContext: ExecutionContext = {
         workflowId,
         runId,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         executionPath: [i],
         stepExecutionPath,
         activeStepsPath: {},
@@ -935,6 +977,52 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           });
         }
 
+        if (result.status === 'suspended') {
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: {
+              type: 'workflow.suspended',
+              resumeAttempt: lifecycleResumeAttempt,
+              suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
+            },
+          });
+        } else if (result.status !== 'paused') {
+          if (result.status === 'failed' || result.status === 'tripwire') {
+            await publishWorkflowLifecycleEvent({
+              pubsub: params.pubsub,
+              workflowId,
+              runId,
+              executionGeneration,
+              event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: result.error },
+            });
+          } else if (result.status === 'canceled') {
+            await publishWorkflowLifecycleEvent({
+              pubsub: params.pubsub,
+              workflowId,
+              runId,
+              executionGeneration,
+              event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+            });
+          }
+
+          await publishWorkflowLifecycleEvent({
+            pubsub: params.pubsub,
+            workflowId,
+            runId,
+            executionGeneration,
+            event: {
+              type: 'workflow.finished',
+              resumeAttempt: lifecycleResumeAttempt,
+              status: result.status,
+              result: result.result,
+              error: result.error,
+            },
+          });
+        }
+
         // Drop the last-persisted-status tracker for early terminal exits
         // (failed, canceled, tripwire) so the map does not grow unbounded.
         // Suspended and paused runs keep their entry so a subsequent resume
@@ -1031,6 +1119,20 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       requestContext: currentRequestContext,
       state: lastState,
       stepExecutionPath,
+    });
+
+    await publishWorkflowLifecycleEvent({
+      pubsub: params.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: {
+        type: 'workflow.finished',
+        resumeAttempt: lifecycleResumeAttempt,
+        status: result.status,
+        result: result.result,
+        error: result.error,
+      },
     });
 
     // Drop the last-persisted-status tracker for terminal runs so the map

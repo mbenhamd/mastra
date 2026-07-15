@@ -17,6 +17,12 @@ import type {
   WorkflowRunState,
 } from '../../../workflows/types';
 import type { Workflow } from '../../../workflows/workflow';
+import {
+  createWorkflowExecutionGeneration,
+  getOrCreateWorkflowStepLifecycleState,
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+} from '../../lifecycle-events';
 import { WORKFLOW_TERMINAL_FOREACH_RUN_KEY, createWorkflowTerminalGraphFingerprint } from '../../terminal-continuation';
 import {
   canonicalPlannerInteger,
@@ -83,6 +89,11 @@ export type ProcessorArgs = {
   resourceId?: string;
   /** Registration generation held by the event currently being dispatched. */
   internalWorkflowRegistrationGeneration?: number;
+  /** Public execution lineage; never substitute the registry generation above. */
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
+  lifecycleStartKind?: 'start' | 'resume';
 };
 
 export type ParentWorkflow = {
@@ -484,7 +495,12 @@ export class WorkflowEventProcessor extends EventProcessor {
         workflowName: workflowId,
         runId,
         resourceId: run?.resourceId,
-        snapshot: pruned,
+        snapshot: {
+          ...pruned,
+          executionGeneration: snapshot.executionGeneration,
+          lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
+          lifecycleStepStates: snapshot.lifecycleStepStates,
+        },
       });
     } catch (error) {
       // Pruning is a size optimization — never fail the suspension over it.
@@ -522,13 +538,23 @@ export class WorkflowEventProcessor extends EventProcessor {
       stepResults,
       resumeData,
       requestContext,
+      executionGeneration: suppliedExecutionGeneration,
+      lifecycleResumeAttempt = 0,
+      lifecycleStepStates = {},
     }: Omit<ProcessorArgs, 'workflow'>,
     e: Error,
   ) {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      suppliedExecutionGeneration,
+      `Evented workflow error ${workflowId}/${runId}`,
+    );
     await this.mastra.pubsub.publish('workflows', {
       type: 'workflow.fail',
       runId,
       data: {
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         workflowId,
         runId,
         executionPath: [],
@@ -590,7 +616,15 @@ export class WorkflowEventProcessor extends EventProcessor {
     forEachIndex,
     initializeSnapshot,
     resourceId: requestedResourceId,
+    executionGeneration: suppliedExecutionGeneration,
+    lifecycleResumeAttempt = 0,
+    lifecycleStepStates = {},
+    lifecycleStartKind = 'start',
   }: ProcessorArgs & { initialState?: Record<string, any> }) {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      suppliedExecutionGeneration,
+      `Evented workflow start ${workflowId}/${runId}`,
+    );
     // Use initialState from event data if provided, otherwise use state from ProcessorArgs
     const initialState = (arguments[0] as any).initialState ?? state ?? {};
     const resolvedFormat = format ?? this.runFormats.get(runId);
@@ -637,6 +671,9 @@ export class WorkflowEventProcessor extends EventProcessor {
           serializedStepGraph,
           timestamp: Date.now(),
           runId,
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates,
           context: {
             ...(stepResults ?? {
               input: prevResult?.status === 'success' ? prevResult.output : undefined,
@@ -648,12 +685,17 @@ export class WorkflowEventProcessor extends EventProcessor {
         }
       : undefined;
     const initialWorkflowSnapshotToPersist = initialWorkflowSnapshot
-      ? workflow?.options?.pruneSnapshot
-        ? workflow.options.pruneSnapshot({
-            snapshot: initialWorkflowSnapshot,
-            workflowStatus: initialWorkflowSnapshot.status,
-          })
-        : initialWorkflowSnapshot
+      ? {
+          ...(workflow?.options?.pruneSnapshot
+            ? workflow.options.pruneSnapshot({
+                snapshot: initialWorkflowSnapshot,
+                workflowStatus: initialWorkflowSnapshot.status,
+              })
+            : initialWorkflowSnapshot),
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates,
+        }
       : undefined;
     const retainedChildEvidence =
       parentWorkflow && terminalRecoveryEnabled && !shouldInitializeSnapshot && workflowsStore
@@ -947,6 +989,21 @@ export class WorkflowEventProcessor extends EventProcessor {
       },
     });
 
+    await publishWorkflowLifecycleEvent({
+      pubsub: this.mastra.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event:
+        lifecycleStartKind === 'resume'
+          ? { type: 'workflow.resumed', resumeAttempt: lifecycleResumeAttempt, resumeData }
+          : {
+              type: 'workflow.started',
+              resumeAttempt: lifecycleResumeAttempt,
+              input: prevResult?.status === 'success' ? prevResult.output : undefined,
+            },
+    });
+
     if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission) {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflow.id,
@@ -971,6 +1028,9 @@ export class WorkflowEventProcessor extends EventProcessor {
         parentWorkflow,
         workflowId,
         runId,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         executionPath: executionPath ?? [0],
         resumeSteps,
         stepResults: {
@@ -1006,7 +1066,13 @@ export class WorkflowEventProcessor extends EventProcessor {
       executionPath,
       parentWorkflow,
       state,
+      executionGeneration: suppliedExecutionGeneration,
+      lifecycleResumeAttempt = 0,
     } = args;
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      suppliedExecutionGeneration,
+      `Evented workflow finish ${workflowId}/${runId}`,
+    );
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
     const normalizedPrevResult = prevResult ?? ({ status } as StepResult<any, any, any, any>);
 
@@ -1026,6 +1092,9 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         opts: {
           status: finalStatus,
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates: args.lifecycleStepStates,
           result: normalizedPrevResult,
           ...(finalStatus === 'paused' || !exactFinalStateEnabled ? {} : { finalState }),
           activePaths: executionPath,
@@ -1068,6 +1137,40 @@ export class WorkflowEventProcessor extends EventProcessor {
         },
       },
     });
+
+    if (finalStatus !== 'paused') {
+      const terminalError = (normalizedPrevResult as { error?: unknown }).error;
+      if (finalStatus === 'canceled') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+        });
+      } else if (finalStatus === 'failed') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'workflow.failed', resumeAttempt: lifecycleResumeAttempt, error: terminalError },
+        });
+      }
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: lifecycleResumeAttempt,
+          status: finalStatus,
+          result: finalStatus === 'success' ? (normalizedPrevResult as { output?: unknown }).output : undefined,
+          error: terminalError,
+        },
+      });
+    }
 
     await this.mastra.pubsub.publish('workflows', {
       type: 'workflow.end',
@@ -1264,6 +1367,22 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
     }
 
+    const suspendedStepId = workflow && executionPath ? getStep(workflow, executionPath)?.id : undefined;
+    await publishWorkflowLifecycleEvent({
+      pubsub: this.mastra.pubsub,
+      workflowId: args.workflowId,
+      runId,
+      executionGeneration: requireWorkflowExecutionGeneration(
+        args.executionGeneration,
+        `Evented workflow suspend ${args.workflowId}/${runId}`,
+      ),
+      event: {
+        type: 'workflow.suspended',
+        resumeAttempt: args.lifecycleResumeAttempt ?? 0,
+        suspendedStepIds: suspendedStepId ? [suspendedStepId] : [],
+      },
+    });
+
     await this.mastra.pubsub.publish('workflows-finish', {
       type: 'workflow.suspend',
       runId,
@@ -1366,6 +1485,31 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
     }
 
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      args.executionGeneration,
+      `Evented workflow failure ${workflowId}/${runId}`,
+    );
+    const workflowError = (prevResult as { error?: unknown }).error;
+    await publishWorkflowLifecycleEvent({
+      pubsub: this.mastra.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: { type: 'workflow.failed', resumeAttempt: args.lifecycleResumeAttempt ?? 0, error: workflowError },
+    });
+    await publishWorkflowLifecycleEvent({
+      pubsub: this.mastra.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event: {
+        type: 'workflow.finished',
+        resumeAttempt: args.lifecycleResumeAttempt ?? 0,
+        status: 'failed',
+        error: workflowError,
+      },
+    });
+
     await this.mastra.pubsub.publish('workflows-finish', {
       type: 'workflow.fail',
       runId,
@@ -1402,7 +1546,15 @@ export class WorkflowEventProcessor extends EventProcessor {
     state,
     outputOptions,
     forEachIndex,
+    executionGeneration: suppliedExecutionGeneration,
+    lifecycleResumeAttempt = 0,
+    lifecycleStepStates = {},
   }: ProcessorArgs) {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      suppliedExecutionGeneration,
+      `Evented workflow step ${workflowId}/${runId}`,
+    );
+    const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
     const streamFormat = this.runFormats.get(runId);
     // Get current state from stepResults.__state or from passed state
     const currentState = resolveCurrentState({ stepResults, state });
@@ -1411,6 +1563,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (!executionPath?.length) {
       return this.errorWorkflow(
         {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -1438,6 +1591,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       // If we're past the last step, end the workflow successfully
       if (executionPath[0]! >= stepGraph.length) {
         return this.endWorkflow({
+          ...lifecycleExecution,
           workflow,
           parentWorkflow,
           workflowId,
@@ -1456,6 +1610,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
       return this.errorWorkflow(
         {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -1489,6 +1644,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } else if (step.type === 'parallel') {
       return processWorkflowParallel(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -1514,6 +1670,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } else if (step?.type === 'conditional') {
       return processWorkflowConditional(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -1540,6 +1697,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } else if (step?.type === 'sleep') {
       return processWorkflowSleep(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -1566,6 +1724,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } else if (step?.type === 'sleepUntil') {
       return processWorkflowSleepUntil(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -1592,6 +1751,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } else if (step?.type === 'foreach' && executionPath.length === 1) {
       return processWorkflowForEach(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -1622,6 +1782,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (!isExecutableStep(step)) {
       return this.errorWorkflow(
         {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -1645,6 +1806,58 @@ export class WorkflowEventProcessor extends EventProcessor {
     activeStepsPath[step.step.id] = executionPath;
 
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
+      workflowId,
+      runId,
+      executionGeneration,
+      stepId: step.step.id,
+      executionPath,
+      foreachIndex: step.type === 'foreach' ? executionPath[1] : forEachIndex,
+      iterationCount: stepResults[step.step.id]?.metadata?.iterationCount,
+      states: lifecycleStepStates,
+    });
+    lifecycleStepState.stepAttempt += 1;
+    await workflowsStore?.updateWorkflowState({
+      workflowName: workflowId,
+      runId,
+      opts: {
+        status: 'running',
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
+      },
+    });
+
+    const isResumedStep = resumeSteps?.[0] === step.step.id && stepResults[step.step.id]?.status === 'suspended';
+    await publishWorkflowLifecycleEvent({
+      pubsub: this.mastra.pubsub,
+      workflowId,
+      runId,
+      executionGeneration,
+      event:
+        retryCount > 0
+          ? {
+              type: 'step.retrying',
+              stepId: step.step.id,
+              stepCallId: lifecycleStepState.stepCallId,
+              stepAttempt: lifecycleStepState.stepAttempt,
+            }
+          : isResumedStep
+            ? {
+                type: 'step.resumed',
+                stepId: step.step.id,
+                stepCallId: lifecycleStepState.stepCallId,
+                stepAttempt: lifecycleStepState.stepAttempt,
+                resumeData,
+              }
+            : {
+                type: 'step.started',
+                stepId: step.step.id,
+                stepCallId: lifecycleStepState.stepCallId,
+                stepAttempt: lifecycleStepState.stepAttempt,
+                input: prevResult?.status === 'success' ? prevResult.output : undefined,
+              },
+    });
 
     // Run nested workflow - check for both EventedWorkflow and regular Workflow
     if (step.step instanceof EventedWorkflow || (step.step as any).component === 'WORKFLOW') {
@@ -1687,6 +1900,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (!nestedRunId) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -1718,6 +1932,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         } catch (error) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -1773,6 +1988,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (snapshot?.status !== 'suspended' || !suspendedStepId || !isValidNestedExecutionPath) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -1794,6 +2010,14 @@ export class WorkflowEventProcessor extends EventProcessor {
         }
 
         const nestedStepResults = snapshot?.context;
+        const nestedLifecycleExecution = {
+          executionGeneration: requireWorkflowExecutionGeneration(
+            snapshot.executionGeneration,
+            `Nested workflow resume ${step.step.id}/${nestedRunId}`,
+          ),
+          lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+          lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+        };
         // The resumed inner step's input is the output of the step that ran before it
         // inside the nested workflow (i.e. the suspended step's stored payload), not the
         // input to the nested-workflow step itself.
@@ -1806,6 +2030,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow.resume',
           runId,
           data: {
+            ...nestedLifecycleExecution,
             workflowId: step.step.id,
             parentWorkflow: {
               stepId: step.step.id,
@@ -1844,6 +2069,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (!nestedRunId) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -1885,6 +2111,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (!isValidNestedExecutionPath) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -1904,6 +2131,14 @@ export class WorkflowEventProcessor extends EventProcessor {
             }),
           );
         }
+        const nestedLifecycleExecution = {
+          executionGeneration: requireWorkflowExecutionGeneration(
+            snapshot.executionGeneration,
+            `Nested workflow resume ${step.step.id}/${nestedRunId}`,
+          ),
+          lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+          lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+        };
         // The step the nested workflow resumes into receives the output of the step that
         // ran before it (its stored payload), not the input to the nested-workflow step.
         const nestedPrevResult = {
@@ -1915,6 +2150,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow.resume',
           runId,
           data: {
+            ...nestedLifecycleExecution,
             workflowId: step.step.id,
             parentWorkflow: {
               stepId: step.step.id,
@@ -1972,11 +2208,17 @@ export class WorkflowEventProcessor extends EventProcessor {
 
         const nestedPrevStep = getStep(nestedWorkflow, timeTravelParams.executionPath);
         const nestedPrevResult = timeTravelParams.stepResults[nestedPrevStep?.id ?? 'input'];
+        const nestedLifecycleExecution = {
+          executionGeneration: createWorkflowExecutionGeneration(),
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+        };
 
         await this.mastra.pubsub.publish('workflows', {
           type: 'workflow.start',
           runId,
           data: {
+            ...nestedLifecycleExecution,
             workflowId: step.step.id,
             parentWorkflow: {
               stepId: step.step.id,
@@ -2023,11 +2265,17 @@ export class WorkflowEventProcessor extends EventProcessor {
 
         const nestedPrevStep = getStep(nestedWorkflow, snapshot.activePaths);
         const nestedPrevResult = restartParams.stepResults[nestedPrevStep?.id ?? 'input'];
+        const nestedLifecycleExecution = {
+          executionGeneration: createWorkflowExecutionGeneration(),
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+        };
 
         await this.mastra.pubsub.publish('workflows', {
           type: 'workflow.start',
           runId,
           data: {
+            ...nestedLifecycleExecution,
             workflowId: step.step.id,
             parentWorkflow: {
               stepId: step.step.id,
@@ -2076,6 +2324,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         const usesAtomicNestedAdmission =
           workflowsStore?.getWorkflowTerminalizationCapabilities().recoveryVersion === 1;
         const parentRun = await workflowsStore?.getWorkflowRunById({ runId, workflowName: workflow.id });
+        const nestedLifecycleExecution = {
+          executionGeneration: createWorkflowExecutionGeneration(),
+          lifecycleResumeAttempt: 0,
+          lifecycleStepStates: {},
+        };
 
         // Recovery-capable stores initialize the child with its real input and
         // state atomically alongside parent ownership in processWorkflowStart.
@@ -2085,6 +2338,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (shouldPersist && !usesAtomicNestedAdmission) {
           const pendingSnapshot: WorkflowRunState = {
             runId: nestedRunId,
+            ...nestedLifecycleExecution,
             status: 'pending',
             value: {},
             context: {} as WorkflowRunState['context'],
@@ -2102,9 +2356,12 @@ export class WorkflowEventProcessor extends EventProcessor {
             workflowName: nestedWorkflow.id,
             runId: nestedRunId,
             resourceId: parentRun?.resourceId,
-            snapshot: nestedWorkflow?.options?.pruneSnapshot
-              ? nestedWorkflow.options.pruneSnapshot({ snapshot: pendingSnapshot, workflowStatus: 'pending' })
-              : pendingSnapshot,
+            snapshot: {
+              ...(nestedWorkflow?.options?.pruneSnapshot
+                ? nestedWorkflow.options.pruneSnapshot({ snapshot: pendingSnapshot, workflowStatus: 'pending' })
+                : pendingSnapshot),
+              ...nestedLifecycleExecution,
+            },
           });
         }
 
@@ -2112,6 +2369,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow.start',
           runId,
           data: {
+            ...nestedLifecycleExecution,
             workflowId: step.step.id,
             parentWorkflow: {
               stepId: step.step.id,
@@ -2157,6 +2415,8 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow-step-start',
           payload: {
             id: step.step.id,
+            stepCallId: lifecycleStepState.stepCallId,
+            stepAttempt: lifecycleStepState.stepAttempt,
             startedAt: Date.now(),
             payload: prevResult.status === 'success' ? prevResult.output : undefined,
             status: 'running',
@@ -2246,11 +2506,31 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (abortController?.signal?.aborted) {
       // Extract updated state from step result
       const updatedState = (stepResult as any).__state ?? currentState;
+      const canceledIdentity = {
+        stepId: step.step.id,
+        stepCallId: lifecycleStepState.stepCallId,
+        stepAttempt: lifecycleStepState.stepAttempt,
+      };
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.canceled', ...canceledIdentity },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'step.finished', ...canceledIdentity, status: 'canceled' },
+      });
       //cancel the workflow
       return this.mastra.pubsub.publish('workflows', {
         type: 'workflow.cancel',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -2278,6 +2558,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       stepResult.status = 'success';
 
       await this.endWorkflow({
+        ...lifecycleExecution,
         workflow,
         resumeData,
         parentWorkflow,
@@ -2306,6 +2587,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow.step.end',
           runId,
           data: {
+            ...lifecycleExecution,
             parentWorkflow,
             workflowId,
             runId,
@@ -2324,6 +2606,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           type: 'workflow.step.run',
           runId,
           data: {
+            ...lifecycleExecution,
             parentWorkflow,
             workflowId,
             runId,
@@ -2365,6 +2648,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.step.end',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -2393,6 +2677,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       // with whatever information it needs from timeTravel, subsequent loop runs use the previous loop run result as it's input.
       await processWorkflowLoop(
         {
+          ...lifecycleExecution,
           workflow,
           workflowId,
           prevResult: stepResult,
@@ -2422,6 +2707,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.step.end',
         runId,
         data: {
+          ...lifecycleExecution,
           parentWorkflow,
           workflowId,
           runId,
@@ -2479,6 +2765,9 @@ export class WorkflowEventProcessor extends EventProcessor {
     requestContext,
     state,
     outputOptions,
+    executionGeneration,
+    lifecycleResumeAttempt,
+    lifecycleStepStates,
   }: {
     workflow: Workflow;
     workflowId: string;
@@ -2501,7 +2790,11 @@ export class WorkflowEventProcessor extends EventProcessor {
     requestContext: Record<string, any>;
     state: Record<string, any>;
     outputOptions?: { includeState?: boolean; includeResumeLabels?: boolean };
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
   }) {
+    const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
     const currentState = resolveCurrentState({ stepResults, state });
     const parentIdx = branchExecutionPath[0]!;
     const finishedBranchIdx = branchExecutionPath.length > 1 ? branchExecutionPath[1]! : undefined;
@@ -2537,6 +2830,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     } catch (error) {
       return this.errorWorkflow(
         {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath: branchExecutionPath,
@@ -2581,6 +2875,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           opts: {
             status: 'suspended',
+            ...lifecycleExecution,
             result: { status: 'suspended' } as any,
             suspendedPaths,
             resumeLabels,
@@ -2593,6 +2888,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.suspend',
         runId,
         data: {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath: branchExecutionPath,
@@ -2625,6 +2921,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       type: 'workflow.step.end',
       runId,
       data: {
+        ...lifecycleExecution,
         parentWorkflow,
         workflowId,
         runId,
@@ -2661,7 +2958,15 @@ export class WorkflowEventProcessor extends EventProcessor {
     outputOptions,
     forEachIndex,
     nestedRunId,
+    executionGeneration: suppliedExecutionGeneration,
+    lifecycleResumeAttempt = 0,
+    lifecycleStepStates = {},
   }: ProcessorArgs) {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      suppliedExecutionGeneration,
+      `Evented workflow step result ${workflowId}/${runId}`,
+    );
+    const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
     // Extract state from prevResult if it was updated by the step
     // For nested workflow completion (parentContext present), prefer the passed state
     // as it contains the nested workflow's updated state
@@ -2682,6 +2987,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (!step) {
       return this.errorWorkflow(
         {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -2702,6 +3008,65 @@ export class WorkflowEventProcessor extends EventProcessor {
 
     // Cache workflows store to avoid redundant async calls
     const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
+
+    if (isExecutableStep(step)) {
+      const { state: lifecycleStepState } = getOrCreateWorkflowStepLifecycleState({
+        workflowId,
+        runId,
+        executionGeneration,
+        stepId: step.step.id,
+        executionPath,
+        foreachIndex: step.type === 'foreach' ? executionPath[1] : forEachIndex,
+        iterationCount: stepResults[step.step.id]?.metadata?.iterationCount,
+        states: lifecycleStepStates,
+      });
+      if (lifecycleStepState.stepAttempt < 1) lifecycleStepState.stepAttempt = 1;
+      const identity = {
+        stepId: step.step.id,
+        stepCallId: lifecycleStepState.stepCallId,
+        stepAttempt: lifecycleStepState.stepAttempt,
+      };
+
+      if (prevResult.status === 'suspended') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.suspended', ...identity, suspendPayload: prevResult.suspendPayload },
+        });
+      } else if (prevResult.status === 'failed') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.failed', ...identity, error: prevResult.error },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.finished', ...identity, status: 'failed' },
+        });
+      } else if (prevResult.status === 'success') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.completed', ...identity, output: prevResult.output },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.mastra.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'step.finished', ...identity, status: 'success' },
+        });
+      }
+    }
 
     if (step.type === 'foreach') {
       const snapshot = await workflowsStore?.loadWorkflowSnapshot({
@@ -2739,6 +3104,7 @@ export class WorkflowEventProcessor extends EventProcessor {
 
           // End workflow with bail result
           return this.endWorkflow({
+            ...lifecycleExecution,
             workflow,
             parentWorkflow,
             workflowId,
@@ -2836,6 +3202,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         } catch (error) {
           return this.errorWorkflow(
             {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath,
@@ -2906,6 +3273,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           // More iterations need to be started - call processWorkflowForEach to continue
           await processWorkflowForEach(
             {
+              ...lifecycleExecution,
               workflow,
               workflowId,
               prevResult: { status: 'success', output: foreachResult.payload } as any,
@@ -2947,6 +3315,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           } catch (error) {
             return this.errorWorkflow(
               {
+                ...lifecycleExecution,
                 workflowId,
                 runId,
                 executionPath,
@@ -3026,6 +3395,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               runId,
               opts: {
                 status: 'suspended',
+                ...lifecycleExecution,
                 result: foreachSuspendResult,
                 suspendedPaths,
                 resumeLabels: suspension.resumeLabels,
@@ -3041,6 +3411,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             type: 'workflow.suspend',
             runId,
             data: {
+              ...lifecycleExecution,
               workflowId,
               runId,
               executionPath: [executionPath[0]!],
@@ -3063,6 +3434,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         // All iterations succeeded - call processWorkflowForEach to advance to next step
         await processWorkflowForEach(
           {
+            ...lifecycleExecution,
             workflow,
             workflowId,
             prevResult: { status: 'success', output: foreachResult.payload } as any,
@@ -3138,6 +3510,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.fail',
         runId,
         data: {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -3178,6 +3551,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         // target any of them (each branch publishing its own workflow.suspend would
         // otherwise race and clobber suspendedPaths).
         await this.aggregateBranchResults({
+          ...lifecycleExecution,
           workflow,
           workflowId,
           runId,
@@ -3210,6 +3584,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       } catch (error) {
         return this.errorWorkflow(
           {
+            ...lifecycleExecution,
             workflowId,
             runId,
             executionPath,
@@ -3255,6 +3630,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           opts: {
             status: 'suspended',
+            ...lifecycleExecution,
             result: prevResult,
             suspendedPaths,
             resumeLabels,
@@ -3270,6 +3646,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.suspend',
         runId,
         data: {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,
@@ -3322,6 +3699,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (parentWorkflow && executionPath[0]! < workflow.stepGraph.length - 1) {
         const { endedAt, output, status, ...nestedPrevResult } = prevResult as StepSuccess<any, any, any, any>;
         await this.endWorkflow({
+          ...lifecycleExecution,
           workflow,
           parentWorkflow,
           workflowId,
@@ -3336,6 +3714,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         });
       } else {
         await this.endWorkflow({
+          ...lifecycleExecution,
           workflow,
           parentWorkflow,
           workflowId,
@@ -3351,6 +3730,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     } else if ((step?.type === 'parallel' || step?.type === 'conditional') && executionPath.length > 1) {
       await this.aggregateBranchResults({
+        ...lifecycleExecution,
         workflow,
         workflowId,
         runId,
@@ -3375,6 +3755,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.step.run',
         runId,
         data: {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath: executionPath.slice(0, -1),
@@ -3393,6 +3774,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       });
     } else if (executionPath[0]! >= workflow.stepGraph.length - 1) {
       await this.endWorkflow({
+        ...lifecycleExecution,
         workflow,
         parentWorkflow,
         workflowId,
@@ -3411,6 +3793,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.step.run',
         runId,
         data: {
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath: executionPath.slice(0, -1).concat([executionPath[executionPath.length - 1]! + 1]),
@@ -3606,7 +3989,18 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     try {
-      await this.errorWorkflow(workflowData, error);
+      await this.errorWorkflow(
+        {
+          ...workflowData,
+          executionGeneration: requireWorkflowExecutionGeneration(
+            workflowData.executionGeneration ?? currentState?.executionGeneration,
+            `Evented workflow terminal failure ${workflowData.workflowId}/${workflowData.runId}`,
+          ),
+          lifecycleResumeAttempt: workflowData.lifecycleResumeAttempt ?? currentState?.lifecycleResumeAttempt ?? 0,
+          lifecycleStepStates: workflowData.lifecycleStepStates ?? currentState?.lifecycleStepStates ?? {},
+        },
+        error,
+      );
       return { ok: false, retry: false };
     } catch (terminalError) {
       this.mastra
@@ -3641,12 +4035,21 @@ export class WorkflowEventProcessor extends EventProcessor {
   async #dispatch(event: Event, internalWorkflowRegistrationGeneration?: number): Promise<boolean> {
     const { type, data } = event;
 
-    const workflowData = data as Omit<ProcessorArgs, 'workflow'>;
+    const incomingWorkflowData = data as Omit<ProcessorArgs, 'workflow'>;
 
     const currentState = await this.loadData({
-      workflowId: workflowData.workflowId,
-      runId: workflowData.runId,
+      workflowId: incomingWorkflowData.workflowId,
+      runId: incomingWorkflowData.runId,
     });
+    const workflowData: Omit<ProcessorArgs, 'workflow'> = {
+      ...incomingWorkflowData,
+      executionGeneration: requireWorkflowExecutionGeneration(
+        incomingWorkflowData.executionGeneration ?? currentState?.executionGeneration,
+        `Evented workflow dispatch ${incomingWorkflowData.workflowId}/${incomingWorkflowData.runId}`,
+      ),
+      lifecycleResumeAttempt: incomingWorkflowData.lifecycleResumeAttempt ?? currentState?.lifecycleResumeAttempt ?? 0,
+      lifecycleStepStates: incomingWorkflowData.lifecycleStepStates ?? currentState?.lifecycleStepStates ?? {},
+    };
 
     if (currentState?.status === 'canceled' && type !== 'workflow.end' && type !== 'workflow.cancel') {
       return false;
@@ -3734,12 +4137,14 @@ export class WorkflowEventProcessor extends EventProcessor {
         await this.processWorkflowStart({
           workflow: workflowArg,
           ...workflowData,
+          lifecycleStartKind: 'start',
         });
         break;
       case 'workflow.resume':
         await this.processWorkflowStart({
           workflow: workflowArg,
           ...workflowData,
+          lifecycleStartKind: 'resume',
         });
         break;
       case 'workflow.end':

@@ -56,6 +56,17 @@ import type { DynamicArgument } from '../types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from './constants';
 import { DefaultExecutionEngine } from './default';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
+import {
+  createWorkflowExecutionGeneration,
+  getWorkflowLifecycleTopic,
+  publishWorkflowLifecycleEvent,
+  requireWorkflowExecutionGeneration,
+} from './lifecycle-events';
+import type {
+  WorkflowExecutionGeneration,
+  WorkflowLifecycleExecutionIdentity,
+  WorkflowStepLifecycleStateMap,
+} from './lifecycle-events';
 import type {
   ConditionFunction,
   ExecuteFunction,
@@ -3086,6 +3097,9 @@ export class Run<
   TRequestContext extends Record<string, any> | unknown = unknown,
 > {
   #abortController?: AbortController;
+  #executionGeneration?: string;
+  #lifecycleResumeAttempt = 0;
+  #lifecycleStepStates: WorkflowStepLifecycleStateMap = {};
   protected pubsub: PubSub;
   /**
    * Unique identifier for this workflow
@@ -3225,12 +3239,119 @@ export class Run<
     return this.#abortController;
   }
 
+  /** @internal Establish a fresh lifecycle lineage for start, restart, or time travel. */
+  protected beginLifecycleExecution(): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    const executionGeneration = createWorkflowExecutionGeneration();
+    this.#executionGeneration = executionGeneration;
+    this.#lifecycleResumeAttempt = 0;
+    this.#lifecycleStepStates = {};
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /** @internal Reuse a lineage reserved by a pre-start lifecycle subscriber. */
+  protected startLifecycleExecution(): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    if (this.workflowRunStatus === 'pending' && this.#executionGeneration) {
+      return {
+        executionGeneration: this.#executionGeneration,
+        lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+        lifecycleStepStates: this.#lifecycleStepStates,
+      };
+    }
+    return this.beginLifecycleExecution();
+  }
+
+  /** @internal Hydrate lifecycle identity without advancing the resume counter. */
+  protected hydrateLifecycleExecution(snapshot: WorkflowRunState): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    const executionGeneration = requireWorkflowExecutionGeneration(
+      snapshot.executionGeneration,
+      `Workflow run ${this.workflowId}/${this.runId}`,
+    );
+    this.#executionGeneration = executionGeneration;
+    this.#lifecycleResumeAttempt = snapshot.lifecycleResumeAttempt ?? 0;
+    this.#lifecycleStepStates = snapshot.lifecycleStepStates ?? {};
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /** @internal Restore the same lifecycle lineage when a suspended run resumes. */
+  protected restoreLifecycleExecution(snapshot: WorkflowRunState): {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  } {
+    const { executionGeneration } = this.hydrateLifecycleExecution(snapshot);
+    this.#lifecycleResumeAttempt += 1;
+    return {
+      executionGeneration,
+      lifecycleResumeAttempt: this.#lifecycleResumeAttempt,
+      lifecycleStepStates: this.#lifecycleStepStates,
+    };
+  }
+
+  /**
+   * Resolve the exact identity needed by lifecycle replay/subscription.
+   *
+   * Before a fresh start this reserves the generation that `start()` will use.
+   * For an existing execution it resolves the persisted generation without
+   * minting a replacement or advancing its durable resume counter.
+   */
+  async getLifecycleExecutionIdentity(): Promise<WorkflowLifecycleExecutionIdentity> {
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    });
+
+    let executionGeneration: string;
+    if (snapshot) {
+      executionGeneration = this.hydrateLifecycleExecution(snapshot).executionGeneration;
+    } else if (this.workflowRunStatus === 'pending') {
+      executionGeneration = this.startLifecycleExecution().executionGeneration;
+    } else {
+      executionGeneration = requireWorkflowExecutionGeneration(
+        this.#executionGeneration,
+        `Workflow run ${this.workflowId}/${this.runId}`,
+      );
+    }
+
+    return {
+      workflowId: this.workflowId,
+      runId: this.runId,
+      executionGeneration,
+      topic: getWorkflowLifecycleTopic({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration,
+      }),
+    };
+  }
+
   /**
    * Cancels the workflow execution.
    * This aborts any running execution and updates the workflow status to 'canceled' in storage.
    */
   async cancel() {
     // Abort any running execution and update in-memory status
+    const previousStatus = this.workflowRunStatus;
     this.abortController.abort();
     this.workflowRunStatus = 'canceled';
 
@@ -3238,6 +3359,30 @@ export class Run<
     // This is necessary for suspended/waiting workflows where the abort signal won't be checked
     try {
       const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+      const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+        workflowName: this.workflowId,
+        runId: this.runId,
+      });
+      const executionGeneration = snapshot?.executionGeneration ?? this.#executionGeneration;
+      const resumeAttempt = snapshot?.lifecycleResumeAttempt ?? this.#lifecycleResumeAttempt;
+      // An actively running execution owns its terminal emission. Suspended,
+      // waiting, and pending runs have no active engine to observe abort.
+      if (executionGeneration && (snapshot?.status ?? previousStatus) !== 'running') {
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.pubsub,
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration,
+          event: { type: 'workflow.canceled', resumeAttempt },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: this.pubsub,
+          workflowId: this.workflowId,
+          runId: this.runId,
+          executionGeneration,
+          event: { type: 'workflow.finished', resumeAttempt, status: 'canceled' },
+        });
+      }
       await workflowsStore?.updateWorkflowState({
         workflowName: this.workflowId,
         runId: this.runId,
@@ -3384,9 +3529,13 @@ export class Run<
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
     await this._validateRequestContext(requestContext as RequestContext);
 
+    const lifecycleExecution = this.startLifecycleExecution();
+    this.workflowRunStatus = 'running';
+
     const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
       workflowId: this.workflowId,
       runId: this.runId,
+      ...lifecycleExecution,
       resourceId: this.resourceId,
       disableScorers: this.disableScorers,
       graph: this.executionGraph,
@@ -3408,6 +3557,7 @@ export class Run<
     if (result.status !== 'suspended') {
       this.cleanup?.();
     }
+    this.workflowRunStatus = result.status;
 
     result.traceId = traceId;
     result.spanId = spanId;
@@ -4245,11 +4395,17 @@ export class Run<
 
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
+    const { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates } =
+      this.restoreLifecycleExecution(snapshot);
+    this.workflowRunStatus = 'running';
 
     const executionResultPromise = this.executionEngine
       .execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
         resourceId: this.resourceId,
         graph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
@@ -4276,6 +4432,7 @@ export class Run<
         perStep: params.perStep,
       })
       .then(result => {
+        this.workflowRunStatus = result.status;
         if (!params.isVNext && result.status !== 'suspended') {
           this.closeStreamAction?.().catch(() => {});
         }
@@ -4349,9 +4506,12 @@ export class Run<
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
+    const lifecycleExecution = this.beginLifecycleExecution();
+
     const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
       workflowId: this.workflowId,
       runId: this.runId,
+      ...lifecycleExecution,
       resourceId: this.resourceId,
       disableScorers: this.disableScorers,
       graph: this.executionGraph,
@@ -4487,9 +4647,12 @@ export class Run<
     const traceId = workflowSpan?.externalTraceId;
     const spanId = workflowSpan?.id;
 
+    const lifecycleExecution = this.beginLifecycleExecution();
+
     const result = await this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
       workflowId: this.workflowId,
       runId: this.runId,
+      ...lifecycleExecution,
       resourceId: this.resourceId,
       disableScorers: this.disableScorers,
       graph: this.executionGraph,
