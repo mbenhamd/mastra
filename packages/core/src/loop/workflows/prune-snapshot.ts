@@ -1,3 +1,4 @@
+import { isEventedForeachSuspensionResult } from '../../workflows/evented/foreach-suspension';
 import type { WorkflowRunState } from '../../workflows/types';
 
 /**
@@ -151,6 +152,18 @@ function pruneStepResult(result: Record<string, any>): Record<string, any> {
       for (const [index, entry] of Object.entries(meta.foreachOutput)) {
         foreachOutput[index] = pruneStepResult(entry as Record<string, any>);
       }
+
+      // The evented foreach context mirrors each suspended iteration in both
+      // `output` and this authoritative resume map. Keep the live stream state
+      // only in the authoritative copy so snapshot size remains bounded.
+      if (Array.isArray(pruned.output)) {
+        pruned.output = pruned.output.map((entry: unknown, index: number) =>
+          isEventedForeachSuspensionResult(meta.foreachOutput[index]) && isEventedForeachSuspensionResult(entry)
+            ? { ...entry, suspendPayload: stripStreamState(entry.suspendPayload) }
+            : entry,
+        );
+      }
+
       pruned.suspendPayload = {
         ...pruned.suspendPayload,
         __workflow_meta: { ...meta, foreachOutput },

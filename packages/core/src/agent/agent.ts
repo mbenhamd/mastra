@@ -4862,6 +4862,11 @@ export class Agent<
             };
 
             const suspendedToolRunId = (inputData as any).suspendedToolRunId as string | undefined;
+            const delegatedResumeToolCallId = (inputData as any).suspendedToolCallId;
+            const suspendedToolCallId =
+              typeof delegatedResumeToolCallId === 'string' && delegatedResumeToolCallId.length > 0
+                ? delegatedResumeToolCallId
+                : undefined;
             const subAgentRunId =
               suspendedToolRunId ||
               context?.mastra?.generateId({
@@ -5149,6 +5154,7 @@ export class Agent<
                 const generateResult = resumeData
                   ? await resolvedAgent.resumeGenerate(resumeData, {
                       runId: suspendedToolRunId,
+                      toolCallId: suspendedToolCallId,
                       _pubsub: pubsub,
                       requestContext,
                       actor: invocationActor,
@@ -5255,6 +5261,10 @@ export class Agent<
                   return suspend?.(generateResult.suspendPayload, {
                     resumeSchema: generateResult.resumeSchema,
                     runId: generateResult.runId,
+                    suspendedToolCallId:
+                      typeof (generateResult.suspendPayload as any)?.toolCallId === 'string'
+                        ? (generateResult.suspendPayload as any).toolCallId
+                        : undefined,
                     isAgentSuspend: true,
                   });
                 }
@@ -5282,6 +5292,7 @@ export class Agent<
                 const streamResult = resumeData
                   ? await resolvedAgent.resumeStream(resumeData, {
                       runId: suspendedToolRunId,
+                      toolCallId: suspendedToolCallId,
                       _pubsub: pubsub,
                       requestContext,
                       actor: invocationActor,
@@ -5338,6 +5349,7 @@ export class Agent<
                 let requireToolApproval;
                 let suspendedPayload;
                 let resumeSchema;
+                const streamSuspendedToolCallIds = new Set<string>();
                 for await (const chunk of streamResult.fullStream) {
                   if (context?.writer) {
                     // Data chunks from writer.custom() should bubble up directly without wrapping
@@ -5347,22 +5359,34 @@ export class Agent<
                       if (chunk.type === 'data-tool-call-approval') {
                         suspendedPayload = {};
                         requireToolApproval = true;
+                        if (typeof chunk.data.toolCallId === 'string' && chunk.data.toolCallId.length > 0) {
+                          streamSuspendedToolCallIds.add(chunk.data.toolCallId);
+                        }
                       }
 
                       if (chunk.type === 'data-tool-call-suspended') {
                         suspendedPayload = chunk.data.suspendPayload;
                         resumeSchema = chunk.data.resumeSchema;
+                        if (typeof chunk.data.toolCallId === 'string' && chunk.data.toolCallId.length > 0) {
+                          streamSuspendedToolCallIds.add(chunk.data.toolCallId);
+                        }
                       }
                     } else {
                       await context.writer.write(chunk);
                       if (chunk.type === 'tool-call-approval') {
                         suspendedPayload = {};
                         requireToolApproval = true;
+                        if (typeof chunk.payload.toolCallId === 'string' && chunk.payload.toolCallId.length > 0) {
+                          streamSuspendedToolCallIds.add(chunk.payload.toolCallId);
+                        }
                       }
 
                       if (chunk.type === 'tool-call-suspended') {
                         suspendedPayload = chunk.payload.suspendPayload;
                         resumeSchema = chunk.payload.resumeSchema;
+                        if (typeof chunk.payload.toolCallId === 'string' && chunk.payload.toolCallId.length > 0) {
+                          streamSuspendedToolCallIds.add(chunk.payload.toolCallId);
+                        }
                       }
                     }
                   }
@@ -5428,6 +5452,10 @@ export class Agent<
                     resumeSchema,
                     requireToolApproval,
                     runId: streamResult.runId,
+                    suspendedToolCallId:
+                      streamSuspendedToolCallIds.size === 1
+                        ? streamSuspendedToolCallIds.values().next().value
+                        : undefined,
                     isAgentSuspend: true,
                   });
                 }

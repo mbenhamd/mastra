@@ -20,6 +20,7 @@ import {
   runCountDeprecationMessage,
   validateStepSuspendData,
 } from '../utils';
+import { isEventedForeachSuspensionResult } from './foreach-suspension';
 import { createEventedResumeLabelsForTarget } from './resume-label';
 
 export class StepExecutor extends MastraBase {
@@ -127,7 +128,7 @@ export class StepExecutor extends MastraBase {
     // (e.g. another tool call's suspended run id).
     if (suspendDataToUse && typeof params.foreachIdx === 'number') {
       const iterationResult = suspendDataToUse.__workflow_meta?.foreachOutput?.[params.foreachIdx];
-      if (iterationResult?.status === 'suspended' && iterationResult.suspendPayload) {
+      if (isEventedForeachSuspensionResult(iterationResult)) {
         suspendDataToUse = iterationResult.suspendPayload;
       }
     }
