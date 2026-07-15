@@ -769,7 +769,7 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       instructions: 'ask one question',
       model,
     });
-    const pubsub = new DelayedDeliveryPubSub(25, 'run-completed');
+    const pubsub = new DelayedDeliveryPubSub(25, 'run-suspended');
     const mastra = new Mastra({ agents: { default: agent }, storage: new InMemoryStore(), pubsub });
     const harness = new Harness({
       mastra,
