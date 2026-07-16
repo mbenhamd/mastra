@@ -4321,7 +4321,7 @@ describe('Harness v1 — delete lifecycle', () => {
 
       override async writeMessageResultEvidence(
         record: Parameters<InMemoryHarness['writeMessageResultEvidence']>[0],
-      ): Promise<{ created: boolean }> {
+      ): Promise<{ created: boolean; applied: boolean }> {
         if (!this.gated && record.status === 'pending') {
           this.gated = true;
           this.gatedSignalId = record.signalId;

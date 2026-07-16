@@ -359,6 +359,75 @@ describe('Session.message() — default path', () => {
     expect(agent.calls).toHaveLength(1);
   });
 
+  it('replays a completed admitted message after a cold Harness and storage restart', async () => {
+    const db = new InMemoryDB();
+    const storage1 = new InMemoryHarness({ db });
+    const agent1 = new FakeAgent('default');
+    const harness1 = new Harness({
+      agents: { default: agent1 } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: storage1 },
+    });
+    const session1 = await harness1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session1.id;
+    await expect(session1.message({ content: 'hi', admissionId: 'restart-completed' })).resolves.toMatchObject({
+      text: 'hello back',
+    });
+    await harness1.shutdown();
+
+    const storage2 = new InMemoryHarness({ db });
+    const agent2 = new FakeAgent('default');
+    const harness2 = new Harness({
+      agents: { default: agent2 } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: storage2 },
+    });
+    try {
+      const session2 = await harness2.session({ sessionId, resourceId: 'u1' });
+      await expect(session2.message({ content: 'hi', admissionId: 'restart-completed' })).resolves.toMatchObject({
+        text: 'hello back',
+      });
+      expect(agent2.calls).toHaveLength(0);
+    } finally {
+      await harness2.shutdown();
+    }
+  });
+
+  it('replays a failed admitted message after a cold Harness and storage restart', async () => {
+    const db = new InMemoryDB();
+    const storage1 = new InMemoryHarness({ db });
+    const agent1 = new FakeAgent('default');
+    vi.spyOn(agent1, 'stream').mockRejectedValue(new Error('model failed'));
+    const harness1 = new Harness({
+      agents: { default: agent1 } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: storage1 },
+    });
+    const session1 = await harness1.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const sessionId = session1.id;
+    await expect(session1.message({ content: 'hi', admissionId: 'restart-failed' })).rejects.toBeDefined();
+    await harness1.shutdown();
+
+    const storage2 = new InMemoryHarness({ db });
+    const agent2 = new FakeAgent('default');
+    const harness2 = new Harness({
+      agents: { default: agent2 } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: storage2 },
+    });
+    try {
+      const session2 = await harness2.session({ sessionId, resourceId: 'u1' });
+      await expect(session2.message({ content: 'hi', admissionId: 'restart-failed' })).rejects.toBeDefined();
+      expect(agent2.calls).toHaveLength(0);
+    } finally {
+      await harness2.shutdown();
+    }
+  });
+
   it('admits a message and returns signal identity before result lookup', async () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -769,7 +838,7 @@ describe('Session.message() — default path', () => {
     class CompletedEvidenceFailingStorage extends InMemoryHarness {
       readonly writes: string[] = [];
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         this.writes.push(record.status);
         if (record.status === 'completed') throw new Error('completed evidence unavailable');
         return super.writeMessageResultEvidence(record);
@@ -808,7 +877,7 @@ describe('Session.message() — default path', () => {
       readonly writes: any[] = [];
       pendingAttempts = 0;
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         this.writes.push(record);
         if (record.admissionId === 'stream-pending-failure' && record.status === 'pending') {
           this.pendingAttempts++;
@@ -915,7 +984,7 @@ describe('Session.message() — default path', () => {
     class StallingFailedEvidenceStorage extends InMemoryHarness {
       pendingAttempts = 0;
 
-      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean }> {
+      override async writeMessageResultEvidence(record: any): Promise<{ created: boolean; applied: boolean }> {
         if (record.admissionId === 'stream-pending-stalled-failure' && record.status === 'pending') {
           this.pendingAttempts++;
           if (this.pendingAttempts === 2) {
