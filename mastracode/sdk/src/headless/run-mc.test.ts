@@ -1,5 +1,6 @@
 import { Agent } from '@mastra/core/agent';
 import { AgentController } from '@mastra/core/agent-controller';
+import type { AgentControllerEvent } from '@mastra/core/agent-controller';
 import { Mastra } from '@mastra/core/mastra';
 import { MastraLanguageModelV2Mock } from '@mastra/core/test-utils/llm-mock';
 import { createTool } from '@mastra/core/tools';
@@ -107,6 +108,118 @@ async function makeHarness(opts: HarnessOptions) {
   await session.thread.create();
 
   return { controller, session };
+}
+
+type GoalEvaluationEvent = Extract<AgentControllerEvent, { type: 'goal_evaluation' }>;
+
+function goalEvaluationEvent(overrides: Partial<GoalEvaluationEvent['payload']> = {}): GoalEvaluationEvent {
+  return {
+    type: 'goal_evaluation',
+    payload: {
+      objective: 'finish the task',
+      iteration: 1,
+      maxRuns: 5,
+      passed: true,
+      status: 'done',
+      results: [],
+      reason: 'goal complete',
+      duration: 0,
+      timedOut: false,
+      maxRunsReached: false,
+      suppressFeedback: false,
+      ...overrides,
+    },
+  };
+}
+
+interface FakeGoalHarnessOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  maxTurns?: number;
+  abortEvent?: AgentControllerEvent;
+  policy?: ResolutionPolicy;
+}
+
+function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
+  let listener: ((event: AgentControllerEvent) => void) | undefined;
+  let resolveStarted!: () => void;
+  const started = new Promise<void>(resolve => {
+    resolveStarted = resolve;
+  });
+  const objectiveRecord = {
+    id: 'goal-1',
+    objective: 'finish the task',
+    status: 'active' as const,
+    runsUsed: 0,
+    maxRuns: 5,
+    judgeModelId: 'mock-judge',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  const fakeAgent = {
+    getObjective: vi.fn().mockResolvedValue(objectiveRecord),
+  };
+  const unsubscribe = vi.fn();
+  const controller = {
+    getCurrentAgent: vi.fn(() => fakeAgent),
+    setResourceId: vi.fn(),
+  };
+  const session = {
+    subscribe: vi.fn((handler: (event: AgentControllerEvent) => void) => {
+      listener = handler;
+      return unsubscribe;
+    }),
+    sendSignal: vi.fn(() => {
+      resolveStarted();
+      return { accepted: Promise.resolve() };
+    }),
+    sendMessage: vi.fn(),
+    abort: vi.fn(() => {
+      if (options.abortEvent) listener?.(options.abortEvent);
+    }),
+    respondToToolApproval: vi.fn(),
+    respondToToolSuspension: vi.fn().mockResolvedValue(undefined),
+    thread: {
+      getId: vi.fn(() => 'thread-1'),
+      getById: vi.fn().mockResolvedValue({ id: 'thread-1' }),
+      create: vi.fn(),
+    },
+  };
+  const goalManager = {
+    setGoal: vi.fn().mockResolvedValue(objectiveRecord),
+    saveToThread: vi.fn().mockResolvedValue(undefined),
+  };
+  const run = runMC({
+    controller: controller as any,
+    session: session as any,
+    goal: {
+      objective: objectiveRecord.objective,
+      judgeModelId: objectiveRecord.judgeModelId,
+      maxRuns: objectiveRecord.maxRuns,
+      goalManager: goalManager as any,
+    },
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
+    ...(options.policy ? { policy: options.policy } : {}),
+  });
+
+  return {
+    run,
+    started,
+    session,
+    unsubscribe,
+    emit: (event: AgentControllerEvent) => listener?.(event),
+  };
+}
+
+async function expectResultPending(result: Promise<unknown>) {
+  let settled = false;
+  void result.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
 }
 
 describe('runMC', () => {
@@ -267,6 +380,192 @@ describe('runMC', () => {
     expect(result.status).toBe('completed');
     expect(result.exitCode).toBe(0);
     expect(result.text).toBe('All done');
+  });
+
+  describe('goal terminal settlement', () => {
+    it('settles an explicit abort exactly once without waiting for agent_end', async () => {
+      const harness = makeFakeGoalHarness({ abortEvent: goalEvaluationEvent() });
+      await harness.started;
+
+      harness.run.abort();
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('aborted');
+      expect(result.exitCode).toBe(1);
+      expect(harness.session.abort).toHaveBeenCalledTimes(1);
+      harness.emit(goalEvaluationEvent());
+      expect(await harness.run.result).toBe(result);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('settles an already-aborted external signal before starting goal work', async () => {
+      const harness = makeFakeGoalHarness({ signal: AbortSignal.abort() });
+
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.abort).toHaveBeenCalledTimes(1);
+      expect(harness.session.sendSignal).not.toHaveBeenCalled();
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('settles an in-flight external abort exactly once', async () => {
+      const abortController = new AbortController();
+      const harness = makeFakeGoalHarness({
+        signal: abortController.signal,
+        abortEvent: goalEvaluationEvent(),
+      });
+      await harness.started;
+
+      abortController.abort();
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.abort).toHaveBeenCalledTimes(1);
+      harness.emit(goalEvaluationEvent({ status: 'paused' }));
+      expect(await harness.run.result).toBe(result);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps maxTurns precedence when abort races a terminal goal evaluation', async () => {
+      const harness = makeFakeGoalHarness({
+        maxTurns: 1,
+        abortEvent: goalEvaluationEvent(),
+      });
+      await harness.started;
+
+      harness.emit({
+        type: 'message_end',
+        message: {
+          id: 'assistant-1',
+          role: 'assistant',
+          content: [],
+          createdAt: new Date(),
+          stopReason: 'tool_use',
+        },
+      });
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('max_turns');
+      expect(result.exitCode).toBe(1);
+      expect(harness.session.abort).toHaveBeenCalledTimes(1);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('settles agent_end error even when no error event was emitted first', async () => {
+      const harness = makeFakeGoalHarness();
+      await harness.started;
+
+      harness.emit({ type: 'agent_end', reason: 'error' });
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('error');
+      expect(result.finishReason).toBe('error');
+      harness.emit(goalEvaluationEvent());
+      expect(await harness.run.result).toBe(result);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('maps a waitingForUser goal evaluation to a paused headless result', async () => {
+      const harness = makeFakeGoalHarness();
+      await harness.started;
+      const event = goalEvaluationEvent({
+        passed: false,
+        status: 'active',
+        waitingForUser: true,
+        reason: 'Need the user to choose a direction.',
+      });
+
+      harness.emit(event);
+      const result = await harness.run.result;
+
+      expect(result).toMatchObject({
+        status: 'paused',
+        reason: 'Need the user to choose a direction.',
+        goalEvent: event,
+      });
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('defensively maps maxRunsReached with an active Core status to paused', async () => {
+      const harness = makeFakeGoalHarness();
+      await harness.started;
+      const event = goalEvaluationEvent({
+        passed: false,
+        status: 'active',
+        maxRunsReached: true,
+        reason: 'Evaluation budget exhausted.',
+      });
+
+      harness.emit(event);
+      const result = await harness.run.result;
+
+      expect(result).toMatchObject({
+        status: 'paused',
+        reason: 'Evaluation budget exhausted.',
+        goalEvent: event,
+      });
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps timeout precedence when abort races a terminal goal evaluation', async () => {
+      const harness = makeFakeGoalHarness({
+        timeoutMs: 25,
+        abortEvent: goalEvaluationEvent(),
+      });
+      await harness.started;
+
+      const result = await harness.run.result;
+
+      expect(result.status).toBe('timeout');
+      expect(result.exitCode).toBe(2);
+      expect(harness.session.abort).toHaveBeenCalledTimes(1);
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('waits through pending evaluation and complete agent_end for a terminal goal evaluation', async () => {
+      const harness = makeFakeGoalHarness();
+      await harness.started;
+
+      harness.emit(goalEvaluationEvent({ pending: true }));
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      await expectResultPending(harness.run.result);
+
+      harness.emit(goalEvaluationEvent({ reason: 'Completed after agent_end.' }));
+      const result = await harness.run.result;
+
+      expect(result).toMatchObject({
+        status: 'done',
+        finishReason: 'complete',
+        reason: 'Completed after agent_end.',
+      });
+    });
+
+    it('keeps suspended auto-resume runs open until the goal becomes terminal', async () => {
+      const policy: ResolutionPolicy = {
+        onToolApproval: () => 'approve',
+        onSuspension: () => ({ resumeData: { answer: 'continue' } }),
+      };
+      const harness = makeFakeGoalHarness({ policy });
+      await harness.started;
+
+      harness.emit({
+        type: 'tool_suspended',
+        toolCallId: 'call-1',
+        toolName: 'ask_user',
+        args: {},
+        suspendPayload: { question: 'Continue?' },
+      });
+      harness.emit({ type: 'agent_end', reason: 'suspended' });
+      await expectResultPending(harness.run.result);
+      expect(harness.session.respondToToolSuspension).toHaveBeenCalledWith({
+        toolCallId: 'call-1',
+        resumeData: { answer: 'continue' },
+      });
+
+      harness.emit(goalEvaluationEvent());
+      expect((await harness.run.result).status).toBe('done');
+    });
   });
 
   it('does not call process.exit', async () => {

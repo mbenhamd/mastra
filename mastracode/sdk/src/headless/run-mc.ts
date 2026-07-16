@@ -173,6 +173,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
   let assistantTurns = 0;
   let settled = false;
   let unsubscribe: (() => void) | undefined;
+  let removeAbortListener: (() => void) | undefined;
   let resolveResult!: (r: RunMCResult) => void;
 
   const result = new Promise<RunMCResult>(resolve => {
@@ -183,6 +184,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     if (settled) return;
     settled = true;
     if (timeoutId) clearTimeout(timeoutId);
+    removeAbortListener?.();
     unsubscribe?.();
     queue.close();
     resolveResult({
@@ -204,10 +206,27 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     finish('error');
   }
 
-  function abort(): void {
+  function forcedGoalStatus(): Extract<RunMCStatus, 'aborted' | 'timeout' | 'max_turns'> | undefined {
+    if (!goal) return undefined;
+    if (timedOut) return 'timeout';
+    if (maxTurnsExceeded) return 'max_turns';
+    if (aborted) return 'aborted';
+    return undefined;
+  }
+
+  function requestAbort(): void {
     if (settled) return;
     aborted = true;
     session.abort();
+    // Goal runs normally wait past agent_end for a terminal goal evaluation.
+    // An explicit abort is already terminal, though, and may happen before an
+    // agent run has started (so no agent_end will ever arrive).
+    const status = forcedGoalStatus();
+    if (status && !settled) finish(status);
+  }
+
+  function abort(): void {
+    requestAbort();
   }
 
   if (options.signal) {
@@ -215,7 +234,9 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       // Defer so the caller can attach iteration / result handlers first.
       queueMicrotask(() => abort());
     } else {
-      options.signal.addEventListener('abort', () => abort(), { once: true });
+      const onAbort = () => abort();
+      options.signal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => options.signal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -225,7 +246,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     timeoutId = setTimeout(() => {
       timedOut = true;
       session.abort();
-      if (goal) finish('timeout');
+      if (goal && !settled) finish('timeout');
     }, options.timeoutMs);
   }
 
@@ -265,6 +286,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     } catch (err) {
       return fail(`Failed to resolve run config: ${(err as Error).message}`);
     }
+    if (settled) return;
 
     // --- Subscribe ---
     unsubscribe = session.subscribe(event => {
@@ -308,6 +330,16 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       aggregate(event, acc);
       queue.push(event);
 
+      if (event.type === 'agent_end') {
+        acc.finishReason = event.reason;
+      }
+
+      const forcedStatus = forcedGoalStatus();
+      if (forcedStatus) {
+        finish(forcedStatus);
+        return;
+      }
+
       if (event.type === 'error' && goal) {
         finish('error');
         return;
@@ -319,13 +351,19 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         assistantTurns += 1;
         if (assistantTurns >= options.maxTurns && !maxTurnsExceeded) {
           maxTurnsExceeded = true;
-          abort();
+          requestAbort();
         }
       }
 
       if (event.type === 'goal_evaluation' && goal && !event.payload.pending) {
-        if (event.payload.status === 'done' || event.payload.status === 'paused') {
-          finish(event.payload.status, {
+        const terminalStatus =
+          event.payload.status === 'done'
+            ? 'done'
+            : event.payload.status === 'paused' || event.payload.waitingForUser || event.payload.maxRunsReached
+              ? 'paused'
+              : undefined;
+        if (terminalStatus) {
+          finish(terminalStatus, {
             objective: goal.objective,
             goalEvent: event,
             reason: event.payload.reason ?? event.payload.results?.[0]?.reason,
@@ -337,10 +375,6 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
       }
 
       if (event.type === 'agent_end') {
-        acc.finishReason = event.reason;
-        // Goal evaluations can arrive after the agent stream ends, so goal runs
-        // remain active until a terminal goal_evaluation is emitted.
-        if (goal) return;
         if (timedOut) {
           finish('timeout');
         } else if (event.reason === 'error') {
@@ -350,6 +384,11 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
           finish('max_turns');
         } else if ((event.reason === 'aborted' || aborted) && !maxTurnsExceeded) {
           finish('aborted');
+        } else if (goal) {
+          // Complete goal evaluations can arrive after the agent stream ends,
+          // and suspended tools may auto-resume into another agent run. Keep
+          // waiting for those paths; only the terminal cases above settle here.
+          return;
         } else {
           finish('completed');
         }
@@ -364,6 +403,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     } catch (err) {
       return fail(`Failed to set resource id: ${(err as Error).message}`);
     }
+    if (settled) return;
 
     // --- Thread selection ---
     try {
@@ -382,6 +422,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     } catch (err) {
       return fail(`Failed to select thread: ${(err as Error).message}`);
     }
+    if (settled) return;
 
     // --- Clone ---
     if (options.thread?.clone) {
@@ -391,6 +432,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         return fail(`Failed to clone thread: ${(err as Error).message}`);
       }
     }
+    if (settled) return;
 
     // --- Title ---
     if (options.title) {
@@ -400,14 +442,17 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         return fail(`Failed to set thread title: ${(err as Error).message}`);
       }
     }
+    if (settled) return;
 
     // --- Start ---
     try {
       if (goal) {
         const threadId = session.thread.getId();
         if (!threadId || !(await session.thread.getById({ threadId }))) {
+          if (settled) return;
           await session.thread.create();
         }
+        if (settled) return;
 
         const goalManager = goal.goalManager ?? new GoalManager();
         const state = {
@@ -418,18 +463,22 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
           planStartedGoalId: undefined,
         } as any;
         const objective = await goalManager.setGoal(state, goal.objective, goal.judgeModelId, goal.maxRuns);
+        if (settled) return;
         if (!objective) return fail('Failed to set goal.');
 
         const agent = controller.getCurrentAgent(session);
         const persisted = await agent.getObjective({ threadId: session.thread.getId()! });
+        if (settled) return;
         if (!persisted || persisted.id !== objective.id) {
           return fail('Failed to persist goal objective before sending goal signal.');
         }
 
         await goalManager.saveToThread(state);
+        if (settled) return;
         if (!settled) await session.sendSignal(createGoalReminderSignal(objective)).accepted;
       } else {
         if (!options.prompt) return fail('A prompt or goal is required.');
+        if (settled) return;
         await session.sendMessage({ content: options.prompt });
       }
     } catch (err) {
