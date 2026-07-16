@@ -133,13 +133,13 @@ class DelayedDeliveryPubSub extends PubSub {
 
   async publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, this.delayMs));
-    if ((event.data as { type?: string } | undefined)?.type === this.rejectEventType) {
+    const eventType = (event.data as { type?: string } | undefined)?.type;
+    const matchesRejectedEvent = this.rejectEventType !== undefined && eventType === this.rejectEventType;
+    if (matchesRejectedEvent) {
       this.matchingEventCount++;
     }
     const shouldReject =
-      !this.rejectedEvent &&
-      this.matchingEventCount === this.rejectEventOccurrence &&
-      (event.data as { type?: string } | undefined)?.type === this.rejectEventType;
+      !this.rejectedEvent && this.matchingEventCount === this.rejectEventOccurrence && matchesRejectedEvent;
     if (shouldReject) {
       this.rejectedEvent = true;
     }
@@ -166,6 +166,34 @@ class DelayedDeliveryPubSub extends PubSub {
 
   async flush(): Promise<void> {}
 }
+
+describe('DelayedDeliveryPubSub rejection injection', () => {
+  it('does not reject an untyped event when rejection injection is omitted', async () => {
+    const pubsub = new DelayedDeliveryPubSub(0);
+    const subscriber = vi.fn();
+    await pubsub.subscribe('test-topic', subscriber);
+
+    await expect(
+      pubsub.publish('test-topic', { type: 'test-event', runId: 'test-run', data: {} }),
+    ).resolves.toBeUndefined();
+    expect(subscriber).toHaveBeenCalledOnce();
+  });
+
+  it('still rejects the configured event type', async () => {
+    const pubsub = new DelayedDeliveryPubSub(0, 'run-suspended');
+    const subscriber = vi.fn();
+    await pubsub.subscribe('test-topic', subscriber);
+
+    await expect(
+      pubsub.publish('test-topic', {
+        type: 'test-event',
+        runId: 'test-run',
+        data: { type: 'run-suspended' },
+      }),
+    ).rejects.toThrow('injected run-suspended publication failure');
+    expect(subscriber).not.toHaveBeenCalled();
+  });
+});
 
 function sequentialApprovalFixture() {
   const firstExecute = vi.fn(async () => ({ first: true }));
