@@ -7,6 +7,11 @@ import { MemoryStorage } from '../../storage';
 import type { StorageListThreadsInput, StorageListThreadsOutput } from '../../storage/types';
 
 import { MessageHistory } from './message-history.js';
+import type { MessageHistoryOptions } from './message-history.js';
+
+interface CustomMessageHistoryOptions extends MessageHistoryOptions {
+  testLabel: string;
+}
 
 // Helper to create RequestContext with memory context
 function createRuntimeContextWithMemory(threadId: string, resourceId?: string): RequestContext {
@@ -104,6 +109,30 @@ describe('MessageHistory', () => {
   beforeEach(() => {
     mockStorage = new MockStorage();
     vi.clearAllMocks();
+  });
+
+  describe('constructor options', () => {
+    it('keeps MessageHistoryOptions extensible as an interface', () => {
+      const options: CustomMessageHistoryOptions = {
+        storage: mockStorage,
+        testLabel: 'custom-message-history',
+      };
+
+      expect(new MessageHistory(options).id).toBe('message-history');
+    });
+
+    it('rejects persistence combined with toolCallFilter', () => {
+      expect(
+        () =>
+          new MessageHistory({
+            storage: mockStorage,
+            persistence: { mode: 'final-turn' },
+            toolCallFilter: {},
+          }),
+      ).toThrowError(
+        new TypeError('MessageHistory options.persistence cannot be combined with options.toolCallFilter'),
+      );
+    });
   });
 
   describe('processInput', () => {

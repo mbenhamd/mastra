@@ -55,7 +55,7 @@ const processor = new MessageHistory({
             name: 'toolCallFilter',
             type: 'MessageHistoryToolCallFilterOptions',
             description:
-              'Optional policy that removes selected tool calls and results before MessageHistory persists them. If omitted, existing persistence behavior is unchanged',
+              'Optional policy that removes selected tool calls and results before MessageHistory persists them. If omitted, existing persistence behavior is unchanged. It cannot be combined with persistence',
             isOptional: true,
             properties: [
               {
@@ -98,7 +98,7 @@ const processor = new MessageHistory({
             name: 'persistence',
             type: 'MessageHistoryFinalTurnPersistenceOptions',
             description:
-              "Optional final-turn policy that keeps one stable user turn, approved compact tool outcomes, and only the final assistant answer. It can't be combined with toolCallFilter",
+              'Optional final-turn policy that keeps one stable user turn, approved compact tool outcomes, and only the final assistant answer. It cannot be combined with toolCallFilter',
             isOptional: true,
             properties: [
               {
@@ -244,6 +244,8 @@ const messageHistory = new MessageHistory({
 ## Persist only the final turn
 
 Set `persistence.mode` to `final-turn` to store one stable user message, approved compact outcomes, and the final assistant text. This mode removes raw tool calls and results, reasoning, step markers, provisional text, transient assistant rows, and provider metadata.
+
+`persistence` and `toolCallFilter` are mutually exclusive. Passing both throws a `TypeError` when `MessageHistory` is constructed.
 
 Compact output is fail closed. Omit `preserveModelOutputFor`, or pass an empty list, to retain no tool output.
 

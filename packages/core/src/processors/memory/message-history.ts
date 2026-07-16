@@ -31,30 +31,23 @@ export type MessageHistoryFinalTurnPersistenceOptions = {
 /**
  * Options for the MessageHistory processor
  */
-type MessageHistoryBaseOptions = {
+export interface MessageHistoryOptions {
   storage: MemoryStorage;
   lastMessages?: number;
-};
-
-export type MessageHistoryOptions = MessageHistoryBaseOptions &
-  (
-    | {
-        /** Omit persistence to preserve the existing full-turn behavior. */
-        persistence?: undefined;
-        /**
-         * Opt-in filtering applied only to messages written by MessageHistory.
-         * Omit this option to preserve the existing persistence behavior.
-         * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
-         * Messages changed by this policy also drop message-level provider metadata.
-         */
-        toolCallFilter?: MessageHistoryToolCallFilterOptions;
-      }
-    | {
-        /** Persist one stable user turn, approved compact outcomes, and the final assistant answer. */
-        persistence: MessageHistoryFinalTurnPersistenceOptions;
-        toolCallFilter?: never;
-      }
-  );
+  /**
+   * Opt-in filtering applied only to messages written by MessageHistory.
+   * Omit this option to preserve the existing persistence behavior.
+   * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
+   * Messages changed by this policy also drop message-level provider metadata.
+   * Can't be combined with `persistence`.
+   */
+  toolCallFilter?: MessageHistoryToolCallFilterOptions;
+  /**
+   * Persist one stable user turn, approved compact outcomes, and the final assistant answer.
+   * Can't be combined with `toolCallFilter`.
+   */
+  persistence?: MessageHistoryFinalTurnPersistenceOptions;
+}
 
 /**
  * Hybrid processor that handles both retrieval and persistence of message history.
@@ -73,6 +66,9 @@ export class MessageHistory implements Processor {
   private persistence?: MessageHistoryFinalTurnPersistenceOptions;
 
   constructor(options: MessageHistoryOptions) {
+    if (options.persistence !== undefined && options.toolCallFilter !== undefined) {
+      throw new TypeError('MessageHistory options.persistence cannot be combined with options.toolCallFilter');
+    }
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
     this.toolCallFilter = options.toolCallFilter;
