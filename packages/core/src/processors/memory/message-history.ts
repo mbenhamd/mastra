@@ -6,30 +6,55 @@ import { SpanType, EntityType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
-import { filterToolCallMessages, normalizeToolCallFilterExclude } from '../tool-call-filter-utils';
+import {
+  filterToolCallMessages,
+  getPreservedModelOutputParts,
+  normalizeToolCallFilterExclude,
+} from '../tool-call-filter-utils';
 import type { ToolCallFilteringOptions } from '../tool-call-filter-utils';
 
 const DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES = 16 * 1024;
 
 export type MessageHistoryToolCallFilterOptions = Pick<
   ToolCallFilteringOptions,
-  'exclude' | 'preserveModelOutput' | 'maxModelOutputBytes'
+  'exclude' | 'preserveModelOutput' | 'preserveModelOutputFor' | 'maxModelOutputBytes'
 >;
+
+export type MessageHistoryFinalTurnPersistenceOptions = {
+  mode: 'final-turn';
+  /** Tool names whose compact model output may be persisted. Omitted or empty retains none. */
+  preserveModelOutputFor?: string[];
+  /** Maximum UTF-8 bytes retained from each approved compact model output. */
+  maxModelOutputBytes?: number;
+};
 
 /**
  * Options for the MessageHistory processor
  */
-export interface MessageHistoryOptions {
+type MessageHistoryBaseOptions = {
   storage: MemoryStorage;
   lastMessages?: number;
-  /**
-   * Opt-in filtering applied only to messages written by MessageHistory.
-   * Omit this option to preserve the existing persistence behavior.
-   * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
-   * Messages changed by this policy also drop message-level provider metadata.
-   */
-  toolCallFilter?: MessageHistoryToolCallFilterOptions;
-}
+};
+
+export type MessageHistoryOptions = MessageHistoryBaseOptions &
+  (
+    | {
+        /** Omit persistence to preserve the existing full-turn behavior. */
+        persistence?: undefined;
+        /**
+         * Opt-in filtering applied only to messages written by MessageHistory.
+         * Omit this option to preserve the existing persistence behavior.
+         * Preserved model output defaults to a 16 KiB UTF-8 byte limit.
+         * Messages changed by this policy also drop message-level provider metadata.
+         */
+        toolCallFilter?: MessageHistoryToolCallFilterOptions;
+      }
+    | {
+        /** Persist one stable user turn, approved compact outcomes, and the final assistant answer. */
+        persistence: MessageHistoryFinalTurnPersistenceOptions;
+        toolCallFilter?: never;
+      }
+  );
 
 /**
  * Hybrid processor that handles both retrieval and persistence of message history.
@@ -45,11 +70,13 @@ export class MessageHistory implements Processor {
   private storage: MemoryStorage;
   private lastMessages?: number;
   private toolCallFilter?: MessageHistoryToolCallFilterOptions;
+  private persistence?: MessageHistoryFinalTurnPersistenceOptions;
 
   constructor(options: MessageHistoryOptions) {
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
     this.toolCallFilter = options.toolCallFilter;
+    this.persistence = options.persistence;
   }
 
   /**
@@ -253,6 +280,10 @@ export class MessageHistory implements Processor {
       })
       .filter((m): m is NonNullable<typeof m> => Boolean(m));
 
+    if (this.persistence?.mode === 'final-turn') {
+      return this.projectFinalTurnForPersistence(filteredMessages, this.persistence);
+    }
+
     return this.toolCallFilter === undefined
       ? filteredMessages
       : filterToolCallMessages(
@@ -264,6 +295,81 @@ export class MessageHistory implements Processor {
           new Set(),
           { stripMessageProviderMetadata: true },
         );
+  }
+
+  private projectFinalTurnForPersistence(
+    messages: MastraDBMessage[],
+    options: MessageHistoryFinalTurnPersistenceOptions,
+  ): MastraDBMessage[] {
+    const stableUserIndex = messages.findLastIndex(message => message.role === 'user');
+    const stableUser = stableUserIndex === -1 ? undefined : messages[stableUserIndex];
+    const finalTurnMessages = stableUserIndex === -1 ? messages : messages.slice(stableUserIndex);
+    const finalAssistant = [...finalTurnMessages].reverse().find(message => message.role === 'assistant');
+    const projected: MastraDBMessage[] = [];
+
+    if (stableUser) {
+      const {
+        providerMetadata: _providerMetadata,
+        metadata: _metadata,
+        reasoning: _reasoning,
+        toolInvocations: _toolInvocations,
+        ...stableUserContent
+      } = stableUser.content;
+      const stableUserParts = stableUser.content.parts
+        .filter(part => part.type !== 'tool-invocation' && part.type !== 'step-start' && part.type !== 'reasoning')
+        .map(part => {
+          const { providerMetadata: _partProviderMetadata, ...stablePart } = part;
+          return stablePart;
+        });
+      const hasStableUserContent =
+        (typeof stableUserContent.content === 'string' && stableUserContent.content.length > 0) ||
+        stableUserParts.length > 0 ||
+        (Array.isArray(stableUserContent.experimental_attachments) &&
+          stableUserContent.experimental_attachments.length > 0);
+
+      if (hasStableUserContent) {
+        projected.push({
+          ...stableUser,
+          content: {
+            ...stableUserContent,
+            parts: stableUserParts,
+          },
+        });
+      }
+    }
+
+    if (!finalAssistant) return projected;
+
+    const approvedOutcomes = getPreservedModelOutputParts(finalTurnMessages, {
+      preserveModelOutputFor: options.preserveModelOutputFor ?? [],
+      maxModelOutputBytes: options.maxModelOutputBytes ?? DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
+    });
+    const lastStepStartIndex = finalAssistant.content.parts.findLastIndex(part => part.type === 'step-start');
+    const lastToolIndex = finalAssistant.content.parts.findLastIndex(part => part.type === 'tool-invocation');
+    const finalAnswerBoundary = Math.max(lastStepStartIndex, lastToolIndex);
+    const finalAnswer = finalAssistant.content.parts
+      .slice(finalAnswerBoundary + 1)
+      .filter((part): part is Extract<typeof part, { type: 'text' }> => part.type === 'text')
+      .map(part => ({ type: 'text' as const, text: part.text }))
+      .filter(part => part.text.length > 0);
+    const assistantParts = [...approvedOutcomes, ...finalAnswer];
+
+    if (assistantParts.length > 0) {
+      projected.push({
+        id: finalAssistant.id,
+        role: 'assistant',
+        createdAt: finalAssistant.createdAt,
+        ...(finalAssistant.threadId === undefined ? {} : { threadId: finalAssistant.threadId }),
+        ...(finalAssistant.resourceId === undefined ? {} : { resourceId: finalAssistant.resourceId }),
+        ...(finalAssistant.type === undefined ? {} : { type: finalAssistant.type }),
+        content: {
+          format: 2,
+          parts: assistantParts,
+        },
+      });
+    }
+
+    return projected;
   }
 
   async processOutputResult(

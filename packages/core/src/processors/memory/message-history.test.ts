@@ -1204,4 +1204,418 @@ describe('MessageHistory', () => {
       expect(serialized).toContain('TOP_LEVEL_RESULT_SENTINEL');
     });
   });
+
+  describe('final-turn persistence policy', () => {
+    const createPersistenceStorage = () =>
+      ({
+        saveMessages: vi.fn().mockResolvedValue(undefined),
+        getThreadById: vi.fn().mockResolvedValue({
+          id: 'thread-1',
+          title: 'Test Thread',
+          metadata: {},
+        }),
+        updateThread: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as MemoryStorage;
+
+    const createFinalTurnMessages = (): MastraDBMessage[] => [
+      {
+        id: 'user-stable',
+        role: 'user',
+        createdAt: new Date('2024-01-01T00:00:00Z'),
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        content: {
+          format: 2,
+          content: 'Find the latest evidence',
+          metadata: { secret: 'USER_MESSAGE_METADATA_SECRET' },
+          providerMetadata: { mastra: { secret: 'USER_PROVIDER_SECRET' } },
+          parts: [
+            { type: 'text', text: 'Find the latest evidence', providerMetadata: { mastra: { secret: 'PART_SECRET' } } },
+          ],
+        },
+      },
+      {
+        id: 'assistant-transient',
+        role: 'assistant',
+        createdAt: new Date('2024-01-01T00:00:01Z'),
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        content: {
+          format: 2,
+          parts: [{ type: 'text', text: 'TRANSIENT_ASSISTANT_ROW' }],
+        },
+      },
+      {
+        id: 'assistant-final',
+        role: 'assistant',
+        createdAt: new Date('2024-01-01T00:00:02Z'),
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        type: 'text',
+        content: {
+          format: 2,
+          content: 'PROVISIONAL_TOP_LEVEL_CONTENT',
+          reasoning: 'TOP_LEVEL_REASONING',
+          providerMetadata: { mastra: { secret: 'ASSISTANT_PROVIDER_SECRET' } },
+          parts: [
+            { type: 'text', text: 'PROVISIONAL_TEXT' },
+            { type: 'reasoning', text: 'INTERMEDIATE_REASONING' },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'private-call',
+                toolName: 'latex_read_file',
+                args: { path: 'PRIVATE_PATH' },
+                result: { content: 'PRIVATE_RAW_RESULT' },
+              },
+              providerMetadata: { mastra: { modelOutput: 'PRIVATE_COMPACT_FILE_CONTENT' } },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'public-call',
+                toolName: 'grounding_search',
+                args: { query: 'RAW_PUBLIC_QUERY' },
+                result: { hits: ['RAW_PUBLIC_RESULT'] },
+              },
+              providerMetadata: {
+                mastra: {
+                  modelOutput: {
+                    type: 'content',
+                    value: [
+                      { type: 'text', text: 'Approved public summary' },
+                      { type: 'media', data: 'BASE64_MEDIA', mediaType: 'image/png' },
+                    ],
+                  },
+                  raw: 'RAW_PROVIDER_METADATA',
+                },
+              },
+            },
+            { type: 'step-start', model: 'provider/model' },
+            { type: 'reasoning', text: 'FINAL_STEP_REASONING' },
+            {
+              type: 'text',
+              text: 'Final evidence answer.',
+              providerMetadata: { mastra: { secret: 'FINAL_TEXT_PROVIDER_SECRET' } },
+            },
+          ],
+          toolInvocations: [
+            {
+              state: 'result',
+              toolCallId: 'legacy-call',
+              toolName: 'legacy_tool',
+              args: { secret: 'TOP_LEVEL_TOOL_ARGS' },
+              result: 'TOP_LEVEL_TOOL_RESULT',
+            },
+          ],
+        },
+      },
+    ];
+
+    it('persists stable user, allowlisted compact outcomes, and only the final assistant answer', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          preserveModelOutputFor: ['grounding_search'],
+          maxModelOutputBytes: 128,
+        },
+      });
+      const messages = createFinalTurnMessages();
+      const sourceBefore = JSON.stringify(messages);
+
+      await processor.persistMessages({ messages, threadId: 'thread-1', resourceId: 'resource-1' });
+
+      expect(JSON.stringify(messages)).toBe(sourceBefore);
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages.map(message => message.id)).toEqual(['user-stable', 'assistant-final']);
+      expect(savedMessages[0]!.content).toEqual({
+        format: 2,
+        content: 'Find the latest evidence',
+        parts: [{ type: 'text', text: 'Find the latest evidence' }],
+      });
+      expect(savedMessages[1]!.content).toEqual({
+        format: 2,
+        parts: [
+          { type: 'text', text: 'grounding_search result:\nApproved public summary' },
+          { type: 'text', text: 'Final evidence answer.' },
+        ],
+      });
+
+      const serialized = JSON.stringify(savedMessages);
+      for (const omitted of [
+        'TRANSIENT_ASSISTANT_ROW',
+        'PROVISIONAL_TOP_LEVEL_CONTENT',
+        'PROVISIONAL_TEXT',
+        'INTERMEDIATE_REASONING',
+        'FINAL_STEP_REASONING',
+        'PRIVATE_PATH',
+        'PRIVATE_RAW_RESULT',
+        'PRIVATE_COMPACT_FILE_CONTENT',
+        'RAW_PUBLIC_QUERY',
+        'RAW_PUBLIC_RESULT',
+        'BASE64_MEDIA',
+        'RAW_PROVIDER_METADATA',
+        'TOP_LEVEL_TOOL_ARGS',
+        'TOP_LEVEL_TOOL_RESULT',
+        'USER_MESSAGE_METADATA_SECRET',
+        'USER_PROVIDER_SECRET',
+        'PART_SECRET',
+        'ASSISTANT_PROVIDER_SECRET',
+        'FINAL_TEXT_PROVIDER_SECRET',
+      ]) {
+        expect(serialized).not.toContain(omitted);
+      }
+    });
+
+    it('applies final-turn projection to input and a merged multi-step response without mutating MessageList', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          preserveModelOutputFor: ['grounding_search'],
+        },
+      });
+      const messages = createFinalTurnMessages();
+      const historicalMessage: MastraDBMessage = {
+        id: 'historical-assistant',
+        role: 'assistant',
+        createdAt: new Date('2023-12-31T23:59:59Z'),
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'historical-public-call',
+                toolName: 'grounding_search',
+                args: {},
+                result: {},
+              },
+              providerMetadata: { mastra: { modelOutput: 'HISTORICAL_OUTCOME_MUST_NOT_LEAK' } },
+            },
+          ],
+        },
+      };
+      const messageList = new MessageList()
+        .add(historicalMessage, 'memory')
+        .add(messages[0]!, 'input')
+        .add(messages[2]!, 'response');
+      const messageListBefore = JSON.stringify(messageList.get.all.db());
+
+      await processor.processOutputResult({
+        messages,
+        messageList,
+        abort: mockAbort,
+        requestContext: createRuntimeContextWithMemory('thread-1', 'resource-1'),
+      });
+
+      expect(JSON.stringify(messageList.get.all.db())).toBe(messageListBefore);
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages.map(message => message.id)).toEqual(['user-stable', 'assistant-final']);
+      expect(savedMessages[1]!.content.parts).toEqual([
+        { type: 'text', text: 'grounding_search result:\nApproved public summary' },
+        { type: 'text', text: 'Final evidence answer.' },
+      ]);
+      expect(JSON.stringify(savedMessages)).not.toContain('HISTORICAL_OUTCOME_MUST_NOT_LEAK');
+    });
+
+    it('does not persist an approved compact outcome from before the last user turn', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          preserveModelOutputFor: ['grounding_search'],
+        },
+      });
+      const messages = createFinalTurnMessages();
+      const historicalAssistant: MastraDBMessage = {
+        id: 'historical-assistant',
+        role: 'assistant',
+        createdAt: new Date('2023-12-31T23:59:59Z'),
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'historical-public-call',
+                toolName: 'grounding_search',
+                args: {},
+                result: {},
+              },
+              providerMetadata: { mastra: { modelOutput: 'HISTORICAL_OUTCOME_MUST_NOT_LEAK' } },
+            },
+          ],
+        },
+      };
+
+      await processor.persistMessages({
+        messages: [historicalAssistant, ...messages],
+        threadId: 'thread-1',
+      });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(JSON.stringify(savedMessages)).not.toContain('HISTORICAL_OUTCOME_MUST_NOT_LEAK');
+      expect(savedMessages[1]!.content.parts).toEqual([
+        { type: 'text', text: 'grounding_search result:\nApproved public summary' },
+        { type: 'text', text: 'Final evidence answer.' },
+      ]);
+    });
+
+    it('does not persist an empty user row when every user part is transient', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: { mode: 'final-turn' },
+      });
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'transient-user',
+          role: 'user',
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+          content: {
+            format: 2,
+            metadata: { secret: 'TRANSIENT_USER_METADATA' },
+            providerMetadata: { mastra: { secret: 'TRANSIENT_USER_PROVIDER_METADATA' } },
+            parts: [
+              { type: 'step-start' },
+              { type: 'reasoning', text: 'TRANSIENT_USER_REASONING' },
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'transient-user-call',
+                  toolName: 'grounding_search',
+                  args: {},
+                  result: {},
+                },
+              },
+            ],
+          },
+        },
+        {
+          id: 'assistant-answer',
+          role: 'assistant',
+          createdAt: new Date('2024-01-01T00:00:01Z'),
+          content: { format: 2, parts: [{ type: 'text', text: 'Final answer only.' }] },
+        },
+      ];
+
+      await processor.persistMessages({ messages, threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages.map(message => message.id)).toEqual(['assistant-answer']);
+      expect(JSON.stringify(savedMessages)).toBe(
+        '[{"id":"assistant-answer","role":"assistant","createdAt":"2024-01-01T00:00:01.000Z","content":{"format":2,"parts":[{"type":"text","text":"Final answer only."}]}}]',
+      );
+    });
+
+    it.each([undefined, []] as const)('retains no compact output for a %s allowlist', async allowlist => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          ...(allowlist === undefined ? {} : { preserveModelOutputFor: [...allowlist] }),
+        },
+      });
+
+      await processor.persistMessages({ messages: createFinalTurnMessages(), threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const serialized = JSON.stringify(savedMessages);
+      expect(serialized).toContain('Final evidence answer.');
+      expect(serialized).not.toContain('Approved public summary');
+      expect(serialized).not.toContain('PRIVATE_COMPACT_FILE_CONTENT');
+    });
+
+    it('applies the UTF-8 bound to an allowlisted multibyte compact outcome', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          preserveModelOutputFor: ['grounding_search'],
+          maxModelOutputBytes: 32,
+        },
+      });
+      const messages = createFinalTurnMessages();
+      const assistant = messages[2]!;
+      const publicTool = assistant.content.parts.find(
+        part => part.type === 'tool-invocation' && part.toolInvocation.toolName === 'grounding_search',
+      );
+      if (!publicTool || publicTool.type !== 'tool-invocation') throw new Error('expected public tool');
+      publicTool.providerMetadata = { mastra: { modelOutput: '🙂'.repeat(100) } };
+
+      await processor.persistMessages({ messages, threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      const outcome = savedMessages[1]!.content.parts[0];
+      if (outcome?.type !== 'text') throw new Error('expected compact outcome');
+      const boundedValue = outcome.text.split(' result:\n')[1]!;
+      expect(new TextEncoder().encode(boundedValue).byteLength).toBeLessThanOrEqual(32);
+      expect(boundedValue).toContain('[truncated]');
+      expect(boundedValue).not.toContain('\uFFFD');
+    });
+
+    it('fails closed for accessor, circular, media, and non-result allowlisted model output', async () => {
+      const storage = createPersistenceStorage();
+      const processor = new MessageHistory({
+        storage,
+        persistence: {
+          mode: 'final-turn',
+          preserveModelOutputFor: ['accessor', 'circular', 'media', 'unfinished'],
+        },
+      });
+      const accessorMetadata: Record<string, unknown> = {};
+      Object.defineProperty(accessorMetadata, 'modelOutput', {
+        enumerable: true,
+        get() {
+          throw new Error('must not invoke accessor');
+        },
+      });
+      const circular: unknown[] = [];
+      circular.push(circular);
+      const messages = createFinalTurnMessages();
+      messages[2]!.content.parts.splice(
+        2,
+        2,
+        {
+          type: 'tool-invocation',
+          toolInvocation: { state: 'result', toolCallId: 'accessor', toolName: 'accessor', args: {}, result: {} },
+          providerMetadata: { mastra: accessorMetadata },
+        },
+        {
+          type: 'tool-invocation',
+          toolInvocation: { state: 'result', toolCallId: 'circular', toolName: 'circular', args: {}, result: {} },
+          providerMetadata: { mastra: { modelOutput: circular } },
+        },
+        {
+          type: 'tool-invocation',
+          toolInvocation: { state: 'result', toolCallId: 'media', toolName: 'media', args: {}, result: {} },
+          providerMetadata: { mastra: { modelOutput: { type: 'media', data: 'BASE64', mediaType: 'image/png' } } },
+        },
+        {
+          type: 'tool-invocation',
+          toolInvocation: { state: 'call', toolCallId: 'unfinished', toolName: 'unfinished', args: {} },
+          providerMetadata: { mastra: { modelOutput: 'UNFINISHED_OUTPUT' } },
+        },
+      );
+
+      await processor.persistMessages({ messages, threadId: 'thread-1' });
+
+      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(savedMessages[1]!.content.parts).toEqual([{ type: 'text', text: 'Final evidence answer.' }]);
+      expect(JSON.stringify(savedMessages)).not.toContain('BASE64');
+      expect(JSON.stringify(savedMessages)).not.toContain('UNFINISHED_OUTPUT');
+    });
+  });
 });
