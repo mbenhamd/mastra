@@ -3965,6 +3965,7 @@ while IFS= read -r file; do
             mastracode/tui/src/tui/event-dispatch.test.ts | \
             mastracode/tui/src/tui/notify.test.ts | \
             mastracode/tui/src/tui/__tests__/goal-manager.test.ts | \
+            mastracode/sdk/src/headless/run-mc.test.ts | \
             mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
@@ -3984,6 +3985,14 @@ while IFS= read -r file; do
         ;;
       mastracode/tui/src/tui/goal-manager.ts)
         required_test="mastracode/tui/src/tui/__tests__/goal-manager.test.ts"
+        ;;
+      mastracode/sdk/src/goal-manager.ts)
+        # The accepted upstream history moved the implementation into Code SDK;
+        # the TUI regression exercises it through the package re-export.
+        required_test="mastracode/tui/src/tui/__tests__/goal-manager.test.ts"
+        ;;
+      mastracode/sdk/src/headless/run-mc.ts)
+        required_test="mastracode/sdk/src/headless/run-mc.test.ts"
         ;;
       mastracode/sdk/src/utils/signals-pubsub.ts)
         required_test="mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts"
@@ -5166,6 +5175,7 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != mastracode/tui/src/tui/event-dispatch.test.ts && \
       "$file" != mastracode/tui/src/tui/notify.test.ts && \
       "$file" != mastracode/tui/src/tui/__tests__/goal-manager.test.ts && \
+      "$file" != mastracode/sdk/src/headless/run-mc.test.ts && \
       "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
