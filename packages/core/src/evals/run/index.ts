@@ -288,8 +288,10 @@ export async function runEvals(config: {
     thresholdScoresByScorerID[scorerId] = [];
   }
 
-  // Per-turn assertion results, collected per data item then aggregated by turn index.
-  const perItemTurnResults: ItemTurnResults[] = [];
+  // Keep results in input order rather than concurrent completion order. Floating-point
+  // addition is not associative, so completion-order aggregation can change a score at
+  // an exact threshold boundary and make the verdict scheduler-dependent.
+  const perItemTurnResults: Array<ItemTurnResults | undefined> = new Array(data.length);
 
   // Get storage from target's Mastra instance if available
   // Agent uses getMastraInstance(), Workflow uses .mastra getter
@@ -299,7 +301,7 @@ export async function runEvals(config: {
   const pMap = (await import('p-map')).default;
   await pMap(
     data,
-    async (item: RunEvalsDataItem<any>) => {
+    async (item: RunEvalsDataItem<any>, dataIndex: number) => {
       const targetResult = await executeTarget(target, item, targetOptions);
 
       // Run gates first
@@ -362,7 +364,7 @@ export async function runEvals(config: {
             }
           }
         }
-        perItemTurnResults.push(itemTurnResults);
+        perItemTurnResults[dataIndex] = itemTurnResults;
       }
 
       // Save scores to storage if available
@@ -397,8 +399,13 @@ export async function runEvals(config: {
   };
 
   // Aggregate per-turn assertions (by turn index across data items).
+  const orderedPerItemTurnResults = perItemTurnResults.filter(
+    (itemResults): itemResults is ItemTurnResults => itemResults !== undefined,
+  );
   const turnAggregate =
-    perItemTurnResults.length > 0 ? aggregateTurnResults(perItemTurnResults, turnAssertionPlan) : undefined;
+    orderedPerItemTurnResults.length > 0
+      ? aggregateTurnResults(orderedPerItemTurnResults, turnAssertionPlan)
+      : undefined;
   if (turnAggregate && turnAggregate.turnResults.length > 0) {
     result.turnResults = turnAggregate.turnResults;
   }

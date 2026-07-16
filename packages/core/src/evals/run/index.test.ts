@@ -2050,6 +2050,58 @@ describe('runEvals', () => {
       expect(Object.keys(result.turnResults![0]!.scores!)).toEqual(['zeta-turn-threshold', 'alpha-turn-threshold']);
     });
 
+    it('aggregates concurrent per-turn scores in data order at an exact threshold boundary', async () => {
+      const agent = createTurnAgent('thresholdBoundaryOrderAgent');
+      let releaseSecond!: () => void;
+      let releaseFirst!: () => void;
+      const secondCanFinish = new Promise<void>(resolve => {
+        releaseSecond = resolve;
+      });
+      const firstCanFinish = new Promise<void>(resolve => {
+        releaseFirst = resolve;
+      });
+
+      const scorer = createScorer({
+        id: 'threshold-boundary-order',
+        description: 'Completes data items in reverse order',
+      }).generateScore(async ({ run }: any) => {
+        if (run.input === 'first') {
+          await firstCanFinish;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          return 0.1;
+        }
+        if (run.input === 'second') {
+          await secondCanFinish;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          releaseFirst();
+          return 0.2;
+        }
+
+        releaseSecond();
+        return 0.3;
+      });
+
+      const result = await runEvals({
+        data: [
+          { turns: [{ input: 'first', scorers: [{ scorer, threshold: 0.2 }] }] },
+          { turns: [{ input: 'second', scorers: [{ scorer, threshold: 0.2 }] }] },
+          { turns: [{ input: 'third', scorers: [{ scorer, threshold: 0.2 }] }] },
+        ],
+        target: agent,
+        concurrency: 3,
+      });
+
+      expect(result.verdict).toBe('passed');
+      expect(result.turnResults![0]!.thresholdResults).toEqual([
+        {
+          id: 'threshold-boundary-order',
+          passed: true,
+          averageScore: 0.20000000000000004,
+          threshold: 0.2,
+        },
+      ]);
+    });
+
     it('rejects an empty turns array', async () => {
       const agent = createTurnAgent('emptyTurnsAgent');
       await expect(
