@@ -3013,9 +3013,35 @@ export const STREAM_NETWORK_ROUTE = createRoute({
       // Authorization: context values take precedence over client-provided values
       let authorizedMemoryOption = params.memory;
       if (params.memory) {
+        const clientThreadId =
+          typeof params.memory.thread === 'string' ? params.memory.thread : params.memory.thread?.id;
         const effectiveResourceId = getEffectiveResourceId(requestContext, params.memory.resource);
         requireEffectiveResourceId(effectiveResourceId);
-        authorizedMemoryOption = { ...params.memory, resource: effectiveResourceId };
+        const effectiveThreadId = getEffectiveThreadId(requestContext, clientThreadId);
+
+        // Validate thread ownership if accessing an existing thread
+        if (effectiveThreadId) {
+          const memoryInstance = await agent.getMemory({ requestContext });
+          if (memoryInstance) {
+            const thread = await memoryInstance.getThreadById({ threadId: effectiveThreadId });
+            if (thread) {
+              await enforceThreadAccess({
+                mastra,
+                requestContext,
+                threadId: effectiveThreadId,
+                thread,
+                effectiveResourceId,
+                permission: MastraFGAPermissions.MEMORY_WRITE,
+              });
+            }
+          }
+        }
+
+        authorizedMemoryOption = {
+          ...params.memory,
+          resource: effectiveResourceId,
+          thread: effectiveThreadId ?? params.memory.thread,
+        };
       }
 
       const streamResult = await agent.network(messages, {

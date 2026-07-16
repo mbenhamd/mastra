@@ -907,6 +907,96 @@ describe('Agent Routes Authorization', () => {
     });
   });
 
+  describe('STREAM_NETWORK_ROUTE', () => {
+    it('should return 403 when memory option specifies thread owned by different resource', async () => {
+      await mockMemory.createThread({
+        threadId: 'network-thread-owned-by-b',
+        resourceId: 'user-b',
+        title: 'Thread B',
+      });
+
+      const requestContext = createContextWithReservedKeys({ resourceId: 'user-a' });
+
+      await expect(
+        STREAM_NETWORK_ROUTE.handler({
+          mastra,
+          agentId: 'test-agent',
+          requestContext,
+          abortSignal: new AbortController().signal,
+          messages: [{ role: 'user', content: 'test' }],
+          memory: {
+            thread: 'network-thread-owned-by-b',
+            resource: 'user-a',
+          },
+        } as any),
+      ).rejects.toThrow(new HTTPException(403, { message: 'Access denied: thread belongs to a different resource' }));
+    });
+
+    it('should override client-provided thread and resource with context values', async () => {
+      await mockMemory.createThread({
+        threadId: 'network-thread-from-context',
+        resourceId: 'user-a',
+        title: 'Context Thread',
+      });
+      await mockMemory.createThread({
+        threadId: 'network-thread-from-client',
+        resourceId: 'user-b',
+        title: 'Client Thread',
+      });
+
+      const requestContext = createContextWithReservedKeys({
+        resourceId: 'user-a',
+        threadId: 'network-thread-from-context',
+      });
+
+      let capturedMemoryOption: any;
+      vi.spyOn(mockAgent, 'network').mockImplementation(async (_messages, options) => {
+        capturedMemoryOption = options?.memory;
+        return { fullStream: new ReadableStream() } as any;
+      });
+
+      await STREAM_NETWORK_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: new AbortController().signal,
+        messages: [{ role: 'user', content: 'test' }],
+        memory: {
+          thread: 'network-thread-from-client',
+          resource: 'user-b',
+        },
+      } as any);
+
+      expect(capturedMemoryOption).toMatchObject({
+        thread: 'network-thread-from-context',
+        resource: 'user-a',
+      });
+    });
+
+    it('should accept memory without resource when context provides one', async () => {
+      const requestContext = createContextWithReservedKeys({ resourceId: 'user-a' });
+
+      let capturedMemoryOption: any;
+      vi.spyOn(mockAgent, 'network').mockImplementation(async (_messages, options) => {
+        capturedMemoryOption = options?.memory;
+        return { fullStream: new ReadableStream() } as any;
+      });
+
+      await STREAM_NETWORK_ROUTE.handler({
+        mastra,
+        agentId: 'test-agent',
+        requestContext,
+        abortSignal: new AbortController().signal,
+        messages: [{ role: 'user', content: 'test' }],
+        memory: {
+          thread: 'new-network-thread',
+        },
+      } as any);
+
+      expect(capturedMemoryOption.resource).toBe('user-a');
+    });
+  });
+
   describe('agentExecutionBodySchema memory option', () => {
     it('accepts a memory option without resource', () => {
       const result = agentExecutionBodySchema.safeParse({
