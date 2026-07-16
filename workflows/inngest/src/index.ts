@@ -1152,7 +1152,10 @@ export function init(inngest: Inngest) {
   >;
   /**
    * Preserve the original explicit generic parameter order for callers that
-   * supplied output types rather than relying on schema inference.
+   * supplied output types rather than relying on schema inference. Transformed
+   * schemas can provide their raw input as the final optional generic without
+   * shifting the existing workflow, state, input, output, steps, or request
+   * context positions.
    */
   function createInngestWorkflow<
     TWorkflowId extends string = string,
@@ -1169,9 +1172,20 @@ export function init(inngest: Inngest) {
       InngestEngineType
     >[],
     TRequestContext extends Record<string, any> | unknown = unknown,
+    TRawInput = TInput,
   >(
-    params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>,
-  ): InngestWorkflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TInput, TRequestContext, TInput>;
+    params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext, TRawInput>,
+  ): InngestWorkflow<
+    InngestEngineType,
+    TSteps,
+    TWorkflowId,
+    TState,
+    TInput,
+    TOutput,
+    TInput,
+    TRequestContext,
+    TRawInput
+  >;
   function createInngestWorkflow(
     params: InngestWorkflowConfig<
       string,

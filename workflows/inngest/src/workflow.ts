@@ -27,6 +27,7 @@ import type {
   InngestFlowControlConfig,
   InngestFlowCronConfig,
   InngestWorkflowConfig,
+  InngestWorkflowRunState,
 } from './types';
 
 export class InngestWorkflow<
@@ -54,7 +55,7 @@ export class InngestWorkflow<
   private function: ReturnType<Inngest['createFunction']> | undefined;
   private cronFunction: ReturnType<Inngest['createFunction']> | undefined;
   private readonly flowControlConfig?: InngestFlowControlConfig;
-  private readonly cronConfig?: InngestFlowCronConfig<TInput, TState>;
+  private readonly cronConfig?: InngestFlowCronConfig<TRawInput, TState>;
   /**
    * Optional override that lets a host (e.g. `createInngestAgent`) provide the
    * PubSub instance used by workflow steps for publishing chunk/finish events.
@@ -71,7 +72,8 @@ export class InngestWorkflow<
       TInput,
       TOutput,
       TSteps & Step<string, any, any, any, any, any, InngestEngineType>[],
-      TRequestContext
+      TRequestContext,
+      TRawInput
     >,
     inngest: Inngest,
   ) {
@@ -216,6 +218,12 @@ export class InngestWorkflow<
     }
 
     const runIdToUse = options?.runId || randomUUID();
+    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+    const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: this.id,
+      runId: runIdToUse,
+    })) as InngestWorkflowRunState | null | undefined;
+    const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
@@ -236,7 +244,7 @@ export class InngestWorkflow<
         inputSchema: this.inputSchema,
         stateSchema: this.stateSchema,
         requestContextSchema: this.requestContextSchema,
-        disableScorers: options?.disableScorers,
+        disableScorers: persistedDisableScorers ?? options?.disableScorers,
       },
       this.inngest,
     );
@@ -249,15 +257,9 @@ export class InngestWorkflow<
       stepResults: {},
     });
 
-    const existingStoredRun = await this.getWorkflowRunById(runIdToUse, {
-      withNestedWorkflows: false,
-    });
-
-    // Check if run exists in persistent storage (not just in-memory)
-    const existsInStorage = existingStoredRun && !existingStoredRun.isFromInMemory;
+    const existsInStorage = Boolean(existingSnapshot);
 
     if (!existsInStorage && shouldPersistSnapshot) {
-      const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
       await workflowsStore?.persistWorkflowSnapshot({
         workflowName: this.id,
         runId: runIdToUse,
@@ -276,6 +278,13 @@ export class InngestWorkflow<
           result: undefined,
           error: undefined,
           timestamp: Date.now(),
+          ...(run.disableScorers !== undefined
+            ? {
+                runOptions: {
+                  disableScorers: run.disableScorers,
+                },
+              }
+            : {}),
         },
       });
     }
@@ -544,7 +553,14 @@ export class InngestWorkflow<
                     result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
                     error: result.status === 'failed' ? result.error : undefined,
                     timestamp: Date.now(),
-                  },
+                    ...(disableScorers !== undefined
+                      ? {
+                          runOptions: {
+                            disableScorers,
+                          },
+                        }
+                      : {}),
+                  } as InngestWorkflowRunState,
                 });
               }
             }

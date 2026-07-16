@@ -100,6 +100,51 @@ describe('Inngest createRun contract', () => {
     await run.start({ inputData: { value: 'ok' }, initialState: { attempt: 1 } });
   });
 
+  it('accepts transformed raw input with the original explicit generic parameter order', async () => {
+    const inngest = new Inngest({ id: 'legacy-explicit-generics-raw-input' });
+    const { createStep, createWorkflow } = init(inngest);
+    const inputSchema = z.object({
+      count: z.string().transform(Number),
+      mode: z.enum(['safe', 'fast']).default('safe'),
+    });
+    const outputSchema = z.object({ count: z.number() });
+    const step = createStep({
+      id: 'legacy-transform-step',
+      inputSchema,
+      outputSchema,
+      execute: async ({ inputData }) => {
+        expectTypeOf(inputData).toEqualTypeOf<{
+          count: number;
+          mode: 'safe' | 'fast';
+        }>();
+        return { count: inputData.count };
+      },
+    });
+    const workflow = createWorkflow<
+      'legacy-explicit-generics-raw-input',
+      unknown,
+      z.output<typeof inputSchema>,
+      z.output<typeof outputSchema>,
+      [typeof step],
+      unknown,
+      z.input<typeof inputSchema>
+    >({
+      id: 'legacy-explicit-generics-raw-input',
+      inputSchema,
+      outputSchema,
+      steps: [step],
+    })
+      .then(step)
+      .commit();
+
+    const run = await workflow.createRun();
+    await run.start({ inputData: { count: '2' } });
+    await run.startAsync({ inputData: { count: '3', mode: 'fast' } });
+
+    // @ts-expect-error - count must satisfy either the schema input or output contract
+    await run.start({ inputData: { count: true, mode: 'safe' } });
+  });
+
   it('preserves ordinary workflow input types', async () => {
     const inngest = new Inngest({ id: 'ordinary-create-run-types' });
     const { createStep, createWorkflow } = init(inngest);
