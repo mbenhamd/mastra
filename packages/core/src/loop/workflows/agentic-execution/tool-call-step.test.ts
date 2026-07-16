@@ -10,6 +10,7 @@ import { createTool } from '../../../tools';
 import * as toolPayloadTransform from '../../../tools/payload-transform';
 import { ToolStream } from '../../../tools/stream';
 import { CoreToolBuilder } from '../../../tools/tool-builder/builder';
+import { wrapToolsWithHooks } from '../../../tools/tool-hooks';
 import type { MastraToolInvocationOptions } from '../../../tools/types';
 import type { OuterLLMRun } from '../../types';
 import { createToolCallStep } from './tool-call-step';
@@ -811,8 +812,23 @@ describe('createToolCallStep tool approval workflow', () => {
   it('should handle declined tool calls without executing the tool', async () => {
     const inputData = makeInputData();
     const resumeData = { approved: false };
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const hookedTools = wrapToolsWithHooks(
+      tools as any,
+      { beforeToolCall, afterToolCall },
+      { agentId: 'test-agent', agentName: 'Test agent' },
+    );
+    const hookedToolCallStep = createToolCallStep({
+      tools: hookedTools,
+      messageList,
+      controller,
+      requireToolApproval: true,
+      runId: 'test-run',
+      streamState,
+    } as any);
 
-    const result = await toolCallStep.execute(
+    const result = await hookedToolCallStep.execute(
       makeExecuteParams({ inputData, resumeData, suspendData: makeSuspendData() }),
     );
 
@@ -827,6 +843,38 @@ describe('createToolCallStep tool approval workflow', () => {
       },
     });
     expectNoToolExecution();
+    expect(beforeToolCall).not.toHaveBeenCalled();
+    expect(afterToolCall).not.toHaveBeenCalled();
+  });
+
+  it('does not run execution hooks when the action-time permission policy denies a tool', async () => {
+    tools['test-tool'].requireApproval = false;
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const hookedTools = wrapToolsWithHooks(
+      tools as any,
+      { beforeToolCall, afterToolCall },
+      { agentId: 'test-agent', agentName: 'Test agent' },
+    );
+    const deniedToolCallStep = createToolCallStep({
+      tools: hookedTools,
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    } as any);
+    const requestContext = new RequestContext();
+    requestContext.set('__mastra_toolPermissionPolicy', () => 'deny');
+
+    const result = await deniedToolCallStep.execute(makeExecuteParams({ inputData: makeInputData(), requestContext }));
+
+    expect(result).toEqual({
+      ...makeInputData(),
+      result: 'Tool "test-tool" was denied by the session permission policy.',
+    });
+    expectNoToolExecution();
+    expect(beforeToolCall).not.toHaveBeenCalled();
+    expect(afterToolCall).not.toHaveBeenCalled();
   });
 
   it('should preserve a user-provided decline reason', async () => {

@@ -50,7 +50,9 @@ import {
 } from '../../../tools/payload-transform';
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
+import { unwrapToolsFromHooks, wrapToolsWithHooks } from '../../../tools/tool-hooks';
 import { getProviderToolName, isMastraTool, isProviderTool } from '../../../tools/toolchecks';
+import type { CoreTool } from '../../../tools/types';
 import { createMastraProxy, makeCoreTool } from '../../../utils';
 import { createStep } from '../../../workflows/workflow';
 import type { Workspace } from '../../../workspace/workspace';
@@ -68,6 +70,7 @@ import {
   STEP_TOOLS_KEY,
   STEP_WORKSPACE_KEY,
   THREAD_ID_KEY,
+  TOOL_HOOKS_KEY,
   TOOL_PAYLOAD_TRANSFORM_KEY,
   TRANSPORT_REF_KEY,
 } from '../../run-scope-keys';
@@ -1163,7 +1166,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 steps: inputData.output?.steps || [],
                 messageId: currentStep.messageId,
                 rotateResponseMessageId,
-                tools,
+                tools: currentStep.tools
+                  ? (unwrapToolsFromHooks(currentStep.tools as unknown as Record<string, CoreTool>) as unknown as TOOLS)
+                  : currentStep.tools,
                 toolChoice,
                 activeTools: activeTools as string[] | undefined,
                 providerOptions: currentStep.providerOptions,
@@ -1389,6 +1394,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 `Forced toolChoice names a permission-denied tool "${forcedDeniedName}" (pre-exposure gate, §4.2e)`,
               );
             }
+          }
+
+          if (currentStep.tools) {
+            currentStep.tools = wrapToolsWithHooks(
+              currentStep.tools as unknown as Record<string, CoreTool>,
+              readScoped(scopeCtx, TOOL_HOOKS_KEY, 'toolHooks'),
+              { agentId, agentName: agentName || agentId },
+            ) as unknown as TOOLS;
           }
 
           // Publish activeTools to the run scope so toolCallStep can enforce them.

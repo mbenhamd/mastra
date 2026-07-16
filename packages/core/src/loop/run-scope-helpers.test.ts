@@ -37,6 +37,7 @@ import {
   STEP_WORKSPACE_KEY,
   THREAD_EXISTS_KEY,
   THREAD_ID_KEY,
+  TOOL_HOOKS_KEY,
   TOOL_PAYLOAD_TRANSFORM_KEY,
   TRANSPORT_REF_KEY,
 } from './run-scope-keys';
@@ -81,6 +82,7 @@ describe('hydrateRunScopeFromInternal', () => {
     const drainPendingSignals = (() => []) as StreamInternal['drainPendingSignals'];
     const initialSignalEchoes = [{ tag: 'echo' }] as any;
     const toolPayloadTransform = { tag: 'toolPayloadTransform' } as any;
+    const toolHooks = { beforeToolCall: () => undefined };
 
     const internal: StreamInternal = {
       now,
@@ -100,6 +102,7 @@ describe('hydrateRunScopeFromInternal', () => {
       drainPendingSignals,
       initialSignalEchoes,
       toolPayloadTransform,
+      toolHooks,
     };
 
     hydrateRunScopeFromInternal(mastra, 'run-1', internal);
@@ -122,6 +125,7 @@ describe('hydrateRunScopeFromInternal', () => {
     expect(scope.get(DRAIN_PENDING_SIGNALS_KEY)).toBe(drainPendingSignals);
     expect(scope.get(INITIAL_SIGNAL_ECHOES_KEY)).toBe(initialSignalEchoes);
     expect(scope.get(TOOL_PAYLOAD_TRANSFORM_KEY)).toBe(toolPayloadTransform);
+    expect(scope.get(TOOL_HOOKS_KEY)).toBe(toolHooks);
 
     mastra.__releaseRunScope('run-1');
   });
@@ -181,6 +185,18 @@ describe('hydrateRunScopeFromInternal', () => {
     hydrateRunScopeFromInternal(mastra, 'run-1', { threadId: undefined });
     expect(scope.get(THREAD_ID_KEY)).toBe('pre-existing');
 
+    mastra.__releaseRunScope('run-1');
+  });
+
+  it('clears hooks when a later execution segment has no effective hook callbacks', () => {
+    const mastra = makeMastra();
+    mastra.__createRunScope('run-1');
+    const scope = mastra.__getRunScope('run-1')!;
+
+    scope.set(TOOL_HOOKS_KEY, { beforeToolCall: () => undefined });
+    hydrateRunScopeFromInternal(mastra, 'run-1', {});
+
+    expect(scope.has(TOOL_HOOKS_KEY)).toBe(false);
     mastra.__releaseRunScope('run-1');
   });
 

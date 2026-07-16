@@ -160,6 +160,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     backgroundTaskManager,
     agentBackgroundConfig,
     toolPayloadTransform,
+    toolHooks: capabilities.resolveToolHooks(options.hooks),
     skipBgTaskWait,
     drainPendingSignals,
     runScope,

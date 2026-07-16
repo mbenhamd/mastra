@@ -79,6 +79,7 @@ export function loop<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
     // silently drops the policy for the whole run (the scope slot stays unset
     // and `readScoped` falls back to this same bag). See `hydrate-run-scope.ts`.
     toolPayloadTransform: _internal?.toolPayloadTransform,
+    toolHooks: _internal?.toolHooks,
   };
 
   let startTimestamp = internalToUse.now?.();

@@ -10,7 +10,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { TestIntegration } from '../../integration/openapi-toolset.mock';
 import { Mastra } from '../../mastra';
-import { RequestContext } from '../../request-context';
+import { MockMemory } from '../../memory/mock';
+import { ToolSearchProcessor } from '../../processors/processors/tool-search';
+import { MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
@@ -211,12 +213,14 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       const agentOne = mastra.getAgent('testAgent');
 
       if (version === 'v1') {
-        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required' });
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
       } else {
-        await agentOne.generate('Call testTool');
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
       }
 
-      expect(calls.slice(0, 2)).toEqual([
+      // Asserted on the whole array, not a slice: a duplicated hook layer would
+      // append a second before/after pair, and a slice would hide it.
+      expect(calls).toEqual([
         { phase: 'before', toolName: 'testTool', input: {} },
         {
           phase: 'after',
@@ -227,9 +231,153 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       ]);
     });
 
+    it('runs effective hooks exactly once for a processor-added tool', async () => {
+      const execute = vi.fn(async () => ({ message: 'dynamic' }));
+      const configuredBefore = vi.fn();
+      const runBefore = vi.fn();
+      const afterToolCall = vi.fn();
+      const dynamicTool = createTool({
+        id: 'testTool',
+        description: 'Processor-added test tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        inputProcessors: [
+          {
+            id: 'add-test-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, testTool: dynamicTool } }),
+          },
+        ],
+        hooks: {
+          beforeToolCall: configuredBefore,
+          afterToolCall,
+        },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', {
+          toolChoice: 'required',
+          hooks: { beforeToolCall: runBefore },
+          maxSteps: 1,
+        });
+      } else {
+        await agentOne.generate('Call testTool', { hooks: { beforeToolCall: runBefore }, maxSteps: 1 });
+      }
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(configuredBefore).not.toHaveBeenCalled();
+      expect(runBefore).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
+    it('runs hooks exactly once around a processor-replaced tool executor', async () => {
+      const initialExecute = vi.fn(async () => ({ message: 'initial' }));
+      const replacementExecute = vi.fn(async () => ({ message: 'replacement' }));
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const initialTool = createTool({
+        id: 'testTool',
+        description: 'Initial test tool',
+        inputSchema: z.object({}),
+        execute: initialExecute,
+      });
+      const replacementTool = createTool({
+        id: 'testTool',
+        description: 'Replacement test tool',
+        inputSchema: z.object({}),
+        execute: replacementExecute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        tools: { testTool: initialTool },
+        inputProcessors: [
+          {
+            id: 'replace-test-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, testTool: replacementTool } }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
+      } else {
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
+      }
+
+      expect(initialExecute).not.toHaveBeenCalled();
+      expect(replacementExecute).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
+    it('runs hooks exactly once when a processor decorates an existing executor', async () => {
+      const execute = vi.fn(async () => ({ message: 'decorated' }));
+      const decorate = vi.fn();
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const initialTool = createTool({
+        id: 'testTool',
+        description: 'Initial test tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const testAgent = new Agent({
+        id: 'test-agent',
+        name: 'Test agent',
+        instructions: 'You are an agent that calls testTool',
+        model: mockModel,
+        tools: { testTool: initialTool },
+        inputProcessors: [
+          {
+            id: 'decorate-test-tool',
+            processInputStep: ({ tools }) => ({
+              tools: {
+                ...tools,
+                testTool: {
+                  ...tools.testTool!,
+                  execute: async (input: any, context: any) => {
+                    decorate();
+                    return tools.testTool!.execute!(input, context);
+                  },
+                },
+              },
+            }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      const mastra = new Mastra({ agents: { testAgent }, logger: false });
+      const agentOne = mastra.getAgent('testAgent');
+
+      if (version === 'v1') {
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 });
+      } else {
+        await agentOne.generate('Call testTool', { maxSteps: 1 });
+      }
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(decorate).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    });
+
     it('uses per-execution hooks through the public generate path', async () => {
       const configBeforeToolCall = vi.fn();
       const runBeforeToolCall = vi.fn(() => ({ proceed: false as const, output: { message: 'blocked' } }));
+      const runAfterToolCall = vi.fn();
       const execute = vi.fn(async () => ({ message: 'executed' }));
       const testTool = createTool({
         id: 'testTool',
@@ -259,25 +407,32 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
           toolChoice: 'required',
           hooks: {
             beforeToolCall: runBeforeToolCall,
+            afterToolCall: runAfterToolCall,
           },
+          maxSteps: 1,
         });
         toolResult = response.toolResults.find((result: any) => result.toolName === 'testTool');
       } else {
         const response = await agentOne.generate('Call testTool', {
           hooks: {
             beforeToolCall: runBeforeToolCall,
+            afterToolCall: runAfterToolCall,
           },
+          maxSteps: 1,
         });
         toolResult = response.toolResults.find((result: any) => result.payload.toolName === 'testTool')?.payload;
       }
 
       expect(toolResult?.result?.message).toBe('blocked');
       expect(configBeforeToolCall).not.toHaveBeenCalled();
+      expect(runBeforeToolCall).toHaveBeenCalledOnce();
       expect(runBeforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'testTool', input: {} }));
+      expect(runAfterToolCall).not.toHaveBeenCalled();
       expect(execute).not.toHaveBeenCalled();
     });
 
     it('runs afterToolCall when a tool errors', async () => {
+      const beforeToolCall = vi.fn();
       const afterToolCall = vi.fn();
       const testTool = createTool({
         id: 'testTool',
@@ -293,7 +448,7 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
         instructions: 'You are an agent that calls testTool',
         model: mockModel,
         tools: { testTool },
-        hooks: { afterToolCall },
+        hooks: { beforeToolCall, afterToolCall },
       });
       const mastra = new Mastra({
         agents: {
@@ -304,9 +459,9 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
       const agentOne = mastra.getAgent('testAgent');
 
       if (version === 'v1') {
-        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required' }).catch(() => undefined);
+        await agentOne.generateLegacy('Call testTool', { toolChoice: 'required', maxSteps: 1 }).catch(() => undefined);
       } else {
-        await agentOne.generate('Call testTool').catch(() => undefined);
+        await agentOne.generate('Call testTool', { maxSteps: 1 }).catch(() => undefined);
       }
 
       expect(afterToolCall).toHaveBeenCalledWith(
@@ -317,6 +472,11 @@ function toolsTest(version: 'v1' | 'v2' | 'v3') {
           error: expect.any(Error),
         }),
       );
+      // Both halves are pinned: a duplicated hook layer on a throwing tool would
+      // re-enter beforeToolCall as well, which counting only afterToolCall misses.
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'testTool', input: {} }));
+      expect(afterToolCall).toHaveBeenCalledOnce();
     });
 
     it('should call findUserTool with parameters', async () => {
@@ -1335,6 +1495,148 @@ toolsTest('v1');
 toolsTest('v2');
 toolsTest('v3');
 
+describe('evented agent tool hooks', () => {
+  it('runs hooks exactly once for a processor-added tool', async () => {
+    vi.stubEnv('MASTRA_EVENTED_EXECUTION', 'true');
+    try {
+      const execute = vi.fn(async () => ({ message: 'dynamic' }));
+      const beforeToolCall = vi.fn();
+      const afterToolCall = vi.fn();
+      const dynamicTool = createTool({
+        id: 'dynamicTool',
+        description: 'Processor-added evented tool',
+        inputSchema: z.object({}),
+        execute,
+      });
+      const model = new MockLanguageModelV2({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'tool-calls',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [
+            {
+              type: 'tool-call',
+              toolCallId: 'dynamic-call',
+              toolName: 'dynamicTool',
+              input: '{}',
+            },
+          ],
+          warnings: [],
+        }),
+      });
+      const agent = new Agent({
+        id: 'evented-hook-agent',
+        name: 'Evented hook agent',
+        instructions: 'Call dynamicTool.',
+        model,
+        inputProcessors: [
+          {
+            id: 'add-dynamic-tool',
+            processInputStep: ({ tools }) => ({ tools: { ...tools, dynamicTool } }),
+          },
+        ],
+        hooks: { beforeToolCall, afterToolCall },
+      });
+      new Mastra({ agents: { agent }, logger: false });
+
+      await agent.generate('Call dynamicTool.', { maxSteps: 1 });
+
+      expect(execute).toHaveBeenCalledOnce();
+      expect(beforeToolCall).toHaveBeenCalledOnce();
+      expect(afterToolCall).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('processor-provided agent tool hooks', () => {
+  it('runs hooks exactly once for a ToolSearch meta-tool and dynamically loaded tool', async () => {
+    const weatherExecute = vi.fn(async ({ location }: { location: string }) => ({ location, conditions: 'sunny' }));
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const weatherTool = createTool({
+      id: 'weather',
+      description: 'Get current weather for a location',
+      inputSchema: z.object({ location: z.string() }),
+      execute: weatherExecute,
+    });
+    const toolSearch = new ToolSearchProcessor({
+      tools: { weather: weatherTool },
+      search: { topK: 5, minScore: 0 },
+    });
+    let modelCall = 0;
+    const model = new MockLanguageModelV2({
+      doGenerate: async options => {
+        modelCall++;
+        const visibleTools = (options.tools ?? []).map(tool => tool.name);
+        if (modelCall === 1) {
+          expect(visibleTools).toContain('load_tool');
+          expect(visibleTools).not.toContain('weather');
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: 'load-weather',
+                toolName: 'load_tool',
+                input: JSON.stringify({ toolName: 'weather' }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        if (modelCall === 2) {
+          expect(visibleTools).toContain('weather');
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: 'use-weather',
+                toolName: 'weather',
+                input: JSON.stringify({ location: 'Berlin' }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'hooked-tool-search-agent',
+      name: 'hooked-tool-search-agent',
+      instructions: 'Load and call the weather tool.',
+      model,
+      inputProcessors: [toolSearch],
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'hooked-tool-search-thread');
+
+    const result = await agent.generate('What is the weather?', {
+      requestContext,
+      maxSteps: 3,
+    });
+
+    expect(result.text).toBe('done');
+    expect(weatherExecute).toHaveBeenCalledOnce();
+    expect(beforeToolCall.mock.calls.map(([context]) => context.toolName)).toEqual(['load_tool', 'weather']);
+    expect(afterToolCall.mock.calls.map(([context]) => context.toolName)).toEqual(['load_tool', 'weather']);
+  });
+});
+
 describe('requireApproval property preservation', () => {
   it('should preserve requireApproval property from tools passed via toolsets', async () => {
     const mockModel = new MockLanguageModelV2({
@@ -1717,6 +2019,49 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     expect(subAgentTool.description).toContain('subAgent');
   });
 
+  it('runs hooks exactly once around a generated sub-agent tool', async () => {
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        content: [{ type: 'text', text: 'delegated result' }],
+        warnings: [],
+      }),
+    });
+    const subAgent = new Agent({
+      id: 'hooked-sub-agent',
+      name: 'Hooked Sub Agent',
+      instructions: 'Return a delegated result.',
+      model,
+    });
+    const parentAgent = new Agent({
+      id: 'hooked-parent-agent',
+      name: 'Hooked Parent Agent',
+      instructions: 'Delegate work.',
+      model,
+      agents: { subAgent },
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const tools = await parentAgent['convertTools']({
+      requestContext: new RequestContext(),
+      methodType: 'generate',
+    });
+
+    const result = await tools['agent-subAgent']!.execute?.({ prompt: 'Do the delegated work.' }, {
+      toolCallId: 'sub-agent-hook-call',
+      messages: [],
+    } as any);
+
+    expect(result).toEqual(expect.objectContaining({ text: 'delegated result' }));
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-subAgent' }));
+    expect(afterToolCall).toHaveBeenCalledOnce();
+    expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-subAgent' }));
+  });
+
   it('reuses sub-agent tool schemas across conversions', async () => {
     const mockModel = new MockLanguageModelV2({
       doGenerate: async () => ({
@@ -1773,5 +2118,145 @@ describe('sub-agent prompt input normalization (GitHub #14154)', () => {
     expect(secondSubAgentTool).not.toBe(firstSubAgentTool);
     expect(secondSchemas.inputSchema).toBe(firstSchemas.inputSchema);
     expect(secondSchemas.outputSchema).toBe(firstSchemas.outputSchema);
+  });
+});
+
+describe('sub-agent delegation tool hooks through the Agent loop', () => {
+  // Companion to the `convertTools` unit test above. That one proves the wrap is
+  // APPLIED at conversion time by invoking the tool directly; this one proves the
+  // wrapped sub-agent tool survives a real `generate()` — i.e. that the parent's
+  // agentic loop actually dispatches through the hook layer exactly once, and
+  // that no later stage in the loop re-wraps or replaces it.
+  it('runs hooks exactly once around a sub-agent tool driven by supervisorAgent.generate', async () => {
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const subAgent = new Agent({
+      id: 'research-agent',
+      name: 'research-agent',
+      description: 'Sub-agent: research-agent',
+      instructions: 'You are a helpful sub-agent.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 5, outputTokens: 10, totalTokens: 15 },
+          content: [{ type: 'text', text: 'Dolphins are marine mammals.' }],
+          warnings: [],
+        }),
+      }),
+    });
+
+    let supervisorCall = 0;
+    const supervisorAgent = new Agent({
+      id: 'supervisor',
+      name: 'supervisor',
+      instructions: 'You orchestrate sub-agents.',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => {
+          supervisorCall++;
+          if (supervisorCall === 1) {
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              finishReason: 'tool-calls' as const,
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+              content: [
+                {
+                  type: 'tool-call' as const,
+                  toolCallId: 'call-1',
+                  toolName: 'agent-researchAgent',
+                  input: JSON.stringify({ prompt: 'research dolphins' }),
+                },
+              ],
+              warnings: [],
+            };
+          }
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            content: [{ type: 'text' as const, text: 'Done' }],
+            warnings: [],
+          };
+        },
+      }),
+      agents: { researchAgent: subAgent },
+      memory: new MockMemory(),
+      hooks: { beforeToolCall, afterToolCall },
+    });
+
+    // maxSteps: 3 deliberately leaves room for more than one step, so a hook
+    // firing per step (rather than per call) would show up as a second call.
+    const result = await supervisorAgent.generate('Research dolphins', { maxSteps: 3 });
+
+    expect(result.text).toBe('Done');
+    expect(beforeToolCall).toHaveBeenCalledOnce();
+    expect(beforeToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
+    expect(afterToolCall).toHaveBeenCalledOnce();
+    expect(afterToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'agent-researchAgent' }));
+  });
+});
+
+describe('multi-step agent tool hooks', () => {
+  it('runs hooks exactly once per call when the SAME tool is called across steps', async () => {
+    const execute = vi.fn(async ({ index }: { index: number }) => ({ index }));
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const counterTool = createTool({
+      id: 'counter',
+      description: 'Records a call index',
+      inputSchema: z.object({ index: z.number() }),
+      execute,
+    });
+
+    let modelCall = 0;
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => {
+        modelCall++;
+        if (modelCall <= 2) {
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'tool-calls' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            content: [
+              {
+                type: 'tool-call' as const,
+                toolCallId: `counter-call-${modelCall}`,
+                toolName: 'counter',
+                input: JSON.stringify({ index: modelCall }),
+              },
+            ],
+            warnings: [],
+          };
+        }
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [{ type: 'text' as const, text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'multi-step-hook-agent',
+      name: 'multi-step-hook-agent',
+      instructions: 'Call counter twice.',
+      model,
+      tools: { counter: counterTool },
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    new Mastra({ agents: { agent }, logger: false });
+
+    const result = await agent.generate('Count twice.', { maxSteps: 3 });
+
+    expect(result.text).toBe('done');
+    // Two calls to the same tool across two steps: the hook layer must be
+    // re-applied per step without accumulating, so exactly one before/after per
+    // call — not two per call on the second step.
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(beforeToolCall.mock.calls.map(([context]) => context.input)).toEqual([{ index: 1 }, { index: 2 }]);
+    expect(afterToolCall.mock.calls.map(([context]) => context.output)).toEqual([{ index: 1 }, { index: 2 }]);
+    expect(beforeToolCall).toHaveBeenCalledTimes(2);
+    expect(afterToolCall).toHaveBeenCalledTimes(2);
   });
 });
