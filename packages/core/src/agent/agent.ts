@@ -1143,6 +1143,7 @@ export class Agent<
     maxRuns?: number;
     prompt?: string;
     status?: GoalObjectiveRecord['status'];
+    pausedReason?: string;
   }): Promise<GoalObjectiveRecord | undefined> {
     const store = await resolveGoalStore(this.#mastra as MastraUnion | undefined);
     const now = Date.now();
@@ -1153,13 +1154,15 @@ export class Agent<
       current => {
         if (!current) return { operation: 'keep', result: { record: undefined } };
 
+        const status = options.status ?? current.status;
         const updated: GoalObjectiveRecord = {
           ...current,
           updatedAt: now,
           ...(options.judgeModelId !== undefined ? { judgeModelId: options.judgeModelId } : {}),
           ...(options.maxRuns !== undefined && options.maxRuns > 0 ? { maxRuns: options.maxRuns } : {}),
           ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
-          ...(options.status !== undefined ? { status: options.status } : {}),
+          status,
+          pausedReason: status === 'paused' ? (options.pausedReason ?? current.pausedReason) : undefined,
         };
         return { operation: 'set', value: updated, result: { record: updated } };
       },

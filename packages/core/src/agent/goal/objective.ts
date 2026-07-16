@@ -167,7 +167,14 @@ export async function writeObjective(
   requestContext?: RequestContext,
 ): Promise<void> {
   if (!store || !resourceId || !threadId) return;
-  await store.setState({ resourceId, threadId, type: GOAL_STATE_TYPE, value: record });
+  // Use the mutation lane even for full replacement so this write is ordered
+  // with a goal verdict that may currently be committing in another turn.
+  await store.mutateState<GoalObjectiveRecord, void>({
+    resourceId,
+    threadId,
+    type: GOAL_STATE_TYPE,
+    mutate: () => ({ operation: 'set', value: record, result: undefined }),
+  });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, record);
 }
 
@@ -179,7 +186,15 @@ export async function clearObjective(
   requestContext?: RequestContext,
 ): Promise<void> {
   if (!store || !resourceId || !threadId) return;
-  await store.deleteState({ resourceId, threadId, type: GOAL_STATE_TYPE });
+  // Clear through the same lane as verdict commits. Otherwise the base
+  // in-memory implementation can read the old objective, yield, observe this
+  // deletion, and then resurrect the old record with its verdict.
+  await store.mutateState<GoalObjectiveRecord, void>({
+    resourceId,
+    threadId,
+    type: GOAL_STATE_TYPE,
+    mutate: () => ({ operation: 'delete', result: undefined }),
+  });
   requestContext?.set(GOAL_REQUEST_CONTEXT_KEY, undefined);
 }
 

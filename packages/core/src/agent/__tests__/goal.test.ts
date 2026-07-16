@@ -188,6 +188,24 @@ describe('Agent objective methods', () => {
     expect(updated).toMatchObject({ judgeModelId: 'new-judge', maxRuns: 12, objective: 'Goal' });
   });
 
+  it('preserves an explicit pause reason and clears it when the goal resumes', async () => {
+    const agent = makeAgent();
+    await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
+
+    await expect(
+      agent.updateObjectiveOptions({
+        threadId: THREAD,
+        resourceId: RESOURCE,
+        status: 'paused',
+        pausedReason: 'waiting for user review',
+      }),
+    ).resolves.toMatchObject({ status: 'paused', pausedReason: 'waiting for user review' });
+
+    await expect(
+      agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, status: 'active' }),
+    ).resolves.toMatchObject({ status: 'active', pausedReason: undefined });
+  });
+
   it('no-ops without storage', async () => {
     const agent = new Agent({
       id: 'no-storage-agent',
