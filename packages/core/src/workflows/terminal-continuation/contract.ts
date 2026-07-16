@@ -21,7 +21,14 @@ import type {
 } from './types';
 
 const ACTIVE_PARENT_STATUSES = new Set<WorkflowRunStatus>(['running', 'waiting', 'suspended']);
-const FINAL_PARENT_STATUSES = new Set<WorkflowRunStatus>(['success', 'failed', 'canceled', 'tripwire', 'bailed']);
+const FINAL_PARENT_STATUSES = new Set<WorkflowRunStatus>([
+  'success',
+  'failed',
+  'canceled',
+  'tripwire',
+  'bailed',
+  'skipped',
+]);
 const ALL_PARENT_STATUSES = new Set<WorkflowRunStatus>([
   'pending',
   'running',
@@ -33,6 +40,7 @@ const ALL_PARENT_STATUSES = new Set<WorkflowRunStatus>([
   'canceled',
   'tripwire',
   'bailed',
+  'skipped',
 ]);
 const CHILD_STATUSES = new Set(['success', 'failed', 'canceled']);
 const QUARANTINE_REASONS = new Set(['graph-conflict', 'parent-conflict-exhausted', 'plan-conflict']);

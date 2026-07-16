@@ -21,8 +21,11 @@ import type {
   WorkflowResult,
 } from '@mastra/core/workflows';
 import type { Inngest, BaseContext } from 'inngest';
-import { NonRetriableError } from 'inngest';
+import { NonRetriableError, StepError } from 'inngest';
 import { InngestWorkflow } from './workflow';
+import { inngestWorkflowResumeOperationHash } from './resume-operation';
+
+const RESUMED_CHILD_TERMINAL_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped']);
 
 function isNonRetryableStepFailure(error: unknown): boolean {
   if (error instanceof MastraNonRetryableError || error instanceof NonRetriableError) {
@@ -552,28 +555,128 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
           lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
           lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
         };
-
-        const invokeResp = (await this.inngestStep.invoke(`workflow.${executionContext.workflowId}.step.${step.id}`, {
-          function: step.getFunction(),
-          data: {
-            inputData,
-            initialState: executionContext.state ?? snapshot?.value ?? {},
-            requestContext: forwardedRequestContext,
-            runId: runId,
-            resume: {
-              runId: runId,
-              steps: resume.steps.slice(1),
-              stepResults: snapshot?.context as any,
-              resumePayload: resume.resumePayload,
-              resumePath: resume.steps?.[1] ? (snapshot?.suspendedPaths?.[resume.steps?.[1]] as any) : undefined,
-            },
-            outputOptions: { includeState: true },
-            perStep,
-            tracingOptions: nestedTracingContext,
-            actor,
-            ...lifecycleExecution,
+        const nestedResumeSteps = resume.steps.slice(1);
+        if (nestedResumeSteps.length === 0) {
+          const suspendedStepIds = Object.keys(snapshot.suspendedPaths ?? {});
+          if (suspendedStepIds.length !== 1) {
+            throw new NonRetriableError(
+              `Cannot infer nested resume step for ${step.id}/${runId}: expected exactly one suspended step`,
+            );
+          }
+          nestedResumeSteps.push(suspendedStepIds[0]!);
+        }
+        const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
+        if (
+          !workflowsStore ||
+          resumeCapabilities?.atomicResumeVersion !== 1 ||
+          resumeCapabilities.fencedStepUpdateVersion !== 1
+        ) {
+          throw new NonRetriableError(
+            `Workflow storage for nested run ${step.id}/${runId} does not support atomic resume admission and fenced step updates`,
+          );
+        }
+        const resourceId = snapshot.resourceId;
+        const resumePath = snapshot.suspendedPaths?.[nestedResumeSteps[0]!] as number[] | undefined;
+        const outputOptions = { includeState: true };
+        const resumeOperationHash = inngestWorkflowResumeOperationHash({
+          workflowId: step.id,
+          runId,
+          resourceId,
+          inputData,
+          steps: nestedResumeSteps,
+          resumePayload: resume.resumePayload,
+          resumePath,
+          requestContext: forwardedRequestContext,
+          outputOptions,
+          tracingOptions: nestedTracingContext,
+          perStep: perStep ?? false,
+        });
+        const receiptKey = `miwr:v1:${resumeOperationHash.slice('sha256:'.length)}`;
+        const admission = await workflowsStore.admitWorkflowResume({
+          workflowName: step.id,
+          runId,
+          resourceId,
+          resumeOperationHash,
+          operationReplayContext: {
+            version: 1,
+            steps: nestedResumeSteps,
+            ...(resumePath === undefined ? {} : { resumePath }),
           },
-        })) as any;
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
+          lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+          nextLifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+          requestContext: forwardedRequestContext,
+        });
+        if (admission.status !== 'admitted' && admission.status !== 'already_admitted') {
+          throw new NonRetriableError(
+            `Cannot resume nested workflow run ${step.id}/${runId}: atomic admission failed with ${admission.status}`,
+          );
+        }
+
+        let invokeResp: any;
+        try {
+          invokeResp = await this.inngestStep.invoke(`workflow.${executionContext.workflowId}.step.${step.id}`, {
+            function: step.getFunction(),
+            data: {
+              inputData,
+              resourceId,
+              requestContext: forwardedRequestContext,
+              runId: runId,
+              resume: {
+                runId: runId,
+                steps: nestedResumeSteps,
+                resumePayload: resume.resumePayload,
+                resumePath,
+              },
+              receiptKey,
+              resumeOperationHash,
+              outputOptions,
+              perStep,
+              tracingOptions: nestedTracingContext,
+              actor,
+              ...lifecycleExecution,
+            },
+          });
+        } catch (invokeError) {
+          // The child lifecycle tuple is admitted immediately before invoke.
+          if (invokeError instanceof StepError) {
+            const authoritativeChild = await workflowsStore.loadWorkflowSnapshot({
+              workflowName: step.id,
+              runId,
+            });
+            const terminalReceipt = authoritativeChild?.resumeResultReceipt;
+            const hasAuthoritativeTerminalResult =
+              terminalReceipt?.runId === runId &&
+              terminalReceipt?.receiptKey === receiptKey &&
+              terminalReceipt.resumeOperationHash === resumeOperationHash &&
+              terminalReceipt.executionGeneration === lifecycleExecution.executionGeneration &&
+              terminalReceipt.lifecycleResumeAttempt === lifecycleExecution.lifecycleResumeAttempt &&
+              RESUMED_CHILD_TERMINAL_STATUSES.has(terminalReceipt.result.status);
+            if (!hasAuthoritativeTerminalResult) {
+              throw new NonRetriableError(
+                `Nested workflow ${step.id}/${runId} failed without authoritative terminal resume evidence`,
+                { cause: invokeError },
+              );
+            }
+          } else if (admission.status === 'admitted') {
+            try {
+              const rollback = await workflowsStore.rollbackWorkflowResume({
+                workflowName: step.id,
+                runId,
+                resourceId,
+                resumeOperationHash,
+                ...lifecycleExecution,
+              });
+              if (rollback.status !== 'rolled_back' && rollback.status !== 'already_rolled_back') {
+                console.error(`Failed to roll back nested workflow resume admission: ${rollback.status}`);
+              }
+            } catch (rollbackError) {
+              console.error('Failed to roll back nested workflow resume admission:', rollbackError);
+            }
+          }
+          throw invokeError;
+        }
         result = invokeResp.result;
         runId = invokeResp.runId;
         executionContext.state = invokeResp.result.state;
@@ -631,13 +734,17 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
       const errorCause = (e as any)?.cause;
 
       // Try to extract runId from error cause or generate new one
-      if (errorCause && typeof errorCause === 'object') {
+      if (
+        errorCause &&
+        typeof errorCause === 'object' &&
+        typeof (errorCause as { status?: unknown }).status === 'string'
+      ) {
         result = errorCause as WorkflowResult<any, any, any, any>;
         // The runId might be in the result's steps metadata
         runId = errorCause.runId || randomUUID();
       } else {
         // Fallback: if we can't get the result from error, construct a basic failed result
-        runId = randomUUID();
+        runId = runId! || randomUUID();
         result = {
           status: 'failed',
           error: e instanceof Error ? e : new Error(String(e)),

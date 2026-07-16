@@ -206,33 +206,78 @@ export async function persistStepUpdate(
     };
 
     const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
-    const authoritativeSnapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
-    if (
-      authoritativeSnapshot &&
-      (authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration ||
-        authoritativeSnapshot.status === 'success' ||
-        authoritativeSnapshot.status === 'failed' ||
-        authoritativeSnapshot.status === 'canceled' ||
-        authoritativeSnapshot.status === 'tripwire' ||
-        authoritativeSnapshot.status === 'bailed')
-    ) {
-      return;
-    }
     const snapshotToPersist = engine.options?.pruneSnapshot
       ? engine.options.pruneSnapshot({ snapshot, workflowStatus })
       : snapshot;
-    await workflowsStore?.persistWorkflowSnapshot({
+
+    const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
+    if (
+      workflowsStore &&
+      executionContext.resumeOperationHash !== undefined &&
+      (resumeCapabilities?.atomicResumeVersion !== 1 || resumeCapabilities.fencedStepUpdateVersion !== 1)
+    ) {
+      throw new Error(
+        `Workflow storage for ${workflowId}/${runId} does not support atomic resume admission and fenced resumed step updates`,
+      );
+    }
+    if (workflowsStore && resumeCapabilities?.fencedStepUpdateVersion !== 1) {
+      // Compatibility path for ordinary runs on custom adapters which do not
+      // participate in atomic resume. Resumed execution never reaches this
+      // path, because it carries the storage-owned resume operation identity.
+      const authoritativeSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+      if (
+        authoritativeSnapshot &&
+        (authoritativeSnapshot.executionGeneration !== executionContext.executionGeneration ||
+          authoritativeSnapshot.status === 'success' ||
+          authoritativeSnapshot.status === 'failed' ||
+          authoritativeSnapshot.status === 'canceled' ||
+          authoritativeSnapshot.status === 'tripwire' ||
+          authoritativeSnapshot.status === 'bailed' ||
+          authoritativeSnapshot.status === 'skipped')
+      ) {
+        return;
+      }
+      const authoritativeMetadata = authoritativeSnapshot
+        ? Object.fromEntries(Object.entries(authoritativeSnapshot).filter(([key]) => !(key in snapshotToPersist)))
+        : {};
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+        resourceId,
+        snapshot: {
+          ...snapshotToPersist,
+          ...authoritativeMetadata,
+          resourceId: authoritativeSnapshot?.resourceId ?? resourceId,
+          resumeCheckpoint: authoritativeSnapshot?.resumeCheckpoint,
+          resumeResultReceipt: authoritativeSnapshot?.resumeResultReceipt,
+          resumeRollbackReceipt: authoritativeSnapshot?.resumeRollbackReceipt,
+          executionGeneration: snapshot.executionGeneration,
+          lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
+          lifecycleStepStates: snapshot.lifecycleStepStates,
+        },
+      });
+      engine.setLastPersistedStatus(runId, workflowStatus);
+      return;
+    }
+
+    const persisted = await workflowsStore?.persistWorkflowStepUpdate({
       workflowName: workflowId,
       runId,
       resourceId,
-      snapshot: {
-        ...snapshotToPersist,
-        executionGeneration: snapshot.executionGeneration,
-        lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
-        lifecycleStepStates: snapshot.lifecycleStepStates,
-      },
+      expectedResumeOperationHash: executionContext.resumeOperationHash,
+      expectedExecutionGeneration: executionContext.executionGeneration,
+      expectedLifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+      snapshot: snapshotToPersist,
     });
-    engine.setLastPersistedStatus(runId, workflowStatus);
+    if (persisted?.status === 'unsupported') {
+      throw new Error(`Workflow storage for ${workflowId}/${runId} does not support fenced workflow step updates`);
+    }
+    if (persisted?.status === 'invalid_snapshot') {
+      throw new Error(`Workflow storage rejected an invalid step snapshot for ${workflowId}/${runId}`);
+    }
+    if (persisted?.status === 'persisted') {
+      engine.setLastPersistedStatus(runId, workflowStatus);
+    }
   });
 }
 

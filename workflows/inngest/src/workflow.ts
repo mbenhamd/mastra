@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { emitErrorEvent } from '@mastra/core/agent/durable';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import { RequestContext } from '@mastra/core/di';
+import { getErrorFromUnknown } from '@mastra/core/error';
 import { CachingPubSub } from '@mastra/core/events';
 import type { PubSub } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
@@ -18,6 +19,7 @@ import type {
   WorkflowConfig,
   StepFlowEntry,
   WorkflowResult,
+  WorkflowResumeResultDataV1,
   WorkflowRunState,
   WorkflowRunStatus,
   WorkflowStreamEvent,
@@ -29,6 +31,7 @@ import type { Inngest } from 'inngest';
 import { InngestExecutionEngine } from './execution-engine';
 import { InngestPubSub } from './pubsub';
 import { InngestRun } from './run';
+import { inngestWorkflowResumeOperationHash } from './resume-operation';
 import type {
   InngestEngineType,
   InngestFlowControlConfig,
@@ -321,6 +324,7 @@ export class InngestWorkflow<
       workflowName: this.id,
       runId: runIdToUse,
     })) as InngestWorkflowRunState | null | undefined;
+    const resourceId = options?.resourceId ?? existingSnapshot?.resourceId;
     const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
     const defaultPubsub = new InngestPubSub(this.inngest, this.id);
     const pubsub = this.lifecyclePubsub(defaultPubsub);
@@ -331,7 +335,7 @@ export class InngestWorkflow<
       {
         workflowId: this.id,
         runId: runIdToUse,
-        resourceId: options?.resourceId,
+        resourceId,
         executionEngine: this.executionEngine,
         executionGraph: this.executionGraph,
         serializedStepGraph: this.serializedStepGraph,
@@ -373,9 +377,10 @@ export class InngestWorkflow<
       await workflowsStore?.persistWorkflowSnapshot({
         workflowName: this.id,
         runId: runIdToUse,
-        resourceId: options?.resourceId,
+        resourceId,
         snapshot: {
           runId: runIdToUse,
+          resourceId,
           ...lifecycleExecution,
           status: 'pending',
           value: {},
@@ -396,7 +401,7 @@ export class InngestWorkflow<
                 },
               }
             : {}),
-        },
+        } as InngestWorkflowRunState,
       });
     }
 
@@ -472,6 +477,8 @@ export class InngestWorkflow<
           tracingOptions,
           actor,
           disableScorers,
+          receiptKey,
+          resumeOperationHash: suppliedResumeOperationHash,
           executionGeneration: suppliedExecutionGeneration,
           lifecycleResumeAttempt: suppliedLifecycleResumeAttempt,
           lifecycleStepStates: suppliedLifecycleStepStates,
@@ -521,6 +528,24 @@ export class InngestWorkflow<
             if (!snapshot) {
               throw new NonRetriableError(`Cannot execute run ${runId}: snapshot not found`);
             }
+            resourceId = resourceId ?? snapshot.resourceId;
+            const resumeOperationHash = resume
+              ? inngestWorkflowResumeOperationHash({
+                  workflowId: this.id,
+                  runId,
+                  resourceId,
+                  inputData,
+                  steps: resume.steps ?? [],
+                  resumePayload: resume.resumePayload,
+                  resumePath: resume.resumePath,
+                  requestContext: event.data.requestContext ?? {},
+                  outputOptions,
+                  tracingOptions,
+                  perStep: perStep ?? false,
+                  disableScorers,
+                  format,
+                })
+              : undefined;
             if (
               snapshot.executionGeneration !== suppliedLifecycleExecution.executionGeneration ||
               snapshot.lifecycleResumeAttempt !== suppliedLifecycleExecution.lifecycleResumeAttempt ||
@@ -532,6 +557,13 @@ export class InngestWorkflow<
               resume ? snapshot.status !== 'running' : snapshot.status !== 'pending' && snapshot.status !== 'running'
             ) {
               throw new NonRetriableError(`Cannot execute run ${runId}: lifecycle execution is not admitted`);
+            }
+            if (
+              resume &&
+              (suppliedResumeOperationHash !== resumeOperationHash ||
+                snapshot.resumeCheckpoint?.resumeOperationHash !== resumeOperationHash)
+            ) {
+              throw new NonRetriableError(`Cannot execute run ${runId}: resume operation identity is stale`);
             }
             return suppliedLifecycleExecution;
           }
@@ -551,6 +583,25 @@ export class InngestWorkflow<
             if (snapshot.status !== 'suspended') {
               throw new NonRetriableError(`Cannot resume run ${runId}: workflow run is not suspended`);
             }
+            resourceId = resourceId ?? snapshot.resourceId;
+            const resumeOperationHash = inngestWorkflowResumeOperationHash({
+              workflowId: this.id,
+              runId,
+              resourceId,
+              inputData,
+              steps: resume.steps ?? [],
+              resumePayload: resume.resumePayload,
+              resumePath: resume.resumePath,
+              requestContext: event.data.requestContext ?? {},
+              outputOptions,
+              tracingOptions,
+              perStep: perStep ?? false,
+              disableScorers,
+              format,
+            });
+            if (suppliedResumeOperationHash !== undefined && suppliedResumeOperationHash !== resumeOperationHash) {
+              throw new NonRetriableError(`Cannot resume run ${runId}: resume operation identity is stale`);
+            }
             const restoredLifecycleExecution = {
               executionGeneration: requireWorkflowExecutionGeneration(
                 snapshot.executionGeneration,
@@ -559,14 +610,37 @@ export class InngestWorkflow<
               lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
               lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
             };
-            await workflowsStore.updateWorkflowState({
+            const resumeCapabilities = workflowsStore.getWorkflowResumeCapabilities();
+            if (
+              resumeCapabilities.atomicResumeVersion !== 1 ||
+              resumeCapabilities.fencedStepUpdateVersion !== 1
+            ) {
+              throw new NonRetriableError(
+                `Workflow storage for ${this.id}/${runId} does not support atomic resume admission and fenced step updates`,
+              );
+            }
+            const admission = await workflowsStore.admitWorkflowResume({
               workflowName: this.id,
               runId,
-              opts: {
-                status: 'running',
-                ...restoredLifecycleExecution,
+              resourceId,
+              resumeOperationHash,
+              operationReplayContext: {
+                version: 1,
+                steps: resume.steps ?? [],
+                ...(resume.resumePath === undefined ? {} : { resumePath: resume.resumePath }),
+                ...(resume.label === undefined ? {} : { label: resume.label }),
               },
+              executionGeneration: restoredLifecycleExecution.executionGeneration,
+              lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
+              lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
+              nextLifecycleResumeAttempt: restoredLifecycleExecution.lifecycleResumeAttempt,
+              requestContext: event.data.requestContext ?? snapshot.requestContext,
             });
+            if (admission.status !== 'admitted' && admission.status !== 'already_admitted') {
+              throw new NonRetriableError(
+                `Cannot resume run ${runId}: atomic admission failed with ${admission.status}`,
+              );
+            }
             return restoredLifecycleExecution;
           }
 
@@ -683,6 +757,48 @@ export class InngestWorkflow<
         if (hasSuppliedLifecycleState && !authoritativeSnapshot) {
           throw new NonRetriableError(`Cannot execute run ${runId}: snapshot not found`);
         }
+        resourceId = resourceId ?? authoritativeSnapshot?.resourceId;
+        const resumeOperationHash = resume
+          ? inngestWorkflowResumeOperationHash({
+              workflowId: this.id,
+              runId,
+              resourceId,
+              inputData,
+              steps: resume.steps ?? [],
+              resumePayload: resume.resumePayload,
+              resumePath: resume.resumePath,
+              requestContext: event.data.requestContext ?? {},
+              outputOptions,
+              tracingOptions,
+              perStep: perStep ?? false,
+              disableScorers,
+              format,
+            })
+          : undefined;
+        if (
+          resume &&
+          suppliedResumeOperationHash !== undefined &&
+          suppliedResumeOperationHash !== resumeOperationHash
+        ) {
+          throw new NonRetriableError(`Cannot execute run ${runId}: resume operation identity is stale`);
+        }
+        const replayReceipt = authoritativeSnapshot?.resumeResultReceipt;
+        if (
+          resume &&
+          replayReceipt &&
+          replayReceipt.resumeOperationHash === resumeOperationHash &&
+          replayReceipt.executionGeneration === lifecycleExecution.executionGeneration &&
+          replayReceipt.lifecycleResumeAttempt === lifecycleExecution.lifecycleResumeAttempt
+        ) {
+          const replayResult = replayReceipt.result as unknown as WorkflowResult<TState, TInput, TOutput, TSteps>;
+          if (replayResult.status === 'failed') {
+            throw new NonRetriableError(`Workflow failed`, { cause: replayResult });
+          }
+          return { result: replayResult, runId };
+        }
+        if (resume && authoritativeSnapshot?.resumeCheckpoint?.resumeOperationHash !== resumeOperationHash) {
+          throw new NonRetriableError(`Cannot execute run ${runId}: resume operation identity is stale`);
+        }
         if (
           authoritativeSnapshot &&
           (authoritativeSnapshot.executionGeneration !== lifecycleExecution.executionGeneration ||
@@ -698,6 +814,13 @@ export class InngestWorkflow<
             ]),
           );
         }
+        const executionResume = resume
+          ? {
+              ...resume,
+              stepResults: authoritativeSnapshot?.context ?? {},
+            }
+          : undefined;
+        const executionInitialState = resume ? (authoritativeSnapshot?.value ?? initialState) : initialState;
 
         let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
         try {
@@ -705,17 +828,18 @@ export class InngestWorkflow<
             workflowId: this.id,
             runId,
             ...lifecycleExecution,
+            resumeOperationHash,
             resourceId,
             disableScorers,
             graph: this.executionGraph,
             serializedStepGraph: this.serializedStepGraph,
             input: inputData,
-            initialState,
+            initialState: executionInitialState,
             pubsub,
             retryConfig: this.retryConfig,
             requestContext,
             actor,
-            resume,
+            resume: executionResume,
             timeTravel,
             perStep,
             format,
@@ -748,7 +872,7 @@ export class InngestWorkflow<
           result = {
             status: 'failed',
             steps: {},
-            state: initialState ?? {},
+            state: executionInitialState ?? {},
             error: executionError instanceof Error ? executionError : new Error(String(executionError)),
           } as WorkflowResult<TState, TInput, TOutput, TSteps>;
         }
@@ -783,7 +907,7 @@ export class InngestWorkflow<
                 resourceId,
                 input: inputData,
                 requestContext,
-                state: result.state ?? initialState ?? {},
+                state: result.state ?? executionInitialState ?? {},
               });
             }
 
@@ -809,57 +933,109 @@ export class InngestWorkflow<
               }
             }
 
-            // Ensure final snapshot is persisted BEFORE publishing workflow-finish
-            // This fixes a race condition where getRunOutput reads the snapshot before it's fully written
+            // Persist/finalize before publishing workflow-finish so neither the
+            // realtime nor polling path can observe a stale suspended result.
             const shouldPersistFinalSnapshot = this.options.shouldPersistSnapshot({
               workflowStatus: result.status,
               stepResults: result.steps,
             });
-            if (shouldPersistFinalSnapshot) {
-              const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
-              if (workflowsStore) {
-                // For suspended workflows, read existing snapshot to preserve suspendedPaths and resumeLabels
-                // which were set correctly by the handlers during execution
-                let existingSnapshot:
-                  | { suspendedPaths?: Record<string, number[]>; resumeLabels?: Record<string, any> }
-                  | undefined;
-                if (result.status === 'suspended') {
-                  existingSnapshot =
-                    (await workflowsStore.loadWorkflowSnapshot({
-                      workflowName: this.id,
-                      runId,
-                    })) ?? undefined;
-                }
+            const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
+            const existingSnapshot =
+              (await workflowsStore?.loadWorkflowSnapshot({
+                workflowName: this.id,
+                runId,
+              })) as InngestWorkflowRunState | undefined;
+            const serializedError =
+              result.status === 'failed'
+                ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()
+                : undefined;
+            const snapshotContext = toSnapshotContext(result.steps);
+            const finalLifecycleExecution = {
+              ...lifecycleExecution,
+              lifecycleStepStates: existingSnapshot?.lifecycleStepStates ?? lifecycleExecution.lifecycleStepStates,
+            };
+            const finalSnapshot: InngestWorkflowRunState = {
+              ...existingSnapshot,
+              runId,
+              resourceId: existingSnapshot?.resourceId ?? resourceId,
+              requestContext: existingSnapshot?.requestContext ?? Object.fromEntries(requestContext.entries()),
+              status: result.status,
+              value: result.state ?? executionInitialState ?? {},
+              context: snapshotContext,
+              activePaths: [],
+              activeStepsPath: {},
+              serializedStepGraph: this.serializedStepGraph,
+              suspendedPaths: existingSnapshot?.suspendedPaths ?? {},
+              waitingPaths: {},
+              resumeLabels: result.resumeLabels ?? existingSnapshot?.resumeLabels ?? {},
+              result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
+              error: serializedError,
+              timestamp: Date.now(),
+              ...finalLifecycleExecution,
+              ...(disableScorers !== undefined
+                ? {
+                    runOptions: {
+                      ...existingSnapshot?.runOptions,
+                      disableScorers,
+                    },
+                  }
+                : {}),
+            };
+            const workflowResult: WorkflowResumeResultDataV1 = {
+              status: result.status,
+              input: inputData,
+              steps: snapshotContext,
+              state: result.state ?? executionInitialState ?? {},
+              ...(result.status === 'success' ? { result: result.result } : {}),
+              ...(serializedError ? { error: serializedError } : {}),
+              ...('tripwire' in result && result.tripwire ? { tripwire: result.tripwire } : {}),
+              ...('stepExecutionPath' in result && result.stepExecutionPath
+                ? { stepExecutionPath: result.stepExecutionPath }
+                : {}),
+              ...(result.resumeLabels ? { resumeLabels: result.resumeLabels } : {}),
+            };
+            let publishedWorkflowResult = workflowResult;
+            const resolvedResumeReceiptKey =
+              resume && resumeOperationHash
+                ? (receiptKey ?? `miwr:v1:${resumeOperationHash.slice('sha256:'.length)}`)
+                : undefined;
 
-                await workflowsStore.persistWorkflowSnapshot({
-                  workflowName: this.id,
-                  runId,
-                  resourceId,
-                  snapshot: {
-                    runId,
-                    status: result.status,
-                    value: result.state ?? initialState ?? {},
-                    context: toSnapshotContext(result.steps),
-                    activePaths: [],
-                    activeStepsPath: {},
-                    serializedStepGraph: this.serializedStepGraph,
-                    suspendedPaths: existingSnapshot?.suspendedPaths ?? {},
-                    waitingPaths: {},
-                    resumeLabels: existingSnapshot?.resumeLabels ?? result.resumeLabels ?? {},
-                    result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
-                    error: result.status === 'failed' ? result.error : undefined,
-                    timestamp: Date.now(),
-                    ...lifecycleExecution,
-                    ...(disableScorers !== undefined
-                      ? {
-                          runOptions: {
-                            disableScorers,
-                          },
-                        }
-                      : {}),
-                  } as InngestWorkflowRunState,
-                });
+            if (resume) {
+              const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
+              if (
+                !workflowsStore ||
+                resumeCapabilities?.atomicResumeVersion !== 1 ||
+                resumeCapabilities.fencedStepUpdateVersion !== 1
+              ) {
+                throw new NonRetriableError(`Workflow storage is required to finalize resumed run ${runId}`);
               }
+              if (!resolvedResumeReceiptKey || !resumeOperationHash) {
+                throw new NonRetriableError(`Cannot finalize resumed run ${runId}: receipt identity is missing`);
+              }
+              const finalization = await workflowsStore.finalizeWorkflowResume({
+                workflowName: this.id,
+                runId,
+                resourceId: existingSnapshot?.resourceId ?? resourceId,
+                resumeOperationHash,
+                ...finalLifecycleExecution,
+                shouldPersistSnapshot: shouldPersistFinalSnapshot,
+                snapshot: finalSnapshot,
+                receiptKey: resolvedResumeReceiptKey,
+                result: workflowResult,
+              });
+              if (finalization.status !== 'finalized' && finalization.status !== 'already_finalized') {
+                throw new NonRetriableError(
+                  `Cannot finalize resumed run ${runId}: atomic finalization failed with ${finalization.status}`,
+                );
+              }
+              if (finalization.receipt) publishedWorkflowResult = finalization.receipt.result;
+            } else if (shouldPersistFinalSnapshot && workflowsStore) {
+              await workflowsStore.persistWorkflowSnapshot({
+                workflowName: this.id,
+                runId,
+                resourceId,
+                snapshot: finalSnapshot,
+              });
             }
 
             // Publish workflow-finish event for realtime subscribers (best-effort)
@@ -873,11 +1049,30 @@ export class InngestWorkflow<
                     status: result.status,
                     result: result.status === 'success' ? result.result : undefined,
                     error: result.status === 'failed' ? result.error : undefined,
+                    ...(resume
+                      ? {
+                          workflowResult: publishedWorkflowResult,
+                          receiptKey: resolvedResumeReceiptKey,
+                          resumeOperationHash,
+                          executionGeneration: finalLifecycleExecution.executionGeneration,
+                          lifecycleResumeAttempt: finalLifecycleExecution.lifecycleResumeAttempt,
+                        }
+                      : {}),
                   },
                 },
               });
             } catch (publishError) {
               this.logger.debug?.('Failed to publish workflow-finish event:', publishError);
+            }
+
+            if (
+              result.status !== 'failed' &&
+              publishedWorkflowResult.status === 'failed' &&
+              publishedWorkflowResult.error?.name === 'WorkflowResumeResultTooLargeError'
+            ) {
+              throw new NonRetriableError(`Workflow resume result exceeded the durable receipt limit`, {
+                cause: publishedWorkflowResult,
+              });
             }
 
             // Throw after span ended for failed workflows

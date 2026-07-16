@@ -108,7 +108,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       snapshot.status === 'failed' ||
       snapshot.status === 'canceled' ||
       snapshot.status === 'tripwire' ||
-      snapshot.status === 'bailed'
+      snapshot.status === 'bailed' ||
+      snapshot.status === 'skipped'
     ) {
       // executeEntry persists this execution's own step result before control
       // returns here. Do not mistake that local write for an independently
@@ -757,6 +758,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     executionGeneration: string;
     lifecycleResumeAttempt: number;
     lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
+    resumeOperationHash?: `sha256:${string}`;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -894,6 +896,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         executionGeneration,
         lifecycleResumeAttempt,
         lifecycleStepStates,
+        resumeOperationHash: params.resumeOperationHash,
         executionPath: [i],
         stepExecutionPath,
         activeStepsPath: {},

@@ -206,7 +206,7 @@ describe('workflow terminal parent continuation planner', () => {
     });
   });
 
-  it.each(['success', 'failed', 'canceled', 'tripwire', 'bailed'] as const)(
+  it.each(['success', 'failed', 'canceled', 'tripwire', 'bailed', 'skipped'] as const)(
     'returns a no-op for an already-%s parent',
     status => {
       const parent = snapshot([{ type: 'step', step: { id: 'nested', component: 'WORKFLOW' } }]);
