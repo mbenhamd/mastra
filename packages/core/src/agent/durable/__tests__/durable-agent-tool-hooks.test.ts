@@ -94,6 +94,67 @@ describe('DurableAgent tool hooks', () => {
     await pubsub.close();
   });
 
+  it('serializes only an opaque marker for per-execution hooks', async () => {
+    const beforeToolCall = vi.fn();
+    const afterToolCall = vi.fn();
+    const baseAgent = new Agent({
+      id: 'durable-run-hook-policy-agent',
+      name: 'Durable Run Hook Policy Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('plainTool', {}, 'done') as any,
+      tools: {
+        plainTool: createTool({
+          id: 'plainTool',
+          description: 'plain',
+          inputSchema: z.object({}),
+          execute: async () => ({ ok: true }),
+        }),
+      },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const prepared = await durableAgent.prepare('run it', { hooks: { beforeToolCall, afterToolCall } });
+
+    expect(prepared.workflowInput.options.toolHookPolicy).toEqual({
+      kind: 'run-registry',
+      id: expect.any(String),
+      beforeToolCall: true,
+      afterToolCall: true,
+    });
+    expect(durableAgent.runRegistry.get(prepared.runId)?.toolHookPolicy).toEqual({
+      id: prepared.workflowInput.options.toolHookPolicy?.id,
+      hooks: { beforeToolCall, afterToolCall },
+    });
+    const wireInput = JSON.parse(JSON.stringify(prepared.workflowInput));
+    expect(wireInput.options.toolHookPolicy).toEqual(prepared.workflowInput.options.toolHookPolicy);
+    expect(JSON.stringify(wireInput)).not.toContain('beforeToolCall()');
+    expect((wireInput.options as any).hooks).toBeUndefined();
+  });
+
+  it('does not mark reconstructible agent-configured hooks as per-execution policy', async () => {
+    const baseAgent = new Agent({
+      id: 'durable-configured-hook-policy-agent',
+      name: 'Durable Configured Hook Policy Agent',
+      instructions: 'use the tool',
+      model: createToolCallThenTextModel('plainTool', {}, 'done') as any,
+      tools: {
+        plainTool: createTool({
+          id: 'plainTool',
+          description: 'plain',
+          inputSchema: z.object({}),
+          execute: async () => ({ ok: true }),
+        }),
+      },
+      hooks: { beforeToolCall: vi.fn(), afterToolCall: vi.fn() },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const prepared = await durableAgent.prepare('run it');
+
+    expect(prepared.workflowInput.options.toolHookPolicy).toBeUndefined();
+    expect(durableAgent.runRegistry.get(prepared.runId)?.toolHookPolicy).toBeUndefined();
+  });
+
   it('runs configured hooks exactly once around a durable tool call', async () => {
     const execute = vi.fn(async () => ({ ok: true }));
     const beforeToolCall = vi.fn();

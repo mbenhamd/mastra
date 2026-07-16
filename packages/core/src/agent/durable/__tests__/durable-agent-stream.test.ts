@@ -459,6 +459,85 @@ describe('DurableAgent streaming execution', () => {
       globalRunRegistry.delete(prepared.runId);
     });
 
+    it('should bind per-execution tool hooks to the exact warm registry policy', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-hook-binding-agent',
+        name: 'Durable Hook Binding Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'tool-hook-binding-run',
+        hooks: { beforeToolCall: vi.fn() },
+      });
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).resolves.toEqual(expect.objectContaining({ tools: expect.any(Object), model: expect.any(Object) }));
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
+    });
+
+    it('should reject cold model resolution when per-execution tool hooks were lost', async () => {
+      const model = createTextStreamModel('must-not-run');
+      const baseAgent = new Agent({
+        id: 'durable-cold-hook-agent',
+        name: 'Durable Cold Hook Agent',
+        instructions: 'test',
+        model: model as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'cold-tool-hook-run',
+        hooks: { beforeToolCall: vi.fn() },
+      });
+      globalRunRegistry.delete(prepared.runId);
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+          mastra: { getAgentById: () => baseAgent } as any,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+    });
+
+    it('should reject a stale warm per-execution hook policy identity', async () => {
+      const baseAgent = new Agent({
+        id: 'durable-stale-hook-agent',
+        name: 'Durable Stale Hook Agent',
+        instructions: 'test',
+        model: createTextStreamModel('unused') as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const prepared = await durableAgent.prepare('test', {
+        runId: 'stale-tool-hook-run',
+        hooks: { beforeToolCall: vi.fn() },
+      });
+      const entry = globalRunRegistry.get(prepared.runId)!;
+      entry.toolHookPolicy = { ...entry.toolHookPolicy!, id: 'stale-policy-id' };
+
+      await expect(
+        resolveRuntimeDependencies({
+          runId: prepared.runId,
+          agentId: baseAgent.id,
+          input: prepared.workflowInput,
+        }),
+      ).rejects.toMatchObject({ id: 'DURABLE_AGENT_TOOL_HOOK_POLICY_UNAVAILABLE' });
+
+      durableAgent.runRegistry.cleanup(prepared.runId);
+      globalRunRegistry.delete(prepared.runId);
+    });
+
     it('should keep a pre-binding-shaped registry-required input fail-closed after registry loss', async () => {
       const backingTool = createTool({
         id: 'legacyBackingTool',

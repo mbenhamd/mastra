@@ -61,6 +61,7 @@ import {
   serializeModelList,
   serializeToolsMetadata,
 } from './utils/serialize-state';
+import { assertDurableToolHookPolicyAvailable } from './utils/tool-hook-policy';
 import { createDurableAgenticWorkflow } from './workflows';
 
 /**
@@ -103,6 +104,13 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   toolsetsMode?: AgentExecutionOptions<OUTPUT>['toolsetsMode'];
   /** Client-side tools available during execution */
   clientTools?: AgentExecutionOptions<OUTPUT>['clientTools'];
+  /**
+   * Per-execution tool hooks. These closures work while the original durable
+   * run registry is available. Cold/cross-process execution fails closed;
+   * configure security-enforcing hooks on the wrapped Agent when they must be
+   * reconstructible on another worker.
+   */
+  hooks?: AgentExecutionOptions<OUTPUT>['hooks'];
   /** Tool selection strategy */
   toolChoice?: AgentExecutionOptions<OUTPUT>['toolChoice'];
   /** Tool names enabled for this execution */
@@ -205,8 +213,15 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   abortSignal?: AbortSignal;
 }
 
-/** Runtime callbacks plus caller identity used to resume a durable segment. */
-export interface DurableAgentResumeOptions<OUTPUT = undefined> extends DurableAgentStreamOptions<OUTPUT> {
+/**
+ * Runtime callbacks plus caller identity used to resume a durable segment.
+ * Tool hooks are fixed when the run starts and cannot be added or replaced on
+ * resume.
+ */
+export interface DurableAgentResumeOptions<OUTPUT = undefined> extends Omit<
+  DurableAgentStreamOptions<OUTPUT>,
+  'hooks'
+> {
   /** Exact workflow resume label for the suspended tool call. */
   toolCallId?: string;
 }
@@ -1926,6 +1941,7 @@ export class DurableAgent<
         details: { agentName: this.name, runId },
       });
     }
+    assertDurableToolHookPolicyAvailable({ serialized: workflowInput.options.toolHookPolicy });
     if (!this.#durableSnapshotPairIsConsistent(runId, persisted, snapshot, nestedPersisted, nestedSnapshot)) {
       throw new MastraError({
         id: 'DURABLE_AGENT_RESUME_SNAPSHOT_PAIR_CONFLICT',
@@ -2586,6 +2602,19 @@ export class DurableAgent<
     resumeData: unknown,
     options?: DurableAgentResumeOptions<TOutput>,
   ): Promise<DurableAgentStreamResult<TOutput>> {
+    if (
+      typeof (options as DurableAgentStreamOptions<TOutput> | undefined)?.hooks?.beforeToolCall === 'function' ||
+      typeof (options as DurableAgentStreamOptions<TOutput> | undefined)?.hooks?.afterToolCall === 'function'
+    ) {
+      throw new MastraError({
+        id: 'DURABLE_AGENT_RESUME_TOOL_HOOKS_UNSUPPORTED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text:
+          'Durable tool hooks are fixed when a run starts and cannot be added or replaced on resume. ' +
+          'Configure durable policy on the Agent or pass per-execution hooks to the initial stream or generate call.',
+      });
+    }
     resumeData = snapshotAgentExecutionValue(resumeData);
     options = options
       ? snapshotAgentExecutionOptions(options, ['runId', 'toolCallId', 'requestContext', 'memory', 'versions'])
@@ -3044,6 +3073,7 @@ export class DurableAgent<
         details: { agentName: this.name, runId, ownerAgentId: workflowInput.agentId },
       });
     }
+    assertDurableToolHookPolicyAvailable({ serialized: workflowInput.options.toolHookPolicy });
 
     // 2. Rebuild the RequestContext from the persisted JSON-safe snapshot.
     const requestContext: RequestContext = workflowInput.requestContextEntries
@@ -3406,7 +3436,8 @@ export class DurableAgent<
    * snapshot-based resume.
    *
    * Returns just the `MastraModelOutput` (matching the base Agent's return
-   * type) while internally delegating to `this.resume()`.
+   * type) while internally delegating to `this.resume()`. Hook overrides are
+   * rejected because the suspended run remains bound to its initial policy.
    */
   override async resumeStream<OUTPUT = TOutput>(
     resumeData: unknown,
