@@ -299,6 +299,163 @@ describe('Inngest createRun contract', () => {
     );
   });
 
+  it('preserves a persisted explicit false over a later truthy reattachment option', async () => {
+    const storage = new MockStore();
+    const firstWorker = createTestWorkflow(storage);
+    const firstRun = await firstWorker.workflow.createRun({
+      runId: 'cold-false-precedence-run',
+      disableScorers: false,
+    });
+
+    const replacementWorker = createTestWorkflow(storage);
+    const replacementRun = await replacementWorker.workflow.createRun({
+      runId: firstRun.runId,
+      disableScorers: true,
+    });
+
+    expect(replacementRun.disableScorers).toBe(false);
+    const workflowsStore = await replacementWorker.mastra.getStorage()!.getStore('workflows');
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: replacementWorker.workflow.id,
+        runId: firstRun.runId,
+      }),
+    ).resolves.toMatchObject({
+      status: 'pending',
+      runOptions: {
+        disableScorers: false,
+      },
+    });
+  });
+
+  it('rehydrates disableScorers for cold time travel after worker replacement', async () => {
+    const storage = new MockStore();
+    const firstWorker = createTestWorkflow(storage);
+    const firstRun = await firstWorker.workflow.createRun({
+      runId: 'cold-time-travel-run',
+      disableScorers: true,
+    });
+    const workflowsStore = await firstWorker.mastra.getStorage()!.getStore('workflows');
+    const pendingSnapshot = await workflowsStore!.loadWorkflowSnapshot({
+      workflowName: firstWorker.workflow.id,
+      runId: firstRun.runId,
+    });
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: firstWorker.workflow.id,
+      runId: firstRun.runId,
+      snapshot: {
+        ...pendingSnapshot!,
+        status: 'success',
+        context: {
+          input: {
+            count: 12,
+            mode: 'safe',
+          },
+        },
+      },
+    });
+
+    const replacementWorker = createTestWorkflow(storage);
+    const replacementRun = await replacementWorker.workflow.createRun({ runId: firstRun.runId });
+    const replacementSend = vi
+      .spyOn(replacementWorker.inngest, 'send')
+      .mockResolvedValue({ ids: ['time-travel-event'] } as never);
+    vi.spyOn(replacementRun, 'getRunOutput').mockResolvedValue({
+      output: {
+        result: {
+          status: 'success',
+          input: { count: 13, mode: 'safe' },
+          steps: {},
+          result: { count: 13 },
+        },
+      },
+    } as never);
+
+    await replacementRun.timeTravel({
+      step: 'parse-input',
+      inputData: { count: '13' },
+    });
+
+    expect(replacementRun.disableScorers).toBe(true);
+    expect(replacementSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          runId: firstRun.runId,
+          disableScorers: true,
+        }),
+      }),
+    );
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: firstWorker.workflow.id,
+        runId: firstRun.runId,
+      }),
+    ).resolves.toMatchObject({
+      status: 'running',
+      runOptions: {
+        disableScorers: true,
+      },
+    });
+  });
+
+  it.each([
+    { dispatchOutcome: 'send rejection', eventIds: undefined },
+    { dispatchOutcome: 'missing event id', eventIds: [] },
+  ])('restores the prior snapshot when time-travel dispatch ends in $dispatchOutcome', async ({ eventIds }) => {
+    const { inngest, mastra, workflow } = createTestWorkflow();
+    const run = await workflow.createRun({ disableScorers: true });
+    const workflowsStore = await mastra.getStorage()!.getStore('workflows');
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: run.runId,
+      snapshot: {
+        ...(await workflowsStore!.loadWorkflowSnapshot({
+          workflowName: workflow.id,
+          runId: run.runId,
+        }))!,
+        status: 'success',
+        context: {
+          input: {
+            count: 14,
+            mode: 'safe',
+          },
+        },
+      },
+    });
+    const send = vi.spyOn(inngest, 'send');
+    const expectedError = eventIds ? 'Event ID is not set' : 'time-travel dispatch failed';
+    if (eventIds) {
+      send.mockResolvedValue({ ids: eventIds } as never);
+    } else {
+      send.mockRejectedValue(new Error(expectedError));
+    }
+
+    await expect(
+      run.timeTravel({
+        step: 'parse-input',
+        inputData: { count: '15' },
+      }),
+    ).rejects.toThrow(expectedError);
+
+    await expect(
+      workflowsStore!.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: run.runId,
+      }),
+    ).resolves.toMatchObject({
+      status: 'success',
+      context: {
+        input: {
+          count: 14,
+          mode: 'safe',
+        },
+      },
+      runOptions: {
+        disableScorers: true,
+      },
+    });
+  });
+
   it('keeps the ordinary createRun path unchanged when no run options are provided', async () => {
     const { inngest, workflow } = createTestWorkflow();
     const send = vi.spyOn(inngest, 'send').mockResolvedValue({ ids: ['event-3'] } as never);
