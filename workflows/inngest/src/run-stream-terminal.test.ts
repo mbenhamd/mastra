@@ -163,7 +163,7 @@ describe('Inngest stream terminal contract', () => {
     const error = new Error('workflow failed');
     const failedResult = { status: 'failed', input: {}, steps: {}, error };
     const run = await createTestRun('vnext-failed-terminal', failedResult);
-    const terminalEvent = createTerminalEvent('failed', { error });
+    const terminalEvent = JSON.parse(JSON.stringify(createTerminalEvent('failed', { error })));
     emitWatchEvents(run, [terminalEvent]);
 
     const output = run.stream({ inputData: {} });
@@ -177,9 +177,12 @@ describe('Inngest stream terminal contract', () => {
         payload: {
           workflowStatus: 'failed',
           output: { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
-          metadata: { error, errorMessage: 'workflow failed' },
+          metadata: {
+            error: { name: 'Error', message: 'workflow failed', stack: expect.any(String) },
+            errorMessage: 'workflow failed',
+          },
           status: 'failed',
-          error,
+          error: { name: 'Error', message: 'workflow failed', stack: expect.any(String) },
         },
       },
     ]);

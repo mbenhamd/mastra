@@ -55,15 +55,11 @@ export function createInngestWorkflowTerminalPayload(result: {
   result?: unknown;
   error?: unknown;
 } {
-  const terminalError = result.status === 'failed' ? result.error : undefined;
-  const errorMessage =
-    terminalError instanceof Error
-      ? terminalError.message
-      : typeof terminalError === 'object' &&
-          terminalError !== null &&
-          typeof (terminalError as { message?: unknown }).message === 'string'
-        ? (terminalError as { message: string }).message
-        : undefined;
+  const terminalError =
+    result.status === 'failed' && result.error !== undefined
+      ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()
+      : undefined;
+  const errorMessage = terminalError?.message;
 
   return {
     workflowStatus: result.status,
