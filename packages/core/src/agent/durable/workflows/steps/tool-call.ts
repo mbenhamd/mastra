@@ -37,6 +37,10 @@ import type {
 import { applyToolPayloadTransformToChunk } from '../../utils/apply-tool-payload-transform';
 import { rebuildRunToolsFromMastra, resolveTool, toolApprovalRequirement } from '../../utils/resolve-runtime';
 import { serializeError } from '../../utils/serialize-state';
+import {
+  assertDurableToolHookPolicyAvailable,
+  throwDurableToolHookPolicyUnavailable,
+} from '../../utils/tool-hook-policy';
 
 /**
  * Input schema for the durable tool call step.
@@ -301,6 +305,14 @@ export function createDurableToolCallStep() {
 
       const { runId, runtimeBindingId, options: agentOptions, state } = initData;
       const logger = (mastra as any)?.getLogger?.();
+      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+      assertDurableToolHookPolicyAvailable({
+        serialized: agentOptions.toolHookPolicy,
+        registryEntry,
+      });
+      if (agentOptions.toolHookPolicy !== undefined && !registryEntry?.tools) {
+        throwDurableToolHookPolicyUnavailable();
+      }
       const resumeIdentityDigest = createToolCallIdentityDigest({ toolCallId: metadataToolCallId, toolName, args });
       const identityDigest = createToolCallIdentityDigest({ toolCallId, toolName, args });
 
@@ -347,7 +359,6 @@ export function createDurableToolCallStep() {
 
       // 1. Resolve the tool from the binding-checked registry first. Built-in
       // durable runs fail closed if that exact runtime entry was lost.
-      const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       if (!registryEntry && initData.runtimeResolution === 'registry-required') {
         throw new MastraError({
           id: 'DURABLE_AGENT_RUNTIME_REGISTRY_MISSING',
@@ -406,6 +417,13 @@ export function createDurableToolCallStep() {
         tool = Object.values(toolSourceMap ?? {}).find(
           (t: any) => t && typeof t === 'object' && 'id' in t && t.id === toolName,
         ) as typeof tool;
+      }
+
+      // Per-execution hooks are burned into the exact tool wrappers captured
+      // at preparation. Falling back to a Mastra-wide or freshly rebuilt tool
+      // here would execute outside that policy even when its marker matches.
+      if (!tool && agentOptions.toolHookPolicy !== undefined) {
+        throwDurableToolHookPolicyUnavailable();
       }
 
       if (!tool && replacementToolNames === undefined && initData.runtimeResolution !== 'registry-required') {

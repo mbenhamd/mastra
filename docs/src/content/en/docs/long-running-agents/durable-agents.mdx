@@ -219,6 +219,8 @@ Protected tool configuration supports ordinary objects and descriptor-visible cl
 
 Use agent-level [`beforeToolCall` and `afterToolCall` hooks](/docs/agents/using-tools#run-logic-around-tool-calls) for validation, auditing, blocking, and other logic around tool execution. Register those hooks on the wrapped Agent so another worker can rebuild the same executable surface.
 
+Per-execution hooks passed to the initial `durableAgent.stream()` or `generate()` call remain supported while the original run registry is available. The policy is fixed for the lifetime of that run; `resume()` and `resumeStream()` reject attempts to add or replace hooks. Because JavaScript closures can't be serialized, a cold worker, retry, or resume fails before provider or tool execution when the initial registry-bound policy is unavailable or doesn't match. Use Agent-level hooks for security policy that must survive cross-process dispatch. Durable execution never silently drops a per-execution hook.
+
 ## Cleanup
 
 Every `stream()` and `observe()` call returns a `cleanup` function. Calling it unsubscribes from PubSub and removes the run from the internal registry. If you forget to call it, an automatic timer fires after the stream ends, but calling `cleanup()` yourself frees resources immediately.

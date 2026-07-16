@@ -24,6 +24,7 @@ import type { ChunkType } from '../../stream/types';
 import type {
   CoreTool,
   RequireToolApproval,
+  ToolHooks,
   ToolPayloadTransformPolicy,
   ToolPayloadTransformTarget,
 } from '../../tools/types';
@@ -168,6 +169,17 @@ export interface SerializableModelSettings {
 }
 
 /**
+ * JSON-safe proof that a durable run depends on per-execution tool hooks kept
+ * in its original process-local run registry.
+ */
+export interface SerializableToolHookPolicy {
+  kind: 'run-registry';
+  id: string;
+  beforeToolCall: boolean;
+  afterToolCall: boolean;
+}
+
+/**
  * Options for durable agent execution (serializable subset)
  */
 export interface SerializableDurableOptions {
@@ -179,6 +191,8 @@ export interface SerializableDurableOptions {
   activeTools?: string[];
   /** Immutable tool-name ceiling for replacement toolset executions */
   toolSurfaceFence?: string[];
+  /** Opaque identity for non-serializable per-execution tool hooks */
+  toolHookPolicy?: SerializableToolHookPolicy;
   /** Serializable LLM call settings (temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, stopSequences, seed). Headers are excluded — see RunRegistryEntry. */
   modelSettings?: SerializableModelSettings;
   /** Whether to require tool approval globally */
@@ -596,6 +610,11 @@ export interface RunRegistryEntry {
    * model was shown the fenced original.
    */
   replacementToolSurface?: Record<string, CoreTool>;
+  /**
+   * Per-execution tool hooks and their opaque durable identity. The hooks are
+   * never serialized; cold workers must fail closed when this entry is gone.
+   */
+  toolHookPolicy?: { id: string; hooks: ToolHooks };
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
   saveQueueManager?: SaveQueueManager;
   /** Memory instance for thread creation and message persistence */
