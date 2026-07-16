@@ -114,6 +114,37 @@ function inngestWorkflowDispatchId(params: {
   return `miwd:v1:${digest}`;
 }
 
+export function createTerminalStreamGate<TEvent>(write: (event: TEvent) => Promise<void>) {
+  let terminalDelivered = false;
+  let writeQueue = Promise.resolve();
+
+  const enqueue = (event: TEvent, terminal: boolean): Promise<boolean> => {
+    const operation = writeQueue.then(async () => {
+      if (terminalDelivered) return false;
+
+      await write(event);
+      if (terminal) terminalDelivered = true;
+      return true;
+    });
+
+    // Keep later writes ordered even when this caller observes a rejection.
+    writeQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  };
+
+  return {
+    writeWatchEvent(event: TEvent, type: string): Promise<boolean> {
+      return enqueue(event, type === 'workflow-finish');
+    },
+    writeSyntheticFinish(event: TEvent): Promise<boolean> {
+      return enqueue(event, true);
+    },
+  };
+}
+
 export class InngestRun<
   TEngineType = InngestEngineType,
   TSteps extends Step<string, any, any, any, any, any, TEngineType>[] = Step<
@@ -1301,11 +1332,12 @@ export class InngestRun<
     const { readable, writable } = new TransformStream<StreamEvent, StreamEvent>();
 
     const writer = writable.getWriter();
-    void writer.write({
-      // @ts-expect-error - stream event type mismatch
+    const terminalGate = createTerminalStreamGate<StreamEvent>(event => writer.write(event));
+    const startEvent = {
       type: 'start',
       payload: { runId: this.runId },
-    });
+    } as unknown as StreamEvent;
+    void terminalGate.writeWatchEvent(startEvent, 'workflow-start').catch(() => {});
 
     const unwatch = this.watch(async event => {
       try {
@@ -1319,22 +1351,25 @@ export class InngestRun<
           e.payload = e.payload.output.payload;
         }
         // watch events are data stream events, so we need to cast them to the correct type
-        await writer.write(e as any);
+        await terminalGate.writeWatchEvent(e as StreamEvent, event.type);
       } catch {}
     });
 
     this.closeStreamAction = async () => {
-      await writer.write({
-        type: 'finish',
-        // @ts-expect-error - stream event type mismatch
-        payload: { runId: this.runId },
-      });
       unwatch();
 
       try {
+        const finishEvent = {
+          type: 'finish',
+          payload: { runId: this.runId },
+        } as unknown as StreamEvent;
+        await terminalGate.writeSyntheticFinish(finishEvent);
         await writer.close();
       } catch (err) {
-        console.error('Error closing stream:', err);
+        try {
+          await writer.abort(err);
+        } catch {}
+        throw new Error(`Failed to finalize legacy workflow stream for run ${this.runId}`, { cause: err });
       } finally {
         writer.releaseLock();
       }
@@ -1424,17 +1459,18 @@ export class InngestRun<
         try {
           executionResults = await executionResultsPromise;
 
+          if (self.streamOutput) {
+            self.streamOutput.updateResults(
+              executionResults as unknown as WorkflowResult<TState, TInput, TOutput, TSteps>,
+            );
+          }
+
           if (closeOnSuspend) {
             // always close stream, even if the workflow is suspended
             // this will trigger a finish event with workflow status set to suspended
             self.closeStreamAction?.().catch(() => {});
           } else if (executionResults.status !== 'suspended') {
             self.closeStreamAction?.().catch(() => {});
-          }
-          if (self.streamOutput) {
-            self.streamOutput.updateResults(
-              executionResults as unknown as WorkflowResult<TState, TInput, TOutput, TSteps>,
-            );
           }
         } catch (err) {
           self.streamOutput?.rejectResults(err as unknown as Error);
@@ -1532,11 +1568,11 @@ export class InngestRun<
         let executionResults;
         try {
           executionResults = await executionResultsPromise;
-          self.closeStreamAction?.().catch(() => {});
 
           if (self.streamOutput) {
             self.streamOutput.updateResults(executionResults);
           }
+          self.closeStreamAction?.().catch(() => {});
         } catch (err) {
           self.streamOutput?.rejectResults(err as unknown as Error);
           self.closeStreamAction?.().catch(() => {});

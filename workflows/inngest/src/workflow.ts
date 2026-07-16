@@ -30,8 +30,8 @@ import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { InngestExecutionEngine } from './execution-engine';
 import { InngestPubSub } from './pubsub';
-import { InngestRun } from './run';
 import { inngestWorkflowResumeOperationHash } from './resume-operation';
+import { InngestRun } from './run';
 import type {
   InngestEngineType,
   InngestFlowControlConfig,
@@ -45,6 +45,41 @@ export const INNGEST_WORKFLOW_LIFECYCLE_REPLAY = {
   retentionMs: 24 * 60 * 60 * 1000,
   maxEvents: 10_000,
 } as const;
+
+export function createInngestWorkflowTerminalPayload(result: {
+  status: WorkflowRunStatus;
+  result?: unknown;
+  error?: unknown;
+}): Extract<WorkflowStreamEvent, { type: 'workflow-finish' }>['payload'] & {
+  status: WorkflowRunStatus;
+  result?: unknown;
+  error?: unknown;
+} {
+  const terminalError = result.status === 'failed' ? result.error : undefined;
+  const errorMessage =
+    terminalError instanceof Error
+      ? terminalError.message
+      : typeof terminalError === 'object' &&
+          terminalError !== null &&
+          typeof (terminalError as { message?: unknown }).message === 'string'
+        ? (terminalError as { message: string }).message
+        : undefined;
+
+  return {
+    workflowStatus: result.status,
+    output: {
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      },
+    },
+    metadata: terminalError === undefined ? {} : { error: terminalError, errorMessage },
+    status: result.status,
+    result: result.status === 'success' ? result.result : undefined,
+    error: terminalError,
+  };
+}
 
 function requireLifecycleEventTuple(params: {
   workflowId: string;
@@ -611,10 +646,7 @@ export class InngestWorkflow<
               lifecycleStepStates: snapshot.lifecycleStepStates ?? {},
             };
             const resumeCapabilities = workflowsStore.getWorkflowResumeCapabilities();
-            if (
-              resumeCapabilities.atomicResumeVersion !== 1 ||
-              resumeCapabilities.fencedStepUpdateVersion !== 1
-            ) {
+            if (resumeCapabilities.atomicResumeVersion !== 1 || resumeCapabilities.fencedStepUpdateVersion !== 1) {
               throw new NonRetriableError(
                 `Workflow storage for ${this.id}/${runId} does not support atomic resume admission and fenced step updates`,
               );
@@ -940,11 +972,10 @@ export class InngestWorkflow<
               stepResults: result.steps,
             });
             const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
-            const existingSnapshot =
-              (await workflowsStore?.loadWorkflowSnapshot({
-                workflowName: this.id,
-                runId,
-              })) as InngestWorkflowRunState | undefined;
+            const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
+              workflowName: this.id,
+              runId,
+            })) as InngestWorkflowRunState | undefined;
             const serializedError =
               result.status === 'failed'
                 ? getErrorFromUnknown(result.error, { serializeStack: true }).toJSON()
@@ -1046,9 +1077,7 @@ export class InngestWorkflow<
                 data: {
                   type: 'workflow-finish',
                   payload: {
-                    status: result.status,
-                    result: result.status === 'success' ? result.result : undefined,
-                    error: result.status === 'failed' ? result.error : undefined,
+                    ...createInngestWorkflowTerminalPayload(result),
                     ...(resume
                       ? {
                           workflowResult: publishedWorkflowResult,

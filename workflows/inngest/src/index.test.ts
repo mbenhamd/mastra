@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { openai } from '@ai-sdk/openai';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
 import { createWorkflowTestSuite } from '@internal/workflow-test-utils';
@@ -53,6 +52,34 @@ const INNGEST_TEST_RUNTIME = new InngestTestRuntimeManager(createInngestTestRunt
 const ACTIVE_TEST_ENDPOINTS = INNGEST_TEST_RUNTIME.config.endpoints;
 
 vi.setConfig({ hookTimeout: 150_000 });
+
+function createTextModel(text: string) {
+  return new MockLanguageModelV2({
+    doGenerate: async () => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      content: [{ type: 'text', text }],
+      warnings: [],
+    }),
+    doStream: async () => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+      stream: simulateReadableStream({
+        chunks: [
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: text },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          },
+        ],
+      }),
+    }),
+  });
+}
 
 function getLocalTestEndpoints(context: unknown): LocalTestEndpoints {
   return (context as LocalTestContext).endpoints;
@@ -8726,10 +8753,6 @@ describe('MastraInngestWorkflow', () => {
 
   describe('Agent as step', () => {
     it('should be able to use an agent as a step', async ctx => {
-      if (!process.env.OPENAI_API_KEY) {
-        throw new Error('OPENAI_API_KEY is not set');
-      }
-
       const inngest = new Inngest({
         id: 'mastra',
         baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
@@ -8750,14 +8773,14 @@ describe('MastraInngestWorkflow', () => {
         id: 'test-agent-1',
         name: 'test-agent-1',
         instructions: 'test agent instructions',
-        model: openai('gpt-4'),
+        model: createTextModel('Paris'),
       });
 
       const agent2 = new Agent({
         id: 'test-agent-2',
         name: 'test-agent-2',
         instructions: 'test agent instructions',
-        model: openai('gpt-4'),
+        model: createTextModel('London'),
       });
 
       const startStep = createStep({
@@ -8842,10 +8865,6 @@ describe('MastraInngestWorkflow', () => {
     });
 
     it('should be able to use an agent in parallel', async ctx => {
-      if (!process.env.OPENAI_API_KEY) {
-        throw new Error('OPENAI_API_KEY is not set');
-      }
-
       const inngest = new Inngest({
         id: 'mastra',
         baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
@@ -8882,14 +8901,14 @@ describe('MastraInngestWorkflow', () => {
         id: 'test-agent-1',
         name: 'test-agent-1',
         instructions: 'test agent instructions',
-        model: openai('gpt-4'),
+        model: createTextModel('Paris'),
       });
 
       const agent2 = new Agent({
         id: 'test-agent-2',
         name: 'test-agent-2',
         instructions: 'test agent instructions',
-        model: openai('gpt-4'),
+        model: createTextModel('London'),
       });
 
       const startStep = createStep({
@@ -11712,6 +11731,7 @@ describe('MastraInngestWorkflow', () => {
           type: 'finish',
         },
       ];
+      expect(values).toHaveLength(expectedValues.length);
       values.forEach((value, i) => {
         const expectedValue = expectedValues[i];
         expect(value).toMatchObject(expectedValue);
