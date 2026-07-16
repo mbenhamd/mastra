@@ -15,6 +15,7 @@ import type {
   WorkflowRunState,
   WorkflowStreamEvent,
   Run,
+  RunWithRawInput,
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
@@ -44,7 +45,9 @@ export class InngestWorkflow<
   TInput = unknown,
   TOutput = unknown,
   TPrevSchema = TInput,
-> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
+  TRequestContext extends Record<string, any> | unknown = unknown,
+  TRawInput = TInput,
+> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, TRequestContext, TRawInput> {
   #mastra: Mastra;
   public inngest: Inngest;
 
@@ -67,14 +70,31 @@ export class InngestWorkflow<
       TState,
       TInput,
       TOutput,
-      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[]
+      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[],
+      TRequestContext
     >,
     inngest: Inngest,
   ) {
-    const { concurrency, rateLimit, throttle, debounce, priority, cron, inputData, initialState, ...workflowParams } =
-      params;
+    const {
+      concurrency,
+      rateLimit,
+      throttle,
+      debounce,
+      priority,
+      cron,
+      inputData,
+      initialState,
+      schedule,
+      ...workflowParams
+    } = params;
 
-    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>);
+    if (schedule !== undefined) {
+      throw new TypeError(
+        'Inngest workflows do not support the Core schedule option; use cron, inputData, and initialState instead',
+      );
+    }
+
+    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>);
 
     this.engineType = 'inngest';
 
@@ -185,12 +205,21 @@ export class InngestWorkflow<
   async createRun(options?: {
     runId?: string;
     resourceId?: string;
-  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput>> {
+    disableScorers?: boolean;
+    /** Inngest functions execute remotely, so per-run PubSub objects cannot be reconstructed. */
+    pubsub?: PubSub;
+  }): Promise<RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>> {
+    if (options?.pubsub) {
+      throw new TypeError(
+        'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object',
+      );
+    }
+
     const runIdToUse = options?.runId || randomUUID();
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
-    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput>(
+    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>(
       {
         workflowId: this.id,
         runId: runIdToUse,
@@ -204,10 +233,14 @@ export class InngestWorkflow<
         workflowSteps: this.steps,
         workflowEngineType: this.engineType,
         validateInputs: this.options.validateInputs,
+        inputSchema: this.inputSchema,
+        stateSchema: this.stateSchema,
+        requestContextSchema: this.requestContextSchema,
+        disableScorers: options?.disableScorers,
       },
       this.inngest,
     );
-    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput>;
+    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>;
 
     this.runs.set(runIdToUse, run);
 
@@ -247,7 +280,7 @@ export class InngestWorkflow<
       });
     }
 
-    return run;
+    return run as RunWithRawInput<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext, TRawInput>;
   }
 
   //createCronFunction is only called if cronConfig.cron is defined.
@@ -307,6 +340,7 @@ export class InngestWorkflow<
           perStep,
           tracingOptions,
           actor,
+          disableScorers,
         } = event.data;
 
         if (!runId) {
@@ -367,6 +401,7 @@ export class InngestWorkflow<
             workflowId: this.id,
             runId,
             resourceId,
+            disableScorers,
             graph: this.executionGraph,
             serializedStepGraph: this.serializedStepGraph,
             input: inputData,

@@ -4,6 +4,7 @@ import { getErrorFromUnknown } from '@mastra/core/error';
 import type { Mastra } from '@mastra/core/mastra';
 import type { TracingContext, TracingOptions } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
+import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { WorkflowRunOutput, ChunkFrom } from '@mastra/core/stream';
 import { createTimeTravelExecutionParams, Run, hydrateSerializedStepErrors } from '@mastra/core/workflows';
 import type {
@@ -38,7 +39,8 @@ export class InngestRun<
   TState = unknown,
   TInput = unknown,
   TOutput = unknown,
-> extends Run<TEngineType, TSteps, TState, TInput, TOutput> {
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> extends Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext> {
   private inngest: Inngest;
   serializedStepGraph: SerializedStepFlowEntry[];
   #mastra: Mastra;
@@ -60,6 +62,10 @@ export class InngestRun<
       workflowSteps: Record<string, StepWithComponent>;
       workflowEngineType: WorkflowEngineType;
       validateInputs?: boolean;
+      inputSchema?: StandardSchemaWithJSON<TInput>;
+      stateSchema?: StandardSchemaWithJSON<TState>;
+      requestContextSchema?: StandardSchemaWithJSON<TRequestContext>;
+      disableScorers?: boolean;
     },
     inngest: Inngest,
   ) {
@@ -285,7 +291,7 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
         actor?: ActorSignal;
         outputWriter?: OutputWriter;
         tracingContext?: TracingContext;
@@ -321,7 +327,7 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
         actor?: ActorSignal;
         tracingOptions?: TracingOptions;
         outputOptions?: {
@@ -355,6 +361,7 @@ export class InngestRun<
     // Validate inputs
     const inputDataToUse = await this._validateInput(args.inputData);
     const initialStateToUse = await this._validateInitialState(args.initialState ?? ({} as TState));
+    await this._validateRequestContext(args.requestContext as RequestContext);
 
     // Send event to Inngest (fire-and-forget)
     const eventOutput = await this.inngest.send({
@@ -369,6 +376,7 @@ export class InngestRun<
         requestContext: args.requestContext ? Object.fromEntries(args.requestContext.entries()) : {},
         actor: args.actor,
         perStep: args.perStep,
+        disableScorers: this.disableScorers,
       },
     });
 
@@ -392,7 +400,7 @@ export class InngestRun<
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     initialState?: TState;
     tracingOptions?: TracingOptions;
@@ -425,6 +433,7 @@ export class InngestRun<
 
     const inputDataToUse = await this._validateInput(inputData);
     const initialStateToUse = await this._validateInitialState(initialState ?? ({} as TState));
+    await this._validateRequestContext(requestContext as RequestContext);
 
     const eventName = `workflow.${this.workflowId}`;
 
@@ -441,6 +450,7 @@ export class InngestRun<
         requestContext: requestContext ? Object.fromEntries(requestContext.entries()) : {},
         actor,
         perStep,
+        disableScorers: this.disableScorers,
       },
     });
 
@@ -473,7 +483,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -505,7 +515,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ eventId: string }> {
@@ -587,6 +597,7 @@ export class InngestRun<
           // persist a membership-bypass signal into durable storage.
           actor: params.actor,
           perStep: params.perStep,
+          disableScorers: this.disableScorers,
         },
       });
     } catch (err) {
@@ -622,7 +633,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
@@ -656,7 +667,7 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<{ runId: string }> {
@@ -676,7 +687,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -708,7 +719,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -830,6 +841,7 @@ export class InngestRun<
           requestContext: params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {},
           actor: params.actor,
           perStep: params.perStep,
+          disableScorers: this.disableScorers,
         },
       });
     } catch (err) {
@@ -898,7 +910,7 @@ export class InngestRun<
     inputData,
     requestContext,
     actor,
-  }: { inputData?: TInput; requestContext?: RequestContext; actor?: ActorSignal } = {}): {
+  }: { inputData?: TInput; requestContext?: RequestContext<TRequestContext>; actor?: ActorSignal } = {}): {
     stream: ReadableStream<StreamEvent>;
     getWorkflowState: () => Promise<WorkflowResult<TState, TInput, TOutput, TSteps>>;
   } {
@@ -969,7 +981,7 @@ export class InngestRun<
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;
@@ -1080,7 +1092,7 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
     actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;

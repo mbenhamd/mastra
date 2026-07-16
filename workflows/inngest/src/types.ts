@@ -1,4 +1,5 @@
-import type { Step, WorkflowConfig } from '@mastra/core/workflows';
+import type { PublicSchema } from '@mastra/core/schema';
+import type { CreateWorkflowParams, InferSchemaOutput, Step, WorkflowConfig } from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
 
 // Extract Inngest's native flow control configuration types from createFunction first argument
@@ -24,9 +25,24 @@ export type InngestWorkflowConfig<
   TInput,
   TOutput,
   TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[],
-> = WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps> &
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> = WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext> &
   InngestFlowControlConfig &
   InngestFlowCronConfig<TInput, TState>;
+
+/**
+ * Schema-typed Inngest workflow configuration.
+ */
+export type CreateInngestWorkflowParams<
+  TWorkflowId extends string = string,
+  TStateSchema extends PublicSchema<any> | undefined = undefined,
+  TInputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TOutputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TSteps extends Step[] = Step[],
+  TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
+> = CreateWorkflowParams<TWorkflowId, TStateSchema, TInputSchema, TOutputSchema, TSteps, TRequestContextSchema> &
+  InngestFlowControlConfig &
+  InngestFlowCronConfig<InferSchemaOutput<TInputSchema>, InferSchemaOutput<TStateSchema>>;
 
 // Compile-time compatibility assertion
 export type _AssertInngestCompatibility =
